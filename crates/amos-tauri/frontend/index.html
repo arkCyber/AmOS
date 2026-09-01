@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Amos · System UI</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <!-- System status bar (global, fixed) -->
+    <div id="status-bar">
+      <span class="sb-time">--:--</span>
+      <span class="sb-right">
+        <span id="nc-bell" class="sb-bell" title="通知中心">🔔</span>
+        <span class="sb-signal">▮▮▮</span>
+        <span class="sb-battery">100%</span>
+      </span>
+    </div>
+
+    <!-- The launcher / app viewport -->
+    <main id="view"></main>
+
+    <!-- iOS-style home indicator (tap to return home) -->
+    <div id="home-indicator" title="回到主屏幕"></div>
+
+    <!-- Notification center (pulled down from the status bar) -->
+    <div id="nc-overlay"></div>
+
+    <!-- Core -->
+    <script src="./js/core.js"></script>
+
+    <!-- Notification center -->
+    <script src="./js/nc.js"></script>
+
+    <!-- Apps -->
+    <script src="./js/apps/phone.js"></script>
+    <script src="./js/apps/messages.js"></script>
+    <script src="./js/apps/camera.js"></script>
+    <script src="./js/apps/photos.js"></script>
+    <script src="./js/apps/settings.js"></script>
+    <script src="./js/apps/calculator.js"></script>
+    <script src="./js/apps/weather.js"></script>
+    <script src="./js/apps/music.js"></script>
+    <script src="./js/apps/clock.js"></script>
+    <script src="./js/apps/maps.js"></script>
+    <script src="./js/apps/files.js"></script>
+    <script src="./js/apps/notes.js"></script>
+    <script src="./js/apps/android.js"></script>
+    <script src="./js/apps/ai.js"></script>
+
+    <!-- Boot -->
+    <script src="./js/main.js"></script>
+  </body>
+</html>

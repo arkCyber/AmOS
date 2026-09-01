@@ -1,0 +1,53 @@
+// Amos Android-compat contract: the strong-typed bridge to the Waydroid /
+// lightweight Android runtime that runs legacy APKs inside a container.
+//
+// The Tauri System UI never runs an APK directly. It talks to the Amos Rust
+// core over this gRPC surface; the core drives the Android container (Waydroid)
+// via CLI/binder, and the resulting app surface is composited into Tauri
+// windows (Wayland / DMA-BUF texture).
+syntax = "proto3";
+
+package android_compat;
+
+service AndroidManager {
+  // Launch a legacy Android app in the container and return its surface id.
+  rpc LaunchAndroidApp(AppLaunchRequest) returns (AppLaunchResponse);
+
+  // List installed apps (so the Tauri Launcher can render their icons).
+  rpc GetInstalledApps(Empty) returns (AppListResponse);
+
+  // Fetch a PNG icon for an app (extracted from its APK / demo-generated).
+  rpc GetAppIcon(AppIconRequest) returns (AppIconResponse);
+}
+
+message AppIconRequest {
+  string package_name = 1;
+}
+
+message AppIconResponse {
+  bytes icon_png = 1; // raw PNG bytes; empty if no icon available
+  bool found = 2;
+}
+
+message AppLaunchRequest {
+  string package_name = 1; // e.g. "com.tencent.mm" (WeChat)
+}
+
+message AppLaunchResponse {
+  bool success = 1;
+  string window_id = 2; // Wayland surface / window id of the launched app
+  string error = 3;     // non-empty when success is false
+}
+
+message AppListResponse {
+  repeated AndroidApp apps = 1;
+}
+
+message AndroidApp {
+  string name = 1;
+  string package_name = 2;
+  string icon_path = 3; // web path the Tauri frontend can render
+  string activity = 4;  // main launch activity
+}
+
+message Empty {}

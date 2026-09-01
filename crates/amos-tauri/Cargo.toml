@@ -1,0 +1,28 @@
+[package]
+name = "amos-tauri"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "amos System UI: Tauri 2 shell + Rust core that bridges the WebView to the AI daemon over UDS."
+
+# Tauri mobile builds require both a staticlib (for the mobile platform shell)
+# and a cdylib/rlib (for the desktop binary entrypoint).
+[lib]
+name = "amos_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+amos-proto.workspace = true
+amos-wm = { path = "../amos-wm" }
+tauri.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+tracing.workspace = true

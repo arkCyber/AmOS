@@ -1,0 +1,54 @@
+// Amos gRPC contract between the Tauri System UI and the OS-level AI CLI daemon.
+//
+// Transport: Unix Domain Socket (no TCP loopback) for low latency + process isolation.
+syntax = "proto3";
+
+package ai_agent;
+
+// The AI Agent service exposed by the OS daemon (amos-ai).
+//
+// The Tauri Rust core acts as a *client*: it opens a stream, consumes the
+// token stream, and re-emits each token to the WebView as a Tauri event so
+// the UI stays perfectly in sync (typing-machine effect) without blocking.
+service AiAgent {
+  // Unary request -> server-streaming tokens (chat / long text generation).
+  rpc StreamChat(AgentRequest) returns (stream AgentChunk);
+
+  // Bidirectional streaming: client pushes prompts/audio, server streams tokens.
+  // Ideal for voice interaction and multi-turn agent orchestration.
+  rpc Chat(stream ClientMessage) returns (stream AgentChunk);
+
+  // Lightweight liveness / capability probe used by the System UI.
+  rpc GetStatus(StatusRequest) returns (StatusReply);
+}
+
+message AgentRequest {
+  string session_id = 1;                 // arbitrary id used to correlate the stream
+  string prompt = 2;                     // user/system text input
+  map<string, string> context = 3;       // injected OS context (screen a11y text, intent, etc.)
+}
+
+message AgentChunk {
+  string session_id = 1;                 // echoes back the originating session_id
+  string token = 2;                      // next piece of generated text
+  bool done = 3;                         // true on the terminal frame of the stream
+  string error = 4;                      // non-empty when the generation failed
+}
+
+message ClientMessage {
+  oneof payload {
+    string prompt = 1;                   // push a text prompt into the stream
+    bytes audio = 2;                     // push an audio frame (voice interaction)
+    string cancel = 3;                   // request cancellation of the current turn
+  }
+}
+
+message StatusRequest {}
+
+message StatusReply {
+  bool running = 1;                      // is the inference daemon alive & ready
+  string model = 2;                      // active model identifier
+  int64 uptime_seconds = 3;              // daemon uptime
+  uint32 gpu_util = 4;                   // rough GPU/NPU utilisation percent
+  uint32 active_sessions = 5;            // number of live agent sessions
+}

@@ -1,0 +1,13 @@
+# Cross-compilation config for the no-UI Android base (aarch64).
+#
+# Copy/adjust and uncomment so the whole workspace can build for Android.
+# The linker path uses the NDK's bundled clang. Generate it automatically via
+# `scripts/build-android.sh` (which reads $ANDROID_NDK_HOME), or set manually:
+
+# [target.aarch64-linux-android]
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clang"
+
+# The AI daemon and WindowManager are pure Rust (no NDK sysroot needed beyond
+# the linker + a target like `aarch64-linux-android`). For the Tauri APK you
+# additionally need the Android SDK/NDK + `cargo tauri android init` (see
+# docs/no-ui-android.md).

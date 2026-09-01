@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/amos-proto",
+    "crates/amos-ai",
+    "crates/amos-wm",
+    "crates/amos-android",
+    "crates/amos-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+authors = ["Amos Team"]
+description = "amos: an AI-first mobile OS built on Tauri + a native Rust AI CLI daemon."
+
+# Shared dependency versions so every crate stays in lockstep.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tauri = "2"
+tauri-build = "2"
+
+# ---- local workspace crates ----
+amos-proto = { path = "crates/amos-proto" }
+amos-android = { path = "crates/amos-android" }
+
+# ---- profile tuning for fast iteration / smaller mobile binaries ----
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

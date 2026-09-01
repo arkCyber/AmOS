@@ -1,0 +1,10 @@
+[package]
+name = "amos-wm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-agnostic window manager state machine for the Amos OS (multi-window phase)."
+
+[dependencies]
+serde.workspace = true

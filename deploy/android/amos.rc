@@ -1,0 +1,37 @@
+# Amos OS — init.rc additions for the no-UI Android base.
+#
+# Since the base Android has no Java UI framework / SystemUI, init must bring
+# up our Rust stack headlessly. Order matters:
+#   1) early-init: create the socket directory with correct owner/perms.
+#   2) boot_completed: start the AI daemon (gRPC server over UDS).
+#   3) The Tauri System UI is installed as the *only* launcher APK (HOME
+#      category); Android auto-starts it as a system app once boot completes.
+#
+# Merge this file into the device's init.rc (e.g. device/<vendor>/<device>/
+# init.rc or via TARGET_PROVIDES_INIT_RC) before building the OS image.
+
+on early-init
+    # Directory for the AI daemon's Unix Domain Socket + any shared state.
+    mkdir /data/amos 0770 system system
+
+on property:sys.boot_completed=1
+    # Bring up the AI inference daemon after core services are ready.
+    # `setenv` + our CLI `--socket` flag ensure both daemon and Tauri agree on
+    # the same UDS path even without the default.
+    start amos-ai
+
+# The AI daemon: a pure Rust binary shipped to /system/bin/amos-ai.
+# - `oneshot` is NOT set: it is a long-running server and init restarts it if
+#   it dies (default restart behavior for class main services).
+# - `oom_score_adj` is lowered so the OS never kills the inference core.
+service amos-ai /system/bin/amos-ai --socket /data/amos/ai.sock
+    class main
+    user root
+    group root system
+    seclabel u:r:system_app:s0
+    setenv AMOS_SOCKET /data/amos/ai.sock
+    oom_score_adj -1000
+
+# Optional: restart policy — init restarts crashed services automatically for
+# `class main`. To cap CPU/mem, wrap with a cgroup via:
+#   write /dev/cpuset/top-app/cgroup.procs $PID   (in a companion service)

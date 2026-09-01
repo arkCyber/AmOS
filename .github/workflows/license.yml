@@ -1,0 +1,31 @@
+name: "License"
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "LICENSE*"
+      - ".github/workflows/license.yml"
+
+jobs:
+  license-check:
+    name: "Check License Headers"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Check for LICENSE files"
+        run: |
+          if [[ ! -f LICENSE-MIT ]] && [[ ! -f LICENSE-APACHE ]] && [[ ! -f LICENSE ]]; then
+            echo "❌ No LICENSE file found!"
+            exit 1
+          fi
+          echo "✓ LICENSE files present"
+
+      - name: "Verify Cargo.toml license field"
+        run: |
+          if ! grep -q "license" Cargo.toml; then
+            echo "⚠️  Warning: No license field in root Cargo.toml"
+          else
+            echo "✓ License field present in Cargo.toml"
+          fi

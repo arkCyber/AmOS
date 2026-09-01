@@ -1,0 +1,85 @@
+# Rust / build artifacts
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Frontend / Node
+node_modules/
+**/node_modules/
+crates/amos-tauri/frontend/node_modules/
+crates/amos-tauri/frontend/dist/
+crates/amos-tauri/frontend/build/
+.next/
+.nuxt/
+dist/
+build/
+
+# Package managers
+*.npm
+yarn.lock
+bun.lockb
+
+# Logs / OS
+*.log
+logs/
+*.log.*
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vim/
+.emacs.d/
+*.iml
+.project
+.classpath
+.c9/
+*.sublime-project
+*.sublime-workspace
+
+# Local env / secrets
+.env
+.env.local
+.env.*.local
+.env.secret
+
+# Tauri specific
+crates/amos-tauri/target/
+crates/amos-tauri/src-tauri/target/
+crates/amos-tauri/gen/
+*.app/
+AppBundle/
+
+# Android / Waydroid
+.gradle/
+.android/
+*.apk
+*.keystore
+build/
+local.properties
+
+# Protocol buffers generated code
+crates/amos-proto/src/generated/
+
+# Testing artifacts
+coverage/
+.coverage
+htmlcov/
+target/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*~
+.swp*

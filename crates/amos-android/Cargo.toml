@@ -1,0 +1,22 @@
+[package]
+name = "amos-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Android-compat layer: drive the Waydroid/LXC Android container from Rust and expose it over gRPC."
+
+[dependencies]
+amos-proto.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+zip = "0.6"
+flate2 = "1"
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
