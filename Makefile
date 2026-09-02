@@ -41,6 +41,11 @@ run-ai:
 run-ui:
 	cargo run -p amos-tauri
 
+# Run the System UI from source against a local frontend dev server (fixes the
+# blank/white window that appears when the dev binary can't reach :5173).
+run-ui-dev:
+	bash scripts/run-gui-dev.sh
+
 # Print the mobile-targets init guide (requires Android SDK / Xcode on a real
 # machine; see docs/mobile-targets.md for the exact commands).
 mobile-init:
