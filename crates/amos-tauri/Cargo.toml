@@ -21,6 +21,7 @@ amos-wm = { path = "../amos-wm" }
 amos-int.workspace = true
 amos-translate = { path = "../amos-translate" }
 amos-tts = { path = "../amos-tts" }
+amos-asr = { path = "../amos-asr", optional = true }
 tauri.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -30,3 +31,11 @@ hyper-util.workspace = true
 serde.workspace = true
 serde_json = "1.0"
 tracing.workspace = true
+
+# Opt-in local streaming ASR: compiles + links the native sherpa-onnx lib.
+# Enable with `--features sherpa-asr` (or via tauri), and set AMOS_SHERPA_MODEL_DIR
+# to a directory with tokens.txt + encoder/decoder/joiner .onnx so interpret_start
+# uses local sherpa ASR instead of the daemon's mock ASR.
+[features]
+default = []
+sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]

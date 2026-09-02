@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use amos_int::event::{InterpretationOutput, SessionEvent};
+use amos_int::pipeline::Pipeline;
 use amos_int::{Session, SessionConfig};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -221,6 +222,52 @@ fn emit(app: &AppHandle, payloads: Vec<InterpretEventPayload>) {
     }
 }
 
+/// Build a composite **local sherpa ASR** + daemon-translation pipeline when the
+/// `sherpa-asr` feature is enabled and `AMOS_SHERPA_MODEL_DIR` points at a model
+/// directory with the standard sherpa files. Returns `None` (so callers fall
+/// back to the daemon) when not configured / models missing.
+#[cfg(feature = "sherpa-asr")]
+fn local_sherpa_pipeline(
+    socket: &std::path::Path,
+    source: &str,
+    target: &str,
+) -> Option<Box<dyn Pipeline>> {
+    use amos_asr::{sherpa_pipeline, SherpaOnlineRecognizerConfig};
+
+    let dir = PathBuf::from(std::env::var("AMOS_SHERPA_MODEL_DIR").ok()?);
+    let names = [
+        "tokens.txt",
+        "encoder-epoch-99-avg-1.int8.onnx",
+        "decoder-epoch-99-avg-1.int8.onnx",
+        "joiner-epoch-99-avg-1.int8.onnx",
+    ];
+    if names.iter().any(|f| !dir.join(f).exists()) {
+        return None; // models not downloaded; use the daemon
+    }
+    let lang = if source.is_empty() || source == "auto" {
+        "en"
+    } else {
+        source
+    };
+    let cfg = SherpaOnlineRecognizerConfig {
+        tokens: dir.join("tokens.txt"),
+        encoder: dir.join(names[1]),
+        decoder: dir.join(names[2]),
+        joiner: dir.join(names[3]),
+        lang: lang.into(),
+        ..Default::default()
+    };
+    let translate: std::sync::Arc<dyn Pipeline> =
+        std::sync::Arc::new(amos_translate::grpc_pipeline::GrpcPipeline::new(
+            socket.to_owned(),
+            source.to_string(),
+            target.to_string(),
+        ));
+    let pipeline = sherpa_pipeline(cfg, Some(translate)).ok()?;
+    tracing::info!("interpret: using local sherpa ASR from {}", dir.display());
+    Some(Box::new(pipeline))
+}
+
 /// Start an interpretation session against the amos-translate daemon.
 #[tauri::command]
 pub async fn interpret_start(
@@ -233,11 +280,20 @@ pub async fn interpret_start(
     let target = target_lang.unwrap_or_else(|| "zh".into());
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
 
-    let pipeline = Box::new(amos_translate::grpc_pipeline::GrpcPipeline::new(
-        state.socket.clone(),
-        source.clone(),
-        target.clone(),
-    ));
+    // Default: daemon ASR + translation via amos-translate.
+    let grpc = || {
+        Box::new(amos_translate::grpc_pipeline::GrpcPipeline::new(
+            state.socket.clone(),
+            source.clone(),
+            target.clone(),
+        )) as Box<dyn Pipeline>
+    };
+    #[cfg(feature = "sherpa-asr")]
+    let pipeline: Box<dyn Pipeline> =
+        local_sherpa_pipeline(&state.socket, &source, &target).unwrap_or_else(grpc);
+    #[cfg(not(feature = "sherpa-asr"))]
+    let pipeline: Box<dyn Pipeline> = grpc();
+
     let config = SessionConfig::one_way(source.clone(), target.clone());
     let (session, rx) = Session::new(config, pipeline);
     let mut active = ActiveSession {
@@ -544,6 +600,19 @@ mod tests {
                 InterpretEventPayload::SegmentFinal { source_text, .. } if source_text == "again"
             )),
             "{payloads:?}"
+        );
+    }
+
+    /// With the `sherpa-asr` feature, a missing/misconfigured model directory
+    /// must yield `None` so `interpret_start` falls back to the daemon.
+    #[cfg(feature = "sherpa-asr")]
+    #[test]
+    fn local_sherpa_pipeline_falls_back_when_models_missing() {
+        std::env::set_var("AMOS_SHERPA_MODEL_DIR", "/nonexistent-amos-sherpa-models");
+        let p = local_sherpa_pipeline(&PathBuf::from("/tmp/amos-test.sock"), "auto", "zh");
+        assert!(
+            p.is_none(),
+            "missing models must fall back to the daemon (None)"
         );
     }
 }
