@@ -32,4 +32,11 @@ describe("music", () => {
     expect(stepIndex(total - 1, total, 1)).toBe(0);
     expect(stepIndex(1, total, 1)).toBe(2);
   });
+
+  test("wrap/stepIndex never produce NaN for an empty playlist", () => {
+    expect(wrap(5, 0)).toBe(0);
+    expect(stepIndex(0, 0, 1)).toBe(0);
+    expect(wrap(3, -2)).toBe(0); // non-positive total guarded
+    expect(Number.isNaN(wrap(1, 0))).toBe(false);
+  });
 });

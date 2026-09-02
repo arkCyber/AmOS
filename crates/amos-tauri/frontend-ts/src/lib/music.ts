@@ -14,8 +14,10 @@ export function seedTracks(): Track[] {
   ];
 }
 
-/** Wrap an index into [0, n). */
+/** Wrap an index into [0, n). Returns 0 for an empty/non-positive collection
+ * (never NaN). */
 export function wrap(i: number, n: number): number {
+  if (!(n > 0)) return 0;
   return ((i % n) + n) % n;
 }
 

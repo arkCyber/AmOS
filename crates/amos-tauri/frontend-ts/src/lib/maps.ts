@@ -13,11 +13,19 @@ export function clampZoom(z: number): number {
   return Math.min(18, Math.max(3, Math.round(z)));
 }
 
-/** Slippy-map tile coordinate (Web Mercator). */
+/**
+ * Slippy-map tile coordinate (Web Mercator). Latitude is clamped to the valid
+ * Mercator range so poles/out-of-range inputs never yield Inf/NaN.
+ */
 export function latLonToTile(lat: number, lon: number, z: number): { x: number; y: number } {
+  // Guard: non-finite inputs are rejected to the tile origin (deterministic).
+  const la = Number.isFinite(lat) ? lat : 0;
+  const lo = Number.isFinite(lon) ? lon : 0;
+  const MERCATOR_MAX_LAT = 85.05112878;
+  const clampedLat = Math.max(-MERCATOR_MAX_LAT, Math.min(MERCATOR_MAX_LAT, la));
   const n = 2 ** z;
-  const x = ((lon + 180) / 360) * n;
-  const latRad = (lat * Math.PI) / 180;
+  const x = ((lo + 180) / 360) * n;
+  const latRad = (clampedLat * Math.PI) / 180;
   const y = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
   return { x, y };
 }

@@ -21,4 +21,23 @@ describe("maps", () => {
   test("tileUrl references openstreetmap", () => {
     expect(tileUrl(12, 1, 2)).toBe("https://tile.openstreetmap.org/12/1/2.png");
   });
+
+  test("latLonToTile stays finite at poles / invalid input (no Inf/NaN)", () => {
+    // Latitude clamped to valid Mercator range.
+    const north = latLonToTile(90, 0, 3);
+    const south = latLonToTile(-90, 0, 3);
+    for (const { x, y } of [north, south]) {
+      expect(Number.isFinite(x)).toBe(true);
+      expect(Number.isFinite(y)).toBe(true);
+    }
+    // Origin is the mercator centre for (0,0).
+    const mid = latLonToTile(0, 0, 3);
+    expect(mid.x).toBeCloseTo(4, 5); // 2^3 / 2
+    expect(mid.y).toBeCloseTo(4, 5);
+    // Non-finite inputs degrade deterministically to the tile origin, not NaN.
+    const bad = latLonToTile(Number.NaN, Number.POSITIVE_INFINITY, 3);
+    expect(Number.isFinite(bad.x)).toBe(true);
+    expect(Number.isFinite(bad.y)).toBe(true);
+    expect(bad.x).toBeCloseTo(4, 5);
+  });
 });
