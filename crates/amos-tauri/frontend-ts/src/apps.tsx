@@ -1,5 +1,6 @@
 import { useEffect, useState, type FC } from "react";
 import FilesApp from "./components/FilesApp";
+import AndroidApp from "./components/AndroidApp";
 import { MessagesApp, PhoneApp, MusicApp } from "./components/CommsApps";
 import MapsApp from "./components/MapsApp";
 import CameraApp from "./components/CameraApp";
@@ -39,6 +40,7 @@ export const APPS: AppMeta[] = [
   { id: "notes", titleKey: "app.notes", icon: "📝" },
   { id: "photos", titleKey: "app.photos", icon: "🖼️" },
   { id: "files", titleKey: "app.files", icon: "📁" },
+  { id: "android", titleKey: "app.android", icon: "🤖" },
   { id: "messages", titleKey: "app.messages", icon: "💬" },
   { id: "phone", titleKey: "app.phone", icon: "📞" },
   { id: "music", titleKey: "app.music", icon: "🎵" },
@@ -303,6 +305,7 @@ const COMPONENTS: Record<string, FC> = {
   notes: Notes,
   photos: Photos,
   files: FilesApp,
+  android: AndroidApp,
   messages: MessagesApp,
   phone: PhoneApp,
   music: MusicApp,

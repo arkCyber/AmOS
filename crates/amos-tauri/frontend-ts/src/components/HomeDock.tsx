@@ -77,6 +77,7 @@ export default function HomeDock({
     notes: "📝",
     photos: "🖼️",
     files: "📁",
+    android: "🤖",
     messages: "💬",
     phone: "📞",
     music: "🎵",

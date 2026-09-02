@@ -128,3 +128,33 @@ export interface TtsPayload {
 export async function ttsSynthesize(text: string, lang = "zh"): Promise<TtsPayload | null> {
   return invoke<TtsPayload>("tts_synthesize", { text, lang });
 }
+
+/* ---- Android compatibility (legacy Waydroid/demo apps over the shared pipe) ---- */
+export interface AndroidApp {
+  name: string;
+  package_name: string;
+  icon_path?: string;
+  activity?: string;
+}
+
+export interface AndroidLaunchResult {
+  success: boolean;
+  window_id?: string;
+  window_label?: string;
+  error?: string;
+}
+
+/** List installed Android apps exposed by the daemon (null outside Tauri). */
+export async function getAndroidApps(): Promise<AndroidApp[] | null> {
+  return invoke<AndroidApp[]>("get_android_apps");
+}
+
+/** Launch a package in the container (registers an external System window). */
+export async function launchAndroidApp(packageName: string): Promise<AndroidLaunchResult | null> {
+  return invoke<AndroidLaunchResult>("launch_android_app", { packageName });
+}
+
+/** Fetch a PNG icon (bytes) for an app so the UI can render a data URI. */
+export async function getAndroidAppIcon(packageName: string): Promise<number[] | null> {
+  return invoke<number[]>("get_android_app_icon", { packageName });
+}
