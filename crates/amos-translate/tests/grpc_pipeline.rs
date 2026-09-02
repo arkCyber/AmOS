@@ -265,10 +265,8 @@ async fn translate_recovers_when_daemon_comes_up() {
     use amos_int::pipeline::{Pipeline, SourceText};
     use amos_int::segment::Speaker;
 
-    let path: PathBuf = std::env::temp_dir().join(format!(
-        "amos-int-grpc-outage-{}.sock",
-        std::process::id()
-    ));
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-int-grpc-outage-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let lang = Language::new("en");
     let sp = Speaker::default();
@@ -297,4 +295,3 @@ async fn translate_recovers_when_daemon_comes_up() {
     daemon.abort();
     let _ = std::fs::remove_file(&path);
 }
-

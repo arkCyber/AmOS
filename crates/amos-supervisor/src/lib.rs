@@ -883,7 +883,10 @@ mod backoff_property {
         };
         for a in [0u32, 1, 2, 7, 1000, u32::MAX] {
             let d = big.delay_for(a);
-            assert!(d.as_secs() <= MAX_BACKOFF, "attempt {a} backoff {d:?} over cap");
+            assert!(
+                d.as_secs() <= MAX_BACKOFF,
+                "attempt {a} backoff {d:?} over cap"
+            );
         }
         // backoff_secs 0 stays 0 for any attempt.
         let zero = RestartPolicy {

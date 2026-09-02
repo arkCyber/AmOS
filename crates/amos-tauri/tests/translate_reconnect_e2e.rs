@@ -46,15 +46,18 @@ const SLEEP: std::time::Duration = std::time::Duration::from_millis(150);
 const PCM: &[u8] = &[0u8; 160];
 
 async fn transcribe_once() -> Result<amos_tauri_lib::translate::TranscriptionPayload, String> {
-    transcribe_audio(PCM.to_vec(), Some("zh".to_string()), Some("wav".to_string())).await
+    transcribe_audio(
+        PCM.to_vec(),
+        Some("zh".to_string()),
+        Some("wav".to_string()),
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_disconnect_is_reported_and_restart_recovers() {
-    let path: PathBuf = std::env::temp_dir().join(format!(
-        "amos-tauri-reconnect-{}.sock",
-        std::process::id()
-    ));
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-tauri-reconnect-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     std::env::set_var("AMOS_TRANSLATE_SOCKET", &path);
 
@@ -77,7 +80,9 @@ async fn daemon_disconnect_is_reported_and_restart_recovers() {
     let _ = std::fs::remove_file(&path); // drop the stale socket file
     let daemon2 = spawn_translate_daemon(&path).await;
     tokio::time::sleep(SLEEP).await;
-    let recovered = transcribe_once().await.expect("recovered after daemon restart");
+    let recovered = transcribe_once()
+        .await
+        .expect("recovered after daemon restart");
     assert!(!recovered.text.trim().is_empty());
 
     // Sanity: text translation also survives a restart.

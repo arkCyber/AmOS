@@ -375,10 +375,16 @@ mod tests {
         // absolute ordering invariant while it is focused.)
         let launcher_state = wm.state_of(launcher);
         assert!(
-            matches!(launcher_state, Some(WindowState::Shown) | Some(WindowState::Focused)),
+            matches!(
+                launcher_state,
+                Some(WindowState::Shown) | Some(WindowState::Focused)
+            ),
             "launcher must be shown/focused, got {launcher_state:?}"
         );
-        assert!(wm.windows().contains(&launcher), "launcher window must remain present");
+        assert!(
+            wm.windows().contains(&launcher),
+            "launcher window must remain present"
+        );
     }
 
     /// Aerospace-grade property test: after every step of a long deterministic

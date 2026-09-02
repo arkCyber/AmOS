@@ -140,12 +140,18 @@ mod tests {
                 let allowed = SessionState::allowed(from, to);
                 match from.transition(to) {
                     Ok(next) => {
-                        assert!(allowed, "transition Ok but allowed=false for {from:?}->{to:?}");
+                        assert!(
+                            allowed,
+                            "transition Ok but allowed=false for {from:?}->{to:?}"
+                        );
                         assert_eq!(next, to);
                         edges += 1;
                     }
                     Err(e) => {
-                        assert!(!allowed, "transition Err but allowed=true for {from:?}->{to:?}");
+                        assert!(
+                            !allowed,
+                            "transition Err but allowed=true for {from:?}->{to:?}"
+                        );
                         assert_eq!(e, StateError { from, to });
                     }
                 }
@@ -169,7 +175,10 @@ mod tests {
             Error,
         ];
         for s in ALL {
-            assert!(!SessionState::allowed(s, s), "self-loop must not be allowed for {s:?}");
+            assert!(
+                !SessionState::allowed(s, s),
+                "self-loop must not be allowed for {s:?}"
+            );
         }
         for to in ALL {
             assert!(
