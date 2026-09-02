@@ -550,19 +550,23 @@ window.Amos = (() => {
     dark: "./wallpaper-dark.png",
     light: "./wallpaper-light.png",
     landscape: "./wallpaper-landscape.png",
+    dawn: "./wallpaper-dawn.png",
+    abyss: "./wallpaper-abyss.png",
   };
   const WALLPAPER_PRESETS = [
     { id: "auto", label: "自动 · 随深浅切换" },
     { id: "dark", label: "极光夜" },
     { id: "light", label: "晴日山丘" },
     { id: "landscape", label: "暮色原野" },
+    { id: "dawn", label: "晨雾玫瑰" },
+    { id: "abyss", label: "墨蓝深谷" },
   ];
   function isCustomWallpaper(w) {
     return typeof w === "string" && /^(data:|blob:|https?:|file:)/.test(w);
   }
   // Pure: pick the image URL for the given theme + stored wallpaper choice.
   function resolveWallpaper(dark, w) {
-    if (w === "landscape" || w === "dark" || w === "light") return WALLPAPER_FILES[w];
+    if (w === "landscape" || w === "dark" || w === "light" || w === "dawn" || w === "abyss") return WALLPAPER_FILES[w];
     if (isCustomWallpaper(w)) return w;
     return dark ? WALLPAPER_FILES.dark : WALLPAPER_FILES.light; // auto / unset
   }

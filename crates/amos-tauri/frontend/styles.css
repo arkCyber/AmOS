@@ -225,24 +225,49 @@ body {
 }
 .app-icon:active .tile { transform: scale(0.9); }
 .app-icon .tile {
-  width: 62px;
-  height: 62px;
-  border-radius: 15px;
+  position: relative;
+  overflow: hidden;
+  width: 60px;
+  height: 60px;
+  border-radius: 17px; /* iOS-style squircle-ish app icon */
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 32px;
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.28),
+    inset 0 1px 1px rgba(255, 255, 255, 0.22),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.08),
     0 2px 4px rgba(0, 0, 0, 0.35),
-    0 8px 18px rgba(0, 0, 0, 0.5);
+    0 10px 20px rgba(0, 0, 0, 0.45);
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
-.app-icon:hover .tile { box-shadow: inset 0 1px 1px rgba(255,255,255,0.3), 0 4px 8px rgba(0,0,0,0.4), 0 14px 26px rgba(0,0,0,0.55); }
+/* iOS glass: a soft top sheen + a subtle bottom inner shade for depth. */
+.app-icon .tile::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.05) 46%, rgba(255, 255, 255, 0) 48%),
+    radial-gradient(120% 60% at 50% -10%, rgba(255, 255, 255, 0.35), rgba(255, 255, 255, 0) 60%);
+  border-radius: inherit;
+}
+.app-icon .tile::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 55%, rgba(0, 0, 0, 0.16));
+  border-radius: inherit;
+}
+/* keep the emoji glyph above the sheen layers */
+.app-icon .tile > * { position: relative; z-index: 1; }
+.app-icon:hover .tile { box-shadow: inset 0 1px 1px rgba(255,255,255,0.26), 0 4px 8px rgba(0,0,0,0.42), 0 16px 28px rgba(0,0,0,0.5); }
 .app-icon .label {
   font-size: 11px;
+  font-weight: 500;
   color: #fff;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
   text-align: center;
   max-width: 76px;
   overflow: hidden;
@@ -527,3 +552,6 @@ body {
 [data-theme="light"] .interp-src::before, [data-theme="light"] .interp-tgt::before { background: rgba(0, 0, 0, 0.08); color: #666; }
 [data-theme="light"] .interp-partial { color: #888; }
 
+
+[data-theme="light"] .app-icon .label { color: #26262a; text-shadow: 0 1px 2px rgba(255, 255, 255, 0.6); }
+[data-theme="light"] .app-icon .tile::before { opacity: 0.75; }
