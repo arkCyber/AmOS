@@ -139,8 +139,11 @@ partial/segment_final → 断言 partial 追加、译文段落含 🔊 朗读按
 make test          # workspace + 前端
 make lint          # fmt + clippy -D warnings
 make smoke         # headless 端到端：int-cli-smoke.sh + full_chain
-make gated-check   # (联网机器) 编译 sherpa/Piper 门控后端
+make gated-check   # 编译 sherpa-onnx / piper-rs 门控后端（联网，已校准为 CI 必须门禁）
 ```
+
+CI（`.github/workflows/ci.yml`）三 job 全绿且**全部必须**：`lint-and-test`、`smoke`、
+`gated-native-backends`（sherpa/Piper 已按 sherpa-onnx 1.13.7 / piper-rs 0.2 真实 API 校准）。
 
 ### 可复现冒烟脚本（headless）
 - `scripts/int-cli-smoke.sh`：起 mock daemon + 管道喂文本给 `amos-int-cli`，断言译文（文本同传端到端）。

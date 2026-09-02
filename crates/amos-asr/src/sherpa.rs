@@ -30,7 +30,6 @@ pub struct SherpaOnlineRecognizerConfig {
     /// `joiner.onnx`
     pub joiner: std::path::PathBuf,
     pub sample_rate: u32,
-    pub feature_dim: usize,
     pub num_threads: usize,
     /// Enable sherpa's built-in endpoint detection.
     pub enable_endpoint: bool,
@@ -45,7 +44,6 @@ impl Default for SherpaOnlineRecognizerConfig {
             decoder: "/models/sherpa-onnx/decoder.onnx".into(),
             joiner: "/models/sherpa-onnx/joiner.onnx".into(),
             sample_rate: 16_000,
-            feature_dim: 80,
             num_threads: 2,
             enable_endpoint: true,
             lang: Language::new("auto"),
