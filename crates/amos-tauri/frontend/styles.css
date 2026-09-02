@@ -485,6 +485,12 @@ body {
 
 /* ---------- Light theme (darkmode toggle actually changes the UI) ---------- */
 [data-theme="light"] body { background: #f2f2f7; color: #1c1c1e; }
+[data-theme="light"] {
+  /* Redefine the semantic text tokens for light theme so every var() consumer
+     (titles, .muted, cards, lock hints…) stays legible. */
+  --text: #1c1c1e;
+  --text-dim: rgba(0, 0, 0, 0.6);
+}
 [data-theme="light"] #status-bar { color: #1c1c1e; text-shadow: none; }
 [data-theme="light"] .app-screen { background: #f2f2f7; color: #1c1c1e; }
 [data-theme="light"] .app-titlebar { color: #1c1c1e; }
