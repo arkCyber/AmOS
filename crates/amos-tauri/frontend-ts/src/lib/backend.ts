@@ -109,6 +109,14 @@ export async function interpretStop(sessionId: string): Promise<unknown> {
   return invoke("interpret_stop", { sessionId });
 }
 
+export async function interpretPause(sessionId: string): Promise<unknown> {
+  return invoke("interpret_pause", { sessionId });
+}
+
+export async function interpretResume(sessionId: string): Promise<unknown> {
+  return invoke("interpret_resume", { sessionId });
+}
+
 /* ---- TTS bridge (final translation segments -> local Piper / mock PCM) ---- */
 export interface TtsPayload {
   sample_rate: number;

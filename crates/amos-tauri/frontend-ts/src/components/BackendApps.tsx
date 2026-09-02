@@ -5,14 +5,31 @@ import {
   conversationId,
   getAiStatus,
   interpretAudio,
+  interpretPause,
+  interpretResume,
   interpretStart,
   interpretStop,
+  interpretText,
   sendChat,
   subscribe,
 } from "../lib/backend";
 import { frameToChunk } from "../lib/audio";
-import { onInterpFinal, speakText } from "../lib/realtimeTts";
-import { chatLogInit, onAiToken, onAiComplete, onInterpOutput, type ChatLog, type InterpLine } from "../lib/stream";
+import { speakText } from "../lib/realtimeTts";
+import { chatLogInit, onAiToken, onAiComplete, type ChatLog } from "../lib/stream";
+import {
+  clearSegs,
+  errorOf,
+  LANGS,
+  langNative,
+  loadSegs,
+  partialTextOf,
+  readPrefs,
+  saveSegs,
+  segOf,
+  writePrefs,
+  type InterpPrefs,
+  type InterpSeg,
+} from "../lib/interp";
 
 /* ---- AI Assistant: real chat_agent + streaming ai-token-received rendering ---- */
 export function AiApp() {
@@ -78,45 +95,70 @@ export function AiApp() {
   );
 }
 
-/* ---- Interpreter (同传): live transcript + mic + read-aloud ---- */
+/* ---- Interpreter (同传): lang pair + mic/text -> live transcript + read-aloud ---- */
 export function InterpApp() {
   const { t } = useI18n();
   const online = bridged();
-  const [lines, setLines] = useState<InterpLine[]>([]);
+  const [prefs, setPrefs] = useState<InterpPrefs>(() => readPrefs());
+  const [running, setRunning] = useState(false);
+  const [paused, setPaused] = useState(false);
   const [rec, setRec] = useState(false);
-  const [, setSid] = useState<string | null>(null);
+  const [segs, setSegs] = useState<InterpSeg[]>(() => loadSegs());
+  const [partial, setPartial] = useState("");
+  const [text, setText] = useState("");
+  const [status, setStatus] = useState("");
+
   const sidRef = useRef<string | null>(null);
-  const setSession = (id: string | null) => {
-    setSid(id);
-    sidRef.current = id;
-  };
+  const runningRef = useRef(false);
+  const pausedRef = useRef(false);
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+  const autospeakRef = useRef(prefs.autospeak);
+  autospeakRef.current = prefs.autospeak;
+  const onlineRef = useRef(online);
+  onlineRef.current = online;
+
+  // Live-capture plumbing (kept in refs so event callbacks stay stable).
   const ctxRef = useRef<AudioContext | null>(null);
   const srcRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const procRef = useRef<ScriptProcessorNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  useEffect(() => {
-    if (!online) return;
-    const unsubs: (() => void)[] = [];
-    (async () => {
-      unsubs.push(
-        await subscribe("interpret-output", (p) => {
-          setLines((ls) => onInterpOutput({ lines: ls }, p).lines);
-          // Real-time read-aloud: only final segments are spoken (mock/real Piper).
-          void onInterpFinal(p);
-        }),
-      );
-    })();
-    return () => unsubs.forEach((f) => f());
-  }, [online]);
+  const langLabel = (code: string): string =>
+    code === "auto" ? t("interp.auto") : langNative(code) || code;
+  const setPref = (patch: Partial<InterpPrefs>) => setPrefs((p) => ({ ...p, ...patch }));
 
-  const speak = () => {
-    const last = lines[lines.length - 1];
-    if (!last?.target) return;
-    // Speak via the Rust TTS backend (real local Piper when configured), not the
-    // browser's built-in voice.
-    void speakText(last.target, "zh");
+  // Remember the language pair + auto-speak so reopening feels continuous.
+  useEffect(() => {
+    writePrefs(prefs);
+  }, [prefs]);
+
+  const stopMicRef = useRef<() => Promise<void>>(async () => {});
+  const stopMic = async (): Promise<void> => {
+    try {
+      procRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      srcRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await ctxRef.current?.close();
+    } catch {
+      /* ignore */
+    }
+    streamRef.current?.getTracks().forEach((tr) => tr.stop());
+    streamRef.current = null;
+    procRef.current = null;
+    srcRef.current = null;
+    ctxRef.current = null;
+    setRec(false);
   };
+  stopMicRef.current = stopMic;
+
   const startCapture = async (): Promise<void> => {
     const media = navigator.mediaDevices;
     if (!media?.getUserMedia) return;
@@ -126,7 +168,7 @@ export function InterpApp() {
       window.AudioContext ??
       (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!Ctx) {
-      stream.getTracks().forEach((t) => t.stop());
+      stream.getTracks().forEach((tr) => tr.stop());
       return;
     }
     const ctx = new Ctx();
@@ -145,74 +187,296 @@ export function InterpApp() {
     setRec(true);
   };
 
-  const stopCapture = async (): Promise<void> => {
-    const id = sidRef.current;
-    if (id) await interpretStop(id);
-    setSession(null);
-    try {
-      procRef.current?.disconnect();
-    } catch {
-      /* ignore */
-    }
-    try {
-      srcRef.current?.disconnect();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await ctxRef.current?.close();
-    } catch {
-      /* ignore */
-    }
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    setRec(false);
+  const resetRunning = () => {
+    runningRef.current = false;
+    pausedRef.current = false;
+    setRunning(false);
+    setPaused(false);
   };
 
-  const toggleMic = async () => {
-    if (rec) {
-      await stopCapture();
+  // Stream live interpret-output events -> partials + final transcript + auto-speak.
+  useEffect(() => {
+    if (!online) return;
+    let alive = true;
+    const unsubs: (() => void)[] = [];
+    (async () => {
+      unsubs.push(
+        await subscribe("interpret-output", (payload) => {
+          if (!alive) return;
+          const kind = (payload as { kind?: string } | null)?.kind;
+          if (kind === "partial") {
+            setPartial(partialTextOf(payload));
+          } else if (kind === "segment_final") {
+            const seg = segOf(payload);
+            if (seg) {
+              setSegs((prev) => {
+                const next = [...prev, seg];
+                saveSegs(next);
+                return next;
+              });
+              if (autospeakRef.current && onlineRef.current && seg.target) {
+                void speakText(seg.target, seg.targetLang || "zh");
+              }
+            }
+            setPartial("");
+          } else if (kind === "utterance_recognized") {
+            const u = payload as { text?: unknown };
+            if (u && typeof u.text === "string") setPartial(u.text);
+          } else if (kind === "session_ended") {
+            resetRunning();
+            void stopMicRef.current();
+            setPartial("");
+            setStatus(t("interp.ended"));
+          } else if (kind === "error") {
+            setStatus("⚠ " + errorOf(payload));
+          }
+        }),
+      );
+    })();
+    return () => {
+      alive = false;
+      unsubs.forEach((f) => f());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [online]);
+
+  const beginSession = async (): Promise<void> => {
+    if (!onlineRef.current) return;
+    const id = await interpretStart({
+      source: prefsRef.current.source,
+      target: prefsRef.current.target,
+    });
+    if (id == null) return;
+    sidRef.current = id;
+    runningRef.current = true;
+    pausedRef.current = false;
+    setRunning(true);
+    setPaused(false);
+    setStatus(`${langLabel(prefsRef.current.source)} → ${langLabel(prefsRef.current.target)}`);
+  };
+
+  const endSession = async (): Promise<void> => {
+    const id = sidRef.current;
+    sidRef.current = null;
+    if (id && onlineRef.current) await interpretStop(id);
+    await stopMicRef.current();
+    resetRunning();
+    setStatus("");
+  };
+
+  const togglePause = async (): Promise<void> => {
+    const id = sidRef.current;
+    if (!id) return;
+    if (pausedRef.current) {
+      await interpretResume(id);
+      pausedRef.current = false;
+      setPaused(false);
+    } else {
+      await interpretPause(id);
+      pausedRef.current = true;
+      setPaused(true);
+    }
+  };
+
+  const toggleMic = async (): Promise<void> => {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setStatus(t("camera.noCamera"));
       return;
     }
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) return;
-    if (online) {
-      const s = await interpretStart({ source: "auto", target: "zh" });
-      if (!s) return;
-      setSession(s);
+    if (rec) {
+      await stopMicRef.current();
+      return;
     }
-    await startCapture();
+    if (!runningRef.current) await beginSession();
+    if (runningRef.current) await startCapture();
+  };
+
+  const send = async (): Promise<void> => {
+    const v = text.trim();
+    if (!v) return;
+    setText("");
+    if (!runningRef.current) {
+      if (!onlineRef.current) return;
+      await beginSession();
+    }
+    const id = sidRef.current;
+    if (id && onlineRef.current) await interpretText(id, v);
+  };
+
+  const speakLast = (seg: InterpSeg) => {
+    if (seg.target) void speakText(seg.target, seg.targetLang || "zh");
+  };
+
+  const copyTarget = (seg: InterpSeg) => {
+    try {
+      void navigator.clipboard?.writeText(seg.target);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const clearHistory = () => {
+    setSegs([]);
+    clearSegs();
   };
 
   return (
     <div className="flex h-full flex-col p-3">
-      <div className="flex flex-wrap items-center gap-2 text-sm">
-        <span className="text-3xl">🌐</span>
-        <span>{t("backend.source")}</span>
-        <span className="opacity-50">→</span>
-        <span>{t("backend.target")}</span>
-        <button
-          onClick={toggleMic}
-          className={"rounded-full px-3 py-1 text-xs " + (rec ? "bg-danger text-white" : "bg-neutral-300 dark:bg-neutral-700")}
+      {!online && <p className="mb-2 text-sm opacity-70">{t("backend.offline")}</p>}
+
+      {/* language pair (remembered) */}
+      <div className="flex items-center gap-2 text-sm">
+        <span className="opacity-60">{t("interp.source")}</span>
+        <select
+          aria-label={t("interp.source")}
+          value={prefs.source}
+          onChange={(e) => setPref({ source: e.target.value })}
+          className="flex-1 rounded-full bg-neutral-200 px-2 py-1 text-sm outline-none dark:bg-neutral-800"
         >
-          {rec ? "●" : "🎤"}
-        </button>
-        <button onClick={speak} className="rounded-full bg-neutral-300 px-3 py-1 text-xs dark:bg-neutral-700">
-          🔊
+          {LANGS.map((l) => (
+            <option key={l.code} value={l.code}>
+              {l.code === "auto" ? t("interp.auto") : l.native}
+            </option>
+          ))}
+        </select>
+        <span className="opacity-50">→</span>
+        <select
+          aria-label={t("interp.target")}
+          value={prefs.target}
+          onChange={(e) => setPref({ target: e.target.value })}
+          className="flex-1 rounded-full bg-neutral-200 px-2 py-1 text-sm outline-none dark:bg-neutral-800"
+        >
+          {LANGS.filter((l) => l.code !== "auto").map((l) => (
+            <option key={l.code} value={l.code}>
+              {l.native}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* session controls */}
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+        <span className="text-3xl">🌐</span>
+        {running ? (
+          <>
+            <button
+              onClick={() => void endSession()}
+              className="rounded-full bg-danger px-3 py-1 text-xs text-white"
+            >
+              {t("interp.stop")}
+            </button>
+            <button
+              onClick={() => void togglePause()}
+              className="rounded-full bg-neutral-300 px-3 py-1 text-xs dark:bg-neutral-700"
+            >
+              {paused ? t("interp.resume") : t("interp.pause")}
+            </button>
+            <button
+              onClick={() => void toggleMic()}
+              title="mic"
+              className={
+                "rounded-full px-3 py-1 text-xs " +
+                (rec ? "bg-accent text-white" : "bg-neutral-300 dark:bg-neutral-700")
+              }
+            >
+              {rec ? "●" : "🎤"}
+            </button>
+          </>
+        ) : (
+          <button
+            onClick={() => void beginSession()}
+            className="rounded-full bg-accent px-3 py-1 text-xs text-white"
+          >
+            {t("interp.start")}
+          </button>
+        )}
+        {status && <span className="truncate text-xs opacity-60">{status}</span>}
+      </div>
+
+      {/* auto-speak read-aloud toggle */}
+      <label className="mt-1 flex items-center gap-2 text-xs opacity-80">
+        <input
+          type="checkbox"
+          checked={prefs.autospeak}
+          onChange={(e) => setPref({ autospeak: e.target.checked })}
+        />
+        {t("interp.autospeak")}
+      </label>
+
+      {/* transcript header + clear */}
+      <div className="mt-2 flex items-center justify-between text-xs opacity-60">
+        <span>{t("interp.transcript")}</span>
+        <button
+          onClick={clearHistory}
+          className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+        >
+          {t("interp.clear")}
         </button>
       </div>
-      {!online && <p className="mt-1 text-sm opacity-70">{t("backend.offline")}</p>}
-      <div role="log" aria-live="polite" className="mt-2 flex-1 space-y-2 overflow-auto">
-        {lines.length === 0 ? (
-          <p className="py-10 text-center text-sm opacity-50">—</p>
+
+      <div
+        role="log"
+        aria-live="polite"
+        className="mt-1 min-h-[80px] flex-1 space-y-2 overflow-auto rounded-2xl bg-neutral-200/40 p-2 text-sm dark:bg-neutral-800/40"
+      >
+        {segs.length === 0 && !partial ? (
+          <p className="py-8 text-center text-xs opacity-40">
+            {running ? t("interp.notRunning") : "—"}
+          </p>
         ) : (
-          lines.map((l, i) => (
-            <div key={i} className="rounded-2xl bg-neutral-200/50 p-2 dark:bg-neutral-800/50">
-              <div className="text-xs opacity-60">{l.src}</div>
-              <div className="text-sm font-medium text-accent">{l.target}</div>
-            </div>
-          ))
+          <>
+            {segs.map((seg, i) => (
+              <div key={i} className="rounded-xl bg-neutral-200/60 p-2 dark:bg-neutral-800/60">
+                <div className="flex items-center gap-1 text-[10px] opacity-50">
+                  <span>{seg.srcLang ? langLabel(seg.srcLang) : "源"}</span>
+                  <span className="truncate">{seg.src}</span>
+                </div>
+                <div className="text-sm font-medium text-accent">{seg.target}</div>
+                <div className="mt-1 flex gap-1">
+                  <button
+                    onClick={() => speakLast(seg)}
+                    className="rounded-full bg-neutral-300 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+                  >
+                    {t("interp.read")}
+                  </button>
+                  <button
+                    onClick={() => copyTarget(seg)}
+                    title={t("interp.copied")}
+                    className="rounded-full bg-neutral-300 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+                  >
+                    ⧉
+                  </button>
+                </div>
+              </div>
+            ))}
+            {partial && (
+              <div className="rounded-xl bg-accent/10 p-2 text-sm italic opacity-80">
+                … {partial}
+              </div>
+            )}
+          </>
         )}
+      </div>
+
+      {/* text-input translate */}
+      <div className="mt-2 flex gap-2">
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void send();
+          }}
+          placeholder={t("interp.placeholder")}
+          className="flex-1 rounded-full bg-neutral-200 px-3 py-2 text-sm outline-none dark:bg-neutral-800"
+        />
+        <button onClick={() => void send()} className="rounded-full bg-accent px-4 text-sm text-white">
+          {t("interp.send")}
+        </button>
       </div>
     </div>
   );
 }
+
+
+
 
