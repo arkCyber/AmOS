@@ -28,6 +28,9 @@ async function init() {
   // Clock.
   tickClock();
   setInterval(tickClock, 1000);
+  // Re-evaluate appearance once a minute so automatic day/night (and its
+  // linked wallpaper) flips at the boundary without any interaction.
+  setInterval(() => window.Amos.applyTheme(), 60000);
 
   // Router + first render. App windows are opened with a `#window=<id>`
   // fragment and auto-navigate to that app; the launcher renders home. Hydrate

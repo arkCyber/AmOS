@@ -532,9 +532,18 @@ window.Amos = (() => {
     brightnessOverlay.style.opacity = String((100 - val) / 100);
   }
 
+  // iOS-style "automatic appearance": a pure day/night decision by local time.
+  // Dark window ~19:00–07:00. When `autoAppearance` is off we fall back to the
+  // stored darkmode toggle (which defaults to dark).
+  function decideDark(darkmode, autoAppearance, hour) {
+    if (autoAppearance) return hour < 7 || hour >= 19;
+    return !darkmode;
+  }
   function applyTheme() {
     const s = readSettings();
-    const dark = !s.darkmode;
+    const now = new Date();
+    const hour = now.getHours() + now.getMinutes() / 60;
+    const dark = decideDark(!!s.darkmode, !!s.autoappearance, hour);
     const root = (typeof document !== "undefined" && (document.documentElement || document.body)) ? (document.documentElement || document.body) : null;
     if (root) root.setAttribute("data-theme", dark ? "dark" : "light");
     const url = resolveWallpaper(dark, s.wallpaper);
@@ -672,6 +681,7 @@ window.Amos = (() => {
     resolveWallpaper,
     wallpaperPresets: WALLPAPER_PRESETS,
     isCustomWallpaper,
+    decideDark,
     get isLocked() { return locked; },
     init(v) { viewEl = v; },
   };

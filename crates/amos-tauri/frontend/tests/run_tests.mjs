@@ -1134,6 +1134,19 @@ test('interp UI: restores saved language pair and auto-speak, persists edits', (
   app.onUnmount();
 });
 
+test('theme: automatic appearance follows local hour', () => {
+  const e = fresh();
+  const A = e.Amos;
+  assert(A.decideDark(false, false, 14) === true, 'default (no darkmode) is dark');
+  assert(A.decideDark(true, false, 14) === false, 'darkmode on => light');
+  assert(A.decideDark(false, true, 3) === true, 'auto at 03:00 => dark');
+  assert(A.decideDark(false, true, 14) === false, 'auto at 14:00 => light');
+  assert(A.decideDark(false, true, 21) === true, 'auto at 21:00 => dark');
+  assert(A.decideDark(true, true, 12) === false, 'auto overrides darkmode at noon => light');
+  assert(A.decideDark(false, true, 6.9) === true, 'auto at 06:54 still dark');
+  assert(A.decideDark(false, true, 7.1) === false, 'auto at 07:06 light');
+});
+
 test('wallpaper: resolution, presets, and custom URLs', () => {
   const e = fresh();
   const A = e.Amos;

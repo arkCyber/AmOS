@@ -44,6 +44,26 @@ window.Amos.register({
       toggle("wifi", "无线局域网", "已连接 AMOS_5G"),
       toggle("bluetooth", "蓝牙", "已开启"),
       toggle("airplane", "飞行模式"),
+      (() => {
+        // iOS-style "自动外观": switch deep/light + wallpaper by local time.
+        const auto = store.autoappearance === true;
+        const setAuto = (on) => {
+          store.autoappearance = on;
+          A.storeWrite(KEY, JSON.stringify(store));
+          A.applyTheme();
+        };
+        const onchange = (e) => { setAuto(e.target.checked); A.applyTheme(); };
+        return A.el("div", { class: "card row spread" }, [
+          A.el("div", null, [
+            A.el("div", null, "自动外观"),
+            A.el("div", { class: "muted" }, "按本地时段在深/浅间切换，壁纸随之自动换"),
+          ]),
+          A.el("label", { class: "switch" }, [
+            A.el("input", { type: "checkbox", checked: auto, onchange }),
+            A.el("span", { class: "track" }),
+          ]),
+        ]);
+      })(),
       toggle("darkmode", "深色模式"),
       (() => {
         // Wallpaper picker: built-in presets + optional custom image URL.
