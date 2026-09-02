@@ -1,9 +1,11 @@
 export interface Photo {
   id: string;
-  a: string; // gradient start
-  b: string; // gradient end
-  emoji: string;
   ts: number;
+  /** Real image data URL when captured by the camera (video frame -> canvas). */
+  data?: string;
+  a?: string; // gradient start (demo/gradient tiles only)
+  b?: string; // gradient end
+  emoji?: string; // demo/gradient tile glyph
 }
 
 export const PHOTOS_KEY = "amos.photos";
@@ -31,10 +33,26 @@ export function seedPhotos(count: number, now: number): Photo[] {
   }));
 }
 
-/** A random new photo (as a real capture or the demo fallback). */
+/** A random demo/gradient photo (fallback when no camera is available). */
 export function newPhoto(id: string, now: number): Photo {
   const i = Math.floor(Math.random() * PALETTE.length);
-  return { id, a: PALETTE[i][0], b: PALETTE[i][1], emoji: EMOJIS[Math.floor(Math.random() * EMOJIS.length)], ts: now };
+  return {
+    id,
+    a: PALETTE[i][0],
+    b: PALETTE[i][1],
+    emoji: EMOJIS[Math.floor(Math.random() * EMOJIS.length)],
+    ts: now,
+  };
+}
+
+/** A real camera capture (video frame -> JPEG data URL). */
+export function newCapturePhoto(id: string, now: number, data: string): Photo {
+  return { id, data, ts: now };
+}
+
+/** True when the photo is a real captured image (has pixel data). */
+export function isRealPhoto(p: Photo): boolean {
+  return !!p.data;
 }
 
 export function removePhoto(list: Photo[], id: string): Photo[] {

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { readStoreValue, writeStoreValue } from "../lib/amosStore";
-import { PHOTOS_KEY, newPhoto, type Photo } from "../lib/photos";
+import { PHOTOS_KEY, newPhoto, newCapturePhoto, type Photo } from "../lib/photos";
 
 export default function CameraApp() {
   const { t } = useI18n();
@@ -37,7 +37,30 @@ export default function CameraApp() {
 
   const capture = () => {
     const list = readStoreValue<Photo[]>(PHOTOS_KEY, []);
-    const photo = newPhoto(`c${Date.now()}`, Date.now());
+    const now = Date.now();
+    const video = videoRef.current;
+    let photo: Photo;
+    if (live && video && typeof document !== "undefined") {
+      // Real frame: draw the live video onto a canvas and store as a data URL.
+      try {
+        const cv = document.createElement("canvas");
+        cv.width = 640;
+        cv.height = 480;
+        const ctx = cv.getContext && cv.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, 640, 480);
+          const data = cv.toDataURL("image/jpeg", 0.8);
+          photo = newCapturePhoto(`c${now}`, now, data);
+        } else {
+          photo = newPhoto(`c${now}`, now);
+        }
+      } catch {
+        photo = newPhoto(`c${now}`, now);
+      }
+    } else {
+      // Demo path: gradient placeholder photo (also works headless).
+      photo = newPhoto(`c${now}`, now);
+    }
     writeStoreValue(PHOTOS_KEY, [photo, ...list]);
     setHint(t("camera.saved"));
   };

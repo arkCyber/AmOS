@@ -242,14 +242,21 @@ const Photos: FC = () => {
   };
   const add = () => persist([newPhoto(`p${Date.now()}`, Date.now()), ...list]);
 
+  const grad = (p: Photo): string | undefined =>
+    p.a && p.b ? `linear-gradient(135deg, ${p.a}, ${p.b})` : undefined;
+
   if (sel) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 p-4">
         <div
-          className="grid h-40 w-40 place-items-center rounded-3xl text-7xl"
-          style={{ background: `linear-gradient(135deg, ${sel.a}, ${sel.b})` }}
+          className="grid h-40 w-40 place-items-center overflow-hidden rounded-3xl text-7xl"
+          style={{ background: grad(sel) ?? "#14161d" }}
         >
-          {sel.emoji}
+          {sel.data ? (
+            <img src={sel.data} alt="" className="h-full w-full object-cover" />
+          ) : (
+            (sel.emoji ?? "")
+          )}
         </div>
         <p className="text-xs opacity-60">{fmtTime(sel.ts)}</p>
         <div className="flex gap-3">
@@ -283,11 +290,15 @@ const Photos: FC = () => {
             <button
               key={p.id}
               onClick={() => setSel(p)}
-              aria-label={p.emoji}
-              className="grid aspect-square place-items-center text-3xl"
-              style={{ background: `linear-gradient(135deg, ${p.a}, ${p.b})` }}
+              aria-label={p.emoji ?? p.id}
+              className="relative grid aspect-square place-items-center overflow-hidden text-3xl"
+              style={{ background: grad(p) ?? "#1c1c1e" }}
             >
-              {p.emoji}
+              {p.data ? (
+                <img src={p.data} alt="" className="absolute inset-0 h-full w-full object-cover" />
+              ) : (
+                (p.emoji ?? "")
+              )}
             </button>
           ))}
         </div>

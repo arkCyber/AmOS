@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { seedPhotos, removePhoto, newPhoto, PALETTE, EMOJIS } from "../lib/photos";
+import {
+  seedPhotos,
+  removePhoto,
+  newPhoto,
+  newCapturePhoto,
+  isRealPhoto,
+  PALETTE,
+  EMOJIS,
+} from "../lib/photos";
 
 describe("photos helpers", () => {
   test("seedPhotos is deterministic and cycles palette/emoji", () => {
@@ -19,6 +27,13 @@ describe("photos helpers", () => {
     expect(p.id).toBe("x");
     expect(p.ts).toBe(5000);
     expect(PALETTE.some(([a]) => a === p.a)).toBe(true);
-    expect(EMOJIS.includes(p.emoji)).toBe(true);
+    expect(p.emoji !== undefined && EMOJIS.includes(p.emoji)).toBe(true);
+  });
+
+  test("newCapturePhoto stores a real frame data URL and isRealPhoto flags it", () => {
+    const p = newCapturePhoto("c1", 123, "data:image/jpeg;base64,abc");
+    expect(p).toEqual({ id: "c1", data: "data:image/jpeg;base64,abc", ts: 123 });
+    expect(isRealPhoto(p)).toBe(true);
+    expect(isRealPhoto(newPhoto("d1", 1))).toBe(false);
   });
 });
