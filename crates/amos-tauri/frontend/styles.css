@@ -128,6 +128,28 @@ body {
     radial-gradient(120% 90% at 100% 10%, #0f5a52 0%, transparent 55%),
     linear-gradient(160deg, #2c3e8f 0%, #1b2a4a 45%, #0b1428 100%);
 }
+/* Photo wallpaper layer sits above the gradient base, behind the launcher UI. */
+#view.home::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: url("./wallpaper.png");
+  background-size: cover;
+  background-position: center;
+  opacity: 0.92;
+  pointer-events: none;
+  z-index: 0;
+}
+/* Keep a faint dark scrim over busy wallpaper areas so icon labels stay legible. */
+#view.home::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.22) 0%, rgba(0, 0, 0, 0) 28%, rgba(0, 0, 0, 0.18) 100%);
+  pointer-events: none;
+  z-index: 0;
+}
+#view.home > * { position: relative; z-index: 1; }
 #view.home .screen-page { animation: homeIn 0.35s ease both; }
 @keyframes homeIn { from { opacity: 0.2; transform: scale(0.96); } }
 
@@ -210,9 +232,13 @@ body {
   align-items: center;
   justify-content: center;
   font-size: 32px;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
-  transition: transform 0.12s ease;
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.28),
+    0 2px 4px rgba(0, 0, 0, 0.35),
+    0 8px 18px rgba(0, 0, 0, 0.5);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
+.app-icon:hover .tile { box-shadow: inset 0 1px 1px rgba(255,255,255,0.3), 0 4px 8px rgba(0,0,0,0.4), 0 14px 26px rgba(0,0,0,0.55); }
 .app-icon .label {
   font-size: 11px;
   color: #fff;
@@ -382,6 +408,21 @@ body {
     radial-gradient(140% 120% at 50% 0%, #1d2742, #0a0a0f 70%),
     linear-gradient(#0a0a0f, #11121a);
 }
+.lock-screen::before {
+  content: "";
+  position: absolute; inset: 0;
+  background-image: url("./wallpaper.png");
+  background-size: cover; background-position: center;
+  opacity: 0.5;
+  pointer-events: none;
+}
+.lock-screen::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: rgba(8, 8, 16, 0.3);
+  pointer-events: none;
+}
+.lock-screen > * { position: relative; z-index: 1; }
 .lock-clock { font-size: 76px; font-weight: 200; letter-spacing: 2px; color: #fff; text-shadow: 0 2px 14px rgba(0,0,0,0.4); }
 .lock-date { font-size: 16px; color: var(--text-dim); margin-bottom: 10px; }
 .lock-hint { font-size: 13px; color: var(--text-dim); margin: 6px 0; }
