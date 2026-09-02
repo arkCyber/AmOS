@@ -616,7 +616,9 @@ mod tests {
             .unwrap();
         let out = drain(&mut rx).await;
         assert_eq!(s.state(), SessionState::Error, "retries=0 => no retry");
-        assert!(out.iter().any(|o| matches!(o, InterpretationOutput::Error { .. })));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, InterpretationOutput::Error { .. })));
     }
 
     #[tokio::test]
