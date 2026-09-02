@@ -50,4 +50,17 @@ describe("files tree ops", () => {
     const after = deleteEntry(list, "a");
     expect(after.map((e) => e.id)).toEqual(["r"]);
   });
+
+  test("pathOf / isInside are cycle-safe on corrupted (looping) input", () => {
+    // A corrupted store where x<->y form a parent cycle (should never be produced
+    // by the app, but must not hang pathOf / isInside if it ever exists).
+    const x = mk("x", "folder", "X", "y");
+    const y = mk("y", "folder", "Y", "x");
+    const bad = [x, y];
+    const p = pathOf(bad, "x");
+    expect(p.length).toBeLessThanOrEqual(bad.length); // terminates, bounded
+    // isInside terminates and does not falsely report reaching an outside node.
+    expect(isInside(bad, "x", "zz")).toBe(false);
+    expect(isInside(bad, "y", "x")).toBe(true); // still correct on the cycle
+  });
 });

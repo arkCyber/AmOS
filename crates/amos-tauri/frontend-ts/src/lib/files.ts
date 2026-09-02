@@ -33,11 +33,14 @@ export function childrenOf(list: FEntry[], parent: string | undefined): FEntry[]
   return list.filter((e) => (e.parent || undefined) === parent);
 }
 
-/** Ancestry root → a folder (for deep-link breadcrumbs). */
+/** Ancestry root → a folder (for deep-link breadcrumbs). Cycle-safe: stops if a
+ * corrupted parent chain loops back on itself instead of hanging forever. */
 export function pathOf(list: FEntry[], id: string | undefined): FEntry[] {
   const segs: FEntry[] = [];
+  const seen = new Set<string>();
   let cur = id;
-  while (cur) {
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
     const f = list.find((e) => e.id === cur);
     if (!f) break;
     segs.unshift(f);
@@ -46,11 +49,14 @@ export function pathOf(list: FEntry[], id: string | undefined): FEntry[] {
   return segs;
 }
 
-/** Is `from` equal to / inside the subtree rooted at `outer`? (cycle guard) */
+/** Is `from` equal to / inside the subtree rooted at `outer`? (cycle guard).
+ * Cycle-safe: tolerates a corrupted parent chain without looping forever. */
 export function isInside(list: FEntry[], from: string | undefined, outer: string): boolean {
+  const seen = new Set<string>();
   let cur = from;
-  while (cur) {
+  while (cur && !seen.has(cur)) {
     if (cur === outer) return true;
+    seen.add(cur);
     const f = list.find((e) => e.id === cur);
     cur = f?.parent;
   }
