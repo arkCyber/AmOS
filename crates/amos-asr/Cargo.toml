@@ -27,6 +27,10 @@ sherpa = ["dep:sherpa-onnx"]
 name = "sherpa_asr"
 required-features = ["sherpa"]
 
+[[example]]
+name = "sherpa_session"
+required-features = ["sherpa"]
+
 [dependencies.sherpa-onnx]
 version = "1.13.7"
 optional = true

@@ -145,3 +145,33 @@ impl StreamingRecognizer for SherpaOnlineRecognizer {
         text
     }
 }
+
+/// Build a composite pipeline from a **local sherpa streaming ASR** plus an
+/// optional translation delegate (e.g. a `GrpcPipeline` to the amos-translate
+/// daemon). This is the seam a System UI / CLI would use to run real local ASR
+/// inside an `amos_int::Session` without linking the native sherpa lib into the
+/// GUI itself.
+///
+/// ```rust,no_run
+/// # use amos_asr::{sherpa_pipeline, SherpaOnlineRecognizerConfig};
+/// let cfg = SherpaOnlineRecognizerConfig {
+///     tokens: "models/sherpa-en-20m/tokens.txt".into(),
+///     encoder: "models/sherpa-en-20m/encoder-epoch-99-avg-1.int8.onnx".into(),
+///     decoder: "models/sherpa-en-20m/decoder-epoch-99-avg-1.int8.onnx".into(),
+///     joiner: "models/sherpa-en-20m/joiner-epoch-99-avg-1.int8.onnx".into(),
+///     ..Default::default()
+/// };
+/// let pipeline = sherpa_pipeline(cfg, None).unwrap();
+/// # let _ = pipeline;
+/// ```
+pub fn sherpa_pipeline(
+    cfg: SherpaOnlineRecognizerConfig,
+    translate: Option<std::sync::Arc<dyn amos_int::pipeline::Pipeline>>,
+) -> anyhow::Result<crate::pipeline::AsrPipeline<SherpaOnlineRecognizer>> {
+    let recognizer = SherpaOnlineRecognizer::new(cfg.clone())?;
+    let mut builder = crate::pipeline::AsrPipelineBuilder::new(recognizer, cfg.lang);
+    if let Some(t) = translate {
+        builder = builder.with_translate(t);
+    }
+    Ok(builder.build())
+}

@@ -29,4 +29,4 @@ pub use recognizer::{Hypothesis, MockStreamingRecognizer, StreamingRecognizer};
 #[cfg(feature = "sherpa")]
 pub mod sherpa;
 #[cfg(feature = "sherpa")]
-pub use sherpa::{SherpaOnlineRecognizer, SherpaOnlineRecognizerConfig};
+pub use sherpa::{sherpa_pipeline, SherpaOnlineRecognizer, SherpaOnlineRecognizerConfig};
