@@ -19,6 +19,12 @@ smoke:
 	bash scripts/int-cli-smoke.sh
 	cargo test -p amos-translate --test full_chain
 
+# Local-model end-to-end: Piper TTS -> sherpa streaming ASR -> daemon translate.
+# (Piper + sherpa are real; translation uses a deterministic mock daemon unless
+# AMOS_TRANSLATE_SOCKET points at a live daemon.)
+e2e-local:
+	bash scripts/e2e-local-models.sh
+
 # Compile the gated native backends (sherpa ASR / Piper TTS) + the sherpa examples
 # + the amos-tauri native bridge (sherpa-asr + piper-tts together). Requires
 # network to download prebuilt native libs — run on a networked machine.

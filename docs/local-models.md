@@ -113,6 +113,16 @@ AMOS_PIPER_MODEL_DIR=$PWD/models/piper-low \
 两个 feature 可单独或一起开启；`make gated-check` 已编译二者组合（同 binary 链接 sherpa+piper，
 macOS 会见到 espeak `duplicate symbol` 的**非致命** linker warning，退出码 0）。
 
+# 端到端本地模型冒烟（headless）
+
+`make e2e-local`（或 `scripts/e2e-local-models.sh [句子]`）真跑通
+**Piper TTS → sherpa 流式 ASR → amos-translate daemon 翻译**：
+
+- Piper + sherpa 是**真实本地模型**（离线，需先 `bash scripts/fetch-models.sh`）。
+- 翻译段默认自起**确定性 mock daemon**（无需网络）；若导出 `AMOS_TRANSLATE_SOCKET` 指向运行中的 daemon 则复用（例如接 ollama 后端）。
+
+> 注意：本机这套 ollama 对 OpenAI 兼容端点 `/v1/chat/completions` 返回 **401（需鉴权，直连 curl 亦然）**，而 `amos-translate` 的 OllamaProvider 走该端点，因此接 ollama 翻译需先给实例配好 /v1 鉴权或换用其原生 `/api` 通道。本地模型段（Piper+sherpa）不受影响。
+
 ## CI
 
 `sherpa`/`piper` 为 feature 门控后端，`make gated-check`（CI `gated-native-backends` job）
