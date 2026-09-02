@@ -16,8 +16,14 @@ export const WALLPAPER_FILES: Record<string, string> = {
 /** Built-in wallpapers (id → i18n key). */
 export const WALLPAPER_PRESETS = ["auto", "dark", "light", "landscape", "dawn", "abyss"] as const;
 
+/**
+ * A "custom wallpaper" is only accepted from safe image sources: http(s),
+ * blob, or a data:-URL of an image type. Everything else (`file:`,
+ * `javascript:`, `data:text/html`, …) is rejected so an injected value can never
+ * become a script surface or a local-file read.
+ */
 export function isCustomWallpaper(w: string): boolean {
-  return /^(https?:|data:|blob:|file:)/.test(w);
+  return /^(https?:|blob:|data:image\/)/.test(w);
 }
 
 /** Which image file to show for a theme + user choice. Returns a URL or custom src. */
