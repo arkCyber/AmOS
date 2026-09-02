@@ -1040,6 +1040,22 @@ test('headless interp UI: auto-speak synthesizes each translation', () => {
   app.onUnmount();
 });
 
+test('headless interp UI: restores a running session on mount', async () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('interpreter');
+  const node = app.render();
+  app.onMount(node);
+  // interpret_status mock reports an active session (id 42, collecting).
+  await new Promise((r) => setTimeout(r, 0)); // flush the async status()
+  const startBtn = e.document.getElementById('interp-start');
+  assert(startBtn.disabled === true, 'start is disabled when a session is running');
+  assert(
+    String(e.document.getElementById('interp-status').textContent).includes('会话运行中'),
+    'status reflects the running session'
+  );
+  app.onUnmount();
+});
+
 // ---------------------------------------------------------------------------
 await runAll();
 

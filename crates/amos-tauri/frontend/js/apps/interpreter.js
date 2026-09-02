@@ -31,6 +31,16 @@
     if (s) s.textContent = text;
   }
 
+  // Reflect whether a session is running across all control buttons.
+  function setControls(running) {
+    const st = el("interp-start"), stop = el("interp-stop"),
+      p = el("interp-pause"), m = el("interp-mic");
+    if (st) st.disabled = running;
+    if (stop) stop.disabled = !running;
+    if (p) { p.disabled = !running; p.textContent = paused ? "▶ 继续" : "⏸ 暂停"; }
+    if (m) m.disabled = !running;
+  }
+
   // ---- transcript rendering ----
   function addSegment(seg) {
     const log = el("interp-log");
@@ -100,11 +110,7 @@
       started = true;
       paused = false;
       status(`会话已启动 (${src || "auto"} → ${tgt})`);
-      el("interp-start").disabled = true;
-      el("interp-stop").disabled = false;
-      el("interp-pause").disabled = false;
-      const micBtn = el("interp-mic");
-      if (micBtn) micBtn.disabled = false;
+      setControls(true);
     } catch (e) {
       status("启动失败：" + e);
     }
@@ -117,10 +123,7 @@
     paused = false;
     sessionId = null;
     status("会话已结束");
-    const b = el("interp-start"); if (b) b.disabled = false;
-    const s = el("interp-stop"); if (s) s.disabled = true;
-    const p = el("interp-pause"); if (p) p.disabled = true;
-    const m = el("interp-mic"); if (m) m.disabled = true;
+    setControls(false);
   }
 
   async function togglePause() {
@@ -266,8 +269,20 @@
         };
       }
       const I = window.__TAURI_INTERNALS__;
-      if (!I) status("非 Tauri 环境 · 同传不可用");
-      else status("就绪 — 点击「开始」后即可说话/输入");
+      if (!I) { status("非 Tauri 环境 · 同传不可用"); return; }
+      status("就绪 — 点击「开始」后即可说话/输入");
+      // If a session is already running in the bridge (e.g. this app was
+      // reopened), restore its state so the controls reflect it.
+      window.AmosInterp.status().then((st) => {
+        if (!mounted) return;
+        if (st && st.session_id) {
+          started = true;
+          paused = st.state === "paused";
+          sessionId = st.session_id;
+          status(`会话运行中 (${st.source || "auto"} → ${st.target || "zh"}) · ${st.state}`);
+          setControls(true);
+        }
+      }).catch(() => {});
     },
     onUnmount() {
       mounted = false;

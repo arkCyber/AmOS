@@ -606,6 +606,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn translate_retries_zero_disables_retry() {
+        // With retries disabled, a single (even transient) failure errors out.
+        let cfg = SessionConfig::one_way("en", "zh").with_translate_retries(0);
+        let (mut s, mut rx) = Session::new(cfg, Box::new(FlakyPipeline::new()));
+        s.start().unwrap();
+        s.handle(SessionEvent::TextSegment("hello".into()))
+            .await
+            .unwrap();
+        let out = drain(&mut rx).await;
+        assert_eq!(s.state(), SessionState::Error, "retries=0 => no retry");
+        assert!(out.iter().any(|o| matches!(o, InterpretationOutput::Error { .. })));
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_an_error_session() {
+        // Fail once (retries disabled) -> Error; restart makes it usable again
+        // (the flaky pipeline's single failure is now consumed).
+        let cfg = SessionConfig::one_way("en", "zh").with_translate_retries(0);
+        let (mut s, mut rx) = Session::new(cfg, Box::new(FlakyPipeline::new()));
+        s.start().unwrap();
+        s.handle(SessionEvent::TextSegment("boom".into()))
+            .await
+            .unwrap();
+        assert_eq!(s.state(), SessionState::Error);
+        drain(&mut rx).await; // consume the error output
+
+        s.restart().unwrap();
+        assert_eq!(s.state(), SessionState::Collecting);
+        s.handle(SessionEvent::TextSegment("ok".into()))
+            .await
+            .unwrap();
+        let out = drain(&mut rx).await;
+        let seg = out
+            .iter()
+            .find_map(|o| match o {
+                InterpretationOutput::SegmentFinal(x) => Some(x.clone()),
+                _ => None,
+            })
+            .expect("segment produced after restart from error");
+        assert_eq!(seg.target_text, "[en] ok");
+    }
+
+    #[tokio::test]
     async fn translate_failure_puts_session_in_error() {
         let cfg = SessionConfig::one_way("en", "zh");
         let (mut s, mut rx) = Session::new(cfg, Box::new(FailTranslatePipeline));
