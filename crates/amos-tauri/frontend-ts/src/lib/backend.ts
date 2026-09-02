@@ -163,3 +163,33 @@ export async function launchAndroidApp(packageName: string): Promise<AndroidLaun
 export async function getAndroidAppIcon(packageName: string): Promise<number[] | null> {
   return invoke<number[]>("get_android_app_icon", { packageName });
 }
+
+/* ---- Voice / ASR (translate daemon: transcribe_audio / translate_text) ---- */
+export interface TranscriptionResult {
+  text: string;
+  recognized: boolean;
+}
+
+/** Transcribe captured audio via the translate daemon's ASR (`Transcribe` RPC). */
+export async function transcribeAudio(
+  audio: ArrayLike<number>,
+  opts: { language?: string; format?: string } = {},
+): Promise<TranscriptionResult | null> {
+  return invoke<TranscriptionResult>("transcribe_audio", {
+    audio: Array.from(audio),
+    language: opts.language ?? "",
+    format: opts.format ?? "wav",
+  });
+}
+
+/** Translate text via the translate daemon's unary `Translate` RPC. */
+export async function translateText(
+  text: string,
+  opts: { sourceLang?: string; targetLang?: string } = {},
+): Promise<string | null> {
+  return invoke<string>("translate_text", {
+    text,
+    sourceLang: opts.sourceLang ?? "",
+    targetLang: opts.targetLang ?? "",
+  });
+}

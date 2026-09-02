@@ -16,6 +16,7 @@ import {
 } from "../lib/backend";
 import { frameToChunk } from "../lib/audio";
 import { speakText } from "../lib/realtimeTts";
+import VoiceMicButton from "./VoiceMicButton";
 import { cardOf, sessionMetaOf, tokenOf, type AiCard } from "../lib/stream";
 import {
   clearSegs,
@@ -244,6 +245,13 @@ export function AiApp() {
             {t("ai.stop")}
           </button>
         )}
+        <VoiceMicButton
+          online={online}
+          disabled={busy}
+          onTranscript={(tx) => {
+            if (tx) setQ(tx);
+          }}
+        />
         <textarea
           value={q}
           onChange={(e) => setQ(e.target.value)}
