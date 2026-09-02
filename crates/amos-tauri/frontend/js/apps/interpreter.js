@@ -13,6 +13,7 @@
   let recording = false;
   let livePartial = null; // element showing the current partial
   let prevOnOutput = null;
+  let meterEl = null; // the recording level-meter element (direct ref, no getElementById)
 
   const LANGS = [
     ["auto", "自动检测"],
@@ -23,6 +24,11 @@
     ["fr", "Français"],
     ["es", "Español"],
   ];
+
+  function langLabel(v) {
+    const f = LANGS.find((x) => x[0] === v);
+    return f ? f[1] : (v || "");
+  }
 
   function el(id) { return document.getElementById(id); }
 
@@ -46,16 +52,43 @@
     const log = el("interp-log");
     if (!log) return;
     if (livePartial) { if (livePartial.remove) livePartial.remove(); livePartial = null; }
-    const row = A.el("div", { class: "interp-seg", style: { marginBottom: "10px" } }, [
-      A.el("div", { style: { color: "#ddd", fontSize: "14px" } }, seg.source_text),
-      A.el("div", { style: { color: "#6aa9ff", fontSize: "15px", marginTop: "2px" } }, seg.target_text),
-      A.el("button", {
-        class: "btn secondary", style: { marginTop: "6px", padding: "2px 10px", fontSize: "12px" },
-        onclick: () => speak(seg.target_text, seg.target_lang),
-      }, "🔊 朗读"),
-    ]);
+    const src = A.el("div", {
+      class: "interp-src",
+      "data-lang": langLabel(seg.source_lang || "源"),
+    }, seg.source_text);
+    const tgt = A.el("div", {
+      class: "interp-tgt",
+      "data-lang": langLabel(seg.target_lang || "译"),
+    }, seg.target_text);
+    const speakBtn = A.el("button", {
+      class: "btn secondary interp-act",
+      onclick: () => speak(seg.target_text, seg.target_lang),
+    }, "🔊 朗读");
+    const copyBtn = A.el("button", {
+      class: "btn secondary interp-act",
+      onclick: () => copyText(seg.target_text),
+    }, "📋 复制");
+    const row = A.el("div", { class: "interp-seg" }, [src, tgt, speakBtn, copyBtn]);
     log.appendChild(row);
     log.scrollTop = log.scrollHeight;
+  }
+
+  function copyText(text) {
+    if (!text) return;
+    const nav = (typeof navigator !== "undefined") ? navigator : null;
+    const done = () => status("已复制译文到剪贴板");
+    if (nav && nav.clipboard && nav.clipboard.writeText) {
+      nav.clipboard.writeText(text).then(done).catch(() => status("复制失败"));
+    } else {
+      status("当前环境不支持剪贴板");
+    }
+  }
+
+  function clearLog() {
+    const log = el("interp-log");
+    if (!log) return;
+    log.innerHTML = "";
+    livePartial = null;
   }
 
   function showPartial(text) {
@@ -69,6 +102,24 @@
     }
     livePartial.textContent = "… " + text;
     log.scrollTop = log.scrollHeight;
+  }
+
+  // Lighting the level meter (0..1) while the mic is live.
+  function setMeter(level) {
+    if (!meterEl) return;
+    const bars = (meterEl.children) ? Array.from(meterEl.children) : [];
+    if (!bars.length) return;
+    const on = Math.max(0, Math.min(bars.length, Math.round((level || 0) * bars.length)));
+    bars.forEach((b, i) => b.classList && b.classList.toggle("on", i < on));
+  }
+
+  // Reflect the recording state across the mic button + level meter.
+  function setRecUi(on) {
+    const b = el("interp-mic");
+    if (b) b.textContent = on ? "⏹ 停止录音" : "🎤 说话";
+    if (b && b.classList) b.classList.toggle("rec", on);
+    if (meterEl) meterEl.style.display = on ? "flex" : "none";
+    if (!on) setMeter(0);
   }
 
   // ---- TTS playback ----
@@ -158,6 +209,10 @@
 
     node.onaudioprocess = (ev) => {
       const data = ev.inputBuffer.getChannelData(0);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+      const rms = data.length ? Math.sqrt(sum / data.length) : 0;
+      setMeter(Math.min(1, rms * 4));
       const ratio = ctx.sampleRate / targetRate;
       const out = new Float32Array(Math.floor(data.length / ratio));
       for (let i = 0; i < out.length; i++) out[i] = data[Math.floor(i * ratio)];
@@ -183,8 +238,7 @@
       mic = { ctx, src, node, stream };
       recording = true;
       status("🎤 正在录音… 松开结束");
-      const b = el("interp-mic");
-      if (b) b.textContent = "⏹ 停止录音";
+      setRecUi(true);
     }).catch((e) => { status("麦克风不可用：" + e); });
   }
 
@@ -196,8 +250,7 @@
     mic = null;
     recording = false;
     if (started && sessionId != null) window.AmosInterp.endOfSpeech().catch(() => {});
-    const b = el("interp-mic");
-    if (b) b.textContent = "🎤 说话";
+    setRecUi(false);
     return true;
   }
 
@@ -238,15 +291,26 @@
         A.el("input", { id: "interp-autospeak", type: "checkbox" }),
         "🔊 自动朗读译文",
       ]);
+
+      // Recording level meter (lit by setMeter while the mic is live).
+      const meter = A.el("div", { id: "interp-meter", class: "interp-meter", style: { display: "none" } });
+      for (let i = 0; i < 10; i++) meter.appendChild(A.el("span", { class: "meter-bar" }));
+      meterEl = meter; // direct ref so setMeter/setRecUi work without getElementById
+
+      const clearBtn = A.el("button", { id: "interp-clear", class: "btn secondary", onclick: () => clearLog() }, "🗑 清空");
       const inputRow = A.el("div", { class: "row", style: { marginTop: "8px" } }, [input, sendBtn]);
 
       const body = A.el("div", {
         style: { display: "flex", flexDirection: "column", height: "100%", minHeight: "0" },
       }, [
-        A.el("div", { class: "row spread", style: { marginBottom: "6px" } }, [statusEl]),
+        A.el("div", { class: "interp-head row spread", style: { marginBottom: "8px" } }, [statusEl]),
         langs,
         controls,
-        autoSpeak,
+        A.el("div", { class: "row", style: { gap: "10px", alignItems: "center", marginTop: "4px" } }, [meter, autoSpeak]),
+        A.el("div", { class: "row spread", style: { marginTop: "8px", marginBottom: "2px" } }, [
+          A.el("span", { class: "muted", style: { fontSize: "11px" } }, "译文记录"),
+          clearBtn,
+        ]),
         log,
         inputRow,
       ]);
@@ -264,7 +328,7 @@
             addSegment(payload);
             if (autoSpeakEnabled()) speak(payload.target_text, payload.target_lang);
           }
-          else if (payload && payload.kind === "session_ended") status("会话已结束");
+          else if (payload && payload.kind === "session_ended") { status("会话已结束"); setControls(false); setRecUi(false); }
           else if (payload && payload.kind === "error") status("错误：" + payload.message);
         };
       }

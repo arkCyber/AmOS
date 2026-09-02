@@ -446,3 +446,42 @@ body {
 }
 
 
+
+/* ---------- 同传 (simultaneous interpretation) app ---------- */
+.interp-head { align-items: center; }
+.interp-head #interp-status {
+  font-size: 12px; padding: 4px 10px; border-radius: 20px;
+  background: rgba(255, 255, 255, 0.07); color: #d6d6de;
+}
+[data-theme="light"] .interp-head #interp-status { background: rgba(0, 0, 0, 0.06); color: #333; }
+
+.interp-seg {
+  margin-bottom: 10px; padding: 8px 10px; border-radius: 12px;
+  background: rgba(255, 255, 255, 0.045); border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.interp-src { color: #cfcfd6; font-size: 14px; }
+.interp-src::before, .interp-tgt::before {
+  content: attr(data-lang);
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  color: #9a9aa2; background: rgba(255, 255, 255, 0.09);
+  border-radius: 6px; padding: 1px 6px; margin-right: 6px; vertical-align: 1px;
+}
+.interp-tgt { color: #6aa9ff; font-size: 15px; margin-top: 3px; font-weight: 600; }
+.interp-tgt::before { color: #a5c8ff; background: rgba(106, 169, 255, 0.16); }
+.interp-act { display: inline-block; padding: 2px 10px; font-size: 12px; margin: 6px 6px 0 0; }
+.interp-partial { color: #aaa; font-style: italic; margin-bottom: 4px; }
+
+/* Recording level meter */
+.interp-meter { display: flex; align-items: flex-end; gap: 3px; height: 14px; }
+.meter-bar { width: 4px; height: 100%; border-radius: 2px; background: rgba(255, 255, 255, 0.14); transition: background 0.08s; }
+.meter-bar.on { background: var(--accent, #0a84ff); }
+.meter-bar.on:last-child { background: #ff453a; }
+#interp-mic.rec { background: #ff453a; color: #fff; animation: interpPulse 1s infinite; }
+@keyframes interpPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+[data-theme="light"] .interp-src { color: #555; }
+[data-theme="light"] .interp-tgt { color: #0a5bd0; }
+[data-theme="light"] .interp-seg { background: rgba(0, 0, 0, 0.05); border-color: rgba(0, 0, 0, 0.06); }
+[data-theme="light"] .interp-src::before, [data-theme="light"] .interp-tgt::before { background: rgba(0, 0, 0, 0.08); color: #666; }
+[data-theme="light"] .interp-partial { color: #888; }
+

@@ -1080,6 +1080,34 @@ test('headless interp UI: restores a running session on mount', async () => {
   app.onUnmount();
 });
 
+test('interp UI: level meter, copy button, and clear controls', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('interpreter');
+  const node = app.render();
+  app.onMount();
+  const meter = findEl(node, 'interp-meter');
+  assert(meter && meter.children.length === 10, 'recording level meter renders 10 bars');
+
+  const AI = e.sandbox.window.AmosInterp;
+  AI.onOutput({ kind: 'segment_final', source_text: 'hello', target_text: '你好', target_lang: 'zh', session_id: 1 });
+  const log = e.document.getElementById('interp-log');
+  const seg = log.children[log.children.length - 1];
+  assert(seg.children[0].textContent === 'hello', 'source is segment child [0]');
+  assert(seg.children[1].textContent === '你好', 'translation is segment child [1]');
+  assert(seg.children[2] && seg.children[2].tagName === 'button' && seg.children[2].textContent.includes('朗读'),
+    'speak button stays at segment child [2]');
+  assert(seg.children[3] && seg.children[3].tagName === 'button' && seg.children[3].textContent.includes('复制'),
+    'copy button added at segment child [3]');
+
+  seg.children[3].dispatch('click', {}); // must not throw when clipboard is unavailable
+
+  const clearBtn = findEl(node, 'interp-clear');
+  assert(clearBtn, 'clear button present');
+  clearBtn.dispatch('click', {});
+  assert(log.children.length === 0, 'clear empties the transcript');
+  app.onUnmount();
+});
+
 // ---------------------------------------------------------------------------
 await runAll();
 
