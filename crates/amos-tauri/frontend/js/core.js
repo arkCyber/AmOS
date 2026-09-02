@@ -460,6 +460,12 @@ window.Amos = (() => {
 
   function hideLock() {
     if (!locked) return;
+    landHome();
+  }
+
+  // Go straight to the home launcher unlocked (used to skip past the lock /
+  // onboarding wall so a demo lands on a usable home screen).
+  function landHome() {
     locked = false;
     if (lockTimer) { clearInterval(lockTimer); lockTimer = null; }
     renderHome();
@@ -530,7 +536,10 @@ window.Amos = (() => {
       wrap.appendChild(el("div", { class: "onb-title" }, "欢迎使用 Amos OS"));
       wrap.appendChild(el("div", { class: "muted", style: { maxWidth: "320px", textAlign: "center" } },
         "AI 优先的移动操作系统。上滑解锁、上滑切换应用、长按整理主屏。"));
-      wrap.appendChild(el("button", { class: "btn onb-next", onclick: () => { onbPage = 1; renderOnboarding(); } }, "开始"));
+      wrap.appendChild(el("div", { class: "onb-row" }, [
+        el("button", { class: "btn onb-next", onclick: () => { onbPage = 1; renderOnboarding(); } }, "开始"),
+        el("button", { class: "btn secondary onb-skip", onclick: () => skipOnboarding() }, "跳过 → 主屏"),
+      ]));
     } else {
       const dark = !!readSettings().darkmode;
       const pin = el("input", {
@@ -548,7 +557,7 @@ window.Amos = (() => {
       ]));
       wrap.appendChild(pin);
       wrap.appendChild(el("button", { class: "btn onb-next", onclick: () => {
-        const v = pin.value.trim();
+        const v = String(pin.value || "").trim();
         if (v) { const l = readLockConfig(); l.enabled = true; l.pin = v; storeWrite("amos.lock", JSON.stringify(l)); }
         finishOnboarding();
       } }, "完成"));
@@ -560,10 +569,21 @@ window.Amos = (() => {
 
   function showOnboarding() { onbPage = 0; renderOnboarding(); }
 
+  // Finish the guided flow. With no lock PIN the user lands straight on the home
+  // launcher (no lock-screen wall); with a PIN we go to the lock screen to match.
   function finishOnboarding() {
     storeWrite("amos.onboarded", "1");
     onbPage = 0;
-    showLock();
+    const cfg = readLockConfig();
+    if (cfg.enabled && cfg.pin) showLock();
+    else landHome();
+  }
+
+  // Skip onboarding entirely (no PIN): mark done and go straight to home.
+  function skipOnboarding() {
+    storeWrite("amos.onboarded", "1");
+    onbPage = 0;
+    landHome();
   }
 
   // ---- Public API ----
@@ -597,6 +617,7 @@ window.Amos = (() => {
     applyTheme,
     showOnboarding,
     finishOnboarding,
+    skipOnboarding,
     get isLocked() { return locked; },
     init(v) { viewEl = v; },
   };

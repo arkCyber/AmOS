@@ -745,6 +745,30 @@ test('onboarding: first-run flow persists and locks the device', () => {
   assert(A.isLocked === true, 'device locked after onboarding');
 });
 
+test('onboarding: skip jumps straight to an unlocked home screen', () => {
+  const e = fresh();
+  const A = e.Amos;
+  A.showOnboarding();
+  const screen = e.view.children[0];
+  const skip = walkClass(screen, 'onb-skip')[0];
+  assert(skip, 'skip button present on welcome page');
+  skip.dispatch('click', {});
+  assert(e.localStorage.getItem('amos.onboarded') === '1', 'onboarding marked done on skip');
+  assert(A.isLocked === false, 'not locked after skip');
+  assert(e.view.children[0].className === 'home-scroll', 'home rendered after skip');
+});
+
+test('onboarding: finishing with no PIN lands on the unlocked home screen', () => {
+  const e = fresh();
+  const A = e.Amos;
+  A.showOnboarding();
+  walkClass(e.view.children[0], 'onb-next')[0].dispatch('click', {}); // → quick settings
+  walkClass(e.view.children[0], 'onb-next')[0].dispatch('click', {}); // 完成, no PIN
+  assert(e.localStorage.getItem('amos.onboarded') === '1', 'onboarding completed');
+  assert(A.isLocked === false, 'unlocked with no PIN set');
+  assert(e.view.children[0].className === 'home-scroll', 'home rendered after finish');
+});
+
 test('photos: gallery seeds and 拍照 adds a stored photo', () => {
   const e = fresh();
   const app = e.Amos.apps.get('photos');
