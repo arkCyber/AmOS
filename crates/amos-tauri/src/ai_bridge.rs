@@ -24,6 +24,54 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
+/// Wrap an outbound RPC payload in a `Request` carrying the caller identity, so
+/// the daemon's security layer can apply per-client rate limits and attribute
+/// each audit entry to this System UI client.
+fn with_client_id<T>(payload: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(payload);
+    req.metadata_mut().insert(
+        amos_proto::CLIENT_ID_HEADER,
+        amos_proto::DEFAULT_CLIENT_ID
+            .parse()
+            .expect("static header value"),
+    );
+    req
+}
+
+/// Serializable mirror of a proto `UiCard` so the frontend can receive it as an
+/// event payload (prost structs are not `Serialize`).
+#[derive(Clone, Serialize)]
+struct CardPayload {
+    kind: String,
+    title: String,
+    subtitle: String,
+    fields: Vec<FieldPayload>,
+    actions: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct FieldPayload {
+    key: String,
+    value: String,
+}
+
+fn card_payload(card: amos_proto::ai_agent::UiCard) -> CardPayload {
+    CardPayload {
+        kind: card.kind,
+        title: card.title,
+        subtitle: card.subtitle,
+        fields: card
+            .fields
+            .into_iter()
+            .map(|f| FieldPayload {
+                key: f.key,
+                value: f.value,
+            })
+            .collect(),
+        actions: card.actions,
+    }
+}
+
 /// App-managed state holding a cached gRPC channel. Reusing the channel avoids
 /// re-handshaking per call; on an RPC failure the cache is invalidated and the
 /// next call reconnects, so daemon restarts are handled gracefully.
@@ -117,7 +165,7 @@ pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, String> {
     let mut attempt = 0;
     loop {
         let mut client = bridge.connect().await?;
-        match client.get_status(StatusRequest {}).await {
+        match client.get_status(with_client_id(StatusRequest {})).await {
             Ok(reply) => {
                 let r = reply.into_inner();
                 return Ok(DaemonStatus {
@@ -173,7 +221,7 @@ pub async fn ask_ai_agent(
     let mut attempt = 0;
     let mut stream = loop {
         let mut client = state.connect().await?;
-        match client.stream_chat(request.clone()).await {
+        match client.stream_chat(with_client_id(request.clone())).await {
             Ok(s) => break s.into_inner(),
             Err(e) => {
                 attempt += 1;
@@ -193,6 +241,11 @@ pub async fn ask_ai_agent(
             if !chunk.token.is_empty() {
                 full.push_str(&chunk.token);
                 let _ = app.emit("ai-token-received", chunk.token);
+            }
+            if let Some(card) = chunk.card {
+                if !card.kind.is_empty() {
+                    let _ = app.emit("ai-card-received", card_payload(card));
+                }
             }
             if chunk.done {
                 let _ = app.emit("ai-session-complete", (sid, full));
@@ -243,7 +296,7 @@ pub async fn chat_agent(
 
     let mut client = state.connect().await?;
     let mut stream = client
-        .chat(request_stream)
+        .chat(with_client_id(request_stream))
         .await
         .map_err(|e| e.to_string())?
         .into_inner();
@@ -268,6 +321,11 @@ pub async fn chat_agent(
             if !chunk.token.is_empty() {
                 full.push_str(&chunk.token);
                 let _ = app.emit("ai-token-received", chunk.token);
+            }
+            if let Some(card) = chunk.card {
+                if !card.kind.is_empty() {
+                    let _ = app.emit("ai-card-received", card_payload(card));
+                }
             }
             if chunk.done {
                 let _ = app.emit("ai-session-complete", (sid.clone(), full.clone()));

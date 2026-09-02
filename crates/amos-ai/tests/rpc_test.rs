@@ -88,3 +88,53 @@ async fn stream_chat_delivers_tokens_then_done() {
     server.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_chat_semantic_intent_returns_ui_card() {
+    let path: PathBuf = std::env::temp_dir().join(format!("amos-card-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    wait_for_socket(&path).await;
+
+    let mut client = connect(&path).await.expect("connect");
+
+    // "查一下钱包余额" maps to a wallet intent → structured UiCard on the done frame.
+    let mut stream = client
+        .stream_chat(AgentRequest {
+            session_id: "card-session".into(),
+            prompt: "查一下钱包余额".into(),
+            context: Default::default(),
+        })
+        .await
+        .expect("stream_chat")
+        .into_inner();
+
+    let mut got_card = None;
+    while let Ok(Some(chunk)) = stream.message().await {
+        if let Some(card) = chunk.card {
+            if !card.kind.is_empty() {
+                got_card = Some(card);
+            }
+        }
+        if chunk.done {
+            break;
+        }
+    }
+
+    let card = got_card.expect("stream_chat should attach a UiCard to the done frame");
+    assert_eq!(
+        card.kind, "wallet",
+        "wallet intent should yield a wallet card"
+    );
+    assert!(
+        card.actions.iter().any(|a| a.contains("设置")),
+        "wallet card offers an action"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}

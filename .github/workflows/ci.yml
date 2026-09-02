@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+# Shared Rust toolchain + caches. Each job installs only what it needs (Tauri
+# Linux deps only where amos-tauri is compiled; protoc only where amos-proto
+# (tonic) is built).
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
@@ -26,8 +29,56 @@ jobs:
       - name: Setup bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Lint (fmt + clippy -D warnings)
         run: make lint
 
       - name: Test (Rust workspace + frontend JS)
         run: make test
+
+  # Headless end-to-end gates: start a mock daemon and drive the real chain
+  # (text CLI smoke + audio->ASR->translate->TTS full chain). No Tauri needed.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc (for tonic-prost-build)
+        uses: arduino/setup-protoc@v3
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Smoke (int-cli + full_chain)
+        run: make smoke
+
+  # Native gated backends — sherpa-onnx ASR (`amos-asr`) and Piper TTS
+  # (`amos-tts`). These download prebuilt native libs, so this runs on GitHub's
+  # *networked* runners. `continue-on-error` keeps it non-blocking until the
+  # sherpa-onnx 1.13.7 / piper-rs 0.2 config APIs are field-verified locally;
+  # flip to a required gate once `make gated-check` is green.
+  gated-native-backends:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libasound2-dev
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile sherpa + Piper backends
+        run: make gated-check
+

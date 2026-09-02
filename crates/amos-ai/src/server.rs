@@ -1,5 +1,6 @@
 //! gRPC service implementation served over a Unix Domain Socket.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,31 +9,162 @@ use amos_proto::ai_agent::{
     ai_agent_server::{AiAgent, AiAgentServer},
     AgentChunk, AgentRequest, ClientMessage, StatusReply, StatusRequest,
 };
+use amos_proto::{CLIENT_ID_HEADER, DEFAULT_CLIENT_ID};
 use anyhow::Context;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::inference::real::{BackendKind, InferenceBackend, MockBackend};
+use crate::security::{AuditResult, Permission, SecurityManager};
+use crate::session::SessionManager;
+
 /// The AiAgent service implementation backed by the (mock) inference engine.
+///
+/// Every RPC passes through the [`SecurityManager`] gate: permission check +
+/// per-client rate limiting first, then token accounting + audit logging while
+/// the stream runs. See `security.rs`.
 pub struct AiAgentService {
     model: &'static str,
     start: Instant,
     /// Number of in-flight generation sessions (for `get_status`).
     active_sessions: Arc<AtomicUsize>,
-}
-
-impl Default for AiAgentService {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Rate limiting / audit logging / permission checks applied to every call.
+    security: Arc<SecurityManager>,
+    /// The active inference backend (GGML / API / Mock), selected via env.
+    backend: Arc<dyn InferenceBackend>,
+    /// Session lineage tracking (token usage, context, memory).
+    sessions: Arc<SessionManager>,
+    /// Where sessions are persisted (`AMOS_SESSIONS_PATH`); `None` = in-memory.
+    sessions_path: Option<std::path::PathBuf>,
 }
 
 impl AiAgentService {
-    pub fn new() -> Self {
+    /// Build a service with the default security manager (grants `Standard` to
+    /// the default client), the backend selected from the environment, and
+    /// sessions loaded from `AMOS_SESSIONS_PATH` (if set).
+    pub async fn new() -> Self {
+        let security = SecurityManager::default();
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        // Periodically drop idle client buckets so the rate limiter's memory
+        // stays bounded as one-off clients come and go.
+        security.start_cleanup_task();
+        let backend = build_backend_from_env().await;
+        let sessions_path = std::env::var("AMOS_SESSIONS_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let sessions = Arc::new(match &sessions_path {
+            Some(p) => SessionManager::load(p),
+            None => SessionManager::default(),
+        });
         Self {
             model: "amos-infer@0.1.0",
             start: Instant::now(),
             active_sessions: Arc::new(AtomicUsize::new(0)),
+            security: Arc::new(security),
+            backend,
+            sessions,
+            sessions_path,
+        }
+    }
+
+    /// Build a service around a caller-provided security manager, using the
+    /// mock backend (used by tests to tighten rate limits / revoke access).
+    pub fn with_security(security: Arc<SecurityManager>) -> Self {
+        Self::with_security_and_backend(security, Arc::new(MockBackend::new()))
+    }
+
+    /// Build a service with an explicit security manager and inference backend.
+    pub fn with_security_and_backend(
+        security: Arc<SecurityManager>,
+        backend: Arc<dyn InferenceBackend>,
+    ) -> Self {
+        Self {
+            model: "amos-infer@0.1.0",
+            start: Instant::now(),
+            active_sessions: Arc::new(AtomicUsize::new(0)),
+            security,
+            backend,
+            sessions: Arc::new(SessionManager::default()),
+            sessions_path: None,
+        }
+    }
+
+    /// Attach a session manager and a persistence path (used by tests / custom
+    /// embedding); call [`Self::save_sessions`] before shutdown to persist.
+    pub fn with_sessions(
+        self,
+        sessions: Arc<SessionManager>,
+        sessions_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            sessions,
+            sessions_path,
+            ..self
+        }
+    }
+
+    /// Persist all tracked sessions to `AMOS_SESSIONS_PATH` (no-op if unset).
+    pub async fn save_sessions(&self) {
+        if let Some(p) = &self.sessions_path {
+            if let Err(e) = self.sessions.save(p).await {
+                tracing::warn!("failed to persist sessions: {e}");
+            }
+        }
+    }
+
+    /// Resolve the caller identity from the gRPC metadata header, falling back
+    /// to the default client id when the caller did not identify itself.
+    fn client_id<T>(&self, request: &Request<T>) -> String {
+        request
+            .metadata()
+            .get(CLIENT_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_CLIENT_ID)
+            .to_string()
+    }
+}
+
+/// Select and build the inference backend from the environment.
+///
+/// Env vars:
+///   AMOS_BACKEND = "mock" | "api" | "ollama" | "hermes" | "ggml"  (default "mock")
+///   AMOS_MODEL_PATH                                       (ggml)
+///   AMOS_API_KEY / AMOS_API_ENDPOINT / AMOS_MODEL         (api)
+///   AMOS_OLLAMA_HOST / AMOS_MODEL                         (ollama)
+///   AMOS_HERMES_ENDPOINT / AMOS_MODEL                     (hermes)
+async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
+    let kind = std::env::var("AMOS_BACKEND").unwrap_or_else(|_| "mock".to_string());
+    let backend = match kind.as_str() {
+        "ggml" => BackendKind::Ggml(std::env::var("AMOS_MODEL_PATH").unwrap_or_default()),
+        "api" => BackendKind::Api {
+            api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
+            endpoint: std::env::var("AMOS_API_ENDPOINT")
+                .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".into()),
+            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+        },
+        "ollama" => BackendKind::Ollama {
+            host: std::env::var("AMOS_OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://localhost:11434".into()),
+            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "hermes3".into()),
+        },
+        "hermes" => BackendKind::Hermes {
+            base_url: std::env::var("AMOS_HERMES_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:11438".into()),
+            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "hermes-rust".into()),
+        },
+        _ => BackendKind::Mock,
+    };
+    match backend.build().await {
+        Ok(b) => Arc::from(b),
+        Err(e) => {
+            tracing::warn!("backend init failed ({e}); falling back to mock");
+            Arc::new(MockBackend::new())
         }
     }
 }
@@ -45,29 +177,123 @@ impl AiAgent for AiAgentService {
         &self,
         request: Request<AgentRequest>,
     ) -> Result<Response<Self::StreamChatStream>, Status> {
+        let client_id = self.client_id(&request);
+
+        // Security gate: permission check + per-client rate limit. On failure the
+        // SecurityManager already wrote a `Rejected` audit entry; surface it to
+        // the caller as a gRPC error so it can back off.
+        if let Err(e) = self.security.validate_request(&client_id).await {
+            tracing::warn!(client = %client_id, "stream_chat rejected: {e}");
+            return Err(Status::resource_exhausted(format!(
+                "request rejected by security layer: {e}"
+            )));
+        }
+
         let req = request.into_inner();
-        tracing::info!(session = %req.session_id, "stream_chat start");
+        tracing::info!(session = %req.session_id, client = %client_id, "stream_chat start");
 
         self.active_sessions.fetch_add(1, Ordering::SeqCst);
         let active = self.active_sessions.clone();
 
         let (tx, rx) = mpsc::channel(64);
         let session_id = req.session_id.clone();
-        let tokens = crate::inference::mock_tokens(&req.prompt);
+        let prompt = req.prompt.clone();
+        let mut context = req.context.clone();
+        // Pass the client session_id through so backends with their own session
+        // lineage (Hermes-Rust) can bind multi-turn memory to it.
+        if !session_id.is_empty() {
+            context.insert(
+                crate::inference::real::SESSION_CTX_KEY.to_string(),
+                session_id.clone(),
+            );
+        }
+        // Semantic intent detection (parity with the bidi `chat` path): if the
+        // prompt maps to a structured card, acknowledge briefly and attach the
+        // card to the terminal frame instead of a long text echo.
+        let card = crate::semantic::detect(&prompt);
+
+        // Hand clones of the security manager + backend to the streaming task.
+        let security = self.security.clone();
+        let client_for_log = client_id.clone();
+        let backend = self.backend.clone();
+        let sessions = self.sessions.clone();
+        let session_key = sessions.create(self.model.to_string()).await;
 
         tokio::spawn(async move {
-            for token in tokens {
+            // Card intent: brief ack + terminal frame carrying the card.
+            if let Some(card) = card {
+                let ack = AgentChunk {
+                    session_id: session_id.clone(),
+                    token: "✨ 已识别意图，正在生成卡片…".to_string(),
+                    done: false,
+                    error: String::new(),
+                    card: None,
+                };
+                if tx.send(Ok(ack)).await.is_err() {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+                let done = AgentChunk {
+                    session_id,
+                    token: String::new(),
+                    done: true,
+                    error: String::new(),
+                    card: Some(card),
+                };
+                let _ = tx.send(Ok(done)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                security.log_tokens(&client_for_log, 1).await;
+                security
+                    .audit_logger
+                    .log(
+                        client_for_log,
+                        "stream_chat".to_string(),
+                        "inference".to_string(),
+                        AuditResult::Success,
+                        "1 tokens streamed".to_string(),
+                    )
+                    .await;
+                let _ = sessions.update(&session_key, |s| s.add_tokens(1)).await;
+                return;
+            }
+
+            // Text intent: stream from the configured inference backend.
+            let mut stream = match backend.infer(&prompt, &context, 256).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx
+                        .send(Ok(AgentChunk {
+                            session_id: session_id.clone(),
+                            token: String::new(),
+                            done: true,
+                            error: format!("inference error: {e}"),
+                            card: None,
+                        }))
+                        .await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let mut token_count = 0usize;
+            while let Some(token) = stream.next().await {
+                let token = match token {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
                 let chunk = AgentChunk {
                     session_id: session_id.clone(),
                     token,
                     done: false,
                     error: String::new(),
+                    card: None,
                 };
                 if tx.send(Ok(chunk)).await.is_err() {
                     // Client disconnected; stop generating.
                     active.fetch_sub(1, Ordering::SeqCst);
                     return;
                 }
+                token_count += 1;
                 tokio::time::sleep(crate::inference::TOKEN_INTERVAL).await;
             }
             let final_frame = AgentChunk {
@@ -75,9 +301,27 @@ impl AiAgent for AiAgentService {
                 token: String::new(),
                 done: true,
                 error: String::new(),
+                card: None,
             };
             let _ = tx.send(Ok(final_frame)).await;
             active.fetch_sub(1, Ordering::SeqCst);
+
+            // Token accounting against the per-client hourly quota + a completion
+            // audit entry so the stream is fully attributable.
+            security.log_tokens(&client_for_log, token_count).await;
+            security
+                .audit_logger
+                .log(
+                    client_for_log,
+                    "stream_chat".to_string(),
+                    "inference".to_string(),
+                    AuditResult::Success,
+                    format!("{token_count} tokens streamed"),
+                )
+                .await;
+            let _ = sessions
+                .update(&session_key, |s| s.add_tokens(token_count))
+                .await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -89,10 +333,26 @@ impl AiAgent for AiAgentService {
         &self,
         request: Request<Streaming<ClientMessage>>,
     ) -> Result<Response<Self::ChatStream>, Status> {
+        let client_id = self.client_id(&request);
+
+        // Security gate at stream establishment: permission + per-client rate
+        // limit. A bidi stream is one logical "request" from the caller's side,
+        // so we validate once up front (each turn is still token-accounted).
+        if let Err(e) = self.security.validate_request(&client_id).await {
+            tracing::warn!(client = %client_id, "chat rejected: {e}");
+            return Err(Status::resource_exhausted(format!(
+                "request rejected by security layer: {e}"
+            )));
+        }
+
         let mut inbound = request.into_inner();
         self.active_sessions.fetch_add(1, Ordering::SeqCst);
         let active = self.active_sessions.clone();
         let (tx, rx) = mpsc::channel(64);
+        let security = self.security.clone();
+        let backend = self.backend.clone();
+        let sessions = self.sessions.clone();
+        let session_key = sessions.create(self.model.to_string()).await;
 
         tokio::spawn(async move {
             // Reader task: forward every inbound message to a local channel so the
@@ -110,6 +370,17 @@ impl AiAgent for AiAgentService {
             // A follow-up message buffered while the previous turn was streaming.
             let mut pending: Option<ClientMessage> = None;
 
+            // Session-aware context so backends with lineage (Hermes-Rust) bind
+            // every turn of this connection to one conversation.
+            let chat_ctx = {
+                let mut m = HashMap::new();
+                m.insert(
+                    crate::inference::real::SESSION_CTX_KEY.to_string(),
+                    session_key.clone(),
+                );
+                m
+            };
+
             'outer: loop {
                 let msg = if let Some(m) = pending.take() {
                     m
@@ -122,43 +393,98 @@ impl AiAgent for AiAgentService {
 
                 match msg.payload {
                     Some(amos_proto::ai_agent::client_message::Payload::Prompt(p)) => {
-                        let tokens = crate::inference::mock_tokens(&p);
+                        // Semantic intent detection: if the prompt maps to a
+                        // structured UI card, acknowledge briefly and attach the
+                        // card to the terminal frame instead of a long text echo.
+                        let card = crate::semantic::detect(&p);
+                        if let Some(card) = card {
+                            let _ = tx
+                                .send(Ok(AgentChunk {
+                                    session_id: String::new(),
+                                    token: "✨ 已识别意图，正在生成卡片…".to_string(),
+                                    done: false,
+                                    error: String::new(),
+                                    card: None,
+                                }))
+                                .await;
+                            let _ = tx
+                                .send(Ok(AgentChunk {
+                                    session_id: String::new(),
+                                    token: String::new(),
+                                    done: true,
+                                    error: String::new(),
+                                    card: Some(card),
+                                }))
+                                .await;
+                            security.log_tokens(&client_id, 1).await;
+                            security
+                                .audit_logger
+                                .log(
+                                    client_id.clone(),
+                                    "chat".to_string(),
+                                    "inference".to_string(),
+                                    AuditResult::Success,
+                                    "1 tokens streamed".to_string(),
+                                )
+                                .await;
+                            let _ = sessions.update(&session_key, |s| s.add_tokens(1)).await;
+                            continue;
+                        }
+                        let mut stream = match backend.infer(&p, &chat_ctx, 256).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Ok(AgentChunk {
+                                        session_id: String::new(),
+                                        token: String::new(),
+                                        done: true,
+                                        error: format!("inference error: {e}"),
+                                        card: None,
+                                    }))
+                                    .await;
+                                continue;
+                            }
+                        };
+                        let mut token_count = 0usize;
                         let mut cancelled = false;
-                        for token in tokens {
-                            let send_fut = tx.send(Ok(AgentChunk {
-                                session_id: String::new(),
-                                token,
-                                done: false,
-                                error: String::new(),
-                            }));
+                        loop {
+                            let next_fut = stream.next();
                             tokio::select! {
-                                r = send_fut => {
-                                    if r.is_err() {
-                                        // Client disconnected; stop generating.
-                                        active.fetch_sub(1, Ordering::SeqCst);
-                                        return;
+                                r = next_fut => match r {
+                                    Some(Ok(token)) => {
+                                        if tx
+                                            .send(Ok(AgentChunk {
+                                                session_id: String::new(),
+                                                token,
+                                                done: false,
+                                                error: String::new(),
+                                                card: None,
+                                            }))
+                                            .await
+                                            .is_err()
+                                        {
+                                            active.fetch_sub(1, Ordering::SeqCst);
+                                            return;
+                                        }
+                                        token_count += 1;
+                                        tokio::time::sleep(crate::inference::TOKEN_INTERVAL).await;
                                     }
-                                }
+                                    Some(Err(_)) => break,
+                                    None => break,
+                                },
                                 maybe = in_rx.recv() => match maybe {
                                     Some(ClientMessage {
-                                        payload: Some(
-                                            amos_proto::ai_agent::client_message::Payload::Cancel(_),
-                                        ),
+                                        payload: Some(amos_proto::ai_agent::client_message::Payload::Cancel(_)),
                                         ..
                                     }) => cancelled = true,
-                                    // Buffer any other mid-stream message (e.g. a
-                                    // follow-up prompt) for the next turn.
                                     other => pending = other,
                                 },
                             }
                             if cancelled {
-                                break;
+                                break 'outer;
                             }
-                            tokio::time::sleep(crate::inference::TOKEN_INTERVAL).await;
                         }
                         if cancelled {
-                            // Cancel arrived mid-generation: end the whole stream
-                            // without a done frame.
                             break 'outer;
                         }
                         let _ = tx
@@ -167,7 +493,23 @@ impl AiAgent for AiAgentService {
                                 token: String::new(),
                                 done: true,
                                 error: String::new(),
+                                card: None,
                             }))
+                            .await;
+                        // Per-turn token accounting + audit for the bidi path.
+                        security.log_tokens(&client_id, token_count).await;
+                        security
+                            .audit_logger
+                            .log(
+                                client_id.clone(),
+                                "chat".to_string(),
+                                "inference".to_string(),
+                                AuditResult::Success,
+                                format!("{token_count} tokens streamed"),
+                            )
+                            .await;
+                        let _ = sessions
+                            .update(&session_key, |s| s.add_tokens(token_count))
                             .await;
                     }
                     Some(amos_proto::ai_agent::client_message::Payload::Audio(audio)) => {
@@ -177,13 +519,16 @@ impl AiAgent for AiAgentService {
                             "[语音] 收到 {} 字节音频，ASR 尚未接入，请改用文本输入。",
                             audio.len()
                         );
-                        for token in crate::inference::mock_tokens(&note) {
+                        let note_tokens = crate::inference::mock_tokens(&note);
+                        let note_count = note_tokens.len();
+                        for token in note_tokens {
                             if tx
                                 .send(Ok(AgentChunk {
                                     session_id: String::new(),
                                     token,
                                     done: false,
                                     error: String::new(),
+                                    card: None,
                                 }))
                                 .await
                                 .is_err()
@@ -199,8 +544,10 @@ impl AiAgent for AiAgentService {
                                 token: String::new(),
                                 done: true,
                                 error: String::new(),
+                                card: None,
                             }))
                             .await;
+                        security.log_tokens(&client_id, note_count).await;
                     }
                     Some(amos_proto::ai_agent::client_message::Payload::Cancel(_)) => {
                         break 'outer;
@@ -217,8 +564,16 @@ impl AiAgent for AiAgentService {
 
     async fn get_status(
         &self,
-        _request: Request<StatusRequest>,
+        request: Request<StatusRequest>,
     ) -> Result<Response<StatusReply>, Status> {
+        let client_id = self.client_id(&request);
+        // Consistency: even a liveness probe is a request the caller must be
+        // permitted + within rate limit to make (prevents probe-driven abuse).
+        if let Err(e) = self.security.validate_request(&client_id).await {
+            return Err(Status::resource_exhausted(format!(
+                "request rejected by security layer: {e}"
+            )));
+        }
         Ok(Response::new(StatusReply {
             running: true,
             model: self.model.to_string(),
@@ -247,8 +602,12 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     // compat layer, so Tauri talks to the whole OS backend over one connection.
     // The runtime is auto-selected: real Waydroid on device, in-process demo
     // elsewhere (so the whole pipeline works on any host).
+    let ai_service = AiAgentService::new().await;
+    // Keep a handle to the session store so we can persist it on shutdown.
+    let sessions = ai_service.sessions.clone();
+    let sessions_path = ai_service.sessions_path.clone();
     let server = tonic::transport::Server::builder()
-        .add_service(AiAgentServer::new(AiAgentService::new()))
+        .add_service(AiAgentServer::new(ai_service))
         .add_service(amos_android::service::server(amos_android::auto()))
         .serve_with_incoming(incoming);
 
@@ -256,6 +615,13 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         result = server => { result?; }
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
+        }
+    }
+
+    // Persist sessions (if `AMOS_SESSIONS_PATH` is set) before exiting.
+    if let Some(p) = &sessions_path {
+        if let Err(e) = sessions.save(p).await {
+            tracing::warn!("failed to persist sessions: {e}");
         }
     }
 
@@ -279,10 +645,25 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::RateLimitConfig;
+    use std::sync::Arc;
+    use tokio_stream::StreamExt as _;
+
+    /// Build a `stream_chat` request tagged with the given client id.
+    fn stream_req(client: &str, sid: &str) -> Request<AgentRequest> {
+        let mut r = Request::new(AgentRequest {
+            session_id: sid.to_string(),
+            prompt: "hello".to_string(),
+            context: Default::default(),
+        });
+        r.metadata_mut()
+            .insert(CLIENT_ID_HEADER, client.parse().unwrap());
+        r
+    }
 
     #[tokio::test]
     async fn session_counter_round_trips() {
-        let svc = AiAgentService::new();
+        let svc = AiAgentService::new().await;
         assert_eq!(svc.active_sessions.load(Ordering::SeqCst), 0);
         svc.active_sessions.fetch_add(1, Ordering::SeqCst);
         assert_eq!(svc.active_sessions.load(Ordering::SeqCst), 1);
@@ -292,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_running_and_model() {
-        let svc = AiAgentService::new();
+        let svc = AiAgentService::new().await;
         let reply = svc
             .get_status(Request::new(StatusRequest {}))
             .await
@@ -301,5 +682,166 @@ mod tests {
         assert!(reply.running);
         assert!(!reply.model.is_empty());
         assert_eq!(reply.active_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_is_audited_and_rate_limited() {
+        // Tight limit (1 request/sec) so the second call in the same second is
+        // rejected, while the first writes a validation + completion audit trail.
+        let config = RateLimitConfig {
+            requests_per_second: 1,
+            ..Default::default()
+        };
+        let security = Arc::new(SecurityManager::new(config));
+        security
+            .permission_manager
+            .grant("client-a".to_string(), Permission::Standard)
+            .await;
+        let svc = AiAgentService::with_security(security);
+
+        // 1) A permitted, within-limit request succeeds and is streamed.
+        assert!(
+            svc.stream_chat(stream_req("client-a", "s1")).await.is_ok(),
+            "first request within limit should succeed"
+        );
+
+        // 2) The second request in the same second hits the per-second quota.
+        let err = svc
+            .stream_chat(stream_req("client-a", "s2"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::ResourceExhausted,
+            "over-quota request must be rejected with ResourceExhausted"
+        );
+
+        // 3) Audit log recorded both the validation and the rejection.
+        let entries = svc.security.audit_logger.get_recent(20).await;
+        assert!(
+            entries.iter().any(|e| e.operation == "infer"
+                && e.result == AuditResult::Success
+                && e.client_id == "client-a"),
+            "a successful request validation must be audited"
+        );
+        assert!(
+            entries.iter().any(|e| e.operation == "infer"
+                && e.result == AuditResult::Rejected
+                && e.details.contains("rate limit")),
+            "the rejected request must be audited as rate-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_client_is_rejected() {
+        // A fresh SecurityManager grants nothing, so any caller is denied.
+        let security = Arc::new(SecurityManager::default());
+        let svc = AiAgentService::with_security(security);
+
+        let err = svc
+            .stream_chat(stream_req("intruder", "s1"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::ResourceExhausted,
+            "unauthenticated caller must be rejected"
+        );
+
+        let entries = svc.security.audit_logger.get_recent(10).await;
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.client_id == "intruder" && e.result == AuditResult::Rejected),
+            "the denial must be audited against the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_completion_logs_tokens() {
+        let svc = AiAgentService::new().await; // grants Standard to the default client
+        let mut stream = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "s1"))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Drain the token stream; the completion audit entry is written after the
+        // terminal `done` frame, so drive it to completion first.
+        let mut saw_done = false;
+        while let Some(chunk) = stream.next().await {
+            if let Ok(c) = chunk {
+                if c.done {
+                    saw_done = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_done, "stream should terminate with a done frame");
+
+        // Then poll briefly for the completion audit entry (logged just after the
+        // terminal frame by the streaming task).
+        let mut logged = false;
+        for _ in 0..50 {
+            let entries = svc.security.audit_logger.get_recent(20).await;
+            if entries.iter().any(|e| {
+                e.operation == "stream_chat"
+                    && e.result == AuditResult::Success
+                    && e.details.contains("tokens streamed")
+            }) {
+                logged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(logged, "a completed stream must log its token count");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_tracks_and_persists_session() {
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let sessions = Arc::new(SessionManager::default());
+        let path = std::env::temp_dir().join(format!("amos-svc-sess-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let svc = AiAgentService::with_security(security)
+            .with_sessions(sessions.clone(), Some(path.clone()));
+
+        let mut stream = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "s1"))
+            .await
+            .unwrap()
+            .into_inner();
+        while let Some(chunk) = stream.next().await {
+            if let Ok(c) = chunk {
+                if c.done {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            sessions.count_active().await,
+            1,
+            "one session tracked per stream"
+        );
+        // The token update is written just after the terminal frame; poll briefly.
+        let mut got_tokens = false;
+        for _ in 0..50 {
+            let list = sessions.list_active().await;
+            if list.iter().any(|s| s.tokens_generated > 0) {
+                got_tokens = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(got_tokens, "token usage recorded in the session");
+
+        svc.save_sessions().await;
+        assert!(path.exists(), "sessions persisted to disk on shutdown");
+        let _ = std::fs::remove_file(&path);
     }
 }

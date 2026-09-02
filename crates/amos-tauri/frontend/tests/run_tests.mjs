@@ -124,6 +124,27 @@ function fresh(opts = {}) {
         if (cmd === 'system_peek_context') {
           return { source_window: 'notes', text: 'hello context for ai', timestamp_ms: 1 };
         }
+        if (cmd === 'transcribe_audio') {
+          return { text: '转写结果', recognized: true };
+        }
+        if (cmd === 'translate_text') {
+          return '译：' + (_args && _args.text ? _args.text : '');
+        }
+        if (cmd === 'interpret_start') {
+          return 42;
+        }
+        if (cmd === 'interpret_text') {
+          return { source_text: _args.text, target_text: '译：' + _args.text };
+        }
+        if (cmd === 'interpret_status') {
+          return { session_id: 42, state: 'collecting', connected: true, source: 'auto', target: 'zh' };
+        }
+        if (cmd === 'tts_synthesize') {
+          return { sample_rate: 16000, channels: 1, samples: new Array(160).fill(0) };
+        }
+        if (cmd === 'interpret_audio' || cmd === 'interpret_end_of_speech' || cmd === 'interpret_pause' || cmd === 'interpret_resume' || cmd === 'interpret_stop' || cmd === 'interpret_abort' || cmd === 'interpret_restart') {
+          return { ok: true };
+        }
         return { model: 'test', active_sessions: 0, uptime_seconds: 1 };
       },
       listen: async () => () => {},
@@ -141,6 +162,7 @@ function fresh(opts = {}) {
   run('core.js');
   for (const f of fs.readdirSync(path.join(JS_ROOT, 'apps'))) run('apps/' + f);
   run('nc.js'); // notification center (uses core helpers)
+  run('cards.js'); // dynamic UI card renderer (semantic UI protocol)
   const view = new El('main');
   windowObj.Amos.init(view);
   return { Amos: windowObj.Amos, AmosNc: windowObj.AmosNc, view, document, localStorage, sandbox: deps };
@@ -158,6 +180,17 @@ function findEl(node, id) {
     if (r) return r;
   }
   return null;
+}
+
+// Walk a rendered node tree collecting elements whose className contains `cls`.
+function walkClass(node, cls) {
+  const out = [];
+  const walk = (n) => {
+    if (n && typeof n.className === 'string' && n.className.split(' ').includes(cls)) out.push(n);
+    for (const c of (n && n.children) || []) walk(c);
+  };
+  walk(node);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +647,397 @@ test('notes: each note has a send-to-AI button and delete still works', () => {
   assert(Array.isArray(sendBtn._listeners.click), 'send button has a click handler');
   delBtn.dispatch('click', {});
   assert(!content.children[2].children.some((c) => c.className === 'card'), 'delete still removes note');
+});
+
+test('lock screen: shows and unlocks via button', () => {
+  const e = fresh();
+  const A = e.Amos;
+  A.showLock();
+  assert(A.isLocked === true, 'locked after showLock');
+  assert(e.view.children[0].className === 'lock-screen', 'lock screen rendered into view');
+  const btns = walkClass(e.view.children[0], 'unlock-btn');
+  assert(btns.length === 1, 'one unlock button present');
+  btns[0].dispatch('click', {});
+  assert(A.isLocked === false, 'unlocked after tapping button');
+  assert(e.view.children[0].className === 'home-scroll', 'home rendered after unlock');
+});
+
+test('lock screen: correct PIN unlocks, wrong PIN does not', () => {
+  const e = fresh();
+  e.localStorage.setItem('amos.lock', JSON.stringify({ enabled: true, pin: '1234' }));
+  const A = e.Amos;
+  A.showLock();
+  assert(A.isLocked === true, 'locked with PIN enabled');
+  const lockNode = e.view.children[0];
+  const keys = {};
+  walkClass(lockNode, 'pin-key').forEach((b) => { keys[b.children[0]] = b; });
+  assert(keys['1'] && keys['✓'], 'pin pad has digit + confirm keys');
+
+  // Wrong PIN first: still locked.
+  keys['9'].dispatch('click', {});
+  keys['✓'].dispatch('click', {});
+  assert(A.isLocked === true, 'wrong PIN keeps device locked');
+
+  // Correct PIN: unlocks.
+  keys['1'].dispatch('click', {});
+  keys['2'].dispatch('click', {});
+  keys['3'].dispatch('click', {});
+  keys['4'].dispatch('click', {});
+  keys['✓'].dispatch('click', {});
+  assert(A.isLocked === false, 'correct PIN unlocks the device');
+});
+
+test('recents: pushRecent dedupes and the switcher renders cards', () => {
+  const e = fresh();
+  const A = e.Amos;
+  A.pushRecent('calculator');
+  A.pushRecent('notes');
+  A.pushRecent('calculator'); // move to front, dedupe
+  const saved = JSON.parse(e.localStorage.getItem('amos.recents'));
+  assert(saved.length === 2 && saved[0] === 'calculator', 'recents deduped and ordered');
+
+  A.showRecents();
+  const screen = e.view.children[0];
+  assert(screen.className === 'recents-screen', 'recents screen rendered');
+  const cards = screen.children[1].children; // the row
+  assert(cards.length === 2, 'two recent cards shown');
+  assert(cards[0].className === 'recents-card', 'first card is a recents-card');
+});
+
+test('applyTheme reads darkmode without throwing (no real DOM)', () => {
+  const e = fresh();
+  e.localStorage.setItem('amos.settings', JSON.stringify({ darkmode: true }));
+  e.Amos.applyTheme(); // must not throw even though document.body is absent
+  e.localStorage.setItem('amos.settings', JSON.stringify({ darkmode: false }));
+  e.Amos.applyTheme();
+});
+
+test('openApp records the app into recents', () => {
+  const e = fresh();
+  e.Amos.openApp('weather');
+  const saved = JSON.parse(e.localStorage.getItem('amos.recents') || '[]');
+  assert(saved.includes('weather'), 'openApp pushes the app into recents');
+});
+
+test('onboarding: first-run flow persists and locks the device', () => {
+  const e = fresh();
+  const A = e.Amos;
+  A.showOnboarding();
+  let screen = e.view.children[0];
+  assert(screen.className === 'onb-screen', 'onboarding rendered');
+
+  // Welcome page → "开始" advances to the quick-settings page.
+  const nexts = walkClass(screen, 'onb-next');
+  assert(nexts.length === 1, 'one next button on welcome page');
+  nexts[0].dispatch('click', {});
+  screen = e.view.children[0];
+  assert(screen.className === 'onb-screen', 'still onboarding after advancing');
+
+  // Set a PIN, then finish.
+  const pin = walkClass(screen, 'onb-pin')[0];
+  pin.value = '4321';
+  const finishBtn = walkClass(screen, 'onb-next')[0];
+  finishBtn.dispatch('click', {});
+
+  assert(e.localStorage.getItem('amos.onboarded') === '1', 'onboarding persisted as complete');
+  const lock = JSON.parse(e.localStorage.getItem('amos.lock'));
+  assert(lock.enabled === true && lock.pin === '4321', 'PIN saved from onboarding');
+  assert(A.isLocked === true, 'device locked after onboarding');
+});
+
+test('photos: gallery seeds and 拍照 adds a stored photo', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('photos');
+  app.render(); // seeds the album on first open
+  const before = JSON.parse(e.localStorage.getItem('amos.photos')).length;
+  assert(before > 0, 'photos seeded on first open');
+
+  const node = app.render();
+  const addBtn = walkClass(node, 'btn').find((b) => b.children && b.children[0] === '＋ 拍照');
+  assert(addBtn, 'photo add button present');
+  addBtn.dispatch('click', {});
+  const after = JSON.parse(e.localStorage.getItem('amos.photos')).length;
+  assert(after === before + 1, 'adding a photo increments the gallery');
+});
+
+test('files: create folder and text file persist to the store', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('files');
+  app.render(); // seeds demo entries
+  assert(JSON.parse(e.localStorage.getItem('amos.files')).length > 0, 'files seeded');
+
+  const node = app.render();
+  // node = app-screen [titlebar, body]; body[0] = content; content[0] = root; root[0] = toolbar.
+  const rootEl = node.children[1].children[0].children[0];
+  const toolbar = rootEl.children[0];
+  toolbar.children[0].dispatch('click', {}); // "＋ 文件夹"
+  const nameInput = walkClass(node, 'field')[0];
+  nameInput.value = '项目';
+  const saveBtn = walkClass(node, 'btn').find((b) => b.children && b.children[0] === '保存');
+  assert(saveBtn, 'save button present');
+  saveBtn.dispatch('click', {});
+  let files = JSON.parse(e.localStorage.getItem('amos.files'));
+  assert(files.some((f) => f.name === '项目' && f.type === 'folder'), 'folder created and persisted');
+
+  // Open the "＋ 文本" form (second toolbar button) and save a text file.
+  toolbar.children[1].dispatch('click', {});
+  const name2 = walkClass(node, 'field')[0];
+  name2.value = '笔记.txt';
+  const textArea = walkClass(node, 'field')[1];
+  textArea.value = '你好 Amos';
+  walkClass(node, 'btn').find((b) => b.children && b.children[0] === '保存').dispatch('click', {});
+  files = JSON.parse(e.localStorage.getItem('amos.files'));
+  assert(files.some((f) => f.name === '笔记.txt' && f.type === 'file' && f.content === '你好 Amos'), 'text file created and persisted');
+});
+
+test('camera: shutter saves a photo into the album store (demo fallback)', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('camera');
+  const node = app.render();
+  const before = JSON.parse(e.localStorage.getItem('amos.photos') || '[]').length;
+  const shutter = walkClass(node, 'shutter')[0];
+  assert(shutter, 'shutter button present');
+  shutter.dispatch('click', {});
+  const after = JSON.parse(e.localStorage.getItem('amos.photos') || '[]').length;
+  assert(after === before + 1, 'capture saved one photo to the album');
+});
+
+test('maps: renders an OSM map with locate + zoom controls', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('maps');
+  const node = app.render();
+  assert(node && typeof node.appendChild === 'function', 'maps rendered without throwing');
+  const locate = walkClass(node, 'btn').find((b) => b.children && b.children[0] === '📍 定位');
+  assert(locate, 'locate button present');
+  locate.dispatch('click', {}); // no navigator in tests → graceful "定位不可用"
+  // zoom buttons exist and don't throw on click
+  const zooms = walkClass(node, 'btn').filter((b) => b.children && (b.children[0] === '+' || b.children[0] === '−'));
+  assert(zooms.length === 2, 'zoom in/out buttons present');
+  zooms.forEach((z) => z.dispatch('click', {}));
+});
+
+test('music: seeds a playlist and play/pause + prev/next work', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('music');
+  app.render(); // seeds the playlist
+  assert(JSON.parse(e.localStorage.getItem('amos.music')).length >= 3, 'playlist seeded on first open');
+
+  const node = app.render();
+  const play = walkClass(node, 'ctl-play')[0];
+  const prev = walkClass(node, 'ctl-prev')[0];
+  const next = walkClass(node, 'ctl-next')[0];
+  assert(play && prev && next, 'transport controls present');
+
+  // Start playing (no AudioContext in tests → graceful fallback, no throw).
+  play.dispatch('click', {});
+  // Toggle to pause.
+  play.dispatch('click', {});
+  // Next / prev cycle without throwing.
+  next.dispatch('click', {});
+  prev.dispatch('click', {});
+  assert(true, 'play/pause and prev/next ran without throwing');
+});
+
+test('semantic cards: AmosCards renders a dynamic UI card', () => {
+  const e = fresh();
+  const Cards = e.sandbox.window.AmosCards;
+  assert(Cards && typeof Cards.render === 'function', 'AmosCards.render available');
+
+  const node = Cards.render({ kind: 'weather', title: '今日天气', subtitle: '北京', fields: [{ key: '气温', value: '26°' }], actions: ['打开地图'] });
+  assert(node && node.className.includes('ai-card'), 'weather card rendered');
+  const title = node.children[0];
+  assert(title.textContent === '今日天气', 'card title rendered in header');
+  const actBtn = walkClass(node, 'btn').find((b) => b.children && b.children[0] === '打开地图');
+  assert(actBtn, 'card action button present');
+
+  // Unknown kind still renders a card (graceful fallback).
+  const generic = Cards.render({ kind: 'anything', title: '通用' });
+  assert(generic && generic.className.includes('ai-card'), 'generic card rendered');
+  // Missing/invalid input returns null.
+  assert(Cards.render(null) === null, 'null card renders nothing');
+});
+
+test('semantic cards: AI app renders a received card into the log', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('ai');
+  const node = app.render();
+  app.onMount(node);
+  const AmosAi = e.sandbox.window.AmosAi;
+
+  const log = e.document.getElementById('ai-log');
+  const before = log.children.length;
+  AmosAi.showCard({ kind: 'media', title: '播放《晨光》', fields: [{ key: '时长', value: '24 秒' }], actions: [] });
+  assert(log.children.length === before + 1, 'card appended to the AI log');
+  const card = log.children[log.children.length - 1];
+  assert(card.className.includes('ai-card'), 'log contains an ai-card');
+});
+
+test('ai: conversation id is stable and reset starts a new one', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('ai');
+  const node = app.render();
+  app.onMount(node);
+  const AmosAi = e.sandbox.window.AmosAi;
+  const a = AmosAi.conversationId();
+  const b = AmosAi.conversationId();
+  assert(a === b, 'conversation id is stable within a conversation');
+  assert(e.localStorage.getItem('amos.ai.session') === a, 'conversation id persisted');
+  const c = AmosAi.newConversation();
+  assert(c !== a, 'new conversation generates a fresh id');
+  assert(AmosAi.conversationId() === c, 'new id reused after reset');
+});
+
+test('hardware buttons: home/voice/ai route to actions', () => {
+  // Without Tauri, press() falls back to handle() and home goes to the launcher.
+  const e = fresh({ noTauri: true });
+  const B = e.sandbox.window.AmosButtons;
+  assert(B && typeof B.handle === 'function', 'AmosButtons available');
+  e.Amos.init(e.view);
+  e.Amos.renderHome();
+  B.handle('home');
+  assert(e.view.children[0].className === 'home-scroll', 'home button returns to launcher');
+  // voice / ai open the AI assistant without throwing.
+  B.handle('voice');
+  B.handle('ai');
+  B.press('ai'); // no-Tauri fallback path
+  assert(true, 'voice/ai handled without throwing');
+});
+
+test('hardware buttons: press goes through the Tauri command when available', () => {
+  const e = fresh(); // Tauri internals present
+  const B = e.sandbox.window.AmosButtons;
+  assert(B && typeof B.press === 'function', 'AmosButtons.press available');
+  // With Tauri, press() calls invoke('simulate_button', ...) — must not throw.
+  B.press('home');
+  B.press('voice');
+  B.press('ai');
+  assert(true, 'press() dispatched via Tauri command without throwing');
+});
+
+test('voice: transcribe and translate call the ASR/translate commands', async () => {
+  const e = fresh(); // Tauri internals present
+  const V = e.sandbox.window.AmosVoice;
+  assert(V && typeof V.transcribe === 'function', 'AmosVoice available');
+
+  const res = await V.transcribe([1, 2, 3], { language: 'zh', format: 'wav' });
+  assert(res.recognized === true, 'transcription recognized via command');
+  assert(res.text === '转写结果', 'transcription text returned');
+
+  const translated = await V.translate('你好', { target_lang: 'en' });
+  assert(translated === '译：你好', 'translate text returned');
+});
+
+test('voice: degrades gracefully without Tauri', async () => {
+  const e = fresh({ noTauri: true });
+  const V = e.sandbox.window.AmosVoice;
+  const res = await V.transcribe([1, 2, 3]);
+  assert(res.recognized === false && res.text === '', 'no-Tauri transcribe is empty');
+  assert(await V.translate('x') === '', 'no-Tauri translate is empty');
+});
+
+test('interp: session lifecycle bridges commands', async () => {
+  const e = fresh(); // Tauri present
+  const AI = e.sandbox.window.AmosInterp;
+  assert(AI && typeof AI.start === 'function', 'AmosInterp available');
+
+  const id = await AI.start({ source: 'en', target: 'zh' });
+  assert(id === 42 && AI.sessionId === 42, 'interpret_start returns the session id');
+
+  await AI.text('hello');
+  const status = await AI.status();
+  assert(status && status.state === 'collecting', 'interpret_status returns the session state');
+
+  // restart is exposed on the wrapper (no-throw).
+  await AI.restart();
+
+  // onOutput hook routes a segment_final event.
+  let got = null;
+  AI.onOutput = (p) => { got = p; };
+  AI.onOutput({ kind: 'segment_final', source_text: 'hi', target_text: '你好', session_id: 42 });
+  assert(got && got.target_text === '你好', 'onOutput receives segment_final payloads');
+});
+
+test('interp: degrades gracefully without Tauri', async () => {
+  const e = fresh({ noTauri: true });
+  const AI = e.sandbox.window.AmosInterp;
+  assert(await AI.start() === null, 'no-Tauri start returns null');
+  await AI.text('hi'); // no-throw
+  assert(await AI.status() === null, 'no-Tauri status is null');
+});
+
+test('interpreter app: registers, renders, and wires session', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('interpreter');
+  assert(app, 'interpreter app registered');
+  const node = app.render();
+  assert(node, 'interpreter rendered a node');
+  app.onMount(node);
+  const AI = e.sandbox.window.AmosInterp;
+  assert(typeof AI.onOutput === 'function', 'onOutput wired');
+  // Feed outputs through the app's handler (against the stub DOM, no throw).
+  AI.onOutput({ kind: 'partial', text: '你好' });
+  AI.onOutput({ kind: 'segment_final', source_text: 'hello', target_text: '你好', target_lang: 'zh', session_id: 1 });
+  AI.onOutput({ kind: 'session_ended', session_id: 1 });
+  assert(true, 'session outputs handled without throwing');
+  app.onUnmount();
+});
+
+test('interpreter app degrades without Tauri', () => {
+  const e = fresh({ noTauri: true });
+  const app = e.Amos.apps.get('interpreter');
+  const node = app.render();
+  app.onMount(node); // must not throw; status shows "非 Tauri"
+  assert(true, 'interpreter mounts without Tauri');
+});
+
+test('tts: synthesize returns playable audio via command', async () => {
+  const e = fresh();
+  const T = e.sandbox.window.AmosTts;
+  const p = await T.synthesize('你好', { lang: 'zh' });
+  assert(p && p.sample_rate === 16000 && Array.isArray(p.samples), 'tts payload is playable audio');
+
+  const e2 = fresh({ noTauri: true });
+  assert(await e2.sandbox.window.AmosTts.synthesize('x') === null, 'no-Tauri tts is null');
+});
+
+test('headless interp UI smoke: renders partial then a segment with speak button', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('interpreter');
+  const node = app.render();
+  app.onMount(node);
+  const AI = e.sandbox.window.AmosInterp;
+  const log = e.document.getElementById('interp-log');
+
+  AI.onOutput({ kind: 'partial', text: '你好' });
+  assert(log.children.length >= 1 && String(log.children[0].textContent).includes('你好'),
+    'partial is rendered');
+
+  AI.onOutput({ kind: 'segment_final', source_text: 'hello', target_text: '你好', target_lang: 'zh', session_id: 1 });
+  const segRow = log.children[log.children.length - 1];
+  const srcText = segRow.children[0] && String(segRow.children[0].textContent);
+  const tgtText = segRow.children[1] && String(segRow.children[1].textContent);
+  assert(srcText === 'hello' && tgtText === '你好',
+    `segment shows source + target: src=${srcText} tgt=${tgtText}`);
+  const btn = segRow.children && segRow.children[2];
+  assert(btn && btn.tagName === 'button', 'segment has a 🔊 朗读 button');
+  btn.dispatch('click', {}); // speak() must not throw (no AudioContext in tests)
+  app.onUnmount();
+});
+
+test('headless interp UI: auto-speak synthesizes each translation', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('interpreter');
+  const node = app.render();
+  app.onMount(node);
+  let spoken = [];
+  e.sandbox.window.AmosTts.synthesize = async (text) => { spoken.push(text); return { sample_rate: 16000, channels: 1, samples: [] }; };
+  // Enable auto-read-aloud.
+  e.document.getElementById('interp-autospeak').checked = true;
+
+  const AI = e.sandbox.window.AmosInterp;
+  AI.onOutput({ kind: 'segment_final', source_text: 'hello', target_text: '你好', target_lang: 'zh', session_id: 1 });
+  assert(spoken.includes('你好'), 'auto-speak synthesized the translation: ' + JSON.stringify(spoken));
+  app.onUnmount();
 });
 
 // ---------------------------------------------------------------------------

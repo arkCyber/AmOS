@@ -14,7 +14,7 @@ pub mod service;
 pub use controller::{
     extract_icon_bytes, parse_app_list, AndroidController, CommandRunner, ShellRunner,
 };
-pub use manager::{AndroidManagerConfig, EnhancedAndroidManager, CacheStats};
+pub use manager::{AndroidManagerConfig, CacheStats, EnhancedAndroidManager};
 pub use png::icon_png;
 pub use runtime::{auto, AndroidRuntime, DemoRuntime, WaydroidRuntime};
 pub use service::AndroidManagerService;

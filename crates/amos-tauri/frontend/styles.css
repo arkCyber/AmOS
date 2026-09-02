@@ -359,3 +359,90 @@ body {
   padding: 10px 12px;
   font-size: 14px;
 }
+
+/* ---------- First-run onboarding ---------- */
+.onb-screen {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 16px; padding: 28px; text-align: center;
+  background: radial-gradient(140% 120% at 50% 0%, #22305a, #0a0a0f 75%);
+}
+.onb-hero { font-size: 84px; }
+.onb-title { font-size: 26px; font-weight: 700; color: #fff; }
+.onb-row { display: flex; gap: 12px; }
+.onb-sel { outline: 2px solid var(--accent); outline-offset: 2px; }
+[data-theme="light"] .onb-title { color: #1c1c1e; }
+
+/* ---------- Lock screen ---------- */
+.lock-screen {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; padding: 24px; text-align: center;
+  background:
+    radial-gradient(140% 120% at 50% 0%, #1d2742, #0a0a0f 70%),
+    linear-gradient(#0a0a0f, #11121a);
+}
+.lock-clock { font-size: 76px; font-weight: 200; letter-spacing: 2px; color: #fff; text-shadow: 0 2px 14px rgba(0,0,0,0.4); }
+.lock-date { font-size: 16px; color: var(--text-dim); margin-bottom: 10px; }
+.lock-hint { font-size: 13px; color: var(--text-dim); margin: 6px 0; }
+.lock-notif { width: 100%; max-width: 340px; text-align: left; }
+.lock-pin { display: flex; flex-direction: column; align-items: center; gap: 8px; margin-top: 8px; }
+.pin-display { letter-spacing: 10px; font-size: 30px; min-height: 40px; color: #fff; }
+.pin-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.pin-key {
+  width: 68px; height: 68px; border-radius: 50%; border: 0;
+  background: rgba(255, 255, 255, 0.12); color: #fff;
+  font-size: 24px; cursor: pointer;
+}
+.pin-key:active { background: rgba(255, 255, 255, 0.28); }
+.unlock-btn { font-size: 16px; padding: 12px 24px; margin-top: 6px; }
+
+/* ---------- Recents / app switcher ---------- */
+.recents-screen {
+  position: absolute; inset: 0;
+  background: rgba(10, 12, 20, 0.92);
+  padding: 26px 16px; display: flex; flex-direction: column;
+}
+.recents-header { font-size: 20px; font-weight: 600; margin-bottom: 20px; color: #fff; }
+.recents-row { display: flex; gap: 16px; overflow-x: auto; flex: 1; align-content: flex-start; }
+.recents-card {
+  flex: 0 0 120px; height: 120px; border: 0; border-radius: 18px;
+  background: rgba(255, 255, 255, 0.08); color: #fff; cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+}
+.recents-card:active { transform: scale(0.96); }
+.recents-close { align-self: flex-end; margin-top: 12px; }
+
+/* ---------- Brightness overlay (full-screen dim, above everything) ---------- */
+.brightness-overlay { position: fixed; inset: 0; z-index: 2000; pointer-events: none; background: #000; opacity: 0; }
+
+/* ---------- Light theme (darkmode toggle actually changes the UI) ---------- */
+[data-theme="light"] body { background: #f2f2f7; color: #1c1c1e; }
+[data-theme="light"] #status-bar { color: #1c1c1e; text-shadow: none; }
+[data-theme="light"] .app-screen { background: #f2f2f7; color: #1c1c1e; }
+[data-theme="light"] .app-titlebar { color: #1c1c1e; }
+[data-theme="light"] .card { background: rgba(0, 0, 0, 0.045); border-color: rgba(0, 0, 0, 0.06); }
+[data-theme="light"] .dock { background: rgba(0, 0, 0, 0.07); }
+[data-theme="light"] #home-indicator::after { background: rgba(0, 0, 0, 0.85); }
+[data-theme="light"] .field { color: #1c1c1e; background: rgba(0, 0, 0, 0.05); border-color: rgba(0, 0, 0, 0.12); }
+[data-theme="light"] .btn.secondary { background: rgba(0, 0, 0, 0.1); color: #1c1c1e; }
+[data-theme="light"] .recents-screen { background: rgba(240, 240, 246, 0.96); }
+[data-theme="light"] .recents-header { color: #1c1c1e; }
+[data-theme="light"] .recents-card { background: rgba(0, 0, 0, 0.06); color: #1c1c1e; }
+[data-theme="light"] .lock-screen { background: radial-gradient(140% 120% at 50% 0%, #cfd6ee, #f2f2f7 70%); }
+[data-theme="light"] .lock-clock { color: #1c1c1e; text-shadow: none; }
+[data-theme="light"] .pin-key { background: rgba(0, 0, 0, 0.08); color: #1c1c1e; }
+[data-theme="light"] .pin-display { color: #1c1c1e; }
+
+/* ---------- AI semantic cards (dynamic UI) ---------- */
+.ai-card { overflow: hidden; }
+.ai-card-head {
+  margin: -12px -14px 0;
+  padding: 12px 14px;
+  color: #fff;
+  font-weight: 700;
+  font-size: 15px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+

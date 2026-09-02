@@ -5,7 +5,11 @@
 //! `ai_bridge` over the local Unix Domain Socket.
 
 pub mod ai_bridge;
+pub mod buttons;
+pub mod interpret;
 pub mod store;
+pub mod translate;
+pub mod tts;
 pub mod wm;
 
 use ai_bridge::AiBridge;
@@ -20,6 +24,9 @@ pub fn run() {
         .manage(WmState::new())
         .manage(SystemContext::new())
         .manage(SharedStore::new())
+        .manage(buttons::HardwareButtons::new())
+        .manage(interpret::InterpretationBridge::new())
+        .manage(tts::TtsBridge::new())
         .invoke_handler(tauri::generate_handler![
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
@@ -28,6 +35,7 @@ pub fn run() {
             ai_bridge::get_android_apps,
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,
+            buttons::simulate_button,
             wm::wm_open,
             wm::wm_focus,
             wm::wm_hide,
@@ -40,7 +48,20 @@ pub fn run() {
             store::store_get,
             store::store_set,
             store::store_remove,
-            store::store_snapshot
+            store::store_snapshot,
+            translate::transcribe_audio,
+            translate::translate_text,
+            interpret::interpret_start,
+            interpret::interpret_text,
+            interpret::interpret_audio,
+            interpret::interpret_end_of_speech,
+            interpret::interpret_pause,
+            interpret::interpret_resume,
+            interpret::interpret_stop,
+            interpret::interpret_restart,
+            interpret::interpret_abort,
+            interpret::interpret_status,
+            tts::tts_synthesize
         ])
         .setup(|app| {
             // System-wide readiness probe: log the daemon status once on boot.

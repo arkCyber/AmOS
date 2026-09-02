@@ -7,6 +7,12 @@ window.Amos = (() => {
   let viewEl = null;
   let jiggling = false;
 
+  // ---- Mobile-OS shell state ----
+  let locked = false;         // lock screen active (blocks app access)
+  let lockTimer = null;       // live clock interval on the lock screen
+  let brightnessOverlay = null; // full-screen dim layer
+  let recents = loadRecents();  // most-recently-opened app ids
+
   const LAYOUT_KEY = "amos.home.layout";
   let layout = null; // { page: [ids], dock: [ids], hidden: [ids] }
 
@@ -310,6 +316,8 @@ window.Amos = (() => {
   // the launcher keeps working headlessly.
 
   function openApp(id) {
+    if (locked) return; // must unlock first
+    pushRecent(id);
     const I = window.__TAURI_INTERNALS__;
     if (I) {
       I.invoke("wm_open", { label: id }).catch((e) => {
@@ -350,6 +358,214 @@ window.Amos = (() => {
     if (!current && viewEl) { layout = null; renderHome(); }
   });
 
+  // -----------------------------------------------------------------------
+  // Mobile-OS shell: lock screen, recents (app switcher), theme & brightness
+  // -----------------------------------------------------------------------
+
+  // ---- small helpers ----
+  function loadRecents() {
+    try { const r = JSON.parse(safeGet("amos.recents", "[]")); return Array.isArray(r) ? r : []; } catch (_) { return []; }
+  }
+  function readSettings() {
+    try { return JSON.parse(safeGet("amos.settings", "{}")) || {}; } catch (_) { return {}; }
+  }
+  function readLockConfig() {
+    try { return JSON.parse(safeGet("amos.lock", "{}")) || {}; } catch (_) { return {}; }
+  }
+  function previewNotifs() {
+    try { const n = JSON.parse(safeGet("amos.notifications", "[]")); return Array.isArray(n) ? n.slice(0, 3) : []; } catch (_) { return []; }
+  }
+  function fmtClock(d) { const p = (n) => String(n).padStart(2, "0"); return `${p(d.getHours())}:${p(d.getMinutes())}`; }
+  function fmtDate(d) { const W = ["日", "一", "二", "三", "四", "五", "六"]; return `${d.getMonth() + 1}月${d.getDate()}日 周${W[d.getDay()]}`; }
+
+  // ---- Lock screen ----
+  function renderLock() {
+    const cfg = readLockConfig();
+    const now = new Date();
+    const lock = el("div", { class: "lock-screen" });
+    lock.appendChild(el("div", { class: "lock-clock", id: "lock-clock" }, fmtClock(now)));
+    lock.appendChild(el("div", { class: "lock-date", id: "lock-date" }, fmtDate(now)));
+
+    const notifs = previewNotifs();
+    if (notifs.length) {
+      lock.appendChild(el("div", { class: "lock-hint" }, "通知"));
+      notifs.forEach((n) => lock.appendChild(el("div", { class: "card lock-notif" }, [
+        el("div", { class: "row" }, [el("span", { style: { fontSize: "20px" } }, n.icon || "🔔"), el("span", { style: { fontWeight: "600" } }, n.title || n.app || "通知")]),
+        el("div", { class: "muted", style: { marginTop: "2px" } }, n.body || ""),
+      ])));
+    }
+
+    lock.appendChild(el("div", { class: "lock-hint" }, "滑动或点击解锁"));
+
+    if (cfg.enabled && cfg.pin) {
+      lock.appendChild(pinPad(cfg.pin));
+    } else {
+      lock.appendChild(el("button", { class: "btn unlock-btn", onclick: () => hideLock() }, "🔓 解锁"));
+    }
+
+    // Swipe-up anywhere to unlock (PIN-less mode only).
+    let startY = null;
+    lock.addEventListener("pointerdown", (e) => { startY = e.clientY || 0; });
+    lock.addEventListener("pointerup", (e) => {
+      if (!cfg.enabled && startY != null && ((e.clientY || 0) - startY) < -40) hideLock();
+      startY = null;
+    });
+
+    viewEl.classList.remove("home");
+    viewEl.innerHTML = "";
+    viewEl.appendChild(lock);
+  }
+
+  // Numeric PIN pad used by the lock screen when a lock PIN is configured.
+  function pinPad(pin) {
+    const disp = el("div", { class: "pin-display", id: "lock-pin-display" }, "····");
+    const pad = el("div", { class: "pin-pad" });
+    const KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫", "0", "✓"];
+    const build = (k) => el("button", {
+      class: "pin-key",
+      onclick: () => {
+        if (k === "⌫") {
+          disp.textContent = disp.textContent.length > 1 && disp.textContent !== "✗" && disp.textContent !== "····"
+            ? disp.textContent.slice(0, -1)
+            : "····";
+        } else if (k === "✓") {
+          if (disp.textContent === pin) hideLock();
+          else { disp.textContent = "✗"; setTimeout(() => { disp.textContent = "····"; }, 600); }
+        } else {
+          disp.textContent = (disp.textContent === "····" || disp.textContent === "✗")
+            ? k
+            : disp.textContent + k;
+        }
+      },
+    }, k);
+    KEYS.forEach((k) => pad.appendChild(build(k)));
+    return el("div", { class: "lock-pin" }, [disp, pad]);
+  }
+
+  function startLockClock() {
+    if (lockTimer) clearInterval(lockTimer);
+    lockTimer = setInterval(() => {
+      const c = document.getElementById && document.getElementById("lock-clock");
+      const d = document.getElementById && document.getElementById("lock-date");
+      if (c) c.textContent = fmtClock(new Date());
+      if (d) d.textContent = fmtDate(new Date());
+    }, 1000);
+  }
+
+  function showLock() {
+    locked = true;
+    renderLock();
+    startLockClock();
+  }
+
+  function hideLock() {
+    if (!locked) return;
+    locked = false;
+    if (lockTimer) { clearInterval(lockTimer); lockTimer = null; }
+    renderHome();
+  }
+
+  // ---- Recents / app switcher ----
+  function pushRecent(id) {
+    recents = [id, ...recents.filter((r) => r !== id)].slice(0, 8);
+    safeSet("amos.recents", JSON.stringify(recents));
+  }
+
+  function showRecents() {
+    if (locked) return;
+    viewEl.classList.remove("home");
+    viewEl.innerHTML = "";
+    const list = recents.length ? recents : Array.from(apps.keys()).slice(0, 4);
+    const row = el("div", { class: "recents-row" });
+    list.forEach((id) => {
+      const app = apps.get(id);
+      if (!app) return;
+      row.appendChild(el("button", {
+        class: "recents-card",
+        onclick: () => openApp(id),
+      }, [iconTile(app), el("span", { class: "label" }, app.name)]));
+    });
+    viewEl.appendChild(el("div", { class: "recents-screen" }, [
+      el("div", { class: "recents-header" }, "最近使用"),
+      row,
+      el("button", { class: "btn secondary recents-close", onclick: () => hideRecents() }, "完成"),
+    ]));
+  }
+
+  function hideRecents() { renderHome(); }
+
+  // ---- Theme & brightness (make the Settings toggles actually do something) ----
+  function updateBrightness(v) {
+    const val = v != null ? Number(v) : 70;
+    const body = (typeof document !== "undefined" && document.body) ? document.body : null;
+    if (!body) return;
+    if (!brightnessOverlay) {
+      brightnessOverlay = el("div", { class: "brightness-overlay" });
+      body.appendChild(brightnessOverlay);
+    }
+    brightnessOverlay.style.opacity = String((100 - val) / 100);
+  }
+
+  function applyTheme() {
+    const s = readSettings();
+    const dark = !s.darkmode;
+    const root = (typeof document !== "undefined" && document.documentElement) ? document.documentElement : null;
+    if (root) root.setAttribute("data-theme", dark ? "dark" : "light");
+    updateBrightness(s.brightness);
+  }
+
+  // Re-apply the theme whenever settings change (darkmode / brightness toggles).
+  onStore("amos.settings", () => applyTheme());
+  // Re-render the lock screen if the PIN config changes while locked.
+  onStore("amos.lock", () => { if (locked) renderLock(); });
+
+  applyTheme();
+
+  // ---- First-run onboarding (shown before the lock screen on first boot) ----
+  let onbPage = 0;
+  function renderOnboarding() {
+    const wrap = el("div", { class: "onb-screen" });
+    if (onbPage === 0) {
+      wrap.appendChild(el("div", { class: "onb-hero" }, "📱"));
+      wrap.appendChild(el("div", { class: "onb-title" }, "欢迎使用 Amos OS"));
+      wrap.appendChild(el("div", { class: "muted", style: { maxWidth: "320px", textAlign: "center" } },
+        "AI 优先的移动操作系统。上滑解锁、上滑切换应用、长按整理主屏。"));
+      wrap.appendChild(el("button", { class: "btn onb-next", onclick: () => { onbPage = 1; renderOnboarding(); } }, "开始"));
+    } else {
+      const dark = !!readSettings().darkmode;
+      const pin = el("input", {
+        class: "field onb-pin", type: "text", inputmode: "numeric", maxlength: "6",
+        placeholder: "设置锁屏密码（可选，4-6 位数字）", style: { marginTop: "10px", maxWidth: "320px" },
+      });
+      const pick = (mode) => {
+        const s = readSettings(); s.darkmode = mode; storeWrite("amos.settings", JSON.stringify(s)); applyTheme();
+        renderOnboarding();
+      };
+      wrap.appendChild(el("div", { class: "onb-title" }, "快速设置"));
+      wrap.appendChild(el("div", { class: "onb-row" }, [
+        el("button", { class: "btn secondary" + (dark ? " onb-sel" : ""), onclick: () => pick(true) }, "🌙 深色"),
+        el("button", { class: "btn secondary" + (!dark ? " onb-sel" : ""), onclick: () => pick(false) }, "☀️ 浅色"),
+      ]));
+      wrap.appendChild(pin);
+      wrap.appendChild(el("button", { class: "btn onb-next", onclick: () => {
+        const v = pin.value.trim();
+        if (v) { const l = readLockConfig(); l.enabled = true; l.pin = v; storeWrite("amos.lock", JSON.stringify(l)); }
+        finishOnboarding();
+      } }, "完成"));
+    }
+    viewEl.classList.remove("home");
+    viewEl.innerHTML = "";
+    viewEl.appendChild(wrap);
+  }
+
+  function showOnboarding() { onbPage = 0; renderOnboarding(); }
+
+  function finishOnboarding() {
+    storeWrite("amos.onboarded", "1");
+    onbPage = 0;
+    showLock();
+  }
+
   // ---- Public API ----
   return {
     el,
@@ -373,6 +589,123 @@ window.Amos = (() => {
     renderHome,
     enterJiggle,
     exitJiggle,
+    showLock,
+    hideLock,
+    showRecents,
+    hideRecents,
+    pushRecent,
+    applyTheme,
+    showOnboarding,
+    finishOnboarding,
+    get isLocked() { return locked; },
     init(v) { viewEl = v; },
+  };
+})();
+
+// ---- Hardware buttons (Home / Voice / AI) ----
+// The Rust core (`amos-tauri/src/buttons.rs`) emits a `hardware-button` event
+// when a physical button is pressed; `main.js` forwards it here. `press(name)`
+// drives the same path via the `simulate_button` command (desktop dev / tests),
+// falling back to `handle` when not running inside Tauri.
+window.AmosButtons = (() => {
+  const A = window.Amos;
+  return {
+    handle(button) {
+      const n = String(button || "").toLowerCase();
+      if (n === "home" || n === "home_button") { A.systemHome(); return; }
+      if (n === "voice") { A.openApp("ai"); return; }
+      if (n === "ai" || n === "ai_assistant" || n === "assistant" || n === "aibutton") { A.openApp("ai"); return; }
+    },
+    press(name) {
+      const I = window.__TAURI_INTERNALS__;
+      if (I) { I.invoke("simulate_button", { button: name }).catch(() => {}); }
+      else this.handle(name);
+    },
+  };
+})();
+
+// ---- Voice input (ASR) ----
+// The AI/translate app captures audio (e.g. via getUserMedia) and calls
+// `AmosVoice.transcribe(bytes)`; this forwards to the `transcribe_audio`
+// command, which runs the translate daemon's ASR recognizer. Without Tauri it
+// resolves to an empty, unrecognized result so callers can degrade gracefully.
+window.AmosVoice = (() => ({
+  async transcribe(audioBytes, opts = {}) {
+    const I = window.__TAURI_INTERNALS__;
+    if (!I) return { text: "", recognized: false };
+    const bytes = Array.from(audioBytes || []);
+    return I.invoke("transcribe_audio", {
+      audio: bytes,
+      language: opts.language || "",
+      format: opts.format || "wav",
+    });
+  },
+  // Translate a text segment through the translate daemon.
+  async translate(text, opts = {}) {
+    const I = window.__TAURI_INTERNALS__;
+    if (!I) return "";
+    return I.invoke("translate_text", {
+      text,
+      source_lang: opts.source_lang || "",
+      target_lang: opts.target_lang || "",
+    });
+  },
+}))();
+
+// ---- Interpretation session (同声传译) ----
+// Bridges `interpret_*` commands so the UI can run a live interpretation
+// session. Outputs arrive as `interpret-output` events (wired in main.js) and
+// are routed to `onOutput` (a hook apps can override). Without Tauri these are
+// no-ops so a non-Tauri build degrades gracefully.
+window.AmosInterp = (() => {
+  const I = window.__TAURI_INTERNALS__;
+  let sessionId = null;
+  return {
+    // Hook for `interpret-output` events; apps may replace it.
+    onOutput(payload) {
+      if (payload && payload.kind === "segment_final") {
+        console.log("[interp]", payload.source_text, "→", payload.target_text);
+      }
+    },
+    get sessionId() { return sessionId; },
+    async start(opts = {}) {
+      if (!I) return null;
+      sessionId = await I.invoke("interpret_start", {
+        source_lang: opts.source || "auto",
+        target_lang: opts.target || "zh",
+      });
+      return sessionId;
+    },
+    async text(text) {
+      if (!I || !sessionId) return;
+      return I.invoke("interpret_text", { text, sessionId });
+    },
+    async audio(chunk) {
+      if (!I || !sessionId) return;
+      return I.invoke("interpret_audio", { chunk: Array.from(chunk || []), sessionId });
+    },
+    async endOfSpeech() {
+      if (!I || !sessionId) return;
+      return I.invoke("interpret_end_of_speech", { sessionId });
+    },
+    async pause() { if (I && sessionId) return I.invoke("interpret_pause", { sessionId }); },
+    async resume() { if (I && sessionId) return I.invoke("interpret_resume", { sessionId }); },
+    async stop() { if (I && sessionId) return I.invoke("interpret_stop", { sessionId }); },
+    async restart() { if (I && sessionId) return I.invoke("interpret_restart", { sessionId }); },
+    async abort() { if (I && sessionId) return I.invoke("interpret_abort", { sessionId }); },
+    async status() { if (!I) return null; return I.invoke("interpret_status"); },
+  };
+})();
+
+// ---- Text-to-speech (同传播报) ----
+// Synthesizes translated text to playable PCM via the `tts_synthesize` command.
+// Without Tauri it returns null so callers degrade gracefully.
+window.AmosTts = (() => {
+  const I = window.__TAURI_INTERNALS__;
+  return {
+    async synthesize(text, opts = {}) {
+      if (!I) return null;
+      return I.invoke("tts_synthesize", { text, lang: opts.lang || "zh" });
+    },
   };
 })();

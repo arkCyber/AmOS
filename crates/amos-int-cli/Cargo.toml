@@ -1,0 +1,21 @@
+[package]
+name = "amos-int-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos text simultaneous-interpretation CLI: drives an amos_int::Session over a GrpcPipeline to the amos-translate daemon (stdin text in, translation out)."
+
+[lib]
+name = "amos_int_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amos-int-cli"
+path = "src/main.rs"
+
+[dependencies]
+amos-int.workspace = true
+amos-translate = { path = "../amos-translate" }
+tokio.workspace = true
+anyhow.workspace = true

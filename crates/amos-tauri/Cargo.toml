@@ -18,6 +18,9 @@ tauri-build.workspace = true
 [dependencies]
 amos-proto.workspace = true
 amos-wm = { path = "../amos-wm" }
+amos-int.workspace = true
+amos-translate = { path = "../amos-translate" }
+amos-tts = { path = "../amos-tts" }
 tauri.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -25,4 +28,5 @@ tonic.workspace = true
 tower.workspace = true
 hyper-util.workspace = true
 serde.workspace = true
+serde_json = "1.0"
 tracing.workspace = true

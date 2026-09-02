@@ -1,0 +1,17 @@
+[package]
+name = "amos-int"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos simultaneous-interpretation session engine: a transport-agnostic state machine and streaming pipeline (ASR -> translation -> TTS), mirroring sokuji's IClient/provider design so the same core drives both the CLI daemon and the Tauri UI."
+
+[lib]
+name = "amos_int"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+async-trait = "0.1"
+serde.workspace = true
+tokio.workspace = true

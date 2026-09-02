@@ -33,6 +33,23 @@ message AgentChunk {
   string token = 2;                      // next piece of generated text
   bool done = 3;                         // true on the terminal frame of the stream
   string error = 4;                      // non-empty when the generation failed
+  UiCard card = 5;                       // optional structured UI descriptor (semantic "card")
+}
+
+// A structured, AI-generated UI descriptor. The frontend renders these as
+// dynamic cards ("语义中枢 → 像素表面"), so the agent can drive the interface
+// instead of only returning text. See `cards.js` for the renderers.
+message UiCard {
+  string kind = 1;                // "weather" | "media" | "note" | "wallet" | "action" | ...
+  string title = 2;
+  string subtitle = 3;
+  repeated UiField fields = 4;    // key/value rows to display
+  repeated string actions = 5;    // quick-action button labels
+}
+
+message UiField {
+  string key = 1;
+  string value = 2;
 }
 
 message ClientMessage {

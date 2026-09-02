@@ -1,4 +1,6 @@
-//! gRPC `AndroidManager` service backed by an [`AndroidRuntime`] driver.
+//! gRPC `AndroidManager` service backed by an [`EnhancedAndroidManager`], which
+//! wraps the underlying [`AndroidRuntime`] with operation timeouts and an LRU
+//! icon cache so the Tauri core gets a robust, bounded-memory surface.
 
 use std::sync::Arc;
 
@@ -8,20 +10,27 @@ use amos_proto::android_compat::{
 };
 use tonic::{Request, Response, Status};
 
+use crate::manager::EnhancedAndroidManager;
 use crate::runtime::AndroidRuntime;
 
 /// gRPC service exposing the Android-compat layer to the Tauri core.
 ///
-/// Runtime calls are moved onto a blocking thread (`spawn_blocking`) so a
-/// subprocess call never stalls the async executor.
+/// All calls flow through [`EnhancedAndroidManager`], so every operation has a
+/// configurable timeout and icon fetches are cached (LRU) rather than hitting
+/// the container every time.
 pub struct AndroidManagerService {
-    runtime: Arc<dyn AndroidRuntime>,
+    manager: Arc<EnhancedAndroidManager>,
 }
 
 impl AndroidManagerService {
-    /// Build a service around an Android runtime driver.
+    /// Build a service around an enhanced manager (timeouts + icon cache).
+    pub fn with_manager(manager: Arc<EnhancedAndroidManager>) -> Self {
+        Self { manager }
+    }
+
+    /// Convenience: wrap a raw runtime in the default enhanced manager.
     pub fn with_runtime(runtime: Arc<dyn AndroidRuntime>) -> Self {
-        Self { runtime }
+        Self::with_manager(Arc::new(EnhancedAndroidManager::new(runtime)))
     }
 }
 
@@ -32,35 +41,29 @@ impl AndroidManager for AndroidManagerService {
         request: Request<AppLaunchRequest>,
     ) -> Result<Response<AppLaunchResponse>, Status> {
         let package_name = request.into_inner().package_name;
-        let runtime = self.runtime.clone();
-        let result = tokio::task::spawn_blocking(move || runtime.launch(&package_name))
-            .await
-            .unwrap_or_else(|e| Err(format!("task join error: {e}")));
-        Ok(Response::new(match result {
-            Ok(window_id) => AppLaunchResponse {
-                success: true,
-                window_id,
-                error: String::new(),
+        Ok(Response::new(
+            match self.manager.launch_app(&package_name).await {
+                Ok(window_id) => AppLaunchResponse {
+                    success: true,
+                    window_id,
+                    error: String::new(),
+                },
+                Err(error) => AppLaunchResponse {
+                    success: false,
+                    window_id: String::new(),
+                    error: error.to_string(),
+                },
             },
-            Err(error) => AppLaunchResponse {
-                success: false,
-                window_id: String::new(),
-                error,
-            },
-        }))
+        ))
     }
 
     async fn get_installed_apps(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<AppListResponse>, Status> {
-        let runtime = self.runtime.clone();
-        let result = tokio::task::spawn_blocking(move || runtime.list_apps())
-            .await
-            .unwrap_or_else(|e| Err(format!("task join error: {e}")));
-        match result {
+        match self.manager.list_apps().await {
             Ok(apps) => Ok(Response::new(AppListResponse { apps })),
-            Err(e) => Err(Status::internal(e)),
+            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
@@ -69,27 +72,24 @@ impl AndroidManager for AndroidManagerService {
         request: Request<AppIconRequest>,
     ) -> Result<Response<AppIconResponse>, Status> {
         let package_name = request.into_inner().package_name;
-        let runtime = self.runtime.clone();
-        let icon = tokio::task::spawn_blocking(move || runtime.icon_for(&package_name))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("icon task join error: {e}");
-                None
-            });
-        Ok(Response::new(match icon {
-            Some(png) => AppIconResponse {
-                icon_png: png,
-                found: true,
+        Ok(Response::new(
+            match self.manager.get_icon(&package_name).await {
+                Ok(Some(png)) => AppIconResponse {
+                    icon_png: png,
+                    found: true,
+                },
+                // Icon not found / fetch timeout are non-fatal by design.
+                Ok(None) | Err(_) => AppIconResponse {
+                    icon_png: Vec::new(),
+                    found: false,
+                },
             },
-            None => AppIconResponse {
-                icon_png: Vec::new(),
-                found: false,
-            },
-        }))
+        ))
     }
 }
 
-/// Convenience for wiring the service into a tonic server.
+/// Convenience for wiring the service into a tonic server. Wraps the runtime in
+/// the default enhanced manager so timeouts + caching apply automatically.
 pub fn server(runtime: Arc<dyn AndroidRuntime>) -> AndroidManagerServer<AndroidManagerService> {
     AndroidManagerServer::new(AndroidManagerService::with_runtime(runtime))
 }
@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_app_icon_returns_png() {
+    async fn get_app_icon_returns_png_and_caches() {
         let svc = AndroidManagerService::with_runtime(Arc::new(DemoRuntime::new()));
         let reply = svc
             .get_app_icon(Request::new(AppIconRequest {
@@ -140,5 +140,20 @@ mod tests {
             &reply.icon_png[..8],
             &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
         );
+
+        // Second call hits the LRU cache (no runtime round-trip).
+        let stats = svc.manager.cache_stats().await;
+        assert_eq!(stats.entries, 1, "icon cached after first fetch");
+        assert_eq!(stats.total_accesses, 1, "first access counted");
+        let again = svc
+            .get_app_icon(Request::new(AppIconRequest {
+                package_name: "com.tencent.mm".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(again.found);
+        let stats2 = svc.manager.cache_stats().await;
+        assert_eq!(stats2.total_accesses, 2, "cache hit bumps access count");
     }
 }

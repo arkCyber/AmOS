@@ -1,0 +1,69 @@
+// Amos simultaneous-interpretation (同声翻译) contract.
+//
+// The System UI / amos-ai talks to the dedicated `amos-translate` daemon over
+// this gRPC surface (Unix Domain Socket). The daemon routes translation through
+// a pluggable provider (Ollama / Hermes / API), keeping the model backend
+// swappable without touching the transport or UI layers.
+syntax = "proto3";
+
+package translate;
+
+service Translator {
+  // Unary text translation.
+  rpc Translate(TranslateRequest) returns (TranslateResponse);
+
+  // Speech-to-text: transcribe an audio segment (drives the hardware Voice
+  // button). `recognized=false` when no recognizer is configured or it fails.
+  rpc Transcribe(TranscribeRequest) returns (TranscribeResponse);
+
+  // Bidirectional streaming for simultaneous interpretation: the client sends
+  // source segments (text now; audio once ASR is wired), the daemon streams
+  // back translated segments as they complete.
+  rpc StreamTranslate(stream TranslateIn) returns (stream TranslateOut);
+
+  // Liveness / model probe used by the System UI.
+  rpc GetStatus(StatusRequest) returns (StatusReply);
+}
+
+message TranscribeRequest {
+  bytes audio = 1;      // audio bytes (wav / webm / raw)
+  string language = 2;  // e.g. "zh"; empty = auto
+  string format = 3;    // e.g. "wav", "webm"; empty = auto
+}
+
+message TranscribeResponse {
+  string text = 1;        // transcribed text
+  bool recognized = 2;    // false when no recognizer configured or the call failed
+}
+
+message TranslateRequest {
+  string text = 1;          // text to translate
+  string source_lang = 2;   // e.g. "en", "zh"; empty = auto-detect
+  string target_lang = 3;   // e.g. "zh"
+}
+
+message TranslateResponse {
+  string translated = 1;    // the translated text
+  string detected_lang = 2; // detected source language (empty when given)
+}
+
+message TranslateIn {
+  oneof payload {
+    string text = 1;        // a source segment
+    bytes audio = 2;        // optional audio segment (ASR not wired yet)
+  }
+}
+
+message TranslateOut {
+  string segment = 1;       // one translated segment
+  bool done = 2;            // true on the terminal frame of the stream
+}
+
+message StatusRequest {}
+
+message StatusReply {
+  bool running = 1;
+  string model = 2;
+  string source_lang = 3;
+  string target_lang = 4;
+}

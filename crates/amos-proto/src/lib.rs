@@ -18,6 +18,27 @@ pub mod android_compat {
     tonic::include_proto!("android_compat");
 }
 
+pub mod translate {
+    //! Generated types for the simultaneous-interpretation daemon:
+    //! `translator_client` (client), `translator_server` (server), and messages
+    //! (`TranslateRequest`, `TranslateIn`, `TranslateOut`, ...).
+    tonic::include_proto!("translate");
+}
+
+/// gRPC metadata header carrying the caller's client id.
+///
+/// The System UI (Tauri core) sends this on every RPC so the daemon's security
+/// layer can apply per-client rate limits and attribute each audit entry to a
+/// concrete caller instead of an anonymous "default".
+pub const CLIENT_ID_HEADER: &str = "x-amos-client";
+
+/// Default client id used when a caller does not send [`CLIENT_ID_HEADER`]
+/// (legacy clients, the boot readiness probe, or third-party tools).
+///
+/// The daemon grants this identity `Standard` access by default so existing
+/// callers keep working once security is enabled.
+pub const DEFAULT_CLIENT_ID: &str = "system-ui";
+
 /// Resolution of the Unix Domain Socket used for inter-process RPC.
 pub mod socket {
     use std::path::PathBuf;

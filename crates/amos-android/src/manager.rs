@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
 use anyhow::{anyhow, Result};
+use tokio::sync::RwLock;
 
 use amos_proto::android_compat::AndroidApp;
 
@@ -79,10 +79,10 @@ impl EnhancedAndroidManager {
     pub async fn launch_app(&self, package_name: &str) -> Result<String> {
         self.increment_ops().await;
         let timeout = Duration::from_secs(self.config.launch_timeout_secs);
-        
+
         let pkg = package_name.to_string();
         let runtime = self.runtime.clone();
-        
+
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || runtime.launch(&pkg)),
@@ -105,7 +105,11 @@ impl EnhancedAndroidManager {
                 Err(anyhow!("task join error: {}", e))
             }
             Err(_) => {
-                tracing::error!("app launch timeout after {}s: {}", self.config.launch_timeout_secs, package_name);
+                tracing::error!(
+                    "app launch timeout after {}s: {}",
+                    self.config.launch_timeout_secs,
+                    package_name
+                );
                 Err(anyhow!("operation timeout"))
             }
         }
@@ -115,9 +119,9 @@ impl EnhancedAndroidManager {
     pub async fn list_apps(&self) -> Result<Vec<AndroidApp>> {
         self.increment_ops().await;
         let timeout = Duration::from_secs(self.config.list_timeout_secs);
-        
+
         let runtime = self.runtime.clone();
-        
+
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || runtime.list_apps()),
@@ -160,10 +164,10 @@ impl EnhancedAndroidManager {
 
         self.increment_ops().await;
         let timeout = Duration::from_secs(self.config.icon_timeout_secs);
-        
+
         let pkg = package_name.to_string();
         let runtime = self.runtime.clone();
-        
+
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || runtime.icon_for(&pkg)),
@@ -177,7 +181,7 @@ impl EnhancedAndroidManager {
                 // Store in cache.
                 {
                     let mut cache = self.icon_cache.write().await;
-                    
+
                     // Evict oldest entry if cache is full.
                     if cache.len() >= self.config.icon_cache_size {
                         if let Some(oldest_key) = cache
@@ -212,7 +216,11 @@ impl EnhancedAndroidManager {
                 Ok(None) // Non-fatal, return None instead of error
             }
             Err(_) => {
-                tracing::warn!("icon fetch timeout after {}s: {}", self.config.icon_timeout_secs, package_name);
+                tracing::warn!(
+                    "icon fetch timeout after {}s: {}",
+                    self.config.icon_timeout_secs,
+                    package_name
+                );
                 Ok(None) // Non-fatal timeout
             }
         }
@@ -223,7 +231,7 @@ impl EnhancedAndroidManager {
         let cache = self.icon_cache.read().await;
         let total_bytes: usize = cache.values().map(|e| e.png_data.len()).sum();
         let total_accesses: usize = cache.values().map(|e| e.access_count).sum();
-        
+
         CacheStats {
             entries: cache.len(),
             total_bytes,

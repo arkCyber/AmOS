@@ -31,6 +31,10 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 | `amos-wm` | transport-agnostic window-manager state machine (z-order/focus) |
 | `amos-android` | Waydroid / demo runtime + icon extraction + PNG generation |
 | `amos-tauri` | System UI: launcher, 14 apps, notification center, gRPC bridge, Android commands |
+| `amos-translate` | simultaneous-interpretation daemon (gRPC) with pluggable translation + ASR providers |
+| `amos-int` | transport-agnostic interpretation session engine (state machine, utterance assembly, `Pipeline` trait) |
+| `amos-asr` | streaming speech recognition: `StreamingRecognizer` abstraction + `AsrPipeline` (Partial/Final) + gated sherpa-onnx backend |
+| `amos-tts` | text-to-speech: `TtsProvider` trait (Mock + gated Piper) -> playable `TtsAudio` |
 
 ## RPC contract (`proto/`)
 

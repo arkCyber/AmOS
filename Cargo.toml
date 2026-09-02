@@ -6,6 +6,12 @@ members = [
     "crates/amos-wm",
     "crates/amos-android",
     "crates/amos-tauri",
+    "crates/amos-supervisor",
+    "crates/amos-translate",
+    "crates/amos-int",
+    "crates/amos-int-cli",
+    "crates/amos-asr",
+    "crates/amos-tts",
 ]
 
 [workspace.package]
@@ -35,6 +41,7 @@ tauri-build = "2"
 # ---- local workspace crates ----
 amos-proto = { path = "crates/amos-proto" }
 amos-android = { path = "crates/amos-android" }
+amos-int = { path = "crates/amos-int" }
 
 # ---- profile tuning for fast iteration / smaller mobile binaries ----
 [profile.dev]

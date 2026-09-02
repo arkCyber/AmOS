@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
 use anyhow::Result;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// Audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,11 +106,31 @@ impl TokenBucket {
     }
 }
 
+/// Per-client state for the rate limiter.
+#[derive(Debug)]
+struct ClientBuckets {
+    request: TokenBucket,
+    tokens: TokenBucket,
+    /// Unix timestamp (secs) of the last request/token check from this client.
+    last_activity: u64,
+}
+
+impl ClientBuckets {
+    fn new(rps: usize, tokens_per_hour: usize) -> Self {
+        Self {
+            request: TokenBucket::new(rps, rps),
+            tokens: TokenBucket::new(tokens_per_hour, tokens_per_hour / 3600),
+            last_activity: current_timestamp(),
+        }
+    }
+}
+
 /// Rate limiter for clients.
+#[derive(Clone)]
 pub struct RateLimiter {
     config: RateLimitConfig,
-    /// Client ID -> (request bucket, token bucket).
-    buckets: Arc<RwLock<HashMap<String, (TokenBucket, TokenBucket)>>>,
+    /// Client ID -> per-client rate-limit state.
+    buckets: Arc<RwLock<HashMap<String, ClientBuckets>>>,
 }
 
 impl RateLimiter {
@@ -125,16 +145,12 @@ impl RateLimiter {
     /// Check if a client can make a request.
     pub async fn check_request(&self, client_id: &str) -> Result<()> {
         let mut buckets = self.buckets.write().await;
-        let entry = buckets
-            .entry(client_id.to_string())
-            .or_insert_with(|| {
-                (
-                    TokenBucket::new(self.config.requests_per_second, self.config.requests_per_second),
-                    TokenBucket::new(self.config.tokens_per_hour, self.config.tokens_per_hour / 3600),
-                )
-            });
+        let entry = buckets.entry(client_id.to_string()).or_insert_with(|| {
+            ClientBuckets::new(self.config.requests_per_second, self.config.tokens_per_hour)
+        });
+        entry.last_activity = current_timestamp();
 
-        if entry.0.consume(1) {
+        if entry.request.consume(1) {
             Ok(())
         } else {
             Err(anyhow::anyhow!("rate limit exceeded: requests per second"))
@@ -144,29 +160,33 @@ impl RateLimiter {
     /// Check if a client can generate tokens.
     pub async fn check_tokens(&self, client_id: &str, count: usize) -> Result<()> {
         let mut buckets = self.buckets.write().await;
-        let entry = buckets
-            .entry(client_id.to_string())
-            .or_insert_with(|| {
-                (
-                    TokenBucket::new(self.config.requests_per_second, self.config.requests_per_second),
-                    TokenBucket::new(self.config.tokens_per_hour, self.config.tokens_per_hour / 3600),
-                )
-            });
+        let entry = buckets.entry(client_id.to_string()).or_insert_with(|| {
+            ClientBuckets::new(self.config.requests_per_second, self.config.tokens_per_hour)
+        });
+        entry.last_activity = current_timestamp();
 
-        if entry.1.consume(count) {
+        if entry.tokens.consume(count) {
             Ok(())
         } else {
             Err(anyhow::anyhow!("rate limit exceeded: tokens per hour"))
         }
     }
 
-    /// Clean up stale client entries.
-    pub async fn cleanup_stale(&self) {
-        // In a production system, track last_activity and remove old entries
+    /// Remove client buckets idle for longer than `idle_window_secs`, bounding
+    /// memory when many one-off clients connect over time. Only *inactive*
+    /// clients are dropped — active quotas are preserved (unlike clearing all).
+    pub async fn cleanup_stale(&self, idle_window_secs: u64) {
         let mut buckets = self.buckets.write().await;
-        tracing::debug!("rate limiter: {} active clients", buckets.len());
-        // TODO: Remove inactive clients
-        buckets.clear(); // For now, keep all to avoid premature cleanup
+        let now = current_timestamp();
+        let before = buckets.len();
+        buckets.retain(|_, b| now.saturating_sub(b.last_activity) < idle_window_secs);
+        if before != buckets.len() {
+            tracing::debug!(
+                "rate limiter cleanup: {} -> {} clients",
+                before,
+                buckets.len()
+            );
+        }
     }
 }
 
@@ -387,6 +407,19 @@ impl SecurityManager {
             )
             .await;
     }
+
+    /// Spawn a background task that periodically drops idle client buckets to
+    /// bound memory. The idle window comes from `cleanup_interval_secs`.
+    pub fn start_cleanup_task(&self) {
+        let idle_secs = self.rate_limiter.config.cleanup_interval_secs.max(1);
+        let limiter = self.rate_limiter.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(idle_secs)).await;
+                limiter.cleanup_stale(idle_secs).await;
+            }
+        });
+    }
 }
 
 /// Get current Unix timestamp in seconds.
@@ -458,5 +491,34 @@ mod tests {
 
         assert!(manager.validate_request("client1").await.is_ok());
         assert!(manager.validate_request("unknown").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_drops_idle_clients_keeps_active() {
+        let config = RateLimitConfig {
+            cleanup_interval_secs: 3600,
+            ..Default::default()
+        };
+        let limiter = RateLimiter::new(config);
+        limiter.check_request("active").await.unwrap();
+        limiter.check_request("idle").await.unwrap();
+        assert_eq!(
+            limiter.buckets.read().await.len(),
+            2,
+            "two clients registered"
+        );
+
+        // Simulate the "idle" client having been inactive for two hours.
+        {
+            let mut b = limiter.buckets.write().await;
+            let idle = b.get_mut("idle").expect("idle bucket exists");
+            idle.last_activity = current_timestamp().saturating_sub(7200);
+        }
+
+        limiter.cleanup_stale(3600).await;
+        let b = limiter.buckets.read().await;
+        assert_eq!(b.len(), 1, "idle client dropped");
+        assert!(b.contains_key("active"), "active client retained");
+        assert!(!b.contains_key("idle"), "idle client gone");
     }
 }

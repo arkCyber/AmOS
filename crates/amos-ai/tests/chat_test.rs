@@ -100,6 +100,53 @@ async fn bidi_chat_prompt_streams_tokens_then_done() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn bidi_chat_semantic_intent_returns_ui_card() {
+    let path: PathBuf = std::env::temp_dir().join(format!("amos-card-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    wait_for_socket(&path).await;
+
+    let mut client = connect(&path).await.expect("connect");
+    let (tx, rx) = mpsc::channel(64);
+    let mut stream = client
+        .chat(ReceiverStream::new(rx))
+        .await
+        .expect("open bidi chat")
+        .into_inner();
+
+    // "播放一首歌" maps to a media intent → a structured UiCard.
+    tx.send(prompt("帮我播放一首歌"))
+        .await
+        .expect("send prompt");
+
+    let mut got_card = None;
+    while let Ok(Some(chunk)) = stream.message().await {
+        if let Some(card) = chunk.card {
+            if !card.kind.is_empty() {
+                got_card = Some(card);
+            }
+        }
+        if chunk.done {
+            break;
+        }
+    }
+
+    let card = got_card.expect("a UiCard should be attached to the done frame");
+    assert_eq!(card.kind, "media", "media intent should yield a media card");
+    assert!(
+        card.actions.iter().any(|a| a.contains("音乐")),
+        "media card offers an action"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bidi_chat_audio_is_acknowledged() {
     let path: PathBuf =
         std::env::temp_dir().join(format!("amos-audio-{}.sock", std::process::id()));

@@ -65,6 +65,39 @@ Release build for the whole OS stack (CLI + UI in one go):
 cargo build --release
 ```
 
+## Inference backend
+
+The daemon routes generation through a pluggable backend selected by `AMOS_BACKEND`:
+
+```bash
+# Mock (default) — deterministic, no network, for dev/tests
+AMOS_BACKEND=mock cargo run -p amos-ai
+
+# Real external API (OpenAI-compatible, streaming over SSE)
+AMOS_BACKEND=api \
+  AMOS_API_KEY=sk-... \
+  AMOS_API_ENDPOINT=https://api.openai.com/v1/chat/completions \
+  AMOS_MODEL=gpt-4o-mini \
+  cargo run -p amos-ai
+
+# Local Ollama (Hermes / any pulled model) — keyless, streaming, function-calling ready
+AMOS_BACKEND=ollama \
+  AMOS_OLLAMA_HOST=http://localhost:11434 \
+  AMOS_MODEL=hermes3 \
+  cargo run -p amos-ai
+
+# Hermes-Rust agent (which itself calls Ollama) — real token streaming + tools
+AMOS_BACKEND=hermes \
+  AMOS_HERMES_ENDPOINT=http://127.0.0.1:11438 \
+  AMOS_MODEL=hermes-rust \
+  cargo run -p amos-ai
+
+# Local GGML (llama.cpp) — binding not wired yet; falls back to mock
+AMOS_BACKEND=ggml AMOS_MODEL_PATH=/path/to/model.gguf cargo run -p amos-ai
+```
+
+Unrecognized / failing backend selections fall back to mock so the daemon always boots.
+
 ## RPC contract (`proto/ai_agent.proto`)
 
 | RPC             | Kind                  | Purpose                                   |

@@ -8,9 +8,25 @@
   let agentNode = null;
   let busy = false;
   let aborted = false;
-  let sessionCounter = 0;
   let activeSession = null;
   const sessions = new Map();
+  const SESSION_KEY = "amos.ai.session";
+
+  // Stable per-conversation session id, persisted so multi-turn memory survives
+  // across renders. Backends with lineage (Hermes-Rust) bind all turns with the
+  // same id to one conversation.
+  function conversationId() {
+    const existing = A.safeGet(SESSION_KEY, "");
+    if (existing) return existing;
+    const id = "conv-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+    A.safeSet(SESSION_KEY, id);
+    return id;
+  }
+  function newConversation() {
+    const id = "conv-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+    A.safeSet(SESSION_KEY, id);
+    return id;
+  }
 
   const api = {
     get mounted() { return mounted; },
@@ -76,11 +92,26 @@
       }).catch(() => { el.textContent = ""; });
     },
 
+    // Stable conversation identity (multi-turn memory).
+    conversationId,
+    newConversation,
+
+    // Render a structured UI card (from the daemon's semantic intent engine).
+    showCard(card) {
+      if (!mounted || !card || !card.kind) return;
+      const log = document.getElementById("ai-log");
+      if (!log || !window.AmosCards) return;
+      const node = window.AmosCards.render(card);
+      if (node) { log.appendChild(node); log.scrollTop = log.scrollHeight; }
+      api.chatComplete();
+    },
+
     reset() {
       const log = document.getElementById("ai-log");
       if (log) log.innerHTML = "";
       agentNode = null;
       sessions.clear();
+      newConversation(); // clearing the log also starts a fresh session lineage
     },
   };
   window.AmosAi = api;
@@ -130,7 +161,7 @@
         if (stop) stop.disabled = false;
         addMsg("me", text);
         input.value = "";
-        const sid = `ui-${++sessionCounter}`;
+        const sid = conversationId();
         activeSession = sid;
         const I = window.__TAURI_INTERNALS__;
         if (!I) {

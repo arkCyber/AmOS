@@ -8,6 +8,7 @@ pub mod cli;
 pub mod config;
 pub mod inference;
 pub mod security;
+pub mod semantic;
 pub mod server;
 pub mod session;
 

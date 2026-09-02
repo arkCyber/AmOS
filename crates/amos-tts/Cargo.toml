@@ -1,0 +1,26 @@
+[package]
+name = "amos-tts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos text-to-speech: a pluggable TtsProvider trait (Mock + feature-gated Piper) that turns an amos_int::TtsRequest into playable TtsAudio."
+
+[lib]
+name = "amos_tts"
+path = "src/lib.rs"
+
+[dependencies]
+amos-int.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
+anyhow.workspace = true
+
+# Native Piper TTS backend (needs model files; gated so the default build stays light).
+[features]
+default = []
+piper = ["dep:piper-rs"]
+
+[dependencies.piper-rs]
+version = "0.2"
+optional = true

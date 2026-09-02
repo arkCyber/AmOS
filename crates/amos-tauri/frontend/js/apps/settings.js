@@ -70,6 +70,46 @@ window.Amos.register({
         ]),
       ]),
       (() => {
+        // 锁屏密码: enable PIN lock + set/change the numeric PIN.
+        const lockCfg = (() => { try { return JSON.parse(A.safeGet("amos.lock", "{}") || "{}"); } catch (_) { return {}; } })();
+        const msg = A.el("div", { class: "muted", style: { marginTop: "6px" } },
+          lockCfg.enabled ? (lockCfg.pin ? `已启用密码（${lockCfg.pin}）` : "已启用，请设置密码") : "未启用");
+        const pinInput = A.el("input", {
+          class: "field", type: "text", inputmode: "numeric", maxlength: "6",
+          placeholder: "4-6 位数字密码",
+          style: { marginTop: "8px", display: lockCfg.enabled ? "block" : "none" },
+        });
+        const apply = () => {
+          const lock = (() => { try { return JSON.parse(A.safeGet("amos.lock", "{}") || "{}"); } catch (_) { return {}; } })();
+          if (lock.enabled && pinInput.value.trim()) lock.pin = pinInput.value.trim();
+          A.storeWrite("amos.lock", JSON.stringify(lock));
+          msg.textContent = lock.enabled ? (lock.pin ? `已启用密码（${lock.pin}）` : "已启用，请设置密码") : "未启用";
+          pinInput.value = "";
+        };
+        return A.el("div", { class: "card" }, [
+          A.el("div", { class: "row spread" }, [
+            A.el("span", null, "锁屏密码"),
+            A.el("label", { class: "switch" }, [
+              A.el("input", {
+                type: "checkbox",
+                checked: !!lockCfg.enabled,
+                onchange: (e) => {
+                  const lock = (() => { try { return JSON.parse(A.safeGet("amos.lock", "{}") || "{}"); } catch (_) { return {}; } })();
+                  lock.enabled = e.target.checked;
+                  A.storeWrite("amos.lock", JSON.stringify(lock));
+                  pinInput.style.display = e.target.checked ? "block" : "none";
+                  msg.textContent = e.target.checked ? "已启用，请设置密码" : "未启用";
+                },
+              }),
+              A.el("span", { class: "track" }),
+            ]),
+          ]),
+          msg,
+          pinInput,
+          A.el("button", { class: "btn secondary", style: { marginTop: "8px" }, onclick: apply }, "保存密码"),
+        ]);
+      })(),
+      (() => {
         // Debug card: live snapshot of the Rust window manager (`wm_windows`).
         const list = A.el("div", {
           id: "wm-list", class: "muted",

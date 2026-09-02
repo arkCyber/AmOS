@@ -4,9 +4,11 @@
 //! utilities for context injection and session cleanup.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Unique session identifier.
@@ -103,6 +105,29 @@ impl SessionManager {
         id
     }
 
+    /// Ensure a session with the given id exists (used to key a conversation by
+    /// the client-supplied `session_id` so history persists across calls). A
+    /// no-op if the session already exists.
+    pub async fn get_or_create(&self, id: &str, model: String) {
+        let mut sessions = self.sessions.write().await;
+        if sessions.contains_key(id) {
+            return;
+        }
+        sessions.insert(
+            id.to_string(),
+            SessionMetadata {
+                id: id.to_string(),
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                model,
+                context: HashMap::new(),
+                tokens_generated: 0,
+                cancelled: false,
+            },
+        );
+        tracing::debug!("created session (keyed): {}", id);
+    }
+
     /// Get a session by ID (returns a clone).
     pub async fn get(&self, id: &str) -> Option<SessionMetadata> {
         let sessions = self.sessions.read().await;
@@ -193,6 +218,101 @@ impl SessionManager {
             }
         })
     }
+
+    /// Persist all active sessions to `path` as JSON (atomic write).
+    ///
+    /// `Instant` values are converted to wall-clock on save and reconstructed on
+    /// load, so sessions survive a daemon restart while staleness stays correct.
+    pub async fn save(&self, path: &Path) -> Result<(), String> {
+        let sessions = self.sessions.read().await;
+        let stored: Vec<StoredSession> = sessions.values().map(StoredSession::from).collect();
+        let json = serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?;
+        drop(sessions);
+
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+        tracing::info!("persisted {} sessions to {}", stored.len(), path.display());
+        Ok(())
+    }
+
+    /// Load sessions previously written by [`SessionManager::save`]. If the file
+    /// is absent or malformed, returns a fresh, empty manager (non-fatal).
+    pub fn load(path: &Path) -> Self {
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        let stored: Vec<StoredSession> = match serde_json::from_str(&json) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to parse session file {}: {e}", path.display());
+                return Self::default();
+            }
+        };
+        let mut sessions = HashMap::new();
+        for s in stored {
+            sessions.insert(s.id.clone(), s.into_metadata());
+        }
+        tracing::info!("loaded {} sessions from {}", sessions.len(), path.display());
+        Self {
+            sessions: Arc::new(RwLock::new(sessions)),
+            session_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Unix timestamp in whole seconds.
+fn current_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Serializable snapshot of a [`SessionMetadata`] for disk persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredSession {
+    id: SessionId,
+    created_at_unix: u64,
+    last_activity_unix: u64,
+    model: String,
+    context: HashMap<String, String>,
+    tokens_generated: usize,
+    cancelled: bool,
+}
+
+impl From<&SessionMetadata> for StoredSession {
+    fn from(s: &SessionMetadata) -> Self {
+        let now = current_unix();
+        Self {
+            id: s.id.clone(),
+            created_at_unix: now.saturating_sub(s.created_at.elapsed().as_secs()),
+            last_activity_unix: now.saturating_sub(s.last_activity.elapsed().as_secs()),
+            model: s.model.clone(),
+            context: s.context.clone(),
+            tokens_generated: s.tokens_generated,
+            cancelled: s.cancelled,
+        }
+    }
+}
+
+impl StoredSession {
+    /// Reconstruct a `SessionMetadata`, deriving monotonic `Instant`s from the
+    /// persisted wall-clock timestamps (valid for staleness checks).
+    fn into_metadata(self) -> SessionMetadata {
+        let now = Instant::now();
+        let now_unix = current_unix();
+        SessionMetadata {
+            id: self.id,
+            created_at: now - Duration::from_secs(now_unix.saturating_sub(self.created_at_unix)),
+            last_activity: now
+                - Duration::from_secs(now_unix.saturating_sub(self.last_activity_unix)),
+            model: self.model,
+            context: self.context,
+            tokens_generated: self.tokens_generated,
+            cancelled: self.cancelled,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -252,5 +372,52 @@ mod tests {
             .unwrap();
         let context = manager.get_context(&id).await.unwrap();
         assert_eq!(context.get("screen"), Some(&"unlocked".to_string()));
+    }
+
+    #[tokio::test]
+    async fn save_then_load_round_trips_sessions() {
+        let path =
+            std::env::temp_dir().join(format!("amos-sess-roundtrip-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let manager = SessionManager::default();
+        let id = manager.create("model1".to_string()).await;
+        manager
+            .inject_context(&id, "screen".to_string(), "locked".to_string())
+            .await
+            .unwrap();
+        manager.update(&id, |s| s.add_tokens(42)).await.unwrap();
+        manager.save(&path).await.expect("save");
+        assert!(path.exists(), "session file written");
+
+        // Load into a fresh manager and verify the session survived.
+        let loaded = SessionManager::load(&path);
+        let session = loaded.get(&id).await.expect("session restored");
+        assert_eq!(session.model, "model1");
+        assert_eq!(session.tokens_generated, 42);
+        assert_eq!(
+            session.context.get("screen").map(String::as_str),
+            Some("locked")
+        );
+        assert!(!session.cancelled);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn load_missing_or_malformed_file_is_empty() {
+        let dir = std::env::temp_dir();
+        let missing = SessionManager::load(
+            &dir.join(format!("amos-sess-missing-{}.json", std::process::id())),
+        );
+        assert_eq!(missing.count_active().await, 0);
+
+        let bad = dir.join(format!("amos-sess-bad-{}.json", std::process::id()));
+        std::fs::write(&bad, "not json").unwrap();
+        let loaded = SessionManager::load(&bad);
+        assert_eq!(
+            loaded.count_active().await,
+            0,
+            "malformed file yields empty manager"
+        );
+        let _ = std::fs::remove_file(&bad);
     }
 }

@@ -1,0 +1,442 @@
+//! `amos-supervisor` — a small process supervisor for the Amos CLI daemon layer.
+//!
+//! The Amos OS runs several long-lived, memory-hungry CLI daemons (inference,
+//! agent orchestrator, wallet, P2P…). This crate spawns, monitors, and
+//! *hot-restarts* them so a crash never takes the OS core down:
+//!
+//! * each daemon gets a **restart policy** (max attempts + exponential backoff),
+//! * an unexpected exit triggers an automatic restart,
+//! * `stop()` / `shutdown_all()` tear the children down cleanly.
+//!
+//! It is transport-agnostic: the same supervisor can manage `amos-ai`,
+//! a Web3 wallet binary, or a NAS/P2P daemon.
+//!
+//! # Example
+//! ```no_run
+//! use amos_supervisor::{DaemonSpec, Supervisor};
+//!
+//! # async fn run() {
+//! let sup = Supervisor::new();
+//! sup.start(DaemonSpec::simple("inference", "sleep", ["9999"])).await.unwrap();
+//! sup.stop("inference").await.unwrap();
+//! # }
+//! ```
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+
+/// How a daemon should behave when it exits unexpectedly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartPolicy {
+    /// Maximum automatic restarts before the daemon is marked `Crashed`.
+    pub max_restarts: u32,
+    /// Base backoff delay (seconds) before the first restart.
+    pub backoff_secs: u64,
+    /// Backoff multiplier per restart attempt (exponential).
+    pub backoff_factor: u32,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            max_restarts: 5,
+            backoff_secs: 1,
+            backoff_factor: 2,
+        }
+    }
+}
+
+impl RestartPolicy {
+    /// Compute the backoff delay for a given restart attempt (1-based).
+    fn delay_for(&self, attempt: u32) -> Duration {
+        let factor = self.backoff_factor.max(1);
+        let secs = self
+            .backoff_secs
+            .saturating_mul(factor.saturating_pow(attempt.saturating_sub(1)) as u64)
+            .min(300); // cap at 5 minutes
+        Duration::from_secs(secs)
+    }
+}
+
+/// Describes a CLI daemon to supervise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSpec {
+    /// Unique name used to address the daemon (status / stop / restart).
+    pub name: String,
+    /// Executable (resolved via `$PATH` unless it contains a path separator).
+    pub program: String,
+    /// Command-line arguments.
+    pub args: Vec<String>,
+    /// Extra environment variables.
+    pub env: Vec<(String, String)>,
+    /// Restart behaviour on unexpected exit.
+    pub restart: RestartPolicy,
+}
+
+impl DaemonSpec {
+    /// Convenience constructor with a default restart policy and no env.
+    pub fn simple<I, S>(name: &str, program: &str, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            name: name.to_string(),
+            program: program.to_string(),
+            args: args.into_iter().map(Into::into).collect(),
+            env: Vec::new(),
+            restart: RestartPolicy::default(),
+        }
+    }
+}
+
+/// Lifecycle state of a supervised daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonStatus {
+    /// Spawned but not yet confirmed running.
+    Starting,
+    /// Alive and being monitored.
+    Running,
+    /// Was running, crashed, and is waiting out the backoff before restart.
+    Restarting { attempt: u32 },
+    /// Stopped by an explicit call to `stop` / `shutdown_all`.
+    Stopped,
+    /// Exhausted its restart budget; the supervisor gave up.
+    Crashed { restarts: u32 },
+}
+
+struct Daemon {
+    spec: DaemonSpec,
+    child: Option<Child>,
+    status: DaemonStatus,
+    restarts: u32,
+    stop_requested: bool,
+}
+
+impl Daemon {
+    fn new(spec: DaemonSpec) -> Self {
+        Self {
+            spec,
+            child: None,
+            status: DaemonStatus::Starting,
+            restarts: 0,
+            stop_requested: false,
+        }
+    }
+}
+
+/// Supervises a set of named child daemons.
+pub struct Supervisor {
+    daemons: Arc<RwLock<HashMap<String, Arc<Mutex<Daemon>>>>>,
+    tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+}
+
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Supervisor {
+    pub fn new() -> Self {
+        Self {
+            daemons: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Register and spawn a daemon, then begin monitoring it.
+    pub async fn start(&self, spec: DaemonSpec) -> Result<(), String> {
+        let name = spec.name.clone();
+        let daemon = Arc::new(Mutex::new(Daemon::new(spec)));
+        spawn_child(&name, &daemon).await?;
+        self.daemons
+            .write()
+            .await
+            .insert(name.clone(), daemon.clone());
+
+        let monitor = tokio::spawn(monitor(name.clone(), daemon));
+        self.tasks.lock().await.insert(name, monitor);
+        Ok(())
+    }
+}
+
+/// Spawn (or restart) a daemon's child process and mark it running.
+async fn spawn_child(name: &str, daemon: &Arc<Mutex<Daemon>>) -> Result<(), String> {
+    let (program, args, env) = {
+        let d = daemon.lock().await;
+        (
+            d.spec.program.clone(),
+            d.spec.args.clone(),
+            d.spec.env.clone(),
+        )
+    };
+    let mut cmd = Command::new(&program);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    // Headless: daemons don't read stdin; silence stdout, keep stderr for logs.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn '{name}' ({program}): {e}"))?;
+
+    let mut d = daemon.lock().await;
+    d.child = Some(child);
+    d.status = DaemonStatus::Running;
+    Ok(())
+}
+
+/// Monitor loop: wait for the child to exit, then apply the restart policy.
+async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
+    loop {
+        // Take the child out so `wait()` doesn't hold the lock across await.
+        let mut child = {
+            let mut d = daemon.lock().await;
+            match d.child.take() {
+                Some(c) => c,
+                None => return, // no live child (stopped / spawn failed)
+            }
+        };
+
+        let _exit = child.wait().await;
+
+        // Decide: explicit stop → Stopped; else restart if budget remains.
+        let (restart, backoff) = {
+            let mut d = daemon.lock().await;
+            if d.stop_requested {
+                d.status = DaemonStatus::Stopped;
+                (false, Duration::ZERO)
+            } else if d.restarts < d.spec.restart.max_restarts {
+                d.restarts += 1;
+                let attempt = d.restarts;
+                d.status = DaemonStatus::Restarting { attempt };
+                (true, d.spec.restart.delay_for(attempt))
+            } else {
+                d.status = DaemonStatus::Crashed {
+                    restarts: d.restarts,
+                };
+                (false, Duration::ZERO)
+            }
+        };
+
+        if !restart {
+            return;
+        }
+
+        tracing::warn!(daemon = %name, "daemon exited; restarting in {:?}", backoff);
+        tokio::time::sleep(backoff).await;
+
+        if spawn_child(&name, &daemon).await.is_err() {
+            let mut d = daemon.lock().await;
+            d.status = DaemonStatus::Crashed {
+                restarts: d.restarts,
+            };
+            return;
+        }
+    }
+}
+
+impl Supervisor {
+    /// Stop a daemon: mark it stopped and terminate its child.
+    pub async fn stop(&self, name: &str) -> Result<(), String> {
+        let child = {
+            let d = self.daemons.read().await;
+            let daemon = d
+                .get(name)
+                .ok_or_else(|| format!("daemon '{name}' is not managed"))?
+                .clone();
+            let mut g = daemon.lock().await;
+            g.stop_requested = true;
+            g.status = DaemonStatus::Stopped;
+            g.child.take()
+        };
+        if let Some(mut c) = child {
+            c.kill().await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Return the current status of a daemon, if it is managed.
+    pub async fn status(&self, name: &str) -> Option<DaemonStatus> {
+        let daemon = self.daemons.read().await.get(name)?.clone();
+        let guard = daemon.lock().await;
+        Some(guard.status.clone())
+    }
+
+    /// Snapshot of all managed daemons and their statuses.
+    pub async fn list(&self) -> Vec<(String, DaemonStatus)> {
+        let d = self.daemons.read().await;
+        let mut out: Vec<(String, DaemonStatus)> = Vec::new();
+        for (name, daemon) in d.iter() {
+            out.push((name.clone(), daemon.lock().await.status.clone()));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Stop every managed daemon and abort its monitor task (graceful shutdown).
+    pub async fn shutdown_all(&self) {
+        let names: Vec<String> = self.daemons.read().await.keys().cloned().collect();
+        for name in names {
+            let _ = self.stop(&name).await;
+        }
+        let tasks = self.tasks.lock().await;
+        for t in tasks.values() {
+            t.abort();
+        }
+    }
+}
+
+/// A top-level config file describing a set of daemons to supervise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorConfig {
+    pub daemons: Vec<DaemonSpec>,
+}
+
+/// Load a supervisor config from a JSON file.
+pub fn load_config(path: &Path) -> anyhow::Result<SupervisorConfig> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let config: SupervisorConfig = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+    Ok(config)
+}
+
+/// Convenience: start every daemon in a config under one `Supervisor`.
+pub async fn start_all(
+    sup: &Supervisor,
+    config: &SupervisorConfig,
+) -> Vec<(String, Result<(), String>)> {
+    let mut out = Vec::new();
+    for spec in &config.daemons {
+        let r = sup.start(spec.clone()).await;
+        out.push((spec.name.clone(), r));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn load_config_round_trips_and_parses_restart() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amos-sup-config-{}.json", std::process::id()));
+        let cfg = SupervisorConfig {
+            daemons: vec![DaemonSpec {
+                name: "ai".into(),
+                program: "amos-ai".into(),
+                args: vec!["--socket".into(), "/tmp/amos-ai.sock".into()],
+                env: vec![("AMOS_BACKEND".into(), "mock".into())],
+                restart: RestartPolicy {
+                    max_restarts: 2,
+                    backoff_secs: 3,
+                    backoff_factor: 4,
+                },
+            }],
+        };
+        std::fs::write(&path, serde_json::to_string(&cfg).unwrap()).unwrap();
+        let loaded = load_config(&path).expect("load config");
+        assert_eq!(loaded.daemons.len(), 1);
+        assert_eq!(loaded.daemons[0].name, "ai");
+        assert_eq!(loaded.daemons[0].restart.max_restarts, 2);
+        assert_eq!(loaded.daemons[0].env[0].0, "AMOS_BACKEND");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_config_rejects_missing_or_bad_file() {
+        let dir = std::env::temp_dir();
+        assert!(load_config(&dir.join("nope.json")).is_err());
+
+        let bad = dir.join(format!("amos-sup-bad-{}.json", std::process::id()));
+        std::fs::write(&bad, "not json").unwrap();
+        assert!(load_config(&bad).is_err());
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    #[tokio::test]
+    async fn start_all_starts_every_daemon() {
+        let sup = Supervisor::new();
+        let cfg = SupervisorConfig {
+            daemons: vec![
+                DaemonSpec::simple("s1", "sleep", ["30"]),
+                DaemonSpec::simple("s2", "sleep", ["30"]),
+            ],
+        };
+        let results = start_all(&sup, &cfg).await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, r)| r.is_ok()), "both daemons start");
+        assert_eq!(sup.status("s1").await, Some(DaemonStatus::Running));
+        assert_eq!(sup.status("s2").await, Some(DaemonStatus::Running));
+        sup.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn start_runs_and_stop_terminates() {
+        let sup = Supervisor::new();
+        sup.start(DaemonSpec::simple("sleeper", "sleep", ["30"]))
+            .await
+            .unwrap();
+        assert_eq!(sup.status("sleeper").await, Some(DaemonStatus::Running));
+
+        sup.stop("sleeper").await.unwrap();
+        assert_eq!(sup.status("sleeper").await, Some(DaemonStatus::Stopped));
+    }
+
+    #[tokio::test]
+    async fn crash_daemon_restarts_then_crashes_after_budget() {
+        let sup = Supervisor::new();
+        // `false` exits immediately → the supervisor should restart it.
+        let mut spec = DaemonSpec::simple("boom", "false", Vec::<&str>::new());
+        spec.restart.max_restarts = 2;
+        spec.restart.backoff_secs = 0;
+        sup.start(spec).await.unwrap();
+
+        // Give the monitor time to exhaust the restart budget.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match sup.status("boom").await {
+            Some(DaemonStatus::Crashed { restarts: 2 }) => {}
+            other => panic!("expected Crashed{{restarts:2}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_unknown_and_errors() {
+        let sup = Supervisor::new();
+        assert_eq!(
+            sup.status("missing").await,
+            None,
+            "unknown daemon has no status"
+        );
+        assert!(
+            sup.stop("missing").await.is_err(),
+            "stopping unknown daemon errors"
+        );
+        assert!(sup.list().await.is_empty(), "no daemons managed yet");
+
+        sup.start(DaemonSpec::simple("sleeper", "sleep", ["30"]))
+            .await
+            .unwrap();
+        let list = sup.list().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "sleeper");
+        sup.shutdown_all().await;
+        assert_eq!(sup.status("sleeper").await, Some(DaemonStatus::Stopped));
+    }
+}

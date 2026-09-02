@@ -13,7 +13,7 @@ window.addEventListener("unhandledrejection", (e) => {
 });
 
 // Which apps live in the dock (must be registered before first render).
-window.AmosDock = ["phone", "messages", "camera", "settings", "ai"];
+window.AmosDock = ["phone", "messages", "camera", "settings", "ai", "interpreter"];
 
 function tickClock() {
   const now = new Date();
@@ -38,11 +38,28 @@ async function init() {
     window.Amos.renderHome();
   }
 
-  // Home indicator → return to home (delegates to the window manager in Tauri).
-  document.getElementById("home-indicator").addEventListener("click", () => window.Amos.systemHome());
+  // Home indicator: tap → home, swipe up → app switcher (Recents).
+  const homeInd = document.getElementById("home-indicator");
+  if (homeInd) {
+    let homeY = null;
+    homeInd.addEventListener("pointerdown", (e) => { homeY = e.clientY || 0; });
+    homeInd.addEventListener("pointerup", (e) => {
+      const dy = (e.clientY || 0) - (homeY || 0);
+      homeY = null;
+      if (dy < -24) window.Amos.showRecents();
+      else window.Amos.systemHome();
+    });
+  }
 
   // Subscribe to the Rust shared store so settings/notifications sync across windows.
   window.Amos.listenStore();
+
+  // First boot → onboarding; otherwise boot straight into the lock screen.
+  if (!window.Amos.safeGet("amos.onboarded")) {
+    window.Amos.showOnboarding();
+  } else {
+    window.Amos.showLock();
+  }
 
   // --- Global AI stream listeners (forward to the AI app if mounted) ---
   if (I) {
@@ -54,6 +71,28 @@ async function init() {
     });
     await I.listen("ai-session-complete", (e) => {
       if (window.AmosAi) window.AmosAi.sessionComplete(e.payload);
+    });
+    await I.listen("ai-card-received", (e) => {
+      if (window.AmosAi) window.AmosAi.showCard(e.payload);
+    });
+    // Hardware buttons emitted by the Rust core (Home / Voice / AI).
+    await I.listen("hardware-button", (e) => {
+      if (window.AmosButtons) window.AmosButtons.handle(e.payload);
+    });
+    // Interpretation session outputs (同声传译).
+    await I.listen("interpret-output", (e) => {
+      if (window.AmosInterp) window.AmosInterp.onOutput(e.payload);
+    });
+  }
+
+  // Desktop dev convenience: keyboard shortcuts for the three hardware buttons.
+  if (window.AmosButtons) {
+    window.addEventListener("keydown", (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "h") window.AmosButtons.press("home");
+      else if (k === "v") window.AmosButtons.press("voice");
+      else if (k === "a") window.AmosButtons.press("ai");
     });
   }
 }

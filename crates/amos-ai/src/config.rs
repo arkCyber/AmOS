@@ -232,15 +232,19 @@ mod tests {
 
     #[test]
     fn invalid_max_tokens_fails() {
-        let mut config = Config::default();
-        config.max_tokens = 0;
+        let config = Config {
+            max_tokens: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn invalid_timeout_fails() {
-        let mut config = Config::default();
-        config.request_timeout = Duration::from_secs(0);
+        let config = Config {
+            request_timeout: Duration::from_secs(0),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 }

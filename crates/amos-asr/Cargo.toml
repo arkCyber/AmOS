@@ -1,0 +1,28 @@
+[package]
+name = "amos-asr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos streaming speech recognition: a transport-agnostic StreamingRecognizer abstraction + a Pipeline adapter that feeds real AsrEvent::Partial/Final into amos_int::Session. A sherpa-onnx backend is available behind the `sherpa` feature."
+
+[lib]
+name = "amos_asr"
+path = "src/lib.rs"
+
+[dependencies]
+amos-int.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
+serde.workspace = true
+anyhow.workspace = true
+
+# Native sherpa-onnx streaming ASR backend (downloads a prebuilt static lib).
+# Gated so the default workspace build stays light and green.
+[features]
+default = []
+sherpa = ["dep:sherpa-onnx"]
+
+[dependencies.sherpa-onnx]
+version = "1.13.7"
+optional = true
