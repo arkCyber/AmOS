@@ -1,8 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { defaultLayout, hideFromHome, restoreToHome, moveBefore, type HomeLayout } from "../lib/amosStore";
+import {
+  defaultLayout,
+  getLayout,
+  getRecents,
+  hideFromHome,
+  pushRecent,
+  restoreToHome,
+  moveBefore,
+  type HomeLayout,
+} from "../lib/amosStore";
 import { APPS, appTitleKey } from "../apps";
 import { zh } from "../i18n/locales/zh";
 import { en } from "../i18n/locales/en";
+
+/** Point `window` at a Map-backed localStorage for store round-trips. */
+function withStorage(store: Map<string, string>) {
+  (globalThis as unknown as { window?: unknown }).window = {
+    localStorage: {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+    },
+  };
+}
 
 describe("core shell", () => {
   test("default layout puts known dock apps on the dock, the rest on a page", () => {
@@ -42,5 +61,51 @@ describe("core shell", () => {
     l = moveBefore(l, "c", "d"); // cross-list into dock before d
     expect(l.page).toEqual(["a", "b"]);
     expect(l.dock).toEqual(["c", "d"]);
+  });
+
+  test("hiding a dock icon moves it back to the page (never hidden)", () => {
+    const l: HomeLayout = { page: [], dock: ["a", "b"], hidden: [] };
+    const h = hideFromHome(l, "a");
+    expect(h.dock).toEqual(["b"]);
+    expect(h.page).toEqual(["a"]);
+    expect(h.hidden).toEqual([]);
+  });
+
+  test("moveBefore dragging from the dock back onto the page works", () => {
+    const l: HomeLayout = { page: ["x"], dock: ["a", "b"], hidden: [] };
+    const out = moveBefore(l, "a", "x"); // a before x on the page
+    expect(out.dock).toEqual(["b"]);
+    expect(out.page).toEqual(["a", "x"]);
+  });
+
+  test("getLayout falls back to default and repairs/merges stored layout", () => {
+    const store = new Map<string, string>();
+    withStorage(store);
+    // nothing stored -> default dock
+    expect(getLayout(["settings", "clock", "ai", "camera"]).dock).toEqual([
+      "camera",
+      "settings",
+      "ai",
+    ]);
+    // stored layout: unknown id is dropped; new available ids are appended to page
+    store.set(
+      "amos.home.layout",
+      JSON.stringify({ page: ["clock", "ghost"], dock: ["camera"], hidden: [] }),
+    );
+    const l = getLayout(["settings", "clock", "ai", "camera"]);
+    expect(l.page).toEqual(["clock", "settings", "ai"]);
+    expect(l.dock).toEqual(["camera"]);
+    expect(l.hidden).toEqual([]);
+  });
+
+  test("pushRecent/getRecents dedupe and cap at 8", () => {
+    const store = new Map<string, string>();
+    withStorage(store);
+    for (const id of ["a", "b", "c", "d", "e", "f", "g", "h", "i"]) pushRecent(id);
+    const rec = getRecents();
+    expect(rec.length).toBe(8);
+    expect(rec[0]).toBe("i");
+    pushRecent("a"); // re-opened app moves to front (dedup)
+    expect(getRecents()[0]).toBe("a");
   });
 });
