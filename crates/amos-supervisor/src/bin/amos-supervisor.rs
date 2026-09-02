@@ -72,10 +72,32 @@ async fn main() -> ExitCode {
     }
 
     println!(
-        "supervising {} daemon(s)… press Ctrl-C to stop",
+        "supervising {} daemon(s)… Ctrl-C/SIGTERM to stop, SIGUSR1 to restart all",
         config.daemons.len()
     );
-    tokio::signal::ctrl_c().await.ok();
+
+    // Foreground supervision loop: Ctrl-C = graceful shutdown; on Unix, SIGUSR1 =
+    // recycle every supervised daemon (operators can `kill -USR1 <pid>`).
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut usr1 = signal(SignalKind::user_defined1()).expect("install SIGUSR1 handler");
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = usr1.recv() => {
+                    println!("SIGUSR1 received: restarting all daemons…");
+                    sup.restart_all().await;
+                    println!("restart requested for all supervised daemons");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+    }
+
     println!("stopping all daemons…");
     sup.shutdown_all().await;
     println!("done");

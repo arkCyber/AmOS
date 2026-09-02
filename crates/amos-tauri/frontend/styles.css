@@ -128,7 +128,18 @@ body {
     radial-gradient(120% 90% at 100% 10%, #0f5a52 0%, transparent 55%),
     linear-gradient(160deg, #2c3e8f 0%, #1b2a4a 45%, #0b1428 100%);
 }
-/* Photo wallpaper layer sits above the gradient base, behind the launcher UI. */
+/* In light theme the base behind the wallpaper must be bright too, otherwise the
+   default faint (若隐若现) wallpaper layer would let the dark base show through
+   and muddy the scenery. */
+[data-theme="light"] #view.home {
+  background:
+    radial-gradient(120% 80% at 20% 0%, #e3e9f7 0%, transparent 55%),
+    radial-gradient(120% 90% at 100% 10%, #e6f1ec 0%, transparent 55%),
+    linear-gradient(160deg, #f2f4f9 0%, #e3e8f1 45%, #ccd6e6 100%);
+}
+/* Photo wallpaper layer sits above the gradient base, behind the launcher UI.
+   Rendered through the active background display method: alpha / blur / sat /
+   brightness come from core.js (data-bg). Defaults = `ghost` (若隐若现). */
 #view.home::before {
   content: "";
   position: absolute;
@@ -136,9 +147,11 @@ body {
   background-image: var(--wp, url("./wallpaper-dark.png"));
   background-size: cover;
   background-position: center;
-  opacity: 0.92;
+  opacity: var(--wp-alpha, 0.58);
+  filter: blur(var(--wp-blur, 9px)) saturate(var(--wp-sat, 0.92)) brightness(var(--wp-bright, 1.02));
   pointer-events: none;
   z-index: 0;
+  transition: opacity 0.5s ease, filter 0.5s ease;
 }
 /* Keep a faint dark scrim over busy wallpaper areas so icon labels stay legible. */
 #view.home::after {
@@ -222,6 +235,7 @@ body {
   background: none;
   cursor: pointer;
   padding: 0;
+  position: relative; /* anchors unread badge / − badge to the icon */
 }
 .app-icon:active .tile { transform: scale(0.9); }
 .app-icon .tile {
@@ -301,10 +315,30 @@ body {
   align-items: center;
   justify-content: center;
 }
+/* Unread-notification badge (red dot, iOS-style) on home/dock icons. */
+.app-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  border-radius: 10px;
+  background: #ff3b30;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.25);
+  z-index: 2;
+}
+[data-theme="light"] .app-badge { box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.6); }
 .remove-badge:hover { background: #ff453a; }
 .app-icon.dragging { opacity: 0.35; }
 .app-icon.drop-target .tile { box-shadow: 0 0 0 2px #fff, 0 6px 16px rgba(0,0,0,0.4); }
-.dock.drop-target { outline: 2px dashed rgba(255, 255, 255, 0.6); }
+/* Dock drop affordance is drawn by .dock.drop-target::after (theme-aware). */
 
 /* Floating "done" button while editing */
 .done-btn {
@@ -323,28 +357,144 @@ body {
   cursor: pointer;
 }
 
-/* Dock */
+/* Dock — a transparent "dynamic island"-style shelf.
+   Instead of an opaque frosted pill it carries no backdrop of its own: the
+   full-screen wallpaper (`--wp`, i.e. the scenery) shows through crisply, and
+   the icons float directly on the landscape. Only a whisper-thin bloom behind
+   the icon row keeps each tile legible over bright parts of the scenery
+   without hiding the view. */
 .dock {
   flex: 0 0 auto;
-  margin: 0 10px 10px;
-  padding: 12px 10px 8px;
-  border-radius: 26px;
-  background: rgba(255, 255, 255, 0.12);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(26px) saturate(1.6);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  position: relative;
+  margin: 4px 8px 8px;
+  padding: 8px 10px 6px;
+  border-radius: 28px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
   display: flex;
   justify-content: space-around;
-  gap: 6px;
+  gap: 8px;
   align-items: flex-end;
 }
+/* Soft "shelf" bloom behind the icon row so tiles stay readable, letting the
+   scenery around them stay fully visible (dynamic-island look). */
+.dock::before {
+  content: "";
+  position: absolute;
+  left: 6px; right: 6px; bottom: 2px; height: 56px;
+  border-radius: 24px;
+  background: radial-gradient(130% 140% at 50% 0%, rgba(0, 0, 0, 0.22), rgba(0, 0, 0, 0) 82%);
+  pointer-events: none;
+}
+.dock > * { position: relative; }
 /* iOS-style dock: no text labels, and hovering lifts + magnifies the icon. */
 .dock .app-icon .label { display: none; }
 .dock .app-icon { gap: 0; }
 .dock .app-icon .tile { transition: transform 0.16s ease; }
 .dock .app-icon:hover .tile { transform: translateY(-7px) scale(1.18); }
 .dock .app-icon:active .tile { transform: translateY(-3px) scale(1.05); }
-[data-theme="light"] .dock { background: rgba(255, 255, 255, 0.7); border-color: rgba(0, 0, 0, 0.08); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); }
+/* The dashed edit-mode drop target needs to stay visible on a clear backdrop. */
+.dock.drop-target::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 26px;
+  border: 2px dashed rgba(255, 255, 255, 0.85);
+  pointer-events: none;
+}
+/* In light theme use a softer bloom so bright scenery isn't greyed out. */
+[data-theme="light"] .dock::before {
+  background: radial-gradient(130% 140% at 50% 0%, rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0) 84%);
+}
+[data-theme="light"] .dock.drop-target::after { border-color: rgba(0, 0, 0, 0.55); }
+
+/* Dock Spotlight (🔍) trigger — a fixed control pinned to the right of the dock.
+   Styled like a small glassy tile but stays stable (no jiggle / no label). */
+.dock-search {
+  flex: 0 0 auto;
+  margin-left: auto;
+  width: 58px; height: 58px;
+  border: 0;
+  border-radius: 16px;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.05));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15), inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+  color: #fff;
+  font-size: 24px;
+  line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: transform 0.16s ease;
+}
+.dock-search:hover { transform: translateY(-3px) scale(1.08); }
+.dock-search:active { transform: scale(0.95); }
+[data-theme="light"] .dock-search {
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18), inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  color: #1c1c1e;
+}
+
+/* ---------- Spotlight (app search overlay) ---------- */
+.spotlight {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: none;
+  flex-direction: column;
+  padding: 6px 12px 4px;
+  background: rgba(8, 10, 18, 0.5);
+  backdrop-filter: blur(30px) saturate(1.3);
+  color: var(--text);
+}
+[data-theme="light"] .spotlight { background: rgba(240, 242, 248, 0.6); color: #1c1c1e; }
+.spot-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 0 8px; }
+.spot-title { font-weight: 700; font-size: 17px; }
+.spot-done { font-size: 13px; padding: 5px 14px; }
+.spot-field {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px; padding: 8px 12px;
+}
+[data-theme="light"] .spot-field { background: rgba(0, 0, 0, 0.06); border-color: rgba(0, 0, 0, 0.12); }
+.spot-mag { opacity: 0.85; font-size: 15px; }
+.spot-input {
+  flex: 1; min-width: 0;
+  background: none; border: 0; outline: none;
+  color: inherit; font-size: 16px;
+}
+.spot-clear { background: none; border: 0; color: inherit; opacity: 0.6; cursor: pointer; font-size: 14px; }
+.spot-results { flex: 1 1 auto; min-height: 0; overflow-y: auto; margin: 10px 0; }
+.spot-empty { padding: 28px 12px; text-align: center; }
+.spot-row {
+  display: flex; align-items: center; gap: 12px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border: 0; border-radius: 16px;
+  padding: 8px 12px; margin-bottom: 8px;
+  color: inherit; cursor: pointer; text-align: left;
+}
+.spot-row:hover { background: rgba(255, 255, 255, 0.16); }
+[data-theme="light"] .spot-row { background: rgba(0, 0, 0, 0.06); }
+[data-theme="light"] .spot-row:hover { background: rgba(0, 0, 0, 0.1); }
+.spot-row .tile { width: 44px; height: 44px; font-size: 22px; border-radius: 12px; flex: 0 0 auto; }
+.spot-row .label { display: none; }
+.spot-name { flex: 1; font-weight: 600; font-size: 15px; }
+.spot-open { font-size: 12px; }
+.spot-kb { flex: 0 0 auto; padding: 4px 0 8px; }
+.spot-kb-row { display: flex; justify-content: center; gap: 6px; margin-bottom: 6px; }
+.spot-key {
+  flex: 1 1 0; max-width: 46px; height: 46px;
+  border: 0; border-radius: 10px;
+  background: rgba(255, 255, 255, 0.13);
+  color: inherit; font-size: 16px; font-weight: 600;
+  cursor: pointer;
+}
+.spot-key:active { background: rgba(255, 255, 255, 0.28); transform: scale(0.96); }
+[data-theme="light"] .spot-key { background: rgba(0, 0, 0, 0.09); }
+.spot-key.wide { max-width: 140px; }
+.spot-key.return { background: #0a84ff; color: #fff; }
+[data-theme="light"] .spot-key.return { color: #fff; }
 
 /* ---------- Home indicator ---------- */
 #home-indicator {
@@ -450,13 +600,18 @@ body {
   position: absolute; inset: 0;
   background-image: var(--wp, url("./wallpaper-dark.png"));
   background-size: cover; background-position: center;
-  opacity: 0.5;
+  /* The screensaver/lock wallpaper renders CRISP by default (its own --lock-*
+     vars, set in applyTheme). Home stays faint via --wp-*; these two are
+     independent so a "若隐若现" home never dulls the full-screen image. */
+  opacity: var(--lock-alpha, 0.9);
+  filter: blur(var(--lock-blur, 0px)) saturate(var(--lock-sat, 1)) brightness(var(--lock-bright, 1));
   pointer-events: none;
+  transition: opacity 0.5s ease, filter 0.5s ease;
 }
 .lock-screen::after {
   content: "";
   position: absolute; inset: 0;
-  background: rgba(8, 8, 16, 0.3);
+  background: rgba(8, 8, 18, 0.24); /* light scrim keeps clock legible on a bright image */
   pointer-events: none;
 }
 .lock-screen > * { position: relative; z-index: 1; }

@@ -152,6 +152,10 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
             host: std::env::var("AMOS_OLLAMA_HOST")
                 .unwrap_or_else(|_| "http://localhost:11434".into()),
             model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "hermes3".into()),
+            // Some local Ollama builds / proxies gate `/v1` behind an API key.
+            bearer: std::env::var("AMOS_OLLAMA_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty()),
         },
         "hermes" => BackendKind::Hermes {
             base_url: std::env::var("AMOS_HERMES_ENDPOINT")

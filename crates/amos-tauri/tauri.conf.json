@@ -6,8 +6,8 @@
   "build": {
     "beforeDevCommand": "",
     "beforeBuildCommand": "",
-    "frontendDist": "frontend",
-    "devUrl": "http://localhost:5173"
+    "frontendDist": "frontend-ts/dist",
+    "devUrl": "http://localhost:1420"
   },
   "app": {
     "windows": [
@@ -26,7 +26,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",

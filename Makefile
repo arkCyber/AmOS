@@ -5,10 +5,13 @@ all: build
 build:
 	cargo build --workspace
 
-# Comprehensive tests: Rust (unit + end-to-end RPC over UDS) + JS (launcher).
+# Comprehensive tests: Rust (unit + end-to-end RPC over UDS) + JS (legacy
+# launcher) + TS System-UI shell (bun). `cargo test --workspace` picks up every
+# crate's tests/ dir automatically (incl. crates/amos-tauri/tests/ai_daemon_e2e.rs).
 test:
 	cargo test --workspace
 	cd crates/amos-tauri/frontend && bun run test
+	cd crates/amos-tauri/frontend-ts && bun run test
 
 # Fast syntax check of the frontend JS only.
 check:
@@ -18,6 +21,12 @@ check:
 smoke:
 	bash scripts/int-cli-smoke.sh
 	cargo test -p amos-translate --test full_chain
+
+# Supervisor headless smoke: launch real amos-ai + amos-translate (mock) under the
+# supervisor with no GUI, SIGUSR1 hot-restart, and a graceful SIGINT stop that must
+# not orphan the child daemons (regression guard).
+sup-smoke:
+	bash scripts/supervisor-smoke.sh
 
 # Local-model end-to-end: Piper TTS -> sherpa streaming ASR -> daemon translate.
 # (Piper + sherpa are real; translation uses a deterministic mock daemon unless
@@ -36,10 +45,12 @@ gated-check:
 	cargo build -p amos-tts --features piper --example piper_tts
 	cargo build -p amos-tauri --features sherpa-asr,piper-tts
 
-# Production gate: formatting + clippy must be clean.
+# Production gate: formatting + clippy must be clean; TS shells must typecheck.
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	cd crates/amos-tauri/frontend-ts && bun run typecheck
+	cd crates/amos-tauri/frontend && bun run check
 
 run-ai:
 	cargo run -p amos-ai

@@ -111,6 +111,59 @@ window.Amos.register({
           msg,
         ]);
       })(),
+      (() => {
+        // 背景显示方式 (配置文件定义 BACKGROUND_MODES): 一张背景图可有多种呈现，
+        // 缺省为 `ghost` 若隐若现 —— 淡雅朦胧、不逼真、不喧宾夺主。
+        const modes = A.backgroundModes || [];
+        const dflt = A.defaultBackgroundMode || "ghost";
+        const activeId = () => store.background || dflt;
+        const desc = A.el("div", { class: "muted", style: { marginTop: "6px" } }, "");
+        const buttons = [];
+        const pick = (id) => { store.background = id; A.storeWrite(KEY, JSON.stringify(store)); A.applyTheme(); paint(); };
+        const reset = () => { delete store.background; A.storeWrite(KEY, JSON.stringify(store)); A.applyTheme(); paint(); };
+        const curLabel = A.el("span", { class: "muted" }, "");
+        modes.forEach((m) => {
+          const b = A.el("button", { class: "btn secondary", onclick: () => pick(m.id) }, m.label);
+          b._id = m.id;
+          buttons.push(b);
+        });
+        const paint = () => {
+          const active = activeId();
+          buttons.forEach((b) => b.classList && b.classList.toggle("wp-sel", active === b._id));
+          const m = (A.resolveBackgroundMode && A.resolveBackgroundMode(active)) || {};
+          curLabel.textContent = active === dflt ? "缺省 · 若隐若现" : (m.label || active);
+          desc.textContent = m.desc || "";
+        };
+        paint();
+        return A.el("div", { class: "card" }, [
+          A.el("div", { class: "row spread" }, [A.el("span", null, "背景显示方式"), curLabel]),
+          A.el("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "8px" } }, buttons),
+          desc,
+          A.el("button", { class: "btn secondary", style: { marginTop: "8px" }, onclick: reset }, "恢复缺省"),
+        ]);
+      })(),
+      (() => {
+        // 屏幕保护(锁屏)背景：默认「清晰」，整张图干净显示；关闭则跟随主屏的
+        // 背景显示方式(若隐若现等)。
+        const clear = store.lockClear !== false;
+        const desc = A.el("div", { class: "muted" }, clear ? "清晰显示整张背景图（默认）" : "跟随「背景显示方式」（若隐若现等）");
+        const onchange = (e) => {
+          store.lockClear = e.target.checked;
+          A.storeWrite(KEY, JSON.stringify(store));
+          A.applyTheme();
+          desc.textContent = e.target.checked ? "清晰显示整张背景图（默认）" : "跟随「背景显示方式」（若隐若现等）";
+        };
+        return A.el("div", { class: "card row spread" }, [
+          A.el("div", null, [
+            A.el("div", null, "屏幕保护 · 清晰背景"),
+            desc,
+          ]),
+          A.el("label", { class: "switch" }, [
+            A.el("input", { type: "checkbox", checked: clear, onchange }),
+            A.el("span", { class: "track" }),
+          ]),
+        ]);
+      })(),
       slider("brightness", "亮度"),
       slider("volume", "音量"),
       (() => {

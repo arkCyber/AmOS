@@ -40,8 +40,8 @@ fn with_client_id<T>(payload: T) -> tonic::Request<T> {
 
 /// Serializable mirror of a proto `UiCard` so the frontend can receive it as an
 /// event payload (prost structs are not `Serialize`).
-#[derive(Clone, Serialize)]
-struct CardPayload {
+#[derive(Clone, Debug, Serialize)]
+pub struct CardPayload {
     kind: String,
     title: String,
     subtitle: String,
@@ -49,7 +49,7 @@ struct CardPayload {
     actions: Vec<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct FieldPayload {
     key: String,
     value: String,
@@ -70,6 +70,55 @@ fn card_payload(card: amos_proto::ai_agent::UiCard) -> CardPayload {
             .collect(),
         actions: card.actions,
     }
+}
+
+/// One unit of an AI reply stream, mirroring the daemon `AgentChunk` so the
+/// (Tauri-free) core can be unit/integration tested headlessly.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReplyEvent {
+    pub token: String,
+    pub done: bool,
+    pub card: Option<CardPayload>,
+}
+
+/// Drive one unary `stream_chat` request against the daemon and collect the whole
+/// reply (tokens + terminal card + done marker). This is the exact RPC the
+/// `ask_ai_agent` command performs, but without any Tauri `AppHandle`, so it is
+/// exercisable headlessly against a real daemon.
+pub async fn ask_daemon(
+    bridge: &AiBridge,
+    request: AgentRequest,
+) -> Result<Vec<ReplyEvent>, String> {
+    // Establish the stream with a single reconnect retry on failure.
+    let mut attempt = 0;
+    let mut stream = loop {
+        let mut client = bridge.connect().await?;
+        match client.stream_chat(with_client_id(request.clone())).await {
+            Ok(s) => break s.into_inner(),
+            Err(e) => {
+                attempt += 1;
+                bridge.invalidate();
+                if attempt >= 2 {
+                    return Err(e.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+
+    let mut events = Vec::new();
+    while let Ok(Some(chunk)) = stream.message().await {
+        let done = chunk.done;
+        events.push(ReplyEvent {
+            token: chunk.token,
+            done,
+            card: chunk.card.map(card_payload),
+        });
+        if done {
+            break;
+        }
+    }
+    Ok(events)
 }
 
 /// App-managed state holding a cached gRPC channel. Reusing the channel avoids
@@ -217,37 +266,22 @@ pub async fn ask_ai_agent(
         context,
     };
 
-    // Establish the stream with a single reconnect retry on failure.
-    let mut attempt = 0;
-    let mut stream = loop {
-        let mut client = state.connect().await?;
-        match client.stream_chat(with_client_id(request.clone())).await {
-            Ok(s) => break s.into_inner(),
-            Err(e) => {
-                attempt += 1;
-                state.invalidate();
-                if attempt >= 2 {
-                    return Err(e.to_string());
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    };
-
-    // Consume the token stream on a background task and fan it out to the UI.
+    // Drive the RPC headlessly (collectable/testable), then fan the events out to
+    // the WebView exactly as before: per-token + card + session-complete.
+    let events = ask_daemon(&state, request).await?;
     tauri::async_runtime::spawn(async move {
         let mut full = String::new();
-        while let Ok(Some(chunk)) = stream.message().await {
-            if !chunk.token.is_empty() {
-                full.push_str(&chunk.token);
-                let _ = app.emit("ai-token-received", chunk.token);
+        for e in events {
+            if !e.token.is_empty() {
+                full.push_str(&e.token);
+                let _ = app.emit("ai-token-received", e.token);
             }
-            if let Some(card) = chunk.card {
+            if let Some(card) = e.card {
                 if !card.kind.is_empty() {
-                    let _ = app.emit("ai-card-received", card_payload(card));
+                    let _ = app.emit("ai-card-received", card);
                 }
             }
-            if chunk.done {
+            if e.done {
                 let _ = app.emit("ai-session-complete", (sid, full));
                 let _ = app.emit("ai-chat-complete", ());
                 break;

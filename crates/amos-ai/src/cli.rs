@@ -57,9 +57,12 @@ ENV:
     AMOS_SOCKET           Socket path override (same as --socket)
     AMOS_BACKEND          Inference backend: \"mock\" | \"api\" | \"ollama\" | \"hermes\" | \"ggml\" (default \"mock\")
     AMOS_MODEL_PATH       Path to the GGUF model (ggml backend)
+    AMOS_GGML_BIN         External GGML engine to run GGUFs, e.g. allama (default: allama)
+    AMOS_GGML_MODEL       Engine run-name override for the model (default: derived from GGUF path)
     AMOS_API_KEY          API key (api backend)
     AMOS_API_ENDPOINT     OpenAI-compatible endpoint (api backend, default /v1/chat/completions)
     AMOS_OLLAMA_HOST      Ollama server base URL (ollama backend, default http://localhost:11434)
+    AMOS_OLLAMA_API_KEY   Bearer token for token-gated Ollama /v1 (optional)
     AMOS_HERMES_ENDPOINT  Hermes-Rust agent base URL (hermes backend, default http://127.0.0.1:11438)
     AMOS_MODEL            Model id for api/ollama/hermes backends (default gpt-4o-mini / hermes3 / hermes-rust)
     RUST_LOG              Log level, e.g. RUST_LOG=info

@@ -7,12 +7,19 @@ window.Amos.register({
   render() {
     const A = window.Amos;
     const contact = "小安";
-    const threads = [
+    const KEY = "amos.messages";
+    const read = () => { try { const m = JSON.parse(A.safeGet(KEY, "[]")); return Array.isArray(m) ? m : []; } catch (_) { return []; } };
+    const SEED = [
       { from: "them", text: "你好！Amos 系统感觉怎么样？" },
       { from: "me", text: "很棒，图标像 iOS 一样顺滑。" },
       { from: "them", text: "要不要试试 AI 应用？长按电源键也可以唤醒。" },
     ];
+    // Persist the thread so a reopened Messages keeps the conversation (iMessage-like).
+    if (!read().length) A.storeWrite(KEY, JSON.stringify(SEED));
+    const threads = read();
+
     const body = A.el("div", {
+      class: "chat-log",
       style: { display: "flex", flexDirection: "column", gap: "8px", paddingBottom: "12px" },
     });
     const draw = () => {
@@ -29,19 +36,20 @@ window.Amos.register({
           }, m.text)
         )
       );
+      try { body.scrollTop = body.scrollHeight; } catch (_) {} // keep newest visible
     };
 
     const input = A.el("input", { class: "field", placeholder: `发给 ${contact}…` });
-    const sendBtn = A.el("button", {
-      class: "btn",
-      onclick: () => {
-        const t = input.value.trim();
-        if (!t) return;
-        threads.push({ from: "me", text: t });
-        input.value = "";
-        draw();
-      },
-    }, "发送");
+    const send = () => {
+      const t = input.value.trim();
+      if (!t) return;
+      threads.push({ from: "me", text: t });
+      A.storeWrite(KEY, JSON.stringify(threads));
+      input.value = "";
+      draw();
+    };
+    input.addEventListener("keydown", (e) => { if (e && e.key === "Enter") send(); });
+    const sendBtn = A.el("button", { class: "btn", onclick: send }, "发送");
 
     draw();
     return A.appShell(`信息 · ${contact}`, A.el("div", null, [body, A.el("div", { class: "row" }, [input, sendBtn])]));

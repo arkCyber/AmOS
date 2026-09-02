@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 /// How a daemon should behave when it exits unexpectedly.
@@ -119,6 +119,13 @@ struct Daemon {
     status: DaemonStatus,
     restarts: u32,
     stop_requested: bool,
+    /// Explicit recycle requested via `restart()`: the monitor resets the restart
+    /// budget and immediately spawns a fresh child (no backoff wait).
+    restart_requested: bool,
+    /// Wakes the monitor loop so `stop()` can interrupt a running child or a
+    /// pending backoff sleep (fixes the race where the monitor already owns the
+    /// `Child` and `stop()` could not terminate the process).
+    notify: Arc<Notify>,
 }
 
 impl Daemon {
@@ -129,6 +136,8 @@ impl Daemon {
             status: DaemonStatus::Starting,
             restarts: 0,
             stop_requested: false,
+            restart_requested: false,
+            notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -199,21 +208,74 @@ async fn spawn_child(name: &str, daemon: &Arc<Mutex<Daemon>>) -> Result<(), Stri
     Ok(())
 }
 
-/// Monitor loop: wait for the child to exit, then apply the restart policy.
+/// Take the live child out of a daemon, if any.
+async fn take_child(daemon: &Arc<Mutex<Daemon>>) -> Option<Child> {
+    daemon.lock().await.child.take()
+}
+
+async fn stop_requested(daemon: &Arc<Mutex<Daemon>>) -> bool {
+    daemon.lock().await.stop_requested
+}
+
+/// Kill and reap a child owned by the monitor (no lock held across the await).
+async fn terminate(mut child: Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// Monitor loop: poll a running child with a non-blocking `try_wait`, honouring a
+/// stop via a shared flag + `Notify`. The monitor owns the live `Child` for the
+/// child's whole life, so `stop()` can never race `child.take()`: it only sets the
+/// flag and wakes us, and this loop terminates the process it holds. A stop during
+/// the backoff window is also honoured (no "resurrection" after an explicit stop).
 async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
+    let mut child = match take_child(&daemon).await {
+        Some(c) => c,
+        None => return, // no live child (already stopped / spawn failed)
+    };
+
     loop {
-        // Take the child out so `wait()` doesn't hold the lock across await.
-        let mut child = {
+        // Stop requested → terminate the process we own and finish.
+        if stop_requested(&daemon).await {
+            terminate(child).await;
             let mut d = daemon.lock().await;
-            match d.child.take() {
-                Some(c) => c,
-                None => return, // no live child (stopped / spawn failed)
+            d.status = DaemonStatus::Stopped;
+            return;
+        }
+
+        // Explicit restart → recycle the process we own right now (reset budget).
+        if daemon.lock().await.restart_requested {
+            {
+                let mut d = daemon.lock().await;
+                d.restart_requested = false;
+                d.restarts = 0;
+                d.status = DaemonStatus::Starting;
             }
-        };
+            terminate(child).await;
+            if spawn_child(&name, &daemon).await.is_err() {
+                let mut d = daemon.lock().await;
+                d.status = DaemonStatus::Crashed {
+                    restarts: d.restarts,
+                };
+                return;
+            }
+            match take_child(&daemon).await {
+                Some(c) => child = c,
+                None => return,
+            }
+            continue;
+        }
 
-        let _exit = child.wait().await;
+        match child.try_wait() {
+            Ok(Some(_)) => {} // exited naturally
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            Err(_) => {} // treat as exited; dropping the child reaps it
+        }
 
-        // Decide: explicit stop → Stopped; else restart if budget remains.
+        // Child exited: apply the restart policy (or honour a stop).
         let (restart, backoff) = {
             let mut d = daemon.lock().await;
             if d.stop_requested {
@@ -231,13 +293,32 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
                 (false, Duration::ZERO)
             }
         };
-
         if !restart {
             return;
         }
 
+        // Interruptible backoff: an explicit stop during the wait must not let the
+        // daemon resurrect; an explicit restart cuts the wait short. We race the
+        // sleep against the stop/restart Notify.
         tracing::warn!(daemon = %name, "daemon exited; restarting in {:?}", backoff);
-        tokio::time::sleep(backoff).await;
+        let notify = daemon.lock().await.notify.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = notify.notified() => {}
+        }
+        {
+            let mut d = daemon.lock().await;
+            if d.stop_requested {
+                d.status = DaemonStatus::Stopped;
+                return;
+            }
+            // Restart during the backoff: drop the wait and respawn immediately.
+            if d.restart_requested {
+                d.restart_requested = false;
+                d.restarts = 0;
+                d.status = DaemonStatus::Starting;
+            }
+        }
 
         if spawn_child(&name, &daemon).await.is_err() {
             let mut d = daemon.lock().await;
@@ -246,27 +327,96 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
             };
             return;
         }
+        // Take the freshly spawned child for continued polling.
+        match take_child(&daemon).await {
+            Some(c) => child = c,
+            None => return,
+        }
     }
 }
 
 impl Supervisor {
     /// Stop a daemon: mark it stopped and terminate its child.
+    ///
+    /// The monitor owns a running child, so `stop()` never races `child.take()`:
+    /// it sets the stop flag (terminating any child still parked in the daemon) and
+    /// wakes the monitor, which then kills the child it holds / aborts the backoff.
     pub async fn stop(&self, name: &str) -> Result<(), String> {
-        let child = {
-            let d = self.daemons.read().await;
-            let daemon = d
+        let (mut child, notify) = {
+            let daemon = self
+                .daemons
+                .read()
+                .await
                 .get(name)
                 .ok_or_else(|| format!("daemon '{name}' is not managed"))?
                 .clone();
             let mut g = daemon.lock().await;
             g.stop_requested = true;
             g.status = DaemonStatus::Stopped;
-            g.child.take()
+            (g.child.take(), g.notify.clone())
         };
-        if let Some(mut c) = child {
-            c.kill().await.map_err(|e| e.to_string())?;
+        // Directly terminate a child that hasn't been claimed by the monitor yet.
+        if let Some(mut c) = child.take() {
+            let _ = c.kill().await;
+            let _ = c.wait().await;
+        }
+        // Wake the monitor so it kills the child it owns (or aborts a backoff).
+        notify.notify_one();
+
+        // Wait (bounded) for the monitor to kill + reap the child it owns, so
+        // `stop()` / `shutdown_all()` return only after the process is actually
+        // gone. Aborting the monitor task right away would orphan the child.
+        let task = self.tasks.lock().await.remove(name);
+        if let Some(t) = task {
+            let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
         }
         Ok(())
+    }
+
+    /// Explicitly restart a daemon that is currently supervised (running, or
+    /// waiting out a backoff). Resets the crash budget and spawns a fresh child
+    /// immediately. Returns an error for an unknown or already-stopped/crashed
+    /// daemon whose monitor has exited — for those, use `start` again.
+    pub async fn restart(&self, name: &str) -> Result<(), String> {
+        let (alive, notify) = {
+            let daemon = self
+                .daemons
+                .read()
+                .await
+                .get(name)
+                .ok_or_else(|| format!("daemon '{name}' is not managed"))?
+                .clone();
+            let g = daemon.lock().await;
+            let alive = matches!(
+                g.status,
+                DaemonStatus::Running | DaemonStatus::Restarting { .. }
+            );
+            (alive, g.notify.clone())
+        };
+        if !alive {
+            return Err(format!("daemon '{name}' is not running; use start instead"));
+        }
+        {
+            let daemon = self
+                .daemons
+                .read()
+                .await
+                .get(name)
+                .ok_or_else(|| format!("daemon '{name}' is not managed"))?
+                .clone();
+            daemon.lock().await.restart_requested = true;
+        }
+        notify.notify_one();
+        Ok(())
+    }
+
+    /// Recycle every supervised daemon that is currently running/backing off.
+    /// Stopped/crashed daemons are left alone (their monitors have exited).
+    pub async fn restart_all(&self) {
+        let names: Vec<String> = self.daemons.read().await.keys().cloned().collect();
+        for name in names {
+            let _ = self.restart(&name).await;
+        }
     }
 
     /// Return the current status of a daemon, if it is managed.
@@ -438,5 +588,259 @@ mod tests {
         assert_eq!(list[0].0, "sleeper");
         sup.shutdown_all().await;
         assert_eq!(sup.status("sleeper").await, Some(DaemonStatus::Stopped));
+    }
+
+    #[tokio::test]
+    async fn restart_replaces_the_child_process() {
+        let sup = Supervisor::new();
+        let pidfile =
+            std::env::temp_dir().join(format!("amos-sup-restart-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        sup.start(DaemonSpec::simple("svc", "sh", ["-c", &script]))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if pidfile.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid1: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        sup.restart("svc").await.unwrap();
+
+        // The restarted child re-writes the pidfile with a *new* pid.
+        let mut pid2 = pid1;
+        for _ in 0..100 {
+            if let Ok(txt) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = txt.trim().parse::<u32>() {
+                    if p != pid1 {
+                        pid2 = p;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_ne!(pid2, pid1, "restart() must spawn a fresh child (new pid)");
+        assert_eq!(sup.status("svc").await, Some(DaemonStatus::Running));
+
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid2.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(alive, "restarted child (pid {pid2}) is running");
+
+        // And restart() rejects a daemon that is not being supervised.
+        assert!(
+            sup.restart("missing").await.is_err(),
+            "unknown daemon cannot be restarted"
+        );
+        sup.shutdown_all().await;
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[tokio::test]
+    async fn stop_terminates_a_long_running_child() {
+        let sup = Supervisor::new();
+        let pidfile =
+            std::env::temp_dir().join(format!("amos-sup-proc-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        // `sh -c 'echo $$ > pidfile; exec sleep 30'`: pidfile holds the live pid
+        // (exec keeps the same pid), so we can prove stop actually killed it.
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        sup.start(DaemonSpec::simple("runner", "sh", ["-c", &script]))
+            .await
+            .unwrap();
+
+        // Wait until the pidfile is written and the daemon is Running.
+        for _ in 0..100 {
+            if pidfile.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pidfile.exists(), "daemon wrote its pidfile");
+        assert_eq!(sup.status("runner").await, Some(DaemonStatus::Running));
+
+        sup.stop("runner").await.unwrap();
+        // Give the monitor time to kill + reap the child.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !alive,
+            "stop() must have terminated the daemon process (pid {pid})"
+        );
+        assert_eq!(sup.status("runner").await, Some(DaemonStatus::Stopped));
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[tokio::test]
+    async fn stop_during_backoff_does_not_resurrect() {
+        let sup = Supervisor::new();
+        // `false` exits immediately → first crash parks the monitor in a 1s backoff.
+        let mut spec = DaemonSpec::simple("boom", "false", Vec::<&str>::new());
+        spec.restart.max_restarts = 100;
+        spec.restart.backoff_secs = 1;
+        spec.restart.backoff_factor = 1;
+        sup.start(spec).await.unwrap();
+
+        // Wait until the first crash puts it into the Restarting backoff window.
+        let mut saw_restarting = false;
+        for _ in 0..50 {
+            if sup.status("boom").await == Some(DaemonStatus::Restarting { attempt: 1 }) {
+                saw_restarting = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_restarting, "daemon crashed into its backoff window");
+
+        // Stop while it is backing off: it must NOT come back.
+        sup.stop("boom").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            sup.status("boom").await,
+            Some(DaemonStatus::Stopped),
+            "an explicit stop during backoff must not resurrect the daemon"
+        );
+        sup.shutdown_all().await;
+    }
+
+    async fn read_pid(pidfile: &std::path::Path) -> u32 {
+        std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    async fn wait_pidfile(pidfile: &std::path::Path) {
+        for _ in 0..100 {
+            if pidfile.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("daemon never wrote its pidfile {}", pidfile.display());
+    }
+
+    #[tokio::test]
+    async fn restart_all_recycles_every_running_child() {
+        let sup = Supervisor::new();
+        let dir = std::env::temp_dir();
+        let pa = dir.join(format!("amos-sup-ra-{}-a.pid", std::process::id()));
+        let pb = dir.join(format!("amos-sup-ra-{}-b.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        let sa = format!("echo $$ > {}; exec sleep 30", pa.display());
+        let sb = format!("echo $$ > {}; exec sleep 30", pb.display());
+        sup.start(DaemonSpec::simple("a", "sh", ["-c", &sa]))
+            .await
+            .unwrap();
+        sup.start(DaemonSpec::simple("b", "sh", ["-c", &sb]))
+            .await
+            .unwrap();
+        wait_pidfile(&pa).await;
+        wait_pidfile(&pb).await;
+        let a1 = read_pid(&pa).await;
+        let b1 = read_pid(&pb).await;
+
+        sup.restart_all().await;
+
+        let mut a2 = a1;
+        let mut b2 = b1;
+        for _ in 0..100 {
+            if let Ok(t) = std::fs::read_to_string(&pa) {
+                if let Ok(p) = t.trim().parse::<u32>() {
+                    a2 = p;
+                }
+            }
+            if let Ok(t) = std::fs::read_to_string(&pb) {
+                if let Ok(p) = t.trim().parse::<u32>() {
+                    b2 = p;
+                }
+            }
+            if a2 != a1 && b2 != b1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_ne!(a2, a1, "daemon a got a fresh pid after restart_all");
+        assert_ne!(b2, b1, "daemon b got a fresh pid after restart_all");
+        assert_eq!(sup.status("a").await, Some(DaemonStatus::Running));
+        assert_eq!(sup.status("b").await, Some(DaemonStatus::Running));
+        let alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        assert!(alive(a2) && alive(b2), "restarted children are running");
+        sup.shutdown_all().await;
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_terminates_every_child() {
+        let sup = Supervisor::new();
+        let dir = std::env::temp_dir();
+        let pa = dir.join(format!("amos-sup-sd-{}-a.pid", std::process::id()));
+        let pb = dir.join(format!("amos-sup-sd-{}-b.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        let sa = format!("echo $$ > {}; exec sleep 30", pa.display());
+        let sb = format!("echo $$ > {}; exec sleep 30", pb.display());
+        sup.start(DaemonSpec::simple("a", "sh", ["-c", &sa]))
+            .await
+            .unwrap();
+        sup.start(DaemonSpec::simple("b", "sh", ["-c", &sb]))
+            .await
+            .unwrap();
+        wait_pidfile(&pa).await;
+        wait_pidfile(&pb).await;
+        let a1 = read_pid(&pa).await;
+        let b1 = read_pid(&pb).await;
+
+        // Graceful stop of everything: returns only after children are dead.
+        sup.shutdown_all().await;
+
+        let alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        assert!(
+            !alive(a1) && !alive(b1),
+            "shutdown_all() must not orphan child daemons ({a1}, {b1})"
+        );
+        assert_eq!(sup.status("a").await, Some(DaemonStatus::Stopped));
+        assert_eq!(sup.status("b").await, Some(DaemonStatus::Stopped));
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
     }
 }

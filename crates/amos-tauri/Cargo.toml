@@ -44,3 +44,8 @@ tracing.workspace = true
 default = []
 sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]
 piper-tts = ["amos-tts/piper"]
+
+# Integration tests spawn the real amos-ai tonic server in-process so the AI
+# bridge command core can be exercised headlessly over UDS (no Tauri/GUI).
+[dev-dependencies]
+amos-ai = { path = "../amos-ai" }

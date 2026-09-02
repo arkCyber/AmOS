@@ -13,38 +13,47 @@ window.Amos.register({
       },
     }, "0");
 
-    let acc = "";      // accumulated left operand + operator
-    let cur = "0";     // current operand
+    let acc = "";        // accumulated left operand + operator, e.g. "9 − "
+    let cur = "0";       // current operand being typed
+    let justEq = false;  // last press was "=" → iOS starts a fresh number next
+
+    // iOS Calculator semantics helpers.
+    const toJs = (s) => s.replace(/−/g, "-").replace(/×/g, "*").replace(/÷/g, "/");
+    const evalNum = (s) => {
+      const v = Function(`"use strict"; return (${toJs(s)});`)();
+      if (typeof v !== "number" || !Number.isFinite(v)) throw new Error("calc");
+      return v;
+    };
+    const fmt = (v) => String(Number(Number(v).toPrecision(12))); // tame 0.1+0.2 noise
 
     const set = (t) => { display.textContent = t; };
     const refresh = () => {
-      set(cur);
-      try {
-        // Live preview when acc is a complete expression.
-        if (acc) set(acc + (cur === "0" ? "" : cur));
-      } catch (_) { /* ignore */ }
+      if (justEq) { set(cur); return; }
+      set(acc ? acc + (cur === "0" ? "" : cur) : cur);
     };
 
     const press = (label) => {
       if (/[0-9]/.test(label)) {
-        cur = cur === "0" ? label : cur + label;
+        if (justEq) { acc = ""; cur = label; justEq = false; }   // fresh number after =
+        else cur = cur === "0" ? label : cur + label;
       } else if (label === ".") {
-        if (!cur.includes(".")) cur += ".";
+        if (justEq) { acc = ""; cur = "0."; justEq = false; }
+        else if (!cur.includes(".")) cur += ".";
       } else if (label === "C") {
-        acc = ""; cur = "0";
+        acc = ""; cur = "0"; justEq = false;
       } else if (label === "⌫") {
         cur = cur.length > 1 ? cur.slice(0, -1) : "0";
+      } else if (label === "%") {
+        // Standard/iOS basic-calculator: percent divides the current entry by 100.
+        try { cur = fmt(evalNum(cur) / 100); } catch (_) { cur = "错误"; }
       } else if (label === "=") {
-        const expr = (acc + cur).replace(/×/g, "*").replace(/÷/g, "/");
-        try { cur = String(parseFloat(Function(`return ${expr}`)())); }
-        catch (_) { cur = "错误"; }
+        try { cur = fmt(evalNum(acc + cur)); } catch (_) { cur = "错误"; }
         acc = "";
+        justEq = true;
       } else {
-        // operator
-        try {
-          const expr = (acc + cur).replace(/×/g, "*").replace(/÷/g, "/");
-          if (acc) cur = String(parseFloat(Function(`return ${expr}`)()));
-        } catch (_) { cur = "错误"; }
+        // operator (＋ − × ÷); keep the current entry as the left operand
+        justEq = false;
+        try { if (acc) cur = fmt(evalNum(acc + cur)); } catch (_) { cur = "错误"; }
         acc = cur + " " + label + " ";
         cur = "0";
       }

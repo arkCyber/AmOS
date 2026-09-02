@@ -118,20 +118,32 @@ impl InferenceBackend for GgmlBackend {
         _context: &HashMap<String, String>,
         max_tokens: usize,
     ) -> Result<Box<dyn TokenStream>> {
-        tracing::debug!(
-            "GGML inference: prompt_len={}, max_tokens={}",
-            prompt.len(),
-            max_tokens
-        );
-
-        // TODO: Integrate with llama.cpp or MLC-LLM
-        // For now, return a stub that yields tokens
-        let tokens = crate::inference::mock_tokens(prompt);
-        let stream = GgmlTokenStream {
-            tokens: tokens.into_iter(),
-        };
-
-        Ok(Box::new(stream))
+        // Real local inference through an external llama.cpp-class engine (e.g.
+        // `allama`, which runs GGUF on Metal/CPU). Falls back to the mock token
+        // generator when no engine / model is available so offline tests & the
+        // browser path keep working.
+        let run_name = model_run_name(&self.model_path);
+        let prompt_owned = prompt.to_owned();
+        let reply = tokio::task::spawn_blocking(move || {
+            run_external_engine(&run_name, &prompt_owned, max_tokens)
+        })
+        .await
+        .unwrap_or(None);
+        match reply {
+            Some(text) => {
+                tracing::info!(model = %self.model_path.display(), "ggml real engine replied ({} chars)", text.len());
+                Ok(Box::new(GgmlTokenStream {
+                    tokens: chunk_reply(&text).into_iter(),
+                }))
+            }
+            None => {
+                tracing::warn!(model = %self.model_path.display(), "ggml engine unavailable — using mock tokens");
+                let tokens = crate::inference::mock_tokens(prompt);
+                Ok(Box::new(GgmlTokenStream {
+                    tokens: tokens.into_iter(),
+                }))
+            }
+        }
     }
 
     fn metadata(&self) -> BackendMetadata {
@@ -169,6 +181,134 @@ impl TokenStream for GgmlTokenStream {
     async fn next(&mut self) -> Option<Result<String>> {
         self.tokens.next().map(Ok)
     }
+}
+
+/// Derive the engine "run name" from a GGUF path. allama stores models as
+/// `~/.allama/models/<name>/<name>:<size>.gguf`, so the parent dir is the run
+/// name. Override with `AMOS_GGML_MODEL` when the layout differs.
+fn model_run_name(path: &std::path::Path) -> String {
+    if let Ok(n) = std::env::var("AMOS_GGML_MODEL") {
+        if !n.is_empty() {
+            return n;
+        }
+    }
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim().to_string());
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    // allama layout: parent == "qwen2.5", file == "qwen2.5:0.5b.gguf" (stem starts with "name:")
+    if let Some(p) = &parent {
+        if !p.is_empty()
+            && p != "models"
+            && (stem == *p
+                || stem.starts_with(&format!("{p}:"))
+                || stem.starts_with(&format!("{p}-")))
+        {
+            return p.clone();
+        }
+    }
+    if stem.is_empty() {
+        "qwen2.5".to_string()
+    } else {
+        stem
+    }
+}
+
+/// Is an external GGML engine (default `allama`) available on PATH?
+fn engine_available() -> bool {
+    let bin = std::env::var("AMOS_GGML_BIN").unwrap_or_else(|_| "allama".into());
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run a one-shot completion through the engine: `allama run <name> -p <prompt>`.
+/// Logs are silenced with `RUST_LOG=off` and proxy env vars are cleared so the
+/// request stays local. Returns `None` when the engine/model is unavailable.
+fn run_external_engine(run_name: &str, prompt: &str, _max_tokens: usize) -> Option<String> {
+    if !engine_available() {
+        return None;
+    }
+    let bin = std::env::var("AMOS_GGML_BIN").unwrap_or_else(|_| "allama".into());
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("run")
+        .arg(run_name)
+        .arg("-p")
+        .arg(prompt)
+        .arg("--nowordwrap");
+    cmd.env("RUST_LOG", "off");
+    for p in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+    ] {
+        cmd.env_remove(p);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let cleaned = clean_engine_output(&text);
+    if cleaned.trim().is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Drop allama's stdout noise (loading/progress/[Generated …]) and keep the reply.
+fn clean_engine_output(output: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("Loading model")
+            || t.starts_with("Model loaded successfully")
+            || t.starts_with("Running model")
+            || t.contains("[Generated ")
+            || t.starts_with("2026-")
+        {
+            continue;
+        }
+        kept.push(t.to_string());
+    }
+    kept.join(" ")
+}
+
+/// Split a reply into word-ish tokens so the frontend can stream it; whitespace
+/// is preserved on each token so concatenation reproduces the original text.
+fn chunk_reply(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for ch in text.trim().chars() {
+        buf.push(ch);
+        if ch.is_whitespace() {
+            out.push(std::mem::take(&mut buf));
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// External API backend (e.g., OpenAI, Claude).
@@ -366,21 +506,31 @@ fn fetch_ollama_models(host: &str) -> Result<Vec<String>> {
 
 /// First-class local backend for an [Ollama](https://ollama.com) server.
 ///
-/// Talks to Ollama's OpenAI-compatible `/v1/chat/completions` (streaming) with
-/// no auth, and uses the native `/api/tags` endpoint for health checks that
-/// also report which models are available.
+/// Talks to Ollama's OpenAI-compatible `/v1/chat/completions` (streaming) and
+/// uses the native `/api/tags` endpoint for health checks that also report
+/// which models are available. Keyless by default, but an optional
+/// `Authorization: Bearer` can be supplied (some local Ollama builds / reverse
+/// proxies gate `/v1` behind an API key).
 pub struct OllamaBackend {
     host: String,
     model: String,
+    bearer: Option<String>,
 }
 
 impl OllamaBackend {
-    /// Create a backend for a host (e.g. `http://localhost:11434`) and model.
+    /// Create a keyless backend for a host (e.g. `http://localhost:11434`) and model.
     pub fn new(host: String, model: String) -> Self {
         Self {
             host: host.trim_end_matches('/').to_string(),
             model,
+            bearer: None,
         }
+    }
+
+    /// Set an optional bearer token so token-gated Ollama deployments can be used.
+    pub fn with_bearer(mut self, bearer: Option<String>) -> Self {
+        self.bearer = bearer;
+        self
     }
 
     /// Names of the models currently installed on the Ollama server.
@@ -416,7 +566,7 @@ impl InferenceBackend for OllamaBackend {
             "stream": true,
         });
         let url = format!("{}/v1/chat/completions", self.host);
-        let tokens = stream_chat_completions(&url, None, body).await?;
+        let tokens = stream_chat_completions(&url, self.bearer.as_deref(), body).await?;
         Ok(Box::new(ApiTokenStream {
             tokens: tokens.into_iter(),
         }))
@@ -691,8 +841,13 @@ pub enum BackendKind {
         endpoint: String,
         model: String,
     },
-    /// Use a local Ollama server (OpenAI-compatible, keyless).
-    Ollama { host: String, model: String },
+    /// Use a local Ollama server (OpenAI-compatible; optional bearer token for
+    /// token-gated deployments).
+    Ollama {
+        host: String,
+        model: String,
+        bearer: Option<String>,
+    },
     /// Use the Hermes-Rust agent (which itself calls Ollama) via its HTTP API.
     Hermes { base_url: String, model: String },
     /// Use mock backend (for testing).
@@ -717,8 +872,13 @@ impl BackendKind {
                 backend.health_check().await?;
                 Ok(Box::new(backend))
             }
-            BackendKind::Ollama { host, model } => {
-                let backend = OllamaBackend::new(host.clone(), model.clone());
+            BackendKind::Ollama {
+                host,
+                model,
+                bearer,
+            } => {
+                let backend =
+                    OllamaBackend::new(host.clone(), model.clone()).with_bearer(bearer.clone());
                 backend.health_check().await?;
                 Ok(Box::new(backend))
             }
@@ -941,6 +1101,134 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ggml_clean_engine_output_keeps_only_reply() {
+        let noisy = "Loading model 'qwen2.5'...\nModel loaded successfully (params)\nRunning model 'qwen2.5' with prompt...\n\nHello from allama\n\n[Generated 5 tokens in 12ms]\n";
+        let c = clean_engine_output(noisy);
+        assert!(!c.contains("Loading"), "progress lines stripped");
+        assert!(!c.contains("[Generated"), "footer stripped");
+        assert!(c.contains("Hello from allama"), "reply preserved");
+    }
+
+    #[test]
+    fn ggml_model_run_name_derives_from_allama_layout() {
+        assert_eq!(
+            model_run_name(std::path::Path::new(
+                "/Users/x/.allama/models/qwen2.5/qwen2.5:0.5b.gguf"
+            )),
+            "qwen2.5"
+        );
+        assert_eq!(
+            model_run_name(std::path::Path::new("/m/plain.gguf")),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn ggml_chunk_reply_roundtrips_with_spaces() {
+        let src = "  hello  world\nok  ";
+        let parts = chunk_reply(src);
+        assert_eq!(parts.concat(), "hello  world\nok");
+    }
+
+    #[tokio::test]
+    async fn ggml_real_engine_streams_when_allama_present() {
+        if !engine_available() {
+            eprintln!("skip: no allama engine on PATH");
+            return;
+        }
+        let p = format!(
+            "{}/.allama/models/qwen2.5/qwen2.5:0.5b.gguf",
+            std::env::var("HOME").unwrap_or_default()
+        );
+        if !std::path::Path::new(&p).exists() {
+            eprintln!("skip: qwen2.5 GGUF not found ({p})");
+            return;
+        }
+        let b = GgmlBackend::new(&p).expect("model exists");
+        let mut s = b
+            .infer(
+                "Reply with the single word: AMOS",
+                &std::collections::HashMap::new(),
+                24,
+            )
+            .await
+            .expect("infer ok");
+        let mut txt = String::new();
+        while let Some(t) = s.next().await {
+            txt.push_str(&t.unwrap_or_default());
+        }
+        eprintln!("ggml real reply: {txt}");
+        assert!(!txt.trim().is_empty(), "real local engine produced text");
+    }
+
+    async fn ollama_stream_carries_expected_auth(expect_bearer: bool) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let srv = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(sock);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push_str(&line);
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            // Drain the request body so closing the socket never RSTs a still-writing client.
+            let mut len = 0usize;
+            for l in head.to_ascii_lowercase().lines() {
+                if let Some(v) = l.strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            if len > 0 {
+                let _ = reader.read_exact(&mut body).await;
+            }
+            let mut sock = reader.into_inner();
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{sse}");
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+            let _ = sock.shutdown().await;
+            head
+        });
+        let mut b = OllamaBackend::new(format!("http://{addr}"), "m".into());
+        if expect_bearer {
+            b = b.with_bearer(Some("sk-test".into()));
+        }
+        let mut stream = b
+            .infer("hi", &std::collections::HashMap::new(), 8)
+            .await
+            .expect("infer ok");
+        let mut all = String::new();
+        while let Some(tok) = stream.next().await {
+            all.push_str(&tok.expect("token ok"));
+        }
+        assert_eq!(all, "Hello", "streamed tokens assembled");
+        let head = srv.await.unwrap();
+        if expect_bearer {
+            assert!(
+                head.contains("Authorization: Bearer sk-test"),
+                "bearer sent when configured"
+            );
+        } else {
+            assert!(!head.contains("Authorization"), "keyless by default");
+        }
+    }
+
     #[tokio::test]
     async fn ollama_health_check_fails_fast_when_unreachable() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -951,5 +1239,15 @@ mod tests {
             b.health_check().await.is_err(),
             "unreachable Ollama must fail health (no hang)"
         );
+    }
+
+    #[tokio::test]
+    async fn ollama_sends_bearer_when_configured() {
+        ollama_stream_carries_expected_auth(true).await;
+    }
+
+    #[tokio::test]
+    async fn ollama_is_keyless_by_default() {
+        ollama_stream_carries_expected_auth(false).await;
     }
 }

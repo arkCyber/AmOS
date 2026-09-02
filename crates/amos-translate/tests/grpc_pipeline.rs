@@ -166,3 +166,91 @@ async fn typed_text_through_daemon_translates() {
     daemon.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+/// interpret-bridge-style lifecycle over a real daemon: a typed segment must
+/// produce exactly one SegmentFinal and, after stop, a SessionEnded, in order —
+/// the same output sequence the Tauri `interpret-output` event forwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn interpret_lifecycle_emits_segment_then_ended() {
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-int-grpc-lifecycle-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let daemon = spawn_daemon(&path).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let pipeline = Box::new(GrpcPipeline::new(&path, "auto", "zh"));
+    let config = SessionConfig::one_way("auto", "zh");
+    let (mut session, mut rx) = Session::new(config, pipeline);
+
+    session.start().unwrap();
+    session
+        .handle(SessionEvent::TextSegment("hello".into()))
+        .await
+        .expect("typed segment through daemon");
+    session.stop().unwrap();
+
+    let out = drain(&mut rx).await;
+    let tags: Vec<&str> = out
+        .iter()
+        .filter_map(|o| match o {
+            InterpretationOutput::SegmentFinal(_) => Some("segment"),
+            InterpretationOutput::SessionEnded { .. } => Some("ended"),
+            _ => None,
+        })
+        .collect();
+    let seg_pos = tags
+        .iter()
+        .position(|k| *k == "segment")
+        .expect("a segment was emitted");
+    let end_pos = tags
+        .iter()
+        .position(|k| *k == "ended")
+        .expect("session ended after stop");
+    assert!(
+        seg_pos < end_pos,
+        "SegmentFinal must precede SessionEnded: {tags:?}"
+    );
+    assert_eq!(session.state(), SessionState::Ended);
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// With TTS enabled, a Session driven over the real daemon must emit a
+/// `TtsRequest` for the translated segment (the interpret/TTS bridge path).
+#[tokio::test(flavor = "multi_thread")]
+async fn tts_request_emitted_over_daemon_when_enabled() {
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-int-grpc-tts-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let daemon = spawn_daemon(&path).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let pipeline = Box::new(GrpcPipeline::new(&path, "auto", "zh"));
+    let config = SessionConfig::one_way("auto", "zh").with_tts(true);
+    let (mut session, mut rx) = Session::new(config, pipeline);
+
+    session.start().unwrap();
+    session
+        .handle(SessionEvent::TextSegment("hello".into()))
+        .await
+        .expect("typed segment through daemon");
+    session.stop().unwrap();
+
+    let out = drain(&mut rx).await;
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, InterpretationOutput::SegmentFinal(_))),
+        "expected a translated segment: {out:?}"
+    );
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, InterpretationOutput::TtsRequest(_))),
+        "TTS must be requested for the translation when enabled: {out:?}"
+    );
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&path);
+}

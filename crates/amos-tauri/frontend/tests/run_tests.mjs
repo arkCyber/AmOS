@@ -221,7 +221,26 @@ test('home renders grid + dock with correct counts', () => {
   const expectedGrid = e.Amos.apps.size - dockCount;
   e.Amos.renderHome();
   assert(gridOf(e.view).children.length === expectedGrid, `grid=${gridOf(e.view).children.length}, expected ${expectedGrid}`);
-  assert(dockOf(e.view).children.length === dockCount, `dock=${dockOf(e.view).children.length}`);
+  // Dock children = N draggable app icons + 1 fixed Spotlight (🔍) trigger.
+  assert(dockOf(e.view).children.length === dockCount + 1, `dock=${dockOf(e.view).children.length}, expected ${dockCount + 1}`);
+  const last = dockOf(e.view).children[dockCount];
+  assert(last.className === 'dock-search', 'dock ends with the search trigger');
+  assert(last.getAttribute('aria-label') === '搜索', 'search trigger has an accessible name');
+});
+
+test('home icons expose an accessible name (dock labels are visually hidden)', () => {
+  const e = fresh();
+  e.Amos.renderHome();
+  const check = (node) => {
+    const aria = node.getAttribute('aria-label');
+    assert(aria && aria.length, `icon missing aria-label`);
+    assert(node.getAttribute('title') === aria, `icon title mirrors aria-label`);
+  };
+  for (const icon of dockOf(e.view).children) check(icon);
+  for (const icon of gridOf(e.view).children) check(icon);
+  const dockId = e.sandbox.window.AmosDock[0];
+  assert(dockOf(e.view).children[0].getAttribute('aria-label') === e.Amos.apps.get(dockId).name,
+    'dock icon aria-label equals its app name');
 });
 
 test('layout persists to localStorage', () => {
@@ -375,6 +394,62 @@ test('calculator handles decimal and clear', () => {
   assert(display.textContent === '0', 'clear resets to 0');
 });
 
+test('calculator: iOS-aligned − × ÷ all evaluate', () => {
+  const e = fresh();
+  const node = e.Amos.apps.get('calculator').render();
+  const content = node.children[1].children[0];
+  const display = content.children[0];
+  const grid = content.children[1];
+  const btn = (t) => grid.children.find((b) => b.children[0] === t);
+  // subtraction (the on-screen key is U+2212 minus)
+  btn('9').dispatch('click', {});
+  btn('−').dispatch('click', {});
+  btn('3').dispatch('click', {});
+  btn('=').dispatch('click', {});
+  assert(display.textContent === '6', `9−3 expected 6, got ${display.textContent}`);
+  btn('C').dispatch('click', {});
+  btn('4').dispatch('click', {});
+  btn('×').dispatch('click', {});
+  btn('5').dispatch('click', {});
+  btn('=').dispatch('click', {});
+  assert(display.textContent === '20', `4×5 expected 20, got ${display.textContent}`);
+  btn('C').dispatch('click', {});
+  btn('9').dispatch('click', {});
+  btn('÷').dispatch('click', {});
+  btn('3').dispatch('click', {});
+  btn('=').dispatch('click', {});
+  assert(display.textContent === '3', `9÷3 expected 3, got ${display.textContent}`);
+});
+
+test('calculator: = then a digit starts a fresh number (iOS behavior)', () => {
+  const e = fresh();
+  const node = e.Amos.apps.get('calculator').render();
+  const content = node.children[1].children[0];
+  const display = content.children[0];
+  const grid = content.children[1];
+  const btn = (t) => grid.children.find((b) => b.children[0] === t);
+  btn('2').dispatch('click', {});
+  btn('+').dispatch('click', {});
+  btn('3').dispatch('click', {});
+  btn('=').dispatch('click', {});
+  assert(display.textContent === '5', '2+3 = 5');
+  btn('7').dispatch('click', {});
+  assert(display.textContent === '7', `after =, 7 starts a fresh number (got ${display.textContent})`);
+});
+
+test('calculator: percent divides the current entry by 100', () => {
+  const e = fresh();
+  const node = e.Amos.apps.get('calculator').render();
+  const content = node.children[1].children[0];
+  const display = content.children[0];
+  const grid = content.children[1];
+  const btn = (t) => grid.children.find((b) => b.children[0] === t);
+  btn('5').dispatch('click', {});
+  btn('0').dispatch('click', {});
+  btn('%').dispatch('click', {});
+  assert(display.textContent === '0.5', `50% → 0.5 (got ${display.textContent})`);
+});
+
 test('notes: adding a note persists and renders', () => {
   const e = fresh();
   const node = e.Amos.apps.get('notes').render();
@@ -401,6 +476,44 @@ test('messages: sending appends a user bubble', () => {
   input.value = '在吗？';
   sendBtn.dispatch('click', {});
   assert(body.children.length === before + 1, 'a bubble was appended');
+});
+
+test('messages: Enter sends and the thread persists across a reopen', () => {
+  const e = fresh();
+  const A = e.Amos;
+  const mk = () => A.apps.get('messages').render();
+  const node = mk();
+  const content = node.children[1].children[0];
+  const input = content.children[1].children[0];
+  input.value = '在吗？';
+  input.dispatch('keydown', { key: 'Enter' });
+  const saved = JSON.parse(e.localStorage.getItem('amos.messages'));
+  assert(Array.isArray(saved) && saved.length === 4 && saved[3].text === '在吗？', 'Enter sent and persisted the message');
+  const node2 = mk(); // reopen in the same environment
+  const content2 = node2.children[1].children[0];
+  assert(content2.children[0].children.length === 4, 'reopened Messages keeps the conversation');
+});
+
+test('clock: stopwatch start → lap → pause → reset flow', () => {
+  const e = fresh();
+  const node = e.Amos.apps.get('clock').render();
+  const content = node.children[1].children[0]; // inner container [big clock, date, world, swCard]
+  const swCard = content.children[3];
+  const disp = swCard.children[1];
+  const btns = swCard.children[2]; // [记圈, 开始/暂停, 复位]
+  const lapBtn = btns.children[0], startBtn = btns.children[1], resetBtn = btns.children[2];
+  const laps = swCard.children[3];
+  assert(disp.textContent === '00:00.00', 'stopwatch starts at zero');
+  assert(startBtn.textContent === '开始', 'starts paused (开始)');
+  startBtn.dispatch('click', {});
+  assert(startBtn.textContent === '暂停', 'running button shows 暂停');
+  lapBtn.dispatch('click', {});
+  assert(laps.children.length === 1, 'lap recorded while running');
+  startBtn.dispatch('click', {}); // pause
+  assert(startBtn.textContent === '开始', 'paused shows 开始');
+  resetBtn.dispatch('click', {});
+  assert(disp.textContent === '00:00.00', 'reset clears the display');
+  assert(laps.children.length === 0, 'reset clears recorded laps');
 });
 
 test('settings: toggling wifi persists to amos.settings', () => {
@@ -824,6 +937,104 @@ test('files: create folder and text file persist to the store', () => {
   assert(files.some((f) => f.name === '笔记.txt' && f.type === 'file' && f.content === '你好 Amos'), 'text file created and persisted');
 });
 
+test('files: folders open/back, create inside folder, and deleting cascades children', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('files');
+  app.render(); // seeds 文档 + 说明.txt
+  const node = app.render();
+  const rootEl = node.children[1].children[0].children[0]; // root
+  const toolbar = rootEl.children[0];
+  const listEl = rootEl.children[4]; // order: toolbar, nav, form, status, list
+
+  // Create a folder at root.
+  toolbar.children[0].dispatch('click', {});
+  let fi = walkClass(node, 'field')[0];
+  fi.value = '项目';
+  walkClass(node, 'btn').find((b) => b.children && b.children[0] === '保存').dispatch('click', {});
+  let projRow = listEl.children.find((r) => r.children[0].textContent === '📁' && r.children[1].children[0].textContent === '项目');
+  assert(projRow, 'new folder listed at root');
+
+  // Enter the folder (row click) → back breadcrumb appears, folder is empty.
+  projRow.dispatch('click', {});
+  assert(listEl.children.length === 0, 'empty folder shows no rows');
+  const backBtn = walkClass(rootEl, 'btn').find((b) => b.children && b.children[0] === '‹ 根目录');
+  assert(backBtn, 'back breadcrumb present while inside a folder');
+
+  // Create a file while inside the folder → stored with parent = folder.
+  toolbar.children[1].dispatch('click', {});
+  fi = walkClass(node, 'field')[0];
+  fi.value = '内.txt';
+  const ta = walkClass(node, 'field')[1];
+  ta.value = '内容';
+  walkClass(node, 'btn').find((b) => b.children && b.children[0] === '保存').dispatch('click', {});
+  let files = JSON.parse(e.localStorage.getItem('amos.files'));
+  assert(files.some((f) => f.name === '内.txt' && f.parent === '项目'), 'file created inside the folder');
+  assert(listEl.children.length === 1, 'folder now lists its child');
+
+  // Back to root: folder visible again, nested file hidden.
+  backBtn.dispatch('click', {});
+  assert(listEl.children.some((r) => r.children[0].textContent === '📁' && r.children[1].children[0].textContent === '项目'), 'root lists the folder again');
+  assert(!listEl.children.some((r) => r.children[1].children[0].textContent === '内.txt'), 'nested file hidden at root');
+
+  // Deleting the folder cascades to its child.
+  const row2 = listEl.children.find((r) => r.children[0].textContent === '📁' && r.children[1].children[0].textContent === '项目');
+  const delBtn = row2.children[row2.children.length - 1];
+  delBtn.dispatch('click', {});
+  files = JSON.parse(e.localStorage.getItem('amos.files'));
+  assert(!files.some((f) => f.name === '项目'), 'folder removed');
+  assert(!files.some((f) => f.name === '内.txt'), 'nested child removed with its folder');
+});
+
+test('files: deep path, rename keeps children, and cut/move into a nested folder', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('files');
+  app.render(); // seeds
+  const node = app.render();
+  const rootEl = node.children[1].children[0].children[0]; // root
+  const toolbar = rootEl.children[0];
+  const listEl = rootEl.children[4]; // toolbar, nav, form, status, list
+  const save = () => walkClass(node, 'btn').find((b) => b.children && b.children[0] === '保存').dispatch('click', {});
+  const folderRow = (name) => listEl.children.find((r) => r.children[0].textContent === '📁' && r.children[1].children[0].textContent === name);
+  const fileRow = (name) => listEl.children.find((r) => r.children[0].textContent === '📄' && r.children[1].children[0].textContent === name);
+  const rowBtn = (row, label) => row.children.find((b) => b.children && b.children[0] === label);
+  const createFolder = (name) => { toolbar.children[0].dispatch('click', {}); walkClass(node, 'field')[0].value = name; save(); };
+  const createFile = (name) => { toolbar.children[1].dispatch('click', {}); const fs = walkClass(node, 'field'); fs[0].value = name; fs[1].value = 'hi'; save(); };
+  const navBtn = (label) => walkClass(rootEl, 'btn').find((b) => b.children && b.children[0] === label);
+
+  // root/A/B nested structure
+  createFolder('A');
+  folderRow('A').dispatch('click', {});           // enter A
+  createFolder('B');                              // B inside A
+  navBtn('‹ 根目录').dispatch('click', {});        // back to root (deep link)
+  createFile('m.txt');                            // file at root
+
+  let files = JSON.parse(e.localStorage.getItem('amos.files'));
+  assert(files.some((f) => f.name === 'B' && f.parent === 'A'), 'B nested under A');
+
+  // Rename folder A → 资料; child B follows the new name (parent updated).
+  rowBtn(folderRow('A'), '重命名').dispatch('click', {});
+  walkClass(node, 'field')[0].value = '资料';
+  save();
+  files = JSON.parse(e.localStorage.getItem('amos.files'));
+  assert(files.some((f) => f.type === 'folder' && f.name === '资料'), 'folder renamed to 资料');
+  assert(!files.some((f) => f.name === 'A'), 'old folder name gone');
+  assert(files.some((f) => f.name === 'B' && f.parent === '资料'), 'child re-parented after folder rename');
+
+  // Cut/move m.txt into the nested folder 资料/B.
+  rowBtn(fileRow('m.txt'), '移动').dispatch('click', {});
+  folderRow('资料').dispatch('click', {});        // descend while moving
+  folderRow('B').dispatch('click', {});           // into 资料/B
+  navBtn('移动到这里').dispatch('click', {});
+  files = JSON.parse(e.localStorage.getItem('amos.files'));
+  assert(files.some((f) => f.name === 'm.txt' && f.parent === 'B'), 'm.txt moved into 资料/B');
+  assert(!files.some((f) => f.name === 'm.txt' && !f.parent), 'm.txt no longer at root');
+
+  // Deep-link breadcrumb: jump directly from 资料/B back to 资料.
+  navBtn('资料').dispatch('click', {});
+  assert(folderRow('B'), 'deep link jumped straight to 资料 showing its child B');
+});
+
+
 test('camera: shutter saves a photo into the album store (demo fallback)', () => {
   const e = fresh();
   const app = e.Amos.apps.get('camera');
@@ -1190,6 +1401,172 @@ test('wallpaper: resolution, presets, and custom URLs', () => {
   assert(A.resolveWallpaper(false, 'https://x/img.jpg') === 'https://x/img.jpg', 'custom http url passes through');
   assert(A.isCustomWallpaper('data:image/png;base64,AAAA') === true, 'data: url is treated as custom');
   assert(A.isCustomWallpaper('dark') === false, 'built-in ids are not custom');
+});
+
+console.log('\nbackground display methods');
+test('background methods config: default is 若隐若现 (ghost) and multiple methods exist', () => {
+  const A = fresh().Amos;
+  assert(A.defaultBackgroundMode === 'ghost', 'default method is ghost (若隐若现)');
+  assert(Array.isArray(A.backgroundModes) && A.backgroundModes.length >= 3, 'multiple display methods defined');
+  assert(A.backgroundModes[0].id === 'ghost', 'first entry is the default');
+  assert(A.resolveBackgroundMode('soft').id === 'soft', 'soft resolves');
+  assert(A.resolveBackgroundMode('not-a-mode').id === 'ghost', 'unknown id falls back to default');
+  for (const m of A.backgroundModes) {
+    assert(m.label && m.desc, `${m.id} has label+desc`);
+    assert(m.style && typeof m.style.alpha === 'number' && typeof m.style.blur === 'number'
+      && typeof m.style.sat === 'number' && typeof m.style.bright === 'number', `${m.id} has numeric CSS style`);
+  }
+});
+
+test('applyTheme applies the active background display method as CSS vars', () => {
+  const e = fresh();
+  const A = e.Amos;
+  const root = {
+    _attrs: {}, style: { _p: {} },
+    setAttribute(k, v) { this._attrs[k] = v; },
+    getAttribute(k) { return this._attrs[k]; },
+  };
+  root.style.setProperty = function (k, v) { this._p[k] = String(v); };
+  e.document.documentElement = root;
+  // No stored setting -> default 若隐若现 (ghost).
+  A.applyTheme();
+  assert(root.getAttribute('data-bg') === 'ghost', 'unset -> data-bg=ghost');
+  assert(root.style._p['--wp-alpha'] === '0.58', 'ghost alpha applied');
+  assert(root.style._p['--wp-blur'] === '9px', 'ghost blur applied');
+  // Switching the store to `vivid` re-applies immediately.
+  e.localStorage.setItem('amos.settings', JSON.stringify({ background: 'vivid' }));
+  A.applyTheme();
+  assert(root.getAttribute('data-bg') === 'vivid', 'data-bg follows the stored method');
+  assert(root.style._p['--wp-alpha'] === '0.95', 'vivid alpha applied');
+  assert(root.style._p['--wp-blur'] === '0px', 'vivid blur applied');
+});
+
+test('settings: background display picker persists a choice and can reset to default', () => {
+  const e = fresh();
+  const A = e.Amos;
+  const node = A.apps.get('settings').render();
+  const btns = walkClass(node, 'secondary').filter((b) => typeof b.textContent === 'string');
+  const byText = (t) => btns.find((b) => b.textContent.trim() === t);
+  const softBtn = byText('柔和 · 透亮');
+  assert(softBtn, 'mode button "柔和 · 透亮" present in settings');
+
+  softBtn.dispatch('click', {});
+  let saved = JSON.parse(e.localStorage.getItem('amos.settings'));
+  assert(saved.background === 'soft', 'picking soft persisted background=soft');
+
+  const root = {
+    _attrs: {}, style: { _p: {} },
+    setAttribute(k, v) { this._attrs[k] = v; },
+    getAttribute(k) { return this._attrs[k]; },
+  };
+  root.style.setProperty = function (k, v) { this._p[k] = String(v); };
+  e.document.documentElement = root;
+  A.applyTheme();
+  assert(root.getAttribute('data-bg') === 'soft', 'applyTheme reflects picked soft mode');
+
+  const resetBtn = byText('恢复缺省');
+  assert(resetBtn, 'reset-to-default button present');
+  resetBtn.dispatch('click', {});
+  saved = JSON.parse(e.localStorage.getItem('amos.settings'));
+  assert(saved.background === undefined, 'reset removed the background override');
+  A.applyTheme();
+  assert(root.getAttribute('data-bg') === 'ghost', 'applyTheme back to default 若隐若现');
+});
+
+test('applyTheme safely falls back when a stored background id is unknown', () => {
+  const e = fresh();
+  const A = e.Amos;
+  const root = {
+    _attrs: {}, style: { _p: {} },
+    setAttribute(k, v) { this._attrs[k] = v; },
+    getAttribute(k) { return this._attrs[k]; },
+  };
+  root.style.setProperty = function (k, v) { this._p[k] = String(v); };
+  e.document.documentElement = root;
+  e.localStorage.setItem('amos.settings', JSON.stringify({ background: 'not-a-real-mode' }));
+  A.applyTheme();
+  assert(root.getAttribute('data-bg') === 'ghost', 'unknown id degrades to ghost default');
+  assert(root.style._p['--wp-alpha'] === '0.58', 'ghost style values applied');
+});
+
+test('screensaver/lock background: crisp by default, follows method when disabled', () => {
+  const e = fresh();
+  const A = e.Amos;
+  const root = {
+    _attrs: {}, style: { _p: {} },
+    setAttribute(k, v) { this._attrs[k] = v; },
+    getAttribute(k) { return this._attrs[k]; },
+  };
+  root.style.setProperty = function (k, v) { this._p[k] = String(v); };
+  e.document.documentElement = root;
+  // Default: lock crisp while home stays faint (若隐若现).
+  A.applyTheme();
+  assert(root.style._p['--lock-blur'] === '0px', 'lock crisp: no blur by default');
+  assert(root.style._p['--lock-alpha'] === '0.9', 'lock near-opaque by default');
+  assert(root.style._p['--wp-blur'] === '9px', 'home background still faint (independent)');
+  // Disable the toggle -> lock follows the home display method.
+  e.localStorage.setItem('amos.settings', JSON.stringify({ lockClear: false }));
+  A.applyTheme();
+  assert(root.style._p['--lock-blur'] === '9px', 'lock follows home method when toggle off');
+});
+
+test('home/dock icons show unread badges and opening the app clears them', () => {
+  const e = fresh({ noTauri: true }); // openApp navigates in-place (SPA)
+  const A = e.Amos;
+  A.renderHome();
+  const findIcon = (list, name) => list.children.find((b) => b.getAttribute && b.getAttribute('aria-label') === name);
+  const badgeOf = (ic) => ic && ic.children.find((c) => c.className === 'app-badge');
+  const dockMsg = findIcon(dockOf(e.view), '信息');
+  assert(dockMsg, 'messages app in dock');
+  assert(badgeOf(dockMsg) && badgeOf(dockMsg).textContent === '1', 'unread badge shows 1 on 信息');
+  const gridW = findIcon(gridOf(e.view), '天气');
+  assert(badgeOf(gridW) && badgeOf(gridW).textContent === '1', 'grid 天气 badge shows 1');
+  assert(!badgeOf(findIcon(gridOf(e.view), '计算器')), 'no badge when an app has no notifications');
+
+  A.openApp('messages');
+  const notifs = JSON.parse(e.localStorage.getItem('amos.notifications'));
+  assert(Array.isArray(notifs) && !notifs.some((x) => x.app === '信息'), 'opening messages cleared its notifications');
+  A.renderHome();
+  assert(!badgeOf(findIcon(dockOf(e.view), '信息')), 'badge cleared after reading messages');
+});
+
+console.log('\nspotlight search');
+test('searchApps: empty query lists every installed app', () => {
+  const A = fresh().Amos;
+  assert(A.searchApps('').length === A.apps.size, 'empty query returns all apps');
+  assert(A.searchApps('   ').length === A.apps.size, 'whitespace query returns all apps');
+});
+test('searchApps: matches by Chinese name, English id, and pinyin alias', () => {
+  const A = fresh().Amos;
+  const byName = A.searchApps('计算器');
+  assert(byName.length && byName[0].id === 'calculator', 'Chinese name match → calculator');
+  const byId = A.searchApps('camera');
+  assert(byId.length && byId[0].id === 'camera', 'English id match → camera');
+  const byPinyin = A.searchApps('shezhi');
+  assert(byPinyin.length && byPinyin[0].id === 'settings', 'pinyin alias match → settings');
+  assert(A.searchApps('zzzz_not_an_app').length === 0, 'no match yields an empty result');
+});
+test('spotlight overlay: builds on the body, filters, and a result tap opens the app', () => {
+  const e = fresh({ noTauri: true }); // SPA routing so tapping a result navigates in-place
+  const A = e.Amos;
+  e.document.body = e.document.createElement('body'); // enable overlay to attach
+  A.showSearch();
+  const overlay = walkClass(e.document.body, 'spotlight')[0];
+  assert(overlay, 'spotlight overlay appended to body');
+  assert(overlay.style.display === 'flex', 'overlay is shown');
+  const input = walkClass(overlay, 'spot-input')[0];
+  assert(input, 'search field present');
+  assert(walkClass(overlay, 'spot-row').length === Math.min(A.apps.size, 24), 'default state lists apps');
+  // Typing (physical / IME path) filters results live.
+  input.value = 'calc';
+  input.dispatch('input', {});
+  const filtered = walkClass(overlay, 'spot-row');
+  assert(filtered.length === 1, 'typing narrowed to one result');
+  assert(walkClass(filtered[0], 'spot-name')[0].textContent === '计算器', 'result is calculator');
+  // Tapping the result launches the app and dismisses the overlay.
+  filtered[0].dispatch('click', {});
+  assert(e.view.children[0].className === 'app-screen', 'result tap navigated to the app');
+  assert(overlay.style.display === 'none', 'overlay hidden after launch');
 });
 
 // ---------------------------------------------------------------------------

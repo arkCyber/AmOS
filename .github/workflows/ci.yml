@@ -57,6 +57,11 @@ jobs:
       - name: Smoke (int-cli + full_chain)
         run: make smoke
 
+      # Headless supervisor gate: real daemons under the supervisor with no GUI,
+      # SIGUSR1 hot-restart, and a graceful SIGINT stop with no orphaned children.
+      - name: Smoke (supervisor headless launch/restart/stop)
+        run: make sup-smoke
+
   # Native gated backends — sherpa-onnx ASR (`amos-asr`) and Piper TTS
   # (`amos-tts`). These download prebuilt native libs, so this runs on GitHub's
   # *networked* runners. Verified against sherpa-onnx 1.13.7 / piper-rs 0.2.

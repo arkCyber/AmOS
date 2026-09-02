@@ -131,11 +131,27 @@ window.Amos = (() => {
     }, app.icon);
   }
 
+  // Unread count for an app icon from the shared notification store. Notifications
+  // carry the display name (`n.app`) which matches `app.name`.
+  function notifCountFor(id) {
+    const name = apps.has(id) ? apps.get(id).name : "";
+    if (!name) return 0;
+    try {
+      const list = JSON.parse(safeGet("amos.notifications", "[]"));
+      if (!Array.isArray(list)) return 0;
+      return list.filter((n) => n && n.app === name).length;
+    } catch (_) { return 0; }
+  }
+
   // ---- Home icon (long-press jiggle, − badge, drag & drop) ----
   function makeIcon(app, inDock) {
     const btn = el("button", {
       class: "app-icon" + (jiggling ? " jiggling" : ""),
       draggable: jiggling ? "true" : "false",
+      // Accessible name: dock labels are visually hidden (display:none), so the
+      // button itself must carry the app name for assistive tech / tooltips.
+      "aria-label": app.name,
+      title: app.name,
       onclick: () => { if (!jiggling) openApp(app.id); },
     });
 
@@ -176,6 +192,11 @@ window.Amos = (() => {
     });
     btn.addEventListener("dragend", () => btn.classList.remove("dragging"));
 
+    // Unread-notification badge (Apple-style red dot) when this app has unseen
+    // notifications. Removed when the app is opened (see openApp).
+    const n = notifCountFor(app.id);
+    if (n > 0) btn.appendChild(el("span", { class: "app-badge" }, n > 99 ? "99+" : String(n)));
+
     return btn;
   }
 
@@ -205,6 +226,14 @@ window.Amos = (() => {
       },
     });
     for (const id of layout.dock) dock.appendChild(makeIcon(apps.get(id), true));
+    // Fixed Spotlight trigger (not an app, not movable / removable). Stays at the
+    // end of the dock so it never displaces the draggable app icons above.
+    dock.appendChild(el("button", {
+      class: "dock-search",
+      "aria-label": "搜索",
+      title: "搜索",
+      onclick: () => { if (jiggling) exitJiggle(); showSearch(); },
+    }, "🔍"));
 
     const scroll = el("div", {
       class: "home-scroll",
@@ -264,6 +293,7 @@ window.Amos = (() => {
   }
 
   function goHome() {
+    hideSearch(); // returning home should dismiss the Spotlight overlay too
     if (current && current.app.onUnmount) current.app.onUnmount(current.node);
     current = null;
     renderHome();
@@ -336,7 +366,16 @@ window.Amos = (() => {
   // the launcher keeps working headlessly.
 
   function openApp(id) {
-    if (locked) return; // must unlock first
+    if (locked) return;
+    hideSearch(); // launching an app always dismisses any open Spotlight overlay
+    // Opening an app marks its notifications as read (iOS behaviour).
+    const appName = apps.has(id) ? apps.get(id).name : "";
+    try {
+      const list = JSON.parse(safeGet("amos.notifications", "[]"));
+      if (Array.isArray(list) && appName && list.some((x) => x && x.app === appName)) {
+        storeWrite("amos.notifications", JSON.stringify(list.filter((x) => x && x.app !== appName)));
+      }
+    } catch (_) {}
     pushRecent(id);
     const I = window.__TAURI_INTERNALS__;
     if (I) {
@@ -520,6 +559,151 @@ window.Amos = (() => {
 
   function hideRecents() { renderHome(); }
 
+  // ---- Spotlight app search (dock 🔍, iPhone-style) ----
+  // Tapping the dock search control opens a full-screen "Spotlight" sheet with a
+  // search field + results and an on-screen keyboard. Matching is done on app
+  // name / id plus aliases below (so pinyin like `shezhi` or English ids like
+  // `camera` find the Chinese-named apps).
+  const SEARCH_ALIASES = {
+    settings: ["shezhi", "shèzhì", "sz"],
+    phone: ["dianhua", "diànhuà", "dh", "call"],
+    camera: ["xiangji", "xiàngjī", "xj"],
+    photos: ["xiangce", "xiàngcè", "xc", "album", "相册"],
+    calculator: ["jisuanqi", "jìsuànqì", "jsq", "calc"],
+    weather: ["tianqi", "tiānqì", "tq"],
+    clock: ["shizhong", "shízhōng", "naozhong", "闹钟"],
+    files: ["wenjian", "wénjiàn", "wj", "file"],
+    maps: ["ditu", "dìtú", "map"],
+    messages: ["xinxi", "xìnxī", "sms", "message", "短信"],
+    music: ["yinyue", "yīnyuè", "yy", "song"],
+    notes: ["beiwanglu", "bèiwànglù", "bwl", "note", "memo"],
+    ai: ["agent", "zhineng", "zhìnéng", "人工智能", "ai"],
+    android: ["anzhuo", "ānzhuó", "android", "apk", "安卓"],
+    interpreter: ["tongchuan", "tónɡchuán", "tc", "translate", "同传", "翻译"],
+  };
+  function searchApps(query) {
+    const q = String(query == null ? "" : query).trim().toLowerCase();
+    const out = [];
+    for (const a of apps.values()) {
+      const name = (a.name || "").toLowerCase();
+      const id = a.id.toLowerCase();
+      const keys = (SEARCH_ALIASES[a.id] || []).concat(Array.isArray(a.search) ? a.search : []);
+      let rank = -1;
+      if (!q) rank = 0;
+      else if (name === q) rank = 1;
+      else if (name.startsWith(q)) rank = 2;
+      else if (id.startsWith(q)) rank = 3;
+      else if (name.includes(q)) rank = 4;
+      else if (id.includes(q)) rank = 5;
+      else if (keys.some((k) => { const s = String(k).toLowerCase(); return s === q || s.startsWith(q) || s.includes(q); })) rank = 6;
+      if (rank >= 0) out.push({ app: a, rank });
+    }
+    if (q) out.sort((x, y) => x.rank - y.rank);
+    return out.map((o) => o.app);
+  }
+
+  // Spotlight overlay state (built once, then shown/hidden on demand).
+  let spotRoot = null, spotInput = null, spotResults = null, spotLast = [];
+  const KB_TOP = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+  const KB_MID = ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"];
+  const KB_HOME = ["a", "s", "d", "f", "g", "h", "j", "k", "l"];
+  const KB_BOT = ["z", "x", "c", "v", "b", "n", "m"];
+
+  function spotKeyRow(keys) {
+    const row = el("div", { class: "spot-kb-row" });
+    keys.forEach((k) => row.appendChild(el("button", {
+      class: "spot-key", "aria-label": k, onclick: () => spotType(k),
+    }, k)));
+    return row;
+  }
+  function spotType(ch) {
+    if (!spotInput) return;
+    spotInput.value = String(spotInput.value) + ch;
+    spotRefresh();
+  }
+  function spotBackspace() {
+    if (!spotInput) return;
+    spotInput.value = String(spotInput.value).slice(0, -1);
+    spotRefresh();
+  }
+  function spotClear() {
+    if (spotInput) { spotInput.value = ""; spotRefresh(); }
+  }
+  function spotRefresh() {
+    if (!spotResults) return;
+    const q = spotInput ? String(spotInput.value) : "";
+    const list = searchApps(q);
+    spotLast = list;
+    spotResults.innerHTML = "";
+    const shown = list.slice(0, 24);
+    if (!shown.length) {
+      spotResults.appendChild(el("div", { class: "spot-empty muted" }, `未找到「${q || "…"}」`));
+      return;
+    }
+    shown.forEach((app) => {
+      spotResults.appendChild(el("button", {
+        class: "spot-row",
+        onclick: () => { const id = app.id; hideSearch(); openApp(id); },
+      }, [iconTile(app), el("span", { class: "spot-name" }, app.name), el("span", { class: "muted spot-open" }, "打开")]));
+    });
+  }
+  function spotOpenFirst() {
+    const first = spotLast && spotLast[0];
+    if (first) { const id = first.id; hideSearch(); openApp(id); }
+    else hideSearch();
+  }
+  function buildSpotlight() {
+    const body = (typeof document !== "undefined" && document.body) ? document.body : null;
+    if (!body) return null;
+    const fieldRow = el("div", { class: "spot-field" }, [
+      el("span", { class: "spot-mag" }, "🔍"),
+      (spotInput = el("input", {
+        class: "spot-input",
+        placeholder: "搜索应用：设置 / camera / shezhi…",
+        autocomplete: "off", spellcheck: "false",
+        oninput: () => spotRefresh(),
+        onkeydown: (e) => {
+          if (e && e.key === "Enter") spotOpenFirst();
+          else if (e && e.key === "Escape") hideSearch();
+        },
+      })),
+      el("button", { class: "spot-clear", "aria-label": "清空", onclick: () => spotClear() }, "✕"),
+    ]);
+    spotResults = el("div", { class: "spot-results" });
+    const kb = el("div", { class: "spot-kb" }, [
+      spotKeyRow(KB_TOP), spotKeyRow(KB_MID), spotKeyRow(KB_HOME), spotKeyRow(KB_BOT),
+      el("div", { class: "spot-kb-row spot-action" }, [
+        el("button", { class: "spot-key wide", onclick: () => spotType(" ") }, "空格"),
+        el("button", { class: "spot-key", onclick: () => spotBackspace() }, "⌫"),
+        el("button", { class: "spot-key return", onclick: () => spotOpenFirst() }, "打开"),
+      ]),
+    ]);
+    spotRoot = el("div", { class: "spotlight", onclick: (e) => { if (e && e.target === spotRoot) hideSearch(); } }, [
+      el("div", { class: "spot-head" }, [
+        el("span", { class: "spot-title" }, "搜索"),
+        el("button", { class: "btn secondary spot-done", onclick: () => hideSearch() }, "完成"),
+      ]),
+      fieldRow,
+      spotResults,
+      kb,
+    ]);
+    body.appendChild(spotRoot);
+    spotRefresh(); // default state: list every app
+    return spotRoot;
+  }
+  function showSearch() {
+    if (locked) return;
+    const body = (typeof document !== "undefined" && document.body) ? document.body : null;
+    if (!body) return;
+    if (!spotRoot) buildSpotlight();
+    if (spotRoot) spotRoot.style.display = "flex";
+    spotClear();
+    setTimeout(() => { try { if (spotInput) spotInput.focus(); } catch (_) {} }, 30);
+  }
+  function hideSearch() {
+    if (spotRoot) spotRoot.style.display = "none";
+  }
+
   // ---- Theme & brightness (make the Settings toggles actually do something) ----
   function updateBrightness(v) {
     const val = v != null ? Number(v) : 70;
@@ -530,6 +714,40 @@ window.Amos = (() => {
       body.appendChild(brightnessOverlay);
     }
     brightnessOverlay.style.opacity = String((100 - val) / 100);
+  }
+
+  // ---- Background display methods (配置文件定义) ----
+  // The wallpaper image is never painted as a raw, fully opaque photo. It is
+  // rendered through one of several "display methods" (显示方式) that recede /
+  // soften it. Default is `ghost` (若隐若现) so a busy scenic image stays
+  // tasteful and never upstages the launcher icons. Each method maps to CSS
+  // custom properties consumed by the wallpaper layers in styles.css:
+  //   --wp-alpha   opacity of the image layer   (0..1)
+  //   --wp-blur    gaussian blur radius         (px)
+  //   --wp-sat     saturation factor            (0..2)
+  //   --wp-bright  brightness factor            (0..2)
+  // To add a method, push a new entry here — the first entry is the default.
+  const BACKGROUND_MODES = [
+    { id: "ghost", label: "若隐若现 · 朦胧",
+      desc: "缺省 · 背景淡雅朦胧、若隐若现，不喧宾夺主",
+      style: { alpha: 0.58, blur: 9, sat: 0.92, bright: 1.02 } },
+    { id: "soft", label: "柔和 · 透亮",
+      desc: "更亮更通透，带一层轻纱质感",
+      style: { alpha: 0.8, blur: 3, sat: 1.0, bright: 1.05 } },
+    { id: "muted", label: "素净 · 淡墨",
+      desc: "极淡水墨感，几乎退为底色，适合低干扰",
+      style: { alpha: 0.42, blur: 14, sat: 0.6, bright: 0.96 } },
+    { id: "vivid", label: "明快 · 清晰",
+      desc: "接近原图质感（默认不启用，以保持含蓄）",
+      style: { alpha: 0.95, blur: 0, sat: 1.08, bright: 1.0 } },
+  ];
+  const BG_DEFAULT = "ghost";
+  function bgStyle(id) {
+    const m = BACKGROUND_MODES.find((m) => m.id === (id || BG_DEFAULT));
+    return (m || BACKGROUND_MODES[0]).style;
+  }
+  function bgMode(id) {
+    return BACKGROUND_MODES.find((m) => m.id === (id || BG_DEFAULT)) || BACKGROUND_MODES[0];
   }
 
   // iOS-style "automatic appearance": a pure day/night decision by local time.
@@ -548,6 +766,25 @@ window.Amos = (() => {
     if (root) root.setAttribute("data-theme", dark ? "dark" : "light");
     const url = resolveWallpaper(dark, s.wallpaper);
     if (root && root.style) root.style.setProperty("--wp", url ? `url("${url}")` : "none");
+    // Apply the selected background display method (default 若隐若现/ghost).
+    if (root) root.setAttribute("data-bg", bgMode(s.background).id);
+    const st = bgStyle(s.background);
+    if (root && root.style) {
+      root.style.setProperty("--wp-alpha", String(st.alpha));
+      root.style.setProperty("--wp-blur", `${st.blur}px`);
+      root.style.setProperty("--wp-sat", String(st.sat));
+      root.style.setProperty("--wp-bright", String(st.bright));
+    }
+    // The screensaver/lock image renders crisp by default (lockClear); turning the
+    // setting off makes it follow the home display method instead.
+    const CLEAR = { alpha: 0.9, blur: 0, sat: 1.0, bright: 1.0 };
+    const ls = s.lockClear === false ? st : CLEAR;
+    if (root && root.style) {
+      root.style.setProperty("--lock-alpha", String(ls.alpha));
+      root.style.setProperty("--lock-blur", `${ls.blur}px`);
+      root.style.setProperty("--lock-sat", String(ls.sat));
+      root.style.setProperty("--lock-bright", String(ls.bright));
+    }
     updateBrightness(s.brightness);
   }
 
@@ -582,6 +819,8 @@ window.Amos = (() => {
 
   // Re-apply the theme whenever settings change (darkmode / brightness toggles).
   onStore("amos.settings", () => applyTheme());
+  // Refresh home/dock unread badges when the shared notification store changes.
+  onStore("amos.notifications", () => { if (!current && viewEl) renderHome(); });
   // Re-render the lock screen if the PIN config changes while locked.
   onStore("amos.lock", () => { if (locked) renderLock(); });
 
@@ -674,6 +913,9 @@ window.Amos = (() => {
     showRecents,
     hideRecents,
     pushRecent,
+    searchApps,
+    showSearch,
+    hideSearch,
     applyTheme,
     showOnboarding,
     finishOnboarding,
@@ -681,6 +923,9 @@ window.Amos = (() => {
     resolveWallpaper,
     wallpaperPresets: WALLPAPER_PRESETS,
     isCustomWallpaper,
+    backgroundModes: BACKGROUND_MODES,
+    defaultBackgroundMode: BG_DEFAULT,
+    resolveBackgroundMode: bgMode,
     decideDark,
     get isLocked() { return locked; },
     init(v) { viewEl = v; },
