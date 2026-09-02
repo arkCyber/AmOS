@@ -77,3 +77,38 @@ describe("stream reducers (fake events)", () => {
     expect(s.lines.length).toBe(0);
   });
 });
+
+describe("ai reducer fault-injection", () => {
+  test("tokenOf never throws and coerces arbitrary payloads safely", () => {
+    expect(tokenOf(null)).toBe("");
+    expect(tokenOf(undefined)).toBe("");
+    expect(tokenOf([1, 2, 3])).toBe("");
+    expect(tokenOf({ token: 0 })).toBe("0");
+    expect(tokenOf({ token: "" })).toBe("");
+  });
+
+  test("onAiToken / onAiComplete keep the busy/complete booleans invariant", () => {
+    let l = chatLogInit();
+    l = onAiToken(l, "hi");
+    expect(typeof l.busy).toBe("boolean");
+    expect(typeof l.complete).toBe("boolean");
+    expect(l.busy).toBe(true);
+    l = onAiComplete(l);
+    expect(l.complete).toBe(true);
+    expect(l.busy).toBe(false);
+  });
+
+  test("cardOf ignores hostile card payloads without throwing", () => {
+    expect(cardOf({ kind: ["evil"] })).toBeNull(); // non-string kind -> dropped
+    expect(cardOf({ kind: "", fields: "x" })).toBeNull();
+    expect(
+      cardOf({ kind: "a", fields: [{ key: "k", value: { nested: true } }] }),
+    ).toEqual({
+      kind: "a",
+      title: "",
+      subtitle: "",
+      fields: [{ key: "k", value: "[object Object]" }],
+      actions: [],
+    });
+  });
+});

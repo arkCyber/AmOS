@@ -43,8 +43,10 @@ export interface AiCard {
 export function cardOf(payload: unknown): AiCard | null {
   if (!payload || typeof payload !== "object") return null;
   const p = payload as Record<string, unknown>;
-  const kind = String(p.kind ?? "");
-  if (!kind) return null;
+  // Aerospace-grade: the daemon must send a plain-string `kind`; anything else
+  // (array/object/number) is treated as "not a card" rather than coerced.
+  if (typeof p.kind !== "string" || !p.kind) return null;
+  const kind = p.kind;
   const fields = Array.isArray(p.fields)
     ? p.fields.map((f) => {
         const o =

@@ -90,3 +90,35 @@ describe("interp helpers", () => {
     expect(errorOf({ kind: "partial" })).toBe("");
   });
 });
+
+describe("interp event fault-injection", () => {
+  test("adversarial segment payloads never crash and coerce safely", () => {
+    // Not an object / not a final segment -> null.
+    expect(segOf(null)).toBeNull();
+    expect(segOf(42)).toBeNull();
+    expect(segOf("boom")).toBeNull();
+    expect(segOf({ kind: "partial", text: "x" })).toBeNull();
+    // Non-string fields coerce deterministically; an empty pair is dropped.
+    expect(
+      segOf({ kind: "segment_final", source_text: 123, target_text: ["a"] }),
+    ).toEqual({ src: "123", target: "a" });
+    expect(
+      segOf({ kind: "segment_final", source_text: "", target_text: "" }),
+    ).toBeNull();
+  });
+
+  test("partialTextOf tolerates weird shapes (fault-injection)", () => {
+    expect(partialTextOf({ kind: "partial", text: 42 })).toBe("42");
+    expect(partialTextOf({ kind: "partial" })).toBe("");
+    expect(partialTextOf(null)).toBe("");
+    expect(partialTextOf({ kind: "segment_final", text: "ignored" })).toBe("");
+  });
+
+  test("sessionEndedOf / errorOf are immune to malformed kinds", () => {
+    expect(sessionEndedOf("session_ended")).toBe(false);
+    expect(sessionEndedOf(null)).toBe(false);
+    expect(errorOf({ kind: "error" })).toBe("");
+    expect(errorOf({ kind: "error", message: 0 })).toBe("0");
+    expect(errorOf(undefined)).toBe("");
+  });
+});
