@@ -14,7 +14,7 @@ import LockSettings from "./components/LockSettings";
 import type { Locale } from "./i18n/types";
 import { calcDisplay, calcInit, calcPress, ERR } from "./lib/calculator";
 import { readStoreValue, writeStoreValue } from "./lib/amosStore";
-import { NOTES_KEY, prependNote, removeNote, fmtTime, type Note } from "./lib/notes";
+import { NOTES_KEY, prependNote, removeNote, fmtTime, normalizeNotes, type Note } from "./lib/notes";
 import { forecast, dayLabel } from "./lib/weather";
 import {
   PHOTOS_KEY,
@@ -181,7 +181,9 @@ const Weather: FC = () => {
 const Notes: FC = () => {
   const { t } = useI18n();
   const [text, setText] = useState("");
-  const [notes, setNotes] = useState<Note[]>(() => readStoreValue<Note[]>(NOTES_KEY, []));
+  const [notes, setNotes] = useState<Note[]>(() =>
+    normalizeNotes(readStoreValue<unknown>(NOTES_KEY, [])),
+  );
   const persist = (list: Note[]) => {
     writeStoreValue(NOTES_KEY, list);
     setNotes(list);
@@ -209,11 +211,11 @@ const Notes: FC = () => {
           <p className="py-6 text-center text-sm opacity-60">{t("note.empty")}</p>
         ) : (
           notes.map((n) => (
-            <div key={n.ts} className="rounded-2xl bg-neutral-200/60 p-3 dark:bg-neutral-800/60">
+            <div key={n.id} className="rounded-2xl bg-neutral-200/60 p-3 dark:bg-neutral-800/60">
               <p className="whitespace-pre-wrap text-sm">{n.text}</p>
               <div className="mt-2 flex items-center justify-between text-[11px] opacity-60">
                 <span>{fmtTime(n.ts)}</span>
-                <button onClick={() => persist(removeNote(notes, n.ts))} className="text-danger hover:underline">
+                <button onClick={() => persist(removeNote(notes, n.id))} className="text-danger hover:underline">
                   {t("note.delete")}
                 </button>
               </div>
