@@ -139,6 +139,10 @@ export const zh = {
   "android.launch": "启动",
   "android.placeholder": "输入包名启动，如 com.tencent.mm",
   "android.fetchError": "获取安卓应用失败",
+  "ai.stop": "⏹ 停止",
+  "ai.clear": "清空",
+  "ai.sessionDone": "会话 {sid} 完成",
+  "ai.placeholder": "与 AI 对话…（可返回天气/音乐/备忘等系统卡片）",
   "count.notifications": "{n} 条通知",
 };
 

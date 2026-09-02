@@ -141,5 +141,9 @@ export const en: Record<MessageKey, string> = {
   "android.launch": "Launch",
   "android.placeholder": "Enter a package to launch, e.g. com.tencent.mm",
   "android.fetchError": "Failed to fetch Android apps",
+  "ai.stop": "⏹ Stop",
+  "ai.clear": "Clear",
+  "ai.sessionDone": "Session {sid} complete",
+  "ai.placeholder": "Chat with the AI… (it can return weather/music/notes system cards)",
   "count.notifications": "{n} notifications",
 };

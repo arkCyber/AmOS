@@ -27,6 +27,53 @@ export function chatLogReset(): ChatLog {
   return chatLogInit();
 }
 
+/** A semantic UiCard delivered via the `ai-card-received` event. */
+export interface AiCard {
+  kind: string;
+  title: string;
+  subtitle: string;
+  fields: { key: string; value: string }[];
+  actions: string[];
+}
+
+/**
+ * Parse an `ai-card-received` payload into an [`AiCard`] (null when it is not a
+ * recognised card object — e.g. an empty `kind`, or a non-card event).
+ */
+export function cardOf(payload: unknown): AiCard | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const kind = String(p.kind ?? "");
+  if (!kind) return null;
+  const fields = Array.isArray(p.fields)
+    ? p.fields.map((f) => {
+        const o =
+          f && typeof f === "object" ? (f as Record<string, unknown>) : {};
+        return { key: String(o.key ?? ""), value: String(o.value ?? "") };
+      })
+    : [];
+  const actions = Array.isArray(p.actions) ? p.actions.map((a) => String(a)) : [];
+  return {
+    kind,
+    title: String(p.title ?? ""),
+    subtitle: String(p.subtitle ?? ""),
+    fields,
+    actions,
+  };
+}
+
+/**
+ * Parse an `ai-session-complete` payload — serialized as a `[sessionId, fullText]`
+ * pair — into a plain object (null otherwise).
+ */
+export function sessionMetaOf(payload: unknown): { sid: string; full: string } | null {
+  if (!Array.isArray(payload) || payload.length < 1) return null;
+  const sid = String(payload[0] ?? "");
+  if (!sid) return null;
+  const full = payload.length >= 2 ? String(payload[1] ?? "") : "";
+  return { sid, full };
+}
+
 export interface InterpLine {
   src: string;
   target: string;

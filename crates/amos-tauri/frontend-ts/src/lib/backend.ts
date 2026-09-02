@@ -84,6 +84,11 @@ export function sendChat(prompt: string, sessionId: string): Promise<unknown> {
   return invoke("chat_agent", { prompt, sessionId, targetWindow: "ai" });
 }
 
+/** Cancel the active bidirectional `Chat` stream so generation halts. */
+export async function cancelAiSession(): Promise<unknown> {
+  return invoke("cancel_ai_session");
+}
+
 /* ---- 同传 / interpret RPC (degrade to null outside Tauri) ---- */
 export interface InterpOpts {
   source?: string;

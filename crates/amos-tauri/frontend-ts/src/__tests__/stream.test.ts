@@ -6,6 +6,8 @@ import {
   tokenOf,
   onInterpOutput,
   interpInit,
+  cardOf,
+  sessionMetaOf,
 } from "../lib/stream";
 
 describe("stream reducers (fake events)", () => {
@@ -23,6 +25,43 @@ describe("stream reducers (fake events)", () => {
     expect(tokenOf("x")).toBe("x");
     expect(tokenOf({ token: "y" })).toBe("y");
     expect(tokenOf(42)).toBe("");
+  });
+
+  test("cardOf parses an ai-card-received semantic card", () => {
+    expect(
+      cardOf({
+        kind: "weather",
+        title: "今日天气",
+        subtitle: "北京",
+        fields: [{ key: "气温", value: "26°" }],
+        actions: ["打开地图"],
+      }),
+    ).toEqual({
+      kind: "weather",
+      title: "今日天气",
+      subtitle: "北京",
+      fields: [{ key: "气温", value: "26°" }],
+      actions: ["打开地图"],
+    });
+    // Empty / non-object / no-kind payloads are not cards.
+    expect(cardOf(null)).toBeNull();
+    expect(cardOf("hi")).toBeNull();
+    expect(cardOf({ kind: "" })).toBeNull();
+    expect(cardOf({ kind: "x", fields: "nope" })).toEqual({
+      kind: "x",
+      title: "",
+      subtitle: "",
+      fields: [],
+      actions: [],
+    });
+  });
+
+  test("sessionMetaOf parses the [sessionId, fullText] completion tuple", () => {
+    expect(sessionMetaOf(["conv-1", "你好 world"])).toEqual({ sid: "conv-1", full: "你好 world" });
+    expect(sessionMetaOf(["conv-1"])).toEqual({ sid: "conv-1", full: "" });
+    expect(sessionMetaOf([])).toBeNull();
+    expect(sessionMetaOf("x")).toBeNull();
+    expect(sessionMetaOf([""])).toBeNull();
   });
 
   test("interpret segment_final events append transcript lines", () => {
