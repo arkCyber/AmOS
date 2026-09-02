@@ -54,6 +54,11 @@ export function appTitleKey(id: string): MessageKey | null {
   return APPS.find((a) => a.id === id)?.titleKey ?? null;
 }
 
+/** Single source of truth for an app's tile icon (emoji). */
+export function appIcon(id: string): string {
+  return APPS.find((a) => a.id === id)?.icon ?? "🧩";
+}
+
 /* ---- Clock (world clock + live now) ---- */
 const Clock: FC = () => {
   const { t } = useI18n();

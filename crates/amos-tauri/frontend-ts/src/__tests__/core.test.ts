@@ -9,7 +9,7 @@ import {
   moveBefore,
   type HomeLayout,
 } from "../lib/amosStore";
-import { APPS, appTitleKey } from "../apps";
+import { APPS, appIcon, appTitleKey } from "../apps";
 import { zh } from "../i18n/locales/zh";
 import { en } from "../i18n/locales/en";
 
@@ -39,6 +39,16 @@ describe("core shell", () => {
       expect(zh[key!]).toBeTruthy();
       expect(en[key!]).toBeTruthy();
     }
+  });
+
+  test("every app has a single source of truth for its dock icon (no drift)", () => {
+    expect(APPS.length).toBeGreaterThan(0);
+    for (const a of APPS) {
+      const icon = appIcon(a.id);
+      expect(icon).toBeTruthy();
+      expect(icon).not.toBe("🧩"); // registered apps must declare a real icon
+    }
+    expect(appIcon("nope")).toBe("🧩"); // unknown ids still fall back safely
   });
 
   test("hideFromHome/restoreToHome edit the layout", () => {

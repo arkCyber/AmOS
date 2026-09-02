@@ -1,6 +1,6 @@
 import { useRef, type DragEvent } from "react";
 import { readStoreValue, type HomeLayout } from "../lib/amosStore";
-import { appTitleKey } from "../apps";
+import { appIcon, appTitleKey } from "../apps";
 import { useI18n } from "../i18n";
 import { zh, type MessageKey } from "../i18n/locales/zh";
 import { NOTIF_KEY, countForApp, type Notif } from "../lib/settings";
@@ -69,23 +69,6 @@ export default function HomeDock({
   const { t } = useI18n();
   const notifs = readStoreValue<Notif[]>(NOTIF_KEY, []);
   const dragId = useRef<string | null>(null);
-  const EMOJI: Record<string, string> = {
-    clock: "🕐",
-    settings: "⚙️",
-    calculator: "🧮",
-    weather: "🌤️",
-    notes: "📝",
-    photos: "🖼️",
-    files: "📁",
-    android: "🤖",
-    messages: "💬",
-    phone: "📞",
-    music: "🎵",
-    maps: "🗺️",
-    camera: "📷",
-    ai: "🤖",
-    interpreter: "🌐",
-  };
 
   const labelOf = (id: string): string => {
     const key = appTitleKey(id);
@@ -97,7 +80,7 @@ export default function HomeDock({
     return key ? zh[key] : id;
   };
   const unreadOf = (id: string) => countForApp(notifs, zhName(id));
-  const iconOf = (id: string): string => EMOJI[id] ?? "🧩";
+  const iconOf = (id: string): string => appIcon(id);
   const handleStart = (id: string) => {
     dragId.current = id;
   };
