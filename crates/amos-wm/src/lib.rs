@@ -349,4 +349,80 @@ mod tests {
             "registration produces exactly one event, got {events:?}"
         );
     }
+
+    /// Core invariants the manager must satisfy at every instant.
+    fn assert_wm_invariants(wm: &WindowManager) {
+        let launcher = wm.launcher().expect("launcher always present");
+        // At most one window is Focused.
+        let focused_count = wm
+            .windows()
+            .iter()
+            .filter(|id| wm.state_of(**id) == Some(WindowState::Focused))
+            .count();
+        assert!(focused_count <= 1, ">1 focused windows: {focused_count}");
+        // If exactly one window is Focused, the reported `focused()` agrees with it.
+        if focused_count == 1 {
+            let f = wm
+                .windows()
+                .iter()
+                .find(|id| wm.state_of(**id) == Some(WindowState::Focused))
+                .copied();
+            assert_eq!(wm.focused(), f);
+        }
+        // The Launcher is immortal and never hidden. (It is *not* required to be
+        // the last entry in `z_order`: `home()`/focus legitimately raise it to the
+        // top. "At the bottom" is a stacking rule when apps are above it, not an
+        // absolute ordering invariant while it is focused.)
+        let launcher_state = wm.state_of(launcher);
+        assert!(
+            matches!(launcher_state, Some(WindowState::Shown) | Some(WindowState::Focused)),
+            "launcher must be shown/focused, got {launcher_state:?}"
+        );
+        assert!(wm.windows().contains(&launcher), "launcher window must remain present");
+    }
+
+    /// Aerospace-grade property test: after every step of a long deterministic
+    /// script of open/focus/hide/close/home the manager invariants still hold.
+    #[test]
+    fn invariants_hold_across_a_deterministic_operation_script() {
+        let mut wm = WindowManager::new();
+        let mut ids: Vec<WindowId> = Vec::new();
+        for _ in 0..6 {
+            ids.push(wm.register(WindowKind::App).0);
+        }
+        ids.push(wm.register(WindowKind::System).0);
+        assert_wm_invariants(&wm);
+
+        // Deterministic LCG (no external rng dependency).
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+
+        for _ in 0..2000 {
+            let op = next() % 5;
+            let id = ids[next() % ids.len()];
+            match op {
+                0 => {
+                    wm.open(id);
+                }
+                1 => {
+                    wm.focus(id);
+                }
+                2 => {
+                    wm.hide(id);
+                }
+                3 => {
+                    wm.close(id);
+                }
+                _ => {
+                    wm.home();
+                }
+            }
+            assert_wm_invariants(&wm);
+        }
+    }
 }

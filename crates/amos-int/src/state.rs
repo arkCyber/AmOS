@@ -117,4 +117,107 @@ mod tests {
         s = s.transition(Collecting).unwrap();
         assert_eq!(s, Collecting);
     }
+
+    /// Full 8×8 matrix: `transition(to)` must be `Ok` iff `allowed(from,to)` is
+    /// true, and the total allowed-edge count must stay exactly 21. Locks the
+    /// table so it can never drift from the `transition` method.
+    #[test]
+    fn transition_is_exactly_consistent_with_allowed_matrix() {
+        use SessionState::*;
+        const ALL: [SessionState; 8] = [
+            Idle,
+            Starting,
+            Collecting,
+            Interpreting,
+            Speaking,
+            Paused,
+            Ended,
+            Error,
+        ];
+        let mut edges = 0usize;
+        for from in ALL {
+            for to in ALL {
+                let allowed = SessionState::allowed(from, to);
+                match from.transition(to) {
+                    Ok(next) => {
+                        assert!(allowed, "transition Ok but allowed=false for {from:?}->{to:?}");
+                        assert_eq!(next, to);
+                        edges += 1;
+                    }
+                    Err(e) => {
+                        assert!(!allowed, "transition Err but allowed=true for {from:?}->{to:?}");
+                        assert_eq!(e, StateError { from, to });
+                    }
+                }
+            }
+        }
+        // Idle2 + Starting3 + Collecting4 + Interpreting5 + Speaking4 + Paused2 + Error1 + Ended0
+        assert_eq!(edges, 21);
+    }
+
+    #[test]
+    fn no_self_loops_and_ended_is_terminal() {
+        use SessionState::*;
+        const ALL: [SessionState; 8] = [
+            Idle,
+            Starting,
+            Collecting,
+            Interpreting,
+            Speaking,
+            Paused,
+            Ended,
+            Error,
+        ];
+        for s in ALL {
+            assert!(!SessionState::allowed(s, s), "self-loop must not be allowed for {s:?}");
+        }
+        for to in ALL {
+            assert!(
+                !SessionState::allowed(Ended, to),
+                "Ended must be terminal (no outgoing edges)"
+            );
+        }
+    }
+
+    /// Every declared state must be reachable from Idle through allowed edges —
+    /// no unreachable/ghost states.
+    #[test]
+    fn every_state_is_reachable_from_idle() {
+        use SessionState::*;
+        const ALL: [SessionState; 8] = [
+            Idle,
+            Starting,
+            Collecting,
+            Interpreting,
+            Speaking,
+            Paused,
+            Ended,
+            Error,
+        ];
+        let mut reach = std::collections::HashSet::new();
+        reach.insert(Idle);
+        let mut frontier = vec![Idle];
+        while let Some(from) = frontier.pop() {
+            for to in ALL {
+                if SessionState::allowed(from, to) && reach.insert(to) {
+                    frontier.push(to);
+                }
+            }
+        }
+        for s in ALL {
+            assert!(reach.contains(&s), "{s:?} unreachable from Idle");
+        }
+    }
+
+    #[test]
+    fn documented_illegal_edges_stay_rejected() {
+        use SessionState::*;
+        assert!(!SessionState::allowed(Paused, Interpreting));
+        assert!(!SessionState::allowed(Paused, Speaking));
+        assert!(!SessionState::allowed(Error, Collecting));
+        assert!(!SessionState::allowed(Error, Starting));
+        assert!(!SessionState::allowed(Error, Paused));
+        assert!(!SessionState::allowed(Collecting, Starting));
+        assert!(!SessionState::allowed(Speaking, Idle));
+    }
 }
