@@ -14,6 +14,8 @@
   let livePartial = null; // element showing the current partial
   let prevOnOutput = null;
   let meterEl = null; // the recording level-meter element (direct ref, no getElementById)
+  let segments = []; // finalized translation segments (in-memory history)
+  const INTERP_LOG_KEY = "amos.interp.log";
 
   const LANGS = [
     ["auto", "自动检测"],
@@ -63,10 +65,23 @@
   }
 
   // ---- transcript rendering ----
+  // A finalized segment is appended live *and* kept in `segments`/localStorage so
+  // the interpretation history survives closing and reopening the app.
   function addSegment(seg) {
+    if (livePartial) { if (livePartial.remove) livePartial.remove(); livePartial = null; }
+    segments.push({
+      source_text: seg.source_text,
+      target_text: seg.target_text,
+      source_lang: seg.source_lang,
+      target_lang: seg.target_lang,
+    });
+    persistSegments();
+    appendRow(seg);
+  }
+
+  function appendRow(seg) {
     const log = el("interp-log");
     if (!log) return;
-    if (livePartial) { if (livePartial.remove) livePartial.remove(); livePartial = null; }
     const src = A.el("div", {
       class: "interp-src",
       "data-lang": langLabel(seg.source_lang || "源"),
@@ -88,6 +103,24 @@
     log.scrollTop = log.scrollHeight;
   }
 
+  function loadSegments() {
+    try { const a = JSON.parse(A.safeGet(INTERP_LOG_KEY, "[]")); return Array.isArray(a) ? a : []; }
+    catch (_) { return []; }
+  }
+  function persistSegments() {
+    try { A.storeWrite(INTERP_LOG_KEY, JSON.stringify(segments)); } catch (_) {}
+  }
+  // On (re)mount, replay the persisted history into the log exactly once.
+  function renderHistory() {
+    const log = el("interp-log");
+    if (!log) return;
+    segments = loadSegments();
+    log.innerHTML = "";
+    livePartial = null;
+    for (const s of segments) appendRow(s);
+    log.scrollTop = log.scrollHeight;
+  }
+
   function copyText(text) {
     if (!text) return;
     const nav = (typeof navigator !== "undefined") ? navigator : null;
@@ -104,6 +137,8 @@
     if (!log) return;
     log.innerHTML = "";
     livePartial = null;
+    segments = [];
+    persistSegments();
   }
 
   function showPartial(text) {
@@ -344,6 +379,8 @@
       if (sSrc) sSrc.addEventListener("change", persistPrefs);
       if (sTgt) sTgt.addEventListener("change", persistPrefs);
       if (sAsp) sAsp.addEventListener("change", persistPrefs);
+      // Replay any persisted transcript from a previous session.
+      renderHistory();
       if (window.AmosInterp) {
         window.AmosInterp.onOutput = (payload) => {
           if (!mounted) return;

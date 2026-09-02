@@ -1134,6 +1134,38 @@ test('interp UI: restores saved language pair and auto-speak, persists edits', (
   app.onUnmount();
 });
 
+test('interp UI: transcript persists across mounts and clear wipes it', () => {
+  const e = fresh();
+  const app = e.Amos.apps.get('interpreter');
+  const node = app.render();
+  app.onMount();
+  const AI = e.sandbox.window.AmosInterp;
+  AI.onOutput({ kind: 'segment_final', source_text: 'hi', target_text: '你好', target_lang: 'zh', source_lang: 'en', session_id: 1 });
+  const saved = JSON.parse(e.localStorage.getItem('amos.interp.log'));
+  assert(Array.isArray(saved) && saved.length === 1 && saved[0].target_text === '你好', 'segment persisted to storage');
+  app.onUnmount();
+
+  // Simulate reopen: wipe the live DOM log, then remount restores from storage.
+  const log = e.document.getElementById('interp-log');
+  log.innerHTML = '';
+  app.onMount();
+  assert(log.children.length === 1 && log.children[0].children[1].textContent === '你好', 'history re-rendered on reopen');
+
+  // Clearing wipes both the DOM and the persisted history.
+  const findBtn = (n) => {
+    if (!n || !n.children) return null;
+    for (const c of n.children) {
+      if (c.tagName === 'button' && c.textContent === '🗑 清空') return c;
+      const r = findBtn(c);
+      if (r) return r;
+    }
+    return null;
+  };
+  findBtn(node).dispatch('click', {});
+  assert(e.localStorage.getItem('amos.interp.log') === '[]', 'persisted log cleared');
+  assert(log.children.length === 0, 'live log cleared');
+});
+
 test('theme: automatic appearance follows local hour', () => {
   const e = fresh();
   const A = e.Amos;
