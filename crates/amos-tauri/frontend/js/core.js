@@ -103,8 +103,28 @@ window.Amos = (() => {
   }
 
   // ---- Icon tile ----
+  // Curated, muted "refined" palette (avoid loud saturated greens/reds). Used
+  // for every home/dock icon so the launcher reads as elegant and consistent.
+  const ICON_GRADIENTS = {
+    phone: ["#a4b0c4", "#6d7b91"],
+    messages: ["#86b3a5", "#51796b"],
+    camera: ["#9aa8b5", "#5f6d7b"],
+    photos: ["#c7b6d9", "#846f9c"],
+    settings: ["#a6adb6", "#6d747d"],
+    calculator: ["#adb0c3", "#6d7085"],
+    weather: ["#95c2d4", "#4f7d96"],
+    music: ["#d9b892", "#9b7040"],
+    clock: ["#99a5c9", "#606c92"],
+    maps: ["#a7c19c", "#6c8a65"],
+    files: ["#c8b7a1", "#8d7558"],
+    notes: ["#d6c792", "#a18a44"],
+    android: ["#91a0b8", "#5e6c83"],
+    ai: ["#93a0db", "#56639f"],
+    interpreter: ["#7d98ca", "#4b6596"],
+  };
+  const DEFAULT_GRADIENT = ["#8d96a6", "#5c6470"];
   function iconTile(app) {
-    const g = app.gradient || ["#5b7cfa", "#3a4f9c"];
+    const g = ICON_GRADIENTS[app.id] || app.gradient || DEFAULT_GRADIENT;
     return el("div", {
       class: "tile",
       style: { background: `linear-gradient(145deg, ${g[0]}, ${g[1]})` },
@@ -515,9 +535,36 @@ window.Amos = (() => {
   function applyTheme() {
     const s = readSettings();
     const dark = !s.darkmode;
-    const root = (typeof document !== "undefined" && document.documentElement) ? document.documentElement : null;
+    const root = (typeof document !== "undefined" && (document.documentElement || document.body)) ? (document.documentElement || document.body) : null;
     if (root) root.setAttribute("data-theme", dark ? "dark" : "light");
+    const url = resolveWallpaper(dark, s.wallpaper);
+    if (root && root.style) root.style.setProperty("--wp", url ? `url("${url}")` : "none");
     updateBrightness(s.brightness);
+  }
+
+  // ---- Wallpaper registry ----
+  // Built-in wallpapers referenced from `frontend/`. `--wp` (set in applyTheme)
+  // drives the home/lock background-image. Users can also point `wallpaper` at
+  // a custom data:/http(s):/file: URL or blob.
+  const WALLPAPER_FILES = {
+    dark: "./wallpaper-dark.png",
+    light: "./wallpaper-light.png",
+    landscape: "./wallpaper-landscape.png",
+  };
+  const WALLPAPER_PRESETS = [
+    { id: "auto", label: "自动 · 随深浅切换" },
+    { id: "dark", label: "极光夜" },
+    { id: "light", label: "晴日山丘" },
+    { id: "landscape", label: "暮色原野" },
+  ];
+  function isCustomWallpaper(w) {
+    return typeof w === "string" && /^(data:|blob:|https?:|file:)/.test(w);
+  }
+  // Pure: pick the image URL for the given theme + stored wallpaper choice.
+  function resolveWallpaper(dark, w) {
+    if (w === "landscape" || w === "dark" || w === "light") return WALLPAPER_FILES[w];
+    if (isCustomWallpaper(w)) return w;
+    return dark ? WALLPAPER_FILES.dark : WALLPAPER_FILES.light; // auto / unset
   }
 
   // Re-apply the theme whenever settings change (darkmode / brightness toggles).
@@ -618,6 +665,9 @@ window.Amos = (() => {
     showOnboarding,
     finishOnboarding,
     skipOnboarding,
+    resolveWallpaper,
+    wallpaperPresets: WALLPAPER_PRESETS,
+    isCustomWallpaper,
     get isLocked() { return locked; },
     init(v) { viewEl = v; },
   };

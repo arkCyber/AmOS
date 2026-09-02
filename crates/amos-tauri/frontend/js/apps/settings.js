@@ -45,6 +45,52 @@ window.Amos.register({
       toggle("bluetooth", "蓝牙", "已开启"),
       toggle("airplane", "飞行模式"),
       toggle("darkmode", "深色模式"),
+      (() => {
+        // Wallpaper picker: built-in presets + optional custom image URL.
+        const WP = A.wallpaperPresets || [
+          { id: "auto", label: "自动 · 随深浅切换" },
+          { id: "dark", label: "极光夜" },
+          { id: "light", label: "晴日山丘" },
+          { id: "landscape", label: "暮色原野" },
+        ];
+        const msg = A.el("div", { class: "muted", style: { marginTop: "6px" } }, "");
+        const url = A.el("input", {
+          class: "field",
+          placeholder: "自设图片 URL（http / data:…）",
+          style: { marginTop: "8px" },
+        });
+        const buttons = [];
+        const paint = () => {
+          const cur = store.wallpaper || "auto";
+          buttons.forEach((b) => b.classList && b.classList.toggle("wp-sel", cur === b._id));
+          msg.textContent = cur === "auto"
+            ? "自动：深色用「极光夜」，浅色用「晴日山丘」"
+            : (A.isCustomWallpaper && A.isCustomWallpaper(cur))
+              ? "正在使用自定义壁纸"
+              : (WP.find((p) => p.id === cur) || { label: cur }).label;
+        };
+        const setWp = (v) => { store.wallpaper = v; A.storeWrite(KEY, JSON.stringify(store)); A.applyTheme(); paint(); };
+        WP.forEach((p) => {
+          const b = A.el("button", { class: "btn secondary", onclick: () => setWp(p.id) }, p.label);
+          b._id = p.id;
+          buttons.push(b);
+        });
+        const applyUrl = () => {
+          const v = url.value.trim();
+          if (!v) return;
+          setWp(v);
+          url.value = "";
+        };
+        if (A.isCustomWallpaper && A.isCustomWallpaper(store.wallpaper)) url.value = store.wallpaper;
+        paint();
+        return A.el("div", { class: "card" }, [
+          A.el("div", { class: "row spread" }, [A.el("span", null, "壁纸"), A.el("span", { class: "muted" }, "点选即时生效")]),
+          A.el("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "8px" } }, buttons),
+          url,
+          A.el("button", { class: "btn secondary", style: { marginTop: "8px" }, onclick: applyUrl }, "应用自定义壁纸"),
+          msg,
+        ]);
+      })(),
       slider("brightness", "亮度"),
       slider("volume", "音量"),
       (() => {

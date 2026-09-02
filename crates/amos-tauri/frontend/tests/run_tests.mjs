@@ -489,8 +489,18 @@ test('settings: reset home layout clears it', () => {
   assert(e.localStorage.getItem('amos.home.layout'), 'layout exists before reset');
   const node = e.Amos.apps.get('settings').render();
   const content = node.children[1].children[0];
-  const resetCard = content.children[6]; // wifi/bt/airplane/dark/brightness/volume/reset/about
-  const resetBtn = resetCard.children[0].children[1];
+  // Locate the 主屏布局 reset button by text (robust to card ordering).
+  const findBtn = (n) => {
+    if (!n || !n.children) return null;
+    for (const c of n.children) {
+      if (c.tagName === 'button' && c.textContent === '重置') return c;
+      const r = findBtn(c);
+      if (r) return r;
+    }
+    return null;
+  };
+  const resetBtn = findBtn(content);
+  assert(resetBtn, 'reset button present');
   resetBtn.dispatch('click', {});
   assert(e.localStorage.getItem('amos.home.layout') === '', 'layout cleared after reset');
 });
@@ -1106,6 +1116,19 @@ test('interp UI: level meter, copy button, and clear controls', () => {
   clearBtn.dispatch('click', {});
   assert(log.children.length === 0, 'clear empties the transcript');
   app.onUnmount();
+});
+
+test('wallpaper: resolution, presets, and custom URLs', () => {
+  const e = fresh();
+  const A = e.Amos;
+  assert(Array.isArray(A.wallpaperPresets) && A.wallpaperPresets.length >= 4, 'wallpaper presets exported');
+  assert(A.resolveWallpaper(true, undefined).includes('dark'), 'dark theme default → dark wallpaper');
+  assert(A.resolveWallpaper(false, undefined).includes('light'), 'light theme default → light wallpaper');
+  assert(A.resolveWallpaper(false, 'landscape').includes('landscape'), 'landscape preset resolves');
+  assert(A.resolveWallpaper(false, 'dark').includes('dark'), 'explicit dark preset wins in light theme');
+  assert(A.resolveWallpaper(false, 'https://x/img.jpg') === 'https://x/img.jpg', 'custom http url passes through');
+  assert(A.isCustomWallpaper('data:image/png;base64,AAAA') === true, 'data: url is treated as custom');
+  assert(A.isCustomWallpaper('dark') === false, 'built-in ids are not custom');
 });
 
 // ---------------------------------------------------------------------------
