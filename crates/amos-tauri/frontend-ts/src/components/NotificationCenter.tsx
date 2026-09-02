@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { useTheme } from "../theme";
 import { readStoreValue, writeStoreValue } from "../lib/amosStore";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import {
@@ -24,6 +25,8 @@ const QUICK: { key: QuickKey; label: "q.wifi" | "q.bluetooth" | "q.airplane" | "
 
 export default function NotificationCenter({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { t } = useI18n();
+  // The "dark mode" quick tile drives the real theme (not just a cosmetic bit).
+  const { dark, toggle: themeToggle } = useTheme();
   const [settings, setSettings] = useState<QuickSettings>(() => readStoreValue<QuickSettings>(SETTINGS_KEY, {}));
   const [notifs, setNotifs] = useState<Notif[]>(() => {
     const l = readStoreValue<Notif[]>(NOTIF_KEY, []);
@@ -37,6 +40,15 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
   if (!open) return null;
 
   const toggle = (key: QuickKey) => {
+    if (key === "darkmode") {
+      // Flip the *actual* theme and keep the quick-setting mirror in sync.
+      const nextDark = !dark;
+      const next = { ...settings, darkmode: nextDark };
+      setSettings(next);
+      writeStoreValue(SETTINGS_KEY, next);
+      themeToggle();
+      return;
+    }
     const next = flipQuick(settings, key);
     setSettings(next);
     writeStoreValue(SETTINGS_KEY, next);
@@ -67,7 +79,7 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
       </div>
       <div className="mt-3 grid grid-cols-3 gap-2">
         {QUICK.map((q) => {
-          const on = !!settings[q.key];
+          const on = q.key === "darkmode" ? dark : !!settings[q.key];
           return (
             <button
               key={q.key}

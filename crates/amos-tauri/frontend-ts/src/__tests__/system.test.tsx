@@ -2,10 +2,15 @@ import { describe, expect, test } from "bun:test";
 import type { ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import { I18nProvider } from "../i18n";
+import { ThemeProvider } from "../theme";
 import { LockScreen, RecentsPanel, SpotlightPanel } from "../components/SystemPanels";
 import NotificationCenter from "../components/NotificationCenter";
 
-const wrap = (el: ReactNode) => <I18nProvider>{el}</I18nProvider>;
+const wrap = (el: ReactNode) => (
+  <I18nProvider>
+    <ThemeProvider>{el}</ThemeProvider>
+  </I18nProvider>
+);
 
 describe("system panels SSR mount", () => {
   test("lock screen renders", () => {
