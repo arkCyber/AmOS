@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ThemeProvider } from "./theme";
 import { I18nProvider, useI18n } from "./i18n";
 import { APPS, appTitleKey, AppComponent } from "./apps";
@@ -11,6 +11,12 @@ import StatusBar from "./components/StatusBar";
 import { getLayout, moveBefore, pushRecent, saveLayout, readStoreValue, writeStoreValue, type HomeLayout } from "./lib/amosStore";
 import { NOTIF_KEY, removeAppNotifs, type Notif } from "./lib/settings";
 import { zh, type MessageKey } from "./i18n/locales/zh";
+import { bridged, subscribe } from "./lib/backend";
+import {
+  buttonActionOf,
+  keyActionOf,
+  type HardwareAction,
+} from "./lib/systemButtons";
 
 function AppShell({ title, onBack, children }: { title: string; onBack: () => void; children: ReactNode }) {
   return (
@@ -102,6 +108,55 @@ function Shell() {
     setActive(id);
   };
   const back = () => setActive(null);
+
+  // System hardware buttons (Home / Voice / AI) + desktop H/V/A shortcuts.
+  const lockedRef = useRef(locked);
+  lockedRef.current = locked;
+  const runRef = useRef<(action: HardwareAction) => void>(() => {});
+  runRef.current = (action) => {
+    if (lockedRef.current) return; // locked: the system must be unlocked first
+    if (action === "home") {
+      setEditMode(false);
+      closeAll();
+      setActive(null);
+    } else if (action === "ai" || action === "voice") {
+      open("ai");
+    }
+  };
+
+  // Route real `hardware-button` events from the Rust core (Home/Voice/AI).
+  useEffect(() => {
+    if (!bridged()) return;
+    let alive = true;
+    let unsub: (() => void) | null = null;
+    void (async () => {
+      unsub = await subscribe("hardware-button", (payload) => {
+        if (alive) runRef.current(buttonActionOf(payload));
+      });
+    })();
+    return () => {
+      alive = false;
+      unsub?.();
+    };
+  }, []);
+
+  // Desktop dev convenience: H = home, V = voice (AI), A = AI — same actions.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      const typing =
+        !!target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+      if (typing) return; // don't hijack keys while typing in a field
+      runRef.current(keyActionOf(e.key));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   if (locked) return <LockScreen onUnlock={() => setLocked(false)} />;
 
