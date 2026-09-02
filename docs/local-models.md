@@ -98,8 +98,23 @@ AMOS_SHERPA_MODEL_DIR=$PWD/models/sherpa-en-20m \
 - 模型目录可用 `env SHERPA_MODEL_DIR`（ASR 示例）或 `AMOS_SHERPA_MODEL_DIR`（GUI）覆盖。
 - CI / 默认构建不带此 feature，原生库只在显式开启时链接。
 
+# 把真实本地 TTS 接进 amos-tauri 的 WebView（feature `piper-tts`）
+
+对称地，`amos-tauri` 可选 feature `piper-tts`（开启 `amos-tts/piper`，链接 piper-rs/onnxruntime/espeak-ng）。
+开启时 `tts_synthesize` 会经 `TtsBridge` 自动选用**本地 Piper 音色**（默认 mock 不变）：
+启动时读 `AMOS_PIPER_MODEL_DIR`（内含 `en_US-lessac-low.onnx` + `.onnx.json`），模型缺失/加载失败回退 mock。
+
+```bash
+AMOS_SHERPA_MODEL_DIR=$PWD/models/sherpa-en-20m \
+AMOS_PIPER_MODEL_DIR=$PWD/models/piper-low \
+  cargo tauri dev --features sherpa-asr,piper-tts    # 本地 ASR + 本地 TTS 同时启用
+```
+
+两个 feature 可单独或一起开启；`make gated-check` 已编译二者组合（同 binary 链接 sherpa+piper，
+macOS 会见到 espeak `duplicate symbol` 的**非致命** linker warning，退出码 0）。
+
 ## CI
 
 `sherpa`/`piper` 为 feature 门控后端，`make gated-check`（CI `gated-native-backends` job）
-编译 lib + 示例（`sherpa_asr` / `sherpa_session` / `piper_tts`）；真实推理需要模型文件，
+编译 lib + 示例（`sherpa_asr` / `sherpa_session` / `piper_tts`）+ amos-tauri 桥接组合；真实推理需要模型文件，
 不在 CI 覆盖范围。示例均标注 `required-features`，默认构建不受影响。

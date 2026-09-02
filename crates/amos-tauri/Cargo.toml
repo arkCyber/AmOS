@@ -36,6 +36,11 @@ tracing.workspace = true
 # Enable with `--features sherpa-asr` (or via tauri), and set AMOS_SHERPA_MODEL_DIR
 # to a directory with tokens.txt + encoder/decoder/joiner .onnx so interpret_start
 # uses local sherpa ASR instead of the daemon's mock ASR.
+#
+# Opt-in local TTS: enables amos-tts' Piper backend (piper-rs + onnxruntime +
+# espeak-ng native libs). Enable with `--features piper-tts`, and set
+# AMOS_PIPER_MODEL_DIR to a voice dir so tts_synthesize uses local Piper.
 [features]
 default = []
 sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]
+piper-tts = ["amos-tts/piper"]

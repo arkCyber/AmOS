@@ -20,15 +20,15 @@ smoke:
 	cargo test -p amos-translate --test full_chain
 
 # Compile the gated native backends (sherpa ASR / Piper TTS) + the sherpa examples
-# + the amos-tauri sherpa-asr bridge. Requires network to download prebuilt native
-# libs — run on a networked machine.
+# + the amos-tauri native bridge (sherpa-asr + piper-tts together). Requires
+# network to download prebuilt native libs — run on a networked machine.
 gated-check:
 	cargo build -p amos-asr --features sherpa
 	cargo build -p amos-asr --features sherpa --example sherpa_asr
 	cargo build -p amos-asr --features sherpa --example sherpa_session
 	cargo build -p amos-tts --features piper
 	cargo build -p amos-tts --features piper --example piper_tts
-	cargo build -p amos-tauri --features sherpa-asr
+	cargo build -p amos-tauri --features sherpa-asr,piper-tts
 
 # Production gate: formatting + clippy must be clean.
 lint:
