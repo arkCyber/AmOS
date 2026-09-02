@@ -328,12 +328,23 @@ body {
   flex: 0 0 auto;
   margin: 0 10px 10px;
   padding: 12px 10px 8px;
-  border-radius: 24px;
+  border-radius: 26px;
   background: rgba(255, 255, 255, 0.12);
-  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(26px) saturate(1.6);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
   display: flex;
   justify-content: space-around;
+  gap: 6px;
+  align-items: flex-end;
 }
+/* iOS-style dock: no text labels, and hovering lifts + magnifies the icon. */
+.dock .app-icon .label { display: none; }
+.dock .app-icon { gap: 0; }
+.dock .app-icon .tile { transition: transform 0.16s ease; }
+.dock .app-icon:hover .tile { transform: translateY(-7px) scale(1.18); }
+.dock .app-icon:active .tile { transform: translateY(-3px) scale(1.05); }
+[data-theme="light"] .dock { background: rgba(255, 255, 255, 0.7); border-color: rgba(0, 0, 0, 0.08); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); }
 
 /* ---------- Home indicator ---------- */
 #home-indicator {
