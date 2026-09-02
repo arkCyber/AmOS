@@ -83,3 +83,6 @@ target/
 *.bak
 *~
 .swp*
+
+# downloaded model files (large; fetch via scripts/fetch-models.sh)
+/models/
