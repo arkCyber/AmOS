@@ -59,12 +59,10 @@ jobs:
 
   # Native gated backends — sherpa-onnx ASR (`amos-asr`) and Piper TTS
   # (`amos-tts`). These download prebuilt native libs, so this runs on GitHub's
-  # *networked* runners. `continue-on-error` keeps it non-blocking until the
-  # sherpa-onnx 1.13.7 / piper-rs 0.2 config APIs are field-verified locally;
-  # flip to a required gate once `make gated-check` is green.
+  # *networked* runners. Verified against sherpa-onnx 1.13.7 / piper-rs 0.2.
+  # Required gate: the sherpa/Piper config APIs are calibrated in-tree.
   gated-native-backends:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
