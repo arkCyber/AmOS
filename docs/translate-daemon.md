@@ -43,7 +43,7 @@
 ### System UI 集成
 
 - `crates/amos-tauri/src/translate.rs`：`transcribe_audio` / `translate_text` 命令经 UDS 调本 daemon。
-- 前端 `window.AmosVoice.transcribe(bytes)` / `.translate(text)`（无 Tauri 时优雅降级）。
+- 前端 `frontend-ts/lib/backend.ts` 的 `transcribeAudio` / `translateText`（无 Tauri 时优雅降级）。
 - `deploy/daemons.json` 的 `amos-translate` 已配 `AMOS_ASR_BACKEND=mock`，开箱即可演示。
 - **`crates/amos-translate/src/grpc_pipeline.rs`**：`amos_int::Pipeline` 的 gRPC 实现，
   用本 daemon 的 `StreamTranslate`（ASR）+ 一元 `Translate` 驱动 `amos_int::Session`，

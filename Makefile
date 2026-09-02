@@ -5,17 +5,16 @@ all: build
 build:
 	cargo build --workspace
 
-# Comprehensive tests: Rust (unit + end-to-end RPC over UDS) + JS (legacy
-# launcher) + TS System-UI shell (bun). `cargo test --workspace` picks up every
+# Comprehensive tests: Rust (unit + end-to-end RPC over UDS) + TS System-UI
+# shell (bun). `cargo test --workspace` picks up every
 # crate's tests/ dir automatically (incl. crates/amos-tauri/tests/ai_daemon_e2e.rs).
 test:
 	cargo test --workspace
-	cd crates/amos-tauri/frontend && bun run test
 	cd crates/amos-tauri/frontend-ts && bun run test
 
-# Fast syntax check of the frontend JS only.
+# Fast check of the React/TS System-UI (tests + typecheck).
 check:
-	cd crates/amos-tauri/frontend && bun run check
+	cd crates/amos-tauri/frontend-ts && bun run check
 
 # Headless end-to-end smokes: start a mock daemon and drive the real chain.
 smoke:
@@ -50,7 +49,6 @@ lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cd crates/amos-tauri/frontend-ts && bun run typecheck
-	cd crates/amos-tauri/frontend && bun run check
 
 run-ai:
 	cargo run -p amos-ai

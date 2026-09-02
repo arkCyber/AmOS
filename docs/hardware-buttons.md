@@ -11,9 +11,9 @@
 [ amos-tauri buttons.rs ]
         │  emit "hardware-button" 事件
         ▼
-[ 前端 main.js → window.AmosButtons.handle(button) ]
+[ 前端 frontend-ts/App.tsx 订阅 hardware-button ]
         ├─ home  → systemHome()
-        ├─ voice → openApp("ai")  (AI app 内可经 AmosVoice.transcribe 接 ASR)
+        ├─ voice → openApp("ai")  (AI app 内可经 backend.transcribeAudio 接 ASR)
         └─ ai    → openApp("ai")
 ```
 
@@ -23,8 +23,8 @@
 |------|------|
 | `crates/amos-tauri/src/buttons.rs` | `HardwareButton` 枚举 + `ButtonAction` 映射 + `HardwareButtons` 状态 + `simulate_button` 命令 |
 | `crates/amos-tauri/src/lib.rs` | 注册 state + 命令 |
-| `frontend/js/core.js` | `window.AmosButtons`（`handle`/`press`） |
-| `frontend/js/main.js` | 监听 `hardware-button` 事件 + 桌面键盘快捷键 H/V/A |
+| `frontend-ts/src/App.tsx` | 订阅 `hardware-button` 事件并路由（Home/Voice/AI） |
+| `frontend-ts/src/lib/systemButtons.ts` | 解析 payload + 桌面键盘快捷键 H/V/A |
 
 ## 真实驱动接入（平台侧）
 
@@ -43,7 +43,7 @@ fn on_button(app: &tauri::AppHandle, buttons: &tauri::State<HardwareButtons>, na
 - **Android**：在 Activity/Service 的 `onKeyDown` 里把 `KEYCODE_HOME`（及自定义键）
   映射为 `HardwareButton`，调用 `press`（经 Tauri `app_handle`）。
 - **Linux/板载**：用 `evdev` 读输入设备，或 GPIO 轮询，命中后调 `press`。
-- **桌面开发/测试**：`simulate_button` 命令 + 前端 `window.AmosButtons.press(name)` +
+- **桌面开发/测试**：`simulate_button` 命令 +
   键盘快捷键（H/V/A）走完全相同的路径。
 
 ## 测试
@@ -54,6 +54,6 @@ fn on_button(app: &tauri::AppHandle, buttons: &tauri::State<HardwareButtons>, na
 
 ## 语音按钮 → ASR
 
-Voice 按钮打开 AI 应用；AI/翻译应用内可调用 `window.AmosVoice.transcribe(audioBytes)`
-把麦克风音频发到 `amos-translate` 的 `Transcribe` RPC（`SpeechRecognizer` 转写），
+Voice 按钮打开 AI 应用；AI 应用内可经 `backend.ts` 的 `transcribeAudio`
+（+ `components/VoiceMicButton.tsx`）把麦克风音频发到 `amos-translate` 的 `Transcribe` RPC（`SpeechRecognizer` 转写），
 实现"语音 → 转写 → 文本/意图"。详见 `docs/translate-daemon.md`。

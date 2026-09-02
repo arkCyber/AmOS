@@ -1,3 +1,5 @@
+> **注（迁移）**：多窗口共享 store 现由 React `frontend-ts/src/lib/amosStore.ts` 承载（仍经 `window.Amos` 桥）。下文 `core.js` / `main.js` 指早期 vanilla 实现，接口语义一致。
+
 # Amos Multi-Window Architecture (真·OS 阶段)
 
 > 目标：从「单窗口 SPA（启动器 + 视图）」升级为「单应用 + 多窗口」——主窗口是

@@ -1,3 +1,5 @@
+> **注（迁移）**：同传 GUI 现实现于 React `frontend-ts`（`src/components/BackendApps.tsx` 的 `InterpApp`，桥接在 `src/lib/backend.ts`）。下文 `AmosInterp` / `AmosTts` / `main.js` 等指早期 vanilla 实现中语义等同的行为，流程描述仍适用。
+
 # AmOS 同声翻译应用：架构与落地路线
 
 本文档是 **用 Rust + Tauri 重构 [sokuji](https://github.com/kizuna-ai-lab/sokuji)
@@ -195,11 +197,11 @@ cargo build -p amos-asr --features sherpa    # 下载并链接 sherpa-onnx 预�
 ### 阶段 3：TTS + 播放（2 周）
 - ✅ **`amos-tts`**（`crates/amos-tts`）：`TtsProvider` trait（`synthesize(text, lang) -> TtsAudio`）
   + 确定性 `MockTtsProvider` + `PiperProvider`（feature `piper`，本地 Piper 模型）。
-- ✅ **Tauri 桥接**：`tts_synthesize` 命令 + 托管 `TtsProvider`；前端 `window.AmosTts.synthesize()` 拿
+- ✅ **Tauri 桥接**：`tts_synthesize` 命令 + 托管 `TtsProvider`；前端（frontend-ts `lib/realtimeTts.ts`）拿
   PCM → Web Audio 播放（`playPcm`）。`TtsRequest` 可落地为可播放音频。
 
 ### 阶段 5（前置）：System UI 同传 App
-- ✅ **`frontend/js/apps/interpreter.js`**（同传 App）：
+- ✅ **同传 App（GUI）**：`frontend-ts/src/components/BackendApps.tsx` 的 `InterpApp` —
   - 会话控制（开始/暂停/继续/结束）+ 语言选择
   - 麦克风采集（`getUserMedia` → 16k mono f32 → `AmosInterp.audio` 流式喂入）+ 键入文本（`AmosInterp.text`）
   - 渲染实时 partial + 翻译后的 final，`🔊 朗读` 调 `AmosTts` 播放

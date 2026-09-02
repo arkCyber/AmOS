@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
-# Run the amos System UI frontend from source (dev build).
+# Run the amos System UI in dev with the React/TS (Vite) frontend on :1420.
 #
-# Why this exists: the amos-tauri *dev* binary loads the frontend from
-# `http://localhost:5173` (tauri.conf.json `build.devUrl`) and does NOT embed
-# assets, so without something serving `crates/amos-tauri/frontend` on :5173 the
-# window shows a blank white page. This script starts that static server (if it
-# isn't already up) and then launches the binary with the local-model features.
+# The amos-tauri *dev* binary loads the frontend from tauri.conf.json
+# `build.devUrl` (http://localhost:1420) and does NOT embed assets, so a Vite dev
+# server must be up. This script starts `bun run dev` for frontend-ts (if the port
+# isn't already served) and then launches the binary with the local-model features.
 #
 # Usage:
 #   scripts/run-gui-dev.sh
 # Env (all optional):
-#   AMOS_UI_PORT          port for the frontend (default 5173)
 #   AMOS_UI_FEATURES      cargo features for amos-tauri (default sherpa-asr,piper-tts;
 #                         set "" to disable native local-model backends)
 #   AMOS_SHERPA_MODEL_DIR / AMOS_PIPER_MODEL_DIR  model dirs (default under ./models)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-UI_DIR="$ROOT/crates/amos-tauri/frontend"
-PORT="${AMOS_UI_PORT:-5173}"
+UI_DIR="$ROOT/crates/amos-tauri/frontend-ts"
+PORT="1420"
 FEAT="${AMOS_UI_FEATURES:-sherpa-asr,piper-tts}"
 
 if ! lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "starting static server on :$PORT serving $UI_DIR"
-  ( cd "$UI_DIR" && nohup python3 -m http.server "$PORT" --bind 127.0.0.1 >/tmp/amos-www.log 2>&1 & )
-  sleep 1
+  echo "starting Vite dev server on :$PORT ($UI_DIR)"
+  ( cd "$UI_DIR" && nohup bun run dev >/tmp/amos-vite.log 2>&1 & )
+  # Wait for the port to accept connections (up to ~20s).
+  for _ in $(seq 1 40); do
+    if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
 fi
-echo "frontend dev server: http://localhost:$PORT/index.html"
+echo "System UI dev server: http://localhost:$PORT"
 
 cd "$ROOT"
 if [ -n "$FEAT" ]; then

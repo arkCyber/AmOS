@@ -127,27 +127,31 @@ module — the transport and UI layers stay unchanged.
 
 ## System UI (launcher)
 
-The single full-screen Tauri window renders an iOS-style **home screen / launcher**:
+The single full-screen Tauri window renders an iOS-style **home screen / launcher**,
+built as a **React + TypeScript** UI (Vite + Tailwind, run with **bun**):
 
 ```
-frontend/
-├── index.html          # full-screen shell: status bar, viewport, home indicator
-├── styles.css          # iOS-style wallpaper, icon grid, dock, app transitions
-└── js/
-    ├── core.js         # app registry + router (home ⇄ app screens) + DOM helpers
-    ├── main.js         # boot: clock, home indicator, AI stream event wiring
-    └── apps/           # one module per app
+frontend-ts/
+├── index.html            # Vite entry
+├── vite.config.ts        # dev server on :1420 (matches tauri.conf `devUrl`)
+└── src/
+    ├── main.tsx          # React bootstrap
+    ├── App.tsx           # shell: router (home ⇄ apps), lock, recents, spotlight, NC, hardware buttons
+    ├── apps.tsx          # app registry (APPS) → per-app React component
+    ├── components/       # HomeDock, StatusBar, per-app views, system panels
+    ├── lib/              # typed amos.* store + Tauri backend bridges + pure logic
+    ├── i18n/             # zh / en dictionaries
+    └── __tests__/        # headless bun test suite
 ```
 
 Tapping an icon navigates to that app's full-screen view; the `⌂` button or the
 home indicator returns to the launcher. The **AI 助手** app drives the real
-`amos-ai` daemon through the Rust RPC bridge (`ai-token-received` events →
-typing-machine effect), identical to the earlier single-view chat.
+`amos-ai` daemon through the Rust RPC bridge (`ai-token-received` / `ai-card-received`
+events → streaming tokens + semantic UiCards), same spirit as the single-view chat.
 
-Each app is a plain module registering itself via `Amos.register({ id, name,
-icon, gradient, render, onMount?, onUnmount? })`. Functionality included:
-calculator, clock, notes, messages, settings (persisted), photos, dialer,
-music player, weather, maps, files, camera, and AI.
+Each app is a React component registered in `APPS` (apps.tsx). Functionality
+included: calculator, clock, notes, messages, settings (persisted), photos,
+dialer, music player, weather, maps, files, camera, android, AI, and 同传.
 
 ### Home screen editing (iOS style)
 
@@ -171,39 +175,40 @@ reveal an iOS-style Notification Center:
 * **Brightness & volume** sliders (persisted in `amos.settings`).
 * A **notification list** (seeded on first run) with per-item dismiss (✕) and a
   **清空 (clear all)** button. Notifications persist in `amos.notifications`;
-  the bell shows an unread count. Apps can post via `window.AmosNc.post(...)`.
+  the bell shows an unread count. Notifications persist in `amos.notifications`; apps
+  write via the shared store (see `frontend-ts/src/lib/settings.ts`).
 * Dismiss by swiping up from the grabber handle.
 
 ## Tooling (bun)
 
-The frontend uses **bun** (not npm) as its runtime and package manager. The
-frontend has no third‑party dependencies, so `bun install` is a no‑op.
+The System UI is built with **bun** + Vite + React + TypeScript. `frontend-ts`
+has real (dev) dependencies, so install once:
 
 ```bash
-cd crates/amos-tauri/frontend
-bun install     # no-op (no deps) — creates nothing
-bun run test    # unit tests (tests/run_tests.mjs)
-bun run check   # syntax check via Bun.Transpiler (tests/check_syntax.mjs)
+cd crates/amos-tauri/frontend-ts
+bun install        # install react/vite/tailwind deps
+bun run dev        # Vite dev server on :1420 (tauri devUrl)
+bun run test       # headless unit tests (bun test, src/__tests__)
+bun run typecheck  # tsc --noEmit
 ```
 
 ## Testing
 
-Run the full suite (Rust unit + end-to-end UDS RPC + frontend JS) from the repo root:
+Run the full suite (Rust unit + end-to-end UDS RPC + TS System-UI) from the repo root:
 
 ```bash
-make test          # = cargo test --workspace && bun run test
-make check         # fast frontend JS syntax check (bun)
+make test          # = cargo test --workspace && bun run test (frontend-ts)
+make check         # fast React/TS check (bun test + typecheck)
 ```
 
 - **Rust** (`cargo test --workspace`): daemon unit tests (mock inference,
   session counter, status), socket-path test, and an **end-to-end RPC test**
   that runs the real server over a Unix Domain Socket and streams tokens via
   the tonic client.
-- **Frontend** (`cd crates/amos-tauri/frontend && bun run test`): a bun/Node
-  harness (`tests/run_tests.mjs`) with a minimal DOM stub covering the core DOM
-  helper, app registry, home layout, jiggle/delete/drag-reorder, layout
-  persistence, and graceful degradation without Tauri internals / with blocked
-  storage.
+- **System-UI** (`cd crates/amos-tauri/frontend-ts && bun run test`): a headless
+  `bun test` suite covering the app registry + routing, home layout & dock
+  drag/jiggle editing, layout persistence, i18n/theme, streaming/ASR/interpret
+  reducers and per-app logic, plus graceful degradation outside Tauri.
 
 ## Mobile (Android/iOS)
 

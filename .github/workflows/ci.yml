@@ -35,7 +35,7 @@ jobs:
       - name: Lint (fmt + clippy -D warnings)
         run: make lint
 
-      - name: Test (Rust workspace + frontend JS)
+      - name: Test (Rust workspace + TS System-UI)
         run: make test
 
   # Headless end-to-end gates: start a mock daemon and drive the real chain

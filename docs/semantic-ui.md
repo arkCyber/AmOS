@@ -28,9 +28,9 @@
    ├─ 终止帧含 card → 发事件 "ai-card-received" (CardPayload)
    └─ done → 发 "ai-session-complete" / "ai-chat-complete"
    ▼  Tauri 事件
-[main.js 转发]  →  [ai.js: showCard(card)]
+[frontend-ts App.tsx / AiApp 订阅]  →  [AiApp: onAiCard → patchCur]
    ▼
-[cards.js: AmosCards.render(card)]  → 动态渲染交互卡片
+[AiCardView(card)]  →  动态渲染交互卡片
 ```
 
 ## 三、协议定义（proto/ai_agent.proto）
@@ -65,13 +65,13 @@ message AgentChunk {
 
 未命中 → `None` → 走普通文本流。
 
-## 五、前端如何渲染（cards.js）
+## 五、前端如何渲染（frontend-ts `AiCardView`）
 
-- 按 `kind` 选头部渐变色，渲染：标题 + 副标题 + 键值字段 + 动作按钮。
-- 动作按钮调用 `A.openApp(...)` 拉起对应系统应用。
-- 未知 `kind` 走通用样式兜底；`card == null` 返回空（不渲染）。
-- 新增卡片类型只需在 `cards.js` 加一个 `headerColor` 色 + 复用通用结构即可，
-  无需改协议。
+- 按 `kind` 从 `CARD_COLORS` 选头部渐变色，渲染：标题 + 副标题 + 键值字段 + 动作按钮。
+- 动作按钮显示为 chips（AI 输出即展示，不拉起系统应用）。
+- 未知 `kind` 走通用样式兜底；`cardOf(payload)` 解析失败则不渲染。
+- 新增卡片类型只需在 `frontend-ts/src/components/BackendApps.tsx` 的 `CARD_COLORS`
+  加一个 `kind` 色值即可，无需改协议。
 
 ## 六、安全约束（重要）
 
@@ -84,14 +84,14 @@ message AgentChunk {
 ## 七、如何扩展一个新卡片类型
 
 1. **后端**：在 `semantic.rs` 增加一个意图匹配 + 卡片构造函数（返回 `UiCard`）。
-2. **前端**：在 `cards.js` 的 `headerColor` 加一个色值（通用结构自动生效）；
+2. **前端**：在 `BackendApps.tsx` 的 `CARD_COLORS` 加一个 `kind` 色值（通用结构自动生效）；
    若需要专属动作，在 `runAction` 加映射。
 3. **测试**：后端加 `semantic::tests` 单测 + `tests/*` 集成测试；前端加
-   `run_tests.mjs` 的渲染/渲染进对话流断言。
+   `frontend-ts` bun test 的卡片渲染断言。
 
 ## 八、测试覆盖
 
 - 后端单测：`semantic::tests`（weather/media/wallet/action/None）。
 - 集成测试：`chat_test.rs::bidi_chat_semantic_intent_returns_ui_card`、
   `rpc_test.rs::stream_chat_semantic_intent_returns_ui_card`（双向流 + 单向流）。
-- 前端：`AmosCards.render` 动态渲染、AI 应用把收到的卡片渲染进对话流。
+- 前端：`AiCardView` 动态渲染、AI 应用把收到的卡片渲染进对话流（`stream.ts cardOf`）。

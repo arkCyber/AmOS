@@ -45,13 +45,15 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 `amos-ai` serves both services on one UDS; `amos-tauri` uses one cached channel
 for both clients.
 
-## Frontend (static, no bundler — run by bun)
+## Frontend (React + TypeScript, Vite + Tailwind, run by bun)
 
-* `js/core.js` — app registry + router (home ⇄ app) + persistent home layout.
-* `js/nc.js` — notification center (quick settings + notifications).
-* `js/apps/*.js` — 14 apps, including the real **AI 助手** (drives the daemon)
-  and **安卓应用** (lists/launches legacy APKs, real PNG icons).
-* `js/main.js` — boot, clock, AI stream event wiring, global error boundary.
+* `frontend-ts/src/App.tsx` — shell: router (home ⇄ apps), lock/recents/spotlight/NC,
+  and hardware-button (Home/Voice/AI) handling.
+* `frontend-ts/src/apps.tsx` — app registry (`APPS`) → per-app React component.
+* `frontend-ts/src/components/` — HomeDock, StatusBar, per-app views, system panels.
+* `frontend-ts/src/lib/` — typed `amos.*` store + Tauri backend bridges + pure logic.
+* `frontend-ts/src/i18n/` — zh / en dictionaries.
+* `frontend-ts/src/__tests__/` — headless bun test suite.
 
 ## Boot (no-UI Android)
 
@@ -63,8 +65,8 @@ the headless binaries with `scripts/build-android.sh`.
 
 ```bash
 make lint   # cargo fmt --check + clippy -D warnings
-make test   # cargo test --workspace + bun run test (frontend)
-make check  # frontend JS syntax check (bun)
+make test   # cargo test --workspace + bun run test (frontend-ts)
+make check  # React/TS check: bun test + typecheck (frontend-ts)
 ```
 
 Rust tests include real UDS + gRPC round trips (AI streaming, Android list /

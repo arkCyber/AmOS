@@ -53,6 +53,6 @@ scripts/dev.sh
 
 - 建窗/聚焦不对 → 查 `amos-wm` 状态机(运行 `cargo test -p amos-wm`);适配层在
   `crates/amos-tauri/src/wm.rs` 的 `apply(&WmEvent)`。
-- 跨窗口不同步 → 确认两端都调用过 `listenStore()`(main.js);写路径是否走
+- 跨窗口不同步 → 确认两端都调用过 `listenStore()`(frontend-ts `lib/amosStore`);写路径是否走
   `storeWrite`(settings/nc 已迁移);Rust 侧 `store.rs` 是否广播。
 - 每次改完代码重新跑 `make lint` + `make test`。

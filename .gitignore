@@ -7,9 +7,6 @@ Cargo.lock
 # Frontend / Node
 node_modules/
 **/node_modules/
-crates/amos-tauri/frontend/node_modules/
-crates/amos-tauri/frontend/dist/
-crates/amos-tauri/frontend/build/
 .next/
 .nuxt/
 dist/

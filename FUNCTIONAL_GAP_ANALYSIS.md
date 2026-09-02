@@ -11,20 +11,20 @@
 |------|------|------|
 | gRPC over UDS 全链路 | ✅ | Tauri core ↔ amos-ai daemon，单 UDS 同时承载 AiAgent + AndroidManager 两个服务 |
 | AI 助手（文本流式） | ✅ | `StreamChat` / `Chat`(bidi)，token 流式渲染、`Cancel` 取消、系统上下文注入 |
-| **语义 UI 卡片协议** | ✅ | 2026-09-01：AI 意图识别引擎（`semantic.rs`）把"天气/音乐/笔记/钱包/打开"意图转为结构化 `UiCard`，经 UDS gRPC → Tauri 桥 → `ai-card-received` 事件 → 前端 `cards.js` 动态渲染交互卡片（AI 直接驱动 UI） |
+| **语义 UI 卡片协议** | ✅ | 2026-09-01：AI 意图识别引擎（`semantic.rs`）把"天气/音乐/笔记/钱包/打开"意图转为结构化 `UiCard`，经 UDS gRPC → Tauri 桥 → `ai-card-received` 事件 → 前端（frontend-ts `AiCardView`/`stream.ts cardOf`）动态渲染交互卡片（AI 直接驱动 UI） |
 | 会话管理 | ✅ | 会话创建/清理/上下文（内存态） |
 | 窗口管理器 | ✅ | `amos-wm` 状态机 + Tauri 适配，多窗口、焦点、外部 surface 跟踪 |
 | 跨窗口共享存储 | ✅ | `SharedStore` + `store-updated` 广播，多窗口同步 |
 | **进程管理器 `amos-supervisor`** | ✅ | 2026-09-01 新增 crate：拉起/监控/热重启 CLI 守护进程，重启策略（上限+指数退避）、`stop`/`shutdown_all` 优雅关闭、`status`/`list` 查询 |
 | **CLI daemon 编排入口** | ✅ | 2026-09-01：`amos-supervisor` 二进制 + JSON 配置（`deploy/daemons.json`），`amos-supervisor check|run <config>` 统一校验/启动/监控 amos-ai 与 amos-translate；`SupervisorConfig`/`load_config`/`start_all` 库支持 |
-| **硬件按钮（Home/语音/AI）** | ✅ | 2026-09-01：`amos-tauri/src/buttons.rs` 抽象 + `hardware-button` 事件 + `simulate_button` 命令 + 前端 `window.AmosButtons` 路由 + 桌面键盘快捷键；平台驱动接入点见 `docs/hardware-buttons.md` |
-| **语音转写（ASR）管线** | ✅ | 2026-09-01：`amos-translate` 新增 `Transcribe` RPC + `SpeechRecognizer` trait（Mock/WhisperProvider）+ 流式音频段转写；`amos-tauri` `transcribe_audio`/`translate_text` 命令 + 前端 `window.AmosVoice`；`deploy/daemons.json` 默认 `AMOS_ASR_BACKEND=mock` |
+| **硬件按钮（Home/语音/AI）** | ✅ | 2026-09-01：`amos-tauri/src/buttons.rs` 抽象 + `hardware-button` 事件 + `simulate_button` 命令 + 前端（frontend-ts `App.tsx`）路由 + 桌面键盘快捷键；平台驱动接入点见 `docs/hardware-buttons.md` |
+| **语音转写（ASR）管线** | ✅ | 2026-09-01：`amos-translate` 新增 `Transcribe` RPC + `SpeechRecognizer` trait（Mock/WhisperProvider）+ 流式音频段转写；`amos-tauri` `transcribe_audio`/`translate_text` 命令 + 前端 `lib/backend.ts` 的 `transcribeAudio`；`deploy/daemons.json` 默认 `AMOS_ASR_BACKEND=mock` |
 | **同传领域引擎 `amos-int`** | ✅ | 2026-09-01：传输无关会话状态机（Idle→Collecting→Interpreting→Speaking）+ `UtteranceBuilder`（流式 partial→stable→final）+ `Pipeline` trait + `BothMode`；`SessionEvent` 进 / `InterpretationOutput` 出 |
 | **同传 daemon 桥接 `GrpcPipeline`** | ✅ | 2026-09-01：`Pipeline` 的 gRPC 实现，`StreamTranslate` 音频路径做 ASR + 一元 `Translate` RPC 翻译；断线自动重连（translate/audio 失败均 `invalidate` 缓存）|
 | **流式 ASR `amos-asr`** | ✅ | 2026-09-01：`StreamingRecognizer` trait（partial/hypothesis/endpoint）+ 确定性 `MockStreamingRecognizer` + `AsrPipeline`（组合本地 ASR + 远端翻译）；sherpa-onnx 后端以 `sherpa` feature 门控（需联网下载预编译库）|
 | **TTS `amos-tts`** | ✅ | 2026-09-01：`TtsProvider` trait + 确定性 `MockTtsProvider` + `PiperProvider`（`piper` feature 门控）；Tauri `tts_synthesize` 命令 → Web Audio 播放 |
 | **同传 CLI `amos-int-cli`** | ✅ | 2026-09-01：stdin 进文本、译文出，`.lang`/`.status`/`.pause`/`.resume`/`.stop` 命令；驱动 `Session` + `GrpcPipeline` |
-| **同传 App（GUI）** | ✅ | 2026-09-01：`frontend/js/apps/interpreter.js` — 语言选择、会话控制、麦克风采集（16k mono→`AmosInterp.audio`）、流式 partial/译文渲染、`🔊 朗读`（`AmosTts`）；已入 dock |
+| **同传 App（GUI）** | ✅ | 2026-09-01：`frontend-ts/src/components/BackendApps.tsx` 的 `InterpApp` — 语言选择、会话控制、麦克风采集（16k mono→`AmosInterp.audio`）、流式 partial/译文渲染、`🔊 朗读`（`AmosTts`）；已入 dock |
 | **全链路冒烟** | ✅ | 2026-09-01：`amos-translate/tests/full_chain.rs` 无头跑通 音频→partial→daemon 译文→TTS 音频；`scripts/gui-smoke.sh` 真机一键冒烟 |
 | 通知中心 + 快速设置 | ✅ | 下拉面板、快捷开关、亮度/音量滑块、通知列表（localStorage） |
 | 锁屏 / 解锁（含 PIN） | ✅ | 2026-09-01 补全：时钟/日期、通知预览、PIN 数字密码、上滑/按钮解锁 |
@@ -116,7 +116,7 @@
 
 ### 短期（让"已有"真正生效）
 1. ~~**把 SecurityManager 接进 AiAgentService**（每请求 rate-limit + audit + permission）~~ → **✅ 已完成（2026-09-01）**
-2. ~~**JSON 语义 UI 协议**（AI 驱动 UI 卡片）~~ → **✅ 已完成（2026-09-01）**：`proto/UiCard` + `semantic.rs` 意图引擎 + 桥接事件 + `cards.js` 动态渲染。
+2. ~~**JSON 语义 UI 协议**（AI 驱动 UI 卡片）~~ → **✅ 已完成（2026-09-01）**：`proto/UiCard` + `semantic.rs` 意图引擎 + 桥接事件 + 前端动态渲染（`AiCardView`）。
 3. **把 EnhancedAndroidManager 接进 AndroidManagerService**（timeout + 图标缓存）。
 4. ~~**会话持久化到磁盘**~~ → **✅ 已完成（2026-09-01）**：`SessionManager::save(path)`（原子 JSON 写入）与 `SessionManager::load(path)`（缺失/损坏文件非致命降级为空）。`Instant` 在保存时转墙钟、加载时反推，重启后 staleness 仍正确。**并已接入 daemon**：`AiAgentService` 持有 `Arc<SessionManager>`，`stream_chat`/`chat` 每次生成都创建会话并记录 token 用量；`AMOS_SESSIONS_PATH` 设定后启动时加载、优雅关闭时保存。
 5. **后端 HTTP 超时** → **✅ 已完成（2026-09-01）**：`ApiBackend`/`OllamaBackend`/`HermesAgentBackend` 的所有 `ureq` 调用（chat 60s、Ollama tags 10s、hermes health 5s）均加超时，后端挂死不再阻塞 daemon。
