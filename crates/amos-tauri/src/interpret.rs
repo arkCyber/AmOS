@@ -615,4 +615,21 @@ mod tests {
             "missing models must fall back to the daemon (None)"
         );
     }
+
+    /// Runtime proof that `interpret_start` selects a real local-sherpa pipeline
+    /// when `AMOS_SHERPA_MODEL_DIR` points at a downloaded model dir (loads the
+    /// sherpa model, so it needs `models/` on disk). Ignored by default: run with
+    /// `cargo test -p amos-tauri --features sherpa-asr -- --ignored`.
+    #[cfg(feature = "sherpa-asr")]
+    #[test]
+    #[ignore = "requires AMOS_SHERPA_MODEL_DIR with downloaded sherpa models"]
+    fn local_sherpa_pipeline_selects_when_configured() {
+        let dir = std::env::var("AMOS_SHERPA_MODEL_DIR")
+            .expect("set AMOS_SHERPA_MODEL_DIR to models/sherpa-en-20m");
+        let p = local_sherpa_pipeline(&PathBuf::from("/tmp/amos-test.sock"), "auto", "zh");
+        assert!(
+            p.is_some(),
+            "configured model dir {dir} should yield a local sherpa pipeline"
+        );
+    }
 }
