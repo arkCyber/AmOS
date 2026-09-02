@@ -81,6 +81,23 @@ cargo run -p amos-asr --example sherpa_asr --features sherpa -- /tmp/piper_out.w
 > - sherpa streaming 逐块喂入需 ≥ 少量缓冲才出字；结尾建议补一段尾静音让解码器 flush。
 > - 并行/后台下载大文件可能截断（onnxruntime 加载报 `cannot catch foreign exceptions`），务必串行 + 校验大小。
 
+# 把真实本地 ASR 接进 amos-tauri 的 WebView（feature `sherpa-asr`）
+
+`amos-tauri` 提供可选 feature `sherpa-asr`（门控 + 编译 sherpa-onnx 原生库）。
+开启时 `interpret_start` 会自动用**本地 sherpa 流式 ASR**（经 daemon 翻译委托）代替 daemon 的 mock ASR，
+其余（`interpret_feed_audio`/事件流/落库）完全不变。
+
+构建并运行（需先用 `bash scripts/fetch-models.sh` 下载模型）：
+
+```bash
+AMOS_SHERPA_MODEL_DIR=$PWD/models/sherpa-en-20m \
+  cargo tauri dev --features sherpa-asr        # 或 cargo run -p amos-tauri --features sherpa-asr
+```
+
+- 未设 `AMOS_SHERPA_MODEL_DIR`、或目录里缺标准模型文件（`tokens.txt` + `encoder/decoder/joiner-epoch-99-avg-1.int8.onnx`）→ `interpret_start` 回退 daemon（默认行为不变）。
+- 模型目录可用 `env SHERPA_MODEL_DIR`（ASR 示例）或 `AMOS_SHERPA_MODEL_DIR`（GUI）覆盖。
+- CI / 默认构建不带此 feature，原生库只在显式开启时链接。
+
 ## CI
 
 `sherpa`/`piper` 为 feature 门控后端，`make gated-check`（CI `gated-native-backends` job）
