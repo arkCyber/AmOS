@@ -844,3 +844,75 @@ mod tests {
         let _ = std::fs::remove_file(&pb);
     }
 }
+
+#[cfg(test)]
+mod backoff_property {
+    use super::*;
+
+    const MAX_BACKOFF: u64 = 300; // delay_for caps at 5 minutes
+
+    #[test]
+    fn exponential_growth_is_capped_and_monotone() {
+        let p = RestartPolicy {
+            max_restarts: 5,
+            backoff_secs: 1,
+            backoff_factor: 2,
+        };
+        let seq: Vec<u64> = (0u32..16).map(|a| p.delay_for(a).as_secs()).collect();
+        for &v in &seq {
+            assert!(v <= MAX_BACKOFF, "backoff must never exceed the cap");
+        }
+        // base=1, factor=2 -> 1,1,2,4,...,256,300,300,...
+        assert_eq!(seq[0], 1); // attempt 0 ≈ first attempt
+        assert_eq!(seq[1], 1);
+        assert_eq!(seq[2], 2);
+        assert_eq!(seq[9], 256);
+        assert_eq!(seq[10], 300);
+        assert_eq!(seq[15], 300);
+        for w in seq.windows(2) {
+            assert!(w[0] <= w[1], "backoff must be non-decreasing: {w:?}");
+        }
+    }
+
+    #[test]
+    fn hostile_inputs_saturate_without_panic_or_overflow() {
+        let big = RestartPolicy {
+            max_restarts: 0,
+            backoff_secs: u64::MAX / 2,
+            backoff_factor: u32::MAX,
+        };
+        for a in [0u32, 1, 2, 7, 1000, u32::MAX] {
+            let d = big.delay_for(a);
+            assert!(d.as_secs() <= MAX_BACKOFF, "attempt {a} backoff {d:?} over cap");
+        }
+        // backoff_secs 0 stays 0 for any attempt.
+        let zero = RestartPolicy {
+            max_restarts: 0,
+            backoff_secs: 0,
+            backoff_factor: 99,
+        };
+        assert_eq!(zero.delay_for(1000).as_secs(), 0);
+        // factor 0 is clamped to 1 (constant base, no runaway zero).
+        let one = RestartPolicy {
+            max_restarts: 0,
+            backoff_secs: 2,
+            backoff_factor: 0,
+        };
+        assert_eq!(one.delay_for(1).as_secs(), 2);
+        assert_eq!(one.delay_for(500).as_secs(), 2);
+    }
+
+    #[test]
+    fn delay_is_deterministic_and_total_for_every_attempt() {
+        let p = RestartPolicy {
+            max_restarts: 4,
+            backoff_secs: 3,
+            backoff_factor: 3,
+        };
+        for a in 0u32..1000 {
+            let d = p.delay_for(a);
+            assert_eq!(d, p.delay_for(a), "delay must be deterministic per attempt");
+            assert!(d.as_secs() <= MAX_BACKOFF);
+        }
+    }
+}
