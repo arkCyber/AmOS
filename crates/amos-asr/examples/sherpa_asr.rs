@@ -29,13 +29,15 @@ fn read_pcm16_wav(path: &Path) -> Result<(u32, Vec<f32>), String> {
     let mut i = 12;
     while i + 8 <= bytes.len() {
         let id = &bytes[i..i + 4];
-        let size = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        let size =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
         i += 8;
         match id {
             b"fmt " if size >= 16 => {
                 let fmt = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
                 channels = u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]);
-                sample_rate = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]);
+                sample_rate =
+                    u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]);
                 bits = u16::from_le_bytes([bytes[i + 14], bytes[i + 15]]);
                 if fmt != 1 {
                     return Err("only uncompressed PCM supported".into());
@@ -67,7 +69,9 @@ fn main() {
     let wav = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "models/sherpa-en-20m/test_wavs/0.wav".to_string());
-    let model_dir = PathBuf::from(std::env::var("SHERPA_MODEL_DIR").unwrap_or_else(|_| "models/sherpa-en-20m".into()));
+    let model_dir = PathBuf::from(
+        std::env::var("SHERPA_MODEL_DIR").unwrap_or_else(|_| "models/sherpa-en-20m".into()),
+    );
 
     let cfg = amos_asr::SherpaOnlineRecognizerConfig {
         tokens: model_dir.join("tokens.txt"),
@@ -87,7 +91,11 @@ fn main() {
     let mut recognizer = amos_asr::SherpaOnlineRecognizer::new(cfg).expect("load sherpa model");
 
     let (sr, samples) = read_pcm16_wav(Path::new(&wav)).expect("read wav");
-    println!("audio: {sr} Hz, {} samples ({:.1}s)", samples.len(), samples.len() as f32 / sr as f32);
+    println!(
+        "audio: {sr} Hz, {} samples ({:.1}s)",
+        samples.len(),
+        samples.len() as f32 / sr as f32
+    );
 
     // Feed in ~400 ms chunks (streaming decoders need enough buffered audio to
     // produce features/partials; 10 ms per decode is too granular).

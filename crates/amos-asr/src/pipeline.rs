@@ -113,6 +113,24 @@ impl<R: StreamingRecognizer + Send + Sync + 'static> Pipeline for AsrPipeline<R>
         Ok(events)
     }
 
+    async fn end_of_utterance(&self) -> Result<Vec<AsrEvent>> {
+        // Flush the recognizer's in-flight utterance even if it never signalled
+        // an endpoint (finite clip, forced stop). Reset for the next utterance.
+        let mut events = Vec::new();
+        let mut rec = self.recognizer.lock().await;
+        let text = rec.finalize();
+        rec.reset();
+        if !text.trim().is_empty() {
+            events.push(AsrEvent::Final {
+                text,
+                lang: self.source_lang.clone(),
+                start: Duration::ZERO,
+                end: Duration::ZERO,
+            });
+        }
+        Ok(events)
+    }
+
     async fn translate(&self, src: SourceText<'_>) -> Result<Translation> {
         match &self.translate {
             Some(t) => t.translate(src).await,
@@ -187,6 +205,37 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, InterpretationError::Other(_)), "{err}");
+        });
+    }
+
+    #[test]
+    fn end_of_utterance_flushes_without_endpoint() {
+        // endpoint_after (10) > word count so feed_audio never auto-finalizes;
+        // only end_of_utterance finalizes the utterance.
+        let pipe = AsrPipeline::new(
+            MockStreamingRecognizer::new(["你", "好", "世界"], 10).with_samples_per_partial(160),
+            "zh",
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Feed enough partials but never reach the endpoint threshold.
+            for _ in 0..5 {
+                let ev = pipe.feed_audio(&vec![0.0; 160]).await.unwrap();
+                assert!(
+                    ev.iter().all(|e| matches!(e, AsrEvent::Partial(_))),
+                    "no final yet"
+                );
+            }
+            // Flush -> the accumulated utterance is finalized.
+            let flushed = pipe.end_of_utterance().await.unwrap();
+            assert!(
+                flushed
+                    .iter()
+                    .any(|e| matches!(e, AsrEvent::Final { text, .. } if text == "你好世界")),
+                "flush produced the final: {flushed:?}"
+            );
         });
     }
 }

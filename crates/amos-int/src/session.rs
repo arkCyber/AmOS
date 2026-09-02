@@ -175,10 +175,33 @@ impl Session {
         self.end(EndReason::Aborted)
     }
 
-    /// Triggered by VAD when the current utterance ended: finalize whatever the
-    /// builder has and translate it (used by manual / non-streaming pipelines).
+    /// Triggered by VAD when the current utterance ended. First asks the pipeline
+    /// to *flush* any in-flight recognition (a recognizer-backed pipeline such as
+    /// sherpa that never signalled an endpoint returns a Final here); if the
+    /// pipeline produced nothing, falls back to finalizing the session's manual
+    /// builder (typed / partial-driven path).
     async fn end_of_speech(&mut self) -> Result<()> {
         self.require_collecting()?;
+
+        // 1) Flush the pipeline's recognizer (sherpa etc.).
+        let flushed = {
+            let p = self.pipeline.as_ref();
+            p.end_of_utterance().await?
+        };
+        for ev in flushed {
+            if let AsrEvent::Final {
+                text,
+                lang,
+                start,
+                end,
+            } = ev
+            {
+                self.translate_source(text, lang, start, end).await?;
+                return Ok(());
+            }
+        }
+
+        // 2) Fall back to the manual builder path.
         let Some(mut b) = self.builder.take() else {
             return Ok(());
         };
@@ -501,6 +524,62 @@ mod tests {
         s.pause().unwrap();
         assert!(s.restart().is_err());
         s.resume().unwrap();
+    }
+
+    /// Pipeline whose `end_of_utterance` flushes a final (sherpa-style: no
+    /// endpoint signal, so a Session EndOfSpeech must flush it to finalize).
+    struct FlushPipeline;
+    #[async_trait::async_trait]
+    impl crate::pipeline::Pipeline for FlushPipeline {
+        fn info(&self) -> crate::pipeline::PipelineInfo {
+            crate::pipeline::PipelineInfo {
+                provider: "flush".into(),
+                model: None,
+                streaming_asr: true,
+                tts: false,
+                both_mode: crate::config::BothMode::Disabled,
+            }
+        }
+        async fn feed_audio(&self, _chunk: &[f32]) -> Result<Vec<crate::pipeline::AsrEvent>> {
+            Ok(Vec::new())
+        }
+        async fn end_of_utterance(&self) -> Result<Vec<crate::pipeline::AsrEvent>> {
+            Ok(vec![crate::pipeline::AsrEvent::Final {
+                text: "hello".into(),
+                lang: crate::language::Language::new("en"),
+                start: Duration::ZERO,
+                end: Duration::ZERO,
+            }])
+        }
+        async fn translate(&self, src: crate::pipeline::SourceText<'_>) -> Result<Translation> {
+            Ok(Translation {
+                target_text: format!("[{}] {}", src.lang, src.text),
+                target_lang: src.lang.clone(),
+            })
+        }
+        async fn synthesize(&self, _req: &TtsRequest) -> Result<crate::pipeline::TtsAudio> {
+            Err(InterpretationError::Other("no tts".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn end_of_speech_flushes_pipeline_final() {
+        let cfg = SessionConfig::one_way("en", "zh");
+        let (mut s, mut rx) = Session::new(cfg, Box::new(FlushPipeline));
+        s.start().unwrap();
+        // The pipeline never emits a final from feed_audio; EndOfSpeech must flush it.
+        s.handle(SessionEvent::EndOfSpeech).await.unwrap();
+        let out = drain(&mut rx).await;
+        let seg = out
+            .iter()
+            .find_map(|o| match o {
+                InterpretationOutput::SegmentFinal(x) => Some(x.clone()),
+                _ => None,
+            })
+            .expect("EndOfSpeech should flush the pipeline into a segment");
+        assert_eq!(seg.source_text, "hello");
+        assert_eq!(seg.target_text, "[en] hello");
+        assert_eq!(s.state(), SessionState::Collecting);
     }
 
     /// Pipeline whose translate always fails, to exercise the error path.

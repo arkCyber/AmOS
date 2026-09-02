@@ -40,16 +40,26 @@ fn write_pcm16_wav(path: &Path, sample_rate: u32, samples: &[f32]) -> std::io::R
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let text = args.get(1).cloned().unwrap_or_else(|| "Hello, this is a test of local text to speech.".into());
-    let model = args.get(2).cloned().unwrap_or_else(|| "models/piper-low/en_US-lessac-low.onnx".into());
-    let voice = args.get(3).cloned().unwrap_or_else(|| "models/piper-low/en_US-lessac-low.onnx.json".into());
-    let out = args.get(4).cloned().unwrap_or_else(|| "/tmp/piper_out.wav".into());
+    let text = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "Hello, this is a test of local text to speech.".into());
+    let model = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "models/piper-low/en_US-lessac-low.onnx".into());
+    let voice = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "models/piper-low/en_US-lessac-low.onnx.json".into());
+    let out = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(|| "/tmp/piper_out.wav".into());
 
     println!("loading piper model {model}");
     let provider = PiperProvider::new(model.into(), voice.into())?;
-    let audio = provider
-        .synthesize(&text, &Language::new("en"))
-        .await?;
+    let audio = provider.synthesize(&text, &Language::new("en")).await?;
     write_pcm16_wav(Path::new(&out), audio.sample_rate, &audio.samples)?;
     println!(
         "synthesized {} samples @ {}Hz -> {out} ({:.1}s)",

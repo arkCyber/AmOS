@@ -23,6 +23,10 @@ anyhow.workspace = true
 default = []
 sherpa = ["dep:sherpa-onnx"]
 
+[[example]]
+name = "sherpa_asr"
+required-features = ["sherpa"]
+
 [dependencies.sherpa-onnx]
 version = "1.13.7"
 optional = true

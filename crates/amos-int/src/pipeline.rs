@@ -74,6 +74,14 @@ pub trait Pipeline: Send + Sync {
     /// error if the provider is unreachable.
     async fn feed_audio(&self, chunk: &[f32]) -> Result<Vec<AsrEvent>>;
 
+    /// Optional: ask the pipeline to *flush* the current utterance — finalize any
+    /// in-flight recognition that hasn't signalled an endpoint yet (e.g. a
+    /// streaming ASR fed a finite clip or told to stop). Returns any finalization
+    /// events. Recognizer-backed pipelines override this; the default is a no-op.
+    async fn end_of_utterance(&self) -> Result<Vec<AsrEvent>> {
+        Ok(Vec::new())
+    }
+
     /// Translate a finalized source utterance.
     async fn translate(&self, src: SourceText<'_>) -> Result<Translation>;
 

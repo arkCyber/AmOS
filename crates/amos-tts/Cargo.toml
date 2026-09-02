@@ -21,6 +21,10 @@ anyhow.workspace = true
 default = []
 piper = ["dep:piper-rs"]
 
+[[example]]
+name = "piper_tts"
+required-features = ["piper"]
+
 [dependencies.piper-rs]
 version = "0.2"
 optional = true
