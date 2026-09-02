@@ -13,8 +13,9 @@ export default function LockSettings() {
   const save = () => {
     const next = makeLock(on, pin, cfg);
     setCfg(next);
+    setOn(next.enabled); // never leave the UI showing enabled if the save was refused
     writeStoreValue(LOCK_KEY, next);
-    setMsg(t("lock.saved"));
+    setMsg(on && !next.enabled ? t("lock.pin") : t("lock.saved"));
   };
 
   return (
