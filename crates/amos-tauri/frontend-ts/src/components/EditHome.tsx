@@ -1,5 +1,5 @@
 import { useI18n } from "../i18n";
-import { appTitleKey } from "../apps";
+import { appIcon, appTitleKey } from "../apps";
 import { hideFromHome, restoreToHome, type HomeLayout } from "../lib/amosStore";
 
 export default function EditHome({
@@ -35,7 +35,7 @@ export default function EditHome({
               className="grid h-16 w-16 place-items-center rounded-2xl bg-neutral-300 text-2xl dark:bg-neutral-700"
               aria-label={`remove ${id}`}
             >
-              🧩
+              {appIcon(id)}
             </button>
             <span className="absolute -left-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-danger text-xs text-white">
               ✕
