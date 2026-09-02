@@ -14,13 +14,88 @@ export function calcInit(): CalcState {
   return { acc: "", cur: "0", justEq: false };
 }
 
-function toJs(s: string): string {
-  return s.replace(/−/g, "-").replace(/×/g, "*").replace(/÷/g, "/");
+/** Normalize iOS display symbols to ASCII math operators. */
+function normalize(s: string): string {
+  return s
+    .replace(/＋/g, "+")
+    .replace(/−/g, "-")
+    .replace(/×/g, "*")
+    .replace(/÷/g, "/");
 }
-function evalNum(s: string): number {
-  const v = new Function(`"use strict"; return (${toJs(s)});`)() as unknown;
-  if (typeof v !== "number" || !Number.isFinite(v)) throw new Error("calc");
+
+/**
+ * Tiny recursive-descent evaluator for `+ - * /` (no `eval`/`new Function`, so
+ * no code-execution surface). Supports unary minus; throws on malformed input,
+ * division by zero, or a non-finite result.
+ */
+function evalExpr(s: string): number {
+  const expr = normalize(s);
+  let i = 0;
+  const n = expr.length;
+  const skipWs = () => {
+    while (i < n && expr[i] === " ") i++;
+  };
+  const num = (): number => {
+    skipWs();
+    const j = i;
+    let dot = false;
+    while (i < n) {
+      const c = expr[i];
+      if (c >= "0" && c <= "9") i++;
+      else if (c === "." && !dot) {
+        dot = true;
+        i++;
+      } else break;
+    }
+    if (i === j) throw new Error("calc"); // no digits consumed
+    return Number(expr.slice(j, i));
+  };
+  const unary = (): number => {
+    skipWs();
+    if (i < n && expr[i] === "-") {
+      i++;
+      return -unary();
+    }
+    return num();
+  };
+  const term = (): number => {
+    let v = unary();
+    for (;;) {
+      skipWs();
+      const c = i < n ? expr[i] : "";
+      if (c === "*" || c === "/") {
+        i++;
+        const r = unary();
+        if (c === "/") {
+          if (r === 0) throw new Error("calc"); // division by zero
+          v /= r;
+        } else v *= r;
+      } else break;
+    }
+    return v;
+  };
+  const sum = (): number => {
+    let v = term();
+    for (;;) {
+      skipWs();
+      const c = i < n ? expr[i] : "";
+      if (c === "+" || c === "-") {
+        i++;
+        const r = term();
+        v = c === "+" ? v + r : v - r;
+      } else break;
+    }
+    return v;
+  };
+  const v = sum();
+  skipWs();
+  if (i !== n) throw new Error("calc"); // trailing garbage
+  if (!Number.isFinite(v)) throw new Error("calc");
   return v;
+}
+
+function evalNum(s: string): number {
+  return evalExpr(s);
 }
 function fmt(v: number): string {
   return String(Number(v.toPrecision(12))); // tame 0.1+0.2 float noise
@@ -29,6 +104,10 @@ function fmt(v: number): string {
 /** Apply one button press and return the next state (pure). */
 export function calcPress(st: CalcState, label: string): CalcState {
   let { acc, cur, justEq } = st;
+
+  // Aerospace-grade error policy: once ERR, the display is frozen — only "C"
+  // clears it (no half-typed "ERR × …" garbage, no NaN leak).
+  if (cur === ERR && label !== "C") return st;
 
   if (/[0-9]/.test(label)) {
     if (justEq) {
@@ -67,12 +146,15 @@ export function calcPress(st: CalcState, label: string): CalcState {
     acc = "";
     justEq = true;
   } else {
-    // operator (＋ − × ÷); keep current entry as the left operand
+    // operator (＋ − × ÷); fold any pending operation, then stage this one
     justEq = false;
-    try {
-      if (acc) cur = fmt(evalNum(acc + cur));
-    } catch {
-      cur = ERR;
+    if (acc) {
+      try {
+        cur = fmt(evalNum(acc + cur));
+      } catch {
+        // hard error: freeze at ERR until cleared with C
+        return { acc: "", cur: ERR, justEq: false };
+      }
     }
     acc = `${cur} ${label} `;
     cur = "0";

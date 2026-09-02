@@ -35,4 +35,31 @@ describe("calculator", () => {
   test("division by zero surfaces an error sentinel", () => {
     expect(calcRun(["5", "÷", "0", "="])).toBe(ERR);
   });
+
+  test("negative results and full-width plus glyph parse", () => {
+    expect(calcRun(["0", "−", "5", "="])).toBe("-5");
+    expect(calcRun(["3", "＋", "4", "="])).toBe("7");
+  });
+
+  test("division by zero freezes at ERR until cleared with C", () => {
+    let s = calcInit();
+    for (const k of ["5", "÷", "0", "=", "3", "+", "9", "="]) s = calcPress(s, k);
+    expect(calcDisplay(s)).toBe(ERR); // frozen — subsequent presses ignored
+    s = calcPress(s, "C");
+    expect(calcDisplay(s)).toBe("0");
+    expect(calcRun(["2", "+", "2", "="])).toBe("4"); // recovered
+  });
+
+  test("mid-chain division by zero is a hard error (no ERR × … garbage)", () => {
+    let s = calcInit();
+    for (const k of ["5", "÷", "0", "+", "2", "="]) s = calcPress(s, k);
+    expect(calcDisplay(s)).toBe(ERR);
+  });
+
+  test("results never leak NaN/Infinity to the display", () => {
+    // 1 / 3 then re-multiplying by 3 must stay a finite decimal (fold semantics)
+    const out = calcRun(["1", "÷", "3", "×", "3", "="]);
+    expect(Number.isFinite(Number(out))).toBe(true);
+    expect(calcRun(["0", "÷", "0", "="])).toBe(ERR);
+  });
 });

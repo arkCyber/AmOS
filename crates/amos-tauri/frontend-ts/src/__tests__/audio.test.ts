@@ -19,4 +19,28 @@ describe("audio chunk helpers", () => {
     const bytes = frameToChunk(new Float32Array([1, -1]), TARGET_RATE);
     expect(bytes).toEqual([0xff, 0x7f, 0x00, 0x80]);
   });
+
+  test("downsample guards invalid/equal/empty inputs (no NaN-length alloc)", () => {
+    const a = new Float32Array([0, 1, 0, -1]);
+    expect(downsample(a, 16000, 16000)).toBe(a); // same rate → unchanged
+    expect(downsample(a, 0, 8000)).toBe(a); // non-positive fromRate
+    expect(downsample(a, -16000, 8000)).toBe(a);
+    expect(downsample(a, NaN, 8000)).toBe(a); // NaN rate
+    expect(downsample(a, 16000, NaN)).toBe(a);
+    expect(downsample(a, 16000, 0)).toBe(a); // non-positive toRate
+    expect(downsample(new Float32Array(0), 16000, 8000).length).toBe(0);
+  });
+
+  test("downsample upsampling is finite and length-proportional", () => {
+    const out = downsample(new Float32Array([-1, 0, 1]), 8000, 16000);
+    expect(out.length).toBe(6); // 8000→16000 doubles samples
+    for (const v of out) expect(Number.isFinite(v)).toBe(true);
+  });
+
+  test("encodePcm16 clamps range and maps non-finite samples to digital zero", () => {
+    expect(encodePcm16(new Float32Array([2, -2]))).toEqual([0xff, 0x7f, 0x00, 0x80]);
+    expect(encodePcm16(new Float32Array([NaN, Infinity, -Infinity]))).toEqual([0, 0, 0, 0, 0, 0]);
+    // byte-count invariant: always 2 bytes per sample, all finite
+    expect(encodePcm16(new Float32Array(7)).length).toBe(14);
+  });
 });
