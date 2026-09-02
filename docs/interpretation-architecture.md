@@ -133,6 +133,9 @@ partial/segment_final → 断言 partial 追加、译文段落含 🔊 朗读按
 - bidi 音频流读响应/打开均有超时（30s / 10s），daemon 卡死会报错而非永久挂起。
 - `Session` 翻译失败自动重试一次（`SessionConfig.translate_retries`，默认 1）：短暂 daemon 抖动 /
   过期 channel（重连路径）被吸收，仅持续失败才进入 `Error`。`FlakyPipeline` 测试覆盖。
+- **句末 flush**：`Pipeline::end_of_utterance()`（默认 no-op）让识别器型管线（如 sherpa，不总是触发端点）
+  在 `Session` 收到 `EndOfSpeech` 时显式收尾产出 `Final` → 定长音频/单句也能完成段落；
+  `AsrPipeline` 已覆写，`Session` 先 flush 管线、无产出再回退手工 builder。
 
 ### CI / 冒烟入口
 ```bash
