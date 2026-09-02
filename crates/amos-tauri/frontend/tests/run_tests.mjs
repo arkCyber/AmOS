@@ -1118,6 +1118,22 @@ test('interp UI: level meter, copy button, and clear controls', () => {
   app.onUnmount();
 });
 
+test('interp UI: restores saved language pair and auto-speak, persists edits', () => {
+  const e = fresh();
+  e.localStorage.setItem('amos.interp', JSON.stringify({ source: 'en', target: 'ja', autospeak: true }));
+  const app = e.Amos.apps.get('interpreter');
+  app.render();
+  app.onMount();
+  assert(e.document.getElementById('interp-source').value === 'en', 'source restored from prefs');
+  assert(e.document.getElementById('interp-target').value === 'ja', 'target restored from prefs');
+  assert(e.document.getElementById('interp-autospeak').checked === true, 'auto-speak restored from prefs');
+  e.document.getElementById('interp-target').value = 'fr';
+  e.document.getElementById('interp-target').dispatch('change', {});
+  const saved = JSON.parse(e.localStorage.getItem('amos.interp'));
+  assert(saved && saved.target === 'fr', 'changing the target persists the preference');
+  app.onUnmount();
+});
+
 test('wallpaper: resolution, presets, and custom URLs', () => {
   const e = fresh();
   const A = e.Amos;

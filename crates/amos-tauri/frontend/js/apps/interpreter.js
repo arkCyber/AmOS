@@ -32,6 +32,21 @@
 
   function el(id) { return document.getElementById(id); }
 
+  // Remember the interpreter preferences (language pair + auto-speak) so
+  // reopening the app feels continuous.
+  function readPrefs() {
+    try { return JSON.parse(A.safeGet("amos.interp", "{}")) || {}; } catch (_) { return {}; }
+  }
+  function persistPrefs() {
+    try {
+      A.storeWrite("amos.interp", JSON.stringify({
+        source: el("interp-source") ? el("interp-source").value : "auto",
+        target: el("interp-target") ? el("interp-target").value : "zh",
+        autospeak: !!(el("interp-autospeak") && el("interp-autospeak").checked),
+      }));
+    } catch (_) {}
+  }
+
   function status(text) {
     const s = el("interp-status");
     if (s) s.textContent = text;
@@ -320,6 +335,15 @@
     onMount() {
       mounted = true;
       prevOnOutput = window.AmosInterp && window.AmosInterp.onOutput;
+      // Restore saved preferences (language pair + auto-speak) and persist edits.
+      const saved = readPrefs();
+      const sSrc = el("interp-source"), sTgt = el("interp-target"), sAsp = el("interp-autospeak");
+      if (sSrc) sSrc.value = (saved.source) || "auto";
+      if (sTgt) sTgt.value = saved.target || "zh";
+      if (sAsp && saved.autospeak) sAsp.checked = true;
+      if (sSrc) sSrc.addEventListener("change", persistPrefs);
+      if (sTgt) sTgt.addEventListener("change", persistPrefs);
+      if (sAsp) sAsp.addEventListener("change", persistPrefs);
       if (window.AmosInterp) {
         window.AmosInterp.onOutput = (payload) => {
           if (!mounted) return;
