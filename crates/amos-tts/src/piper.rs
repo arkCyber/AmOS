@@ -7,38 +7,35 @@
 //! cargo build -p amos-tts --features piper
 //! ```
 //!
-//! Note: `piper-rs` may pull native dependencies (espeak-ng / onnxruntime) and
-//! needs network to fetch them. This module is written against piper-rs 0.2's
-//! documented API; verify the exact `Piper`/`PiperConfig` surface with a local
-//! `--features piper` build.
+//! Note: `piper-rs` pulls native deps (onnxruntime + espeak-ng) and needs network
+//! to fetch them. Verified against piper-rs 0.2.0's real API:
+//! `Piper::new(model_path, config_path)` and `Piper::create(&mut self, text, …)`
+//! returning `(Vec<f32> samples, u32 sample_rate)`. Because `create` needs
+//! `&mut self` while [`TtsProvider::synthesize`] takes `&self`, the `Piper` is
+//! held in an `Arc<Mutex<Piper>>` and driven on a blocking task.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use amos_int::error::{InterpretationError, Result};
 use amos_int::language::Language;
 use amos_int::pipeline::TtsAudio;
 use async_trait::async_trait;
-use piper_rs::{Piper, PiperConfig};
+use piper_rs::Piper;
 
 use crate::provider::TtsProvider;
 
 /// A [`TtsProvider`] backed by a local Piper model.
 pub struct PiperProvider {
-    piper: Piper,
-    sample_rate: u32,
+    piper: Arc<Mutex<Piper>>,
 }
 
 impl PiperProvider {
     /// Load a Piper model from `model` (`.onnx`) and its `voice` config (`.json`).
-    pub fn new(model: std::path::PathBuf, voice: std::path::PathBuf) -> anyhow::Result<Self> {
-        let config = PiperConfig {
-            model,
-            voice: Some(voice),
-            ..Default::default()
-        };
-        let piper = Piper::new(config)?;
-        let sample_rate = piper.sample_rate();
+    pub fn new(model: PathBuf, voice: PathBuf) -> anyhow::Result<Self> {
+        let piper = Piper::new(&model, &voice)?;
         Ok(Self {
-            piper,
-            sample_rate: sample_rate as u32,
+            piper: Arc::new(Mutex::new(piper)),
         })
     }
 }
@@ -51,20 +48,20 @@ impl TtsProvider for PiperProvider {
 
     async fn synthesize(&self, text: &str, _lang: &Language) -> Result<TtsAudio> {
         let text = text.to_string();
-        let sr = self.sample_rate;
-        let piper = &self.piper;
-        let samples: Vec<i16> = tokio::task::spawn_blocking(move || {
-            piper
-                .synthesize(&text)
+        let piper = Arc::clone(&self.piper);
+        let (samples, sample_rate) = tokio::task::spawn_blocking(move || {
+            let mut guard = piper.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .create(&text, false, None, None, None, None)
                 .map_err(|e| InterpretationError::Other(e.to_string()))
         })
         .await
         .map_err(|e| InterpretationError::Other(format!("piper task join: {e}")))??;
 
         Ok(TtsAudio {
-            sample_rate: sr,
+            sample_rate,
             channels: 1,
-            samples: samples.into_iter().map(|s| s as f32 / 32767.0).collect(),
+            samples,
         })
     }
 }
