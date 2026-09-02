@@ -254,3 +254,47 @@ async fn tts_request_emitted_over_daemon_when_enabled() {
     daemon.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+/// Aerospace resilience on `GrpcPipeline.translate`: it builds its channel on
+/// demand, so a daemon that is initially down must produce a clean `Err` and the
+/// SAME `GrpcPipeline` must then recover without re-creation once the daemon
+/// comes up on the socket (no poisoned/permanent-failure state).
+#[tokio::test(flavor = "multi_thread")]
+async fn translate_recovers_when_daemon_comes_up() {
+    use amos_int::language::Language;
+    use amos_int::pipeline::{Pipeline, SourceText};
+    use amos_int::segment::Speaker;
+
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-int-grpc-outage-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let lang = Language::new("en");
+    let sp = Speaker::default();
+    let mk = |text: &'static str| SourceText {
+        text,
+        lang: &lang,
+        speaker: &sp,
+    };
+
+    // Daemon is NOT up yet.
+    let pipe = GrpcPipeline::new(&path, Language::new("en"), Language::new("zh"));
+    assert!(
+        pipe.translate(mk("hello")).await.is_err(),
+        "unreachable daemon must surface a clean Err (no hang/panic)"
+    );
+
+    // Daemon comes up on the same socket later.
+    let daemon = spawn_daemon(&path).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let t = pipe
+        .translate(mk("world"))
+        .await
+        .expect("same GrpcPipeline recovers once the daemon is up");
+    assert_eq!(t.target_text, "[译](en->zh)world");
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
