@@ -18,7 +18,14 @@ bash scripts/fetch-models.sh
 运行真实流式识别（feature `sherpa`）：
 
 ```bash
+# 直接流式识别一个 WAV（打印流式 partial → FINAL）
 cargo run -p amos-asr --example sherpa_asr --features sherpa -- \
+    models/sherpa-en-20m/test_wavs/0.wav
+
+# 把真实 sherpa ASR 喂进 amos Session（System UI 的接线模式）
+# sherpa_pipeline(cfg, translate) 组合 本地流式 ASR + 翻译委托；
+# EndOfSpeech 会 flush 识别器 → 产出已翻译的 SegmentFinal。
+cargo run -p amos-asr --example sherpa_session --features sherpa -- \
     models/sherpa-en-20m/test_wavs/0.wav
 ```
 
@@ -77,4 +84,5 @@ cargo run -p amos-asr --example sherpa_asr --features sherpa -- /tmp/piper_out.w
 ## CI
 
 `sherpa`/`piper` 为 feature 门控后端，`make gated-check`（CI `gated-native-backends` job）
-编译 lib + 两个示例（`sherpa_asr` / `piper_tts`）；真实推理需要模型文件，不在 CI 覆盖范围。
+编译 lib + 示例（`sherpa_asr` / `sherpa_session` / `piper_tts`）；真实推理需要模型文件，
+不在 CI 覆盖范围。示例均标注 `required-features`，默认构建不受影响。
