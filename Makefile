@@ -25,6 +25,7 @@ gated-check:
 	cargo build -p amos-asr --features sherpa
 	cargo build -p amos-asr --features sherpa --example sherpa_asr
 	cargo build -p amos-tts --features piper
+	cargo build -p amos-tts --features piper --example piper_tts
 
 # Production gate: formatting + clippy must be clean.
 lint:

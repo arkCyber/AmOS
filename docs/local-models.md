@@ -53,7 +53,28 @@ FINAL: THE YELLOW LAMPS WOULD LIGHT UP HERE AND THERE THE SQUALID QUARTER
 下载 Piper 英文音色 + 用 TTS 合成一句话存 WAV，再喂给上面的 sherpa ASR ——
 在无麦克风的机器上即可闭环验证「文本 → 语音 → 文本」。
 
+已实测（macOS，本地无外网时用 `env -u ALL_PROXY -u all_proxy` 走 HTTP 代理）：
+
+```bash
+# ① Piper 真实合成（需 espeak-ng；low 音色 ~63MB）
+brew install espeak-ng
+bash scripts/fetch-models.sh   # 或手动下载 en_US-lessac-low.{onnx,onnx.json} 到 models/piper-low/
+cargo run -p amos-tts --example piper_tts --features piper -- \
+    'This is a real test.' models/piper-low/en_US-lessac-low.onnx \
+    models/piper-low/en_US-lessac-low.onnx.json /tmp/piper_out.wav
+# → synthesized 43520 samples @ 16000Hz -> /tmp/piper_out.wav (2.7s)
+
+# ② sherpa 识别合成音频（文本→语音→文本）
+cargo run -p amos-asr --example sherpa_asr --features sherpa -- /tmp/piper_out.wav
+# （harness 按 400ms 块喂入 + 单次 finalize，首尾略有截断；识别为真实推理）
+```
+
+> 诊断备忘：
+> - Piper/`say` 生成的音频均为 16k 单声道 16-bit，sherpa 可直接消费。
+> - sherpa streaming 逐块喂入需 ≥ 少量缓冲才出字；结尾建议补一段尾静音让解码器 flush。
+> - 并行/后台下载大文件可能截断（onnxruntime 加载报 `cannot catch foreign exceptions`），务必串行 + 校验大小。
+
 ## CI
 
 `sherpa`/`piper` 为 feature 门控后端，`make gated-check`（CI `gated-native-backends` job）
-只做编译；真实推理需要模型文件，不在 CI 覆盖范围。
+编译 lib + 两个示例（`sherpa_asr` / `piper_tts`）；真实推理需要模型文件，不在 CI 覆盖范围。
