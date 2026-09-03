@@ -155,7 +155,10 @@ impl AndroidRuntime for DemoRuntime {
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .any(|a| a.package_name == package_name);
-        known.then(|| crate::png::icon_png(package_name, 64))
+        known
+            .then(|| crate::png::icon_png(package_name, 64))
+            // Encode failures become a missing icon (None), never a panic.
+            .and_then(|res| res.ok())
     }
 }
 

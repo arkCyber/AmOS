@@ -40,7 +40,7 @@ function evalExpr(s: string): number {
     const j = i;
     let dot = false;
     while (i < n) {
-      const c = expr[i];
+      const c = expr.charAt(i); // charAt never returns undefined (empty string past end)
       if (c >= "0" && c <= "9") i++;
       else if (c === "." && !dot) {
         dot = true;
@@ -171,4 +171,61 @@ export function calcDisplay(st: CalcState): string {
 /** Run a whole sequence of presses, returning the display text. */
 export function calcRun(presses: string[]): string {
   return presses.reduce((s, k) => calcPress(s, k), calcInit()).cur;
+}
+
+export interface CalcEntry {
+  expr: string; // e.g. "9 − 3"
+  result: string; // e.g. "6" (plain ASCII result, ERR if not solvable)
+}
+
+/**
+ * Build the history row a completed "=" would produce from the state *before*
+ * "=" is pressed. Returns null when there is no pending binary operation
+ * (acc empty) or the expression is not solvable.
+ */
+export function calcEntry(st: CalcState): CalcEntry | null {
+  if (!st.acc) return null;
+  const expr = `${st.acc}${st.cur}`.replace(/\s+$/g, "");
+  try {
+    return { expr, result: fmt(evalNum(expr)) };
+  } catch {
+    return null; // division by zero etc. — nothing meaningful to record
+  }
+}
+
+/**
+ * Add an entry to the history (newest first, dedup by expr+result) while capping
+ * the list length. Pure — returns a fresh array.
+ */
+export function addHistory(
+  history: readonly CalcEntry[],
+  entry: CalcEntry,
+  cap = 12,
+): CalcEntry[] {
+  const rest = history.filter((h) => h.expr !== entry.expr || h.result !== entry.result);
+  const next = [entry, ...rest];
+  return cap > 0 ? next.slice(0, cap) : next;
+}
+
+/**
+ * Map a physical-keyboard event to the on-screen label the calculator
+ * understands (the reducer speaks iOS symbols: ＋−×÷). Returns null when the
+ * key isn't a calculator input, so callers can skip preventDefault.
+ * `modifiers` is truthy when ctrl/meta/alt is held → always ignored.
+ */
+export function calcFromKey(
+  key: string,
+  modifiers?: boolean,
+): string | null {
+  if (modifiers) return null;
+  if (/^[0-9.]$/.test(key)) return key;
+  if (key === "Enter" || key === "=") return "=";
+  if (key === "Backspace") return "⌫";
+  if (key === "Delete" || key === "Escape" || key === "c" || key === "C") return "C";
+  if (key === "%") return "%";
+  if (key === "+") return "+";
+  if (key === "-") return "−"; // display glyph the reducer also normalizes
+  if (key === "*") return "×";
+  if (key === "/") return "÷";
+  return null;
 }

@@ -52,9 +52,14 @@ pub fn parse_openai_content(body: &str) -> Result<String> {
 }
 
 /// Local Ollama provider (OpenAI-compatible `/v1/chat/completions`, non-stream).
+///
+/// Supports an optional bearer token so it can talk to authenticated
+/// OpenAI-compatible gateways (many local setups front Ollama with one). Real
+/// Ollama without auth works with no key.
 pub struct OllamaProvider {
     host: String,
     model: String,
+    api_key: Option<String>,
 }
 
 impl OllamaProvider {
@@ -63,7 +68,17 @@ impl OllamaProvider {
         Self {
             host: host.into().trim_end_matches('/').to_string(),
             model: model.into(),
+            api_key: None,
         }
+    }
+
+    /// Attach a bearer token for authenticated OpenAI-compatible endpoints.
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        if !key.is_empty() {
+            self.api_key = Some(key);
+        }
+        self
     }
 }
 
@@ -72,6 +87,7 @@ impl TranslationProvider for OllamaProvider {
     async fn translate(&self, text: &str, source: &str, target: &str) -> Result<String> {
         let host = self.host.clone();
         let model = self.model.clone();
+        let api_key = self.api_key.clone();
         let prompt = build_prompt(text, source, target);
 
         let body = serde_json::json!({
@@ -84,10 +100,13 @@ impl TranslationProvider for OllamaProvider {
         });
 
         let resp = tokio::task::spawn_blocking(move || {
-            ureq::post(&format!("{host}/v1/chat/completions"))
+            let mut req = ureq::post(&format!("{host}/v1/chat/completions"))
                 .timeout(Duration::from_secs(60))
-                .set("Content-Type", "application/json")
-                .send_string(&body.to_string())
+                .set("Content-Type", "application/json");
+            if let Some(key) = &api_key {
+                req = req.set("Authorization", &format!("Bearer {key}"));
+            }
+            req.send_string(&body.to_string())
                 .map_err(|e| e.to_string())?
                 .into_string()
                 .map_err(|e| e.to_string())
@@ -160,5 +179,13 @@ mod tests {
         let p = MockProvider::default();
         let out = p.translate("hi", "en", "zh").await.unwrap();
         assert_eq!(out, "[译](en->zh)hi");
+    }
+
+    #[test]
+    fn ollama_with_api_key_retains_token_or_ignores_empty() {
+        let keyed = OllamaProvider::new("http://h", "m").with_api_key("sekret");
+        assert_eq!(keyed.api_key.as_deref(), Some("sekret"));
+        let empty = OllamaProvider::new("http://h", "m").with_api_key("");
+        assert_eq!(empty.api_key, None);
     }
 }

@@ -17,13 +17,36 @@ export function bridged(): boolean {
   return bridge() !== null;
 }
 
+/**
+ * Last bridge outcome, structured so the root cause of a `null` return is never
+ * lost. Callers keep the simple `T | null` contract; when debugging you can read
+ * *why* a call failed instead of guessing between "not bridged" and "command
+ * rejected". Reset to `{ ok: true }` on every successful command.
+ */
+export type BridgeDiag =
+  | { ok: true }
+  | { ok: false; kind: "not-bridged"; command: string }
+  | { ok: false; kind: "command-failed"; command: string; detail?: unknown };
+
+let lastDiag: BridgeDiag = { ok: true };
+
+export function bridgeDiag(): BridgeDiag {
+  return lastDiag;
+}
+
 /** Call a Tauri command; returns null when not running inside Tauri. */
 export async function invoke<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T | null> {
   const b = bridge();
-  if (!b) return null;
+  if (!b) {
+    lastDiag = { ok: false, kind: "not-bridged", command };
+    return null;
+  }
   try {
-    return (await b.invoke(command, args)) as T;
+    const result = (await b.invoke(command, args)) as T;
+    lastDiag = { ok: true };
+    return result;
   } catch (err) {
+    lastDiag = { ok: false, kind: "command-failed", command, detail: err };
     console.warn(`[backend] ${command} failed`, err);
     return null;
   }
@@ -54,6 +77,58 @@ export async function getAiStatus(): Promise<AiStatus> {
   return invoke<AiStatus>("get_status");
 }
 
+/** One tracked daemon session (mirrors the daemon `SessionInfo`). */
+export interface AiSessionInfo {
+  session_id: string;
+  model: string;
+  tokens_generated: number;
+  cancelled: boolean;
+  age_seconds: number;
+}
+
+/** List the daemon's tracked sessions (most recently active first). */
+export async function listSessions(): Promise<AiSessionInfo[] | null> {
+  return invoke<AiSessionInfo[]>("get_ai_sessions");
+}
+
+/** Clear all tracked daemon sessions; returns how many were removed. */
+export async function clearSessions(): Promise<number | null> {
+  return invoke<number>("clear_ai_sessions");
+}
+
+/** Remove a single daemon session by id; true when it was found+removed. */
+export async function removeSession(sessionId: string): Promise<boolean | null> {
+  return invoke<boolean>("remove_ai_session", { sessionId });
+}
+
+/** One completed conversation turn on a daemon session. */
+export interface HistoryTurn {
+  role: string;
+  text: string;
+}
+/** A session's completed conversation history. */
+export interface SessionHistory {
+  session_id: string;
+  model: string;
+  tokens_generated: number;
+  cancelled: boolean;
+  turns: HistoryTurn[];
+}
+
+/** Fetch one session's completed conversation history. */
+export async function getSessionHistory(sessionId: string): Promise<SessionHistory | null> {
+  return invoke<SessionHistory>("get_ai_session_history", { sessionId });
+}
+
+/** One-click backend switch (local mock | DeepSeek cloud). Returns the daemon
+ * launch report. No-op (null) when not running inside Tauri. */
+export async function switchAiBackend(
+  provider: "local" | "deepseek",
+  apiKey = "",
+): Promise<string | null> {
+  return invoke<string>("ai_backend_switch", { provider, apiKey });
+}
+
 /** Stable conversation id persisted for multi-turn memory. */
 export function conversationId(): string {
   const KEY = "amos.ai.session";
@@ -62,6 +137,12 @@ export function conversationId(): string {
   const id = `conv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   writeStored(KEY, id);
   return id;
+}
+
+/** Rotate to a brand-new conversation (clears the persisted multi-turn id so the
+ * next `conversationId()` call generates a fresh one). */
+export function newConversation(): void {
+  writeStored("amos.ai.session", "");
 }
 
 function readStored(key: string, fb: string): string {
@@ -193,3 +274,204 @@ export async function translateText(
     targetLang: opts.targetLang ?? "",
   });
 }
+
+/* ---- Mail (amos-mail bridge: mail_mailboxes / mail_list / mail_inbox /
+ *       mail_read / mail_send). Shapes mirror the Rust amos_mail models. ---- */
+export type MailAddr = { name: string; email: string };
+export type MailFlags = { seen: boolean; flagged: boolean; answered: boolean };
+export interface MailSummary {
+  id: string;
+  mailbox: string;
+  from: MailAddr | null;
+  to: MailAddr[];
+  subject: string;
+  date: number; // unix epoch seconds
+  flags: MailFlags;
+  attachment_count: number;
+}
+export type MailAttachment = { id: string; filename: string; mime: string; size: number };
+export interface MailMessage {
+  summary: MailSummary;
+  body_plain: string;
+  body_html: string | null;
+  attachments: MailAttachment[];
+}
+export type MailReceipt = { id: string; date: number };
+
+/** List selectable mailbox names. */
+export async function mailMailboxes(): Promise<string[] | null> {
+  return invoke<string[]>("mail_mailboxes");
+}
+
+/** Summaries in a mailbox, newest first. */
+export async function mailList(
+  mailbox: string,
+  limit?: number | null,
+): Promise<MailSummary[] | null> {
+  return invoke<MailSummary[]>("mail_list", { mailbox, limit: limit ?? null });
+}
+
+/** Search summaries in a mailbox (sender/recipient/subject/body), newest first. */
+export async function mailSearch(mailbox: string, query: string): Promise<MailSummary[] | null> {
+  return invoke<MailSummary[]>("mail_search", { mailbox, query });
+}
+
+/** The INBOX summaries (the mail app's default view). */
+export async function mailInbox(limit?: number | null): Promise<MailSummary[] | null> {
+  return invoke<MailSummary[]>("mail_inbox", { limit: limit ?? null });
+}
+
+/** Fetch a message and mark it read. */
+export async function mailRead(mailbox: string, id: string): Promise<MailMessage | null> {
+  return invoke<MailMessage>("mail_read", { mailbox, id });
+}
+
+/** Send a message (sender is the account). */
+export async function mailSend(o: {
+  to: string[];
+  subject: string;
+  body: string;
+  cc?: string[];
+}): Promise<MailReceipt | null> {
+  const cc = o.cc && o.cc.length > 0 ? o.cc : null;
+  return invoke<MailReceipt>("mail_send", {
+    to: o.to,
+    subject: o.subject,
+    body: o.body,
+    cc,
+  });
+}
+
+/** Star / unstar a message. Resolves (null) on success, else the command throws. */
+export async function mailSetFlagged(
+  mailbox: string,
+  id: string,
+  flagged: boolean,
+): Promise<null> {
+  return invoke<null>("mail_set_flagged", { mailbox, id, flagged });
+}
+
+/** Mark a message read / unread. */
+export async function mailSetSeen(mailbox: string, id: string, seen: boolean): Promise<null> {
+  return invoke<null>("mail_set_seen", { mailbox, id, seen });
+}
+
+/** Delete a message from a mailbox. Resolves (null) on success. */
+export async function mailDelete(mailbox: string, id: string): Promise<null> {
+  return invoke<null>("mail_delete", { mailbox, id });
+}
+
+/** Move a message into another mailbox (archive / trash). */
+export async function mailMove(
+  mailbox: string,
+  id: string,
+  target: string,
+): Promise<null> {
+  return invoke<null>("mail_move", { mailbox, id, target });
+}
+
+/* ---- App Store (amos-appstore bridge: appstore_catalog / appstore_search /
+ *       appstore_find / appstore_installed / appstore_updatable /
+ *       appstore_status / appstore_install / appstore_upgrade /
+ *       appstore_uninstall). Shapes mirror the Rust amos_appstore models. ---- */
+export type AppVersion = { major: number; minor: number; patch: number; pre: string | null };
+export type AppCategory =
+  | "other" | "tools" | "media" | "communication"
+  | "games" | "productivity" | "education" | "system";
+export type PackageFormat = "tar_gz" | "zip";
+export type AppChecksum = { algorithm: "sha256"; value: string };
+export interface PackageRef {
+  format: PackageFormat;
+  url: string;
+  sha256: AppChecksum | null;
+  size_bytes: number | null;
+}
+export interface AppManifest {
+  id: string;
+  name: string;
+  summary: string;
+  description?: string;
+  author: string;
+  version: AppVersion;
+  category: AppCategory;
+  homepage?: string;
+  icon_url?: string;
+  package: PackageRef;
+  /** Optional Ed25519 developer signature (present only for signed apps). */
+  publisher?: { public_key: string; signature: string } | null;
+}
+export interface InstalledApp {
+  manifest: AppManifest;
+  installed_at: number; // unix epoch seconds
+}
+/** Mirrors the Rust AppStatus serde shape: a bare "Available" string, or an
+ *  externally-tagged { installed } / { updatable } object. */
+export type AppStatus =
+  | "Available"
+  | { installed: { version: string } }
+  | { updatable: { installed: string; latest: string } };
+
+/** The full store catalog (browse view), sorted by id. */
+export async function storeCatalog(): Promise<AppManifest[] | null> {
+  return invoke<AppManifest[]>("appstore_catalog");
+}
+
+/** Search the catalog (id/name/summary/author/category, case-insensitive). */
+export async function storeSearch(query: string): Promise<AppManifest[] | null> {
+  return invoke<AppManifest[]>("appstore_search", { query });
+}
+
+/** One catalog entry, if still published (null when not bridged / not found). */
+export async function storeFind(id: string): Promise<AppManifest | null> {
+  return invoke<AppManifest>("appstore_find", { id });
+}
+
+/** The apps currently installed. */
+export async function storeInstalled(): Promise<InstalledApp[] | null> {
+  return invoke<InstalledApp[]>("appstore_installed");
+}
+
+/** Ids of installed apps that have a newer release in the catalog. */
+export async function storeUpdatable(): Promise<string[] | null> {
+  return invoke<string[]>("appstore_updatable");
+}
+
+/** Lifecycle state of one app (Available / Installed / Updatable). */
+export async function storeStatus(id: string): Promise<AppStatus | null> {
+  return invoke<AppStatus>("appstore_status", { id });
+}
+
+/** Download → verify → install the catalog's release of `id`. */
+export async function storeInstall(id: string): Promise<InstalledApp | null> {
+  return invoke<InstalledApp>("appstore_install", { id });
+}
+
+/** Upgrade `id` to the catalog's newest release. */
+export async function storeUpgrade(id: string): Promise<InstalledApp | null> {
+  return invoke<InstalledApp>("appstore_upgrade", { id });
+}
+
+/** Uninstall `id`. Resolves (null) on success. */
+export async function storeUninstall(id: string): Promise<null> {
+  return invoke<null>("appstore_uninstall", { id });
+}
+
+/** Snapshot of the durable Rust system store (boot hydration into localStorage). */
+export async function systemStoreSnapshot(): Promise<Record<string, string> | null> {
+  return invoke<Record<string, string>>("store_snapshot");
+}
+
+/** One file of an installed web-bundle, served as base64 + MIME for the UI to render. */
+export interface BundleResource {
+  mime: string;
+  nosniff: boolean;
+  base64: string;
+}
+export async function storeBundleResource(
+  id: string,
+  path: string,
+): Promise<BundleResource | null> {
+  return invoke<BundleResource>("appstore_bundle_resource", { id, path });
+}
+
+

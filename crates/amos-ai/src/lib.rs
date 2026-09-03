@@ -4,6 +4,12 @@
 //! both the CLI binary (`main.rs`) and integration tests / the mobile embedder
 //! can reuse the same logic.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod cli;
 pub mod config;
 pub mod inference;

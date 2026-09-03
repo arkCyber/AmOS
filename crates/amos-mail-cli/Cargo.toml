@@ -1,0 +1,27 @@
+[package]
+name = "amos-mail-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos email CLI: drives an amos_mail::MailClient (default offline MockMailProvider) to list/read/send/delete mail from the terminal. A future live backend (IMAP+SMTP) will slot in behind the same MailProvider seam with no CLI changes."
+
+[lib]
+name = "amos_mail_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amos-mail-cli"
+path = "src/main.rs"
+
+[dependencies]
+amos-mail = { path = "../amos-mail" }
+tokio.workspace = true
+anyhow.workspace = true
+
+# Forward the live (real SMTP) capability: amos-mail is then compiled with
+# `live` so `send --smtp host:port` transmits over real SMTP instead of the mock.
+[features]
+default = []
+live = ["amos-mail/live"]
+

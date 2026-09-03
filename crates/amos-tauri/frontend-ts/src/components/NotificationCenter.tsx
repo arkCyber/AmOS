@@ -7,6 +7,8 @@ import {
   NOTIF_KEY,
   SETTINGS_KEY,
   flipQuick,
+  normalizeNotifs,
+  normalizeQuick,
   removeNotif,
   seedNotifs,
   type Notif,
@@ -27,9 +29,11 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
   const { t } = useI18n();
   // The "dark mode" quick tile drives the real theme (not just a cosmetic bit).
   const { dark, toggle: themeToggle } = useTheme();
-  const [settings, setSettings] = useState<QuickSettings>(() => readStoreValue<QuickSettings>(SETTINGS_KEY, {}));
+  const [settings, setSettings] = useState<QuickSettings>(() =>
+    normalizeQuick(readStoreValue<unknown>(SETTINGS_KEY, {})),
+  );
   const [notifs, setNotifs] = useState<Notif[]>(() => {
-    const l = readStoreValue<Notif[]>(NOTIF_KEY, []);
+    const l = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
     if (l.length) return l;
     const s = seedNotifs(Date.now());
     writeStoreValue(NOTIF_KEY, s);
@@ -69,49 +73,66 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
       role="dialog"
       aria-modal="true"
       aria-label={t("nc.title")}
-      className="fixed inset-0 z-40 flex flex-col bg-neutral-100/95 p-4 dark:bg-neutral-950/95"
+      className="drop-in absolute inset-0 z-40 flex flex-col bg-white/45 p-4 backdrop-blur-2xl backdrop-saturate-150 dark:bg-neutral-950/60"
     >
-      <div className="flex items-center justify-between">
-        <h2 className="font-semibold">{t("nc.title")}</h2>
-        <button onClick={onClose} className="rounded-full bg-neutral-300 px-3 py-1 text-sm dark:bg-neutral-700">
+      <div className="flex items-center justify-between px-1">
+        <h2 className="text-xl font-semibold tracking-tight">{t("nc.title")}</h2>
+        <button
+          onClick={onClose}
+          className="rounded-full bg-neutral-200/80 px-4 py-1.5 text-sm font-medium text-accent transition active:scale-95 dark:bg-white/10"
+        >
           {t("common.done")}
         </button>
       </div>
-      <div className="mt-3 grid grid-cols-3 gap-2">
+
+      {/* Quick settings — iOS Control-Center style translucent tiles */}
+      <div className="mt-4 grid grid-cols-3 gap-2.5">
         {QUICK.map((q) => {
           const on = q.key === "darkmode" ? dark : !!settings[q.key];
           return (
             <button
               key={q.key}
               onClick={() => toggle(q.key)}
+              aria-pressed={on}
               className={
-                "flex flex-col items-center gap-1 rounded-2xl py-3 text-xs " +
-                (on ? "bg-accent text-white" : "bg-neutral-200/80 dark:bg-neutral-800/80")
+                "flex flex-col items-center justify-center gap-1.5 rounded-3xl py-4 text-[11px] font-medium backdrop-blur transition active:scale-95 " +
+                (on
+                  ? "bg-accent text-white shadow-[0_6px_16px_rgba(10,132,255,0.35)]"
+                  : "bg-white/55 text-neutral-800 ring-1 ring-white/50 shadow-sm dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10")
               }
             >
-              <span className="text-lg">{q.icon}</span>
+              <span className="text-xl leading-none">{q.icon}</span>
               {t(q.label)}
             </button>
           );
         })}
       </div>
-      <div className="mt-3 flex items-center justify-between">
-        <span className="text-xs opacity-60">{notifs.length} ·</span>
-        <button onClick={clear} className="text-xs text-accent hover:underline">
+
+      <div className="mt-3 flex items-center justify-between px-1">
+        <span className="text-xs font-semibold uppercase tracking-widest opacity-50">{notifs.length} ·</span>
+        <button onClick={clear} className="text-xs font-medium text-accent hover:underline">
           {t("nc.clear")}
         </button>
       </div>
-      <div className="mt-1 flex-1 space-y-2 overflow-auto">
+
+      <div className="mt-2 flex-1 space-y-2.5 overflow-auto pr-0.5">
         {notifs.length === 0 ? (
-          <p className="py-10 text-center text-sm opacity-60">{t("nc.empty")}</p>
+          <p className="py-12 text-center text-sm opacity-50">{t("nc.empty")}</p>
         ) : (
           notifs.map((n) => (
-            <div key={n.id} className="rounded-2xl bg-neutral-200/60 p-3 dark:bg-neutral-800/60">
+            <div
+              key={n.id}
+              className="rounded-3xl bg-white/60 p-3.5 shadow-sm ring-1 ring-black/5 dark:bg-white/10 dark:ring-white/10"
+            >
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold">
                   {n.icon} {n.app ?? n.title}
                 </span>
-                <button onClick={() => dismiss(n.id)} aria-label="dismiss" className="opacity-60 hover:opacity-100">
+                <button
+                  onClick={() => dismiss(n.id)}
+                  aria-label="dismiss"
+                  className="grid h-6 w-6 place-items-center rounded-full opacity-60 transition hover:opacity-100"
+                >
                   ✕
                 </button>
               </div>

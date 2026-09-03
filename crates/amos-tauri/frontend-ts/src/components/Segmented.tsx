@@ -15,7 +15,7 @@ export default function Segmented<T extends string>({ value, options, onChange, 
     <div
       role="radiogroup"
       aria-label={ariaLabel}
-      className="inline-flex rounded-lg bg-neutral-200 p-0.5 dark:bg-neutral-800"
+      className="inline-flex rounded-[9px] bg-neutral-200/70 p-[3px] ring-1 ring-black/5 dark:bg-white/10 dark:ring-white/10"
     >
       {options.map((o) => {
         const active = o.value === value;
@@ -26,10 +26,10 @@ export default function Segmented<T extends string>({ value, options, onChange, 
             aria-checked={active}
             onClick={() => onChange(o.value)}
             className={
-              "rounded-md px-3 py-1 text-sm transition " +
+              "rounded-md px-3.5 py-1.5 text-sm leading-none transition " +
               (active
-                ? "bg-white text-neutral-900 shadow dark:bg-neutral-950 dark:text-white"
-                : "text-neutral-600 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white")
+                ? "bg-white text-neutral-900 shadow-sm dark:bg-neutral-900 dark:text-white dark:shadow-black/40"
+                : "text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white")
             }
           >
             {o.label}

@@ -16,7 +16,7 @@ export function downsample(samples: Float32Array, fromRate: number, toRate: numb
   const step = fromRate / toRate;
   for (let i = 0; i < out.length; i++) {
     const idx = Math.min(samples.length - 1, Math.floor(i * step));
-    out[i] = samples[idx];
+    out[i] = samples[idx] ?? 0; // idx is in bounds; ??0 guards the impossible case
   }
   return out;
 }
@@ -26,7 +26,7 @@ export function downsample(samples: Float32Array, fromRate: number, toRate: numb
 export function encodePcm16(samples: Float32Array): number[] {
   const bytes = new Array<number>(samples.length * 2);
   for (let i = 0; i < samples.length; i++) {
-    const x = samples[i];
+    const x = samples[i] ?? 0; // never NaN/Inf garbage; see encodePcm16 doc
     const s = Number.isFinite(x) ? Math.max(-1, Math.min(1, x)) : 0;
     const int = (s < 0 ? s * 0x8000 : s * 0x7fff) & 0xffff;
     bytes[i * 2] = int & 0xff;

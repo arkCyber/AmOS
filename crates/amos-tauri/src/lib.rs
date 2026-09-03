@@ -4,9 +4,18 @@
 //! WebView never talks to the daemon directly: every request flows through
 //! `ai_bridge` over the local Unix Domain Socket.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+// Two documented invariant/boot sites are individually #[allow]ed.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod ai_bridge;
+pub mod appstore;
 pub mod buttons;
 pub mod interpret;
+pub mod mail;
 pub mod store;
 pub mod translate;
 pub mod tts;
@@ -18,6 +27,10 @@ use tauri::Manager;
 use wm::{SystemContext, WmState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// Boot boundary: if the GUI event loop cannot start, exiting the process is the
+// intended loud failure (nothing sensible can run without it). This is the
+// single allowed expect in production — everything else is gated (P0-1).
+#[allow(clippy::expect_used)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AiBridge::new())
@@ -27,11 +40,18 @@ pub fn run() {
         .manage(buttons::HardwareButtons::new())
         .manage(interpret::InterpretationBridge::new())
         .manage(tts::TtsBridge::new())
+        .manage(mail::MailBridge::new())
+        .manage(appstore::StoreBridge::new())
         .invoke_handler(tauri::generate_handler![
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
             ai_bridge::cancel_ai_session,
             ai_bridge::get_status,
+            ai_bridge::get_ai_sessions,
+            ai_bridge::clear_ai_sessions,
+            ai_bridge::remove_ai_session,
+            ai_bridge::get_ai_session_history,
+            ai_bridge::ai_backend_switch,
             ai_bridge::get_android_apps,
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,
@@ -61,7 +81,27 @@ pub fn run() {
             interpret::interpret_restart,
             interpret::interpret_abort,
             interpret::interpret_status,
-            tts::tts_synthesize
+            tts::tts_synthesize,
+            mail::mail_mailboxes,
+            mail::mail_list,
+            mail::mail_search,
+            mail::mail_inbox,
+            mail::mail_read,
+            mail::mail_send,
+            mail::mail_set_flagged,
+            mail::mail_set_seen,
+            mail::mail_delete,
+            mail::mail_move,
+            appstore::appstore_catalog,
+            appstore::appstore_search,
+            appstore::appstore_find,
+            appstore::appstore_installed,
+            appstore::appstore_updatable,
+            appstore::appstore_status,
+            appstore::appstore_install,
+            appstore::appstore_upgrade,
+            appstore::appstore_uninstall,
+            appstore::appstore_bundle_resource
         ])
         .setup(|app| {
             // System-wide readiness probe: log the daemon status once on boot.

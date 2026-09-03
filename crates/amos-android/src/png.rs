@@ -41,7 +41,9 @@ fn chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
 }
 
 /// Encode a deterministic solid-color RGBA PNG of `size`×`size`.
-pub fn icon_png(seed: &str, size: u32) -> Vec<u8> {
+/// Returns an error (instead of panicking) if the in-memory zlib pass fails —
+/// callers turn that into a missing icon rather than a crash.
+pub fn icon_png(seed: &str, size: u32) -> Result<Vec<u8>, String> {
     // FNV-1a hash of the seed -> RGB color.
     let mut h: u32 = 0x811C_9DC5;
     for b in seed.bytes() {
@@ -58,8 +60,9 @@ pub fn icon_png(seed: &str, size: u32) -> Vec<u8> {
         raw.extend_from_slice(&pixel.repeat(n));
     }
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(&raw).expect("zlib encode");
-    let idat = enc.finish().expect("zlib finish");
+    enc.write_all(&raw)
+        .map_err(|e| format!("zlib encode: {e}"))?;
+    let idat = enc.finish().map_err(|e| format!("zlib finish: {e}"))?;
 
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&size.to_be_bytes());
@@ -71,7 +74,7 @@ pub fn icon_png(seed: &str, size: u32) -> Vec<u8> {
     out.extend_from_slice(&chunk(b"IHDR", &ihdr));
     out.extend_from_slice(&chunk(b"IDAT", &idat));
     out.extend_from_slice(&chunk(b"IEND", &[]));
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -82,7 +85,7 @@ mod tests {
 
     #[test]
     fn produces_valid_png_with_signature_and_chunks() {
-        let png = icon_png("com.tencent.mm", 64);
+        let png = icon_png("com.tencent.mm", 64).expect("icon_png encodes");
         assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
         // Has IHDR, IDAT, IEND markers.
         let s = String::from_utf8_lossy(&png);
@@ -92,7 +95,7 @@ mod tests {
     #[test]
     fn idat_inflates_to_expected_size() {
         let size = 32u32;
-        let png = icon_png("com.taobao.taobao", size);
+        let png = icon_png("com.taobao.taobao", size).expect("icon_png encodes");
         // Find IDAT data and decompress it.
         let idat_start = png
             .windows(4)
@@ -113,8 +116,8 @@ mod tests {
 
     #[test]
     fn different_seeds_give_different_colors() {
-        let a = icon_png("com.a", 8);
-        let b = icon_png("com.b", 8);
+        let a = icon_png("com.a", 8).expect("png a");
+        let b = icon_png("com.b", 8).expect("png b");
         // IDAT differs (different raw bytes).
         assert_ne!(a, b);
     }

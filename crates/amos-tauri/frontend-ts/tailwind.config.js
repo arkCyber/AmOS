@@ -7,8 +7,8 @@ export default {
   theme: {
     extend: {
       colors: {
-        accent: "#0a84ff",
-        danger: "#ff3b30",
+        accent: "rgb(var(--accent) / <alpha-value>)",
+        danger: "rgb(var(--danger) / <alpha-value>)",
       },
     },
   },

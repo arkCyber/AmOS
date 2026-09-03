@@ -38,6 +38,9 @@ jobs:
       - name: Test (Rust workspace + TS System-UI)
         run: make test
 
+      - name: Coverage gate (TS core lib, P2-1)
+        run: make cov
+
   # Headless end-to-end gates: start a mock daemon and drive the real chain
   # (text CLI smoke + audio->ASR->translate->TTS full chain). No Tauri needed.
   smoke:

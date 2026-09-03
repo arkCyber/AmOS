@@ -72,12 +72,13 @@ cd crates/amos-tauri && ./switch-frontend.sh legacy
 > Real chat/translation for **AI** and **同传(interpreter)** requires the TS shell
 > running inside Tauri **and** a local daemon (`AMOS_BACKEND=ggml/ollama … amos-ai`,
 > translate stack). Without it those two apps show a localized "daemon not
-> connected" fallback. Everything else (14 apps + lock/recents/spotlight, light/dark,
+> connected" fallback. Everything else (15 apps + lock/recents/spotlight, light/dark,
 > zh/en) works standalone via `bun run dev`.
 
 ## Status (as of last update)
 - Apps ported: clock, settings, calculator, weather, notes, photos, files,
-  messages, phone, music, maps, camera, ai, interpreter (14/14 slots).
+  messages, phone, music, maps, camera, ai, interpreter, mail (15 apps; mail is a
+  React UI over the `amos-mail` bridge with its own list/read/compose).
 - System: theme (light|dark|auto), i18n (zh/en), lock, Recents, Spotlight, Home/Dock,
   shared `amos.*` store bridge, SSR mount smoke.
 - Test/build: `bun test`, `bun run typecheck`, `bun run build`.

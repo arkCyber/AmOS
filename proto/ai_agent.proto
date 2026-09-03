@@ -20,6 +20,19 @@ service AiAgent {
 
   // Lightweight liveness / capability probe used by the System UI.
   rpc GetStatus(StatusRequest) returns (StatusReply);
+
+  // List the daemon's tracked agent sessions (id, model, usage) — lets the UI
+  // show / manage live conversations.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsReply);
+
+  // Remove all tracked sessions (session-management UI's "clear all").
+  rpc ClearSessions(ClearSessionsRequest) returns (ClearSessionsReply);
+
+  // Remove a single tracked session by id.
+  rpc RemoveSession(RemoveSessionRequest) returns (RemoveSessionReply);
+
+  // Fetch one session's completed conversation history.
+  rpc GetHistory(GetHistoryRequest) returns (GetHistoryReply);
 }
 
 message AgentRequest {
@@ -68,4 +81,50 @@ message StatusReply {
   int64 uptime_seconds = 3;              // daemon uptime
   uint32 gpu_util = 4;                   // rough GPU/NPU utilisation percent
   uint32 active_sessions = 5;            // number of live agent sessions
+}
+
+message ListSessionsRequest {}
+
+message SessionInfo {
+  string session_id = 1;
+  string model = 2;
+  uint64 tokens_generated = 3;           // tokens produced in this session
+  bool cancelled = 4;
+  uint64 age_seconds = 5;                // seconds since the session was created
+}
+
+message ListSessionsReply {
+  repeated SessionInfo sessions = 1;     // most-recently-active first
+  uint32 count = 2;                      // number of sessions returned
+}
+
+message ClearSessionsRequest {}
+
+message ClearSessionsReply {
+  uint32 removed = 1;                    // how many sessions were cleared
+}
+
+message RemoveSessionRequest {
+  string session_id = 1;
+}
+
+message RemoveSessionReply {
+  bool removed = 1;                      // true when the session existed and was removed
+}
+
+message GetHistoryRequest {
+  string session_id = 1;
+}
+
+message HistoryTurn {
+  string role = 1;                       // "user" | "assistant"
+  string text = 2;
+}
+
+message GetHistoryReply {
+  string session_id = 1;
+  string model = 2;
+  uint64 tokens_generated = 3;
+  bool cancelled = 4;
+  repeated HistoryTurn turns = 5;        // completed turns, oldest first
 }

@@ -3,11 +3,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use amos_proto::ai_agent::{
     ai_agent_server::{AiAgent, AiAgentServer},
-    AgentChunk, AgentRequest, ClientMessage, StatusReply, StatusRequest,
+    AgentChunk, AgentRequest, ClearSessionsReply, ClearSessionsRequest, ClientMessage,
+    GetHistoryReply, GetHistoryRequest, HistoryTurn, ListSessionsReply, ListSessionsRequest,
+    RemoveSessionReply, RemoveSessionRequest, SessionInfo, StatusReply, StatusRequest,
 };
 use amos_proto::{CLIENT_ID_HEADER, DEFAULT_CLIENT_ID};
 use anyhow::Context;
@@ -57,10 +59,21 @@ impl AiAgentService {
             .ok()
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from);
+        let session_timeout = std::env::var("AMOS_SESSION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s >= 1)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(300));
         let sessions = Arc::new(match &sessions_path {
             Some(p) => SessionManager::load(p),
-            None => SessionManager::default(),
+            None => SessionManager::new(session_timeout),
         });
+        // Long-lived sessions that go idle must not accumulate: run the periodic
+        // stale-session sweeper for the daemon's whole lifetime.
+        let _sweeper = sessions
+            .clone()
+            .spawn_cleanup_task(sessions.cleanup_interval());
         Self {
             model: "amos-infer@0.1.0",
             start: Instant::now(),
@@ -280,11 +293,13 @@ impl AiAgent for AiAgentService {
             };
 
             let mut token_count = 0usize;
+            let mut full = String::new();
             while let Some(token) = stream.next().await {
                 let token = match token {
                     Ok(t) => t,
                     Err(_) => break,
                 };
+                full.push_str(&token);
                 let chunk = AgentChunk {
                     session_id: session_id.clone(),
                     token,
@@ -325,6 +340,14 @@ impl AiAgent for AiAgentService {
                 .await;
             let _ = sessions
                 .update(&session_key, |s| s.add_tokens(token_count))
+                .await;
+            // Record the completed turn (user prompt + assistant reply) so a
+            // session's history can be read back via get_history.
+            let _ = sessions
+                .update(&session_key, |s| {
+                    s.append_turn("user".to_string(), prompt.clone());
+                    s.append_turn("assistant".to_string(), full.clone());
+                })
                 .await;
         });
 
@@ -451,11 +474,13 @@ impl AiAgent for AiAgentService {
                         };
                         let mut token_count = 0usize;
                         let mut cancelled = false;
+                        let mut full = String::new();
                         loop {
                             let next_fut = stream.next();
                             tokio::select! {
                                 r = next_fut => match r {
                                     Some(Ok(token)) => {
+                                        full.push_str(&token);
                                         if tx
                                             .send(Ok(AgentChunk {
                                                 session_id: String::new(),
@@ -514,6 +539,13 @@ impl AiAgent for AiAgentService {
                             .await;
                         let _ = sessions
                             .update(&session_key, |s| s.add_tokens(token_count))
+                            .await;
+                        // Bidi turn completed: record the prompt + reply for history.
+                        let _ = sessions
+                            .update(&session_key, |s| {
+                                s.append_turn("user".to_string(), p.clone());
+                                s.append_turn("assistant".to_string(), full.clone());
+                            })
                             .await;
                     }
                     Some(amos_proto::ai_agent::client_message::Payload::Audio(audio)) => {
@@ -586,6 +618,103 @@ impl AiAgent for AiAgentService {
             active_sessions: self.active_sessions.load(Ordering::SeqCst) as u32,
         }))
     }
+
+    /// Enumerate the daemon's tracked sessions, most-recently-active first.
+    async fn list_sessions(
+        &self,
+        request: Request<ListSessionsRequest>,
+    ) -> Result<Response<ListSessionsReply>, Status> {
+        let client_id = self.client_id(&request);
+        if let Err(e) = self.security.validate_request(&client_id).await {
+            return Err(Status::resource_exhausted(format!(
+                "request rejected by security layer: {e}"
+            )));
+        }
+        let mut sessions = self.sessions.list_active().await;
+        sessions.sort_by_key(|a| std::cmp::Reverse(a.last_activity));
+        let sessions = sessions
+            .into_iter()
+            .take(100)
+            .map(|s| SessionInfo {
+                session_id: s.id,
+                model: s.model,
+                tokens_generated: s.tokens_generated as u64,
+                cancelled: s.cancelled,
+                age_seconds: s.created_at.elapsed().as_secs(),
+            })
+            .collect::<Vec<_>>();
+        Ok(Response::new(ListSessionsReply {
+            count: sessions.len() as u32,
+            sessions,
+        }))
+    }
+
+    /// Remove all tracked sessions (session-management "clear all").
+    async fn clear_sessions(
+        &self,
+        request: Request<ClearSessionsRequest>,
+    ) -> Result<Response<ClearSessionsReply>, Status> {
+        let client_id = self.client_id(&request);
+        if let Err(e) = self.security.validate_request(&client_id).await {
+            return Err(Status::resource_exhausted(format!(
+                "request rejected by security layer: {e}"
+            )));
+        }
+        let removed = self.sessions.clear_all().await;
+        Ok(Response::new(ClearSessionsReply {
+            removed: removed as u32,
+        }))
+    }
+
+    /// Remove a single tracked session by id.
+    async fn remove_session(
+        &self,
+        request: Request<RemoveSessionRequest>,
+    ) -> Result<Response<RemoveSessionReply>, Status> {
+        let client_id = self.client_id(&request);
+        if let Err(e) = self.security.validate_request(&client_id).await {
+            return Err(Status::resource_exhausted(format!(
+                "request rejected by security layer: {e}"
+            )));
+        }
+        let id = request.into_inner().session_id;
+        let removed = self.sessions.remove(&id).await.is_ok();
+        Ok(Response::new(RemoveSessionReply { removed }))
+    }
+
+    /// Fetch one session's completed conversation history.
+    async fn get_history(
+        &self,
+        request: Request<GetHistoryRequest>,
+    ) -> Result<Response<GetHistoryReply>, Status> {
+        let client_id = self.client_id(&request);
+        if let Err(e) = self.security.validate_request(&client_id).await {
+            return Err(Status::resource_exhausted(format!(
+                "request rejected by security layer: {e}"
+            )));
+        }
+        let id = request.into_inner().session_id;
+        let meta = self
+            .sessions
+            .get(&id)
+            .await
+            .ok_or_else(|| Status::not_found("session not found"))?;
+        let turns = meta
+            .history
+            .into_iter()
+            .map(|t| HistoryTurn {
+                role: t.role,
+                text: t.text,
+            })
+            .collect();
+        Ok(Response::new(GetHistoryReply {
+            session_id: id,
+            model: meta.model,
+            tokens_generated: meta.tokens_generated as u64,
+            cancelled: meta.cancelled,
+            turns,
+        }))
+    }
 }
 
 /// Bind the UDS, harden its permissions, and run the tonic server until a
@@ -635,13 +764,41 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
 }
 
 /// Resolves on SIGINT, SIGTERM, or Ctrl-C so the daemon can exit cleanly.
+/// Registering the Unix handlers is best-effort: failing to install one must
+/// never panic the daemon (P0-1) — we degrade to whatever is available, and
+/// Ctrl-C always is.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+
+    let term = match signal(SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(
+                "SIGTERM handler unavailable ({e}); supervisor stop falls back to SIGINT"
+            );
+            None
+        }
+    };
+    let int = match signal(SignalKind::interrupt()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("SIGINT handler unavailable ({e}); relying on Ctrl-C");
+            None
+        }
+    };
+    // A handler that could not be installed is awaited as pending (never fires),
+    // so the other branches still decide the outcome.
+    let wait = |mut s: Option<tokio::signal::unix::Signal>| async move {
+        match s.as_mut() {
+            Some(sig) => {
+                sig.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+        _ = wait(term) => {}
+        _ = wait(int) => {}
         _ = tokio::signal::ctrl_c() => {}
     }
 }
@@ -686,6 +843,122 @@ mod tests {
         assert!(reply.running);
         assert!(!reply.model.is_empty());
         assert_eq!(reply.active_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_reports_seeded_sessions() {
+        let svc = AiAgentService::new().await;
+        let _a = svc.sessions.create("model-m".to_string()).await;
+        let _b = svc.sessions.create("model-m".to_string()).await;
+        let reply = svc
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .expect("list_sessions")
+            .into_inner();
+        assert_eq!(reply.count, 2);
+        assert_eq!(reply.sessions.len(), 2);
+        assert!(reply.sessions.iter().all(|s| s.model == "model-m"));
+        // Distinct sessions carry distinct ids.
+        let ids = reply
+            .sessions
+            .iter()
+            .map(|s| s.session_id.clone())
+            .collect::<Vec<_>>();
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_is_ordered_by_recent_activity() {
+        let svc = AiAgentService::new().await;
+        let _older = svc.sessions.create("model-m".to_string()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let newer = svc.sessions.create("model-m".to_string()).await;
+        let reply = svc
+            .list_sessions(Request::new(ListSessionsRequest {}))
+            .await
+            .expect("list_sessions")
+            .into_inner();
+        assert_eq!(reply.sessions.len(), 2);
+        // The later-created session is the most recently active -> listed first.
+        assert_eq!(reply.sessions[0].session_id, newer);
+    }
+
+    #[tokio::test]
+    async fn clear_sessions_removes_all_tracked() {
+        let svc = AiAgentService::new().await;
+        let _a = svc.sessions.create("model-m".to_string()).await;
+        let _b = svc.sessions.create("model-m".to_string()).await;
+        let reply = svc
+            .clear_sessions(Request::new(ClearSessionsRequest {}))
+            .await
+            .expect("clear_sessions")
+            .into_inner();
+        assert_eq!(reply.removed, 2);
+        assert_eq!(svc.sessions.count_active().await, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_session_deletes_one_and_reports_missing() {
+        let svc = AiAgentService::new().await;
+        let a = svc.sessions.create("model-m".to_string()).await;
+        let b = svc.sessions.create("model-m".to_string()).await;
+        let removed = svc
+            .remove_session(Request::new(RemoveSessionRequest {
+                session_id: a.clone(),
+            }))
+            .await
+            .expect("remove_session")
+            .into_inner();
+        assert!(removed.removed);
+        assert_eq!(svc.sessions.count_active().await, 1);
+        // second session still there, and the removed one is gone
+        assert!(svc.sessions.get(&b).await.is_some());
+        assert!(svc.sessions.get(&a).await.is_none());
+        // removing an unknown id reports removed=false (no error)
+        let missing = svc
+            .remove_session(Request::new(RemoveSessionRequest {
+                session_id: "nope".to_string(),
+            }))
+            .await
+            .expect("remove_session missing")
+            .into_inner();
+        assert!(!missing.removed);
+    }
+
+    #[tokio::test]
+    async fn get_history_returns_completed_turns() {
+        let svc = AiAgentService::new().await;
+        let id = svc.sessions.create("model-m".to_string()).await;
+        svc.sessions
+            .update(&id, |s| {
+                s.append_turn("user".to_string(), "hi".to_string());
+                s.append_turn("assistant".to_string(), "hello!".to_string());
+            })
+            .await
+            .unwrap();
+        let reply = svc
+            .get_history(Request::new(GetHistoryRequest {
+                session_id: id.clone(),
+            }))
+            .await
+            .expect("get_history")
+            .into_inner();
+        assert_eq!(reply.session_id, id);
+        assert_eq!(reply.turns.len(), 2);
+        assert_eq!(reply.turns[0].role, "user");
+        assert_eq!(reply.turns[1].text, "hello!");
+    }
+
+    #[tokio::test]
+    async fn get_history_unknown_session_is_not_found() {
+        let svc = AiAgentService::new().await;
+        let err = svc
+            .get_history(Request::new(GetHistoryRequest {
+                session_id: "nope".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

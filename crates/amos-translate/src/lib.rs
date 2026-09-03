@@ -5,6 +5,13 @@
 //! segment through a pluggable [`TranslationProvider`] and streams translations
 //! back, enabling real-time (simultaneous) interpretation.
 
+// P0-1 gate: production code must not panic on programmer error. Test code is
+// exempt (assertions/unwrap are idiomatic there).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod asr;
 pub mod grpc_pipeline;
 pub mod provider;
@@ -226,11 +233,14 @@ pub fn provider_from_env() -> Arc<dyn TranslationProvider> {
     let kind = std::env::var("AMOS_TRANSLATE_BACKEND").unwrap_or_else(|_| "ollama".to_string());
     match kind.as_str() {
         "mock" => Arc::new(provider::MockProvider::default()),
-        _ => Arc::new(provider::OllamaProvider::new(
-            std::env::var("AMOS_TRANSLATE_HOST")
-                .unwrap_or_else(|_| "http://localhost:11434".into()),
-            std::env::var("AMOS_TRANSLATE_MODEL").unwrap_or_else(|_| "llama3.2".into()),
-        )),
+        _ => Arc::new(
+            provider::OllamaProvider::new(
+                std::env::var("AMOS_TRANSLATE_HOST")
+                    .unwrap_or_else(|_| "http://localhost:11434".into()),
+                std::env::var("AMOS_TRANSLATE_MODEL").unwrap_or_else(|_| "llama3.2".into()),
+            )
+            .with_api_key(std::env::var("AMOS_TRANSLATE_API_KEY").unwrap_or_default()),
+        ),
     }
 }
 
@@ -289,13 +299,41 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
 }
 
 /// Resolves on SIGINT, SIGTERM, or Ctrl-C so the daemon can exit cleanly.
+/// Registering the Unix handlers is best-effort: failing to install one must
+/// never panic the daemon (P0-1) — we degrade to whatever is available, and
+/// Ctrl-C always is.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+
+    let term = match signal(SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(
+                "SIGTERM handler unavailable ({e}); supervisor stop falls back to SIGINT"
+            );
+            None
+        }
+    };
+    let int = match signal(SignalKind::interrupt()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("SIGINT handler unavailable ({e}); relying on Ctrl-C");
+            None
+        }
+    };
+    // A handler that could not be installed is awaited as pending (never fires),
+    // so the other branches still decide the outcome.
+    let wait = |mut s: Option<tokio::signal::unix::Signal>| async move {
+        match s.as_mut() {
+            Some(sig) => {
+                sig.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+        _ = wait(term) => {}
+        _ = wait(int) => {}
         _ = tokio::signal::ctrl_c() => {}
     }
 }

@@ -27,9 +27,9 @@ describe("Recents/Spotlight focus trap (DOM)", () => {
     await mount();
     const btns = Array.from(document.querySelectorAll("button")) as HTMLElement[];
     expect(btns.length).toBeGreaterThan(0);
-    btns[btns.length - 1].focus();
+    btns[btns.length - 1]!.focus();
     tab();
-    expect(document.activeElement).toBe(btns[0]);
+    expect(document.activeElement).toBe(btns[0]!);
     root.unmount();
   });
 
@@ -39,9 +39,9 @@ describe("Recents/Spotlight focus trap (DOM)", () => {
     await mount();
     const btns = Array.from(document.querySelectorAll("button")) as HTMLElement[];
     expect(btns.length).toBeGreaterThan(0);
-    btns[btns.length - 1].focus();
+    btns[btns.length - 1]!.focus();
     tab();
-    expect(document.activeElement).toBe(btns[0]);
+    expect(document.activeElement).toBe(btns[0]!);
     esc();
     expect(closed).toBe(1);
     root.unmount();

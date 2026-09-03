@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
   chatLogInit,
+  chatLogReset,
   onAiToken,
   onAiComplete,
   tokenOf,
   onInterpOutput,
   interpInit,
+  interpClear,
+  INTERP_LINE_CAP,
   cardOf,
   sessionMetaOf,
+  finalSegmentOf,
 } from "../lib/stream";
 
 describe("stream reducers (fake events)", () => {
@@ -110,5 +114,55 @@ describe("ai reducer fault-injection", () => {
       fields: [{ key: "k", value: "[object Object]" }],
       actions: [],
     });
+  });
+});
+
+describe("stream chat/interp lifecycle + final segment", () => {
+  test("chatLogReset returns a fresh empty log", () => {
+    let l = chatLogInit();
+    l = onAiToken(l, "hi");
+    expect(l.text).toBe("hi");
+    expect(chatLogReset()).toEqual(chatLogInit());
+    // reset does not alias the previous object
+    expect(chatLogReset()).not.toBe(chatLogInit());
+  });
+
+  test("finalSegmentOf only accepts speakable segment_final payloads", () => {
+    expect(finalSegmentOf({ kind: "segment_final", target_text: "你好", target_lang: "en" })).toEqual({
+      text: "你好",
+      lang: "en",
+    });
+    // missing lang defaults to zh
+    expect(finalSegmentOf({ kind: "segment_final", target_text: "ok" })).toEqual({ text: "ok", lang: "zh" });
+    // empty text / wrong kind / non-object are not speakable
+    expect(finalSegmentOf({ kind: "segment_final", target_text: "" })).toBeNull();
+    expect(finalSegmentOf({ kind: "partial", target_text: "hi" })).toBeNull();
+    expect(finalSegmentOf(null)).toBeNull();
+    expect(finalSegmentOf("x")).toBeNull();
+  });
+
+  test("interpClear resets transcript lines", () => {
+    let s = onInterpOutput(interpInit(), { kind: "segment_final", source_text: "hi", target_text: "你好" });
+    expect(s.lines.length).toBe(1);
+    s = interpClear();
+    expect(s.lines).toEqual([]);
+  });
+
+  test("onInterpOutput ignores malformed / empty payloads without churn", () => {
+    const state = interpInit();
+    expect(onInterpOutput(state, 42)).toBe(state); // non-object → same ref
+    expect(onInterpOutput(state, { kind: "segment_final" })).toBe(state); // empty line → same ref
+  });
+
+  test("interp transcript is memory-bounded (drops oldest beyond INTERP_LINE_CAP)", () => {
+    let s = interpInit();
+    // Push well past the cap.
+    for (let i = 0; i < INTERP_LINE_CAP + 50; i++) {
+      s = onInterpOutput(s, { kind: "segment_final", source_text: `s${i}`, target_text: `t${i}` });
+    }
+    expect(s.lines.length).toBe(INTERP_LINE_CAP); // never exceeds the cap
+    // The oldest were evicted: newest tail is intact.
+    expect(s.lines[s.lines.length - 1]).toEqual({ src: `s${INTERP_LINE_CAP + 49}`, target: `t${INTERP_LINE_CAP + 49}` });
+    expect(s.lines[0]).toEqual({ src: "s50", target: "t50" }); // dropped s0..s49
   });
 });

@@ -62,14 +62,33 @@ pub struct BackendMetadata {
 }
 
 /// Backend resource statistics.
+///
+/// Every field is `Option` **on purpose**: `None` means "not instrumented / no
+/// data available", which is distinct from a genuine reading of `0`. Callers
+/// must treat `None` as unknown and must never render it as a real metric.
+/// (Safety principle: do not fabricate telemetry values to fill a dashboard.)
 #[derive(Debug, Clone)]
 pub struct BackendStats {
-    pub gpu_utilization_percent: u32,
-    pub memory_used_mb: usize,
-    pub memory_total_mb: usize,
-    pub active_requests: usize,
-    pub total_tokens_generated: u64,
-    pub avg_tokens_per_second: f32,
+    pub gpu_utilization_percent: Option<u32>,
+    pub memory_used_mb: Option<usize>,
+    pub memory_total_mb: Option<usize>,
+    pub active_requests: Option<usize>,
+    pub total_tokens_generated: Option<u64>,
+    pub avg_tokens_per_second: Option<f32>,
+}
+
+impl Default for BackendStats {
+    /// Honest default: every metric is *unknown* until a backend instruments it.
+    fn default() -> Self {
+        Self {
+            gpu_utilization_percent: None,
+            memory_used_mb: None,
+            memory_total_mb: None,
+            active_requests: None,
+            total_tokens_generated: None,
+            avg_tokens_per_second: None,
+        }
+    }
 }
 
 /// Local GPU/NPU backend using GGML (llama.cpp compatible).
@@ -159,15 +178,9 @@ impl InferenceBackend for GgmlBackend {
     }
 
     async fn get_stats(&self) -> BackendStats {
-        // TODO: Query actual GPU stats
-        BackendStats {
-            gpu_utilization_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 8192,
-            active_requests: 0,
-            total_tokens_generated: 0,
-            avg_tokens_per_second: 0.0,
-        }
+        // Honest telemetry: no local GPU counters are instrumented yet, so report
+        // "unknown" (None) rather than a fabricated 0 / 8192. See BackendStats.
+        BackendStats::default()
     }
 }
 
@@ -384,14 +397,9 @@ impl InferenceBackend for ApiBackend {
     }
 
     async fn get_stats(&self) -> BackendStats {
-        BackendStats {
-            gpu_utilization_percent: 0, // N/A for API
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-            active_requests: 0,
-            total_tokens_generated: 0,
-            avg_tokens_per_second: 0.0,
-        }
+        // Remote API — we cannot observe GPU/RAM here; report unknown (None)
+        // instead of zeros pretending to be real usage.
+        BackendStats::default()
     }
 }
 
@@ -612,14 +620,8 @@ impl InferenceBackend for OllamaBackend {
     }
 
     async fn get_stats(&self) -> BackendStats {
-        BackendStats {
-            gpu_utilization_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-            active_requests: 0,
-            total_tokens_generated: 0,
-            avg_tokens_per_second: 0.0,
-        }
+        // Honest telemetry: not instrumented here -> report unknown (None), not 0.
+        BackendStats::default()
     }
 }
 
@@ -745,14 +747,8 @@ impl InferenceBackend for HermesAgentBackend {
     }
 
     async fn get_stats(&self) -> BackendStats {
-        BackendStats {
-            gpu_utilization_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-            active_requests: 0,
-            total_tokens_generated: 0,
-            avg_tokens_per_second: 0.0,
-        }
+        // Honest telemetry: not instrumented here -> report unknown (None), not 0.
+        BackendStats::default()
     }
 }
 
@@ -820,14 +816,8 @@ impl InferenceBackend for MockBackend {
     }
 
     async fn get_stats(&self) -> BackendStats {
-        BackendStats {
-            gpu_utilization_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-            active_requests: 0,
-            total_tokens_generated: 0,
-            avg_tokens_per_second: 0.0,
-        }
+        // Honest telemetry: not instrumented here -> report unknown (None), not 0.
+        BackendStats::default()
     }
 }
 
@@ -1249,5 +1239,33 @@ mod tests {
     #[tokio::test]
     async fn ollama_is_keyless_by_default() {
         ollama_stream_carries_expected_auth(false).await;
+    }
+
+    /// A backend must report metrics it does not measure as *unknown* (`None`),
+    /// never as a fabricated `0`/value-as-if-real (telemetry honesty).
+    #[tokio::test]
+    async fn stats_report_unknown_instead_of_fabricated_zero() {
+        for kind in ["mock", "api"] {
+            let backend: Box<dyn InferenceBackend> = match kind {
+                "mock" => Box::new(MockBackend::new()),
+                _ => Box::new(ApiBackend::new(
+                    "k".to_string(),
+                    "https://api.example.com".to_string(),
+                    "gpt-4".to_string(),
+                )),
+            };
+            let s = backend.get_stats().await;
+            assert!(
+                s.gpu_utilization_percent.is_none()
+                    && s.memory_used_mb.is_none()
+                    && s.memory_total_mb.is_none()
+                    && s.active_requests.is_none()
+                    && s.total_tokens_generated.is_none()
+                    && s.avg_tokens_per_second.is_none(),
+                "{kind} backend fabricated telemetry (fields must be None): {s:?}",
+            );
+        }
+        // Default value represents "all unknown" — never confuse None with 0.
+        assert!(BackendStats::default().memory_total_mb.is_none());
     }
 }

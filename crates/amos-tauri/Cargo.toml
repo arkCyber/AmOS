@@ -19,6 +19,8 @@ tauri-build.workspace = true
 amos-proto.workspace = true
 amos-wm = { path = "../amos-wm" }
 amos-int.workspace = true
+amos-mail = { path = "../amos-mail" }
+amos-appstore = { path = "../amos-appstore" }
 amos-translate = { path = "../amos-translate" }
 amos-tts = { path = "../amos-tts" }
 amos-asr = { path = "../amos-asr", optional = true }
@@ -30,6 +32,7 @@ tower.workspace = true
 hyper-util.workspace = true
 serde.workspace = true
 serde_json = "1.0"
+base64 = "0.21"
 tracing.workspace = true
 
 # Opt-in local streaming ASR: compiles + links the native sherpa-onnx lib.
@@ -44,6 +47,9 @@ tracing.workspace = true
 default = []
 sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]
 piper-tts = ["amos-tts/piper"]
+# Real HTTP app-store backend for the StoreBridge (remote catalog + package
+# downloads). Off by default so the UI build stays offline-green.
+appstore-live = ["amos-appstore/live"]
 
 # Integration tests spawn the real amos-ai tonic server in-process so the AI
 # bridge command core can be exercised headlessly over UDS (no Tauri/GUI).

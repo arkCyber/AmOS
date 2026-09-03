@@ -53,6 +53,21 @@ export function langNative(code: string): string {
   return LANGS.find((l) => l.code === code)?.native ?? code;
 }
 
+/**
+ * Join a finalized transcript into one copyable block. Returns the target lines
+ * (skipping empty ones). When `includeSource` is set, each line becomes
+ * `source → target` so a bilingual copy can be made.
+ */
+export function transcriptText(segs: readonly InterpSeg[], includeSource = false): string {
+  const lines: string[] = [];
+  for (const s of segs) {
+    const target = s.target.trim();
+    if (!target) continue;
+    lines.push(includeSource && s.src.trim() ? `${s.src.trim()} → ${target}` : target);
+  }
+  return lines.join("\n");
+}
+
 /** Load remembered prefs (language pair + auto-speak) with safe defaults. */
 export function readPrefs(): InterpPrefs {
   const p = readStoreValue<Partial<InterpPrefs> | null>(INTERP_PREFS_KEY, null);

@@ -175,3 +175,64 @@ pub fn sherpa_pipeline(
     }
     Ok(builder.build())
 }
+
+/// Recognize a **whole recording** (e.g. the audio buffer of an RPC `Transcribe`
+/// request) and return the final hypothesis text. Feeds the buffer through the
+/// streaming recognizer in chunks, then finalizes. Deterministic and reusable by
+/// both the native System UI path and a daemon `SpeechRecognizer`.
+pub fn transcribe_buffer(
+    cfg: SherpaOnlineRecognizerConfig,
+    samples: &[f32],
+) -> anyhow::Result<String> {
+    let mut recognizer = SherpaOnlineRecognizer::new(cfg)?;
+    // Feed in ~400 ms chunks (6400 @16 kHz): streaming decoders need enough
+    // buffered audio per decode to produce features — too-fine chunks (e.g.
+    // 4096) can trip sherpa's internal frame assertion on short clips.
+    const CHUNK: usize = 6400;
+    for chunk in samples.chunks(CHUNK) {
+        let _ = recognizer.push_samples(chunk);
+    }
+    Ok(recognizer.finalize().trim().to_string())
+}
+
+/// Decode a 16-bit mono PCM WAV into `(sample_rate, f32 samples)`. Minimal but
+/// sufficient for the bundled demo clips (used by tests / examples).
+pub fn decode_pcm16_wav(bytes: &[u8]) -> Option<(u32, Vec<f32>)> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut i = 12;
+    let mut sample_rate = 0u32;
+    let mut channels = 1u16;
+    let mut data: Option<&[u8]> = None;
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let size =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        i += 8;
+        match id {
+            b"fmt " if size >= 16 => {
+                channels = u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]);
+                sample_rate =
+                    u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]);
+                i += size;
+            }
+            b"data" => {
+                data = Some(&bytes[i..(i + size).min(bytes.len())]);
+                i += size;
+            }
+            _ => i += size,
+        }
+    }
+    let pcm = data?;
+    let mut out = Vec::with_capacity(pcm.len() / 2);
+    for pair in pcm.chunks_exact(2) {
+        let v = i16::from_le_bytes([pair[0], pair[1]]);
+        out.push(v as f32 / 32768.0);
+    }
+    if channels != 1 {
+        // Down-mix to mono by dropping extra channels (demo clips are mono).
+        out = out.iter().step_by(channels as usize).copied().collect();
+    }
+    Some((sample_rate, out))
+}

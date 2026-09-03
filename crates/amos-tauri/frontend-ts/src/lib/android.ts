@@ -48,7 +48,7 @@ export function addRecent(list: AndroidRecent[], item: AndroidRecent): AndroidRe
 /** PNG bytes (0..255) from the backend -> a base64 data URI for an <img src>. */
 export function bytesToDataUri(bytes: ArrayLike<number>): string {
   let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i] ?? 0);
   return "data:image/png;base64," + btoa(bin);
 }
 

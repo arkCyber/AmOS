@@ -82,7 +82,7 @@ describe("android backend bridge", () => {
       "launch_android_app",
       "get_android_app_icon",
     ]);
-    expect(calls[1].args.packageName).toBe("com.tencent.mm");
-    expect(calls[2].args.packageName).toBe("com.tencent.mm");
+    expect(calls[1]!.args.packageName).toBe("com.tencent.mm");
+    expect(calls[2]!.args.packageName).toBe("com.tencent.mm");
   });
 });

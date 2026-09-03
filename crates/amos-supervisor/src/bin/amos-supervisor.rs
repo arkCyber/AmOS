@@ -6,6 +6,12 @@
 //! amos-supervisor run   <config.json>   # launch + supervise; Ctrl-C to stop
 //! ```
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::process::ExitCode;
 
 use amos_supervisor::{load_config, start_all, Supervisor};
@@ -54,7 +60,36 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // `run`: launch every daemon, supervise, and block until Ctrl-C.
+    // `run`: start the optional periodic wall-clock calibration FIRST so its state
+    // path can be exported to children (feature `timesync` + AMOS_TIMESYNC=1),
+    // then launch & supervise every daemon until Ctrl-C.
+    #[cfg(feature = "timesync")]
+    let mut _timekeeper: Option<amos_supervisor::timesync::TimeSyncHandle> = {
+        use amos_supervisor::timesync::TimeSyncConfig;
+        match TimeSyncConfig::from_env() {
+            Some(cfg) => {
+                let tk = cfg.start();
+                if let Some(s) = tk.state_file().to_str() {
+                    // Children inherit the process env, so this hands each
+                    // supervised daemon the last-known-good calibrated clock.
+                    std::env::set_var("AMOS_TIMESYNC_STATE", s);
+                }
+                println!(
+                    "time sync: enabled (state {}): {}",
+                    tk.state_file().display(),
+                    tk.report().await
+                );
+                Some(tk)
+            }
+            None => {
+                println!("time sync: disabled (set AMOS_TIMESYNC=1 to enable)");
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "timesync"))]
+    let _timekeeper = ();
+
     let sup = Supervisor::new();
     let results = start_all(&sup, &config).await;
     let mut any_failed = false;
@@ -81,12 +116,31 @@ async fn main() -> ExitCode {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut usr1 = signal(SignalKind::user_defined1()).expect("install SIGUSR1 handler");
+        // Best-effort SIGUSR1: if it cannot be installed we degrade to Ctrl-C
+        // only and warn (never panic the supervisor).
+        let mut usr1 = match signal(SignalKind::user_defined1()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot install SIGUSR1 ({e}); hot-restart disabled, Ctrl-C only"
+                );
+                None
+            }
+        };
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
-                _ = usr1.recv() => {
+                _ = async {
+                    match usr1.as_mut() {
+                        Some(u) => { u.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
                     println!("SIGUSR1 received: restarting all daemons…");
+                    #[cfg(feature = "timesync")]
+                    if let Some(tk) = _timekeeper.as_ref() {
+                        println!("time sync status: {}", tk.report().await);
+                    }
                     sup.restart_all().await;
                     println!("restart requested for all supervised daemons");
                 }
@@ -96,6 +150,14 @@ async fn main() -> ExitCode {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await.ok();
+    }
+
+    // Stop the periodic time-sync task (reporting its final calibration) before
+    // tearing down the supervised daemons.
+    #[cfg(feature = "timesync")]
+    if let Some(tk) = _timekeeper.take() {
+        println!("time sync final status: {}", tk.report().await);
+        tk.stop().await;
     }
 
     println!("stopping all daemons…");

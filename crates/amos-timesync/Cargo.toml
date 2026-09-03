@@ -1,0 +1,34 @@
+[package]
+name = "amos-timesync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos network time calibration: a transport-agnostic TimeSource seam (deterministic MockTimeSource + offline HostClock) feeding a SyncedClock that maintains a calibrated wall clock and persists its last-known-good offset, plus a timekeeper periodic-sync loop. A real SNTP/NTP backend is available behind the `ntp` feature."
+
+[lib]
+name = "amos_timesync"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = "1"
+tokio.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+thiserror = "1"
+
+# Real network time query (SNTP over UDP) for the NtpTimeSource. Kept behind the
+# `ntp` feature so the default workspace build stays offline-green, mirroring
+# amos-appstore's `live` and amos-asr's `sherpa` gating. The blocking SNTP client
+# runs inside `tokio::task::spawn_blocking`.
+sntpc = { version = "0.11", features = ["sync"], optional = true }
+sntpc-net-std = { version = "1.3", optional = true }
+
+[features]
+default = []
+ntp = ["dep:sntpc", "dep:sntpc-net-std"]
+
+[[example]]
+name = "ntp_probe"
+required-features = ["ntp"]

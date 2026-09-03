@@ -35,6 +35,8 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 | `amos-int` | transport-agnostic interpretation session engine (state machine, utterance assembly, `Pipeline` trait) |
 | `amos-asr` | streaming speech recognition: `StreamingRecognizer` abstraction + `AsrPipeline` (Partial/Final) + gated sherpa-onnx backend |
 | `amos-tts` | text-to-speech: `TtsProvider` trait (Mock + gated Piper) -> playable `TtsAudio` |
+| `amos-appstore` | app-store domain core: `AppManifest` catalog + `Version`, sha256 integrity, Ed25519 publisher signing, `AppStore` engine (download→verify→install/upgrade/uninstall) over a pluggable `StoreProvider` (Mock default; `live` feature adds a real HTTP backend) |
+| `amos-appstore-cli` | headless app-store CLI (demo/catalog/search/install/upgrade/uninstall/status) driving the same engine, mirroring `amos-mail-cli` |
 
 ## RPC contract (`proto/`)
 

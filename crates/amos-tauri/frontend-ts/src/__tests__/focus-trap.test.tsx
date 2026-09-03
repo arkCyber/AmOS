@@ -41,11 +41,11 @@ describe("useFocusTrap (DOM)", () => {
     });
     const buttons = Array.from(el.querySelectorAll("button")) as HTMLElement[];
     expect(buttons.length).toBe(2);
-    expect(document.activeElement).toBe(buttons[0]); // first focused on mount
+    expect(document.activeElement).toBe(buttons[0]!); // first focused on mount
 
-    buttons[1].focus(); // user tabs to the last
+    buttons[1]!.focus(); // user tabs to the last
     tabKey(); // Tab from last wraps to first
-    expect(document.activeElement).toBe(buttons[0]);
+    expect(document.activeElement).toBe(buttons[0]!);
 
     escapeKey(); // Escape closes
     expect(closed).toEqual(["x"]);

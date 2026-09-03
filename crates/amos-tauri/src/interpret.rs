@@ -324,7 +324,9 @@ pub async fn interpret_text(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let a = guard.as_mut().unwrap();
+    let a = guard
+        .as_mut()
+        .ok_or_else(|| "no active session".to_string())?;
     let payloads = a.apply(SessionEvent::TextSegment(text)).await?;
     drop(guard);
     emit(&app, payloads);
@@ -341,7 +343,9 @@ pub async fn interpret_audio(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let a = guard.as_mut().unwrap();
+    let a = guard
+        .as_mut()
+        .ok_or_else(|| "no active session".to_string())?;
     let payloads = a.apply(SessionEvent::AudioChunk(chunk)).await?;
     drop(guard);
     emit(&app, payloads);
@@ -357,7 +361,9 @@ pub async fn interpret_end_of_speech(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let a = guard.as_mut().unwrap();
+    let a = guard
+        .as_mut()
+        .ok_or_else(|| "no active session".to_string())?;
     let payloads = a.apply(SessionEvent::EndOfSpeech).await?;
     drop(guard);
     emit(&app, payloads);
@@ -372,7 +378,9 @@ pub async fn interpret_pause(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let a = guard.as_mut().unwrap();
+    let a = guard
+        .as_mut()
+        .ok_or_else(|| "no active session".to_string())?;
     a.session.pause().map_err(|e| e.to_string())?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
@@ -388,7 +396,9 @@ pub async fn interpret_resume(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let a = guard.as_mut().unwrap();
+    let a = guard
+        .as_mut()
+        .ok_or_else(|| "no active session".to_string())?;
     a.session.resume().map_err(|e| e.to_string())?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
@@ -405,7 +415,9 @@ pub async fn interpret_stop(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let a = guard.as_mut().unwrap();
+    let a = guard
+        .as_mut()
+        .ok_or_else(|| "no active session".to_string())?;
     a.session.stop().map_err(|e| e.to_string())?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
@@ -422,7 +434,9 @@ pub async fn interpret_restart(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let a = guard.as_mut().unwrap();
+    let a = guard
+        .as_mut()
+        .ok_or_else(|| "no active session".to_string())?;
     a.session.restart().map_err(|e| e.to_string())?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
@@ -439,7 +453,9 @@ pub async fn interpret_abort(
 ) -> Result<(), String> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
-    let mut a = guard.take().unwrap();
+    let mut a = guard
+        .take()
+        .ok_or_else(|| "no active session".to_string())?;
     a.session.abort().map_err(|e| e.to_string())?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);

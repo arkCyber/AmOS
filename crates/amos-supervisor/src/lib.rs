@@ -22,6 +22,12 @@
 //! # }
 //! ```
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
@@ -463,6 +469,244 @@ pub fn load_config(path: &Path) -> anyhow::Result<SupervisorConfig> {
     let config: SupervisorConfig = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     Ok(config)
+}
+
+#[cfg(feature = "timesync")]
+pub mod timesync {
+    //! Periodic wall-clock calibration, orchestrated alongside daemon supervision.
+    //!
+    //! When enabled at build time (`timesync` feature) and at runtime
+    //! (`AMOS_TIMESYNC=1`), the supervisor spawns a background loop that keeps a
+    //! shared [`SyncedClock`] calibrated from a [`TimeSource`] and persists its
+    //! last-known-good offset — exactly like any other supervised concern, but
+    //! in-process because a periodic *loop* is not a crash-restartable child.
+    //!
+    //! Source selection: set `AMOS_NTP_SERVER` for a real SNTP query (feature
+    //! `timesync` enables `amos-timesync/ntp`); without it the offline
+    //! [`HostClock`] is used (persists host time, performs no calibration).
+
+    use std::fmt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use amos_timesync::time_source::HostClock;
+    use amos_timesync::timekeeper::spawn_timekeeper;
+    use amos_timesync::{NtpTimeSource, SyncedClock, TimeSource};
+    use tokio::sync::{watch, Mutex};
+    use tokio::task::JoinHandle;
+
+    /// Default interval between calibration passes (1 hour).
+    const DEFAULT_INTERVAL: Duration = Duration::from_secs(3600);
+    /// Operator-facing floor on the interval (seconds): an operator setting
+    /// `AMOS_TIMESYNC_INTERVAL_SECS=0` must not make the loop hammer the time
+    /// source. (The library's own floor is 1 ms; the supervised loop is far less
+    /// frequent by policy.)
+    const MIN_SYNC_SECS: u64 = 1;
+
+    /// Runtime configuration for the supervised periodic time sync.
+    #[derive(Debug, Clone)]
+    pub struct TimeSyncConfig {
+        /// Seconds between calibration passes.
+        pub interval: Duration,
+        /// Where the last-known-good clock offset is persisted.
+        pub state_file: PathBuf,
+        /// Optional SNTP server (`host` or `host:port`). `None` → host clock.
+        pub server: Option<String>,
+    }
+
+    impl TimeSyncConfig {
+        /// Build from the environment, or `None` when time sync is disabled.
+        ///
+        /// Enabled only when `AMOS_TIMESYNC=1`. Optional knobs:
+        /// `AMOS_TIMESYNC_INTERVAL_SECS`, `AMOS_TIMESYNC_STATE`,
+        /// `AMOS_NTP_SERVER`.
+        pub fn from_env() -> Option<Self> {
+            let enabled = std::env::var("AMOS_TIMESYNC")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if !enabled {
+                return None;
+            }
+            let state_file = std::env::var_os("AMOS_TIMESYNC_STATE")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_state_file);
+            let interval = std::env::var("AMOS_TIMESYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_INTERVAL)
+                .max(Duration::from_secs(MIN_SYNC_SECS));
+            let server = std::env::var("AMOS_NTP_SERVER")
+                .ok()
+                .filter(|s| !s.is_empty());
+            Some(Self {
+                interval,
+                state_file,
+                server,
+            })
+        }
+
+        /// The state file this config persists the calibrated clock to.
+        pub fn state_file(&self) -> &Path {
+            &self.state_file
+        }
+
+        /// Spawn the periodic calibration loop and return its live handle.
+        pub fn start(self) -> TimeSyncHandle {
+            let clock = Arc::new(Mutex::new(
+                SyncedClock::load(&self.state_file).with_state_file(self.state_file.clone()),
+            ));
+            let source: Arc<dyn TimeSource> = match self.server {
+                Some(server) => Arc::new(NtpTimeSource::new([server])),
+                None => Arc::new(HostClock),
+            };
+            let (handle, shutdown) =
+                spawn_timekeeper(clock.clone(), source, self.interval, "timesync".to_string());
+            TimeSyncHandle {
+                clock,
+                state_file: self.state_file,
+                shutdown,
+                handle,
+            }
+        }
+    }
+
+    /// A live, supervised periodic time-sync loop.
+    pub struct TimeSyncHandle {
+        clock: Arc<Mutex<SyncedClock>>,
+        state_file: PathBuf,
+        shutdown: watch::Sender<bool>,
+        handle: JoinHandle<()>,
+    }
+
+    impl TimeSyncHandle {
+        /// The state file the calibrated clock is persisted to (exported to
+        /// supervised daemons via `AMOS_TIMESYNC_STATE`).
+        pub fn state_file(&self) -> &Path {
+            &self.state_file
+        }
+
+        /// A snapshot of the current calibration for status output.
+        pub async fn report(&self) -> TimeSyncStatus {
+            let clock = self.clock.lock().await;
+            TimeSyncStatus {
+                synced: clock.synced(),
+                offset_ms: clock.offset_ns().map(|ns| ns / 1_000_000).unwrap_or(0),
+                staleness_ms: clock.staleness().map(|d| d.as_millis() as u64),
+                corrected_now_ms: epoch_ms(clock.now()),
+            }
+        }
+
+        /// Signal the loop to stop and wait (bounded) for it to finish.
+        pub async fn stop(self) {
+            let _ = self.shutdown.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.handle).await;
+        }
+    }
+
+    /// Human-readable snapshot of the supervised clock.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TimeSyncStatus {
+        /// Whether any calibration offset is known.
+        pub synced: bool,
+        /// Signed host→true offset, whole milliseconds.
+        pub offset_ms: i64,
+        /// Age of the calibration, or `None` if never synced.
+        pub staleness_ms: Option<u64>,
+        /// Corrected wall clock as Unix-epoch milliseconds.
+        pub corrected_now_ms: u64,
+    }
+
+    impl fmt::Display for TimeSyncStatus {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "corrected now = epoch {}ms (offset {}ms)",
+                self.corrected_now_ms, self.offset_ms
+            )?;
+            match self.staleness_ms {
+                Some(ms) => write!(f, ", last synced {ms}ms ago"),
+                None => write!(f, ", never synced"),
+            }
+        }
+    }
+
+    fn epoch_ms(t: SystemTime) -> u64 {
+        t.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn default_state_file() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".amos").join("timesync.json"))
+            .unwrap_or_else(|| PathBuf::from(".amos-timesync.json"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn handle_reports_persists_and_stops() {
+            let state = std::env::temp_dir()
+                .join(format!("amos-sup-ts-status-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&state);
+            let cfg = TimeSyncConfig {
+                interval: Duration::from_millis(1),
+                state_file: state.clone(),
+                server: None, // HostClock: offline, deterministic
+            };
+            let tk = cfg.start();
+            assert_eq!(tk.state_file(), state.as_path());
+
+            // Wait for the first calibration pass so the report reflects reality.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if tk.report().await.synced {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("clock never synced within 2s");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let status = tk.report().await;
+            assert!(status.synced, "host-clock sync marks the clock synced");
+            assert!(state.exists(), "state file should be written");
+
+            // stop() must complete (loop exits) within a bounded time.
+            tokio::time::timeout(Duration::from_secs(2), tk.stop())
+                .await
+                .expect("time sync handle should stop within 2s");
+
+            let _ = std::fs::remove_file(&state);
+            let _ = std::fs::remove_file(state.with_extension("tmp"));
+        }
+
+        #[test]
+        fn from_env_clamps_sub_second_interval_and_disables_when_unset() {
+            // Set the operator knobs, then clear them afterwards so nothing leaks
+            // into sibling tests.
+            std::env::set_var("AMOS_TIMESYNC", "1");
+            std::env::set_var("AMOS_TIMESYNC_INTERVAL_SECS", "0");
+            let cfg = TimeSyncConfig::from_env().expect("time sync enabled");
+            assert!(
+                cfg.interval >= Duration::from_secs(1),
+                "a sub-second operator interval must be clamped, got {:?}",
+                cfg.interval
+            );
+            std::env::remove_var("AMOS_TIMESYNC");
+            std::env::remove_var("AMOS_TIMESYNC_INTERVAL_SECS");
+            assert!(
+                TimeSyncConfig::from_env().is_none(),
+                "time sync is disabled once AMOS_TIMESYNC is unset"
+            );
+        }
+    }
 }
 
 /// Convenience: start every daemon in a config under one `Supervisor`.

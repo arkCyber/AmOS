@@ -8,10 +8,16 @@ members = [
     "crates/amos-tauri",
     "crates/amos-supervisor",
     "crates/amos-translate",
+    "crates/amos-mail",
+    "crates/amos-mail-cli",
     "crates/amos-int",
     "crates/amos-int-cli",
     "crates/amos-asr",
     "crates/amos-tts",
+    "crates/amos-appstore",
+    "crates/amos-appstore-cli",
+    "crates/amos-timesync",
+    "crates/amos-timesync-cli",
 ]
 
 [workspace.package]
@@ -42,6 +48,8 @@ tauri-build = "2"
 amos-proto = { path = "crates/amos-proto" }
 amos-android = { path = "crates/amos-android" }
 amos-int = { path = "crates/amos-int" }
+amos-appstore = { path = "crates/amos-appstore" }
+amos-timesync = { path = "crates/amos-timesync" }
 
 # ---- profile tuning for fast iteration / smaller mobile binaries ----
 [profile.dev]

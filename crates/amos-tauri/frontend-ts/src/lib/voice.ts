@@ -78,7 +78,7 @@ export function wavBytes(pcm: number[], sampleRate: number): number[] {
   u16(34, 16); // bits per sample
   ascii(36, "data");
   u32(40, dataLen);
-  for (let i = 0; i < dataLen; i++) bytes[44 + i] = pcm[i] & 0xff;
+  for (let i = 0; i < dataLen; i++) bytes[44 + i] = (pcm[i] ?? 0) & 0xff;
   return bytes;
 }
 
@@ -95,7 +95,7 @@ export function pcmToWavBytes(frames: ArrayLike<number>, fromRate: number): numb
 /** Rough silence guard: is there any audible content above `threshold`? */
 export function hasSignal(frames: ArrayLike<number>, threshold = 0.004): boolean {
   for (let i = 0; i < frames.length; i++) {
-    const v = Math.abs(frames[i]);
+    const v = Math.abs(frames[i] ?? 0);
     if (v > threshold) return true;
   }
   return false;

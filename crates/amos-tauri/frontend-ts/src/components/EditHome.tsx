@@ -1,5 +1,6 @@
 import { useI18n } from "../i18n";
 import { appIcon, appTitleKey } from "../apps";
+import { AppIconTile } from "./AppIcon";
 import { hideFromHome, restoreToHome, type HomeLayout } from "../lib/amosStore";
 
 export default function EditHome({
@@ -32,10 +33,15 @@ export default function EditHome({
           <div key={id} className="relative">
             <button
               onClick={() => onChange(hideFromHome(layout, id))}
-              className="grid h-16 w-16 place-items-center rounded-2xl bg-neutral-300 text-2xl dark:bg-neutral-700"
+              className="group relative block outline-none transition-transform active:scale-90"
               aria-label={`remove ${id}`}
             >
-              {appIcon(id)}
+              <AppIconTile
+                id={id}
+                icon={appIcon(id)}
+                tileClassName="h-16 w-16 rounded-[21px]"
+                glyphClassName="text-[2.5rem]"
+              />
             </button>
             <span className="absolute -left-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-danger text-xs text-white">
               ✕

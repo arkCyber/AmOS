@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
 import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+import { GROUP, pillCls } from "./ui";
 import {
   BACKGROUND_MODES,
   DEFAULT_BG_MODE,
@@ -10,6 +11,7 @@ import {
   isBgMode,
   isCustomWallpaper,
   resolveWallpaper,
+  type BgModeId,
 } from "../lib/wallpaper";
 
 interface Prefs {
@@ -24,7 +26,7 @@ function writePref(patch: Prefs) {
   writeStoreValue("amos.settings", { ...readPrefs(), ...patch });
 }
 
-const PRESET_LABEL: Record<string, string> = {
+const PRESET_LABEL: Record<(typeof WALLPAPER_PRESETS)[number], string> = {
   auto: "wp.auto",
   dark: "wp.dark",
   light: "wp.light",
@@ -33,7 +35,7 @@ const PRESET_LABEL: Record<string, string> = {
   abyss: "wp.abyss",
 };
 
-const MODE_LABEL: Record<string, string> = {
+const MODE_LABEL: Record<BgModeId, string> = {
   ghost: "bg.ghost",
   soft: "bg.soft",
   muted: "bg.muted",
@@ -49,7 +51,7 @@ export function Backdrop() {
   return (
     <div
       aria-hidden
-      className="fixed inset-0 -z-10 bg-cover bg-center"
+      className="absolute inset-0 bg-cover bg-center"
       style={{
         backgroundImage: `url(${bg})`,
         opacity: style.alpha,
@@ -75,45 +77,37 @@ export function WallpaperCard() {
     if (v) writePref({ wallpaper: v });
   };
   return (
-    <section className="rounded-2xl bg-neutral-200/60 p-3 dark:bg-neutral-800/60">
-      <h3 className="text-sm font-semibold">{t("wp.label")}</h3>
+    <section className={"p-4 " + GROUP}>
+      <h3 className="text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">{t("wp.label")}</h3>
       <div className="mt-2 flex flex-wrap gap-2">
         {WALLPAPER_PRESETS.map((id) => (
           <button
             key={id}
             onClick={() => pick(id)}
-            className={
-              "rounded-full px-3 py-1 text-xs " +
-              (prefs.wallpaper === id || (!prefs.wallpaper && id === "auto")
-                ? "bg-accent text-white"
-                : "bg-neutral-300 dark:bg-neutral-700")
-            }
+            className={pillCls(prefs.wallpaper === id || (!prefs.wallpaper && id === "auto"))}
           >
             {t(PRESET_LABEL[id])}
           </button>
         ))}
       </div>
-      <div className="mt-2 flex gap-2">
+      <div className="mt-3 flex gap-2">
         <input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder={t("wp.customPh")}
-          className="min-w-0 flex-1 rounded-full bg-white px-3 py-1 text-xs outline-none dark:bg-neutral-900"
+          className="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-xs outline-none dark:bg-white/10"
         />
-        <button onClick={setCustom} className="rounded-full bg-neutral-300 px-3 py-1 text-xs dark:bg-neutral-700">
+        <button onClick={setCustom} className={pillCls(false)}>
           {t("bg.customPh")}
         </button>
       </div>
-      <h4 className="mt-3 text-xs opacity-70">{t("bg.label")}</h4>
+      <h4 className="mt-4 text-xs opacity-70">{t("bg.label")}</h4>
       <div className="mt-1 flex flex-wrap gap-2">
         {BACKGROUND_MODES.map((m) => (
           <button
             key={m.id}
             onClick={() => writePref({ background: m.id })}
-            className={
-              "rounded-full px-3 py-1 text-xs " +
-              (mode === m.id ? "bg-accent text-white" : "bg-neutral-300 dark:bg-neutral-700")
-            }
+            className={pillCls(mode === m.id)}
           >
             {t(MODE_LABEL[m.id])}
           </button>

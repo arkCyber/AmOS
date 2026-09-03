@@ -14,6 +14,13 @@
 //!     hiding/closing the focused window restores focus to the previous one.
 //!   * Transitions return `WmEvent`s for the host to apply to the real backend.
 
+// P0-1 gate: production code must not panic on programmer error. Test code is
+// exempt (assertions/unwrap are idiomatic there).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 

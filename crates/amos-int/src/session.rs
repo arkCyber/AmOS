@@ -272,10 +272,19 @@ impl Session {
                 }
             }
         }
-        let Translation {
+        // By construction the loop above either `break`s on success or returns
+        // on failure, so `translation` is always Some here. Still, never panic on
+        // a surprise (P0-1): treat a missing result as a failure instead.
+        let Some(Translation {
             target_text,
             target_lang,
-        } = translation.expect("translation either succeeded or failed above");
+        }) = translation
+        else {
+            self.fail(InterpretationError::Other(
+                "translation produced no result after retries".to_string(),
+            ));
+            return Ok(());
+        };
 
         let segment = Segment {
             id,

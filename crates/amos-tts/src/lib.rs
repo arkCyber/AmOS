@@ -13,6 +13,13 @@
 //!                                                          (PCM f32, playable)
 //! ```
 
+// P0-1 gate: production code must not panic on programmer error. Test code is
+// exempt (assertions/unwrap are idiomatic there).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod provider;
 
 pub use provider::{MockTtsProvider, TtsProvider};

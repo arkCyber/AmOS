@@ -86,6 +86,9 @@ export interface InterpOutput {
 export function interpInit(): InterpOutput {
   return { lines: [] };
 }
+/** Cap on in-memory transcript lines: a long live session must not grow
+ * unboundedly (mirrors the `capTail` policy used by chat/filed stores). */
+export const INTERP_LINE_CAP = 200;
 /**
  * Extract the speakable final translation from an `interpret-output` payload, or
  * null when it is not a `segment_final` (partials/state change are never spoken,
@@ -108,7 +111,12 @@ export function onInterpOutput(state: InterpOutput, payload: unknown): InterpOut
       src: String(p.source_text ?? ""),
       target: String(p.target_text ?? ""),
     };
-    if (line.src || line.target) return { lines: [...state.lines, line] };
+    if (line.src || line.target) {
+      const lines = [...state.lines, line];
+      // Long live sessions must stay memory-bounded: drop the oldest beyond cap.
+      const bounded = lines.length > INTERP_LINE_CAP ? lines.slice(lines.length - INTERP_LINE_CAP) : lines;
+      return { lines: bounded };
+    }
   }
   return state;
 }

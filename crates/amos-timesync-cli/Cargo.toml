@@ -1,0 +1,28 @@
+[package]
+name = "amos-timesync-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos time-sync CLI: query the calibrated wall clock and perform a sync against a time source, driving the amos-timesync SyncedClock and its last-known-good state file. `--server` performs a real SNTP query (requires the `ntp` feature); otherwise the offline host clock is used, so the default build stays green."
+
+[lib]
+name = "amos_timesync_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amos-timesync-cli"
+path = "src/main.rs"
+
+[dependencies]
+amos-timesync = { path = "../amos-timesync" }
+tokio.workspace = true
+anyhow.workspace = true
+
+# Forward the real network time query: with `--features ntp`, `--server` (or
+# $AMOS_NTP_SERVER) uses the NtpTimeSource instead of the offline HostClock.
+# Default build stays offline-green (mirrors amos-appstore-cli forwarding
+# amos-appstore/live).
+[features]
+default = []
+ntp = ["amos-timesync/ntp"]

@@ -52,6 +52,10 @@ impl Default for WmState {
 
 impl WmState {
     /// Create a manager whose Launcher is bound to the Tauri main window.
+    // `WindowManager::new()` registers the Launcher synchronously, so
+    // `launcher()` is always Some here; this single documented invariant-site is
+    // allowed (P0-1), everything else in production is gated.
+    #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         let wm = WindowManager::new(); // registers + focuses the Launcher
         let launcher = wm.launcher().expect("launcher always registered");

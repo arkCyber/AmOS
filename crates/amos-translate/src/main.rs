@@ -92,6 +92,7 @@ ENV:
     AMOS_TRANSLATE_BACKEND  Provider: \"ollama\" | \"mock\" (default \"ollama\")
     AMOS_TRANSLATE_HOST     Ollama base URL (default http://localhost:11434)
     AMOS_TRANSLATE_MODEL    Ollama model (default llama3.2)
+    AMOS_TRANSLATE_API_KEY  Optional bearer token (auth-gated OpenAI-compatible hosts)
     AMOS_TRANSLATE_SOURCE   Default source language (default auto)
     AMOS_TRANSLATE_TARGET   Default target language (default zh)
     RUST_LOG                Log level, e.g. RUST_LOG=info

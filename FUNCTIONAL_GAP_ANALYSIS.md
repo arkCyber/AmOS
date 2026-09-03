@@ -1,7 +1,7 @@
 # AmOS 功能差距分析 (Functional Gap Analysis)
 
-**日期**: 2026-09-01
-**范围**: 全 workspace（amos-proto / amos-ai / amos-wm / amos-android / amos-tauri）
+**日期**: 2026-09-03
+**范围**: 全 workspace（amos-proto / amos-ai / amos-wm / amos-android / amos-tauri / amos-supervisor / amos-mail / amos-appstore 等）
 
 ---
 
@@ -24,6 +24,7 @@
 | **流式 ASR `amos-asr`** | ✅ | 2026-09-01：`StreamingRecognizer` trait（partial/hypothesis/endpoint）+ 确定性 `MockStreamingRecognizer` + `AsrPipeline`（组合本地 ASR + 远端翻译）；sherpa-onnx 后端以 `sherpa` feature 门控（需联网下载预编译库）|
 | **TTS `amos-tts`** | ✅ | 2026-09-01：`TtsProvider` trait + 确定性 `MockTtsProvider` + `PiperProvider`（`piper` feature 门控）；Tauri `tts_synthesize` 命令 → Web Audio 播放 |
 | **同传 CLI `amos-int-cli`** | ✅ | 2026-09-01：stdin 进文本、译文出，`.lang`/`.status`/`.pause`/`.resume`/`.stop` 命令；驱动 `Session` + `GrpcPipeline` |
+| **应用商店核心 `amos-appstore`** | ✅(领域内核) | 2026-09-03 新增 crate：传输无关 `AppManifest`/`Version`/`Checksum(sha256)` + `StoreProvider`(Mock) seam + `AppStore` 引擎（download→校验→install/upgrade/uninstall）+ 注册表 JSON 持久化；契约见 `docs/appstore.md` |
 | **同传 App（GUI）** | ✅ | 2026-09-01：`frontend-ts/src/components/BackendApps.tsx` 的 `InterpApp` — 语言选择、会话控制、麦克风采集（16k mono→`AmosInterp.audio`）、流式 partial/译文渲染、`🔊 朗读`（`AmosTts`）；已入 dock |
 | **全链路冒烟** | ✅ | 2026-09-01：`amos-translate/tests/full_chain.rs` 无头跑通 音频→partial→daemon 译文→TTS 音频；`scripts/gui-smoke.sh` 真机一键冒烟 |
 | 通知中心 + 快速设置 | ✅ | 下拉面板、快捷开关、亮度/音量滑块、通知列表（localStorage） |
@@ -65,7 +66,7 @@
 18. **无 OTA / 自动更新**。
 
 ### 🟡 E. 桌面 OS 级功能
-19. **设置不落盘**：`SharedStore` 仅内存 + localStorage，重启丢失（Rust 侧无磁盘持久化）。
+19. ~~**设置不落盘**~~ → **✅ 已完成（2026-09-03）**：`SharedStore`（`amos-tauri/src/store.rs`）现持久化到磁盘——每次写入写回 `AMOS_STATE_FILE`（缺省 `~/.amos/state.json`），重启可恢复且 Rust 侧可读；损坏文件降级为空并可自愈；localStorage 仅作前端缓存。测试覆盖跨实例持久化/删除/损坏容错。
 20. **文件系统无真实访问**：files 应用是 mock 静态列表 → **✅ 部分完成（2026-09-01）**：已改为 store 支撑的虚拟文件系统（建文件夹/建文本/查看/删除），但尚未接真实磁盘/Tauri `fs` 插件。
 21. ~~**快捷设置不生效**~~ → **✅ 部分完成（2026-09-01）**：深色模式与亮度现在真实生效（浅色主题 + 亮度遮罩）；wifi/蓝牙/飞行等仍为模拟开关（未接系统能力）。
 22. **无应用生命周期管理**：无后台/墓碑/冻结/进程调度。
@@ -91,7 +92,7 @@
 36. **无基准/压力/混沌测试**。
 
 ### 🟢 I. 生态 / 分发
-37. **无应用市场 / APK 安装**（只能从精选列表启动）。
+37. ~~**无应用市场 / 只能从精选列表启动**~~ → **✅ 部分完成（2026-09-03）**：应用商店**领域内核** `amos-appstore` 已落地（目录 manifest + sha256 完整性 + download→verify→install/upgrade/uninstall 引擎 + 注册表持久化，`cargo test -p amos-appstore` 18 测试通过）；**尚未**有 HTTP 目录后端、CLI、Tauri 桥接与商店 UI，前端 `APPS` 仍是编译期静态注册表（未支持动态注入已安装应用）。契约与路线图见 `docs/appstore.md`。
 38. **无开发者 SDK / API 文档站**。
 39. **CI 无发布产物**（release artifacts）。
 

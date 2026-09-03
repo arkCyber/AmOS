@@ -10,6 +10,13 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
 (`amos-tauri`), connected over a local **Unix Domain Socket (UDS)** via
 **gRPC (tonic)** for low-latency, streamed token delivery.
 
+> ⚠️ **非审定软件 (not safety-critical / not certified).** Amos is a research /
+> prototype OS. Although the code is developed with safety-critical engineering
+> discipline (see `docs/AEROSPACE_SOFTWARE_AUDIT.md` and
+> `docs/TRACEABILITY_MATRIX.md`), it is **not** qualified to DO-178C or any
+> aviation/mission-safety standard and must not be used to control
+> flight/medical/DAL-A systems.
+
 ```
 [ Tauri WebView (TS/JS) ]
         │  ▲  Tauri Command / Event (async, streaming)
@@ -36,6 +43,9 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-ai/                  # AI CLI daemon (gRPC *server* over UDS)
     ├── amos-wm/                  # window-manager state machine (multi-window)
     ├── amos-android/             # Waydroid/APK compat (gRPC + icon extraction)
+    ├── amos-appstore/            # app-store core: catalog/Version + sha256 integrity + install engine (docs/appstore.md)
+    ├── amos-timesync/            # network wall-clock calibration (TimeSource seam + SyncedClock + periodic timekeeper)
+    ├── amos-timesync-cli/        # query/sync the calibrated clock (now/status/sync over the shared state file)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -43,6 +53,23 @@ The `.proto` file is the single truth: editing it regenerates Rust on **both**
 sides on the next `cargo build`, so the wire contract can never drift.
 
 ## Build & run
+
+```bash
+# Production-style boot: start the backends the UI needs, honoring the persisted
+# AI-provider choice (last selection survives restart). amos-ai resumes the saved
+# local/cloud backend; translate starts (mock unless env overridden).
+scripts/run-backends.sh
+
+# Then launch the System UI (desktop dev build, embedded UI, no fixed port)
+cargo run -p amos-tauri
+```
+
+> Use the **embedded (release)** UI: the *debug* binary loads `build.devUrl`
+> (`http://localhost:1420`), which can collide with another app. To view **this**
+> project's UI reliably, run `make run-ui-release` (builds release, embeds dist,
+> binds no port).
+
+Manual (two terminals):
 
 ```bash
 # 1. Start the AI daemon (blocking; serves /tmp/amos-ai.sock by default)
@@ -58,6 +85,44 @@ Override the socket path for both sides with the `AMOS_SOCKET` env var:
 AMOS_SOCKET=/tmp/amos-test.sock cargo run -p amos-ai
 AMOS_SOCKET=/tmp/amos-test.sock cargo run -p amos-tauri
 ```
+
+## Backend operations (ops cheatsheet)
+
+Single-command controls for the local ↔ cloud (DeepSeek) inference + translate backends:
+
+```bash
+# One-click switch AI backend and persist the choice (0600 key file on cloud).
+scripts/ai-backend.sh local                          # local deterministic mock
+scripts/ai-backend.sh deepseek "$AMOS_API_KEY"       # DeepSeek cloud (api)
+scripts/ai-backend.sh                                # resume last persisted choice
+
+# Start the backends the UI needs (honors persisted choice); optionally gate on
+# RPC readiness.
+scripts/run-backends.sh
+scripts/run-backends.sh --health
+
+# Run amos-ai + amos-translate under amos-supervisor (crash auto-restart,
+# SIGUSR1 hot-restart, graceful stop). Dry-run print the generated spec first.
+scripts/supervise-backends.sh --print-config
+scripts/supervise-backends.sh
+
+# RPC readiness probe: both daemons must answer get_status running=true.
+make health
+
+# Secrets: cloud keys are stored (0600) at ~/.amos/ai.key, never in the UI store
+# or repo. Provide new keys via AMOS_API_KEY / the switch command; rotate leaked
+# keys at the provider console.
+```
+
+Live smoke (connect to a *running* daemon and exercise the real RPC):
+
+```bash
+cargo run -p amos-ai --example chat_once -- /tmp/amos-ai.sock "你好"
+cargo run -p amos-translate --example translate_once -- /tmp/amos-translate.sock "Hello" en zh
+cargo run -p amos-ai --example status_once -- /tmp/amos-ai.sock
+```
+
+Logs: `/tmp/amos-ai-daemon.log`, `/tmp/amos-translate.log`, `/tmp/amos-ui.log`.
 
 Release build for the whole OS stack (CLI + UI in one go):
 
@@ -151,7 +216,9 @@ events → streaming tokens + semantic UiCards), same spirit as the single-view 
 
 Each app is a React component registered in `APPS` (apps.tsx). Functionality
 included: calculator, clock, notes, messages, settings (persisted), photos,
-dialer, music player, weather, maps, files, camera, android, AI, and 同传.
+dialer, music player, weather, maps, files, camera, android, AI, 同传, and an
+**App Store** (`store` — browse the catalog and install/update/uninstall apps,
+see `docs/appstore.md`).
 
 ### Home screen editing (iOS style)
 
@@ -245,6 +312,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
 - [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility
+- [docs/appstore.md](./docs/appstore.md) — App-store core: catalog/package JSON publish contract + download→verify→install (developer onboarding)
 
 ## License
 

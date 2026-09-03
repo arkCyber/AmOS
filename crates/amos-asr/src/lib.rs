@@ -20,6 +20,13 @@
 //!                        AsrEvent::Partial/Final --> amos_int::Session
 //! ```
 
+// P0-1 gate: production code must not panic on programmer error. Test code is
+// exempt (assertions/unwrap are idiomatic there).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod pipeline;
 pub mod recognizer;
 

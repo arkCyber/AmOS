@@ -16,7 +16,8 @@ export function useFocusTrap(active: boolean, ref: RefObject<HTMLElement | null>
     if (!active || !ref.current) return;
     const scope = ref.current;
     const f = focusables(scope);
-    if (f.length) f[0].focus();
+    const firstFocus = f[0];
+    if (firstFocus) firstFocus.focus();
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -29,6 +30,7 @@ export function useFocusTrap(active: boolean, ref: RefObject<HTMLElement | null>
       if (!list.length) return;
       const first = list[0];
       const last = list[list.length - 1];
+      if (!first || !last) return; // non-empty by the guard above; defensive
       const cur = document.activeElement as HTMLElement | null;
       const inside = cur ? list.includes(cur) : false;
       if (e.shiftKey && (!inside || cur === first)) {

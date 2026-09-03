@@ -132,7 +132,8 @@ impl Pipeline for MockPipeline {
         if chunk.is_empty() {
             return Ok(out);
         }
-        let mut n = self.chunks.lock().unwrap();
+        // Poison-safe lock: a panicked thread must not take the session down.
+        let mut n = self.chunks.lock().unwrap_or_else(|p| p.into_inner());
         *n += 1;
         if *n == 1 {
             out.push(AsrEvent::Partial(PartialSegment {

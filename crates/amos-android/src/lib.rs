@@ -5,6 +5,12 @@
 //! gRPC service (`AndroidManager`) that the Tauri core consumes. App surfaces
 //! are composited into Tauri windows via Wayland / DMA-BUF (see docs).
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod controller;
 pub mod manager;
 pub mod png;

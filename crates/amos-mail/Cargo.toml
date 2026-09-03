@@ -1,0 +1,41 @@
+[package]
+name = "amos-mail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos email client core engine: transport-agnostic mail models + a pluggable MailProvider trait with a deterministic in-memory MockMailProvider. The same engine drives a future mail CLI (amos-mail-cli) and the Tauri System UI bridge; real SMTP/IMAP backends plug in behind the MailProvider seam."
+
+[lib]
+name = "amos_mail"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = "1"
+tokio.workspace = true
+async-trait = "0.1"
+thiserror = "1"
+
+# Real network SMTP sending (lettre), gated behind the `live` feature so the
+# default workspace build stays light and offline-green.
+lettre = { version = "0.11", optional = true, default-features = false, features = [
+    "smtp-transport",
+    "builder",
+    "rustls-tls",
+] }
+
+# TLS for the IMAP reader (imap.gmail.com:993 etc.), optional + feature-gated.
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# Future real IMAP reading backend (imap-next) plugs in behind `live` too.
+[features]
+default = []
+live = [
+    "dep:lettre",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+]

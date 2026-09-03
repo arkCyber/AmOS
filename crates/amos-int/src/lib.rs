@@ -28,6 +28,12 @@
 //! * Pure event I/O: push [`SessionEvent`]s in, read [`InterpretationOutput`]s
 //!   out through a channel. No I/O happens inside the engine itself.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod config;
 pub mod error;
 pub mod event;

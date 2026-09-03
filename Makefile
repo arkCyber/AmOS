@@ -1,4 +1,4 @@
-.PHONY: all build test check lint smoke gated-check run-ai run-ui mobile-init mobile-check clean
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check clean
 
 all: build
 
@@ -10,11 +10,20 @@ build:
 # crate's tests/ dir automatically (incl. crates/amos-tauri/tests/ai_daemon_e2e.rs).
 test:
 	cargo test --workspace
+	# TS System-UI: bun-iso-test.mjs runs pure files in one process and each DOM
+	# test file in its OWN process (happy-dom global windows are per-process).
 	cd crates/amos-tauri/frontend-ts && bun run test
 
 # Fast check of the React/TS System-UI (tests + typecheck).
 check:
 	cd crates/amos-tauri/frontend-ts && bun run check
+
+# TS core-lib coverage gate (P2-1): line coverage over src/lib/** must stay >= the
+# threshold enforced by scripts/lib-coverage-gate.mjs (default 80%). Runs over the
+# pure (non-DOM) files so no shared happy-dom process is involved (DOM files are
+# already covered by correctness in `make test`).
+cov:
+	cd crates/amos-tauri/frontend-ts && bun run coverage:gate
 
 # Headless end-to-end smokes: start a mock daemon and drive the real chain.
 smoke:
@@ -27,21 +36,31 @@ smoke:
 sup-smoke:
 	bash scripts/supervisor-smoke.sh
 
+# Time-sync headless smoke: supervisor (timesync) calibrates + persists state,
+# propagates AMOS_TIMESYNC_STATE to a child, and the amos-timesync-cli reads the
+# calibrated clock; graceful SIGINT stop with no orphans.
+timesync-smoke:
+	bash scripts/timesync-smoke.sh
+
 # Local-model end-to-end: Piper TTS -> sherpa streaming ASR -> daemon translate.
 # (Piper + sherpa are real; translation uses a deterministic mock daemon unless
 # AMOS_TRANSLATE_SOCKET points at a live daemon.)
 e2e-local:
 	bash scripts/e2e-local-models.sh
 
-# Compile the gated native backends (sherpa ASR / Piper TTS) + the sherpa examples
-# + the amos-tauri native bridge (sherpa-asr + piper-tts together). Requires
-# network to download prebuilt native libs — run on a networked machine.
+# Compile the gated native backends (sherpa ASR / Piper TTS / SNTP time sync) +
+# the sherpa examples + the amos-tauri native bridge (sherpa-asr + piper-tts
+# together). Requires network to download prebuilt native libs — run on a
+# networked machine.
 gated-check:
 	cargo build -p amos-asr --features sherpa
 	cargo build -p amos-asr --features sherpa --example sherpa_asr
 	cargo build -p amos-asr --features sherpa --example sherpa_session
 	cargo build -p amos-tts --features piper
 	cargo build -p amos-tts --features piper --example piper_tts
+	cargo build -p amos-timesync --features ntp --example ntp_probe
+	cargo build -p amos-timesync-cli --features ntp
+	cargo build -p amos-supervisor --features timesync
 	cargo build -p amos-tauri --features sherpa-asr,piper-tts
 
 # Production gate: formatting + clippy must be clean; TS shells must typecheck.
@@ -60,6 +79,20 @@ run-ui:
 # blank/white window that appears when the dev binary can't reach :5173).
 run-ui-dev:
 	bash scripts/run-gui-dev.sh
+
+# Production boot: start backends (AI honors the persisted local/cloud choice)
+# + translate, wait until both UDS sockets are ready. Then: cargo run -p amos-tauri
+run-backends:
+	bash scripts/run-backends.sh
+
+# Build & launch the EMBEDDED (release) System UI. The debug binary loads
+# devUrl (localhost:1420) and can collide with another app; use this target.
+run-ui-release:
+	bash scripts/run-ui-release.sh
+
+# RPC readiness probe: both daemons must answer get_status running=true.
+health:
+	bash scripts/health-backends.sh
 
 # Print the mobile-targets init guide (requires Android SDK / Xcode on a real
 # machine; see docs/mobile-targets.md for the exact commands).

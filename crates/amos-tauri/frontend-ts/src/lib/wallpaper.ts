@@ -30,7 +30,8 @@ export function isCustomWallpaper(w: string): boolean {
 export function resolveWallpaper(dark: boolean, choice: string | undefined): string {
   if (choice && isCustomWallpaper(choice)) return choice;
   const id = choice && WALLPAPER_FILES[choice] ? choice : dark ? "dark" : "light";
-  return WALLPAPER_FILES[id];
+  // id is always a known built-in key (choice validated above, or dark/light).
+  return WALLPAPER_FILES[id] ?? "wallpaper-dark.png";
 }
 
 /** Display methods: alpha / blur / saturation / brightness CSS for the layer. */
@@ -53,5 +54,9 @@ export function isBgMode(id: string | undefined): id is BgModeId {
 }
 export function bgMode(id: string | undefined): BgStyle {
   const m = BACKGROUND_MODES.find((x) => x.id === id);
-  return m ? m.style : BACKGROUND_MODES[0].style;
+  if (m) return m.style;
+  const fallback = BACKGROUND_MODES[0];
+  return fallback
+    ? fallback.style
+    : { alpha: 0.58, blur: 9, sat: 0.92, bright: 1.02 }; // ghost default if list empty
 }

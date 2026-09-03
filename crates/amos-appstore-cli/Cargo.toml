@@ -1,0 +1,31 @@
+[package]
+name = "amos-appstore-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos app-store CLI: drives an amos_appstore::AppStore over the default offline MockStoreProvider to browse the catalog and install/upgrade/uninstall apps from the terminal. A future real HTTP backend slots in behind the same StoreProvider seam with no CLI changes."
+
+[lib]
+name = "amos_appstore_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amos-appstore-cli"
+path = "src/main.rs"
+
+[dependencies]
+amos-appstore = { path = "../amos-appstore" }
+tokio.workspace = true
+anyhow.workspace = true
+
+# Forward the real HTTP capability: with `--features live`, `--catalog <URL>`
+# drives the HttpStoreProvider (remote catalog + package downloads) instead of
+# the offline demo catalog. Default build stays offline-green (mirrors
+# amos-mail-cli forwarding amos-mail/live).
+[features]
+default = []
+live = ["amos-appstore/live"]
+
+[dev-dependencies]
+serde_json = "1"

@@ -14,6 +14,14 @@ use tokio::sync::RwLock;
 /// Unique session identifier.
 pub type SessionId = String;
 
+/// One conversation turn recorded on a session (appended only once a turn fully
+/// completes, so it never sees partial streaming state).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Turn {
+    pub role: String, // "user" | "assistant"
+    pub text: String,
+}
+
 /// A single inference session's metadata and context.
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
@@ -38,6 +46,9 @@ pub struct SessionMetadata {
 
     /// Whether the session has been explicitly cancelled.
     pub cancelled: bool,
+
+    /// Completed conversation turns (bounded; oldest dropped beyond the cap).
+    pub history: Vec<Turn>,
 }
 
 impl SessionMetadata {
@@ -60,7 +71,20 @@ impl SessionMetadata {
     pub fn add_tokens(&mut self, count: usize) {
         self.tokens_generated += count;
     }
+
+    /// Append one completed conversation turn, bounding history to the newest
+    /// `SESSION_HISTORY_CAP` turns (dropping the oldest).
+    pub fn append_turn(&mut self, role: String, text: String) {
+        self.history.push(Turn { role, text });
+        if self.history.len() > SESSION_HISTORY_CAP {
+            self.history
+                .drain(0..self.history.len() - SESSION_HISTORY_CAP);
+        }
+    }
 }
+
+/// Max completed turns kept per session.
+pub const SESSION_HISTORY_CAP: usize = 200;
 
 /// Manages the lifecycle of inference sessions.
 pub struct SessionManager {
@@ -97,6 +121,7 @@ impl SessionManager {
             context: HashMap::new(),
             tokens_generated: 0,
             cancelled: false,
+            history: Vec::new(),
         };
 
         let mut sessions = self.sessions.write().await;
@@ -123,6 +148,7 @@ impl SessionManager {
                 context: HashMap::new(),
                 tokens_generated: 0,
                 cancelled: false,
+                history: Vec::new(),
             },
         );
         tracing::debug!("created session (keyed): {}", id);
@@ -165,6 +191,14 @@ impl SessionManager {
         sessions
             .remove(id)
             .ok_or_else(|| format!("session not found: {}", id))
+    }
+
+    /// Remove every tracked session, returning how many were removed.
+    pub async fn clear_all(&self) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let n = sessions.len();
+        sessions.clear();
+        n
     }
 
     /// Get all active sessions.
@@ -217,6 +251,13 @@ impl SessionManager {
                 self.cleanup_stale().await;
             }
         })
+    }
+
+    /// A sane cleanup cadence derived from the timeout (half of it, min 1s) so a
+    /// stale session is reaped within ~1.5× the inactivity timeout.
+    pub fn cleanup_interval(&self) -> Duration {
+        let secs = self.session_timeout.as_secs().max(2) / 2;
+        Duration::from_secs(secs.max(1))
     }
 
     /// Persist all active sessions to `path` as JSON (atomic write).
@@ -279,6 +320,9 @@ struct StoredSession {
     context: HashMap<String, String>,
     tokens_generated: usize,
     cancelled: bool,
+    /// Completed turns (missing on pre-history files => default empty).
+    #[serde(default)]
+    history: Vec<Turn>,
 }
 
 impl From<&SessionMetadata> for StoredSession {
@@ -292,6 +336,7 @@ impl From<&SessionMetadata> for StoredSession {
             context: s.context.clone(),
             tokens_generated: s.tokens_generated,
             cancelled: s.cancelled,
+            history: s.history.clone(),
         }
     }
 }
@@ -311,6 +356,7 @@ impl StoredSession {
             context: self.context,
             tokens_generated: self.tokens_generated,
             cancelled: self.cancelled,
+            history: self.history,
         }
     }
 }
@@ -360,6 +406,53 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let removed = manager.cleanup_stale().await;
         assert_eq!(removed, 1);
+    }
+
+    #[tokio::test]
+    async fn touch_keeps_active_session_alive() {
+        let manager = SessionManager::new(Duration::from_millis(120));
+        let id = manager.create("model1".to_string()).await;
+        // Activity before the timeout expires keeps the session from being reaped.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        manager.update(&id, |s| s.touch()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            manager.cleanup_stale().await,
+            0,
+            "touched session stays alive"
+        );
+        // Once it actually goes idle past the timeout it is reaped.
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        assert_eq!(manager.cleanup_stale().await, 1);
+    }
+
+    #[tokio::test]
+    async fn background_sweeper_reaps_stale_periodically() {
+        let manager = Arc::new(SessionManager::new(Duration::from_millis(120)));
+        let _id = manager.create("model1".to_string()).await;
+        let _sweeper = manager
+            .clone()
+            .spawn_cleanup_task(Duration::from_millis(30));
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert_eq!(
+            manager.count_active().await,
+            0,
+            "sweeper removed the stale session"
+        );
+    }
+
+    #[test]
+    fn cleanup_interval_is_half_the_timeout_and_never_zero() {
+        // Sub-second timeouts still get a ≥1s cadence.
+        assert_eq!(
+            SessionManager::new(Duration::from_millis(100)).cleanup_interval(),
+            Duration::from_secs(1)
+        );
+        // 600s timeout → sweep every 300s.
+        assert_eq!(
+            SessionManager::new(Duration::from_secs(600)).cleanup_interval(),
+            Duration::from_secs(300)
+        );
     }
 
     #[tokio::test]

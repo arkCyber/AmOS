@@ -26,8 +26,8 @@ function withStorage(store: Map<string, string>) {
 describe("core shell", () => {
   test("default layout puts known dock apps on the dock, the rest on a page", () => {
     const l = defaultLayout(["settings", "clock", "ai", "camera"]);
-    expect(l.dock).toEqual(["camera", "settings", "ai"]);
-    expect(l.page).toEqual(["clock"]);
+    expect(l.dock).toEqual(["ai"]); // ai stays docked; camera & settings are page apps
+    expect(l.page).toEqual(["settings", "clock", "camera"]);
     expect(l.hidden).toEqual([]);
   });
 
@@ -91,12 +91,8 @@ describe("core shell", () => {
   test("getLayout falls back to default and repairs/merges stored layout", () => {
     const store = new Map<string, string>();
     withStorage(store);
-    // nothing stored -> default dock
-    expect(getLayout(["settings", "clock", "ai", "camera"]).dock).toEqual([
-      "camera",
-      "settings",
-      "ai",
-    ]);
+    // nothing stored -> default dock (camera/settings are on the page now)
+    expect(getLayout(["settings", "clock", "ai", "camera"]).dock).toEqual(["ai"]);
     // stored layout: unknown id is dropped; new available ids are appended to page
     store.set(
       "amos.home.layout",

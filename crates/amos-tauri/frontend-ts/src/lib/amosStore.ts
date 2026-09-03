@@ -1,8 +1,7 @@
-/**
- * Typed access to the *same* `amos.*` shared-store keys the legacy vanilla UI
+/** Typed access to the *same* `amos.*` shared-store keys the legacy vanilla UI
  * uses (amos.home.layout / amos.recents / …), so both UIs interoperate and, in
- * the Tauri shell, sync across windows via window.Amos (if present).
- */
+ * the Tauri shell, sync across windows via window.Amos (if present). */
+import { bridged, systemStoreSnapshot } from "./backend";
 export interface HomeLayout {
   page: string[];
   dock: string[];
@@ -12,7 +11,7 @@ export interface HomeLayout {
 export const LAYOUT_KEY = "amos.home.layout";
 export const RECENTS_KEY = "amos.recents";
 
-export const DEFAULT_DOCK = ["phone", "messages", "camera", "settings", "ai", "interpreter"];
+export const DEFAULT_DOCK = ["phone", "messages", "ai", "interpreter", "mail"];
 
 declare global {
   interface Window {
@@ -24,12 +23,43 @@ declare global {
   }
 }
 
+/** Quarantine key that keeps the raw bytes of a corrupt value so a later
+ * "seed + write" cannot silently destroy them. Bounded: one slot per key. */
+const CORRUPT_SUFFIX = ".corrupt";
+
+/**
+ * Read + parse a stored value, returning `fallback` when absent.
+ *
+ * When the stored JSON is *corrupt* (not merely absent) we do NOT silently drop
+ * it: we log a warning and quarantine a copy of the original raw text under
+ * `${key}.corrupt`. This keeps corrupt user data recoverable even though the
+ * caller then falls back to a default / seed value.
+ */
 function readJson<T>(key: string, fallback: T): T {
+  let raw: string | null;
   try {
-    const raw = window.localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : fallback;
+    raw = window.localStorage.getItem(key);
   } catch {
+    return fallback; // storage unavailable (e.g. private mode) — not corruption
+  }
+  if (raw == null) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    quarantineCorrupt(key, raw);
     return fallback;
+  }
+}
+
+function quarantineCorrupt(key: string, raw: string): void {
+  const backupKey = `${key}${CORRUPT_SUFFIX}`;
+  try {
+    window.localStorage.setItem(backupKey, raw);
+    console.warn(
+      `[amos-store] corrupt value for "${key}"; original preserved at "${backupKey}"`,
+    );
+  } catch {
+    console.warn(`[amos-store] corrupt value for "${key}" (and it could not be backed up)`);
   }
 }
 
@@ -68,6 +98,23 @@ export function getLayout(available: string[]): HomeLayout {
 
 export function saveLayout(layout: HomeLayout): void {
   writeJson(LAYOUT_KEY, layout);
+}
+
+/**
+ * On boot, pull the durable Rust system store into localStorage. The Rust side
+ * is authoritative after every write-through (see amos-tauri/src/store.rs), so
+ * this recovers settings/notifications/layout from disk even if localStorage
+ * was cleared. Best-effort: no-ops outside the Tauri shell.
+ */
+export async function hydrateFromSystemStore(): Promise<void> {
+  if (!bridged()) return;
+  const snap = await systemStoreSnapshot();
+  if (!snap) return;
+  try {
+    for (const [key, value] of Object.entries(snap)) window.localStorage.setItem(key, value);
+  } catch {
+    /* storage unavailable — ignore */
+  }
 }
 
 /* ---- Home layout editing (pure) ---- */

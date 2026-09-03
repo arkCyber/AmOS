@@ -11,7 +11,8 @@ use std::time::Duration;
 use crate::wm::{inject_context, SystemContext, WmState};
 use amos_proto::ai_agent::client_message::Payload;
 use amos_proto::ai_agent::{
-    ai_agent_client::AiAgentClient, AgentRequest, ClientMessage, StatusRequest,
+    ai_agent_client::AiAgentClient, AgentRequest, ClearSessionsRequest, ClientMessage,
+    GetHistoryRequest, ListSessionsRequest, RemoveSessionRequest, StatusRequest,
 };
 use amos_proto::android_compat::{
     android_manager_client::AndroidManagerClient, AppIconRequest, AppLaunchRequest, Empty,
@@ -29,12 +30,12 @@ use tower::service_fn;
 /// each audit entry to this System UI client.
 fn with_client_id<T>(payload: T) -> tonic::Request<T> {
     let mut req = tonic::Request::new(payload);
-    req.metadata_mut().insert(
-        amos_proto::CLIENT_ID_HEADER,
-        amos_proto::DEFAULT_CLIENT_ID
-            .parse()
-            .expect("static header value"),
-    );
+    // `system-ui` always parses; if it ever didn't we simply omit the header
+    // (daemon treats the request as anonymous) rather than panic.
+    if let Ok(value) = amos_proto::DEFAULT_CLIENT_ID.parse() {
+        req.metadata_mut()
+            .insert(amos_proto::CLIENT_ID_HEADER, value);
+    }
     req
 }
 
@@ -131,6 +132,92 @@ pub struct AiBridge {
     active_bidi: Arc<Mutex<Option<mpsc::Sender<ClientMessage>>>>,
 }
 
+/// Resolve the Amos repo root (hosts `scripts/ai-backend.sh` + the daemon bin):
+/// `AMOS_ROOT` env first, else derive from the running binary's location.
+fn repo_root() -> std::path::PathBuf {
+    if let Ok(r) = std::env::var("AMOS_ROOT") {
+        if !r.is_empty() {
+            return std::path::PathBuf::from(r);
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Where the cloud AI key is persisted (0600) so it never lives in the webview
+/// store and can be reused on later switches/resumes.
+fn creds_path() -> Option<std::path::PathBuf> {
+    if let Ok(f) = std::env::var("AMOS_CRED_FILE") {
+        if !f.is_empty() {
+            return Some(std::path::PathBuf::from(f));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| std::path::PathBuf::from(h).join(".amos").join("ai.key"))
+}
+
+/// One-click backend switch: runs `scripts/ai-backend.sh` which stops the current
+/// amos-ai and starts it with the selected provider (local mock | DeepSeek api).
+#[tauri::command]
+pub async fn ai_backend_switch(provider: String, api_key: String) -> Result<String, String> {
+    let root = repo_root();
+    let script = root.join("scripts").join("ai-backend.sh");
+    let script_s = script.display().to_string();
+    let root_s = root.display().to_string();
+    let cred = creds_path();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // Resolve an effective key: caller-provided wins and is persisted;
+        // otherwise fall back to the 0600 key file (so switching cloud later,
+        // or resuming after a restart, needs no re-entry).
+        let mut effective = api_key;
+        if provider == "deepseek" {
+            if !effective.is_empty() {
+                if let Some(path) = cred.clone() {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(&path, effective.as_bytes());
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            } else if let Some(path) = cred {
+                if let Ok(s) = std::fs::read_to_string(&path) {
+                    effective = s.trim().to_string();
+                }
+            }
+        }
+
+        let out = std::process::Command::new("bash")
+            .arg(&script_s)
+            .arg(&provider)
+            .arg(&effective)
+            .env("AMOS_ROOT", &root_s)
+            .env("AMOS_API_KEY", &effective)
+            .output();
+        match out {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                if o.status.success() {
+                    Ok(stdout.trim().to_string())
+                } else {
+                    Err(format!("{stdout}\n{stderr}").trim().to_string())
+                }
+            }
+            Err(e) => Err(format!("failed to run {script_s}: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("switch task join error: {e}"))?
+}
+
 impl Default for AiBridge {
     fn default() -> Self {
         Self::new()
@@ -207,6 +294,108 @@ pub struct DaemonStatus {
     pub uptime_seconds: i64,
     pub gpu_util: u32,
     pub active_sessions: u32,
+}
+
+/// Serializable mirror of the daemon `SessionInfo` so the frontend can render a
+/// lightweight session list (prost structs are not `Serialize`).
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub model: String,
+    pub tokens_generated: u64,
+    pub cancelled: bool,
+    pub age_seconds: u64,
+}
+
+/// Serializable mirror of a session's completed conversation history.
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryTurn {
+    pub role: String,
+    pub text: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionHistory {
+    pub session_id: String,
+    pub model: String,
+    pub tokens_generated: u64,
+    pub cancelled: bool,
+    pub turns: Vec<HistoryTurn>,
+}
+
+/// Fetch one session's completed conversation history (headless).
+pub async fn get_session_history(bridge: &AiBridge, id: &str) -> Result<SessionHistory, String> {
+    let mut attempt = 0;
+    loop {
+        let mut client = bridge.connect().await?;
+        match client
+            .get_history(with_client_id(GetHistoryRequest {
+                session_id: id.to_string(),
+            }))
+            .await
+        {
+            Ok(reply) => {
+                let r = reply.into_inner();
+                return Ok(SessionHistory {
+                    session_id: r.session_id,
+                    model: r.model,
+                    tokens_generated: r.tokens_generated,
+                    cancelled: r.cancelled,
+                    turns: r
+                        .turns
+                        .into_iter()
+                        .map(|t| HistoryTurn {
+                            role: t.role,
+                            text: t.text,
+                        })
+                        .collect(),
+                });
+            }
+            Err(e) => {
+                attempt += 1;
+                bridge.invalidate();
+                if attempt >= 2 {
+                    return Err(e.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// List the daemon's tracked sessions (most recently active first), headless so
+/// it can be unit/e2e tested like `fetch_status`.
+pub async fn list_sessions(bridge: &AiBridge) -> Result<Vec<SessionInfo>, String> {
+    let mut attempt = 0;
+    loop {
+        let mut client = bridge.connect().await?;
+        match client
+            .list_sessions(with_client_id(ListSessionsRequest {}))
+            .await
+        {
+            Ok(reply) => {
+                let r = reply.into_inner();
+                return Ok(r
+                    .sessions
+                    .into_iter()
+                    .map(|s| SessionInfo {
+                        session_id: s.session_id,
+                        model: s.model,
+                        tokens_generated: s.tokens_generated,
+                        cancelled: s.cancelled,
+                        age_seconds: s.age_seconds,
+                    })
+                    .collect());
+            }
+            Err(e) => {
+                attempt += 1;
+                bridge.invalidate();
+                if attempt >= 2 {
+                    return Err(e.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// Probe the daemon, retrying once after reconnecting (in case it restarted).
@@ -296,6 +485,82 @@ pub async fn ask_ai_agent(
 #[tauri::command]
 pub async fn get_status(state: State<'_, AiBridge>) -> Result<DaemonStatus, String> {
     fetch_status(&state).await
+}
+
+/// Remove every tracked daemon session; returns how many were cleared.
+pub async fn clear_sessions(bridge: &AiBridge) -> Result<u32, String> {
+    let mut attempt = 0;
+    loop {
+        let mut client = bridge.connect().await?;
+        match client
+            .clear_sessions(with_client_id(ClearSessionsRequest {}))
+            .await
+        {
+            Ok(reply) => return Ok(reply.into_inner().removed),
+            Err(e) => {
+                attempt += 1;
+                bridge.invalidate();
+                if attempt >= 2 {
+                    return Err(e.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// Tauri command: return the daemon's tracked sessions (for a session manager UI).
+#[tauri::command]
+pub async fn get_ai_sessions(state: State<'_, AiBridge>) -> Result<Vec<SessionInfo>, String> {
+    list_sessions(&state).await
+}
+
+/// Remove a single tracked daemon session by id.
+async fn remove_session(bridge: &AiBridge, id: &str) -> Result<bool, String> {
+    let mut attempt = 0;
+    loop {
+        let mut client = bridge.connect().await?;
+        match client
+            .remove_session(with_client_id(RemoveSessionRequest {
+                session_id: id.to_string(),
+            }))
+            .await
+        {
+            Ok(reply) => return Ok(reply.into_inner().removed),
+            Err(e) => {
+                attempt += 1;
+                bridge.invalidate();
+                if attempt >= 2 {
+                    return Err(e.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// Tauri command: remove a single tracked daemon session.
+#[tauri::command]
+pub async fn remove_ai_session(
+    state: State<'_, AiBridge>,
+    session_id: String,
+) -> Result<bool, String> {
+    remove_session(&state, &session_id).await
+}
+
+/// Tauri command: fetch one session's completed conversation history.
+#[tauri::command]
+pub async fn get_ai_session_history(
+    state: State<'_, AiBridge>,
+    session_id: String,
+) -> Result<SessionHistory, String> {
+    get_session_history(&state, &session_id).await
+}
+
+/// Tauri command: clear all tracked daemon sessions.
+#[tauri::command]
+pub async fn clear_ai_sessions(state: State<'_, AiBridge>) -> Result<u32, String> {
+    clear_sessions(&state).await
 }
 
 /// Tauri command: open a *bidirectional* `Chat` stream, push the opening prompt,

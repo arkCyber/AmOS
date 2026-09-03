@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { chip, btn } from "./ui";
 import {
   bridged,
   cancelAiSession,
   conversationId,
+  newConversation,
   getAiStatus,
   interpretAudio,
   interpretPause,
@@ -11,12 +13,20 @@ import {
   interpretStart,
   interpretStop,
   interpretText,
+  listSessions,
+  clearSessions,
+  removeSession,
+  getSessionHistory,
   sendChat,
   subscribe,
+  type AiSessionInfo,
+  type HistoryTurn,
 } from "../lib/backend";
 import { frameToChunk } from "../lib/audio";
 import { speakText } from "../lib/realtimeTts";
+import { capTail } from "../lib/bounded";
 import VoiceMicButton from "./VoiceMicButton";
+import { useCapability } from "./CapabilityGate";
 import { cardOf, sessionMetaOf, tokenOf, type AiCard } from "../lib/stream";
 import {
   clearSegs,
@@ -28,10 +38,15 @@ import {
   readPrefs,
   saveSegs,
   segOf,
+  transcriptText,
   writePrefs,
   type InterpPrefs,
   type InterpSeg,
 } from "../lib/interp";
+
+/* Bounds for long-lived in-session lists (deterministic-memory guard). */
+const CHAT_MSG_CAP = 200; // AI conversation bubbles kept in memory
+const SEG_CAP = 200; // interpreter transcript segments kept in memory
 
 /* Semantic UiCard header accents per intent kind (fallback = generic purple). */
 const CARD_COLORS: Record<string, string> = {
@@ -89,6 +104,33 @@ export function AiApp() {
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [meta, setMeta] = useState("");
+  const [copiedReply, setCopiedReply] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [sessions, setSessions] = useState<AiSessionInfo[] | null>(null);
+  const [sessOpen, setSessOpen] = useState(false);
+  const [showHist, setShowHist] = useState<string | null>(null);
+  const [histories, setHistories] = useState<Record<string, HistoryTurn[] | "loading">>({});
+  const toggleSessions = async (): Promise<void> => {
+    const open = !sessOpen;
+    setSessOpen(open);
+    if (open && sessions === null) {
+      const res = await listSessions();
+      if (Array.isArray(res)) setSessions(res);
+    }
+  };
+  const toggleHist = async (id: string): Promise<void> => {
+    if (showHist === id) {
+      setShowHist(null);
+      return;
+    }
+    setShowHist(id);
+    if (histories[id] === undefined) {
+      setHistories((h) => ({ ...h, [id]: "loading" as const }));
+      const res = await getSessionHistory(id);
+      const turns = res && Array.isArray(res.turns) ? res.turns : [];
+      setHistories((h) => ({ ...h, [id]: turns }));
+    }
+  };
   const [busy, setBusy] = useState(false);
   const [msgs, setMsgs] = useState<AiMsg[]>([]);
 
@@ -156,16 +198,21 @@ export function AiApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [online]);
 
-  const send = async () => {
-    const v = q.trim();
+  const send = async (force?: string) => {
+    const v = (force ?? q).trim();
     if (!v || busyRef.current) return;
     if (!onlineRef.current) {
       // Offline: echo an agent note so users see why nothing streams.
-      setMsgs((prev) => [
-        ...prev,
-        { id: uid("u"), role: "user", text: v, cards: [] },
-        { id: uid("a"), role: "agent", text: t("backend.offline"), cards: [] },
-      ]);
+      setMsgs((prev) =>
+        capTail(
+          [
+            ...prev,
+            { id: uid("u"), role: "user", text: v, cards: [] },
+            { id: uid("a"), role: "agent", text: t("backend.offline"), cards: [] },
+          ],
+          CHAT_MSG_CAP,
+        ),
+      );
       setQ("");
       return;
     }
@@ -175,18 +222,38 @@ export function AiApp() {
     abortedRef.current = false;
     setBusyBoth(true);
     setMeta("");
-    setMsgs((prev) => [
-      ...prev,
-      { id: uid("u"), role: "user", text: v, cards: [] },
-      { id: agent, role: "agent", text: "", cards: [] },
-    ]);
-    await sendChat(v, conversationId());
+    setMsgs((prev) =>
+      capTail(
+        [
+          ...prev,
+          { id: uid("u"), role: "user", text: v, cards: [] },
+          { id: agent, role: "agent", text: "", cards: [] },
+        ],
+        CHAT_MSG_CAP,
+      ),
+    );
+    const r = await sendChat(v, conversationId());
+    // If the command failed to reach the daemon (r == null) no `ai-chat-complete`
+    // event will ever fire — clear the busy state so the UI never sticks on "⏹ 停止".
+    if (r == null && !abortedRef.current) {
+      curIdRef.current = null;
+      setBusyBoth(false);
+      setMeta(t("backend.offline"));
+    }
   };
 
   const stop = () => {
     if (!busyRef.current) return;
     abortedRef.current = true;
-    void cancelAiSession();
+    const r = cancelAiSession();
+    // Best-effort: if cancellation couldn't reach the daemon, drop busy ourselves.
+    void r.then((res) => {
+      if (res == null) {
+        curIdRef.current = null;
+        setBusyBoth(false);
+        setMeta(t("backend.offline"));
+      }
+    });
   };
 
   const clear = () => {
@@ -197,20 +264,157 @@ export function AiApp() {
     setMsgs([]);
   };
 
+  const clearSess = async (): Promise<void> => {
+    await clearSessions();
+    setSessions([]);
+  };
+  const delSess = async (id: string): Promise<void> => {
+    await removeSession(id);
+    setSessions((prev) => (prev ?? []).filter((s) => s.session_id !== id));
+  };
+
+  const lastAgent = [...msgs].reverse().find((m) => m.role === "agent" && m.text);
+  const copyReply = async (): Promise<void> => {
+    if (!lastAgent?.text) return;
+    try {
+      await navigator.clipboard?.writeText(lastAgent.text);
+      setCopiedReply(true);
+      window.setTimeout(() => setCopiedReply(false), 1500);
+    } catch {
+      /* clipboard unavailable: no-op */
+    }
+  };
+
+  // Last user question — the target of "↺ resend".
+  const lastUserText = [...msgs].reverse().find((m) => m.role === "user" && m.text)?.text;
+  const resend = (): void => {
+    if (lastUserText && !busyRef.current) void send(lastUserText);
+  };
+
+  // Brand-new conversation: clear the bubbles AND rotate the multi-turn id.
+  const newChat = (): void => {
+    if (busyRef.current) stop();
+    clear();
+    newConversation();
+  };
+
+  // Two-step 清空: first tap arms it, second tap (within a short window) confirms.
+  const clearArmed = (): void => {
+    if (confirmClear) {
+      setConfirmClear(false);
+      clear();
+      return;
+    }
+    setConfirmClear(true);
+    window.setTimeout(() => setConfirmClear(false), 3000);
+  };
+
   return (
     <div className="flex h-full flex-col p-3">
       <div className="flex items-center gap-2">
         <span className="text-3xl">🤖</span>
         {status && <span className="truncate text-xs opacity-60">{status}</span>}
-        <button
-          onClick={clear}
-          className="ml-auto rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
-        >
-          {t("ai.clear")}
-        </button>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={() => void toggleSessions()}
+            className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+          >
+            {t("ai.sessions")}
+            {sessions !== null ? ` ${sessions.length}` : ""}
+          </button>
+          {msgs.length > 0 && (
+            <button
+              onClick={newChat}
+              className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+            >
+              {t("ai.newChat")}
+            </button>
+          )}
+          {lastUserText && !busy && (
+            <button
+              onClick={resend}
+              className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+            >
+              {t("ai.resend")}
+            </button>
+          )}
+          {lastAgent && !busy && (
+            <button
+              onClick={() => void copyReply()}
+              className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+            >
+              {copiedReply ? "✓" : t("ai.copyReply")}
+            </button>
+          )}
+          <button
+            onClick={clearArmed}
+            className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+          >
+            {confirmClear ? t("ai.clearConfirm") : t("ai.clear")}
+          </button>
+        </div>
       </div>
       {meta && <p className="mt-0.5 text-[11px] opacity-60">{meta}</p>}
-      {!online && <p className="mt-1 text-sm opacity-70">{t("backend.offline")}</p>}
+      {sessOpen && (
+        <div className="mt-1 space-y-1 rounded-xl bg-neutral-200/50 p-2 text-[11px] dark:bg-neutral-800/50">
+          {sessions && sessions.length > 0 && (
+            <button
+              onClick={() => void clearSess()}
+              className="block w-full text-right text-accent hover:underline"
+            >
+              {t("ai.clearSessions")}
+            </button>
+          )}
+          {sessions && sessions.length > 0 ? (
+            sessions.map((s) => (
+              <div key={s.session_id} className="flex items-center justify-between gap-2">
+                <span className="truncate font-mono">{s.session_id.slice(0, 8)}</span>
+                <span className="truncate opacity-70">{s.model}</span>
+                <span className="tabular-nums opacity-60">
+                  {s.tokens_generated}t · {s.age_seconds}s{s.cancelled ? " · ✕" : ""}
+                </span>
+                <button
+                  onClick={() => void toggleHist(s.session_id)}
+                  title={t("ai.history")}
+                  className="rounded-full bg-neutral-300 px-1.5 text-xs dark:bg-neutral-700"
+                >
+                  {showHist === s.session_id ? "▲" : "…"}
+                </button>
+                <button
+                  onClick={() => void delSess(s.session_id)}
+                  title={t("ai.removeSession")}
+                  className="rounded-full bg-neutral-300 px-1.5 text-xs text-danger dark:bg-neutral-700"
+                >
+                  ✕
+                </button>
+              </div>
+            ))
+          ) : (
+            <p className="opacity-60">{t("ai.sessionEmpty")}</p>
+          )}
+          {showHist && histories[showHist] !== undefined && (
+            <div className="max-h-32 space-y-1 overflow-auto border-t pt-1">
+              {histories[showHist] === "loading" ? (
+                <p className="opacity-50">{t("ai.historyLoading")}</p>
+              ) : (histories[showHist] as HistoryTurn[]).length === 0 ? (
+                <p className="opacity-60">{t("ai.historyEmpty")}</p>
+              ) : (
+                (histories[showHist] as HistoryTurn[]).map((tn, i) => (
+                  <p key={i} className="leading-snug">
+                    <span className={tn.role === "user" ? "" : "opacity-70"}>{tn.role === "user" ? "👤 " : "🤖 "}</span>
+                    {tn.text}
+                  </p>
+                ))
+              )}
+            </div>
+          )}
+        </div>
+      )}
+      {!bridged() ? (
+        <p className="mt-1 text-sm opacity-70">{t("backend.inBrowser")}</p>
+      ) : !online ? (
+        <p className="mt-1 text-sm opacity-70">{t("backend.offline")}</p>
+      ) : null}
       <div
         role="log"
         aria-live="polite"
@@ -281,10 +485,15 @@ export function InterpApp() {
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
   const [rec, setRec] = useState(false);
+  // OS microphone permission gate for the interpreter (see lib/permissions.ts).
+  const mic = useCapability("interpreter", "microphone");
+  const [askMic, setAskMic] = useState(false);
   const [segs, setSegs] = useState<InterpSeg[]>(() => loadSegs());
   const [partial, setPartial] = useState("");
   const [text, setText] = useState("");
   const [status, setStatus] = useState("");
+  const [copiedAll, setCopiedAll] = useState(false);
+  const [bilingual, setBilingual] = useState(false);
 
   const sidRef = useRef<string | null>(null);
   const runningRef = useRef(false);
@@ -388,7 +597,7 @@ export function InterpApp() {
             const seg = segOf(payload);
             if (seg) {
               setSegs((prev) => {
-                const next = [...prev, seg];
+                const next = capTail([...prev, seg], SEG_CAP);
                 saveSegs(next);
                 return next;
               });
@@ -419,7 +628,11 @@ export function InterpApp() {
   }, [online]);
 
   const beginSession = async (): Promise<void> => {
-    if (!onlineRef.current) return;
+    if (!onlineRef.current) {
+      // Daemon isn't reachable — tell the user instead of a silent no-op.
+      setStatus(t("backend.offline"));
+      return;
+    }
     const id = await interpretStart({
       source: prefsRef.current.source,
       target: prefsRef.current.target,
@@ -465,6 +678,19 @@ export function InterpApp() {
       await stopMicRef.current();
       return;
     }
+    if (!mic.granted) {
+      // Two-tap consent: first tap explains, second grants (and records).
+      if (!askMic) {
+        setAskMic(true);
+        setStatus(t("interp.permNeed"));
+        return;
+      }
+      mic.allow();
+      setAskMic(false);
+      setStatus("");
+    } else {
+      setAskMic(false);
+    }
     if (!runningRef.current) await beginSession();
     if (runningRef.current) await startCapture();
   };
@@ -472,13 +698,18 @@ export function InterpApp() {
   const send = async (): Promise<void> => {
     const v = text.trim();
     if (!v) return;
-    setText("");
-    if (!runningRef.current) {
-      if (!onlineRef.current) return;
-      await beginSession();
+    if (!onlineRef.current) {
+      // Daemon isn't reachable — keep the typed text and explain instead of
+      // clearing it into a silent no-op.
+      setStatus(t("backend.offline"));
+      return;
     }
+    if (!runningRef.current) await beginSession();
     const id = sidRef.current;
-    if (id && onlineRef.current) await interpretText(id, v);
+    if (id) {
+      setText("");
+      await interpretText(id, v);
+    }
   };
 
   const speakLast = (seg: InterpSeg) => {
@@ -498,9 +729,25 @@ export function InterpApp() {
     clearSegs();
   };
 
+  const copyAll = async (): Promise<void> => {
+    const text = transcriptText(segs, bilingual);
+    if (!text) return;
+    try {
+      await navigator.clipboard?.writeText(text);
+      setCopiedAll(true);
+      window.setTimeout(() => setCopiedAll(false), 1500);
+    } catch {
+      /* clipboard unavailable: no-op */
+    }
+  };
+
   return (
     <div className="flex h-full flex-col p-3">
-      {!online && <p className="mb-2 text-sm opacity-70">{t("backend.offline")}</p>}
+      {!bridged() ? (
+        <p className="mb-2 text-sm opacity-70">{t("backend.inBrowser")}</p>
+      ) : !online ? (
+        <p className="mb-2 text-sm opacity-70">{t("backend.offline")}</p>
+      ) : null}
 
       {/* language pair (remembered) */}
       <div className="flex items-center gap-2 text-sm">
@@ -539,23 +786,20 @@ export function InterpApp() {
           <>
             <button
               onClick={() => void endSession()}
-              className="rounded-full bg-danger px-3 py-1 text-xs text-white"
+              className={btn("danger", "sm")}
             >
               {t("interp.stop")}
             </button>
             <button
               onClick={() => void togglePause()}
-              className="rounded-full bg-neutral-300 px-3 py-1 text-xs dark:bg-neutral-700"
+              className={btn("neutral", "sm")}
             >
               {paused ? t("interp.resume") : t("interp.pause")}
             </button>
             <button
               onClick={() => void toggleMic()}
               title="mic"
-              className={
-                "rounded-full px-3 py-1 text-xs " +
-                (rec ? "bg-accent text-white" : "bg-neutral-300 dark:bg-neutral-700")
-              }
+              className={chip(rec)}
             >
               {rec ? "●" : "🎤"}
             </button>
@@ -563,7 +807,7 @@ export function InterpApp() {
         ) : (
           <button
             onClick={() => void beginSession()}
-            className="rounded-full bg-accent px-3 py-1 text-xs text-white"
+            className={btn("accent", "sm")}
           >
             {t("interp.start")}
           </button>
@@ -584,12 +828,33 @@ export function InterpApp() {
       {/* transcript header + clear */}
       <div className="mt-2 flex items-center justify-between text-xs opacity-60">
         <span>{t("interp.transcript")}</span>
-        <button
-          onClick={clearHistory}
-          className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
-        >
-          {t("interp.clear")}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setBilingual((b) => !b)}
+            aria-pressed={bilingual}
+            className={
+              "rounded-full px-2 py-0.5 text-[11px] " +
+              (bilingual
+                ? "bg-accent text-white"
+                : "bg-neutral-200 dark:bg-neutral-700")
+            }
+          >
+            {t("interp.bilingual")}
+          </button>
+          <button
+            onClick={() => void copyAll()}
+            disabled={segs.length === 0}
+            className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700 disabled:opacity-40"
+          >
+            {copiedAll ? "✓" : t("interp.copyAll")}
+          </button>
+          <button
+            onClick={clearHistory}
+            className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+          >
+            {t("interp.clear")}
+          </button>
+        </div>
       </div>
 
       <div

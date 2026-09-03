@@ -16,8 +16,12 @@ export interface SpeakDeps {
 
 /** Lazily-created playback AudioContext (one per session, shared across segments). */
 let playCtx: AudioContext | null = null;
+/** The most recently started BufferSource. When a newer final segment arrives we
+ * stop the previous one so read-aloud never overlaps (latest utterance wins). */
+let activeSrc: { stop: () => void } | null = null;
 export function resetPlayCtx(): void {
   playCtx = null;
+  activeSrc = null;
 }
 
 /** Play a synthesized PCM payload out of the speakers. No-op when unavailable. */
@@ -34,6 +38,9 @@ export function playPcm(pcm: TtsPayload): void {
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.connect(ctx.destination);
+  // Low-latency rule: the newest final segment preempts any still playing one.
+  activeSrc?.stop();
+  activeSrc = src;
   src.start();
 }
 
