@@ -13,6 +13,7 @@
 pub mod cli;
 pub mod config;
 pub mod inference;
+pub mod monitoring;
 pub mod security;
 pub mod semantic;
 pub mod server;

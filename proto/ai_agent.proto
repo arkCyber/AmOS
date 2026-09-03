@@ -81,6 +81,8 @@ message StatusReply {
   int64 uptime_seconds = 3;              // daemon uptime
   uint32 gpu_util = 4;                   // rough GPU/NPU utilisation percent
   uint32 active_sessions = 5;            // number of live agent sessions
+  int64 rpc_total = 6;                   // RPCs seen at the gRPC boundary (monitoring)
+  int64 heartbeats = 7;                  // periodic self-health ticks emitted (monitoring)
 }
 
 message ListSessionsRequest {}

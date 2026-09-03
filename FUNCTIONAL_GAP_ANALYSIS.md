@@ -85,8 +85,8 @@
 31. **无权限弹窗 / 隐私看板**。
 
 ### 🟡 H. 可观测性 / 运维
-32. **无监控指标**（`monitoring.rs` 未创建）。
-33. **无周期性健康检查/探针**（`GetStatus` 仅 boot 时查一次）。
+32. ~~**无监控指标**（`monitoring.rs` 未创建）~~ → **✅ 已完成（2026-09-03）**：`amos-ai` 新增 `monitoring.rs`——`Monitor` 无锁计数（rpc_total、uptime、周期心跳）经 tonic interceptor 集中统计；`StatusReply` 现携带 `rpc_total`/`heartbeats`，任意 `GetStatus` 探针即可读实时指标；`AMOS_METRICS_INTERVAL_SECS` 调周期。
+33. ~~**无周期性健康检查/探针**（`GetStatus` 仅 boot 时查一次）~~ → **✅ 部分完成（2026-09-03）**：daemon 侧周期自健康心跳（heartbeat 计数 + 指标日志）已落地并随 `serve()` 启停；跨进程/客户端侧定时调用 `GetStatus` 的探针仍待接（见下）。
 34. **无日志持久化/聚合**（tracing 仅 stdout）。
 35. **无缓存层 / 连接池**（`cache.rs`、`pool.rs` 未创建）。
 36. **无基准/压力/混沌测试**。

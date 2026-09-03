@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use amos_proto::ai_agent::{
     ai_agent_server::{AiAgent, AiAgentServer},
@@ -18,6 +18,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::inference::real::{BackendKind, InferenceBackend, MockBackend};
+use crate::monitoring::Monitor;
 use crate::security::{AuditResult, Permission, SecurityManager};
 use crate::session::SessionManager;
 
@@ -28,7 +29,6 @@ use crate::session::SessionManager;
 /// the stream runs. See `security.rs`.
 pub struct AiAgentService {
     model: &'static str,
-    start: Instant,
     /// Number of in-flight generation sessions (for `get_status`).
     active_sessions: Arc<AtomicUsize>,
     /// Rate limiting / audit logging / permission checks applied to every call.
@@ -39,6 +39,8 @@ pub struct AiAgentService {
     sessions: Arc<SessionManager>,
     /// Where sessions are persisted (`AMOS_SESSIONS_PATH`); `None` = in-memory.
     sessions_path: Option<std::path::PathBuf>,
+    /// Daemon health/metrics (RPC counts, uptime, heartbeats).
+    monitor: Arc<Monitor>,
 }
 
 impl AiAgentService {
@@ -76,12 +78,12 @@ impl AiAgentService {
             .spawn_cleanup_task(sessions.cleanup_interval());
         Self {
             model: "amos-infer@0.1.0",
-            start: Instant::now(),
             active_sessions: Arc::new(AtomicUsize::new(0)),
             security: Arc::new(security),
             backend,
             sessions,
             sessions_path,
+            monitor: Arc::new(Monitor::new()),
         }
     }
 
@@ -98,12 +100,12 @@ impl AiAgentService {
     ) -> Self {
         Self {
             model: "amos-infer@0.1.0",
-            start: Instant::now(),
             active_sessions: Arc::new(AtomicUsize::new(0)),
             security,
             backend,
             sessions: Arc::new(SessionManager::default()),
             sessions_path: None,
+            monitor: Arc::new(Monitor::new()),
         }
     }
 
@@ -128,6 +130,12 @@ impl AiAgentService {
                 tracing::warn!("failed to persist sessions: {e}");
             }
         }
+    }
+
+    /// Shared handle to the daemon metrics monitor (used by the gRPC interceptor
+    /// and the periodic self-health heartbeat).
+    pub fn monitor(&self) -> Arc<Monitor> {
+        Arc::clone(&self.monitor)
     }
 
     /// Resolve the caller identity from the gRPC metadata header, falling back
@@ -610,12 +618,16 @@ impl AiAgent for AiAgentService {
                 "request rejected by security layer: {e}"
             )));
         }
+        // Single snapshot so the reply's metrics are mutually consistent.
+        let snap = self.monitor.snapshot();
         Ok(Response::new(StatusReply {
             running: true,
             model: self.model.to_string(),
-            uptime_seconds: self.start.elapsed().as_secs() as i64,
+            uptime_seconds: snap.uptime_secs as i64,
             gpu_util: 0,
             active_sessions: self.active_sessions.load(Ordering::SeqCst) as u32,
+            rpc_total: snap.rpc_total as i64,
+            heartbeats: snap.heartbeats as i64,
         }))
     }
 
@@ -736,11 +748,26 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     // The runtime is auto-selected: real Waydroid on device, in-process demo
     // elsewhere (so the whole pipeline works on any host).
     let ai_service = AiAgentService::new().await;
+    // monitor counts requests to the *AiAgent* gRPC service (the AI daemon's own
+    // RPCs); the Android-compat service sharing the same socket is separate.
+    let monitor = ai_service.monitor();
     // Keep a handle to the session store so we can persist it on shutdown.
     let sessions = ai_service.sessions.clone();
     let sessions_path = ai_service.sessions_path.clone();
+
+    // Periodic self-health heartbeat: logs a metrics line every interval (aborted
+    // on shutdown). Metrics are also served live over GetStatus.
+    let heartbeat = monitor.spawn_periodic(metrics_interval());
+    let svc_monitor = Arc::clone(&monitor);
+
     let server = tonic::transport::Server::builder()
-        .add_service(AiAgentServer::new(ai_service))
+        .add_service(AiAgentServer::with_interceptor(
+            ai_service,
+            move |req: tonic::Request<()>| {
+                svc_monitor.record_rpc();
+                Ok(req)
+            },
+        ))
         .add_service(amos_android::service::server(amos_android::auto()))
         .serve_with_incoming(incoming);
 
@@ -750,6 +777,7 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
             tracing::info!("shutdown signal received");
         }
     }
+    heartbeat.abort();
 
     // Persist sessions (if `AMOS_SESSIONS_PATH` is set) before exiting.
     if let Some(p) = &sessions_path {
@@ -761,6 +789,17 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     // Remove the socket file so a stale one never blocks the next bind.
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// Resolve the periodic health-metrics interval: `AMOS_METRICS_INTERVAL_SECS`
+/// (≥1s) or a 60s default.
+fn metrics_interval() -> Duration {
+    let secs = std::env::var("AMOS_METRICS_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s >= 1)
+        .unwrap_or(60);
+    Duration::from_secs(secs)
 }
 
 /// Resolves on SIGINT, SIGTERM, or Ctrl-C so the daemon can exit cleanly.

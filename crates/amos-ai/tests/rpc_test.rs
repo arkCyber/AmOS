@@ -138,3 +138,43 @@ async fn stream_chat_semantic_intent_returns_ui_card() {
     server.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_status_exposes_live_monitoring_metrics() {
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-test-{}-metrics.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    wait_for_socket(&path).await;
+    let mut client = connect(&path).await.expect("connect");
+
+    // Every GetStatus passes the gRPC interceptor, so each call must bump the
+    // daemon's rpc_total counter seen on the wire.
+    let s1 = client
+        .get_status(StatusRequest {})
+        .await
+        .expect("get_status #1")
+        .into_inner();
+    assert!(s1.running);
+    assert!(s1.rpc_total >= 1, "first probe itself is counted");
+
+    let s2 = client
+        .get_status(StatusRequest {})
+        .await
+        .expect("get_status #2")
+        .into_inner();
+    assert!(
+        s2.rpc_total > s1.rpc_total,
+        "a second probe must advance rpc_total ({} -> {})",
+        s1.rpc_total,
+        s2.rpc_total
+    );
+    assert_eq!(s2.running, s1.running);
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
