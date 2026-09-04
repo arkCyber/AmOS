@@ -7,7 +7,7 @@
  * sample rate); this module down-samples to 16 kHz and wraps them as a WAV so the
  * translate daemon's ASR recognizer (format = "wav") can consume them.
  */
-import { downsample, encodePcm16, TARGET_RATE } from "./audio";
+import { downsample, encodeF32le, encodePcm16, TARGET_RATE } from "./audio";
 
 export type VoiceStatus = "idle" | "recording" | "transcribing" | "error";
 
@@ -100,3 +100,48 @@ export function hasSignal(frames: ArrayLike<number>, threshold = 0.004): boolean
   }
   return false;
 }
+
+/* ---- AI assistant resident-voice (streaming Payload::Audio) ---- */
+
+/** Typed mirror of the Rust `assistant-voice-event` payloads. */
+export type AssistantVoiceEvent =
+  | { kind: "listening"; session: string }
+  | { kind: "token"; session: string; token: string }
+  | { kind: "turn_done"; session: string; text: string }
+  | { kind: "stopped"; session: string }
+  | { kind: "error"; session: string; message: string };
+
+const VOICE_KINDS = ["listening", "token", "turn_done", "stopped", "error"] as const;
+
+/** Parse a `assistant-voice-event` payload (null when it isn't one). */
+export function parseVoiceEvent(payload: unknown): AssistantVoiceEvent | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const k = p.kind;
+  if (typeof k !== "string" || !(VOICE_KINDS as readonly string[]).includes(k)) return null;
+  const kind = k as AssistantVoiceEvent["kind"];
+  const session = String(p.session ?? "");
+  switch (kind) {
+    case "listening":
+      return { kind, session };
+    case "token":
+      return typeof p.token === "string" ? { kind, session, token: p.token } : null;
+    case "turn_done":
+      return typeof p.text === "string" ? { kind, session, text: p.text } : null;
+    case "stopped":
+      return { kind, session };
+    case "error":
+      return typeof p.message === "string" ? { kind, session, message: p.message } : null;
+  }
+}
+
+/**
+ * Convert raw mono f32 frames at `fromRate` into a **16 kHz little-endian f32**
+ * byte chunk — the exact `Payload::Audio` frame `assistant_voice_feed` pushes to
+ * the daemon's recognizer.
+ */
+export function pcmToAssistantChunk(frames: ArrayLike<number>, fromRate: number): number[] {
+  const f = frames instanceof Float32Array ? frames : Float32Array.from(frames);
+  return encodeF32le(downsample(f, fromRate, TARGET_RATE));
+}
+

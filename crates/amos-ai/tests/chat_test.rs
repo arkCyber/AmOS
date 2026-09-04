@@ -52,6 +52,14 @@ fn cancel() -> ClientMessage {
     }
 }
 
+/// Push-to-talk release: signal the recognizer to force-finalize the current
+/// utterance instead of waiting for its own endpoint/VAD.
+fn audio_end() -> ClientMessage {
+    ClientMessage {
+        payload: Some(Payload::AudioEnd(true)),
+    }
+}
+
 /// Collect all chunks until the done frame; returns the concatenated reply.
 async fn collect_until_done(
     stream: &mut tonic::Streaming<amos_proto::ai_agent::AgentChunk>,
@@ -181,6 +189,105 @@ async fn bidi_chat_audio_is_acknowledged() {
 
     server.abort();
     let _ = std::fs::remove_file(&path);
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn bidi_chat_audio_end_finalizes_a_short_utterance() {
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-audio-end-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    wait_for_socket(&path).await;
+
+    let mut client = connect(&path).await.expect("connect");
+    let (tx, rx) = mpsc::channel(64);
+    let mut stream = client
+        .chat(ReceiverStream::new(rx))
+        .await
+        .expect("open bidi chat")
+        .into_inner();
+
+    // A short utterance (160 f32 samples = 640 bytes) that has NOT reached the
+    // recognizer's own endpoint (needs 640 samples) — only the push-to-talk
+    // `AudioEnd` release turns it into a recognized turn.
+    tx.send(ClientMessage {
+        payload: Some(Payload::Audio(vec![0u8; 640])),
+    })
+    .await
+    .expect("send short audio frame");
+    tx.send(audio_end()).await.expect("send audio_end");
+
+    let (full, done) = collect_until_done(&mut stream).await;
+    assert!(done, "audio_end turn terminates with a done frame");
+    assert!(
+        full.contains("Amos"),
+        "audio_end force-finalizes into an answered turn; got: {full:?}"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stray_audio_end_does_not_wedge_and_text_prompt_still_answers() {
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-audio-end-stray-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    wait_for_socket(&path).await;
+
+    let mut client = connect(&path).await.expect("connect");
+    let (tx, rx) = mpsc::channel(64);
+    let mut stream = client
+        .chat(ReceiverStream::new(rx))
+        .await
+        .expect("open bidi chat")
+        .into_inner();
+
+    // A stray AudioEnd with no preceding audio must not error or wedge the stream
+    // (the recognizer's `finish` simply has nothing real to finalize).
+    tx.send(audio_end()).await.expect("send stray audio_end");
+    // A real text prompt follows on the same stream and must still be answered.
+    tx.send(prompt("ping")).await.expect("send text prompt");
+
+    // Collect turns until one answers the "ping" prompt (the stray AudioEnd may
+    // itself produce a (mock) turn first; keep going past it).
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    tokio::pin!(deadline);
+    let mut got_ping = false;
+    let mut cur = String::new();
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            msg = stream.message() => match msg {
+                Ok(Some(chunk)) => {
+                    if !chunk.token.is_empty() { cur.push_str(&chunk.token); }
+                    if chunk.done {
+                        if cur.contains("ping") {
+                            got_ping = true;
+                            break;
+                        }
+                        cur.clear();
+                    }
+                }
+                _ => break,
+            },
+        }
+    }
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        got_ping,
+        "a text prompt sent after a stray AudioEnd must still be answered"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

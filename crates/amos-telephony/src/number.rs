@@ -20,10 +20,17 @@ pub enum NumberKind {
 pub struct Number(String);
 
 impl Number {
+    /// Maximum canonical digit count a dial string may carry (mirrors the dialer
+    /// UI's `MAX_DIAL_LEN`). E.164 numbers are ≤ 15 digits; headroom covers local
+    /// extension-heavy plans while still bounding the length so a crafted RPC can
+    /// never ask a provider to place a pathologically long call.
+    pub const MAX_LEN: usize = 18;
+
     /// Parse and validate a raw dial string.
     ///
     /// Empty / whitespace-only input, letters and other symbols (other than a
-    /// leading `+` and the allowed separators) are rejected.
+    /// leading `+` and the allowed separators) are rejected, as is anything longer
+    /// than [`Number::MAX_LEN`] digits.
     pub fn new(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -53,6 +60,10 @@ impl Number {
             }
         }
         if !seen_digit {
+            return Err(TelephonyError::InvalidNumber(raw.to_string()));
+        }
+        let digits = cleaned.trim_start_matches('+');
+        if digits.len() > Self::MAX_LEN {
             return Err(TelephonyError::InvalidNumber(raw.to_string()));
         }
         Ok(Self(cleaned))
@@ -97,13 +108,71 @@ impl EmergencyMap {
     }
 
     /// A broad, commonly-shared emergency set (CN + EU + US + JP style codes).
+    /// Intended as the **fallback** when no jurisdiction is known; production
+    /// assembly should prefer [`EmergencyMap::for_region`].
     pub fn common_global() -> Self {
         Self::from_slice(&["110", "112", "119", "120", "122", "911", "999"])
+    }
+
+    /// Jurisdiction-flavoured emergency set, self-maintained (see `docs/telephony.md`
+    /// §11 decision: self-maintained + overridable). Each set always carries the
+    /// international **112**, which every GSM/UMTS/LTE network routes regardless of
+    /// region, so a roaming/unknown SIM still resolves an emergency call.
+    ///
+    /// Unknown / empty region codes fall back to [`EmergencyMap::common_global`], so
+    /// an un-assembled build can never produce an *empty* emergency table (a live
+    /// 110/112/911 misrouted as a regular call would be the worst failure mode).
+    pub fn for_region(region: &str) -> Self {
+        let mut codes: Vec<&str> = Vec::new();
+        match region.trim().to_ascii_uppercase().as_str() {
+            // 中国大陆：110 公安、119 火警、120 急救、122 交通事故。
+            "CN" | "CN-HK" | "CN-MO" => codes.extend(["110", "119", "120", "122"]),
+            "US" | "CA" | "MX" => codes.extend(["911"]),
+            "GB" | "IE" => codes.extend(["999", "112"]),
+            "AU" | "NZ" => codes.extend(["000", "112"]),
+            "JP" => codes.extend(["110", "119", "118"]),
+            "KR" => codes.extend(["112", "119"]),
+            // EEA members + others are the plain 112 family.
+            "DE" | "FR" | "IT" | "ES" | "PT" | "NL" | "BE" | "AT" | "CH" | "SE" | "NO" | "DK"
+            | "FI" | "PL" | "RU" | "GR" => codes.extend(["112"]),
+            _ => {
+                // No jurisdiction known — the broad global set is the safe default.
+                return Self::common_global();
+            }
+        }
+        // The international emergency number is always recognized on top of the
+        // local codes (deduplicated in case a set listed it explicitly).
+        codes.push("112");
+        let mut seen = std::collections::HashSet::new();
+        Self {
+            codes: codes
+                .into_iter()
+                .filter(|c| seen.insert((*c).to_string()))
+                .map(normalize)
+                .collect(),
+        }
+    }
+
+    /// The primary quick-dial code used by a one-key lock-screen emergency entry
+    /// for `region` (the number a locked user reaches in one tap). Defaults to the
+    /// universal **112** so the button is never tied to one country.
+    pub fn quick_dial(region: &str) -> &'static str {
+        match region.trim().to_ascii_uppercase().as_str() {
+            "CN" | "CN-HK" | "CN-MO" | "JP" | "KR" => "110",
+            "US" | "CA" | "MX" | "AU" | "NZ" => "911",
+            _ => "112",
+        }
     }
 
     /// Whether `digits` (already digits-only) is a recognized emergency code.
     pub fn is_emergency(&self, digits: &str) -> bool {
         self.codes.iter().any(|c| c == digits)
+    }
+
+    /// The recognized codes (digits-only, canonical). Used for diagnostics and for
+    /// surfacing the exact table to UI/ops layers.
+    pub fn codes(&self) -> &[String] {
+        &self.codes
     }
 }
 
@@ -141,6 +210,34 @@ mod tests {
     }
 
     #[test]
+    fn number_length_is_server_capped() {
+        // Exactly MAX_LEN digits (and with a leading '+') are accepted.
+        let ok = "1".repeat(Number::MAX_LEN);
+        assert!(Number::new(&ok).is_ok());
+        assert!(Number::new(&format!("+{ok}")).is_ok());
+        // One digit over is rejected — a crafted RPC can't dial a pathological number.
+        let over = "1".repeat(Number::MAX_LEN + 1);
+        assert_eq!(
+            Number::new(&over).unwrap_err(),
+            TelephonyError::InvalidNumber(over.clone())
+        );
+        assert!(Number::new(&format!("+{over}")).is_err());
+        // The cap counts canonical *digits*, not raw characters (separators ignored).
+        let spread: String = ok
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 3 == 2 {
+                    format!("{c}-")
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        assert!(Number::new(&spread).is_ok());
+    }
+
+    #[test]
     fn common_map_classifies_emergency_codes() {
         let map = EmergencyMap::common_global();
         assert!(map.is_emergency("110"));
@@ -159,5 +256,67 @@ mod tests {
         assert_eq!(n.kind(&map), NumberKind::Emergency);
         let ordinary = Number::new("13800138000").unwrap();
         assert_eq!(ordinary.kind(&map), NumberKind::Regular);
+    }
+
+    #[test]
+    fn cn_region_set_covers_local_and_international_codes() {
+        let map = EmergencyMap::for_region("CN");
+        // Local CN codes resolve…
+        for c in ["110", "119", "120", "122"] {
+            assert!(map.is_emergency(c), "CN must recognize {c}");
+        }
+        // …and so does the universal 112 (GSM family), deduplicated exactly once.
+        assert!(map.is_emergency("112"));
+        assert_eq!(
+            map.codes().iter().filter(|c| c.as_str() == "112").count(),
+            1,
+            "international 112 must not be duplicated"
+        );
+        // Regional call-out from a classification standpoint.
+        assert_eq!(
+            Number::new("110").unwrap().kind(&map),
+            NumberKind::Emergency
+        );
+        assert_eq!(
+            Number::new("13800138000").unwrap().kind(&map),
+            NumberKind::Regular
+        );
+    }
+
+    #[test]
+    fn unknown_region_falls_back_to_global_never_empty() {
+        // Region matching is case- and whitespace-insensitive.
+        let map = EmergencyMap::for_region(" cn ");
+        assert!(map.is_emergency("110"));
+        // Unknown / empty jurisdiction must never yield an empty table.
+        let fallback = EmergencyMap::for_region("zz");
+        assert!(fallback.is_emergency("112"));
+        assert!(fallback.is_emergency("911"));
+        assert!(!fallback.codes().is_empty());
+        assert!(EmergencyMap::for_region("").is_emergency("999"));
+    }
+
+    #[test]
+    fn quick_dial_is_region_appropriate_and_defaults_universal() {
+        assert_eq!(EmergencyMap::quick_dial("CN"), "110");
+        assert_eq!(EmergencyMap::quick_dial("cn"), "110");
+        assert_eq!(EmergencyMap::quick_dial("US"), "911");
+        assert_eq!(EmergencyMap::quick_dial("GB"), "112"); // EU/UK default
+        assert_eq!(EmergencyMap::quick_dial("XX"), "112"); // universal default
+        assert_eq!(EmergencyMap::quick_dial(""), "112");
+    }
+
+    #[test]
+    fn region_kind_still_classifies_via_number() {
+        let map = EmergencyMap::for_region("US");
+        assert_eq!(
+            Number::new("911").unwrap().kind(&map),
+            NumberKind::Emergency
+        );
+        assert_eq!(
+            Number::new("110").unwrap().kind(&map),
+            NumberKind::Regular,
+            "110 is not a US emergency code"
+        );
     }
 }

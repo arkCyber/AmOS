@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   hasSignal,
   parseTranscribe,
+  parseVoiceEvent,
+  pcmToAssistantChunk,
   pcmToWavBytes,
   voiceReducer,
   wavBytes,
@@ -151,5 +153,58 @@ describe("voice reducer — aerospace state-machine audit", () => {
     expect(s).toBe("idle");
     s = voiceReducer(s, { type: "start" });
     expect(s).toBe("recording");
+  });
+});
+
+describe("assistant resident-voice helpers", () => {
+  test("pcmToAssistantChunk encodes 16k f32 little-endian", () => {
+    // 4 mono f32 samples at 16k (no down-sample): 16 bytes.
+    const bytes = pcmToAssistantChunk(Float32Array.from([1.0, -1.0, 0.5, 0.0]), 16000);
+    expect(bytes.length).toBe(16);
+    // 1.0 as IEEE-754 little-endian f32 = 00 00 80 3f.
+    expect(bytes.slice(0, 4)).toEqual([0x00, 0x00, 0x80, 0x3f]);
+    // -1.0 = 00 00 80 bf.
+    expect(bytes.slice(4, 8)).toEqual([0x00, 0x00, 0x80, 0xbf]);
+    // NaN/inf treated as digital silence (0x00000000).
+    const silent = pcmToAssistantChunk(Float32Array.from([NaN]), 16000);
+    expect(silent.slice(0, 4)).toEqual([0, 0, 0, 0]);
+  });
+
+  test("pcmToAssistantChunk down-samples 48k to 16k (x3 shorter)", () => {
+    const in48k = Float32Array.from({ length: 3000 }, () => 0.2);
+    const bytes = pcmToAssistantChunk(in48k, 48000);
+    expect(bytes.length).toBeGreaterThan(0);
+    expect(bytes.length % 4).toBe(0);
+    // 3000 @48k → ~1000 @16k → ~4000 bytes.
+    expect(bytes.length / 4).toBe(1000);
+  });
+
+  test("parseVoiceEvent reads every tagged kind and rejects junk", () => {
+    expect(parseVoiceEvent({ kind: "listening", session: "s" })).toEqual({
+      kind: "listening",
+      session: "s",
+    });
+    expect(parseVoiceEvent({ kind: "token", session: "s", token: "hi" })).toEqual({
+      kind: "token",
+      session: "s",
+      token: "hi",
+    });
+    expect(parseVoiceEvent({ kind: "turn_done", session: "s", text: "ok" })).toEqual({
+      kind: "turn_done",
+      session: "s",
+      text: "ok",
+    });
+    expect(parseVoiceEvent({ kind: "stopped", session: "s" })).toEqual({
+      kind: "stopped",
+      session: "s",
+    });
+    expect(parseVoiceEvent({ kind: "error", session: "s", message: "boom" })).toEqual({
+      kind: "error",
+      session: "s",
+      message: "boom",
+    });
+    expect(parseVoiceEvent({ kind: "nope" })).toBeNull();
+    expect(parseVoiceEvent(null)).toBeNull();
+    expect(parseVoiceEvent({ kind: "token", session: "s" })).toBeNull(); // missing token
   });
 });

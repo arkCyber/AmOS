@@ -19,11 +19,13 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
+use crate::audit::{AuditEntry, AuditLog, AuditOutcome};
 use crate::error::TelephonyError;
 use crate::number::{EmergencyMap, Number, NumberKind};
 use crate::provider::{
     EmergencyTelephonyProvider, MockTelephonyProvider, ProviderEvent, TelephonyProvider,
 };
+use crate::rate::DialRateLimiter;
 use crate::session::{
     Call as ModelCall, CallDirection, CallId, CallState, EndReason,
     RecordingState as DomainRecording,
@@ -34,6 +36,13 @@ pub struct TelephonyService {
     regular: Arc<dyn TelephonyProvider>,
     emergency: Arc<dyn EmergencyTelephonyProvider>,
     emergency_map: EmergencyMap,
+    /// Bounded audit trail for calls (esp. `emergency_dial`, §5: rate-limit exempt
+    /// but never un-audited). Always set by the public constructors.
+    audit: Arc<AuditLog>,
+    /// Emergency-exempt ordinary-dial limiter. `None` = unlimited (strict/test +
+    /// mock backends); the daemon's demo backend enables it via
+    /// [`TelephonyService::with_mock_demo_limited`] / [`demo_server_limited`].
+    dial_limiter: Option<Arc<DialRateLimiter>>,
     /// Dev/test hook: when the backend is the in-process mock, this lets a caller
     /// (tests, a future CLI) simulate an incoming call so the `Watch` stream and
     /// the answering path can be exercised headlessly. `None` for a real backend.
@@ -65,9 +74,16 @@ impl TelephonyService {
             regular,
             emergency,
             emergency_map,
+            audit: Arc::new(AuditLog::new()),
+            dial_limiter: None,
             injector,
             demo_connect_delay: None,
         }
+    }
+
+    /// Access the bounded call audit trail (for tests / future ops surfaces).
+    pub fn audit_log(&self) -> Arc<AuditLog> {
+        self.audit.clone()
     }
 
     /// Default P1 backend: a single [`MockTelephonyProvider`] behind both seams.
@@ -89,6 +105,18 @@ impl TelephonyService {
     /// need exact Dialing semantics use [`Self::with_mock`] instead (no demo).
     pub fn with_mock_demo() -> Self {
         Self::with_demo_delay(tokio::time::Duration::from_millis(900))
+    }
+
+    /// Demo backend (auto-connect) **with ordinary-dial rate limiting enabled**:
+    /// up to `cap_per_min` non-emergency dials per client id per minute; emergency
+    /// calls are always exempt (see `docs/telephony.md §5`). Used by the daemon's
+    /// `demo_server_limited`; strict/headless test backends stay unlimited.
+    pub fn with_mock_demo_limited(cap_per_min: u32) -> Self {
+        let mut s = Self::with_demo_delay(tokio::time::Duration::from_millis(900));
+        s.dial_limiter = Some(std::sync::Arc::new(DialRateLimiter::per_minute(
+            cap_per_min,
+        )));
+        s
     }
 
     fn with_demo_delay(delay: tokio::time::Duration) -> Self {
@@ -298,6 +326,12 @@ pub fn demo_server() -> TelephonyServer<TelephonyService> {
     TelephonyServer::new(TelephonyService::with_mock_demo())
 }
 
+/// Like [`demo_server`] but with **ordinary-dial rate limiting** enabled (emergency
+/// exempt). The production daemon should mount this variant, not the unlimited one.
+pub fn demo_server_limited(cap_per_min: u32) -> TelephonyServer<TelephonyService> {
+    TelephonyServer::new(TelephonyService::with_mock_demo_limited(cap_per_min))
+}
+
 #[tonic::async_trait]
 impl Telephony for TelephonyService {
     /// Server-streaming: yields the current live calls, then streams signalling
@@ -305,16 +339,56 @@ impl Telephony for TelephonyService {
     type WatchStream = Pin<Box<dyn Stream<Item = Result<CallStateEvent, Status>> + Send + 'static>>;
 
     async fn dial(&self, request: Request<DialRequest>) -> Result<Response<CallIdMsg>, Status> {
+        // Client id for per-client rate limiting (read before consuming the request).
+        let client = request
+            .metadata()
+            .get("x-client-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("_default")
+            .to_string();
         let req = request.into_inner();
         let number = Number::new(&req.number).map_err(into_status)?;
         let emergency = self.is_emergency(&number, req.emergency);
-        let id = if emergency {
-            self.emergency
-                .emergency_call(number)
-                .await
-                .map_err(into_status)?
+        // Ordinary dials are rate-limited per client; emergency calls are always
+        // exempt so a throttle can never delay a 110/112 (docs/telephony.md §5).
+        if !emergency {
+            if let Some(limiter) = &self.dial_limiter {
+                if !limiter.allow(&client) {
+                    self.audit.record(AuditEntry::new(
+                        "dial",
+                        number.as_str(),
+                        AuditOutcome::Rejected,
+                        "rate limit exceeded",
+                    ));
+                    return Err(Status::resource_exhausted("dial rate limit exceeded"));
+                }
+            }
+        }
+        // Every *parsed* dial attempt is audited (§5: emergency is rate-limit exempt
+        // but never un-audited). Unparseable/garbage input is rejected above without
+        // an audit entry — we deliberately don't echo attacker-controlled huge text.
+        let op = if emergency { "emergency_dial" } else { "dial" };
+        let detail = number.as_str().to_string();
+        let result = if emergency {
+            self.emergency.emergency_call(number).await
         } else {
-            self.regular.dial(&number).await.map_err(into_status)?
+            self.regular.dial(&number).await
+        };
+        let id = match result {
+            Ok(id) => {
+                self.audit
+                    .record(AuditEntry::new(op, &detail, AuditOutcome::Accepted, ""));
+                id
+            }
+            Err(e) => {
+                self.audit.record(AuditEntry::new(
+                    op,
+                    &detail,
+                    AuditOutcome::Rejected,
+                    e.to_string(),
+                ));
+                return Err(into_status(e));
+            }
         };
         // Desktop-demo driver: once the mock answers the outgoing *regular* call
         // (the network stand-in), the Watch stream emits `Connected` → the call is
@@ -501,6 +575,102 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn emergency_dial_is_audited_when_auto_routed() {
+        let svc = svc();
+        // 112 without the flag still auto-routes to the emergency provider.
+        svc.dial(Request::new(DialRequest {
+            number: "112".into(),
+            emergency: false,
+        }))
+        .await
+        .unwrap();
+        let log = svc.audit_log();
+        assert!(
+            log.any(|e| {
+                e.operation == "emergency_dial"
+                    && e.detail == "112"
+                    && e.outcome == AuditOutcome::Accepted
+            }),
+            "an accepted emergency dial must leave an emergency_dial audit entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_and_rejected_dials_are_audited() {
+        let svc = svc();
+        svc.dial(Request::new(DialRequest {
+            number: "13800138000".into(),
+            emergency: false,
+        }))
+        .await
+        .unwrap();
+        assert!(svc.audit_log().any(|e| {
+            e.operation == "dial"
+                && e.detail == "13800138000"
+                && e.outcome == AuditOutcome::Accepted
+        }));
+
+        // A forced-emergency regular number is rejected — but still audited as refused.
+        let _ = svc
+            .dial(Request::new(DialRequest {
+                number: "13800138000".into(),
+                emergency: true,
+            }))
+            .await;
+        assert!(svc.audit_log().any(|e| {
+            e.operation == "emergency_dial"
+                && e.detail == "13800138000"
+                && e.outcome == AuditOutcome::Rejected
+        }));
+    }
+
+    fn dial_req(number: &str, emergency: bool, client: Option<&str>) -> Request<DialRequest> {
+        let mut r = Request::new(DialRequest {
+            number: number.to_string(),
+            emergency,
+        });
+        if let Some(id) = client {
+            r.metadata_mut().insert(
+                "x-client-id",
+                tonic::metadata::AsciiMetadataValue::try_from(id).unwrap(),
+            );
+        }
+        r
+    }
+
+    #[tokio::test]
+    async fn ordinary_dial_is_rate_limited_but_emergency_is_exempt() {
+        let svc = TelephonyService::with_mock_demo_limited(1);
+        assert!(svc.dial(dial_req("13800138000", false, None)).await.is_ok());
+        let err = svc
+            .dial(dial_req("13800138000", false, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        // Even after the regular budget is spent, an emergency dial is never throttled.
+        assert!(svc.dial(dial_req("110", true, None)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_buckets_are_per_client() {
+        let svc = TelephonyService::with_mock_demo_limited(1);
+        assert!(svc
+            .dial(dial_req("13800138000", false, Some("a")))
+            .await
+            .is_ok());
+        let err = svc
+            .dial(dial_req("13800138000", false, Some("a")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        // A different client id has its own budget.
+        assert!(svc
+            .dial(dial_req("13800138000", false, Some("b")))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

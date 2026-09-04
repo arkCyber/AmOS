@@ -26,6 +26,7 @@ import { frameToChunk } from "../lib/audio";
 import { speakText } from "../lib/realtimeTts";
 import { capTail } from "../lib/bounded";
 import VoiceMicButton from "./VoiceMicButton";
+import StreamVoiceButton from "./StreamVoiceButton";
 import { useCapability } from "./CapabilityGate";
 import { cardOf, sessionMetaOf, tokenOf, type AiCard } from "../lib/stream";
 import {
@@ -153,13 +154,20 @@ export function AiApp() {
     busyRef.current = b;
     setBusy(b);
   };
+  // Append a finished chat bubble (used by streaming-voice turns, which arrive on
+  // the separate `assistant-voice-event` channel rather than `chat_agent`).
+  const pushMsg = (role: "user" | "agent", text: string) =>
+    setMsgs((prev) =>
+      capTail([...prev, { id: uid(role === "agent" ? "a" : "u"), role, text, cards: [] }], CHAT_MSG_CAP),
+    );
 
   useEffect(() => {
     if (!online) return;
     let alive = true;
     const unsubs: (() => void)[] = [];
     getAiStatus().then((s) => {
-      if (alive && s?.model) setStatus(`${s.model} · ${s.active_sessions ?? 0} 会话`);
+      if (alive && s?.model)
+        setStatus(t("ai.modelStatus", { model: s.model, count: s.active_sessions ?? 0 }));
     });
     (async () => {
       unsubs.push(
@@ -449,6 +457,13 @@ export function AiApp() {
             {t("ai.stop")}
           </button>
         )}
+        <StreamVoiceButton
+          online={online}
+          disabled={busy}
+          session={() => conversationId()}
+          onStart={() => pushMsg("user", t("ai.voicePrompt"))}
+          onReply={(text) => pushMsg("agent", text)}
+        />
         <VoiceMicButton
           online={online}
           disabled={busy}

@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import { readStoreValue } from "../lib/amosStore";
 import { getRecents } from "../lib/amosStore";
 import { telephonyDial } from "../lib/backend";
+import { EMERGENCY_QUICK_NUMBER } from "../lib/emergency";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import { APPS, appIcon, appTitleKey } from "../apps";
 import { AppIconTile } from "./AppIcon";
@@ -44,13 +45,22 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
     }
   };
 
-  // Emergency quick-dial (legal hard path): always reachable from the lock screen,
-  // goes straight to the privileged emergency provider (110). One-shot guard so a
-  // locked UI can't spam duplicate dials while one is in flight.
-  const dialEmergency = () => {
+  // Emergency quick-dial (legal hard path): always reachable from the lock screen
+  // and goes straight to the privileged emergency provider with the shared quick
+  // number. `disabled` while one dial is in flight so a locked UI can't spam
+  // duplicates; if the daemon is unreachable / rejects the dial (returns null) the
+  // button recovers to the idle state instead of lying with a permanent
+  // "calling…" that can never connect.
+  const [dialFailed, setDialFailed] = useState(false);
+  const dialEmergency = async () => {
     if (emergency) return;
+    setDialFailed(false);
     setEmergency(true);
-    void telephonyDial("110", true);
+    const res = await telephonyDial(EMERGENCY_QUICK_NUMBER, true);
+    if (!res) {
+      setEmergency(false);
+      setDialFailed(true);
+    }
   };
 
   return (
@@ -108,13 +118,20 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
         </button>
       )}
       <button
-        onClick={dialEmergency}
+        onClick={() => void dialEmergency()}
         disabled={emergency}
         className="mt-10 rounded-full bg-danger/20 px-8 py-3 text-base font-medium text-red-200 ring-1 ring-red-400/40 transition active:bg-danger/30 disabled:opacity-60"
-        aria-label={t("shell.emergency")}
+        aria-label={t("shell.emergency", { num: EMERGENCY_QUICK_NUMBER })}
       >
-        {emergency ? t("shell.emergencyCalling") : t("shell.emergency")}
+        {emergency
+          ? t("shell.emergencyCalling", { num: EMERGENCY_QUICK_NUMBER })
+          : t("shell.emergency", { num: EMERGENCY_QUICK_NUMBER })}
       </button>
+      {dialFailed && (
+        <p className="mt-3 max-w-xs text-center text-xs text-red-200/80">
+          {t("shell.emergencyUnreachable")}
+        </p>
+      )}
     </div>
   );
 }

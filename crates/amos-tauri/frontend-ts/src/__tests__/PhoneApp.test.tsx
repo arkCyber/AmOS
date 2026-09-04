@@ -39,8 +39,17 @@ function mount() {
   return host;
 }
 
-describe("PhoneApp recents", () => {
-  test("shows a Recent chip for a previously dialed contact (name resolved)", async () => {
+function buttons(host: HTMLElement): HTMLButtonElement[] {
+  return Array.from(host.querySelectorAll("button"));
+}
+function tab(host: HTMLElement, label: string): HTMLButtonElement {
+  const b = buttons(host).find((x) => x.getAttribute("role") === "tab" && x.textContent === label);
+  if (!b) throw new Error(`tab not found: ${label}`);
+  return b;
+}
+
+describe("PhoneApp list tabs", () => {
+  test("Recents tab lists a previously dialed contact (name resolved)", async () => {
     writeStoreValue(CONTACTS_KEY, [
       { id: makeContactId(), name: "Ada", phones: ["+86 138 0000 0001"], fav: false, ts: 1 },
     ]);
@@ -49,11 +58,16 @@ describe("PhoneApp recents", () => {
     ]);
     const host = mount();
     await act(async () => {});
-    expect(host.textContent).toContain("Recent");
-    expect(host.textContent).toContain("Ada"); // chip label from contact lookup
+    // The recent entries live under the Recents tab now (not on the keypad).
+    expect(host.textContent).not.toContain("+86 138 0000 0001");
+    await act(async () => {
+      tab(host, "Recents").click();
+    });
+    expect(host.textContent).toContain("+86 138 0000 0001");
+    expect(host.textContent).toContain("Ada"); // label from contact lookup
   });
 
-  test("shows a Frequent chip when a number was dialed repeatedly", async () => {
+  test("Frequent tab shows a number dialed repeatedly", async () => {
     writeStoreValue(CONTACTS_KEY, [
       { id: makeContactId(), name: "Ada", phones: ["+86 138 0000 0001"], fav: false, ts: 1 },
     ]);
@@ -64,6 +78,31 @@ describe("PhoneApp recents", () => {
     ]);
     const host = mount();
     await act(async () => {});
-    expect(host.textContent).toContain("Frequent");
+    await act(async () => {
+      tab(host, "Frequent").click();
+    });
+    expect(host.textContent).toContain("Ada");
+    expect(host.textContent).toContain("+86 138 0000 0001");
+  });
+
+  test("picking a recent entry fills the keypad (select-then-place)", async () => {
+    writeStoreValue(CONTACTS_KEY, [
+      { id: makeContactId(), name: "Ada", phones: ["13800000001"], fav: false, ts: 1 },
+    ]);
+    writeStoreValue(CALLLOG_KEY, [{ number: "13800000001", name: "Ada", ts: 1 }]);
+    const host = mount();
+    await act(async () => {});
+    await act(async () => {
+      tab(host, "Recents").click();
+    });
+    const row = buttons(host).find((b) => b.title === "13800000001");
+    expect(row).toBeTruthy();
+    await act(async () => {
+      row!.click();
+    });
+    // Back on the keypad with the number filled in.
+    expect(buttons(host).some((b) => b.getAttribute("role") === "tab" && b.textContent === "Keypad" && b.getAttribute("aria-selected") === "true")).toBe(true);
+    expect(host.textContent).toContain("13800000001");
   });
 });
+

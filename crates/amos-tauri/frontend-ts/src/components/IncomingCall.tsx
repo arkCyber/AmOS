@@ -28,6 +28,7 @@ export default function IncomingCall() {
   const [call, setCall] = useState<TelephonyCall | null>(null);
   const [phase, setPhase] = useState<"ringing" | "talking">("ringing");
   const [recording, setRecording] = useState<"Off" | "On" | "Failed">("Off");
+  const [muted, setMuted] = useState(false);
   const [contacts] = useState<Contact[]>(() =>
     normalizeContacts(readStoreValue(CONTACTS_KEY, [])),
   );
@@ -40,11 +41,13 @@ export default function IncomingCall() {
           setCall(c);
           setPhase("ringing");
           setRecording("Off");
+          setMuted(false);
         } else if (c.state === "Active") {
           setCall(c);
           setPhase("talking");
           setRecording(c.recording as "Off" | "On" | "Failed");
         } else if (c.state === "Ended") {
+          setMuted(false);
           setCall((prev) => (prev && prev.id === c.id ? null : prev));
         }
       }),
@@ -60,6 +63,7 @@ export default function IncomingCall() {
     const id = call?.id;
     if (id) await telephonyEnd(id);
     setCall(null);
+    setMuted(false);
     void label;
   };
   const toggleRecord = async () => {
@@ -97,6 +101,20 @@ export default function IncomingCall() {
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {!ringing && (
+            <button
+              onClick={() => setMuted((m) => !m)}
+              aria-label={muted ? t("phone.unmute") : t("phone.mute")}
+              className={
+                "grid h-11 w-11 place-items-center rounded-full text-base transition active:scale-90 " +
+                (muted
+                  ? "bg-danger text-white"
+                  : "bg-neutral-200 text-neutral-700 dark:bg-white/10 dark:text-white")
+              }
+            >
+              {muted ? "🔇" : "🎙️"}
+            </button>
+          )}
           {!ringing && (
             <button
               onClick={() => void toggleRecord()}

@@ -129,4 +129,32 @@ describe("IncomingCall overlay", () => {
     await tick();
     expect(host.textContent).not.toContain("Incoming call");
   });
+
+  test("answered (talking) banner offers a mute toggle that switches to Unmute", async () => {
+    installBridge();
+    const host = mount();
+    await tick();
+    // Answering optimistically moves to the talking banner.
+    emit({ id: "in1", peer: "13800138000", state: "Ringing", direction: "Incoming", emergency: false, recording: "Off" });
+    await tick();
+    await act(async () => {
+      byAria(host, "Answer")!.click();
+    });
+    await tick();
+    expect(host.textContent).toContain("In call");
+
+    const mute = byAria(host, "Mute");
+    expect(mute).toBeTruthy();
+    await act(async () => {
+      mute!.click();
+    });
+    await tick();
+    expect(byAria(host, "Unmute")).toBeTruthy();
+    // Toggling back is fine too.
+    await act(async () => {
+      byAria(host, "Unmute")!.click();
+    });
+    await tick();
+    expect(byAria(host, "Mute")).toBeTruthy();
+  });
 });

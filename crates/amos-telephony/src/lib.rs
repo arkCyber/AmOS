@@ -24,11 +24,14 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod audit;
 pub mod error;
 pub mod number;
 pub mod provider;
+pub mod rate;
 pub mod session;
 
+pub use audit::{AuditEntry, AuditLog, AuditOutcome};
 pub use error::{Result, TelephonyError};
 pub use number::{EmergencyMap, Number, NumberKind};
 pub use provider::{
@@ -41,5 +44,11 @@ pub use session::{Call, CallDirection, CallId, CallSession, CallState, EndReason
 // the providers in P3 (feature `android`).
 pub mod service;
 
-// The Android/Binder backend will live here under `#[cfg(feature = "android")]`
-// (see docs/telephony.md §10 P3). Not yet present.
+// The real Android backend (see docs/telephony.md §10 P3). Feature-gated so desktop/
+// CI builds stay free of the JNI stack; `cargo check --features android` keeps the
+// on-device implementation compiling. Runtime needs a real Android VM + Context.
+#[cfg(feature = "android")]
+pub mod android;
+
+#[cfg(feature = "android")]
+pub use android::{AndroidEmergencyTelephonyProvider, AndroidTelephonyProvider};

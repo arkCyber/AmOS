@@ -13,6 +13,7 @@
 
 pub mod ai_bridge;
 pub mod appstore;
+pub mod assistant_voice;
 pub mod buttons;
 pub mod interpret;
 pub mod mail;
@@ -44,6 +45,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(AiBridge::new())
+        .manage(assistant_voice::VoiceSession::new())
         .manage(WmState::new())
         .manage(SystemContext::new())
         .manage(shared_store)
@@ -63,6 +65,10 @@ pub fn run() {
             ai_bridge::remove_ai_session,
             ai_bridge::get_ai_session_history,
             ai_bridge::ai_backend_switch,
+            assistant_voice::assistant_voice_start,
+            assistant_voice::assistant_voice_feed,
+            assistant_voice::assistant_voice_end,
+            assistant_voice::assistant_voice_stop,
             ai_bridge::get_android_apps,
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,

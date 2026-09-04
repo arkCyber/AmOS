@@ -1,7 +1,7 @@
 # Amos 电话（Telephony）设计稿 + 契约
 
 **日期**: 2026-09-03
-**状态**: ✅ **P0 + P1 + P2(事件核心) 已实现（2026-09-03）**：`crates/amos-telephony` 领域内核（`number`/`session`/`error`/`provider` + `MockTelephonyProvider`）、`proto/telephony.proto` 契约与代码生成、`service` 模块与 UDS 挂载（`amos-ai` 同 socket 新增 `Telephony` 服务）、Tauri 命令桥 + 拨号器/锁屏紧急入口 110、`Watch` **真实持续事件流 + 注入式来电模拟** 均已落地并通过（25 单测 + 2 UDS e2e）。剩余：**Watch 前端来电浮层 / Tauri 事件桥** → **✅ 已完成（2026-09-04，见 §10.3）**；**P3（Android/Binder 真实现）** 待做。**通话录音（2026-09-04 追加实现）**：`RecordingState{Off,On,Failed}` 领域状态机 + `TelephonyProvider::start/stop_recording`（provider 允许/拒绝/审计，紧急号硬拒绝）+ proto `RecordingState`/`CallSnapshot.recording` + `StartRecording/StopRecording` RPC + gRPC/Tauri 桥 + `PhoneApp` 通话页录音开关与「正在录音」指示 + en/zh i18n（41 单测 + 3 DOM 测；真实音频采集仍属音频管线）。
+**状态**: ✅ **P0 + P1 + P2(事件核心) 已实现（2026-09-03）**：`crates/amos-telephony` 领域内核（`number`/`session`/`error`/`provider` + `MockTelephonyProvider`）、`proto/telephony.proto` 契约与代码生成、`service` 模块与 UDS 挂载（`amos-ai` 同 socket 新增 `Telephony` 服务）、Tauri 命令桥 + 拨号器/锁屏紧急入口 110、`Watch` **真实持续事件流 + 注入式来电模拟** 均已落地并通过（25 单测 + 2 UDS e2e）。剩余：**Watch 前端来电浮层 / Tauri 事件桥** → **✅ 已完成（2026-09-04，见 §10.3）**；**通话录音（2026-09-04 追加实现）**：`RecordingState{Off,On,Failed}` 领域状态机 + `TelephonyProvider::start/stop_recording`（provider 允许/拒绝/审计，紧急号硬拒绝）+ proto `RecordingState`/`CallSnapshot.recording` + `StartRecording/StopRecording` RPC + gRPC/Tauri 桥 + `PhoneApp` 通话页录音开关与「正在录音」指示 + en/zh i18n（41 单测 + 3 DOM 测；真实音频采集仍属音频管线）。**Phase A+C 审计校正与拨号器生产化（2026-09-04，见 §12）**：✅ 真电话宿主进程与责任边界定稿、`EmergencyMap` 司法区化（`for_region`/`quick_dial`，未知区域回退全局）、锁屏紧急一键用共享单一来源并可自恢复、`PhoneApp` 无 daemon 拨号优雅降级并给用户错误（Rust 单测 51 + 前端新测，全绿）。**P3（真机 Android/Binder backend）代码仍 ⏳ 待做**（见 §10.4，含宿主进程与实现要点已定稿）。
 **关联**：`FUNCTIONAL_GAP_ANALYSIS.md` §六（真缺口 #1）；`docs/external-analysis-review.md` §1.2；`docs/no-ui-android.md`（产品底座 = no-UI Android，telephony 走 **Binder**）；前端现有 `PhoneApp`（`CommsApps.tsx:213`）目前是纯 UI，无任何真实拨号。
 
 ---
@@ -47,6 +47,7 @@ AmOS 作为真机手机 OS，必须有**真实、合规、可用**的电话能�
 - **领域内核不做任何 Binder/系统调用**：它只维护「一次通话的合法状态迁移 + 号码规则 + 审计点」。
 - **`TelephonyProvider` 只负责「发出信令」**（dial/answer/end + 上报状态事件），不决定状态机合法性——合法性由内核判定。
 - **紧急路径是独立 provider**（不是普通 Dial 的特例参数）：因为它在权限、可达性、绕过锁屏上的保证与普通呼叫**根本不同**（见 §5）。
+- **宿主进程（§12 审计校正 #1）**：真实 Android provider 持 `Context` + `ROLE_DIALER`，必须宿主于 **System UI（`amos-tauri` APK）进程**，由 Tauri 桥进程内驱动（复刻 `amos-radio` 的 `AndroidRadioProvider`/`RadioBridge` 模式），**不**由 headless `amos-ai` daemon 承载。daemon 的 `TelephonyService`（gRPC/UDS）是领域/桌面层，真机拨号在其上层由 System UI 实现并回灌事件；桌面继续用 demo/mock provider。`android.rs` 实现要点随之更新（见 §10.4）。
 
 ---
 
@@ -139,13 +140,14 @@ pub trait EmergencyTelephonyProvider: Send + Sync {
 4. **UI 直达**：锁屏上永远有一个紧急入口；物理按钮（见 `docs/hardware-buttons.md`）可绑定「长按 → 紧急」。
 5. **号码正规化兜底**：紧急号去空格/连字符后仍须命中 `EmergencyMap`；命中即走紧急通路，绝不落进普通 dial 被 SIM 判断拒掉。
 
-### Android 实现要点（提案）
-- 生产路径走 **Binder**（见 `docs/no-ui-android.md` §4 的 `binder` crate 计划），调 `TelecomManager`/`TelephonyManager` 的紧急 API；兜底可用 `intent` 起系统拨号/紧急服务。
+### Android 实现要点（提案，含 §12 校正）
+- 真机**拨号/接听/来电都宿主在持有 `Context` + `ROLE_DIALER` 的 System UI（`amos-tauri`）进程**，进程内 JNI `getSystemService("telecom"/"phone")` → `TelecomManager`/`TelephonyManager`（复刻 `amos-radio` 的 `AndroidRadioProvider`：`AndroidContext(GlobalRef)` + 每线程 attach + feature `android` + 可选 `jni` 门控）。Binder 是框架 IPC 的底层机制，**不需要也不应**从无 Context 的 daemon 手写 `/dev/binder` 事务去「直连 TelecomManager」——受支持的正确接线是 APK 内 Java 系统服务 API（经 JNI）。兜底可用 `intent`（`ACTION_CALL`）起系统拨号。
+- **责任边界（§12 校正 #2）**：紧急号路由的"无 SIM/锁屏/崩溃仍可拨"硬保证**不在用户态 crate**，而在 (i) Android Telecom 框架 + EmergencyNumber DB、(ii) RIL/厂商 HAL 的合规放行、(iii) 平台锁屏紧急拨号器（无 launcher 也可达）。`amos-telephony`/本壳能做的是：分类 + **独立紧急 provider**（不与普通拨号共享实现）+ 审计留痕（豁免限速、不免审计）+ `ROLE_DIALER` 注册 + 锁屏可信紧急入口。真机验收按 §8 对"紧急硬通路"一栏执行（需 OEM/root + 真机交叉窗）。**切勿对外宣称用户态实现了"内核绝对保护通路"。**
 - 需 OEM 在 **`ROLE_DIALER`（Default Phone App）+ 特权权限**（`MANAGE_OWN_CALLS` 等）上出厂授权，并在锁屏把本壳的紧急入口算作可信 surface。
 - 在 no-UI 基座上，即使 Tauri 壳未被前台渲染，也要求系统在锁屏给本包一个可点的紧急入口（**厂商配合项**，见 §9）。
 
 ### 审计与安全
-- 紧急呼出在 `security.rs` 审计日志中**必须留痕**（`operation="emergency_dial"`），但 `validate_request` 对它放行——**豁免限速、不免审计**。
+- 紧急呼出**必须留痕**（`operation="emergency_dial"`）但**豁免限速、不免审计**。已落地：`crate::audit::AuditLog`（有界）+ `TelephonyService::dial` 逐条落审计；普通拨号**限速、紧急豁免**（`crate::rate::DialRateLimiter` + daemon `demo_server_limited`，见 §12 #6/#7）。daemon（`amos-ai`）侧 `AiAgentService` 的安全门/每客户端限速与 telephony 分开，真机 provider 接入时再统一。
 - 状态机对紧急呼叫：一旦建立不可被普通挂断逻辑吞掉（挂断是用户显式操作才允许）。
 
 ---
@@ -192,7 +194,7 @@ service Telephony {
 
 ## 7. UI / 集成点
 
-- **拨号器**：替换 `CommsApps.tsx` 的 `PhoneApp` 静态 `calling` 状态——拨号时调 `telephony.dial`，渲染以 `CallStateEvent` 为准；加锁屏紧急入口与一键 110/112。
+- **拨号器**：`components/PhoneDialer.tsx`（自 `CommsApps.tsx` 再导出 `PhoneApp`）——标签页 `键盘/最近/常用/紧急`，拨号调 `telephony.dial`，渲染以 `CallStateEvent` 为准；**紧急页**一键特权拨号（共享号源）；通话中（talking）提供录音 + 静音 + DTMF 键；锁屏另有紧急一键入口（见 §12 #4/#5）。无 daemon 时拨号降级并给本地化错误。
 - **来电表面**：`Watch` 流在**任意 app 前台**收到 `RINGING` 时，经 `amos-wm` 在顶层弹出可接听/拒接的来电卡（含 AI 助手注入"来电人"上下文的钩子，供 `amos-ai` 做后续 VLM/翻译）。
 - **快捷键/按钮**：`amos-tauri/src/buttons.rs` 加「长按语音键 → 紧急呼叫」硬件路径。
 - **音频**：接通后进入未来音频管线；本期来电仅信令 + UI，不播放铃声（铃声属音频管线）。
@@ -227,13 +229,65 @@ service Telephony {
 1. **P0**：`crates/amos-telephony` 领域内核（`model`/`error`/`provider`/`CallSession` 状态机 + `EmergencyMap`）+ `MockTelephonyProvider` + 全单测。→ **✅ 已完成（2026-09-03）**：`number.rs`/`session.rs`/`error.rs`/`provider.rs`，17 单测通过，可在无真机时完成并进 CI。
 2. **P1**：`proto/telephony.proto` + `amos-proto` 代码生成 + `TelephonyService` 挂进 `amos-ai` UDS + 无头 gRPC 测试。→ **✅ 已完成（2026-09-03）**：`service.rs`（`mock_server()`）、`amos-ai/src/server.rs` 经 `add_service` 挂载、`tests/telephony_rpc_e2e.rs` 真 UDS 往返（Dial/Status/End、112 自动紧急路由）。
 3. **P2**：前端接线 + 来电 surface。→ **✅ 完成（2026-09-03/04）**：`PhoneApp` 拨号接线、锁屏紧急入口 110、**`Watch` 真实持续事件流**（`ProviderEvent` 增 `Incoming/Connected{id,peer}`，Mock 上报；`service.inject_incoming()` 供无头注入）；**2026-09-04 闭环**：Tauri `Watch` 事件桥（`spawn_telephony_watch` 长连 `telephony-event`，带退避重连）+ 前端**来电浮层 `IncomingCall`**（Ringing→接听/拒接；接通 Active→含录音开关的通话条 + 挂断）+ `telephony_answer` + 拨号出局 **demo 自动接通**（`demo_server()`：出局普通号短响铃后到 Active，桌面拨号→通话→录音→挂断真实可操作；`mock_server()` 仍确定性供无头 e2e）＋ `SimulateIncoming` RPC（mock 专用，真 provider 返回 `Unavailable`）+ `telephony_simulate_incoming` + PhoneApp「模拟来电」demo 入口，**来电浮层也可桌面手测**（生产来电仍走真机注入/Binder）。
-4. **P3（需真机/OEM）**：`android.rs` 的 `AndroidTelephonyProvider`（Binder/`cfg(target_os="android")`，feature `android` 门控）+ `EmergencyTelephonyProvider`；真机按 §5 硬性保证验收。→ ⏳ 待做。
+4. **P3（需真机/OEM；宿主进程已在 §12 定稿）**：宿主于 **System UI（`amos-tauri` APK）进程**的 `AndroidTelephonyProvider`/`AndroidEmergencyTelephonyProvider`（feature `android` + 可选 `jni`）。→ **编译骨架已落地（2026-09-04，见 §12 #8）**：`crates/amos-telephony/src/android.rs` 以 `ACTION_CALL` 真实起呼（System UI `Context` 直呼），`cargo check --features android` + `clippy` 通过；**仍 ⏳ 待真机/OEM 验收**：接 `InCallService`/`TelephonyCallback` 的接听/挂断/来电/录音、`ACTION_CALL`→`TelecomManager#placeCall` 迁移、锁屏无 UI 紧急拨号验证（按 §5 硬性保证，需 OEM/root + 交叉窗）。紧急号分类复用 §3 `EmergencyMap`。
 
 ---
 
-## 11. 关键开放问题（实现前需拍板）
-- 普通通话是否**只**经系统电信栈（`TelecomManager`），还是也要在 no-UI 基座上直接驱动 `TelephonyManager`？（建议：`TelecomManager` 为主，`TelephonyManager` 兜底。）
-- 来电要不要先给 `amos-ai`「静音接听前」钩子（隐私决策）？默认否。
-- 紧急号表维护来源：随 AOSP `res`/数据库，还是自维护 `EmergencyMap`（建议自维护一份 + 可覆盖）。
+## 11. 关键开放问题（已拍板，见 §12）
+- 普通通话经**系统电信栈 `TelecomManager` 为主**，`TelephonyManager` 兜底（宿主 System UI 进程）。✅
+- 来电默认**不给** `amos-ai`「静音接听前」钩子（隐私），保留后续开关。✅
+- 紧急号表**自维护一份 `EmergencyMap` + 可被司法区覆盖**（`for_region`/`quick_dial`），不做运行时依赖 AOSP DB。✅
+
+---
+
+## 12. 审计校正与生产化记录（2026-09-04，Phase A+C）
+
+外部把 telephony 描述为"静态页面 + 完全缺基带通信"并不准确（领域/服务/桥/桌面闭环已在 P0–P2 落地）；真正缺口是 P3 真机 backend 与若干生产化薄弱点。本轮据此校正并落地：
+
+### #1 真电话宿主进程（架构定稿）
+- 真实 Android provider 必须持 `Context` + `ROLE_DIALER` → **宿主于 System UI（`amos-tauri` APK）**，进程内 JNI 驱动（复刻 `amos-radio` 的 `AndroidRadioProvider` 模式）；**headless `amos-ai` daemon 不承载真机拨号**（它无 Context/无 ROLE_DIALER）。daemon 的 gRPC `TelephonyService` 定位为领域/桌面层。
+- 结论落地于 §2 宿主进程 bullet 与 §10.4。
+
+### #2 紧急硬保证的责任边界（口径纠正）
+- Android 上"无 SIM / 锁屏 / 崩溃仍能拨 110/112"由 **framework(EmergencyNumber DB) + RIL/厂商 HAL + 平台锁屏紧急拨号器** 保证，**不是**用户态 Rust crate 能做或应宣称的"内核绝对保护通路"；也没有从 daemon 手写 `/dev/binder` 直连 TelecomManager 这条受支持路径。
+- 本壳负责：分类 + **独立紧急 provider**（普通/紧急不共用实现）+ 审计（豁免限速、不免审计）+ `ROLE_DIALER` + 锁屏可信紧急入口。见 §5「责任边界」。真机验收仍需 OEM/root + 交叉窗（§8）。
+
+### #3 `EmergencyMap` 司法区化（代码，已测）
+- `crates/amos-telephony/src/number.rs`：新增 `EmergencyMap::for_region`（CN/US/GB/IE/AU/NZ/JP/KR/EEA…，每集恒含国际 112，去重）、`EmergencyMap::quick_dial(region)`（CN/JP/KR→110，US/CA/MX/AU/NZ→911，其余→112）、`codes()`；未知/空区域**回退 `common_global()`，绝不为空**（防把 110/112 误当普通号被 SIM 拒）。
+- Rust 单测：`cn_region_*`、`unknown_region_*`、`quick_dial_*`、`region_kind_*` 新增（51 通过）；前端 `lib/emergency.ts` 镜像 `quick_dial`（`quickEmergencyNumber`）。
+
+### #4 拨号器生产化（前端，已测）
+- **锁屏紧急一键去硬编码**：`SystemPanels.tsx` 拨号与标签同取 `lib/emergency.ts::EMERGENCY_QUICK_NUMBER`；i18n `shell.emergency*` 改 `{num}` 插值（en/zh）。失败（无 daemon）时**自恢复**（重新可用）并给出 `shell.emergencyUnreachable`，不再永久卡在假"正在呼叫…"。
+- **`PhoneApp` 无 daemon 拨号降级**：`telephonyDial` 返回 null 即退出 calling、回到键盘并提示 `phone.dialFailed`，不再滞留无 id 的假呼叫屏（原行为）。`endCall` 清错误。
+- 前端测试：`emergency.test.ts`（单一来源/区域镜像/必须是紧急族）、`lockEmergency.test.tsx`（标签用共享号、无服务自恢复）、`PhoneRecording.test.tsx` 原"no daemon"用例改为断言新降级语义。`tsc --noEmit` 通过。
+
+### #5 全功能拨号器（前端，已测）
+- `PhoneApp` 抽出到独立 `components/PhoneDialer.tsx`（自 `CommsApps` 再导出），改为**标签页拨号器**：`键盘 / 最近 / 常用 / 紧急`。最近/常用为列表页（点选即回填键盘，select-then-place）；**紧急页**一键直拨共享的 `lib/emergency.ts::EMERGENCY_NUMBERS`（CN 集 + 通用 112，按职能标注，主号码高亮）并走 `telephony_dial(…, emergency: true)` 特权通路。
+- 通话中（talking）增 **静音（Mute）** 与 **DTMF 拨号键**：均为本地 UI 态，真实麦克风静音/按键音属音频管线（`docs/native-voice.md`）——不做假"已生效"，只诚实呈现 UI 并在无后端时说明。录音开关/挂断保持不变。
+- 测试：`PhoneDialer.test.tsx`（紧急特权拨号、接通后可静音、DTMF 键开合）、`PhoneApp.test.tsx` 改写（Recents/Frequent 标签 + 点选回填）；`PhoneRecording`/`MessagesApp`/emergency/lock/i18n 仍绿；`tsc --noEmit` 通过。
+
+### #6 服务端硬化与审计核查（2026-09-04 追加）
+- `Number` 服务端权威**长度上限**：新增 `MAX_LEN = 18`（与拨号器 UI 对齐；E.164 ≤15，余量给本地区号），超过即 `InvalidNumber`——被构造的 gRPC `Dial` 无法让 provider 拨打病态超长号。按规范化**位数**计数（忽略分隔符/前导 `+`）。单测 `number_length_is_server_capped` 通过。
+- 核查确认：`amos-ai` daemon 在共享 UDS 上真实挂载 `amos_telephony::service::demo_server()`（`amos-ai/src/server.rs`），拨号器→Tauri→daemon→provider 链路是活的，非死代码。
+- **记录待办（未在本轮实现）：** 普通拨号的**每客户端速率限制**仍是 daemon（`amos-ai`）安全层的事；`TelephonyService` 不在 AiAgentService 的 security 门内。
+- **紧急拨号审计已实现（本轮）**：新增 `crate::audit`（`AuditLog`，有界 1024、最新在前、`Accepted/Rejected`），`TelephonyService::dial` 对每个被解析的拨号落审计——紧急自动路由/强制紧急记为 `operation="emergency_dial"`（豁免限速、绝不遗漏），普通为 `"dial"`；拒绝同样留 `Rejected`。**不可解析的超长/垃圾输入不落审计**（避免回显攻击者控制的巨型串）。访问：`TelephonyService::audit_log()`。Rust 全量 **56 单测 + 2 UDS e2e** 通过、`clippy -D warnings` 干净、`amos-ai` check 通过。
+
+### #7 普通拨号限速、紧急豁免（已实现）
+- 新增 `crate::rate::DialRateLimiter`：**每客户端**固定窗口计数（默认 `_default` 桶；gRPC 元数据 `x-client-id` 可选细分，设备上通常单一 System UI 主体）。**有界**：不同 client 上限（默认 256，`with_clients` 可配），过期窗口随访问剪除——伪造海量 `x-client-id` 无法撑爆内存（memory-DoS）。
+- `TelephonyService::dial`：**紧急**（自动路由或强制）**永不限速**；**普通**在有 limiter 时先 `allow(client)`，超限返回 `ResourceExhausted` 且留审计（`dial` Rejected rate limit exceeded）。未配置 limiter（strict/mock、headless e2e）保持不限速，既有测试不受影响。
+- daemon 改用 `amos_telephony::service::demo_server_limited(30)`（`amos-ai/src/server.rs`）——普通拨号 30/分/客户端，紧急豁免。新增构建器 `with_mock_demo_limited(cap)` 与 `demo_server_limited(cap)`。
+- 测试：`rate` 模块（window 内达上限拦截、按客户端隔离）+ 服务层（普通限速后紧急仍可拨、`a/b` 两客户端预算独立）。Rust 全量 **60 单测 + 2 UDS e2e**、`clippy -D warnings` 干净、`amos-ai` check 通过。
+
+### #8 P3 真机接线骨架落地（编译门控，真机待验）
+- `crates/amos-telephony/src/android.rs`（feature `android` = `dep:jni`，lib 侧 `#[cfg(feature)]` 门控并导出 `AndroidTelephonyProvider`/`AndroidEmergencyTelephonyProvider`）：
+  - 复用 `amos-radio` 的 `AndroidContext(GlobalRef)` + 线程 attach 模式；`dial`/`emergency_call` 用 `ACTION_CALL` + `tel:` intent 从 System UI `Context` **真实起呼**，返回 provider call id；`subscribe` 挂到 `EventBus` 注册表（真机回调接入后广播）。
+  - 诚实划线：`answer`/`end`/录音/实时 `status` 明确返回 `Provider(...P3 device-validated...)`，不假装；TODO(device) 标注 `ACTION_CALL`→`TelecomManager#placeCall` 迁移与 InCallService/TelephonyCallback 接入。
+- 验证：`cargo check --features android`、`cargo clippy --features android -D warnings` 均通过；默认(desktop/CI) 构建不含 JNI 栈、不受影响。
+- 真机仍需：System UI(ROLE_DIALER) APK 交叉编译、真实起呼/接听/来电注入与锁屏无 UI 紧急拨号按 §5 验收。
+
+### 验收
+- `cargo test -p amos-telephony --lib`：**51 通过**；`cargo clippy -p amos-telephony --all-targets -D warnings`：干净。
+- 前端：`bun test` 目标文件通过、`tsc --noEmit` 通过（全量 `bun test` 在本机环境存在个别文件空转，非本轮改动引入）。
+
 
 

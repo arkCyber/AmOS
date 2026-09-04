@@ -170,6 +170,28 @@ export async function cancelAiSession(): Promise<unknown> {
   return invoke("cancel_ai_session");
 }
 
+/* ---- AI assistant resident-voice (always-on mic → Payload::Audio) ---- */
+
+/** Begin resident listening: open the daemon `Chat` stream (no prompt). */
+export async function assistantVoiceStart(sessionId: string): Promise<unknown> {
+  return invoke("assistant_voice_start", { sessionId });
+}
+
+/** Push one 16 kHz mono little-endian f32 audio frame to the recognizer. */
+export async function assistantVoiceFeed(bytes: number[]): Promise<unknown> {
+  return invoke("assistant_voice_feed", { frame: bytes });
+}
+
+/** Stop the resident voice listener (sends Cancel, stream winds down). */
+export async function assistantVoiceStop(): Promise<unknown> {
+  return invoke("assistant_voice_stop");
+}
+
+/** End the current utterance (push-to-talk release): force-finalize speech. */
+export async function assistantVoiceEnd(): Promise<unknown> {
+  return invoke("assistant_voice_end");
+}
+
 /* ---- 同传 / interpret RPC (degrade to null outside Tauri) ---- */
 export interface InterpOpts {
   source?: string;

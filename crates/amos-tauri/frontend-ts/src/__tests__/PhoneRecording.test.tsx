@@ -119,7 +119,7 @@ async function placeCall(host: HTMLElement) {
 }
 
 describe("PhoneApp call recording", () => {
-  test("no daemon-backed call id => no recording toggle is offered", async () => {
+  test("no daemon-backed call => dial fails and we return to the keypad (never stuck)", async () => {
     const host = mount();
     await tick();
     const one = findButton(host, "1");
@@ -131,9 +131,12 @@ describe("PhoneApp call recording", () => {
       byAria(host, "call")!.click();
     });
     await tick();
-    // Graceful degradation: no live call id, so we never claim to record.
-    expect(host.textContent).toContain("Call");
-    expect(byAria(host, "Record")).toBeNull();
+    // Nothing was placed: we must not linger on a phantom "calling…" screen with no
+    // call id. Instead a localized error is shown and the keypad is usable again.
+    expect(host.textContent).toContain("Could not dial");
+    expect(findButton(host, "1")).toBeTruthy(); // keypad restored
+    expect(byAria(host, "Record")).toBeNull(); // and no recording toggle is offered
+    expect(byAria(host, "end")).toBeNull(); // no dead "hang up" for a call we never made
   });
 
   test("an outgoing call reaching Active enables the record toggle", async () => {

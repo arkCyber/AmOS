@@ -40,6 +40,7 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
 │   └── android-compat.md         # Waydroid APK-compat layer
 └── crates/
     ├── amos-proto/               # tonic-generated types + socket-path helper
+    ├── amos-audio/               # hardware audio-HAL abstraction: capture/playback traits + resample + mocks + gated TinyALSA/AAudio FFI seams (docs/audio-hal-bridge.md)
     ├── amos-ai/                  # AI CLI daemon (gRPC *server* over UDS)
     ├── amos-wm/                  # window-manager state machine (multi-window)
     ├── amos-android/             # Waydroid/APK compat (gRPC + icon extraction)
@@ -329,6 +330,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams)
 - [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
 - [docs/bidi-voice-asr.md](./docs/bidi-voice-asr.md) — AI-assistant voice wiring: bidi `Payload::Audio` → local ASR (design)
+- [docs/audio-hal-bridge.md](./docs/audio-hal-bridge.md) — Hardware audio (Audio HAL Bridge): `amos-audio` capture/playback traits + resample + mocks + gated TinyALSA/AAudio seams; bidi real-sherpa ASR (`asr-sherpa` feature)
 - [docs/device-poc.md](./docs/device-poc.md) — On-device POC: cross-compile `amos-ai` + run `chat_once` over UDS on a real phone
 - [docs/external-analysis-review.md](./docs/external-analysis-review.md) — Audit of an external gap analysis against the real tree
 - [docs/DELIVERY_NOTES_2026-09-03.md](./docs/DELIVERY_NOTES_2026-09-03.md) — Commit message + changeset + known limits for the telephony/voice/strategy work (2026-09-03)

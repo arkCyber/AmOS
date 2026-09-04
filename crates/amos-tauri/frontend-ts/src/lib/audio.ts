@@ -39,3 +39,29 @@ export function encodePcm16(samples: Float32Array): number[] {
 export function frameToChunk(samples: Float32Array, fromRate: number): number[] {
   return encodePcm16(downsample(samples, fromRate));
 }
+
+/**
+ * Encode mono f32 [-1,1] as **little-endian f32 bytes** (4 bytes/sample) — the
+ * exact wire format of the AI daemon's bidi `Payload::Audio` / the recognizer's
+ * 16 kHz f32 PCM. Non-finite samples are treated as digital silence (0).
+ */
+export function encodeF32le(samples: Float32Array): number[] {
+  const bytes = new Array<number>(samples.length * 4);
+  const buf = new DataView(new ArrayBuffer(4));
+  for (let i = 0; i < samples.length; i++) {
+    const x = samples[i] ?? 0;
+    const s = Number.isFinite(x) ? Math.max(-1, Math.min(1, x)) : 0;
+    buf.setFloat32(0, s, true); // true = little-endian
+    bytes[i * 4] = buf.getUint8(0);
+    bytes[i * 4 + 1] = buf.getUint8(1);
+    bytes[i * 4 + 2] = buf.getUint8(2);
+    bytes[i * 4 + 3] = buf.getUint8(3);
+  }
+  return bytes;
+}
+
+/** Whole mono frame -> 16k mono -> little-endian f32 bytes for assistant_voice_feed. */
+export function frameToAssistantChunk(samples: Float32Array, fromRate: number): number[] {
+  return encodeF32le(downsample(samples, fromRate));
+}
+

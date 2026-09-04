@@ -28,7 +28,7 @@ use tower::service_fn;
 /// Wrap an outbound RPC payload in a `Request` carrying the caller identity, so
 /// the daemon's security layer can apply per-client rate limits and attribute
 /// each audit entry to this System UI client.
-fn with_client_id<T>(payload: T) -> tonic::Request<T> {
+pub(crate) fn with_client_id<T>(payload: T) -> tonic::Request<T> {
     let mut req = tonic::Request::new(payload);
     // `system-ui` always parses; if it ever didn't we simply omit the header
     // (daemon treats the request as anonymous) rather than panic.
@@ -250,7 +250,7 @@ impl AiBridge {
     }
 
     /// Return an AI agent client, reusing the cached channel when healthy.
-    async fn connect(&self) -> Result<AiAgentClient<tonic::transport::Channel>, String> {
+    pub(crate) async fn connect(&self) -> Result<AiAgentClient<tonic::transport::Channel>, String> {
         Ok(AiAgentClient::new(self.connect_channel().await?))
     }
 

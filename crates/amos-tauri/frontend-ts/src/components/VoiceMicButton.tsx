@@ -178,7 +178,7 @@ export default function VoiceMicButton({
           else void start();
         }}
         disabled={!clickable}
-        title={online ? "语音输入（ASR）" : "离线：语音不可用"}
+        title={online ? t("ai.voiceInputTitle") : t("ai.streamVoiceOffline")}
         aria-label="voice input"
         className={
           "grid h-9 w-9 shrink-0 place-items-center rounded-full text-base " +

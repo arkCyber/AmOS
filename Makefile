@@ -56,6 +56,12 @@ gated-check:
 	cargo build -p amos-asr --features sherpa
 	cargo build -p amos-asr --features sherpa --example sherpa_asr
 	cargo build -p amos-asr --features sherpa --example sherpa_session
+	# Real local ASR inside the AI daemon (bidi Payload::Audio → sherpa).
+	cargo build -p amos-ai --features asr-sherpa
+	cargo test -p amos-ai --features asr-sherpa --test bidi_sherpa_audio
+	# System-UI resident voice capture thread (feeds amos-audio captures to the
+	# daemon; single- and multi-utterance e2e).
+	cargo test -p amos-tauri --test assistant_voice_e2e
 	cargo build -p amos-tts --features piper
 	cargo build -p amos-tts --features piper --example piper_tts
 	cargo build -p amos-timesync --features ntp --example ntp_probe

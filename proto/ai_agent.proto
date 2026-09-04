@@ -70,6 +70,10 @@ message ClientMessage {
     string prompt = 1;                   // push a text prompt into the stream
     bytes audio = 2;                     // push an audio frame (voice interaction)
     string cancel = 3;                   // request cancellation of the current turn
+    bool audio_end = 4;                  // "end of utterance": force-finalize the
+                                         // current speech segment now (push-to-talk
+                                         // release), instead of waiting for the
+                                         // recognizer's own VAD/endpoint.
   }
 }
 

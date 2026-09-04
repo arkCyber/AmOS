@@ -117,7 +117,9 @@ fn validate_bundle(dir: &Path) -> Result<()> {
         .map_err(|e| StoreError::Provider(format!("bundle missing amos-app.json: {e}")))?;
     let meta: WebBundleMeta = serde_json::from_slice(&raw)
         .map_err(|e| StoreError::Provider(format!("bad amos-app.json: {e}")))?;
-    let entry = dir.join(&meta.start);
+    // The entry comes from inside the archive (a plain JSON field), so it is not
+    // constrained by the tar crate's own `..`-rejection — refuse traversal here.
+    let entry = safe_join(dir, &meta.start)?;
     if !entry.is_file() {
         return Err(StoreError::Provider(format!(
             "bundle entry {} not found",
@@ -132,9 +134,37 @@ fn io_err(action: &str, path: &Path, err: &std::io::Error) -> StoreError {
     StoreError::Provider(format!("{action} {}: {err}", path.display()))
 }
 
+/// Whether `rel` is a safe **relative** path with only normal components — i.e.
+/// no absolute path, no `..`/`.`/empty segments, no Windows prefix and no NUL.
+///
+/// This guards the *post-unpack* paths that come from inside an archive (the
+/// bundle's `start` entry) and from host asset requests, where the `tar`
+/// crate's own `..`-rejection does **not** apply (it only protects the archive
+/// entries themselves, not a path string parsed out of a JSON file afterwards).
+fn safe_relative(rel: &str) -> bool {
+    use std::path::Component;
+    if rel.is_empty() || rel.contains('\0') {
+        return false;
+    }
+    let p = Path::new(rel);
+    !p.is_absolute() && p.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// `dir.join(rel)` but only for a [`safe_relative`] path, so a bundle/host can
+/// never escape the install directory via a crafted relative path.
+fn safe_join(dir: &Path, rel: &str) -> Result<PathBuf> {
+    if !safe_relative(rel) {
+        return Err(StoreError::Provider(format!(
+            "unsafe relative path {rel:?} (path traversal refused)"
+        )));
+    }
+    Ok(dir.join(rel))
+}
+
 /// Read a small in-memory file (used by tests / hosts to load index.html).
+/// Refuses any relative path that would escape `dir` (`..`, absolute, NUL).
 pub fn read_file(dir: &Path, rel: &str) -> Result<Vec<u8>> {
-    let p = dir.join(rel);
+    let p = safe_join(dir, rel)?;
     let mut f = fs::File::open(&p).map_err(|e| io_err("open", &p, &e))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)
@@ -259,6 +289,72 @@ mod tests {
         let mf = manifest();
         // Not a gzip at all → install is rejected (Provider error), not panic.
         assert!(installer.install(&mf, b"definitely not a tar.gz").is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejects_manifest_start_that_traverses_out_of_dir() {
+        // A malicious bundle can put `../..` in its *JSON* `start` field: the tar
+        // crate's `..`-rejection does not apply to a path parsed out afterwards,
+        // so the installer must reject it itself (it must not even probe is_file
+        // outside the install dir).
+        let base = std::env::temp_dir().join(format!("amos-webinst-tt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("install"); // installer root
+                                         // A decoy that an unguarded `dir.join("../../...")` would happily hit.
+        let decoy = base.join("decoy.txt");
+        std::fs::write(&decoy, b"secret").unwrap();
+
+        let installer = WebInstaller::new(&root);
+        let mf = manifest();
+        let start = format!("../../{}", decoy.file_name().unwrap().to_string_lossy());
+        let meta = format!(r#"{{"id":"{}","name":"Evil","start":"{start}"}}"#, mf.id);
+        let bytes = gz_bundle(&[("amos-app.json", meta.as_bytes())]);
+
+        let err = installer.install(&mf, &bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe relative path"),
+            "traversal start must be refused with a clear message: {err}"
+        );
+        // The out-of-dir decoy is untouched — nothing was read or written through
+        // the traversal. (install() pre-creates the per-app dir before the final
+        // validation, so that dir may exist empty; the escape itself is refused.)
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"secret");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_file_refuses_path_traversal_and_absolute_paths() {
+        let root = std::env::temp_dir().join(format!("amos-webinst-rf-{}", std::process::id()));
+        let installer = WebInstaller::new(&root);
+        let mf = manifest();
+        let bytes = gz_bundle(&[
+            ("amos-app.json", &web_meta(&mf.id)),
+            ("index.html", b"<html>hi</html>"),
+            ("assets/app.js", b"x"),
+        ]);
+        let inst = installer.install(&mf, &bytes).unwrap();
+
+        // Normal in-dir reads (including a subdirectory) still work.
+        assert_eq!(
+            read_file(&inst.dir, "index.html").unwrap(),
+            b"<html>hi</html>"
+        );
+        assert!(read_file(&inst.dir, "assets/app.js").is_ok());
+        // Anything that would escape `dir` is refused outright.
+        assert!(read_file(&inst.dir, "..").is_err());
+        assert!(read_file(&inst.dir, "../decoy.txt").is_err());
+        assert!(
+            read_file(&inst.dir, "/etc/hostname").is_err(),
+            "absolute paths refused"
+        );
+        assert!(
+            read_file(&inst.dir, "index.html\u{0}").is_err(),
+            "NUL refused"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

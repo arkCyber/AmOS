@@ -4,7 +4,10 @@
 //! rules the UI depends on live here so they are unit-testable and identical
 //! across the Mock and a future real backend:
 //!
-//! * Enabling Airplane mode cascades Wi-Fi + Bluetooth **off**.
+//! * Enabling Airplane mode cascades Wi-Fi + Bluetooth **off** — and is
+//!   **atomic**: if any cascade step fails after Airplane is switched on, the
+//!   provider is rolled back to the exact prior snapshot and the error surfaces,
+//!   so a partially-applied Airplane state never leaks.
 //! * The non-airplane radios (Wi-Fi / Bluetooth) cannot be switched on while
 //!   Airplane mode is active — the set is refused with
 //!   [`RadioError::AirplaneActive`].
@@ -41,10 +44,20 @@ impl RadioManager {
         match radio {
             RadioMode::Airplane => {
                 if on {
-                    // Airplane ON cascades Wi-Fi + Bluetooth off.
+                    // Airplane ON cascades Wi-Fi + Bluetooth off. Do it atomically:
+                    // capture the prior state and, if a cascade step fails after
+                    // Airplane is already on, roll the whole set back so a partially
+                    // applied Airplane state can never leak to the user/provider.
+                    let before = self.snapshot().await?;
                     self.provider.set_airplane(true).await?;
-                    self.provider.set_wifi(false).await?;
-                    self.provider.set_bluetooth(false).await?;
+                    if let Err(e) = self.provider.set_wifi(false).await {
+                        self.rollback_to(before).await;
+                        return Err(e);
+                    }
+                    if let Err(e) = self.provider.set_bluetooth(false).await {
+                        self.rollback_to(before).await;
+                        return Err(e);
+                    }
                 } else {
                     self.provider.set_airplane(false).await?;
                 }
@@ -59,6 +72,14 @@ impl RadioManager {
             }
         }
         self.snapshot().await
+    }
+
+    /// Best-effort restore of every radio bit to `before` after a failed cascade.
+    /// Swallows per-call errors (the original failure is the one we report).
+    async fn rollback_to(&self, before: RadioSnapshot) {
+        let _ = self.provider.set_airplane(before.airplane).await;
+        let _ = self.provider.set_wifi(before.wifi).await;
+        let _ = self.provider.set_bluetooth(before.bluetooth).await;
     }
 
     /// Refuse non-airplane radios while Airplane mode is on.
@@ -165,5 +186,97 @@ mod tests {
         let snap = m.set(RadioMode::Wifi, false).await.unwrap();
         assert!(!snap.wifi);
         assert!(snap.bluetooth, "Bluetooth is untouched by the Wi-Fi toggle");
+    }
+
+    // ---- failure-injection: Airplane cascade is atomic (rolls back) ----
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
+
+    /// A provider whose Wi-Fi/Bluetooth writes can be made to fail a set number
+    /// of times, to prove the manager rolls back a partially-applied cascade.
+    struct FlakyProvider {
+        state: Mutex<RadioSnapshot>,
+        wifi_failures: Mutex<usize>,
+        bt_failures: Mutex<usize>,
+    }
+
+    impl FlakyProvider {
+        fn new(initial: RadioSnapshot, wifi_failures: usize, bt_failures: usize) -> Self {
+            Self {
+                state: Mutex::new(initial),
+                wifi_failures: Mutex::new(wifi_failures),
+                bt_failures: Mutex::new(bt_failures),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RadioProvider for FlakyProvider {
+        async fn snapshot(&self) -> Result<RadioSnapshot> {
+            Ok(*self.state.lock().await)
+        }
+        async fn set_wifi(&self, on: bool) -> Result<()> {
+            let mut f = self.wifi_failures.lock().await;
+            if *f > 0 {
+                *f -= 1;
+                return Err(RadioError::Provider("injected wifi failure".into()));
+            }
+            drop(f);
+            self.state.lock().await.wifi = on;
+            Ok(())
+        }
+        async fn set_bluetooth(&self, on: bool) -> Result<()> {
+            let mut f = self.bt_failures.lock().await;
+            if *f > 0 {
+                *f -= 1;
+                return Err(RadioError::Provider("injected bluetooth failure".into()));
+            }
+            drop(f);
+            self.state.lock().await.bluetooth = on;
+            Ok(())
+        }
+        async fn set_airplane(&self, on: bool) -> Result<()> {
+            self.state.lock().await.airplane = on;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn airplane_cascade_wifi_failure_rolls_back_to_prior_state() {
+        let initial = radios_on();
+        let provider = Arc::new(FlakyProvider::new(
+            initial, /*wifi_fail*/ 1, /*bt_fail*/ 0,
+        ));
+        let m = RadioManager::new(provider);
+
+        let err = m.set(RadioMode::Airplane, true).await.unwrap_err();
+        assert!(matches!(err, RadioError::Provider(_)), "{err}");
+        // No partial Airplane state may leak: every bit restored to `before`.
+        assert_eq!(m.snapshot().await.unwrap(), initial);
+    }
+
+    #[tokio::test]
+    async fn airplane_cascade_bluetooth_failure_rolls_back_to_prior_state() {
+        let initial = radios_on();
+        let provider = Arc::new(FlakyProvider::new(
+            initial, /*wifi_fail*/ 0, /*bt_fail*/ 1,
+        ));
+        let m = RadioManager::new(provider);
+
+        let err = m.set(RadioMode::Airplane, true).await.unwrap_err();
+        assert!(matches!(err, RadioError::Provider(_)), "{err}");
+        assert_eq!(m.snapshot().await.unwrap(), initial);
+    }
+
+    #[tokio::test]
+    async fn airplane_on_succeeds_when_cascade_has_no_failures() {
+        let initial = radios_on();
+        let provider = Arc::new(FlakyProvider::new(
+            initial, /*wifi_fail*/ 0, /*bt_fail*/ 0,
+        ));
+        let m = RadioManager::new(provider);
+
+        let snap = m.set(RadioMode::Airplane, true).await.unwrap();
+        assert!(snap.airplane && !snap.wifi && !snap.bluetooth);
     }
 }

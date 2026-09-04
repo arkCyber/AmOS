@@ -32,6 +32,13 @@ async-trait = "0.1"
 serde_json = "1.0"
 ureq = "2"
 
+# Compile-time switches for the native inference/ASR backends. The default
+# build is lightweight (mock ASR); enabling `asr-sherpa` pulls the real
+# sherpa-onnx local recognizer into the daemon so the bidi `Payload::Audio`
+# channel runs genuine on-device speech recognition.
+[features]
+asr-sherpa = ["amos-asr/sherpa"]
+
 [dev-dependencies]
 tower.workspace = true
 hyper-util.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "amos-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos hardware audio: AOSP-near audio-HAL abstraction (capture/playback traits + 16 kHz PCM wire spec), sample-rate resampling, deterministic mocks for tests/dev, and target_os-gated direct TinyALSA / AAudio FFI seams for the on-device pipeline (mic -> local ASR, call-audio interception)."
+
+[lib]
+name = "amos_audio"
+path = "src/lib.rs"
+
+# Pure-std on host: no runtime deps, so the default workspace build stays light.
+# The platform FFI bindings are self-contained (hand-written extern blocks, no
+# third-party native crate) and are compiled only when the matching feature is
+# on **and** the target is Android (`cfg(all(feature, target_os = "android"))`).
+[dependencies]
+
+[features]
+default = []
+# Android-only: capture/playback over AOSP TinyALSA (`libtinyalsa` PCM). Selecting
+# this on a non-Android host is a no-op (the module is cfg'd out).
+tinyalsa = []
+# Android-only: capture/playback over AAudio (low-latency NDK native audio).
+aaudio = []
+
+[[example]]
+name = "mic_to_asr"
+required-features = []

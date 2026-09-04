@@ -17,12 +17,18 @@ async-trait = "0.1"
 thiserror = "1"
 amos-proto.workspace = true
 tonic.workspace = true
+# Real Android backend (dial via the System UI's app Context → `ACTION_CALL`/Telecom
+# under ROLE_DIALER). Optional: only pulled in when the `android` feature is enabled,
+# so desktop/CI builds stay free of the JNI stack (mirrors `amos-radio`).
+jni = { version = "0.21", optional = true }
 
 [features]
 default = []
-# Real Android/Binder provider (needs a target OS + privileged role). P1 ships the
-# domain core + Mock + the gRPC service; this gates the platform impl when it lands.
-android = []
+# Enables `src/android.rs` (AndroidTelephonyProvider / AndroidEmergencyTelephonyProvider).
+# Intended for on-device builds of the System UI (ROLE_DIALER) APK (cross-compiled for
+# aarch64-linux-android); deliberately excluded from desktop/CI. Runtime still needs a
+# real Android VM + a Context; `cargo check --features android` validates it *compiles*.
+android = ["dep:jni"]
 
 [dev-dependencies]
 tower.workspace = true

@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  assistantVoiceEnd,
+  assistantVoiceFeed,
+  assistantVoiceStart,
+  assistantVoiceStop,
   bridged,
   bridgeDiag,
   cancelAiSession,
@@ -183,5 +187,31 @@ describe("backend bridge", () => {
     ]) {
       expect(calls, `expected ${cmd} to be routed`).toContain(cmd);
     }
+  });
+
+  test("assistant voice wrappers route to start/feed/end/stop with correct args", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    const fake = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args: args ?? {} });
+        return { ok: true };
+      },
+      listen: async () => async () => {},
+    };
+    setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
+
+    await assistantVoiceStart("conv-v");
+    await assistantVoiceFeed([1, 2, 3]);
+    await assistantVoiceEnd();
+    await assistantVoiceStop();
+
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "assistant_voice_start",
+      "assistant_voice_feed",
+      "assistant_voice_end",
+      "assistant_voice_stop",
+    ]);
+    expect(calls[0]!.args.sessionId).toBe("conv-v");
+    expect(calls[1]!.args.frame).toEqual([1, 2, 3]);
   });
 });

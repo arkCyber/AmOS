@@ -581,6 +581,21 @@ impl AiAgent for AiAgentService {
                             });
                         }
                     }
+                    Some(amos_proto::ai_agent::client_message::Payload::AudioEnd(_)) => {
+                        // Push-to-talk release: the user signalled "done speaking",
+                        // so force-finalize whatever was recognized so far into a
+                        // prompt (works even for a short utterance that has not yet
+                        // reached the recognizer's own VAD/endpoint).
+                        if let Some(prompt_text) = chat_asr.as_mut().and_then(|a| a.finish()) {
+                            pending = Some(ClientMessage {
+                                payload: Some(
+                                    amos_proto::ai_agent::client_message::Payload::Prompt(
+                                        prompt_text,
+                                    ),
+                                ),
+                            });
+                        }
+                    }
                     Some(amos_proto::ai_agent::client_message::Payload::Cancel(_)) => {
                         break 'outer;
                     }
@@ -759,10 +774,10 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         .add_service(amos_android::service::server(amos_android::auto()))
         // Telephony service (see crates/amos-telephony + docs/telephony.md).
         // P1 backend is the in-process mock; a real Android provider is swapped in
-        // later (feature `android`). `demo_server()` auto-connects outgoing calls so
-        // the desktop demo can reach Active and record; `mock_server()` stays strict
-        // for the headless e2e harness.
-        .add_service(amos_telephony::service::demo_server())
+        // later (feature `android`). We mount the *rate-limited* variant: ordinary
+        // dials are capped per client id (30/min) while emergency calls are always
+        // exempt (docs/telephony.md §5); auto-connect keeps the desktop demo operable.
+        .add_service(amos_telephony::service::demo_server_limited(30))
         .serve_with_incoming(incoming);
 
     tokio::select! {

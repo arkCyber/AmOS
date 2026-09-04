@@ -231,3 +231,71 @@ pub fn spawn_telephony_watch(app: AppHandle) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::call_payload;
+    use amos_proto::amos_telephony::{
+        CallDirection as ProtoDirection, CallIdMsg, CallSnapshot, CallState as ProtoState,
+        RecordingState as ProtoRecording,
+    };
+
+    fn snap(state: i32, direction: i32, recording: i32) -> CallSnapshot {
+        CallSnapshot {
+            call: Some(CallIdMsg { id: "c1".into() }),
+            peer: "13800138000".into(),
+            direction,
+            state,
+            end_reason: 0,
+            emergency: false,
+            recording,
+        }
+    }
+
+    #[test]
+    fn maps_active_incoming_recording_on() {
+        let p = call_payload(&snap(
+            ProtoState::Active as i32,
+            ProtoDirection::Incoming as i32,
+            ProtoRecording::RecordingOn as i32,
+        ));
+        assert_eq!(p.id, "c1");
+        assert_eq!(p.peer, "13800138000");
+        assert_eq!(p.state, "Active");
+        assert_eq!(p.direction, "Incoming");
+        assert_eq!(p.recording, "On");
+        assert!(!p.emergency);
+    }
+
+    #[test]
+    fn maps_ended_and_failed_recording() {
+        let p = call_payload(&snap(
+            ProtoState::Ended as i32,
+            ProtoDirection::Outgoing as i32,
+            ProtoRecording::RecordingFailed as i32,
+        ));
+        assert_eq!(p.state, "Ended");
+        assert_eq!(p.direction, "Outgoing");
+        assert_eq!(p.recording, "Failed");
+    }
+
+    #[test]
+    fn unknown_values_degrade_to_safe_defaults() {
+        // Unrecognized wire values must never panic or leak raw ints to the UI.
+        let p = call_payload(&snap(999, 999, 999));
+        assert_eq!(p.state, "Unknown");
+        assert_eq!(p.direction, "Outgoing");
+        assert_eq!(p.recording, "Off");
+    }
+
+    #[test]
+    fn maps_dialing_and_recording_off() {
+        let p = call_payload(&snap(
+            ProtoState::Dialing as i32,
+            ProtoDirection::Outgoing as i32,
+            ProtoRecording::RecordingOff as i32,
+        ));
+        assert_eq!(p.state, "Dialing");
+        assert_eq!(p.recording, "Off");
+    }
+}
