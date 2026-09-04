@@ -115,3 +115,20 @@ export async function startLmkSurfaceWatcher(): Promise<() => void> {
     void reconcileLegacySurfaces();
   });
 }
+
+/** Default cadence for the background periodic reconcile (ms). */
+export const RECONCILE_INTERVAL_MS = 30_000;
+
+/**
+ * Run one reconcile immediately (catches surfaces stale from before the shell
+ * started watching), then every `intervalMs`. Returns a stop() that clears the
+ * timer. No-op when not bridged (reconcile guards internally). A DOM-side helper;
+ * the pure decision logic stays in `reconcileLegacySurfaces`.
+ */
+export function startPeriodicReconcile(intervalMs = RECONCILE_INTERVAL_MS): () => void {
+  void reconcileLegacySurfaces();
+  const id = window.setInterval(() => {
+    void reconcileLegacySurfaces();
+  }, intervalMs);
+  return () => window.clearInterval(id);
+}

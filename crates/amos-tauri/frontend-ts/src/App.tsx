@@ -17,7 +17,7 @@ import { isExtId, loadStoreTiles, subscribeStoreTiles, tileById, type StoreTile 
 import { useStoreValue } from "./lib/useStoreValue";
 import { bridged, subscribe } from "./lib/backend";
 import { useNotificationAlert } from "./lib/useNotificationAlert";
-import { startLmkSurfaceWatcher } from "./lib/lmk";
+import { startLmkSurfaceWatcher, startPeriodicReconcile } from "./lib/lmk";
 import { useDueReminderAlerts } from "./lib/reminderNotify";
 import {
   buttonActionOf,
@@ -298,7 +298,9 @@ function Shell() {
   }, []);
 
   // Tear down `legacy` Android surfaces whose container app was reclaimed or
-  // destroyed (daemon `WatchLmk` → Rust `lmk-surface` event → wm_close).
+  // destroyed (daemon `WatchLmk` → Rust `lmk-surface` event → wm_close). Also
+  // reconcile the whole legacy set periodically against the authoritative LMK
+  // snapshot (catches surfaces stale before the watcher started / missed events).
   useEffect(() => {
     if (!bridged()) return;
     let alive = true;
@@ -311,9 +313,11 @@ function Shell() {
       }
       unsub = stop;
     })();
+    const stopPeriodic = startPeriodicReconcile();
     return () => {
       alive = false;
       unsub?.();
+      stopPeriodic();
     };
   }, []);
 
