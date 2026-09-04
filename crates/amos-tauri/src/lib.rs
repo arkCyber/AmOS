@@ -82,6 +82,7 @@ pub fn run() {
             ai_bridge::get_android_apps,
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,
+            ai_bridge::android_lmk_tasks,
             buttons::simulate_button,
             wm::wm_open,
             wm::wm_focus,

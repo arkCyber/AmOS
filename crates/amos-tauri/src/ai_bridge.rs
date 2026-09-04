@@ -801,3 +801,48 @@ pub async fn get_android_app_icon(
         }
     }
 }
+
+/// Serializable live container LMK task (prost types don't impl serde). The shell
+/// uses this (via `GetLmkSnapshot`) as the *authoritative* set of still-alive
+/// legacy surfaces when reconciling against `wm_windows`.
+#[derive(Serialize)]
+pub struct AndroidLmkTaskInfo {
+    pub window_id: String,
+    pub package_name: String,
+    /// `foreground|visible|foreground_service|background|cached|stopped`.
+    pub state: String,
+}
+
+/// Tauri command: fetch the daemon's live LMK task snapshot (which container
+/// legacy surfaces are still alive) so the shell can reconcile stale surfaces.
+#[tauri::command]
+pub async fn android_lmk_tasks(
+    state: State<'_, AiBridge>,
+) -> Result<Vec<AndroidLmkTaskInfo>, String> {
+    let mut attempt = 0;
+    loop {
+        let mut client = state.connect_android().await?;
+        match client.get_lmk_snapshot(Empty {}).await {
+            Ok(resp) => {
+                let snap = resp.into_inner();
+                return Ok(snap
+                    .tasks
+                    .into_iter()
+                    .map(|t| AndroidLmkTaskInfo {
+                        window_id: t.window_id,
+                        package_name: t.package_name,
+                        state: t.state_key,
+                    })
+                    .collect());
+            }
+            Err(e) => {
+                attempt += 1;
+                state.invalidate();
+                if attempt >= 2 {
+                    return Err(e.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
