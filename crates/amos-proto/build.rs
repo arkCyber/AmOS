@@ -9,11 +9,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/ai_agent.proto",
                 "../../proto/android_compat.proto",
                 "../../proto/translate.proto",
+                "../../proto/telephony.proto",
             ],
             &["../../proto"],
         )?;
     println!("cargo:rerun-if-changed=../../proto/ai_agent.proto");
     println!("cargo:rerun-if-changed=../../proto/android_compat.proto");
     println!("cargo:rerun-if-changed=../../proto/translate.proto");
+    println!("cargo:rerun-if-changed=../../proto/telephony.proto");
     Ok(())
 }

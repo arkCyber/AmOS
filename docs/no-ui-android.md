@@ -6,6 +6,8 @@ framework / SystemUI. This is the ideal substrate: it gives us every hardware
 driver and the ActivityManager/SurfaceFlinger, while letting Rust + Tauri own
 the entire user-facing system.
 
+> **✅ 定位判定 (Deployment Decision, 2026-09-03)**：本文（no-UI Android 基座）是 **AmOS 产品在真机上的唯一底座**。与之相对的 `docs/android-compat.md` / `amos-android` 的 **Waydroid 容器路径仅用于「开发 / 原型」**（非 Android 主机上验证 APK 兼容管线）；真机上旧 APK 作为原生 Android 进程直接运行，无需 Waydroid。两者不矛盾——按部署目标分工。
+
 ## 1. Why the existing code already fits
 
 | Amos component | Runs as | Notes |

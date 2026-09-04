@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline } from "../lib/notes";
+import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline } from "../lib/notes";
 
 describe("notes store helpers", () => {
   test("prependNote adds newest first, each with a unique id", () => {
@@ -284,3 +284,13 @@ describe("notes store helpers", () => {
     expect(fmtInline("[m](mailto:a@b.c)").every((s) => !s.link)).toBe(true);
   });
 });
+
+describe("fmtTime", () => {
+  test("formats a timestamp into a localized string", () => {
+    expect(typeof fmtTime(0)).toBe("string");
+    expect(fmtTime(0).length).toBeGreaterThan(0);
+    // different instants format differently
+    expect(fmtTime(0)).not.toBe(fmtTime(86400000));
+  });
+});
+

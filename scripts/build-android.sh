@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Build the headless Rust pieces of Amos for aarch64-linux-android.
+# Build the Rust pieces of Amos for aarch64-linux-android.
 #
-# Outputs static binaries under target/aarch64-linux-android/release/ which can
-# be staged into /system/bin/ on the no-UI Android base (see amos.rc).
+# * Headless binaries (amos-ai, amos-wm) output under
+#   target/aarch64-linux-android/release/ for staging into /system/bin/ (amos.rc).
+# * amos-radio with --features android compiles the jni AndroidRadioProvider —
+#   a *lib* the System UI APK links (cargo tauri android build --features android).
 #
 # Requires: Android NDK (ANDROID_NDK_HOME), rustup target aarch64-linux-android.
 set -euo pipefail
@@ -34,9 +36,20 @@ EOF
 cargo build --release --target "$TARGET" -p amos-ai -p amos-wm
 
 echo
+echo "--- compiling radio/connectivity crate (android provider) for $TARGET ---"
+# amos-radio with `--features android` pulls in the jni-based AndroidRadioProvider
+# (Wi-Fi via WifiManager, Bluetooth via BluetoothAdapter). Pure Rust + jni — no
+# extra NDK C libs — but gated behind the feature so desktop builds skip it.
+cargo build --release --target "$TARGET" -p amos-radio --features android
+
+echo
 echo "Built binaries:"
 find "target/$TARGET/release" -maxdepth 1 -type f \
   -name 'amos-ai' -o -name 'amos-ai.exe' | sort
+echo
+echo "System UI: enable amos-tauri's 'android' feature so its RadioBridge is backed"
+echo "  by AndroidRadioProvider, then build the APK:"
+echo "  cd crates/amos-tauri && cargo tauri android build --features android"
 echo
 echo "Stage to device (example):"
 echo "  adb root; adb push target/$TARGET/release/amos-ai /system/bin/ ; adb shell chmod 0755 /system/bin/amos-ai"

@@ -3,6 +3,8 @@ import { useI18n } from "../i18n";
 import { chip } from "./ui";
 import { useCapability } from "./CapabilityGate";
 import { useOnline } from "../lib/useOnline";
+import { SETTINGS_KEY, locationEnabled, normalizeQuick } from "../lib/settings";
+import { useStoreValue } from "../lib/useStoreValue";
 import {
   PLACES,
   clampZoom,
@@ -32,6 +34,14 @@ export default function MapsApp() {
   // called after the "location" capability is granted to the maps app.
   const loc = useCapability("maps", "location");
   const [askLoc, setAskLoc] = useState(false);
+
+  // System location master switch (the Notification Center "location" quick
+  // toggle). When it is OFF, geolocation is blocked for every app regardless of
+  // its grant — a granted app still needs the master ON to actually locate.
+  const quickSettings = useStoreValue<unknown>(SETTINGS_KEY, {});
+  // Location services default to ON; only an explicit OFF (the NC quick toggle)
+  // disables them system-wide (regardless of per-app grants).
+  const locationMaster = locationEnabled(normalizeQuick(quickSettings));
 
   // Drag-to-pan: remember where the drag began so each move is relative to the
   // start (no drift), and pan by screen-pixel delta.
@@ -77,6 +87,10 @@ export default function MapsApp() {
   };
 
   const locate = () => {
+    if (!locationMaster) {
+      setStatus(t("maps.locOff"));
+      return;
+    }
     if (typeof navigator !== "undefined" && navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => {
@@ -165,7 +179,8 @@ export default function MapsApp() {
         )}
         <button
           onClick={() => {
-            if (!loc.granted) setAskLoc(true);
+            if (!locationMaster) setStatus(t("maps.locOff"));
+            else if (!loc.granted) setAskLoc(true);
             else locate();
           }}
           className="rounded-full bg-neutral-300 px-3 py-1 text-sm dark:bg-neutral-700"

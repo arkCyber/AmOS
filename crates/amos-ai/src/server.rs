@@ -416,6 +416,12 @@ impl AiAgent for AiAgentService {
                 m
             };
 
+            // Per-connection voice recognizer: `Payload::Audio` frames feed it;
+            // when an utterance completes its text is enqueued as a prompt (see
+            // the Audio arm below). Deterministic mock by default; disabled via
+            // AMOS_ASR_BACKEND=off.
+            let mut chat_asr = crate::chat_asr::ChatAsr::from_env();
+
             'outer: loop {
                 let msg = if let Some(m) = pending.take() {
                     m
@@ -557,41 +563,23 @@ impl AiAgent for AiAgentService {
                             .await;
                     }
                     Some(amos_proto::ai_agent::client_message::Payload::Audio(audio)) => {
-                        // Voice input: ASR isn't wired yet, so acknowledge honestly
-                        // instead of silently swallowing the frame.
-                        let note = format!(
-                            "[语音] 收到 {} 字节音频，ASR 尚未接入，请改用文本输入。",
-                            audio.len()
-                        );
-                        let note_tokens = crate::inference::mock_tokens(&note);
-                        let note_count = note_tokens.len();
-                        for token in note_tokens {
-                            if tx
-                                .send(Ok(AgentChunk {
-                                    session_id: String::new(),
-                                    token,
-                                    done: false,
-                                    error: String::new(),
-                                    card: None,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                active.fetch_sub(1, Ordering::SeqCst);
-                                return;
-                            }
-                            tokio::time::sleep(crate::inference::TOKEN_INTERVAL).await;
+                        // Voice input: feed the frame to this connection's
+                        // recognizer. When an utterance is complete (recognizer
+                        // endpoint), enqueue its text as a *prompt* so the
+                        // existing Prompt path (semantic card + inference +
+                        // audit + session history) handles it unchanged. When
+                        // voice is disabled the frame is simply dropped.
+                        if let Some(prompt_text) =
+                            chat_asr.as_mut().and_then(|a| a.feed_audio(&audio))
+                        {
+                            pending = Some(ClientMessage {
+                                payload: Some(
+                                    amos_proto::ai_agent::client_message::Payload::Prompt(
+                                        prompt_text,
+                                    ),
+                                ),
+                            });
                         }
-                        let _ = tx
-                            .send(Ok(AgentChunk {
-                                session_id: String::new(),
-                                token: String::new(),
-                                done: true,
-                                error: String::new(),
-                                card: None,
-                            }))
-                            .await;
-                        security.log_tokens(&client_id, note_count).await;
                     }
                     Some(amos_proto::ai_agent::client_message::Payload::Cancel(_)) => {
                         break 'outer;
@@ -769,6 +757,12 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
             },
         ))
         .add_service(amos_android::service::server(amos_android::auto()))
+        // Telephony service (see crates/amos-telephony + docs/telephony.md).
+        // P1 backend is the in-process mock; a real Android provider is swapped in
+        // later (feature `android`). `demo_server()` auto-connects outgoing calls so
+        // the desktop demo can reach Active and record; `mock_server()` stays strict
+        // for the headless e2e harness.
+        .add_service(amos_telephony::service::demo_server())
         .serve_with_incoming(incoming);
 
     tokio::select! {

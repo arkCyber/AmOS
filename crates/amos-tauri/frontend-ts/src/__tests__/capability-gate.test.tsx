@@ -31,10 +31,16 @@ afterEach(() => {
   window.localStorage.removeItem("amos-ui.locale");
 });
 
-function renderGate() {
+function renderGate(onAllowed?: () => void) {
   root.render(
     <I18nProvider>
-      <CapabilityGate appId="camera" cap="camera" appLabel="Camera" capLabel="Camera">
+      <CapabilityGate
+        appId="camera"
+        cap="camera"
+        appLabel="Camera"
+        capLabel="Camera"
+        onAllowed={onAllowed}
+      >
         <div id="secret">LIVE VIEWFINDER</div>
       </CapabilityGate>
     </I18nProvider>,
@@ -65,5 +71,44 @@ describe("CapabilityGate (reusable permission gate)", () => {
     expect(host.querySelector("#secret")).not.toBeNull();
     // Persisted: a fresh ledger read sees the grant.
     expect(loadLedger().camera).toContain("camera");
+  });
+
+  test("onAllowed fires right after Allow is tapped", async () => {
+    window.localStorage.removeItem("amos.permissions");
+    let fired = 0;
+    renderGate(() => {
+      fired += 1;
+    });
+    await act(async () => {});
+    await act(async () => {
+      Array.from(host.querySelectorAll("button")).find(
+        (b) => (b.textContent ?? "").toLowerCase().includes("allow"),
+      )?.click();
+    });
+    expect(fired).toBe(1);
+  });
+
+  test("Deny refuses (children stay hidden, nothing persisted); Allow later still works", async () => {
+    window.localStorage.removeItem("amos.permissions");
+    renderGate();
+    await act(async () => {});
+    // Tap Deny → still gated, not granted.
+    await act(async () => {
+      Array.from(host.querySelectorAll("button")).find(
+        (b) => (b.textContent ?? "").toLowerCase().includes("deny"),
+      )?.click();
+    });
+    expect(host.querySelector("#secret")).toBeNull();
+    expect(loadLedger().camera ?? []).not.toContain("camera");
+    // The denied hint is now shown.
+    expect(host.textContent!.toLowerCase()).toContain("denied");
+    // A later Allow reveals the children.
+    await act(async () => {
+      Array.from(host.querySelectorAll("button")).find(
+        (b) => (b.textContent ?? "").toLowerCase().includes("allow"),
+      )?.click();
+    });
+    await act(async () => {});
+    expect(host.querySelector("#secret")).not.toBeNull();
   });
 });

@@ -25,6 +25,13 @@ pub mod translate {
     tonic::include_proto!("translate");
 }
 
+pub mod amos_telephony {
+    //! Generated types for the telephony service:
+    //! `amos_telephony_client` (client), `amos_telephony_server` (server), and
+    //! messages/enums (`DialRequest`, `CallSnapshot`, `CallState`, ...).
+    tonic::include_proto!("amos_telephony");
+}
+
 /// gRPC metadata header carrying the caller's client id.
 ///
 /// The System UI (Tauri core) sends this on every RPC so the daemon's security

@@ -275,6 +275,109 @@ export async function translateText(
   });
 }
 
+/* ---- Telephony (amos-telephony service over the OS UDS: dial/end/status/recording).
+ *       Mirrors amos_tauri_lib::telephony payloads. -------- */
+export type TelephonyCall = {
+  id: string;
+  peer: string;
+  state: string;
+  /** "Outgoing" / "Incoming" — who initiated the call. */
+  direction: string;
+  emergency: boolean;
+  /** "Off" / "On" / "Failed" — whether the call is being recorded. */
+  recording: string;
+};
+export type TelephonyDialResult = { id: string };
+
+/** Tauri event carrying one live-call state snapshot (incoming/connected/ended). */
+export const TELEPHONY_EVENT = "telephony-event";
+
+/** Place a call. `emergency` (or an emergency number) uses the privileged path. */
+export async function telephonyDial(
+  number: string,
+  emergency = false,
+): Promise<TelephonyDialResult | null> {
+  return invoke<TelephonyDialResult>("telephony_dial", { number, emergency });
+}
+
+/** End a live call by id. */
+export async function telephonyEnd(callId: string): Promise<void | null> {
+  return invoke<void>("telephony_end", { callId });
+}
+
+/** Answer an incoming (ringing) call by id. */
+export async function telephonyAnswer(callId: string): Promise<void | null> {
+  return invoke<void>("telephony_answer", { callId });
+}
+
+/** Dev/demo: ask the mock daemon to ring an incoming call; returns its call id. */
+export async function telephonySimulateIncoming(
+  number: string,
+): Promise<string | null> {
+  return invoke<string>("telephony_simulate_incoming", { number });
+}
+
+/** List live calls (dialling / ringing / active). */
+export async function telephonyStatus(): Promise<TelephonyCall[] | null> {
+  return invoke<TelephonyCall[]>("telephony_status");
+}
+
+/**
+ * Subscribe to live call-state events pushed from the daemon `Watch` stream via the
+ * Rust bridge. Outside Tauri this is a no-op (returns an unsubscribe). Each call to
+ * `onEvent` receives a `TelephonyCall`.
+ */
+export function onTelephonyEvent(
+  onEvent: (call: TelephonyCall) => void,
+): () => void {
+  let cancelled = false;
+  let unsub: (() => void) | null = null;
+  void subscribe(TELEPHONY_EVENT, (payload) => {
+    const call = payload as TelephonyCall;
+    if (call && typeof call.id === "string") onEvent(call);
+  }).then((u) => {
+    if (cancelled) u();
+    else unsub = u;
+  });
+  return () => {
+    cancelled = true;
+    unsub?.();
+  };
+}
+
+/** Start recording a live call; returns its authoritative snapshot. */
+export async function telephonyStartRecording(
+  callId: string,
+): Promise<TelephonyCall | null> {
+  return invoke<TelephonyCall>("telephony_start_recording", { callId });
+}
+
+/** Stop recording a live call; returns its authoritative snapshot. */
+export async function telephonyStopRecording(
+  callId: string,
+): Promise<TelephonyCall | null> {
+  return invoke<TelephonyCall>("telephony_stop_recording", { callId });
+}
+
+/* ---- Radio / connectivity (radio_*: wifi / bluetooth / airplane). Real radios
+ *       live on the System UI side (Android services), so unlike telephony these
+ *       do NOT round-trip through the headless daemon. ---- */
+export type RadioPayload = { wifi: boolean; bluetooth: boolean; airplane: boolean };
+
+/** Read the current radio state (wifi / bluetooth / airplane). */
+export async function radioStatus(): Promise<RadioPayload | null> {
+  return invoke<RadioPayload>("radio_status");
+}
+
+/** Toggle one radio. Airplane mode cascades Wi-Fi + Bluetooth off and gates
+ * them until it is turned back off; returns the authoritative resulting state. */
+export async function radioSet(
+  key: "wifi" | "bluetooth" | "airplane",
+  enabled: boolean,
+): Promise<RadioPayload | null> {
+  return invoke<RadioPayload>("radio_set", { key, enabled });
+}
+
 /* ---- Mail (amos-mail bridge: mail_mailboxes / mail_list / mail_inbox /
  *       mail_read / mail_send). Shapes mirror the Rust amos_mail models. ---- */
 export type MailAddr = { name: string; email: string };

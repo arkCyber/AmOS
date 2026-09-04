@@ -16,7 +16,9 @@ pub mod appstore;
 pub mod buttons;
 pub mod interpret;
 pub mod mail;
+pub mod radio;
 pub mod store;
+pub mod telephony;
 pub mod translate;
 pub mod tts;
 pub mod wm;
@@ -32,11 +34,20 @@ use wm::{SystemContext, WmState};
 // single allowed expect in production — everything else is gated (P0-1).
 #[allow(clippy::expect_used)]
 pub fn run() {
+    // Durable store is the source of truth for quick-settings. Radio toggles live
+    // in-process (Android services are reachable from the System UI APK, not the
+    // headless daemon), so we seed the radio bridge from the persisted
+    // `amos.settings` so radios survive restarts without the UI re-applying them.
+    let shared_store = SharedStore::new();
+    let radio_seed = radio::seed_from_settings(shared_store.get("amos.settings").as_deref());
+    let radio_bridge = radio::RadioBridge::mock_seeded(radio_seed);
+
     tauri::Builder::default()
         .manage(AiBridge::new())
         .manage(WmState::new())
         .manage(SystemContext::new())
-        .manage(SharedStore::new())
+        .manage(shared_store)
+        .manage(radio_bridge)
         .manage(buttons::HardwareButtons::new())
         .manage(interpret::InterpretationBridge::new())
         .manage(tts::TtsBridge::new())
@@ -101,7 +112,16 @@ pub fn run() {
             appstore::appstore_install,
             appstore::appstore_upgrade,
             appstore::appstore_uninstall,
-            appstore::appstore_bundle_resource
+            appstore::appstore_bundle_resource,
+            telephony::telephony_dial,
+            telephony::telephony_end,
+            telephony::telephony_status,
+            telephony::telephony_answer,
+            telephony::telephony_simulate_incoming,
+            telephony::telephony_start_recording,
+            telephony::telephony_stop_recording,
+            radio::radio_status,
+            radio::radio_set
         ])
         .setup(|app| {
             // System-wide readiness probe: log the daemon status once on boot.
@@ -110,6 +130,10 @@ pub fn run() {
                 Ok(status) => tracing::info!("AI daemon online: model={}", status.model),
                 Err(e) => tracing::warn!("AI daemon not reachable on boot: {e}"),
             }
+            // Forward the daemon telephony `Watch` stream (incoming/connected/ended)
+            // to the WebView as `telephony-event` so the phone UI stays live without
+            // polling (reconnects if the daemon starts/stops).
+            telephony::spawn_telephony_watch(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -1,0 +1,28 @@
+[package]
+name = "amos-radio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos radio/connectivity domain core: wifi/bluetooth/airplane state, a pluggable RadioProvider seam (Mock + future Android backend), and airplane-mode cascade rules enforced by a RadioManager. Design: docs/radio.md."
+
+[lib]
+name = "amos_radio"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "1"
+tokio.workspace = true
+# Real Android backend (Android ConnectivityManager/WifiManager + BluetoothManager
+# via JNI). Optional: only pulled in when the `android` feature is enabled, so
+# desktop/CI builds stay free of the JNI stack.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enables `src/android.rs` (AndroidRadioProvider). Intended for on-device builds
+# of the System UI APK (cross-compiled for aarch64-linux-android); the module is
+# deliberately excluded from desktop/CI. Runtime still requires a real Android
+# VM + a Context; `cargo check --features android` validates that it *compiles*.
+android = ["dep:jni"]

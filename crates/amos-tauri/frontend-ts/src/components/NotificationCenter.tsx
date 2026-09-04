@@ -1,12 +1,17 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
 import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+import { bridged, radioSet, radioStatus, type RadioPayload } from "../lib/backend";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import {
   NOTIF_KEY,
   SETTINGS_KEY,
+  dndActive,
+  flipLocation,
   flipQuick,
+  flipRadio,
+  locationEnabled,
   normalizeNotifs,
   normalizeQuick,
   removeNotif,
@@ -14,6 +19,7 @@ import {
   type Notif,
   type QuickKey,
   type QuickSettings,
+  type RadioKey,
 } from "../lib/settings";
 
 const QUICK: { key: QuickKey; label: "q.wifi" | "q.bluetooth" | "q.airplane" | "q.dark" | "q.dnd" | "q.location"; icon: string }[] = [
@@ -41,9 +47,35 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
   });
   const rootRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(open, rootRef, onClose);
+  const quiet = dndActive(settings);
+
+  // Merge an authoritative backend snapshot into the local quick-settings,
+  // preserving the non-radio toggles (darkmode/dnd/location).
+  const mergeRadio = (s: QuickSettings, r: RadioPayload): QuickSettings => ({
+    ...s,
+    wifi: r.wifi,
+    bluetooth: r.bluetooth,
+    airplane: r.airplane,
+  });
+
+  // When the panel opens inside Tauri, sync radio tiles from the authoritative
+  // backend snapshot (e.g. airplane mode was toggled from another window). We
+  // only touch React state here — durability lives in the shared store.
+  useEffect(() => {
+    if (!open || !bridged()) return;
+    let cancelled = false;
+    radioStatus().then((snap) => {
+      if (!snap || cancelled) return;
+      setSettings((prev) => mergeRadio(prev, snap));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
   if (!open) return null;
 
-  const toggle = (key: QuickKey) => {
+  const toggle = async (key: QuickKey) => {
     if (key === "darkmode") {
       // Flip the *actual* theme and keep the quick-setting mirror in sync.
       const nextDark = !dark;
@@ -53,7 +85,45 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
       themeToggle();
       return;
     }
+    if (key === "wifi" || key === "bluetooth" || key === "airplane") {
+      await toggleRadio(key);
+      return;
+    }
+    if (key === "location") {
+      // System location-services master: defaults ON; tapping flips it OFF/ON.
+      const next = flipLocation(settings);
+      setSettings(next);
+      writeStoreValue(SETTINGS_KEY, next);
+      return;
+    }
     const next = flipQuick(settings, key);
+    setSettings(next);
+    writeStoreValue(SETTINGS_KEY, next);
+  };
+
+  // Radio toggles go through the real `radio_*` backend when it is reachable
+  // (authoritative snapshot incl. airplane cascade); outside Tauri we fall back
+  // to the same policy locally so the UI still behaves identically.
+  const toggleRadio = async (key: RadioKey) => {
+    // wifi / bluetooth are disabled while airplane mode is on — mirror the
+    // backend guard, so a gated tap is a clean no-op rather than an RPC error.
+    if (key !== "airplane" && settings.airplane) return;
+    const on = !!settings[key];
+    if (bridged()) {
+      const snap = await radioSet(key, !on);
+      if (snap) {
+        const merged = mergeRadio(settings, snap);
+        setSettings(merged);
+        writeStoreValue(SETTINGS_KEY, merged);
+        return;
+      }
+      // Rejected/unavailable (e.g. daemon bridge down): don't keep stale tiles —
+      // pull the authoritative state instead.
+      const live = await radioStatus();
+      if (live) setSettings((prev) => mergeRadio(prev, live));
+      return;
+    }
+    const next = flipRadio(settings, key);
     setSettings(next);
     writeStoreValue(SETTINGS_KEY, next);
   };
@@ -88,7 +158,12 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
       {/* Quick settings — iOS Control-Center style translucent tiles */}
       <div className="mt-4 grid grid-cols-3 gap-2.5">
         {QUICK.map((q) => {
-          const on = q.key === "darkmode" ? dark : !!settings[q.key];
+          const on =
+            q.key === "darkmode"
+              ? dark
+              : q.key === "location"
+                ? locationEnabled(settings)
+                : !!settings[q.key];
           return (
             <button
               key={q.key}
@@ -109,7 +184,15 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
       </div>
 
       <div className="mt-3 flex items-center justify-between px-1">
-        <span className="text-xs font-semibold uppercase tracking-widest opacity-50">{notifs.length} ·</span>
+        <span className="text-xs font-semibold uppercase tracking-widest opacity-50">
+          {quiet ? (
+            <span className="normal-case tracking-normal text-accent">
+              🌒 {t("nc.dnd")}
+            </span>
+          ) : (
+            `${notifs.length} ·`
+          )}
+        </span>
         <button onClick={clear} className="text-xs font-medium text-accent hover:underline">
           {t("nc.clear")}
         </button>
@@ -122,7 +205,12 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
           notifs.map((n) => (
             <div
               key={n.id}
-              className="rounded-3xl bg-white/60 p-3.5 shadow-sm ring-1 ring-black/5 dark:bg-white/10 dark:ring-white/10"
+              className={
+                "rounded-3xl p-3.5 shadow-sm ring-1 ring-black/5 dark:ring-white/10 " +
+                (quiet
+                  ? "bg-white/30 opacity-60 saturate-50 dark:bg-white/5"
+                  : "bg-white/60 dark:bg-white/10")
+              }
             >
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold">

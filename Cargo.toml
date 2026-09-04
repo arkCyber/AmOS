@@ -13,11 +13,13 @@ members = [
     "crates/amos-int",
     "crates/amos-int-cli",
     "crates/amos-asr",
+    "crates/amos-telephony",
     "crates/amos-tts",
     "crates/amos-appstore",
     "crates/amos-appstore-cli",
     "crates/amos-timesync",
     "crates/amos-timesync-cli",
+    "crates/amos-radio",
 ]
 
 [workspace.package]
@@ -50,6 +52,7 @@ amos-android = { path = "crates/amos-android" }
 amos-int = { path = "crates/amos-int" }
 amos-appstore = { path = "crates/amos-appstore" }
 amos-timesync = { path = "crates/amos-timesync" }
+amos-telephony = { path = "crates/amos-telephony" }
 
 # ---- profile tuning for fast iteration / smaller mobile binaries ----
 [profile.dev]

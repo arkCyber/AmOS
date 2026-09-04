@@ -24,6 +24,10 @@ amos-appstore = { path = "../amos-appstore" }
 amos-translate = { path = "../amos-translate" }
 amos-tts = { path = "../amos-tts" }
 amos-asr = { path = "../amos-asr", optional = true }
+amos-radio = { path = "../amos-radio" }
+# Real Android radio provider (via amos-radio/android). Optional: only pulled in
+# when amos-tauri's `android` feature is on (System UI APK on-device build).
+jni = { version = "0.21", optional = true }
 tauri.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -45,6 +49,10 @@ tracing.workspace = true
 # AMOS_PIPER_MODEL_DIR to a voice dir so tts_synthesize uses local Piper.
 [features]
 default = []
+# On-device System UI: back RadioBridge with amos-radio's AndroidRadioProvider
+# (jni). Desktop/CI omit it so no JNI stack is compiled. Host `cargo check
+# --features android` still validates that the wiring compiles.
+android = ["dep:jni", "amos-radio/android"]
 sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]
 piper-tts = ["amos-tts/piper"]
 # Real HTTP app-store backend for the StoreBridge (remote catalog + package

@@ -2,6 +2,14 @@ import { Fragment, useEffect, useRef, useState, type TouchEvent as ReactTouchEve
 import { useI18n } from "../i18n";
 import { readStoreValue, writeStoreValue } from "../lib/amosStore";
 import {
+  onTelephonyEvent,
+  telephonyDial,
+  telephonyEnd,
+  telephonySimulateIncoming,
+  telephonyStartRecording,
+  telephonyStopRecording,
+} from "../lib/backend";
+import {
   MSG_KEY,
   appendMessage,
   appendQuote,
@@ -19,6 +27,15 @@ import {
 } from "../lib/messages";
 import { KEYS, backspace, clearDial, pushKey, MAX_DIAL_LEN } from "../lib/phone";
 import { MUSIC_KEY, nextIndexAfterRemoval, nextIndex, normalizeTracks, pctProgress, removeTrack, seekSeconds, seedTracks, stepIndex, DEMO_LYRICS, lyricIndex, type RepeatMode, type Track } from "../lib/music";
+import {
+  CONTACTS_KEY,
+  contactNameFor,
+  normalizeContacts,
+  type Contact,
+} from "../lib/contacts";
+import { useOutgoingCalls } from "../lib/useOutgoingCalls";
+import { NOTIF_KEY, removeAppNotifs, type Notif } from "../lib/settings";
+import { zh } from "../i18n/locales/zh";
 
 const DURATION = 24; // demo seconds per track
 
@@ -48,9 +65,31 @@ export function MessagesApp() {
   const [text, setText] = useState("");
   const [replyTo, setReplyTo] = useState<string | null>(null);
   const persist = (l: Msg[]) => {
-    writeStoreValue(MSG_KEY, l);
-    setMsgs(l);
+    // Write through the normalizer so every save is cleaned + bounded (MESSAGE_CAP).
+    const capped = normalizeMessages(l);
+    writeStoreValue(MSG_KEY, capped);
+    setMsgs(capped);
   };
+
+  // Publish unread incoming messages as app notifications → dock "信息" badge +
+  // notification center (kept in sync as the user reads/clears). Mirrors MailApp.
+  useEffect(() => {
+    const app = zh["app.messages"];
+    const existing = readStoreValue<Notif[]>(NOTIF_KEY, []);
+    const hadAppNotifs = existing.some((n) => n.app === app);
+    const unread = msgs.filter((m) => m.from === "them" && !m.read).slice(0, 20);
+    if (unread.length === 0 && !hadAppNotifs) return; // nothing to publish/remove
+    const others = removeAppNotifs(existing, app);
+    const fresh: Notif[] = unread.map((m, i) => ({
+      id: `msg:${i}:${m.ts}`,
+      app,
+      icon: "💬",
+      title: m.text.length > 40 ? `${m.text.slice(0, 40)}…` : m.text,
+      time: m.ts,
+    }));
+    writeStoreValue(NOTIF_KEY, [...others, ...fresh]);
+  }, [msgs]);
+
   const send = () => {
     const v = text.trim();
     if (!v) return;
@@ -214,7 +253,105 @@ export function PhoneApp() {
   const { t } = useI18n();
   const [num, setNum] = useState("");
   const [calling, setCalling] = useState(false);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  // Whether our outgoing call has connected (reached Active); enables recording.
+  const [talking, setTalking] = useState(false);
+  // Authoritative recording state for the live call, mirrored from the daemon's
+  // telephony_start_recording / telephony_stop_recording responses.
+  const [recording, setRecording] = useState<"Off" | "On" | "Failed">("Off");
+  // Live copy of activeId so the event subscription (registered once) never reads a
+  // stale id from its closure.
+  const activeRef = useRef<string | null>(null);
+  const [contacts] = useState<Contact[]>(() =>
+    normalizeContacts(readStoreValue(CONTACTS_KEY, [])),
+  );
+  const { recents, frequent, recordOutgoing } = useOutgoingCalls(contacts);
   const tap = (k: string) => !calling && setNum(pushKey(num, k));
+
+  // Place a real call via the OS telephony service when the daemon is present;
+  // outside the Tauri shell (or with no daemon) this still shows the local
+  // "calling" UI but leaves no id to hang up (honest graceful degradation).
+  const startCall = async () => {
+    if (!num) return;
+    setCalling(true);
+    setTalking(false);
+    setActiveId(null);
+    activeRef.current = null;
+    setRecording("Off");
+    const res = await telephonyDial(num);
+    if (res) {
+      setActiveId(res.id);
+      activeRef.current = res.id;
+      // Feed call history + a phone notification (shared, like ContactsApp).
+      recordOutgoing(num, contactNameFor(contacts, num) ?? undefined, t("contacts.dialed"));
+    }
+  };
+  const endCall = async () => {
+    if (activeId) await telephonyEnd(activeId);
+    setCalling(false);
+    setTalking(false);
+    setActiveId(null);
+    activeRef.current = null;
+    setRecording("Off");
+  };
+  // Start/stop recording on the live call. Recording is only legal once the call
+  // is ACTIVE + non-emergency (enforced by the OS telephony domain); when the
+  // daemon declines (call not yet connected) the authoritative response keeps the
+  // local toggle unchanged rather than lying about a recording that didn't start.
+  const toggleRecord = async () => {
+    if (!activeId) return;
+    const target = recording !== "On";
+    const res = target
+      ? await telephonyStartRecording(activeId)
+      : await telephonyStopRecording(activeId);
+    if (res) setRecording(res.recording as "Off" | "On" | "Failed");
+  };
+
+  // Demo-only: have the mock daemon ring an incoming call from the currently dialed
+  // number (or a demo number) so the system incoming-call overlay can be exercised.
+  const simIncoming = async () => {
+    if (calling) return;
+    const from = num.trim() !== "" ? num.trim() : "02112345678";
+    await telephonySimulateIncoming(from);
+  };
+
+  // Drive our own dialed call from the daemon `Watch` stream: when it connects we
+  // enter the "talking" screen (recording becomes legal), and when it ends (local or
+  // remote) we drop back to the keypad. Events for other calls (incoming) are left
+  // to the system incoming-call overlay.
+  useEffect(() => {
+    return onTelephonyEvent((call) => {
+      if (call.id !== activeRef.current) return;
+      setRecording(call.recording as "Off" | "On" | "Failed");
+      if (call.state === "Active") setTalking(true);
+      else if (call.state === "Ended") {
+        setCalling(false);
+        setTalking(false);
+        setActiveId(null);
+        activeRef.current = null;
+        setRecording("Off");
+      }
+    });
+  }, []);
+
+  const quickRow = (header: string, items: { num: string; label: string }[]) =>
+    items.length === 0 ? null : (
+      <div className="mb-3 flex w-full max-w-xs flex-wrap items-center justify-center gap-1.5">
+        <span className="text-[10px] font-semibold uppercase tracking-widest opacity-40">
+          {header}
+        </span>
+        {items.map(({ num, label }) => (
+          <button
+            key={num}
+            onClick={() => setNum(num)}
+            title={num}
+            className="rounded-full bg-neutral-300/80 px-2.5 py-1 text-[11px] text-neutral-800 transition active:scale-95 dark:bg-white/10 dark:text-white"
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+    );
   return (
     <div className="flex h-full flex-col items-center p-3">
       <div className="py-6 text-center">
@@ -226,10 +363,38 @@ export function PhoneApp() {
       {calling ? (
         <div className="flex flex-col items-center gap-6 py-10">
           <p className="text-2xl font-thin">
-            {t("phone.call")} {num}…
+            {talking ? t("phone.talking") : t("phone.call")}
+            {talking ? "" : ` ${num}…`}
           </p>
+          {recording === "On" && (
+            <p className="flex items-center gap-1.5 text-xs font-medium text-danger">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-danger" aria-hidden />
+              {t("phone.recording")}
+            </p>
+          )}
+          {recording === "Failed" && (
+            <p className="text-[11px] opacity-60">{t("phone.recordUnavailable")}</p>
+          )}
+          {/* Recording toggle: offered only once the call has connected (talking) and
+              the OS returned a live call id — recording is domain-legal only then. */}
+          {talking && activeId && (
+            <button
+              onClick={() => void toggleRecord()}
+              aria-label={
+                recording === "On" ? t("phone.recordStop") : t("phone.recordStart")
+              }
+              className={
+                "grid h-14 w-14 place-items-center rounded-full text-lg transition active:scale-90 " +
+                (recording === "On"
+                  ? "bg-danger text-white"
+                  : "bg-neutral-200 text-danger dark:bg-white/10")
+              }
+            >
+              {recording === "On" ? "⏹" : "●"}
+            </button>
+          )}
           <button
-            onClick={() => setCalling(false)}
+            onClick={() => void endCall()}
             className="h-16 w-16 rounded-full bg-danger text-2xl text-white"
             aria-label="end"
           >
@@ -238,6 +403,8 @@ export function PhoneApp() {
         </div>
       ) : (
         <>
+          {quickRow(t("contacts.frequent"), frequent)}
+          {quickRow(t("contacts.recent"), recents)}
           <div className="grid w-full max-w-xs grid-cols-3 gap-3">
             {KEYS.map((k) => {
               const letters = SUB[k as keyof typeof SUB];
@@ -277,7 +444,7 @@ export function PhoneApp() {
               </button>
             </div>
             <button
-              onClick={() => num && setCalling(true)}
+              onClick={() => void startCall()}
               disabled={!num}
               className="grid h-[72px] w-[72px] place-items-center rounded-full bg-green-500 text-white shadow-[0_8px_20px_rgba(52,199,89,0.4)] transition active:scale-90 disabled:opacity-40"
               aria-label="call"
@@ -285,6 +452,16 @@ export function PhoneApp() {
               <span className="text-3xl leading-none">📞</span>
             </button>
           </div>
+          {/* Demo-only: ask the mock daemon to ring an incoming call so the system
+              incoming-call surface can be exercised by hand (dev affordance). */}
+          <button
+            onClick={() => void simIncoming()}
+            disabled={calling}
+            aria-label={t("phone.simIncoming")}
+            className="mt-3 text-[10px] uppercase tracking-widest text-accent/70 transition hover:text-accent disabled:opacity-30"
+          >
+            {t("phone.simIncoming")}
+          </button>
         </>
       )}
     </div>

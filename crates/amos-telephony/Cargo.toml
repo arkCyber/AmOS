@@ -1,0 +1,30 @@
+[package]
+name = "amos-telephony"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos telephony domain core: phone-number + emergency-map rules, a per-call CallSession state machine, and pluggable TelephonyProvider/EmergencyTelephonyProvider seams (Mock + feature-gated Android). Design: docs/telephony.md."
+
+[lib]
+name = "amos_telephony"
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+async-trait = "0.1"
+thiserror = "1"
+amos-proto.workspace = true
+tonic.workspace = true
+
+[features]
+default = []
+# Real Android/Binder provider (needs a target OS + privileged role). P1 ships the
+# domain core + Mock + the gRPC service; this gates the platform impl when it lands.
+android = []
+
+[dev-dependencies]
+tower.workspace = true
+hyper-util.workspace = true
+

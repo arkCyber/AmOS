@@ -8,6 +8,7 @@ import { AiApp, InterpApp } from "./components/BackendApps";
 import MailApp from "./components/MailApp";
 import StoreApp from "./components/StoreApp";
 import PermissionsApp from "./components/PermissionsApp";
+import ContactsApp from "./components/ContactsApp";
 import ExtApp from "./components/ExtApp";
 import { isExtId } from "./lib/storeApps";
 import type { MessageKey } from "./i18n/locales/zh";
@@ -68,6 +69,7 @@ export const APPS: AppMeta[] = [
   { id: "mail", titleKey: "app.mail", icon: "✉️" },
   { id: "store", titleKey: "app.store", icon: "🛍️" },
   { id: "privacy", titleKey: "app.privacy", icon: "🛡️" },
+  { id: "contacts", titleKey: "app.contacts", icon: "👥" },
 ];
 
 export function appTitleKey(id: string): MessageKey | null {
@@ -1428,6 +1430,7 @@ const COMPONENTS: Record<string, FC> = {
   mail: MailApp,
   store: StoreApp,
   privacy: PermissionsApp,
+  contacts: ContactsApp,
 };
 
 /** Get the component for an app id, or a "not ported yet" placeholder. */

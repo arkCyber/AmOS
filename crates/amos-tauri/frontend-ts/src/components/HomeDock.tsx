@@ -1,10 +1,11 @@
 import { useRef, type DragEvent } from "react";
-import { readStoreValue, type HomeLayout } from "../lib/amosStore";
+import type { HomeLayout } from "../lib/amosStore";
 import { appIcon, appTitleKey } from "../apps";
 import { AppIconTile } from "./AppIcon";
 import { useI18n } from "../i18n";
 import { zh, type MessageKey } from "../i18n/locales/zh";
-import { NOTIF_KEY, countForApp, type Notif } from "../lib/settings";
+import { NOTIF_KEY, SETTINGS_KEY, countForApp, dndActive, normalizeQuick, type Notif } from "../lib/settings";
+import { useStoreValue } from "../lib/useStoreValue";
 import { HomeWidgets } from "./HomeWidgets";
 import type { StoreTile } from "../lib/storeApps";
 
@@ -85,7 +86,10 @@ export default function HomeDock({
   ext?: StoreTile[];
 }) {
   const { t } = useI18n();
-  const notifs = readStoreValue<Notif[]>(NOTIF_KEY, []);
+  // Reactive reads: home unread badges (and their DND suppression) update live
+  // as notifications / quick-settings change (same window or cross-window).
+  const notifs = useStoreValue<Notif[]>(NOTIF_KEY, []);
+  const quiet = dndActive(normalizeQuick(useStoreValue<unknown>(SETTINGS_KEY, {})));
   const dragId = useRef<string | null>(null);
 
   const extById = new Map(ext.map((e) => [e.id, e]));
@@ -100,7 +104,8 @@ export default function HomeDock({
     const key = appTitleKey(id) as MessageKey | null;
     return key ? zh[key] : extName(id) ?? id;
   };
-  const unreadOf = (id: string) => (extById.has(id) ? 0 : countForApp(notifs, zhName(id)));
+  const unreadOf = (id: string) =>
+    quiet || extById.has(id) ? 0 : countForApp(notifs, zhName(id));
   const iconOf = (id: string): string => extById.get(id)?.icon ?? appIcon(id);
   const handleStart = (id: string) => {
     dragId.current = id;

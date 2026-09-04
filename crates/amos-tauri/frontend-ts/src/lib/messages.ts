@@ -10,6 +10,9 @@ export interface Msg {
 
 export const MSG_KEY = "amos.messages";
 
+/** Upper bound on stored messages (keeps the conversation from growing unbounded). */
+export const MESSAGE_CAP = 200;
+
 export function seedMessages(now: number): Msg[] {
   return [
     { from: "them", text: "你好！Amos 系统感觉怎么样？", ts: now - 3000, read: true },
@@ -18,9 +21,12 @@ export function seedMessages(now: number): Msg[] {
   ];
 }
 
-/** Append an outgoing message (iMessage-style, chronological). */
+/** Append an outgoing message (iMessage-style, chronological). Blank text is
+ * trimmed and refused (returns the list unchanged). */
 export function appendMessage(list: Msg[], text: string, now: number): Msg[] {
-  return [...list, { from: "me", text, ts: now }];
+  const clean = text.trim();
+  if (!clean) return list;
+  return [...list, { from: "me", text: clean, ts: now }];
 }
 
 /** Corruption / back-compat guard for a stored conversation. Drops entries with a
@@ -43,15 +49,18 @@ export function normalizeMessages(list: unknown): Msg[] {
     if (typeof o.quote === "string" && o.quote !== "") m.quote = o.quote;
     out.push(m);
   }
-  return out;
+  // Bound the history so a long-running conversation can't grow unbounded.
+  return out.length > MESSAGE_CAP ? out.slice(out.length - MESSAGE_CAP) : out;
 }
 
-/** Append an outgoing message that quote-replies to `quote` (trimmed; drops the
- * quote when it would be empty). */
+/** Append an outgoing message that quote-replies to `quote` (trims both; blank
+ * text is refused, whitespace-only quote degrades to a plain message). */
 export function appendQuote(list: Msg[], text: string, quote: string, now: number): Msg[] {
+  const clean = text.trim();
+  if (!clean) return list;
   const q = quote.trim();
-  if (!q) return appendMessage(list, text, now);
-  return [...list, { from: "me", text, ts: now, quote: q }];
+  if (!q) return appendMessage(list, clean, now);
+  return [...list, { from: "me", text: clean, ts: now, quote: q }];
 }
 
 /** Start a brand-new, empty conversation. */

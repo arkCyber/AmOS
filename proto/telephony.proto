@@ -1,0 +1,100 @@
+// Amos telephony gRPC contract between the System UI and the OS daemon.
+//
+// Transport: the same Unix Domain Socket as ai_agent / android_compat
+// (single UDS for the whole OS backend). Design & contract: docs/telephony.md.
+syntax = "proto3";
+
+package amos_telephony;
+
+enum CallDirection {
+  OUTGOING = 0;
+  INCOMING = 1;
+}
+
+enum CallState {
+  IDLE = 0;
+  DIALING = 1;
+  RINGING = 2;
+  ACTIVE = 3;
+  ENDED = 4;
+}
+
+enum EndReason {
+  LOCAL = 0;
+  REMOTE = 1;
+  FAILED = 2;
+  EMERGENCY = 3;
+}
+
+// Whether the call is being recorded. A call may only start recording once it is
+// ACTIVE and non-emergency; FAILED means the backend reported a recording error.
+enum RecordingState {
+  RECORDING_OFF = 0;
+  RECORDING_ON = 1;
+  RECORDING_FAILED = 2;
+}
+
+message CallIdMsg {
+  string id = 1;
+}
+
+message DialRequest {
+  string number = 1;
+  // emergency=true routes to the privileged emergency provider (110/112/911/...),
+  // which is never gated by the ordinary rate limiter.
+  bool emergency = 2;
+}
+
+// Dev/demo-only: simulate a ringing incoming call from `number` (mock backend). A
+// real provider rejects this — incoming calls come from the network, not a client.
+message SimulateIncomingRequest {
+  string number = 1;
+}
+
+message AnswerRequest {
+  CallIdMsg call = 1;
+}
+
+message EndRequest {
+  CallIdMsg call = 1;
+}
+
+message StatusRequest {}
+
+message WatchRequest {}
+
+message CallSnapshot {
+  CallIdMsg call = 1;
+  string peer = 2;
+  CallDirection direction = 3;
+  CallState state = 4;
+  EndReason end_reason = 5;
+  bool emergency = 6;
+  RecordingState recording = 7;
+}
+
+message CallList {
+  repeated CallSnapshot calls = 1;
+}
+
+message CallStateEvent {
+  CallSnapshot call = 1;
+}
+
+// Telephony service exposed by the OS daemon (amos-ai).
+//
+// Dial/Answer/End are unary; Status lists live calls; Watch streams the
+// signalling events the UI (and AI assistant) need to react to (incoming call,
+// connected, remote hangup). StartRecording/StopRecording toggle call recording
+// (only legal while a call is ACTIVE + non-emergency) and return the authoritative
+// snapshot so the UI can reflect the recording state without a round-trip.
+service Telephony {
+  rpc Dial(DialRequest) returns (CallIdMsg);
+  rpc Answer(AnswerRequest) returns (CallIdMsg);
+  rpc End(EndRequest) returns (CallIdMsg);
+  rpc StartRecording(CallIdMsg) returns (CallSnapshot);
+  rpc StopRecording(CallIdMsg) returns (CallSnapshot);
+  rpc SimulateIncoming(SimulateIncomingRequest) returns (CallIdMsg);
+  rpc Status(StatusRequest) returns (CallList);
+  rpc Watch(WatchRequest) returns (stream CallStateEvent);
+}

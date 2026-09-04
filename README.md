@@ -46,6 +46,8 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-appstore/            # app-store core: catalog/Version + sha256 integrity + install engine (docs/appstore.md)
     ├── amos-timesync/            # network wall-clock calibration (TimeSource seam + SyncedClock + periodic timekeeper)
     ├── amos-timesync-cli/        # query/sync the calibrated clock (now/status/sync over the shared state file)
+    ├── amos-telephony/           # telephony domain core + gRPC service: Number/EmergencyMap, CallSession state machine, TelephonyProvider seams + Mock (docs/telephony.md)
+    ├── amos-radio/               # radio/connectivity domain core: wifi/bluetooth/airplane state + RadioProvider seams (Mock / android JNI) + RadioManager airplane policy (docs/radio.md)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -216,7 +218,8 @@ events → streaming tokens + semantic UiCards), same spirit as the single-view 
 
 Each app is a React component registered in `APPS` (apps.tsx). Functionality
 included: calculator, clock, notes, messages, settings (persisted), photos,
-dialer, music player, weather, maps, files, camera, android, AI, 同传, and an
+dialer (real calls: dial → talk → **record** → hang up, plus an incoming-call
+surface), music player, weather, maps, files, camera, android, AI, 同传, and an
 **App Store** (`store` — browse the catalog and install/update/uninstall apps,
 see `docs/appstore.md`).
 
@@ -277,6 +280,16 @@ make check         # fast React/TS check (bun test + typecheck)
   drag/jiggle editing, layout persistence, i18n/theme, streaming/ASR/interpret
   reducers and per-app logic, plus graceful degradation outside Tauri.
 
+## Recent additions (2026-09-04)
+
+- **Call recording — first-class, contractual (`crates/amos-telephony` + `proto/telephony.proto` + `amos-tauri` + `frontend-ts`)**: per-call `RecordingState{Off,On,Failed}` domain state machine; `TelephonyProvider::start/stop_recording` allow/deny consent seam with a **hard no-record rule for emergency (110/112/911…) lines**; wire `StartRecording`/`StopRecording` RPCs, `CallSnapshot.recording`, Tauri `telephony_start/stop_recording`, and a record toggle + live "正在录音" indicator in `PhoneApp`. `Call`-state recording is broadcast on `Watch`, so every surface stays consistent.
+- **Phone calls — real end-to-end loop (dial → talk → record → hang up) + incoming surface**: `amos-ai` mounts a demo `TelephonyService` that auto-connects dialed calls; a `Watch`→`telephony-event` bridge streams every transition (connect / record / local+remote end) to the WebView; `PhoneApp` shows a talking screen when its call connects; a system **`IncomingCall`** overlay offers Answer/Decline then a recordable in-call banner. A **模拟来电** demo trigger (`SimulateIncoming`) exercises the incoming path by hand. See `docs/telephony.md`.
+- **Radio / connectivity**: quick-settings Wi‑Fi / Bluetooth / Airplane now go through a real policy layer — `crates/amos-radio` (`RadioManager` airplane cascade + guard, `MockRadioProvider`; Android `AndroidRadioProvider` behind the `android` feature, wired into `amos-tauri` via `RadioBridge::from_android`) — persisted `amos.settings`, status-bar indicators, and `scripts/build-android.sh` cross-compiles `amos-radio --features android`. See `docs/radio.md`.
+- **Phone contacts / 通讯录 + call history**: a `contacts` app (👥) with `lib/contacts.ts` (validation, favorites, search by name/number, duplicate guard incl. `+CC`/bare, first-letter groups, colored avatars, number→name lookup) and `lib/calllog.ts` (recent/frequent outgoing calls). Successful bridged calls are recorded, raise a phone notification, and surface "Frequent ⭐"/"Recent" quick-dial strips.
+- **Notifications & Do-Not-Disturb**: arrival banner (`NotificationBanner`, tap-to-acknowledge), ring/vibrate sound policy (`lib/sound.ts`) with Web-Audio chime + `navigator.vibrate`, DND that hides badges/banners, live unread bell/dock badges, and a reactive cross-window store (`useStoreValue` + authoritative `store-updated`).
+
+All new domain libs are pure + unit-tested (contacts/calllog at 100% function coverage) with DOM interaction tests; i18n en/zh key-sets are auto-validated.
+
 ## Mobile (Android/iOS)
 
 Tauri 2 mobile is ready: `amos-tauri` is already structured as a
@@ -311,8 +324,14 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) — Community guidelines
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
-- [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility
+- [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility (dev/prototype; product = no-UI Android base)
 - [docs/appstore.md](./docs/appstore.md) — App-store core: catalog/package JSON publish contract + download→verify→install (developer onboarding)
+- [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams)
+- [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
+- [docs/bidi-voice-asr.md](./docs/bidi-voice-asr.md) — AI-assistant voice wiring: bidi `Payload::Audio` → local ASR (design)
+- [docs/device-poc.md](./docs/device-poc.md) — On-device POC: cross-compile `amos-ai` + run `chat_once` over UDS on a real phone
+- [docs/external-analysis-review.md](./docs/external-analysis-review.md) — Audit of an external gap analysis against the real tree
+- [docs/DELIVERY_NOTES_2026-09-03.md](./docs/DELIVERY_NOTES_2026-09-03.md) — Commit message + changeset + known limits for the telephony/voice/strategy work (2026-09-03)
 
 ## License
 

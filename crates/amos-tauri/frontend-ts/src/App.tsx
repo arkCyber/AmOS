@@ -5,14 +5,18 @@ import { APPS, appTitleKey, AppComponent } from "./apps";
 import HomeDock from "./components/HomeDock";
 import { LockScreen, RecentsPanel, SpotlightPanel } from "./components/SystemPanels";
 import NotificationCenter from "./components/NotificationCenter";
+import NotificationBanner from "./components/NotificationBanner";
+import IncomingCall from "./components/IncomingCall";
 import { Backdrop } from "./components/Wallpaper";
 import EditHome from "./components/EditHome";
 import StatusBar from "./components/StatusBar";
 import { getLayout, hydrateFromSystemStore, moveBefore, pushRecent, saveLayout, readStoreValue, writeStoreValue, type HomeLayout } from "./lib/amosStore";
-import { NOTIF_KEY, removeAppNotifs, type Notif } from "./lib/settings";
+import { NOTIF_KEY, removeAppNotifs, dndActive, normalizeQuick, SETTINGS_KEY, type Notif } from "./lib/settings";
 import { zh, type MessageKey } from "./i18n/locales/zh";
 import { isExtId, loadStoreTiles, subscribeStoreTiles, tileById, type StoreTile } from "./lib/storeApps";
+import { useStoreValue } from "./lib/useStoreValue";
 import { bridged, subscribe } from "./lib/backend";
+import { useNotificationAlert } from "./lib/useNotificationAlert";
 import {
   buttonActionOf,
   keyActionOf,
@@ -99,11 +103,25 @@ function TopBar({
 }) {
   const btn =
     "grid h-9 w-9 place-items-center rounded-full bg-white/45 text-sm shadow-sm ring-1 ring-black/5 backdrop-blur-md transition active:scale-90 dark:bg-white/10 dark:ring-white/10";
+  // Unread notification count on the bell (hidden while Do-Not-Disturb is on),
+  // reactive so it updates live as notifications change.
+  const notifs = useStoreValue<Notif[]>(NOTIF_KEY, []);
+  const unread = dndActive(normalizeQuick(useStoreValue<unknown>(SETTINGS_KEY, {})))
+    ? 0
+    : notifs.length;
+  const badge = unread > 0 ? (unread > 99 ? "99+" : String(unread)) : null;
   return (
     <div className="flex items-center justify-between px-4 pt-2">
       <div className="flex gap-2">
         <button onClick={onNotify} aria-label="notifications" className={btn} title="notifications">
-          🔔
+          <span className="relative">
+            🔔
+            {badge && (
+              <span className="absolute -right-2.5 -top-1.5 grid min-w-[16px] place-items-center rounded-full bg-danger px-1 text-[10px] font-bold text-white ring-2 ring-white dark:ring-neutral-900">
+                {badge}
+              </span>
+            )}
+          </span>
         </button>
         <button onClick={onRecents} aria-label="recents" className={btn} title="recents">
           ⇤
@@ -203,6 +221,10 @@ function Shell() {
       if (t) window.clearTimeout(t);
     };
   }, []);
+
+  // Global notification-arrival alert (vibrate + ring per effective sound policy),
+  // mounted once so it fires on every screen — home, inside an app, even locked.
+  useNotificationAlert();
 
   // Search-launch: clear the badge + record a recent, but stay on the home
   // screen and briefly highlight that app's icon (like picking it in Spotlight).
@@ -360,6 +382,10 @@ export default function App() {
             <div className="relative z-10 h-full">
               <Shell />
             </div>
+            {/* Global arrival toast, layered above every screen (home/app/lock). */}
+            <NotificationBanner />
+            {/* Incoming-call surface: Ringing → Answer/Decline; Active → record + hang up. */}
+            <IncomingCall />
           </div>
         </div>
       </I18nProvider>

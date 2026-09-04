@@ -28,6 +28,13 @@ declare global {
 const CORRUPT_SUFFIX = ".corrupt";
 
 /**
+ * Window event fired after a store value is written, so same-window components
+ * (e.g. the StatusBar radio indicators) can re-read reactively even though
+ * `storage` only fires cross-tab. Detail: `{ key }`.
+ */
+export const STORE_CHANGED_EVENT = "amos-store-changed";
+
+/**
  * Read + parse a stored value, returning `fallback` when absent.
  *
  * When the stored JSON is *corrupt* (not merely absent) we do NOT silently drop
@@ -64,10 +71,11 @@ function quarantineCorrupt(key: string, raw: string): void {
 }
 
 function writeJson(key: string, value: unknown): void {
-  const text = JSON.stringify(value);
   try {
-    window.localStorage.setItem(key, text);
-    window.Amos?.storeWrite?.(key, text);
+    window.localStorage.setItem(key, JSON.stringify(value));
+    window.Amos?.storeWrite?.(key, JSON.stringify(value));
+    // Notify same-window consumers that this store key changed.
+    window.dispatchEvent(new CustomEvent(STORE_CHANGED_EVENT, { detail: { key } }));
   } catch {
     /* ignore */
   }

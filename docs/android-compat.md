@@ -1,5 +1,10 @@
 # Android Compat Layer (Waydroid)
 
+> **⚠️ 定位判定 (Deployment Decision, 2026-09-03)** — 本文描述的 **Waydroid / LXC 容器路径是「开发 / 原型」兼容层**：在**非 Android 主机（桌面 Linux / 通用硬件 / 尚无系统 Android 的测试机）**上验证「APK 启动 → 表面 → 与 `amos-wm` 多窗口协同」整条管线，也是 CI / 无真机开发时的端到端载体。
+> 在**真机产品本体**上，底座是 **no-UI Android 基座**（见 `docs/no-ui-android.md`）：旧 APK 是**原生 Android 进程**直接运行，**不需要 Waydroid**；届时 `amos-android` 的 `AndroidRuntime` 驱动换成面向原生 app 的 driver（`am start` / SurfaceControl / VirtualDisplay）。本页的"合成 / 多窗口 / 输入法共享"协议思路在真机路径上继续适用，只是底层载体不同。
+>
+> 一句话：**Waydroid = 开发原型时跑 APK 用；产品 = no-UI Android 基座，APK 原生跑。**
+
 The Tauri System UI never runs an APK directly. Legacy Android apps run inside a
 **lightweight Android runtime container (Waydroid / LXC)**, and its capability is
 **piped through gRPC** and composited into Tauri windows.

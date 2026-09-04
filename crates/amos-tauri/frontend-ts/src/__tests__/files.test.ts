@@ -20,6 +20,7 @@ import {
   moveEntries,
   normalizeFiles,
   folderTree,
+  hasName,
   type FEntry,
 } from "../lib/files";
 
@@ -303,3 +304,17 @@ describe("files tree ops", () => {
     expect(contentContains(mk("z", "file", "z"), "qqq")).toBe(false);
   });
 });
+
+describe("hasName (child-name lookup)", () => {
+  test("detects whether a child with the given name exists", () => {
+    const kids = [
+      makeEntry("folder", "docs", undefined, 1),
+      makeEntry("file", "readme.md", undefined, 2),
+    ];
+    expect(hasName(kids, "docs")).toBe(true);
+    expect(hasName(kids, "readme.md")).toBe(true);
+    expect(hasName(kids, "missing.txt")).toBe(false);
+    expect(hasName([], "anything")).toBe(false);
+  });
+});
+

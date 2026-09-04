@@ -1,7 +1,7 @@
 //! End-to-end test of the *bidirectional* `Chat` RPC over a real UDS: the path
 //! that voice / multi-turn / cancel interaction flows through. Verifies text
-//! prompts stream tokens, audio is acknowledged (ASR not wired yet), and a
-//! Cancel closes the stream.
+//! prompts stream tokens, audio is fed through the (mock) ASR to an answered
+//! turn, and a Cancel closes the stream.
 
 use amos_proto::ai_agent::{
     ai_agent_client::AiAgentClient, client_message::Payload, ClientMessage,
@@ -167,7 +167,7 @@ async fn bidi_chat_audio_is_acknowledged() {
         .into_inner();
 
     tx.send(ClientMessage {
-        payload: Some(Payload::Audio(vec![0u8; 1024])),
+        payload: Some(Payload::Audio(vec![0u8; 2560])), // 640 f32 samples → mock endpoint
     })
     .await
     .expect("send audio frame");
@@ -175,8 +175,8 @@ async fn bidi_chat_audio_is_acknowledged() {
     let (full, done) = collect_until_done(&mut stream).await;
     assert!(done, "audio turn terminates with a done frame");
     assert!(
-        full.contains("语音") && full.contains("1024"),
-        "audio is acknowledged with an honest note, got: {full:?}"
+        !full.trim().is_empty(),
+        "recognized audio is answered, got: {full:?}"
     );
 
     server.abort();

@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 amos-proto.workspace = true
 amos-android.workspace = true
+amos-telephony.workspace = true
+amos-asr = { path = "../amos-asr" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

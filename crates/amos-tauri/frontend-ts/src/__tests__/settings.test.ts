@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { flipQuick, removeNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, NOTIF_CAP } from "../lib/settings";
+import { flipQuick, flipRadio, applyConnectivity, flipLocation, locationEnabled, dndActive, radioIcons, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, NOTIF_CAP, type Notif } from "../lib/settings";
 import {
   SETTINGS_KEY,
   readCloud,
@@ -16,11 +16,122 @@ describe("settings / NC helpers", () => {
     expect(flipQuick(s1, "wifi").wifi).toBe(false);
   });
 
+  test("location master defaults ON; flipLocation toggles it OFF first", () => {
+    expect(locationEnabled({})).toBe(true); // unset → enabled
+    expect(locationEnabled({ location: true })).toBe(true);
+    expect(locationEnabled({ location: false })).toBe(false);
+
+    // first tap turns it OFF (unset was treated as ON)
+    expect(flipLocation({})).toEqual({ location: false });
+    // second tap turns it back ON
+    expect(flipLocation({ location: false })).toEqual({ location: true });
+    expect(flipLocation({ location: true })).toEqual({ location: false });
+  });
+
+  test("dndActive is OFF by default, ON only when explicitly set", () => {
+    expect(dndActive({})).toBe(false);
+    expect(dndActive({ dnd: false })).toBe(false);
+    expect(dndActive({ dnd: true })).toBe(true);
+  });
+
+  test("flipRadio toggles wifi/bt independently when airplane is off", () => {
+    const s0 = {};
+    const wifiOn = flipRadio(s0, "wifi");
+    expect(wifiOn.wifi).toBe(true);
+    expect(wifiOn.airplane).toBeUndefined();
+    const btOn = flipRadio(s0, "bluetooth");
+    expect(btOn.bluetooth).toBe(true);
+    // toggling back off
+    expect(flipRadio(wifiOn, "wifi").wifi).toBe(false);
+  });
+
+  test("flipRadio airplane ON cascades wifi + bluetooth off", () => {
+    const before = { wifi: true, bluetooth: true };
+    const next = flipRadio(before, "airplane");
+    expect(next.airplane).toBe(true);
+    expect(next.wifi).toBe(false);
+    expect(next.bluetooth).toBe(false);
+    // input untouched
+    expect(before.wifi).toBe(true);
+    expect(before.bluetooth).toBe(true);
+  });
+
+  test("flipRadio airplane OFF only clears airplane (no auto re-enable)", () => {
+    const next = flipRadio({ airplane: true }, "airplane");
+    expect(next.airplane).toBe(false);
+    expect(next.wifi).toBeUndefined();
+  });
+
+  test("flipRadio gates wifi/bt while airplane is on (no-op)", () => {
+    const gated = { airplane: true, wifi: false };
+    expect(flipRadio(gated, "wifi")).toBe(gated); // unchanged reference
+    expect(flipRadio(gated, "bluetooth").bluetooth).toBeUndefined();
+  });
+
+  test("radioIcons shows wifi+bt normally, airplane supersedes them", () => {
+    expect(radioIcons({ wifi: true, bluetooth: false })).toEqual([
+      { kind: "wifi", on: true },
+      { kind: "bluetooth", on: false },
+    ]);
+    expect(radioIcons({ wifi: true, bluetooth: true, airplane: true })).toEqual([
+      { kind: "airplane", on: true },
+    ]);
+    expect(radioIcons({})).toEqual([
+      { kind: "wifi", on: false },
+      { kind: "bluetooth", on: false },
+    ]);
+  });
+
+  test("applyConnectivity dims wifi when offline, leaves bt/airplane alone", () => {
+    const icons = radioIcons({ wifi: true, bluetooth: true });
+    expect(applyConnectivity(icons, true)).toEqual(icons); // online → unchanged
+    const offline = applyConnectivity(icons, false);
+    expect(offline[0]).toEqual({ kind: "wifi", on: false });
+    expect(offline[1]).toEqual({ kind: "bluetooth", on: true }); // bt unaffected
+
+    // airplane present → wifi already gone; offline doesn't change it
+    const ap = radioIcons({ airplane: true });
+    expect(applyConnectivity(ap, false)).toEqual(ap);
+  });
+
+  test("newestAddedNotif reports only newly-added ids, newest time wins", () => {
+    const prev = [
+      { id: "a", app: "X", time: 1 },
+      { id: "b", app: "Y", time: 2 },
+    ];
+    expect(newestAddedNotif(prev, prev)).toBeNull(); // nothing new
+    expect(newestAddedNotif(prev, [])).toBeNull(); // shrink/clear → no arrival
+
+    const curr = [
+      ...prev,
+      { id: "c", app: "Z", time: 5 },
+      { id: "d", app: "W", time: 4 },
+    ];
+    const added = newestAddedNotif(prev, curr);
+    expect(added?.id).toBe("c"); // newest by time
+
+    // a removal of an existing id isn't an arrival
+    const removed = [prev[0]!];
+    expect(newestAddedNotif(prev, removed)).toBeNull();
+  });
+
   test("notifications seed and dismiss", () => {
     const list = seedNotifs(1000);
     expect(list.length).toBe(3);
     const after = removeNotif(list, list[0]!.id);
     expect(after.length).toBe(2);
+  });
+
+  test("addNotif prepends newest-first and caps at NOTIF_CAP", () => {
+    const base: Notif[] = [{ id: "a", time: 1 }];
+    const n2: Notif = { id: "b", time: 2 };
+    const next = addNotif(base, n2);
+    expect(next).toHaveLength(2);
+    expect(next[0]).toEqual(n2); // newest on top
+    // cap
+    let many: Notif[] = [];
+    for (let i = 0; i < NOTIF_CAP + 5; i++) many = addNotif(many, { id: `x${i}`, time: i });
+    expect(many.length).toBe(NOTIF_CAP);
   });
 
   test("badge counts and clearing per app", () => {

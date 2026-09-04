@@ -19,6 +19,8 @@ and a Tauri 2 System UI — all connected over a local Unix Domain Socket via gR
 [ no-UI Android base / Linux ]  →  NPU/GPU/Wi-Fi/bluetooth
 ```
 
+> **部署判定 (2026-09-03)**：真机产品本体底座 = **no-UI Android 基座**（`docs/no-ui-android.md`），旧 APK 原生运行。`AndroidRuntime driver (Waydroid | Demo)` 在真机路径换成面向原生 app 的 driver；**Waydroid 仅作开发/原型**（`docs/android-compat.md`）。详见两文档顶部的定位判定。
+
 The single UDS carries **all** services, so the OS backend is one process and
 one connection; the WebView talks to a real daemon, not directly to hardware.
 

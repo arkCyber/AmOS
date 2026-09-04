@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { readStoreValue } from "../lib/amosStore";
 import { getRecents } from "../lib/amosStore";
+import { telephonyDial } from "../lib/backend";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import { APPS, appIcon, appTitleKey } from "../apps";
 import { AppIconTile } from "./AppIcon";
@@ -14,6 +15,7 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
   const needPin = !!cfg.enabled && !!cfg.pin;
   const [pin, setPin] = useState("");
   const [bad, setBad] = useState(false);
+  const [emergency, setEmergency] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(true, rootRef);
 
@@ -40,6 +42,15 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
       setBad(true);
       setPin("");
     }
+  };
+
+  // Emergency quick-dial (legal hard path): always reachable from the lock screen,
+  // goes straight to the privileged emergency provider (110). One-shot guard so a
+  // locked UI can't spam duplicate dials while one is in flight.
+  const dialEmergency = () => {
+    if (emergency) return;
+    setEmergency(true);
+    void telephonyDial("110", true);
   };
 
   return (
@@ -96,6 +107,14 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
           {t("shell.unlock")}
         </button>
       )}
+      <button
+        onClick={dialEmergency}
+        disabled={emergency}
+        className="mt-10 rounded-full bg-danger/20 px-8 py-3 text-base font-medium text-red-200 ring-1 ring-red-400/40 transition active:bg-danger/30 disabled:opacity-60"
+        aria-label={t("shell.emergency")}
+      >
+        {emergency ? t("shell.emergencyCalling") : t("shell.emergency")}
+      </button>
     </div>
   );
 }
