@@ -23,6 +23,12 @@ pub trait AndroidRuntime: Send + Sync {
     fn icon_for(&self, _package_name: &str) -> Option<Vec<u8>> {
         None
     }
+    /// Force-stop a running app in the container — the physical half of an
+    /// LMK-proxy `Kill`. Runtimes that cannot (or in demo, need not) really
+    /// kill report `Err` unless overridden.
+    fn force_stop(&self, _package_name: &str) -> Result<(), String> {
+        Err("this runtime cannot force-stop apps".to_string())
+    }
 }
 
 /// Real Waydroid container runtime (default on device).
@@ -64,13 +70,18 @@ impl<R: CommandRunner> AndroidRuntime for WaydroidRuntime<R> {
     fn launch(&self, package_name: &str) -> Result<String, String> {
         self.ctl.launch_apk(package_name)
     }
+
+    fn force_stop(&self, package_name: &str) -> Result<(), String> {
+        self.ctl.force_stop(package_name)
+    }
 }
 
 /// In-process demo runtime: works without Waydroid so the OS is usable on the
-/// host and in tests. Maintains a real app list and records launches.
+/// host and in tests. Maintains a real app list and records launches + stops.
 pub struct DemoRuntime {
     apps: Arc<Mutex<Vec<AndroidApp>>>,
     launches: Arc<Mutex<Vec<String>>>,
+    stops: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for DemoRuntime {
@@ -110,6 +121,7 @@ impl DemoRuntime {
         Self {
             apps: Arc::new(Mutex::new(apps)),
             launches: Arc::new(Mutex::new(Vec::new())),
+            stops: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -119,6 +131,11 @@ impl DemoRuntime {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// Packages force-stopped so far (for inspection / tests).
+    pub fn stops(&self) -> Vec<String> {
+        self.stops.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 
@@ -146,6 +163,14 @@ impl AndroidRuntime for DemoRuntime {
             .unwrap_or_else(|p| p.into_inner())
             .push(package_name.to_string());
         Ok(format!("waydroid_demo_{package_name}"))
+    }
+
+    fn force_stop(&self, package_name: &str) -> Result<(), String> {
+        self.stops
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(package_name.to_string());
+        Ok(())
     }
 
     fn icon_for(&self, package_name: &str) -> Option<Vec<u8>> {
@@ -198,6 +223,13 @@ mod tests {
         let wid = rt.launch("com.tencent.mm").unwrap();
         assert_eq!(wid, "waydroid_demo_com.tencent.mm");
         assert_eq!(rt.launches(), vec!["com.tencent.mm"]);
+    }
+
+    #[test]
+    fn demo_force_stop_records_and_succeeds() {
+        let rt = DemoRuntime::new();
+        assert!(rt.force_stop("com.tencent.mm").is_ok());
+        assert_eq!(rt.stops(), vec!["com.tencent.mm"]);
     }
 
     #[test]

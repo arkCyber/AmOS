@@ -8,8 +8,10 @@ description = "Android-compat layer: drive the Waydroid/LXC Android container fr
 
 [dependencies]
 amos-proto.workspace = true
+amos-applife.workspace = true
 tonic.workspace = true
 tokio.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
 zip = "0.6"
 flate2 = "1"
 anyhow.workspace = true

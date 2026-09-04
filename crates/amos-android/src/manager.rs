@@ -115,6 +115,49 @@ impl EnhancedAndroidManager {
         }
     }
 
+    /// Force-stop an app in the container with timeout protection — the physical
+    /// half of an LMK-proxy `Kill` (the container-side, `am force-stop`). Best
+    /// effort: on a runtime that cannot stop (or a demo), the decision was still
+    /// made upstream in the proxy registry.
+    pub async fn force_stop_app(&self, package_name: &str) -> Result<()> {
+        self.increment_ops().await;
+        let timeout = Duration::from_secs(self.config.launch_timeout_secs);
+
+        let pkg = package_name.to_string();
+        let runtime = self.runtime.clone();
+
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || runtime.force_stop(&pkg)),
+        )
+        .await;
+
+        self.decrement_ops().await;
+
+        match result {
+            Ok(Ok(Ok(()))) => {
+                tracing::info!("force-stopped app: {}", package_name);
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::warn!("app force-stop failed: {}: {}", package_name, e);
+                Err(anyhow!("force-stop failed: {}", e))
+            }
+            Ok(Err(e)) => {
+                tracing::error!("task join error: {}", e);
+                Err(anyhow!("task join error: {}", e))
+            }
+            Err(_) => {
+                tracing::error!(
+                    "app force-stop timeout after {}s: {}",
+                    self.config.launch_timeout_secs,
+                    package_name
+                );
+                Err(anyhow!("operation timeout"))
+            }
+        }
+    }
+
     /// List installed apps with timeout protection.
     pub async fn list_apps(&self) -> Result<Vec<AndroidApp>> {
         self.increment_ops().await;

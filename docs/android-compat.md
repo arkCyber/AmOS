@@ -38,6 +38,22 @@ The Tauri System UI never runs an APK directly. Legacy Android apps run inside a
 - **`AndroidManagerService`**: a tonic gRPC server wrapping the runtime
   (`spawn_blocking` so subprocess calls don't stall the executor). Served on the
   same UDS as `AiAgent` by `amos-ai`.
+- **LMK-proxy / Activity-Task lifecycle** (`lmk.rs`, 2026-09): an AmOS-side
+  authority that proxies the container's silent `lmkd` — it tracks each launched
+  package's top-Activity lifecycle + optional foreground service + LRU recency,
+  derives its importance tier with the same rank ladder as
+  `amos-applife`/`governor.proto`, and under memory pressure decides which tasks
+  to freeze (`Background -> Cached`) or kill. Exposed over gRPC as `OnActivity` /
+  `GetLmkSnapshot` / `TriggerLmk`; `launch_android_app` auto-adopts a launched app
+  into the proxy. A `Kill` issues a real container `am force-stop`. Every container
+  transition is also bridged **up** into the daemon's shared `ResourceGovernor`
+  (`GovernorLmkHost`, `MoveApp`/`kill_app`) and host decisions are driven **back**
+  into the container both by the daemon's governor beat (`drive_host_decisions` /
+  `am force-stop`) and over the wire (`ApplyHostDecision` RPC, Freeze/Thaw/Reclaim),
+  so host & container registries stay coherent **bidirectionally**. A server-streaming
+  `WatchLmk` feed broadcasts every container LMK decision (`package_name` +
+  `window_id` + kind) so a System UI subscriber can tear down / refresh the
+  `legacy:<window_id>` surface. Full design & boundaries: `docs/lmk-proxy.md`.
 - **Tauri commands**: `get_android_apps` / `launch_android_app`, plus a Launcher
   **「安卓应用」page** that lists app icons and launches them on tap.
 
@@ -99,3 +115,8 @@ container or used to control the Rust `WindowManager` (see `docs/multi-window.md
   多窗口」的像素层整合仍属后续工作。
 - 在无 Waydroid 的 CI/开发机上,`W1`–`W4` 均可通过 `DemoRuntime` 验证(返回合成
   window id),这正是 `crates/amos-android` 端到端测试覆盖的路径。
+- **LMK-proxy 的生命周期状态 + 容器侧 Kill 已落地,但「表面拆除」仍是 seam**：`TriggerLmk`
+  的 `Kill` 会移除 proxy 内记录、返回确切 `window_id`(即该移除的 `legacy:<id>` 表面),
+  并**真下发容器 `am force-stop`**(`WaydroidRuntime` 走 `waydroid shell am force-stop`;
+  `DemoRuntime` 记录;离线用注入的 `CommandRunner` 断言)。仍属后续真机接线:向 `amos-wm`
+  拆除 `legacy` 表面窗口、no-UI 基座 SurfaceControl teardown(`docs/lmk-proxy.md` §7)。

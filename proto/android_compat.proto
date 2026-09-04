@@ -18,6 +18,28 @@ service AndroidManager {
 
   // Fetch a PNG icon for an app (extracted from its APK / demo-generated).
   rpc GetAppIcon(AppIconRequest) returns (AppIconResponse);
+
+  // Report a container-observed Activity lifecycle event to the LMK-proxy.
+  // The proxy tracks each running task's importance and its freeze/kill
+  // candidacy under memory pressure (docs/lmk-proxy.md).
+  rpc OnActivity(ActivityEventRequest) returns (ActivityEventResponse);
+
+  // Snapshot of every tracked Android task + its current importance tier.
+  rpc GetLmkSnapshot(Empty) returns (LmkSnapshot);
+
+  // Run the LMK-proxy under memory pressure; returns the freeze/kill victims.
+  rpc TriggerLmk(LmkRequest) returns (LmkResponse);
+
+  // Push a host resource-governor decision back to the container (reverse half
+  // of the bridge): freeze/thaw the task tier, or reclaim (force-stop) it.
+  rpc ApplyHostDecision(HostActionRequest) returns (Empty);
+
+  // Server-streaming LMK event feed: the daemon pushes a real-time stream of
+  // container lifecycle decisions (a legacy app was reclaimed/frozen/thawed or
+  // its task destroyed). A System UI subscriber uses `window_id` to tear down /
+  // refresh the `legacy:<window_id>` surface. Events are best-effort broadcast
+  // (a slow/late subscriber just misses them and re-syncs via GetLmkSnapshot).
+  rpc WatchLmk(Empty) returns (stream LmkEvent);
 }
 
 message AppIconRequest {
@@ -48,6 +70,103 @@ message AndroidApp {
   string package_name = 2;
   string icon_path = 3; // web path the Tauri frontend can render
   string activity = 4;  // main launch activity
+}
+
+// ---------------------------------------------------------------
+// Activity/Task lifecycle + Low-Memory-Kill proxy (LMK-proxy).
+// The daemon / System UI pushes container-observed Activity lifecycle events
+// into the proxy, which keeps each running task's importance (rank ladder
+// shared with amos_applife / governor.proto) and, under memory pressure,
+// decides which tasks to freeze (Background -> Cached) or kill (reclaim).
+// Design & honest boundaries: docs/lmk-proxy.md.
+// ---------------------------------------------------------------
+
+// A container-observed top-Activity lifecycle event for one package.
+// Values carry the enum-name prefix because protobuf enum values share the
+// package namespace; prost strips the `ACTIVITY_EVENT_` prefix into Rust
+// variants (`Resume`, `Pause`, ...).
+enum ActivityEvent {
+  ACTIVITY_EVENT_UNSPECIFIED = 0;
+  ACTIVITY_EVENT_RESUME = 1;  // top Activity regained focus
+  ACTIVITY_EVENT_PAUSE = 2;   // lost focus but still visible (split/overlay)
+  ACTIVITY_EVENT_STOP = 3;    // hidden -> background tier
+  ACTIVITY_EVENT_DESTROY = 4; // task/surface torn down
+}
+
+message ActivityEventRequest {
+  string package_name = 1;
+  ActivityEvent event = 2;
+}
+
+message ActivityEventResponse {
+  // Derived importance key after the event (rank ladder shared with
+  // amos_applife / governor.proto): foreground | visible |
+  // foreground_service | background | cached | stopped.
+  string state_key = 1;
+}
+
+message LmkTask {
+  string package_name = 1;
+  string window_id = 2;  // legacy surface registered in amos-wm, if any
+  string state_key = 3;  // current importance key
+}
+
+message LmkSnapshot {
+  repeated LmkTask tasks = 1;
+  uint64 cached_count = 2;
+  uint64 background_count = 3;
+}
+
+// Memory-pressure level fed to the LMK-proxy (mirrors Android `lmkd`).
+enum MemoryPressure {
+  MEMORY_PRESSURE_UNSPECIFIED = 0;
+  MEMORY_PRESSURE_NONE = 1;     // no action
+  MEMORY_PRESSURE_LOW = 2;      // freeze LRU Background -> Cached (no kills)
+  MEMORY_PRESSURE_CRITICAL = 3; // reclaim (kill) LRU Cached/Background
+}
+
+message LmkRequest {
+  MemoryPressure pressure = 1;
+  uint64 budget = 2;  // max victims this round (0 => no victims)
+}
+
+message LmkVictim {
+  string package_name = 1;
+  string window_id = 2;
+  bool killed = 3;  // true = killed (surface torn down); false = frozen
+}
+
+message LmkResponse {
+  repeated LmkVictim victims = 1;
+}
+
+// A host resource-governor decision about a container-managed app to apply back
+// to the container (reverse half of the bridge, docs/lmk-proxy.md §8).
+enum HostAction {
+  HOST_ACTION_UNSPECIFIED = 0;
+  HOST_ACTION_FREEZE = 1;   // host froze it to Cached -> freeze the container task
+  HOST_ACTION_THAW = 2;     // host thawed it to Background -> thaw the container task
+  HOST_ACTION_RECLAIM = 3;  // host killed it -> force-stop the container process
+}
+
+message HostActionRequest {
+  string package_name = 1;
+  HostAction action = 2;
+}
+
+// The kind of container lifecycle decision reported on `WatchLmk`.
+enum LmkEventKind {
+  LMK_EVENT_KIND_UNSPECIFIED = 0;
+  LMK_EVENT_KIND_RECLAIMED = 1;  // force-stopped / dropped -> tear down the surface
+  LMK_EVENT_KIND_FROZEN = 2;     // froze the task to Cached (surface kept, hidden)
+  LMK_EVENT_KIND_THAWED = 3;     // thawed the task back to Background
+  LMK_EVENT_KIND_DESTROYED = 4;  // task destroyed (user closed) -> surface gone
+}
+
+message LmkEvent {
+  string package_name = 1;
+  string window_id = 2;          // the `legacy:<window_id>` surface, if known
+  LmkEventKind kind = 3;
 }
 
 message Empty {}

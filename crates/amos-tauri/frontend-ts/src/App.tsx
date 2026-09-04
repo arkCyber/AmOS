@@ -17,6 +17,7 @@ import { isExtId, loadStoreTiles, subscribeStoreTiles, tileById, type StoreTile 
 import { useStoreValue } from "./lib/useStoreValue";
 import { bridged, subscribe } from "./lib/backend";
 import { useNotificationAlert } from "./lib/useNotificationAlert";
+import { startLmkSurfaceWatcher } from "./lib/lmk";
 import { useDueReminderAlerts } from "./lib/reminderNotify";
 import {
   buttonActionOf,
@@ -289,6 +290,26 @@ function Shell() {
       unsub = await subscribe("hardware-button", (payload) => {
         if (alive) runRef.current(buttonActionOf(payload));
       });
+    })();
+    return () => {
+      alive = false;
+      unsub?.();
+    };
+  }, []);
+
+  // Tear down `legacy` Android surfaces whose container app was reclaimed or
+  // destroyed (daemon `WatchLmk` → Rust `lmk-surface` event → wm_close).
+  useEffect(() => {
+    if (!bridged()) return;
+    let alive = true;
+    let unsub: (() => void) | null = null;
+    void (async () => {
+      const stop = await startLmkSurfaceWatcher();
+      if (!alive) {
+        stop();
+        return;
+      }
+      unsub = stop;
     })();
     return () => {
       alive = false;

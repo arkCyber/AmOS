@@ -12,12 +12,16 @@
 )]
 
 pub mod ai_bridge;
+#[cfg(feature = "android")]
+pub mod android_glue;
+pub mod android_lmk;
 pub mod appstore;
 pub mod assistant_voice;
 pub mod buttons;
 pub mod interpret;
 pub mod mail;
 pub mod radio;
+pub mod sensor_host;
 pub mod sensors;
 pub mod store;
 pub mod telephony;
@@ -47,6 +51,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AiBridge::new())
         .manage(assistant_voice::VoiceSession::new())
+        .manage(assistant_voice::DeviceMic::new())
         .manage(WmState::new())
         .manage(SystemContext::new())
         .manage(shared_store)
@@ -56,6 +61,7 @@ pub fn run() {
         .manage(tts::TtsBridge::new())
         .manage(mail::MailBridge::new())
         .manage(appstore::StoreBridge::new())
+        .manage(sensor_host::SensorHost::new())
         .invoke_handler(tauri::generate_handler![
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
@@ -70,6 +76,9 @@ pub fn run() {
             assistant_voice::assistant_voice_feed,
             assistant_voice::assistant_voice_end,
             assistant_voice::assistant_voice_stop,
+            assistant_voice::device_mic_start,
+            assistant_voice::device_mic_stop,
+            assistant_voice::device_mic_status,
             ai_bridge::get_android_apps,
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,
@@ -80,6 +89,15 @@ pub fn run() {
             wm::wm_close,
             wm::wm_home,
             wm::wm_windows,
+            wm::wm_layout_snapshot,
+            wm::wm_layout_set_screen,
+            wm::wm_split,
+            wm::wm_split_resize,
+            wm::wm_split_move,
+            wm::wm_split_swap,
+            wm::wm_split_exit,
+            wm::wm_split_candidates,
+            wm::wm_split_demo,
             wm::system_set_context,
             wm::system_clear_context,
             wm::system_peek_context,
@@ -132,7 +150,12 @@ pub fn run() {
             radio::radio_set,
             sensors::sensor_snapshot,
             sensors::sensor_set_mode,
-            sensors::sensor_acquire
+            sensors::sensor_acquire,
+            sensor_host::sensor_host_snapshot,
+            sensor_host::sensor_host_set_mode,
+            sensor_host::sensor_host_record_imu,
+            sensor_host::sensor_host_record_frame,
+            sensor_host::sensor_host_acquire
         ])
         .setup(|app| {
             // System-wide readiness probe: log the daemon status once on boot.
@@ -145,6 +168,10 @@ pub fn run() {
             // to the WebView as `telephony-event` so the phone UI stays live without
             // polling (reconnects if the daemon starts/stops).
             telephony::spawn_telephony_watch(app.handle().clone());
+            // Forward the daemon `WatchLmk` stream to the WebView as `lmk-surface`
+            // so the shell can tear down / refresh a `legacy` surface when its
+            // Android app is reclaimed/destroyed (reconnects if the daemon starts).
+            android_lmk::spawn_lmk_watch(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

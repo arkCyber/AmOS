@@ -12,6 +12,7 @@
 )]
 
 pub mod controller;
+pub mod lmk;
 pub mod manager;
 pub mod png;
 pub mod runtime;
@@ -19,6 +20,10 @@ pub mod service;
 
 pub use controller::{
     extract_icon_bytes, parse_app_list, AndroidController, CommandRunner, ShellRunner,
+};
+pub use lmk::{
+    host_state, ActivityState, HostAction, LmkAction, LmkDecision, LmkError, LmkHost, LmkProxy,
+    LmkVictim, MemoryPressure, NoopLmkHost, TaskSnapshot,
 };
 pub use manager::{AndroidManagerConfig, CacheStats, EnhancedAndroidManager};
 pub use png::icon_png;

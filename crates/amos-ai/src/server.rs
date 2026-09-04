@@ -1083,8 +1083,33 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         Arc::new(std::sync::Mutex::new(ResourceGovernor::default()));
     let gov_pressure = env_governor_flag("AMOS_GOVERNOR_MEMORY_PRESSURE");
     let gov_window = env_governor_flag("AMOS_GOVERNOR_MAINTENANCE");
+    // Android-compat container runtime + LMK-proxy + host bridge. We keep the
+    // SAME instances here for (a) the AndroidManager service mount below and (b)
+    // the governor beat, which drives container decisions BACK into the proxy /
+    // real force-stop (reverse half of the bridge, docs/lmk-proxy.md §8). The
+    // host bridge also records which apps it adopted so the beat only touches
+    // real container apps, not host-native ones.
+    let android_runtime = amos_android::auto();
+    let android_proxy: Arc<std::sync::Mutex<amos_android::lmk::LmkProxy>> =
+        Arc::new(std::sync::Mutex::new(amos_android::lmk::LmkProxy::new()));
+    let android_manager: Arc<amos_android::manager::EnhancedAndroidManager> = Arc::new(
+        amos_android::manager::EnhancedAndroidManager::new(android_runtime),
+    );
+    let android_host: Arc<crate::governor_service::GovernorLmkHost> = Arc::new(
+        crate::governor_service::GovernorLmkHost::new(Arc::clone(&governor)),
+    );
+    let android_host_dyn: Arc<dyn amos_android::lmk::LmkHost> = android_host.clone();
+    // One shared `WatchLmk` broadcast: the AndroidManager service emits the
+    // System-UI-visible decisions (TriggerLmk / ApplyHostDecision / OnActivity)
+    // and the governor beat feeds host-driven reclaims through the same fan-out.
+    let lmk_events: tokio::sync::broadcast::Sender<amos_proto::android_compat::LmkEvent> =
+        tokio::sync::broadcast::channel(128).0;
     let governor_beat = {
         let gov = Arc::clone(&governor);
+        let ahost = Arc::clone(&android_host);
+        let aproxy = Arc::clone(&android_proxy);
+        let amanager = Arc::clone(&android_manager);
+        let levents = lmk_events.clone();
         let interval = interval.max(std::time::Duration::from_millis(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -1097,6 +1122,13 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
                     let mut g = gov.lock().unwrap_or_else(|p| p.into_inner());
                     g.observe(now, t, gov_pressure, gov_window)
                 };
+                // Reverse half of the bridge: whatever the host governor decided
+                // for a container-managed app, drive back into the container
+                // (force-stop / freeze / thaw) so both registries stay coherent.
+                crate::governor_service::drive_host_decisions(
+                    &o, &ahost, &aproxy, &amanager, &levents,
+                )
+                .await;
                 let acted = !o.fired_alarms.is_empty()
                     || !o.ran_deferred.is_empty()
                     || !o.frozen.is_empty()
@@ -1131,7 +1163,22 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
                 Ok(req)
             },
         ))
-        .add_service(amos_android::service::server(amos_android::auto()))
+        // Android-compat service whose LMK-proxy is bridged into the SAME shared
+        // ResourceGovernor the periodic beat and the Governor gRPC service drive:
+        // container Activity/Task importance and LMK kills are reflected up as
+        // register_app/move_app/kill_app; the beat drives host decisions back
+        // (reverse half). Built from the SAME proxy/manager/host instances the
+        // beat uses (docs/lmk-proxy.md §2/§8).
+        .add_service(
+            amos_proto::android_compat::android_manager_server::AndroidManagerServer::new(
+                amos_android::AndroidManagerService::with_parts_and_events(
+                    Arc::clone(&android_manager),
+                    Arc::clone(&android_proxy),
+                    android_host_dyn.clone(),
+                    lmk_events.clone(),
+                ),
+            ),
+        )
         // Telephony service (see crates/amos-telephony + docs/telephony.md).
         // P1 backend is the in-process mock; a real Android provider is swapped in
         // later (feature `android`). We mount the *rate-limited* variant: ordinary

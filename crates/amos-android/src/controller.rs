@@ -126,6 +126,22 @@ impl<R: CommandRunner> AndroidController<R> {
         let stdout = String::from_utf8_lossy(&out.stdout);
         Ok(parse_app_list(&stdout))
     }
+
+    /// Force-stop an app in the container (the physical half of an LMK-proxy
+    /// `Kill` decision). Runs `am force-stop` inside the container via
+    /// `waydroid shell`, so the process is really gone — not just absent from
+    /// the proxy's registry.
+    pub fn force_stop(&self, package_name: &str) -> Result<(), String> {
+        let out = self
+            .runner
+            .run("waydroid", &["shell", "am", "force-stop", package_name])
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +194,20 @@ mod tests {
         });
         let err = ctl.launch_apk("com.foo.bar").unwrap_err();
         assert!(err.contains("no such app"));
+    }
+
+    #[test]
+    fn force_stop_succeeds_and_reports_failure() {
+        // Success path.
+        let ok = AndroidController::with_runner(FakeRunner { out: ok_out("") });
+        assert!(ok.force_stop("com.tencent.mm").is_ok());
+
+        // Failure path surfaces the container stderr.
+        let bad = AndroidController::with_runner(FakeRunner {
+            out: err_out("am: unknown command"),
+        });
+        let err = bad.force_stop("com.foo.bar").unwrap_err();
+        assert!(err.contains("unknown command"));
     }
 
     #[test]

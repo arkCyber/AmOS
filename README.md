@@ -359,6 +359,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
 - [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility (dev/prototype; product = no-UI Android base)
+- [docs/lmk-proxy.md](./docs/lmk-proxy.md) — Android Activity/Task lifecycle proxy + LMK (AmOS-controlled freeze/kill of container APKs)
 - [docs/appstore.md](./docs/appstore.md) — App-store core: catalog/package JSON publish contract + download→verify→install (developer onboarding)
 - [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams)
 - [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
@@ -372,6 +373,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/device-bring-up.md](./docs/device-bring-up.md) — 真机 bring-up 行动件：energy/applife/scheduler 三块 Android 接线的接线点、复用 seam、验收判据，与"daemon 托管生命周期"(可选 gRPC Governor 服务) 路线
 - [docs/qcom-mtk-bringup.md](./docs/qcom-mtk-bringup.md) — QCOM/MTK 真机落地骨架：`amos-ai::accelerator` 芯片/加速器画像 seam、`AMOS_GGML_STRICT` 诚实本地引擎、AAudio→sherpa 语音闭环接线点与验收判据
 - [docs/DELIVERY_NOTES_2026-09-03.md](./docs/DELIVERY_NOTES_2026-09-03.md) — Commit message + changeset + known limits for the telephony/voice/strategy work (2026-09-03)
+- [docs/DELIVERY_NOTES_2026-09-05.md](./docs/DELIVERY_NOTES_2026-09-05.md) — Commit message + changeset + known limits for the Android LMK-proxy / bidirectional bridge / WatchLmk / System-UI surface-teardown work (2026-09-05)
 
 ## License
 

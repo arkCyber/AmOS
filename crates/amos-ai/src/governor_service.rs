@@ -8,18 +8,167 @@
 //! lifecycle, while the daemon keeps deciding over them. See
 //! `docs/device-bring-up.md` §4.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use amos_applife::AppId;
+use amos_android::lmk::{LmkHost, LmkProxy};
+use amos_android::manager::EnhancedAndroidManager;
+use amos_applife::{AppId, AppState};
 use amos_proto::amos_governor::{
     governor_server::{Governor, GovernorServer},
     AppInfo, AppRef, AppState as ProtoState, Empty, GovernorDecision, GovernorState, JobInfo,
     JobType as ProtoJobType, MoveAppRequest, ScheduleJobRequest,
 };
+use amos_proto::android_compat::{LmkEvent, LmkEventKind};
 use amos_scheduler::ScheduledJob;
+use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
-use crate::governor::ResourceGovernor;
+use crate::governor::{GovernorOutcome, ResourceGovernor};
+
+/// Broadcast one container LMK decision on the shared `WatchLmk` channel.
+fn emit_lmk(
+    events: &broadcast::Sender<LmkEvent>,
+    package: &str,
+    window: Option<String>,
+    kind: LmkEventKind,
+) {
+    let _ = events.send(LmkEvent {
+        package_name: package.to_string(),
+        window_id: window.unwrap_or_default(),
+        kind: kind as i32,
+    });
+}
+
+/// The host-side half of the container↔host LMK bridge: an [`LmkHost`] that
+/// reflects container `LmkProxy` importance/kills into the **same shared
+/// [`ResourceGovernor`]** the daemon's periodic beat and the `Governor` gRPC
+/// service drive. Keeps the container registry and the host closed loop in one
+/// coherent view — a container `Kill` drops the app from the host; a container
+/// tier change `register_app`/`move_app`s it (no-op when unchanged).
+///
+/// It also tracks *which* host apps are container-managed (the package set it
+/// registered), so the reverse half of the bridge ([`drive_host_decisions`])
+/// only touches real container apps when the daemon reclaims/freezes them.
+pub struct GovernorLmkHost {
+    /// The shared resource governor (same instance the daemon beat + service use).
+    pub governor: Arc<Mutex<ResourceGovernor>>,
+    /// Package names this host has adopted from the container proxy.
+    managed: Arc<Mutex<HashSet<String>>>,
+}
+
+impl GovernorLmkHost {
+    pub fn new(governor: Arc<Mutex<ResourceGovernor>>) -> Self {
+        Self {
+            governor,
+            managed: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Package names currently adopted from the container (for reverse driving).
+    pub fn managed_ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .managed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+impl LmkHost for GovernorLmkHost {
+    fn report_state(&self, package_name: &str, state: AppState) {
+        let id = AppId::new(package_name);
+        let mut g = self.governor.lock().unwrap_or_else(|p| p.into_inner());
+        if g.app_state(&id) == Some(state) {
+            return; // no-op de-dupe (avoids inflating the LRU recency).
+        }
+        if g.app_state(&id).is_none() {
+            // register creates at Foreground; subsequent move lands the target tier.
+            let _ = g.register_app(id.clone());
+            self.managed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(package_name.to_string());
+        }
+        let _ = g.move_app(id, state);
+    }
+
+    fn report_killed(&self, package_name: &str) {
+        let id = AppId::new(package_name);
+        let mut g = self.governor.lock().unwrap_or_else(|p| p.into_inner());
+        g.kill_app(&id);
+        self.managed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(package_name);
+    }
+}
+
+/// The reverse half of the container↔host bridge: after the daemon's shared
+/// `ResourceGovernor` has run one `observe` tick (freeze/thaw/reclaim on its own
+/// registry), drive those decisions **back into the container** so the two sides
+/// stay coherent. Only apps this host adopted from the container (`host.managed`)
+/// are touched; a `reclaim` force-stops the container process and drops the
+/// task, while `frozen`/`thawed` mirror the container tier. Best effort.
+pub async fn drive_host_decisions(
+    outcome: &GovernorOutcome,
+    host: &GovernorLmkHost,
+    proxy: &Arc<Mutex<LmkProxy>>,
+    manager: &Arc<EnhancedAndroidManager>,
+    events: &broadcast::Sender<LmkEvent>,
+) {
+    // Snapshot the container-managed set once (cheap O(n)) instead of cloning it
+    // per id; a reclaimed app is also dropped from the live set below.
+    let managed: HashSet<String> = host.managed_ids().into_iter().collect();
+    for id in outcome.reclaimed.iter().chain(outcome.frozen.iter()) {
+        if !managed.contains(&id.0) {
+            continue;
+        }
+        if outcome.reclaimed.contains(id) {
+            // Host killed it (no saved state) → real container force-stop and stop
+            // tracking it as a managed container app.
+            let window = proxy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .window_id(&id.0);
+            let _ = manager.force_stop_app(&id.0).await;
+            let _ = proxy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .destroy(&id.0);
+            host.managed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id.0);
+            emit_lmk(events, &id.0, window, LmkEventKind::Reclaimed);
+        } else {
+            // Host froze it to Cached → mirror the container tier.
+            let window = proxy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .window_id(&id.0);
+            let _ = proxy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .freeze(&id.0);
+            emit_lmk(events, &id.0, window, LmkEventKind::Frozen);
+        }
+    }
+    for id in &outcome.thawed {
+        if managed.contains(&id.0) {
+            let window = proxy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .window_id(&id.0);
+            let _ = proxy.lock().unwrap_or_else(|p| p.into_inner()).thaw(&id.0);
+            emit_lmk(events, &id.0, window, LmkEventKind::Thawed);
+        }
+    }
+}
 
 /// gRPC service wiring the resource governor to the wire contract.
 pub struct GovernorService {
