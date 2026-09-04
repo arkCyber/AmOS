@@ -203,6 +203,47 @@ let dir = installer.dir_for(&id);
 let f = resolve_request(&dir, "assets/app.js")?; // ServedFile{ path, content_type:"text/javascript…", nosniff:true }
 ```
 
+### 4.10 前端 srcdoc 宿主（无自定义协议）
+
+系统 UI 的三方应用容器 `components/ExtApp.tsx` 已能**真正运行** web-bundle：它把
+`amos_appstore::serve` 的安全解析交给 **Tauri 桥接** `appstore_bundle_resource(id, path)`
+（逐文件 base64 + MIME），前端用 `frontend-ts/src/lib/bundle.ts`（纯函数、已单测）把
+`index.html` 里的相对 `script/link/img` 引用解析并内联成 `data:` URL，得到**单一自包含文档**
+后放进 `sandbox="allow-scripts"`（无 `allow-same-origin`）的 `srcdoc` iframe 运行——三方代码
+拿不到 OS 壳/存储，且路径在 Rust 侧已被 `serve` 限定在自身 bundle 目录内。内联只处理**真实
+标签属性**：`<script>/<style>` 正文与 HTML 注释里的 `src=`/`href=` 字样会被忽略，不会污染
+bundle 的代码/样式（`bundle.test.ts` 回归单测覆盖）。
+
+诚实边界：这是“无需自定义协议”的落地路径，适合 **classic 单页** demo bundle（脚本以 `data:`
+子资源运行，需宿主 CSP 放行 data）。真正多页 / ESM / 需要独立 origin 的第三方 bundle，仍是
+未来注册 `amos-app://` 自定义协议宿主（serve.rs 已为它设计好）——见文末路线图。
+
+### 4.11 `amos-app://` 协议宿主（Rust 层，已就绪）
+
+`crates/amos-appstore/src/host.rs` 提供了「未来 `amos-app://` 宿主」所缺的 **URI 层**，可直接被
+Tauri 的自定义协议 handler 调用（host 可单测）：
+
+```rust
+use amos_appstore::{parse_bundle_uri, serve_bundle};
+
+let (id, path) = parse_bundle_uri("amos-app://org.amos.pomodoro/assets/app.js")?;
+// → ("org.amos.pomodoro", "/assets/app.js")
+
+let b = serve_bundle(install_root, "amos-app://org.amos.pomodoro/")?; // → index.html bytes
+// 宿主把 b.bytes 以 b.content_type 写出，并强制 nosniff（已内建）
+```
+
+安全不变量：URI 的 **netloc 必须是通过 `model::valid_id` 的应用 id**（`..`/`/`/空白/大写都无法当
+id 寻址）；请求路径交给 `serve::resolve_request` 做 canonicalize + 防穿越 + 缺文件报错。
+
+**Tauri 侧接线（已落代码）**：`amos-tauri/src/appstore.rs` 新增 `read_bundle_uri(root, uri)`
+（纯、可单测）与命令 `appstore_bundle_uri(uri)`（已注册进 handler），System UI 可经
+`lib/backend.ts` 的 `storeBundleUri(uri)` 以 URL 形式取回一个 web-bundle 文件（base64 + MIME +
+nosniff）——这是未来自定义协议 handler 唯一要调的入口。同时给原 `read_bundle_resource(id, path)`
+补上了 **id 校验**（旧的 `root.join(id)` 无守卫，恶意 `id` 如 `..` 可能越到 root 之外），与
+`host` 模块共用 `is_valid_app_id`。真正把 `amos-app://` 注册成 WebView 协议并加 scheme 白名单仍属
+GUI/设备接线（本仓库无 GUI runner），见路线图。
+
 ---
 
 ## 5. 快速上手（Rust）
@@ -309,5 +350,5 @@ cargo run -p amos-appstore-cli --features live -- \
 - [x] **`APPS` 动态注册表**（部分，2026-09-03）：store 已装应用经 `frontend-ts/src/lib/storeApps.ts` 作为 `store:<manifest-id>` tile 并入 `amos.home.layout` **上主屏**（`HomeDock`/标题/`AppComponent` 均已识别 ext tile），点击打开占位容器页 `components/ExtApp.tsx`；Store 页 install/upgrade/uninstall 后经 `notifyStoreTilesChanged()` 即时刷新。**边界**：dock/编辑主屏/Spotlight/Recents 目前仍只列出内置应用；真正"运行第三方代码"待 installer（真实 web-bundle 宿主）。
 - [x] **发布签名**（2026-09-03）：Ed25519 作者签名（`DeveloperKey`/`sign_manifest`）+ 引擎安装前验签（不符 `BadPublisherSignature` 拒绝），钉死「谁发布的」；公钥信任准入（pin/密钥服务器）留给商店层。
 - [x] **installer（web-bundle 后端）**（2026-09-03）：`amos_appstore::webinstall`（`WebInstaller`）——把 `tar.gz` 的 web-bundle（`index.html` + 资源 + `amos-app.json`）解包到 `<root>/<id>/`、校验入口、写 `manifest.json`、可卸载；tar 拒绝 `..` 路径。宿主把解包目录 serve 出来即可运行。
-- [ ] **web-bundle 宿主/启动**：把 `<root>/<id>/` 里的 bundle 用宿主（iframe/独立 webview）真正 serve 并打开，接上动态注册表的占位容器页。Rust 侧安全解析器已就绪（`amos_appstore::serve`），见 §4.9。
+- [x] **web-bundle 宿主（前端 srcdoc 沙箱）**（2026-09-04）：`components/ExtApp.tsx` 不再只是占位页——若该 app 带可运行的 web 界面，就逐文件经 `storeBundleResource`（base64）取回，用 `lib/bundle.ts` 的纯函数把相对资源内联成**单一自包含文档**，再放进 `sandbox="allow-scripts"` 的 `srcdoc` iframe 运行（无 same-origin → 碰不到 OS 壳）；无 web 界面的仅清单安装回落为清单展示（`extApp.notWeb`），加载失败给错误并可重载。纯内联核心已单测（`bundle.test.ts`）。诚实边界：这是**无自定义协议**路径，适合 classic 单页 demo bundle；多页/ESM/需真 origin 的 bundle 仍待真正 `amos-app://` 协议宿主（Rust `amos_appstore::serve` 已就绪，见 §4.9/4.10）。
 

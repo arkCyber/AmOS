@@ -89,4 +89,27 @@ describe("Notes — read-only checklist with quick toggle + progress (DOM)", () 
     });
     expect(host.textContent).toContain("2/2");
   });
+
+  test("a plain note renders as a collapsed iOS row, and tapping opens it", async () => {
+    window.localStorage.setItem(
+      NOTES_KEY,
+      JSON.stringify([{ id: "x", text: "计划\n今晚去买菜\n记得带伞", ts: Date.now() }]),
+    );
+    const host = await mountNotes();
+    // Collapsed row: bold title + preview snippet + "打开", no editing footer yet.
+    expect(host.textContent).toContain("计划");
+    expect(host.textContent).toContain("今晚去买菜 记得带伞");
+    expect(host.textContent).not.toContain("编辑");
+    const open = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.includes("打开"))!;
+    expect(open).toBeTruthy();
+    await act(async () => open.click());
+    // Expanded: the full body/actions (编辑) become available.
+    expect(host.textContent).toContain("编辑");
+    // Collapse back to the row via "收起".
+    const collapse = host.querySelector('button[aria-label="收起"]') as HTMLButtonElement | null;
+    expect(collapse).toBeTruthy();
+    await act(async () => collapse!.click());
+    expect(host.textContent).toContain("打开");
+    expect(host.textContent).not.toContain("编辑");
+  });
 });

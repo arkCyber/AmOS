@@ -22,6 +22,8 @@ export interface AiConfig {
 
 export const DEEPSEEK_ENDPOINT = "https://api.deepseek.com/v1/chat/completions";
 export const DEEPSEEK_MODEL = "deepseek-chat";
+/** Base URL of the local Ollama engine the "Local" provider prefers. */
+export const LOCAL_OLLAMA_HOST = "http://localhost:11434";
 
 /** Read an AiConfig out of a settings blob (tolerant of garbage/absence). */
 export function readAiConfig(prefs: Record<string, unknown> | null | undefined): AiConfig {
@@ -77,7 +79,15 @@ export function envFor(cfg: AiConfig): Record<string, string> {
       ...(cfg.apiKey ? { AMOS_API_KEY: cfg.apiKey } : {}),
     };
   }
-  // Local: deterministic mock backend (no network). Swap to ollama by editing
-  // AMOS_BACKEND/AMOS_OLLAMA_HOST when a local Ollama with a chat model is used.
-  return { AMOS_BACKEND: "mock" };
+  // Local = real on-device inference via a local Ollama. We intentionally do NOT
+  // hard-code AMOS_BACKEND=mock here: the daemon auto-selects the first installed
+  // *chat* model, and `scripts/ai-backend.sh local` (which this UI drives via
+  // `ai_backend_switch`) probes Ollama first and only falls back to the
+  // deterministic mock when no Ollama is reachable. If the daemon itself is
+  // started with this env and Ollama is down, it reports `degraded=true` in
+  // get_status so the UI is never mistaken about what is serving.
+  return {
+    AMOS_BACKEND: "ollama",
+    AMOS_OLLAMA_HOST: LOCAL_OLLAMA_HOST,
+  };
 }

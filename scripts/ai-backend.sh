@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # ai-backend.sh — one-command switch of the amos-ai inference backend.
 #
-#   scripts/ai-backend.sh local
+#   scripts/ai-backend.sh local            # prefer a real local Ollama; else mock
+#   scripts/ai-backend.sh ollama           # force the local Ollama engine
+#   scripts/ai-backend.sh mock             # force the deterministic mock (offline/dev)
 #   scripts/ai-backend.sh deepseek [API_KEY]
 #
 # It stops the running amos-ai (pid file /tmp/amos-ai.pid), writes the chosen
 # config to /tmp/amos-ai-backend.json, and starts amos-ai again with the env the
-# provider needs (local → mock, deepseek → OpenAI-compatible api + DeepSeek).
+# provider needs. `local` means *real on-device inference via a local Ollama*
+# when one is reachable — the deterministic mock is used only as an offline/dev
+# fallback (never the product default).
 #
 # Env:
 #   AMOS_ROOT   repo root that contains target/debug/amos-ai (default: script dir/..)
 #   AMOS_SOCKET socket path (default /tmp/amos-ai.sock)
+#   AMOS_OLLAMA_HOST   Ollama base URL (default http://localhost:11434)
+#   AMOS_MODEL         Ollama model id (default: auto-select the first installed)
+#   AMOS_LOCAL_MODE    local resolution: auto | ollama | mock  (default auto)
 set -euo pipefail
 
 ROOT="${AMOS_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -27,7 +34,7 @@ api_key="${2:-${AMOS_API_KEY:-}}"
 if [ -z "$provider" ] && [ -f "$CFG" ]; then
   saved="$(sed -n 's/.*"provider":"\([a-z]*\)".*/\1/p' "$CFG" | head -1)"
   case "$saved" in
-    local|deepseek) provider="$saved" ;;
+    local|ollama|mock|deepseek) provider="$saved" ;;
     *) provider=local ;;
   esac
   echo "resuming last backend: $provider (from $CFG)"
@@ -40,6 +47,16 @@ if [ "$provider" = deepseek ] && [ -z "$api_key" ] && [ -f "$CREDS" ]; then
   api_key="$(tr -d '\r\n' < "$CREDS")"
   [ -n "$api_key" ] && echo "using saved cloud key ($CREDS)"
 fi
+
+# Reachability probe for a local Ollama server (used by the `local` resolver).
+# Returns 0 when /api/tags answers within ~1 s; curls with no proxy so a stray
+# HTTP(S)_PROXY cannot make a localhost probe fail or route it externally.
+ollama_up() {
+  local host="${1:-http://localhost:11434}"
+  local url="${host%/}/api/tags"
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsS --noproxy '*' --max-time 1 "$url" >/dev/null 2>&1
+}
 
 # 1) Stop the current daemon (if any).
 if [ -f "$PIDFILE" ]; then
@@ -56,10 +73,43 @@ rm -f "$PIDFILE" "$SOCK"
 # 2) Write config + build env.
 case "$provider" in
   local)
+    # "Local" = real on-device inference via a reachable local Ollama; the
+    # deterministic mock is used only when Ollama is offline (or forced).
+    OLLAMA_HOST="${AMOS_OLLAMA_HOST:-http://localhost:11434}"
+    mode="${AMOS_LOCAL_MODE:-auto}"
+    backend=ollama
+    if [ "$mode" = mock ]; then
+      backend=mock
+    elif [ "$mode" = ollama ]; then
+      backend=ollama
+    elif ! ollama_up "$OLLAMA_HOST"; then
+      echo "note: no reachable Ollama at $OLLAMA_HOST — falling back to the deterministic mock (use 'ollama' to force, or set AMOS_LOCAL_MODE=ollama to make absence a hard stop)"
+      backend=mock
+    fi
+    if [ "$backend" = ollama ]; then
+      MODEL="${AMOS_MODEL:-}"   # empty -> daemon auto-selects the first installed model
+      printf '{"provider":"local","backend":"ollama","host":"%s"}' "$OLLAMA_HOST" > "$CFG"
+      ENVS=(env -u ALL_PROXY -u all_proxy AMOS_BACKEND=ollama AMOS_OLLAMA_HOST="$OLLAMA_HOST")
+    else
+      MODEL="mock"
+      echo '{"provider":"local","backend":"mock"}' > "$CFG"
+      ENVS=(env -u ALL_PROXY -u all_proxy AMOS_BACKEND=mock)
+    fi
+    ;;
+
+  mock)
     MODEL="mock"
-    echo '{"provider":"local","backend":"mock"}' > "$CFG"
+    echo '{"provider":"mock","backend":"mock"}' > "$CFG"
     ENVS=(env -u ALL_PROXY -u all_proxy AMOS_BACKEND=mock)
     ;;
+
+  ollama)
+    OLLAMA_HOST="${AMOS_OLLAMA_HOST:-http://localhost:11434}"
+    MODEL="${AMOS_MODEL:-}"   # empty -> daemon auto-selects the first installed model
+    printf '{"provider":"ollama","backend":"ollama","host":"%s"}' "$OLLAMA_HOST" > "$CFG"
+    ENVS=(env -u ALL_PROXY -u all_proxy AMOS_BACKEND=ollama AMOS_OLLAMA_HOST="$OLLAMA_HOST")
+    ;;
+
   deepseek)
     MODEL="${DEEPSEEK_MODEL:-deepseek-chat}"
     EP="${DEEPSEEK_ENDPOINT:-https://api.deepseek.com/v1/chat/completions}"
@@ -72,8 +122,9 @@ case "$provider" in
     printf '%s' "$api_key" > "$CREDS"
     chmod 600 "$CREDS"
     ;;
+
   *)
-    echo "usage: $0 local|deepseek [API_KEY]" >&2
+    echo "usage: $0 local|ollama|mock|deepseek [API_KEY]" >&2
     exit 2
     ;;
 esac

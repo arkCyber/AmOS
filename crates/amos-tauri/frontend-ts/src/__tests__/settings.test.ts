@@ -169,6 +169,8 @@ describe("settings / NC helpers", () => {
     const stores: Record<string, unknown> = {
       "amos.photos": [{ id: "p1" }],
       "amos.notes": [{ text: "hi" }],
+      "amos.reminders": [{ id: "r1", title: "写周报" }],
+      "amos.reminderLists": [{ id: "inbox", custom: false, color: "blue" }],
       "amos.other-not-synced": undefined, // non-listed key is ignored entirely
     };
     const a = snapshotStores(stores);
@@ -176,6 +178,8 @@ describe("settings / NC helpers", () => {
     expect(a).toBe(b); // same fixed key order → same JSON every time
     expect(a).toContain('"amos.photos"');
     expect(a).toContain('"amos.notes"');
+    expect(a).toContain('"amos.reminders"'); // reminders are user data → backed up
+    expect(a).toContain('"amos.reminderLists"');
     expect(a).not.toContain("other-not-synced"); // non-sync store omitted
     const parsed = JSON.parse(a) as Record<string, unknown>;
     expect(Object.keys(parsed).length).toBeGreaterThan(0);

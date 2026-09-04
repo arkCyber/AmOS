@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check clean
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check clean honesty-smoke
 
 all: build
 
@@ -68,6 +68,18 @@ gated-check:
 	cargo build -p amos-timesync-cli --features ntp
 	cargo build -p amos-supervisor --features timesync
 	cargo build -p amos-tauri --features sherpa-asr,piper-tts
+	# QCOM/MTK accelerator seams (amos_ai::accelerator): `qnn`/`neuropilot` feature
+	# flags gate vendor-NPU claims — compile + unit-test both branches (no network).
+	cargo check -p amos-ai --features qnn,neuropilot
+	cargo test -p amos-ai --features qnn,neuropilot --lib accelerator::
+	# Host compile-checks of the feature-gated Android HAL/power seams (no device /
+	# no NDK needed; runtime requires a real Android VM + Context at device bring-up).
+	cargo check -p amos-radio --features android
+	cargo check -p amos-telephony --features android
+	cargo check -p amos-sensor --features android
+	cargo check -p amos-profiling --features android
+	# Battery/thermal telemetry seam feeding the energy governor (amos-power).
+	cargo check -p amos-power --features android
 
 # Production gate: formatting + clippy must be clean; TS shells must typecheck.
 lint:
@@ -99,6 +111,13 @@ run-ui-release:
 # RPC readiness probe: both daemons must answer get_status running=true.
 health:
 	bash scripts/health-backends.sh
+
+# Host-side "honesty" smoke: proves the AI daemon truthfully reports its real
+# engine + degraded state (engine/engine_model/degraded/asr) over get_status —
+# mock=not-degraded, a requested-but-unreachable real engine=degraded, and
+# ollama follows reachability. No GUI / no real device needed.
+honesty-smoke:
+	bash scripts/ai-honesty-smoke.sh
 
 # Print the mobile-targets init guide (requires Android SDK / Xcode on a real
 # machine; see docs/mobile-targets.md for the exact commands).

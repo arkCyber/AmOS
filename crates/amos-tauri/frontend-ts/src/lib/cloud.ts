@@ -14,6 +14,8 @@ export const SYNC_STORES = [
   "amos.messages",
   "amos.music",
   "amos.files.fav",
+  "amos.reminders",
+  "amos.reminderLists",
 ] as const;
 
 export interface CloudPrefs {

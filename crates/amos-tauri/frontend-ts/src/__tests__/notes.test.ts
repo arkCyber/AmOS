@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline } from "../lib/notes";
+import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf } from "../lib/notes";
 
 describe("notes store helpers", () => {
   test("prependNote adds newest first, each with a unique id", () => {
@@ -291,6 +291,28 @@ describe("fmtTime", () => {
     expect(fmtTime(0).length).toBeGreaterThan(0);
     // different instants format differently
     expect(fmtTime(0)).not.toBe(fmtTime(86400000));
+  });
+});
+
+describe("iOS-style note row helpers", () => {
+  test("noteTitle returns the first meaningful line", () => {
+    expect(noteTitle("买菜\n- [ ] 苹果")).toBe("买菜");
+    expect(noteTitle("   - 标题行\n正文")).toBe("标题行");
+    expect(noteTitle("   \n\n\n纯备注")).toBe("纯备注");
+    expect(noteTitle("  ")).toBe("");
+  });
+
+  test("notePreview collapses the body after the title", () => {
+    expect(notePreview("标题\n第一行\n  第二行")).toBe("第一行 第二行");
+    expect(notePreview("只有标题")).toBe("");
+    expect(notePreview("标题\n" + "长".repeat(200), 20).length).toBe(21); // 20 + ellipsis
+  });
+
+  test("noteDayOf reports whole-day deltas from now", () => {
+    const now = new Date(2026, 8, 4, 12, 0, 0).getTime();
+    expect(noteDayOf(now, now)).toBe(0); // today
+    expect(noteDayOf(now - 86_400_000, now)).toBe(-1); // yesterday
+    expect(noteDayOf(now + 86_400_000, now)).toBe(1); // tomorrow
   });
 });
 

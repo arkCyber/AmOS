@@ -400,8 +400,9 @@ impl fmt::Display for AppManifest {
 
 /// Whether `id` is an allowed app slug: non-empty, lowercase alphanumerics with
 /// `.`, `_` or `-` separators that never lead, trail, or repeat. Reverse-DNS
-/// ids like `org.amos.pomodoro` fit naturally.
-fn valid_id(id: &str) -> bool {
+/// ids like `org.amos.pomodoro` fit naturally. Shared with the URI host
+/// (`crate::host`) so an `amos-app://<id>/…` netloc is validated identically.
+pub(crate) fn valid_id(id: &str) -> bool {
     if id.is_empty() {
         return false;
     }

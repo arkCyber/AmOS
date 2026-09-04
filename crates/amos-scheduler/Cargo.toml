@@ -1,0 +1,14 @@
+[package]
+name = "amos-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos background-task scheduler + wakeup-alignment domain core: deterministic, pure-std register of AlarmExact vs Deferred jobs with [earliest,latest] windows, Doze/charging/maintenance-window gating for deferred work, due-batching (coalesced alignment) and next-wake computation. Design: docs/scheduler.md."
+
+[lib]
+name = "amos_scheduler"
+path = "src/lib.rs"
+
+[dependencies]
+# None — pure `std` domain core (transport/platform-agnostic, offline-testable).

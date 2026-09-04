@@ -9,13 +9,15 @@
 //! `docs/bidi-voice-asr.md`.
 //!
 //! Backend is selected by `AMOS_ASR_BACKEND`:
-//! * `mock` (default, deterministic, offline — emits a fixed phrase once enough
-//!   samples arrive);
+//! * unset (default) — real on-device sherpa **when the daemon is built with the
+//!   `asr-sherpa` feature and `AMOS_SHERPA_MODEL_DIR` is staged**; otherwise the
+//!   deterministic mock (so voice always works offline). This is the "real ASR by
+//!   default" production path.
+//! * `mock` — force the deterministic, offline recognizer (tests / dev).
 //! * `sherpa` — real local on-device ASR (sherpa-onnx behind `amos-asr`'s
-//!   `sherpa` feature). Requires building `amos-ai` with the `asr-sherpa`
-//!   feature **and** pointing `AMOS_SHERPA_MODEL_DIR` at a sherpa model dir;
-//!   otherwise voice falls back to `None` (honest "not configured") rather than
-//!   silently degrading to the mock.
+//!   `sherpa` feature). Requires the `asr-sherpa` feature **and**
+//!   `AMOS_SHERPA_MODEL_DIR`; if either is missing, returns `None` (honest
+//!   "not configured") rather than silently degrading to the mock.
 //! * `off` / `none` / `disabled` — disable voice entirely.
 
 use amos_asr::{MockStreamingRecognizer, StreamingRecognizer};
@@ -45,20 +47,48 @@ impl ChatAsr {
     ///   `AMOS_SHERPA_MODEL_DIR`. If the feature or the model files are missing
     ///   we warn and return `None` so `Payload::Audio` falls back to the honest
     ///   "voice not configured" path instead of silently degrading to the mock.
-    /// * anything else (default) → the deterministic mock.
+    /// * `AMOS_ASR_BACKEND=mock` → the deterministic mock.
+    /// * unset (or an unrecognised value) → [`Self::default_asr`]: a real
+    ///   on-device sherpa recognizer *when the daemon was built with the
+    ///   `asr-sherpa` feature and a model dir is staged*
+    ///   (`AMOS_SHERPA_MODEL_DIR`); otherwise the deterministic mock, so unset
+    ///   always yields a working recognizer.
     pub fn from_env() -> Option<Self> {
         match std::env::var("AMOS_ASR_BACKEND").as_deref() {
             Ok("off") | Ok("none") | Ok("disabled") => {
                 tracing::debug!("voice input disabled (AMOS_ASR_BACKEND)");
                 None
             }
+            // Explicit real on-device ASR: honest "None" (not mock) when the
+            // feature or model files are missing.
             Ok("sherpa") => sherpa_recognizer_from_env(),
-            // mock (default) or any unrecognised value -> deterministic mock.
-            _ => {
+            // Explicit deterministic mock (tests / offline / dev).
+            Ok("mock") => {
                 tracing::info!("voice input: deterministic mock ASR (AMOS_ASR_BACKEND=mock)");
                 Some(Self::new(Box::new(mock_recognizer())))
             }
+            // Default: real sherpa when staged, else deterministic mock.
+            _ => Some(Self::default_asr()),
         }
+    }
+
+    /// Default recognizer for an *unset* `AMOS_ASR_BACKEND`: a real on-device
+    /// sherpa recognizer when the daemon was built with `asr-sherpa` **and** a
+    /// model dir is staged; otherwise (feature off / no model dir / staged init
+    /// failure) the deterministic mock. Never `None`, so unset always yields a
+    /// working recognizer for the bidi `Payload::Audio` channel.
+    fn default_asr() -> Self {
+        #[cfg(feature = "asr-sherpa")]
+        if sherpa_staged() {
+            // Reuse the explicit-sherpa builder; on failure warn and fall back to
+            // the mock (staging a broken dir must not disable voice).
+            if let Some(asr) = sherpa_recognizer_from_env() {
+                return asr;
+            }
+            tracing::warn!("staged sherpa model dir failed to initialise; using mock ASR");
+        }
+        tracing::info!("voice input: deterministic mock ASR (default)");
+        Self::new(Box::new(mock_recognizer()))
     }
 
     /// Feed one PCM frame (mono 16 kHz f32, little-endian) and return the
@@ -125,6 +155,20 @@ fn mock_recognizer() -> MockStreamingRecognizer {
 #[cfg(feature = "asr-sherpa")]
 fn first_existing(dir: &std::path::Path, candidates: &[&str]) -> Option<std::path::PathBuf> {
     candidates.iter().map(|f| dir.join(f)).find(|p| p.exists())
+}
+
+/// Is a sherpa model dir "staged" for the auto (unset) default — i.e. is
+/// `AMOS_SHERPA_MODEL_DIR` set to a directory containing `tokens.txt`? Used by
+/// [`ChatAsr::default_asr`] to decide whether to prefer a real on-device
+/// recognizer without the caller having to name `AMOS_ASR_BACKEND=sherpa`.
+#[cfg(feature = "asr-sherpa")]
+fn sherpa_staged() -> bool {
+    std::env::var("AMOS_SHERPA_MODEL_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .map(|d| d.join("tokens.txt").exists())
+        .unwrap_or(false)
 }
 
 /// Real local sherpa-onnx streaming recognizer selected by

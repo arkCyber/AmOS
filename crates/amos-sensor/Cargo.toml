@@ -1,0 +1,35 @@
+[package]
+name = "amos-sensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos device-sensor domain core + gRPC service: camera / GPS-GNSS / IMU spec types, a pluggable SensorProvider seam (Mock today, Android Camera2/Gnss/SensorManager HAL later), an energy-policy SensorManager, and a SensorService exposed over the daemon UDS. Design: docs/sensors.md."
+
+[lib]
+name = "amos_sensor"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+amos-proto.workspace = true
+tonic.workspace = true
+# Real Android backend (CameraManager / LocationManager / SensorManager via JNI,
+# hosted in the System UI APK which owns the Context). Optional: only pulled in
+# when the `android` feature is enabled so desktop/CI builds stay light.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enables `src/android.rs` (AndroidSensorProvider). Intended for on-device builds
+# of the System UI APK (cross-compiled for aarch64-linux-android); deliberately
+# excluded from desktop/CI. Runtime still requires a real Android VM + a Context;
+# `cargo check --features android` validates that it *compiles*.
+android = ["dep:jni"]
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
+

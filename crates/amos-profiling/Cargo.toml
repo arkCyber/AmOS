@@ -1,0 +1,23 @@
+[package]
+name = "amos-profiling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos inference performance & power-profiling domain core: prompt-eval/decode phase tracking, tokens-per-second + time-to-first-token + per-token-latency meters, a PowerSource seam with a deterministic mock, and energy estimation for on-device LLM runs. Pure domain core on host; PowerSource/HAL + metric export wiring left as a seam. Design: docs/profiling.md."
+
+[lib]
+name = "amos_profiling"
+path = "src/lib.rs"
+
+[dependencies]
+# Real Android power backend (BatteryManager via JNI, hosted in the System UI APK
+# which owns the Context). Optional: only pulled in with the `android` feature.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enables `src/android.rs` (AndroidBatteryPowerSource). Intended for on-device
+# builds of the System UI APK; excluded from desktop/CI. `cargo check --features
+# android` validates it *compiles* (runtime needs a real Android VM + a Context).
+android = ["dep:jni"]

@@ -50,6 +50,7 @@
 
 pub mod client;
 pub mod error;
+pub mod host;
 pub mod model;
 pub mod provider;
 pub mod serve;
@@ -61,6 +62,7 @@ pub mod http;
 
 pub use client::AppStore;
 pub use error::{Result, StoreError};
+pub use host::{is_valid_app_id, parse_bundle_uri, serve_bundle, ServedBundle, SCHEME};
 pub use model::{
     AppCategory, AppManifest, AppStatus, Checksum, HashAlgorithm, InstalledApp, PackageFormat,
     PackageRef, PublisherSig, Version,

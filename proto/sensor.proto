@@ -1,0 +1,122 @@
+// Amos device-sensor gRPC contract between the System UI / apps and the OS daemon.
+//
+// Transport: the same Unix Domain Socket as ai_agent / android_compat / telephony
+// (single UDS for the whole OS backend). Design & contract: docs/sensors.md.
+// This is the *service bus* on top of the amos-sensor domain core. Raw camera
+// frame *bytes* are NOT shipped here (a frame stream belongs on a dedicated media
+// channel with the real HAL); the service exposes capability listing, GNSS/IMU
+// readings, the energy mode, and the PowerSave-gated stream-acquisition contract.
+syntax = "proto3";
+
+package amos_sensor;
+
+message Empty {}
+
+enum SensorMode {
+  PERFORMANCE = 0;
+  BALANCED = 1;
+  POWER_SAVE = 2;
+}
+
+enum SensorKind {
+  CAMERA = 0;
+  GNSS = 1;
+  IMU = 2;
+}
+
+enum PixelFormat {
+  RGBA8 = 0;
+  NV21 = 1;
+}
+
+enum FixMode {
+  NO_FIX = 0;
+  TWO_DIM = 1;
+  THREE_DIM = 2;
+}
+
+message CameraDesc {
+  uint32 id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 fps = 4;
+  PixelFormat format = 5;
+}
+
+message CameraList {
+  repeated CameraDesc cameras = 1;
+}
+
+message CameraCaptureRequest {
+  uint32 id = 1;
+}
+
+// Frame *metadata* (no raw bytes here — see module docs). Enough to prove a
+// real capture path and to size a future media channel.
+message CameraCaptureReply {
+  uint32 id = 1;
+  uint64 seq = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  PixelFormat format = 5;
+  uint64 payload_len = 6;
+}
+
+message GnssReply {
+  bool enabled = 1;
+  bool has_fix = 2;
+  double latitude_deg = 3;
+  double longitude_deg = 4;
+  double altitude_m = 5;
+  double accuracy_m = 6;
+  FixMode fix_mode = 7;
+  uint32 sats_in_view = 8;
+  uint64 timestamp_ms = 9;
+}
+
+message Vec3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message ImuReply {
+  uint64 timestamp_ms = 1;
+  Vec3 accel_m_s2 = 2;
+  Vec3 gyro_rad_s = 3;
+  float temperature_c = 4;
+  uint32 rate_hz = 5;
+}
+
+message SetModeRequest {
+  SensorMode mode = 1;
+}
+
+message ModeReply {
+  SensorMode mode = 1;
+}
+
+message AcquireRequest {
+  SensorKind kind = 1;
+  uint32 rate_hz = 2;
+}
+
+message AcquireReply {
+  bool allowed = 1;
+  string error = 2;
+}
+
+// Device-sensor service exposed by the OS daemon (amos-ai), backed by the
+// amos-sensor domain core (SensorManager + SensorProvider). Unary, pull-based.
+// AcquireStream is the energy-gated declaration of a continuous stream: it is
+// refused in POWER_SAVE above the family ceiling / always above the hardware
+// ceiling.
+service Sensor {
+  rpc ListCameras(Empty) returns (CameraList);
+  rpc CaptureCamera(CameraCaptureRequest) returns (CameraCaptureReply);
+  rpc GetGnss(Empty) returns (GnssReply);
+  rpc GetImu(Empty) returns (ImuReply);
+  rpc GetMode(Empty) returns (ModeReply);
+  rpc SetMode(SetModeRequest) returns (ModeReply);
+  rpc AcquireStream(AcquireRequest) returns (AcquireReply);
+}

@@ -17,6 +17,7 @@ import { isExtId, loadStoreTiles, subscribeStoreTiles, tileById, type StoreTile 
 import { useStoreValue } from "./lib/useStoreValue";
 import { bridged, subscribe } from "./lib/backend";
 import { useNotificationAlert } from "./lib/useNotificationAlert";
+import { useDueReminderAlerts } from "./lib/reminderNotify";
 import {
   buttonActionOf,
   keyActionOf,
@@ -225,7 +226,10 @@ function Shell() {
   // Global notification-arrival alert (vibrate + ring per effective sound policy),
   // mounted once so it fires on every screen — home, inside an app, even locked.
   useNotificationAlert();
-
+  // OS-wide due-reminder scheduler: fires an app alert when a reminder's due
+  // time is reached, on any screen (see lib/reminderNotify.ts). Suppressed while
+  // the Reminders app itself is focused (its items are already on screen).
+  useDueReminderAlerts(active);
   // Search-launch: clear the badge + record a recent, but stay on the home
   // screen and briefly highlight that app's icon (like picking it in Spotlight).
   const softLaunch = (id: string) => {

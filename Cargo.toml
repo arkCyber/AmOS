@@ -21,6 +21,11 @@ members = [
     "crates/amos-timesync",
     "crates/amos-timesync-cli",
     "crates/amos-radio",
+    "crates/amos-sensor",
+    "crates/amos-profiling",
+    "crates/amos-power",
+    "crates/amos-applife",
+    "crates/amos-scheduler",
 ]
 
 [workspace.package]
@@ -54,6 +59,11 @@ amos-int = { path = "crates/amos-int" }
 amos-appstore = { path = "crates/amos-appstore" }
 amos-timesync = { path = "crates/amos-timesync" }
 amos-telephony = { path = "crates/amos-telephony" }
+amos-sensor = { path = "crates/amos-sensor" }
+amos-profiling = { path = "crates/amos-profiling" }
+amos-power = { path = "crates/amos-power" }
+amos-applife = { path = "crates/amos-applife" }
+amos-scheduler = { path = "crates/amos-scheduler" }
 
 # ---- profile tuning for fast iteration / smaller mobile binaries ----
 [profile.dev]

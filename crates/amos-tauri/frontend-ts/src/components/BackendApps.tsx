@@ -105,6 +105,7 @@ export function AiApp() {
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [meta, setMeta] = useState("");
+  const [degraded, setDegraded] = useState(false);
   const [copiedReply, setCopiedReply] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [sessions, setSessions] = useState<AiSessionInfo[] | null>(null);
@@ -166,8 +167,10 @@ export function AiApp() {
     let alive = true;
     const unsubs: (() => void)[] = [];
     getAiStatus().then((s) => {
-      if (alive && s?.model)
+      if (!alive) return;
+      if (s?.model)
         setStatus(t("ai.modelStatus", { model: s.model, count: s.active_sessions ?? 0 }));
+      setDegraded(Boolean(s?.degraded));
     });
     (async () => {
       unsubs.push(
@@ -322,6 +325,15 @@ export function AiApp() {
       <div className="flex items-center gap-2">
         <span className="text-3xl">🤖</span>
         {status && <span className="truncate text-xs opacity-60">{status}</span>}
+        {degraded && (
+          <span
+            role="alert"
+            title={t("ai.degraded")}
+            className="shrink-0 rounded-full bg-red-500/15 px-1.5 py-0.5 text-[10px] font-medium text-red-600 dark:text-red-300"
+          >
+            {t("ai.degraded")}
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-1">
           <button
             onClick={() => void toggleSessions()}

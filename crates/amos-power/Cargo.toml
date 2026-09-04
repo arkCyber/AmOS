@@ -1,0 +1,29 @@
+[package]
+name = "amos-power"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos battery/thermal/foreground-aware energy-governor domain core: folds battery state-of-charge + charger state + die temperature + live board power (amos-profiling PowerSource) + foreground/background usage into a deterministic power-save recommendation (amos-sensor SensorMode), and applies it to a SensorManager. Pure std decision core; daemon/System-UI ticker + real power HAL wiring left as seams. Design: docs/power-policy.md."
+
+[lib]
+name = "amos_power"
+path = "src/lib.rs"
+
+[dependencies]
+# Decision output type + the manager we push the chosen mode into (domain cores).
+amos-sensor.workspace = true
+# The PowerSource seam we sample live board power from.
+amos-profiling.workspace = true
+# Real Android battery/thermal telemetry source (BatteryManager via JNI, hosted in
+# the System UI APK which owns the Context). Optional: only pulled in with the
+# `android` feature so desktop/CI builds stay light.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enables `src/android.rs` (AndroidBatteryTelemetry). Intended for on-device builds
+# of the System UI APK; excluded from desktop/CI. `cargo check --features android`
+# validates it *compiles* (runtime needs a real Android VM + a Context).
+android = ["dep:jni"]
+

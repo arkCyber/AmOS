@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use amos_proto::ai_agent::{
     ai_agent_server::{AiAgent, AiAgentServer},
     AgentChunk, AgentRequest, ClearSessionsReply, ClearSessionsRequest, ClientMessage,
-    GetHistoryReply, GetHistoryRequest, HistoryTurn, ListSessionsReply, ListSessionsRequest,
-    RemoveSessionReply, RemoveSessionRequest, SessionInfo, StatusReply, StatusRequest,
+    EnergyPolicy, GetHistoryReply, GetHistoryRequest, GovernorMetrics, HistoryTurn,
+    ListSessionsReply, ListSessionsRequest, ProfileMetrics, RemoveSessionReply,
+    RemoveSessionRequest, SessionInfo, StatusReply, StatusRequest,
 };
 use amos_proto::{CLIENT_ID_HEADER, DEFAULT_CLIENT_ID};
 use anyhow::Context;
@@ -17,8 +18,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::inference::real::{BackendKind, InferenceBackend, MockBackend};
+use crate::energy::{EnergySnapshot, EnergyStore};
+use crate::governor::ResourceGovernor;
+use crate::inference::real::{BackendKind, InferenceBackend, MockBackend, OllamaBackend};
 use crate::monitoring::Monitor;
+use crate::profiler::{ProfileSnapshot, ProfileStore};
 use crate::security::{AuditResult, Permission, SecurityManager};
 use crate::session::SessionManager;
 
@@ -35,12 +39,24 @@ pub struct AiAgentService {
     security: Arc<SecurityManager>,
     /// The active inference backend (GGML / API / Mock), selected via env.
     backend: Arc<dyn InferenceBackend>,
+    /// Startup snapshot of the effective engine + ASR, so `get_status` can tell a
+    /// caller which real engine is serving and whether it degraded to mock.
+    engine: EngineState,
     /// Session lineage tracking (token usage, context, memory).
     sessions: Arc<SessionManager>,
     /// Where sessions are persisted (`AMOS_SESSIONS_PATH`); `None` = in-memory.
     sessions_path: Option<std::path::PathBuf>,
     /// Daemon health/metrics (RPC counts, uptime, heartbeats).
     monitor: Arc<Monitor>,
+    /// Rolling inference profile (decode tokens/s + TTFT) shared with the
+    /// stream_chat decode path and exposed via `get_status`.
+    profile: Arc<ProfileStore>,
+    /// Rolling energy-governor store (battery/thermal/power → SensorMode + throttle
+    /// flags), ticked periodically and exposed via `get_status`.
+    energy: Arc<EnergyStore>,
+    /// The shared resource-governor closed loop (set by `serve()` so `get_status`
+    /// can report what the governor is doing; `None` for a standalone service).
+    governor: Option<Arc<std::sync::Mutex<ResourceGovernor>>>,
 }
 
 impl AiAgentService {
@@ -76,14 +92,22 @@ impl AiAgentService {
         let _sweeper = sessions
             .clone()
             .spawn_cleanup_task(sessions.cleanup_interval());
+        // Snapshot the effective engine state (captured before the backend is
+        // moved into the struct): reports which real engine is serving and
+        // whether a requested real engine degraded to mock at startup.
+        let engine = EngineState::from_env(&backend.metadata().name);
         Self {
             model: "amos-infer@0.1.0",
             active_sessions: Arc::new(AtomicUsize::new(0)),
             security: Arc::new(security),
             backend,
+            engine,
             sessions,
             sessions_path,
             monitor: Arc::new(Monitor::new()),
+            profile: Arc::new(ProfileStore::new()),
+            energy: Arc::new(EnergyStore::new()),
+            governor: None,
         }
     }
 
@@ -103,9 +127,13 @@ impl AiAgentService {
             active_sessions: Arc::new(AtomicUsize::new(0)),
             security,
             backend,
+            engine: EngineState::non_degraded(),
             sessions: Arc::new(SessionManager::default()),
             sessions_path: None,
             monitor: Arc::new(Monitor::new()),
+            profile: Arc::new(ProfileStore::new()),
+            energy: Arc::new(EnergyStore::new()),
+            governor: None,
         }
     }
 
@@ -138,6 +166,81 @@ impl AiAgentService {
         Arc::clone(&self.monitor)
     }
 
+    /// Shared handle to the rolling inference profile store (decode path records
+    /// into it; `get_status` reads it).
+    pub fn profile(&self) -> Arc<ProfileStore> {
+        Arc::clone(&self.profile)
+    }
+
+    /// Shared handle to the energy-governor store (ticked periodically; `get_status`
+    /// reads it).
+    pub fn energy(&self) -> Arc<EnergyStore> {
+        Arc::clone(&self.energy)
+    }
+
+    /// Attach the daemon's shared resource-governor closed loop so `get_status`
+    /// reports its live decision (called by `serve()`).
+    pub fn set_governor(&mut self, governor: Arc<std::sync::Mutex<ResourceGovernor>>) {
+        self.governor = Some(governor);
+    }
+
+    /// Fold the current [`ProfileStore`] snapshot into the wire `ProfileMetrics`.
+    fn profile_metrics(&self) -> ProfileMetrics {
+        let s: ProfileSnapshot = self.profile.snapshot();
+        ProfileMetrics {
+            decode_tokens_per_sec: s.decode_tokens_per_sec,
+            ttft_ms: s.ttft_ms,
+            decode_tokens_total: s.decode_tokens_total,
+            decode_runs: s.decode_runs,
+        }
+    }
+
+    /// Fold the current [`EnergyStore`] snapshot into the wire `EnergyPolicy`.
+    fn energy_metrics(&self) -> EnergyPolicy {
+        let s: EnergySnapshot = self.energy.snapshot();
+        EnergyPolicy {
+            sensor_mode: s.sensor_mode.to_string(),
+            reason: s.reason.to_string(),
+            cap_inference: s.cap_inference,
+            throttle_background: s.throttle_background,
+            ticks: s.ticks,
+        }
+    }
+
+    /// Fold the shared resource-governor's latest decision into the wire
+    /// `GovernorMetrics` (pending baseline when the governor is not attached / has
+    /// not run yet).
+    fn governor_metrics(&self) -> GovernorMetrics {
+        match &self.governor {
+            Some(g) => {
+                let g = g.lock().unwrap_or_else(|p| p.into_inner());
+                match g.last_decision() {
+                    Some(o) => GovernorMetrics {
+                        sensor_mode: o.sensor_mode.to_string(),
+                        reason: o.reason.to_string(),
+                        cap_inference: o.cap_inference,
+                        throttle_background: o.throttle_background,
+                        ticks: g.ticks(),
+                    },
+                    None => GovernorMetrics {
+                        sensor_mode: "balanced".to_string(),
+                        reason: "pending".to_string(),
+                        cap_inference: false,
+                        throttle_background: false,
+                        ticks: 0,
+                    },
+                }
+            }
+            None => GovernorMetrics {
+                sensor_mode: "balanced".to_string(),
+                reason: "pending".to_string(),
+                cap_inference: false,
+                throttle_background: false,
+                ticks: 0,
+            },
+        }
+    }
+
     /// Resolve the caller identity from the gRPC metadata header, falling back
     /// to the default client id when the caller did not identify itself.
     fn client_id<T>(&self, request: &Request<T>) -> String {
@@ -151,6 +254,80 @@ impl AiAgentService {
     }
 }
 
+/// A real inference backend kind (as named by `AMOS_BACKEND`), as opposed to the
+/// dev/test `mock` (or an empty/unknown value).
+fn is_real_backend(kind: &str) -> bool {
+    matches!(kind, "api" | "ollama" | "hermes" | "ggml")
+}
+
+/// Human label of the voice ASR recognizer that `ChatAsr` would build from the
+/// environment — "off" (disabled), "sherpa" (explicit), "mock" (explicit), or
+/// the unset-default which is "sherpa(auto)" when the `asr-sherpa` feature is
+/// compiled in, else "mock". Mirrors `crate::chat_asr::ChatAsr::from_env`.
+fn asr_label_from_env() -> String {
+    match std::env::var("AMOS_ASR_BACKEND").as_deref() {
+        Ok("off") | Ok("none") | Ok("disabled") => "off".to_string(),
+        Ok("sherpa") => "sherpa".to_string(),
+        Ok("mock") => "mock".to_string(),
+        _ => {
+            if cfg!(feature = "asr-sherpa") {
+                "sherpa(auto)".to_string()
+            } else {
+                "mock".to_string()
+            }
+        }
+    }
+}
+
+/// Startup snapshot of the *effective* engine state, captured once so the daemon
+/// truthfully reports — and an operator can never mistake a degraded (mock)
+/// engine for the real inference they asked for.
+#[derive(Clone, Debug)]
+struct EngineState {
+    /// True when a real engine was requested (`AMOS_BACKEND` = api/ollama/hermes/
+    /// ggml) but the daemon is actually serving the deterministic mock (the real
+    /// backend failed to initialise at startup).
+    degraded: bool,
+    /// Voice ASR recognizer in effect: "mock" | "sherpa" | "sherpa(auto)" | "off".
+    asr: String,
+    /// Resolved device-acceleration target of the *local* inference engine
+    /// (`amos_ai::accelerator`), e.g. "android/nnapi". `Some` only when a local
+    /// engine that actually offloads is serving (ggml); `None` for remote/managed
+    /// backends (mock/api/ollama/hermes). Never `Auto`, never fabricated.
+    accelerator: Option<String>,
+}
+
+impl EngineState {
+    /// Capture from the environment at startup.
+    fn from_env(active_backend_name: &str) -> Self {
+        let requested = std::env::var("AMOS_BACKEND").unwrap_or_default();
+        Self {
+            degraded: is_real_backend(&requested) && active_backend_name == "mock",
+            asr: asr_label_from_env(),
+            accelerator: accel_label_for_active(active_backend_name),
+        }
+    }
+
+    /// Explicitly non-degraded snapshot (used when the caller injects a concrete
+    /// backend, e.g. tests), with the ASR label read from the environment. No
+    /// local-accelerator claim unless the caller sets one.
+    fn non_degraded() -> Self {
+        Self {
+            degraded: false,
+            asr: asr_label_from_env(),
+            accelerator: None,
+        }
+    }
+}
+
+/// Which *active* backend should report a device-acceleration target: only the
+/// local GGML engine applies `amos_ai::accelerator` offload (see
+/// `inference::real`), so only it gets a label. Remote/managed backends
+/// (mock/api/ollama/hermes) have no local offload to report → `None`.
+fn accel_label_for_active(active: &str) -> Option<String> {
+    (active == "ggml").then(|| crate::accelerator::AccelProfile::from_env().label())
+}
+
 /// Select and build the inference backend from the environment.
 ///
 /// Env vars:
@@ -159,8 +336,33 @@ impl AiAgentService {
 ///   AMOS_API_KEY / AMOS_API_ENDPOINT / AMOS_MODEL         (api)
 ///   AMOS_OLLAMA_HOST / AMOS_MODEL                         (ollama)
 ///   AMOS_HERMES_ENDPOINT / AMOS_MODEL                     (hermes)
+///
+/// **Honesty rule**: `mock` is a *dev/test* default only. When the operator
+/// explicitly selects a real backend (`api`/`ollama`/`hermes`/`ggml`) and it
+/// fails to initialise (unreachable server, missing model, bad key…), we keep
+/// the daemon serving so the System UI and health probes stay up, but log the
+/// failure at **error** level and make clear the running engine is the
+/// deterministic mock — never silently pretending mock is real inference.
 async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
     let kind = std::env::var("AMOS_BACKEND").unwrap_or_else(|_| "mock".to_string());
+    // Surface which chip/accelerator the local-inference path would use, resolved
+    // honestly (never "auto", never an uncompiled vendor SDK). See accelerator.rs.
+    let accel = crate::accelerator::AccelProfile::from_env();
+    let (accel_eff, accel_reason) = accel.resolve();
+    match accel_reason {
+        Some(r) => tracing::info!(
+            requested = %accel.accel.label(),
+            vendor = accel.vendor.label(),
+            accel = %accel_eff.label(),
+            "accelerator downgraded: {r}"
+        ),
+        None => tracing::info!(
+            accel = %accel_eff.label(),
+            vendor = accel.vendor.label(),
+            llama_layers = accel.n_gpu_layers(),
+            "local-inference accelerator profile"
+        ),
+    }
     let backend = match kind.as_str() {
         "ggml" => BackendKind::Ggml(std::env::var("AMOS_MODEL_PATH").unwrap_or_default()),
         "api" => BackendKind::Api {
@@ -169,10 +371,14 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
                 .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".into()),
             model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
         },
+        // Real on-device / localhost engine via Ollama. When the operator does
+        // not pin a model, auto-select the first model the running Ollama has
+        // actually installed (so the daemon serves real tokens instead of
+        // erroring on a hard-coded default that may not be pulled yet).
         "ollama" => BackendKind::Ollama {
             host: std::env::var("AMOS_OLLAMA_HOST")
                 .unwrap_or_else(|_| "http://localhost:11434".into()),
-            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "hermes3".into()),
+            model: resolve_ollama_model().await,
             // Some local Ollama builds / proxies gate `/v1` behind an API key.
             bearer: std::env::var("AMOS_OLLAMA_API_KEY")
                 .ok()
@@ -185,11 +391,81 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
         },
         _ => BackendKind::Mock,
     };
+    // Ollama manages its own offload, so the accelerator can't be passed as CLI
+    // args — surface the resolved profile as the operator/device hint (which
+    // chip Ollama should use). See accelerator.rs / docs/qcom-mtk-bringup.md.
+    if kind == "ollama" {
+        tracing::info!(
+            accel = %accel_eff.label(),
+            vendor = accel.vendor.label(),
+            ollama_hint = %accel.ollama_hint(),
+            "ollama backend — accelerator device hint"
+        );
+    }
     match backend.build().await {
         Ok(b) => Arc::from(b),
         Err(e) => {
-            tracing::warn!("backend init failed ({e}); falling back to mock");
+            if matches!(kind.as_str(), "api" | "ollama" | "hermes" | "ggml") {
+                tracing::error!(
+                    backend = %kind,
+                    "requested inference backend failed to initialise: {e:#}; serving the \
+                     deterministic mock engine instead — this is NOT real inference"
+                );
+            } else {
+                tracing::debug!("mock backend ready");
+            }
             Arc::new(MockBackend::new())
+        }
+    }
+}
+
+/// Is `name` plausibly a *chat* model (not an embedding/test/junk model)?
+/// Ollama reports every pulled model in `/api/tags`, including `*-embed*`
+/// variants (no `/v1` chat) and stray `cli-smoke-*`/`bad-mf-*` entries left by
+/// ad-hoc test pulls. Auto-selection must never hand the daemon one of these —
+/// it yields an immediate empty/error reply or, worse, silently serves garbage.
+fn is_chat_model(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return false;
+    }
+    let lower = n.to_ascii_lowercase();
+    // Names are only the authoritative signal (list_models has no sizes). These
+    // substrings reliably mark non-chat/test entries and won't match a real model.
+    !["embed", "cli-smoke", "bad-mf"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Pick the Ollama model to run: `AMOS_MODEL` when set, otherwise the first
+/// *chat-capable* model the local Ollama reports installed via `/api/tags`
+/// (embedding/text models are skipped). Falls back to the classic `hermes3`
+/// name (Ollama will pull it on first use) when Ollama is unreachable or only
+/// reports embedding models. Resolution is time-boxed so a down Ollama cannot
+/// stall daemon startup for the full tags timeout.
+async fn resolve_ollama_model() -> String {
+    if let Ok(m) = std::env::var("AMOS_MODEL") {
+        if !m.trim().is_empty() {
+            return m;
+        }
+    }
+    let host =
+        std::env::var("AMOS_OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".into());
+    let probe = OllamaBackend::new(host.clone(), String::new());
+    let models = tokio::time::timeout(Duration::from_secs(3), probe.list_models())
+        .await
+        .unwrap_or_default();
+    match models.iter().find(|m| is_chat_model(m)).cloned() {
+        Some(model) => {
+            tracing::info!(host = %host, model = %model, "auto-selected Ollama model");
+            model
+        }
+        None => {
+            tracing::warn!(
+                host = %host,
+                "Ollama reported no chat-capable installed model; defaulting to 'hermes3' (pulled on first use)"
+            );
+            "hermes3".to_string()
         }
     }
 }
@@ -242,6 +518,7 @@ impl AiAgent for AiAgentService {
         let client_for_log = client_id.clone();
         let backend = self.backend.clone();
         let sessions = self.sessions.clone();
+        let profile = self.profile.clone();
         let session_key = sessions.create(self.model.to_string()).await;
 
         tokio::spawn(async move {
@@ -283,6 +560,10 @@ impl AiAgent for AiAgentService {
             }
 
             // Text intent: stream from the configured inference backend.
+            // Profile this decode turn: gen_start → first token is the TTFT; the
+            // whole run (tokens + wall) is the end-to-end decode throughput.
+            let gen_start = Instant::now();
+            let mut ttft_recorded = false;
             let mut stream = match backend.infer(&prompt, &context, 256).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -308,6 +589,10 @@ impl AiAgent for AiAgentService {
                     Err(_) => break,
                 };
                 full.push_str(&token);
+                if !ttft_recorded {
+                    ttft_recorded = true;
+                    profile.record_ttft(gen_start.elapsed());
+                }
                 let chunk = AgentChunk {
                     session_id: session_id.clone(),
                     token,
@@ -323,6 +608,8 @@ impl AiAgent for AiAgentService {
                 token_count += 1;
                 tokio::time::sleep(crate::inference::TOKEN_INTERVAL).await;
             }
+            // Record the completed decode turn for get_status profile metrics.
+            profile.record_decode(token_count as u64, gen_start.elapsed());
             let final_frame = AgentChunk {
                 session_id,
                 token: String::new(),
@@ -387,6 +674,7 @@ impl AiAgent for AiAgentService {
         let security = self.security.clone();
         let backend = self.backend.clone();
         let sessions = self.sessions.clone();
+        let profile = self.profile.clone();
         let session_key = sessions.create(self.model.to_string()).await;
 
         tokio::spawn(async move {
@@ -471,6 +759,8 @@ impl AiAgent for AiAgentService {
                             let _ = sessions.update(&session_key, |s| s.add_tokens(1)).await;
                             continue;
                         }
+                        let gen_start = Instant::now();
+                        let mut ttft_recorded = false;
                         let mut stream = match backend.infer(&p, &chat_ctx, 256).await {
                             Ok(s) => s,
                             Err(e) => {
@@ -495,6 +785,10 @@ impl AiAgent for AiAgentService {
                                 r = next_fut => match r {
                                     Some(Ok(token)) => {
                                         full.push_str(&token);
+                                        if !ttft_recorded {
+                                            ttft_recorded = true;
+                                            profile.record_ttft(gen_start.elapsed());
+                                        }
                                         if tx
                                             .send(Ok(AgentChunk {
                                                 session_id: String::new(),
@@ -530,6 +824,9 @@ impl AiAgent for AiAgentService {
                         if cancelled {
                             break 'outer;
                         }
+                        // Completed (non-cancelled) turn → fold into the shared
+                        // inference profile (same store as stream_chat).
+                        profile.record_decode(token_count as u64, gen_start.elapsed());
                         let _ = tx
                             .send(Ok(AgentChunk {
                                 session_id: String::new(),
@@ -623,14 +920,23 @@ impl AiAgent for AiAgentService {
         }
         // Single snapshot so the reply's metrics are mutually consistent.
         let snap = self.monitor.snapshot();
+        let meta = self.backend.metadata();
         Ok(Response::new(StatusReply {
             running: true,
             model: self.model.to_string(),
             uptime_seconds: snap.uptime_secs as i64,
-            gpu_util: 0,
+            gpu_util: 0, // honest: no GPU/NPU metrics instrumented yet (0 ≠ a reading)
             active_sessions: self.active_sessions.load(Ordering::SeqCst) as u32,
             rpc_total: snap.rpc_total as i64,
             heartbeats: snap.heartbeats as i64,
+            engine: meta.name,
+            engine_model: meta.model_name,
+            degraded: self.engine.degraded,
+            asr: self.engine.asr.clone(),
+            accelerator: self.engine.accelerator.clone().unwrap_or_default(),
+            profile: Some(self.profile_metrics()),
+            energy: Some(self.energy_metrics()),
+            governor: Some(self.governor_metrics()),
         }))
     }
 
@@ -750,7 +1056,7 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     // compat layer, so Tauri talks to the whole OS backend over one connection.
     // The runtime is auto-selected: real Waydroid on device, in-process demo
     // elsewhere (so the whole pipeline works on any host).
-    let ai_service = AiAgentService::new().await;
+    let mut ai_service = AiAgentService::new().await;
     // monitor counts requests to the *AiAgent* gRPC service (the AI daemon's own
     // RPCs); the Android-compat service sharing the same socket is separate.
     let monitor = ai_service.monitor();
@@ -760,7 +1066,61 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
 
     // Periodic self-health heartbeat: logs a metrics line every interval (aborted
     // on shutdown). Metrics are also served live over GetStatus.
-    let heartbeat = monitor.spawn_periodic(metrics_interval());
+    let interval = metrics_interval();
+    let heartbeat = monitor.spawn_periodic(interval);
+    // Roll the live inference profile into the same periodic cadence so an
+    // operator sees decode tps / TTFT without an RPC round-trip.
+    let profile_beat = ai_service.profile().spawn_periodic_log(interval);
+    // Tick the energy governor on the same cadence (battery/thermal → SensorMode +
+    // throttle flags), logged + served over GetStatus.energy.
+    let energy_beat = ai_service.energy().spawn_periodic(interval);
+    // Run the composed resource/energy/lifecycle/scheduler closed loop over a
+    // SHARED ResourceGovernor. The periodic beat ticks it (energy → freeze/thaw →
+    // defer/reclaim) while the Governor gRPC service (below) lets a System UI /
+    // per-app host register apps & jobs into the same instance — so the loop acts
+    // on host-registered apps, not an empty registry. Logs only when it acts.
+    let governor: Arc<std::sync::Mutex<ResourceGovernor>> =
+        Arc::new(std::sync::Mutex::new(ResourceGovernor::default()));
+    let gov_pressure = env_governor_flag("AMOS_GOVERNOR_MEMORY_PRESSURE");
+    let gov_window = env_governor_flag("AMOS_GOVERNOR_MAINTENANCE");
+    let governor_beat = {
+        let gov = Arc::clone(&governor);
+        let interval = interval.max(std::time::Duration::from_millis(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            let mut now = 0u64;
+            loop {
+                ticker.tick().await;
+                now += 1;
+                let t = crate::energy::telemetry_from_env();
+                let o = {
+                    let mut g = gov.lock().unwrap_or_else(|p| p.into_inner());
+                    g.observe(now, t, gov_pressure, gov_window)
+                };
+                let acted = !o.fired_alarms.is_empty()
+                    || !o.ran_deferred.is_empty()
+                    || !o.frozen.is_empty()
+                    || !o.thawed.is_empty()
+                    || !o.reclaimed.is_empty();
+                if acted {
+                    tracing::info!(
+                        sensor_mode = o.sensor_mode,
+                        reason = o.reason,
+                        fired_alarms = o.fired_alarms.len(),
+                        ran_deferred = o.ran_deferred.len(),
+                        frozen = o.frozen.len(),
+                        thawed = o.thawed.len(),
+                        reclaimed = o.reclaimed.len(),
+                        background_count = o.background_count,
+                        "amos-ai resource governor acted"
+                    );
+                }
+            }
+        })
+    };
+    // Make get_status report the shared governor's live decision (same instance the
+    // beat ticks and the Governor gRPC service mutates).
+    ai_service.set_governor(Arc::clone(&governor));
     let svc_monitor = Arc::clone(&monitor);
 
     let server = tonic::transport::Server::builder()
@@ -778,6 +1138,15 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         // dials are capped per client id (30/min) while emergency calls are always
         // exempt (docs/telephony.md §5); auto-connect keeps the desktop demo operable.
         .add_service(amos_telephony::service::demo_server_limited(30))
+        // Device-sensor service (crates/amos-sensor + docs/sensors.md). P1 backend
+        // is the in-process mock; a real Android HAL provider is swapped in later
+        // (feature `android`) without changing the mount point.
+        .add_service(amos_sensor::service::mock_server())
+        // Resource-governor service (crates/amos-ai governor_service + proto
+        // governor.proto): lets a System UI / per-app host register apps & jobs and
+        // move apps through their lifecycle, driving the SAME shared governor the
+        // periodic beat ticks (docs/device-bring-up.md §4).
+        .add_service(crate::governor_service::server(Arc::clone(&governor)))
         .serve_with_incoming(incoming);
 
     tokio::select! {
@@ -787,6 +1156,9 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         }
     }
     heartbeat.abort();
+    profile_beat.abort();
+    energy_beat.abort();
+    governor_beat.abort();
 
     // Persist sessions (if `AMOS_SESSIONS_PATH` is set) before exiting.
     if let Some(p) = &sessions_path {
@@ -809,6 +1181,18 @@ fn metrics_interval() -> Duration {
         .filter(|s| *s >= 1)
         .unwrap_or(60);
     Duration::from_secs(secs)
+}
+
+/// Parse an optional bool env var for the governor beat (`1`/`true`/`yes`); an
+/// unset or garbage value is treated as `false`.
+fn env_governor_flag(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 /// Resolves on SIGINT, SIGTERM, or Ctrl-C so the daemon can exit cleanly.
@@ -868,6 +1252,87 @@ mod tests {
         r.metadata_mut()
             .insert(CLIENT_ID_HEADER, client.parse().unwrap());
         r
+    }
+
+    #[test]
+    fn ollama_auto_model_skips_embedding_models() {
+        // Chat models are selected for auto-resolution...
+        assert!(is_chat_model("qwen2.5"));
+        assert!(is_chat_model("gemma4-4b:latest"));
+        assert!(is_chat_model("llama3-latest"));
+        assert!(is_chat_model("Qwen3-8B"));
+        // ...embedding/text models (which cannot do /v1 chat) are never chosen.
+        assert!(!is_chat_model("nomic-embed-text-latest"));
+        assert!(!is_chat_model("bge-embedding-v1"));
+        assert!(!is_chat_model("  "), "blank is not a model");
+        // ...nor stray ad-hoc test/junk entries left in /api/tags.
+        assert!(!is_chat_model("cli-smoke-bad-mf-1786097807099608000"));
+        assert!(!is_chat_model("CLI-SMOKE-000"));
+        assert!(!is_chat_model("bad-mf-12345"));
+    }
+
+    #[test]
+    fn real_backend_kinds_are_detected() {
+        for real in ["api", "ollama", "hermes", "ggml"] {
+            assert!(is_real_backend(real), "{real} is a real backend");
+        }
+        for dev in ["mock", "", "unknown"] {
+            assert!(!is_real_backend(dev), "{dev:?} is not a real backend");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_engine_and_degradation_honestly() {
+        // Default build boots with the deterministic mock engine; it must be
+        // reported as such (not as a real model), and never "degraded" (mock was
+        // the default, not a fallback). The ASR label reflects the env and may be
+        // any of its valid values.
+        let svc = AiAgentService::new().await;
+        let reply = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("get_status")
+            .into_inner();
+        assert!(reply.running);
+        assert_eq!(reply.engine, "mock", "mock backend reports itself as mock");
+        assert!(!reply.engine_model.is_empty(), "mock still names its model");
+        assert!(!reply.degraded, "mock-as-default is not a degradation");
+        assert!(
+            matches!(
+                reply.asr.as_str(),
+                "mock" | "sherpa" | "sherpa(auto)" | "off"
+            ),
+            "asr label is one of the known values (got {:?})",
+            reply.asr
+        );
+        assert!(
+            reply.accelerator.is_empty(),
+            "a mock serving reports no local-accelerator target (got {:?})",
+            reply.accelerator
+        );
+    }
+
+    #[test]
+    fn accelerator_label_only_for_local_ggml() {
+        // Only the local GGML engine applies amos_ai::accelerator offload, so it
+        // alone reports a label; mock/api/ollama/hermes have no local offload.
+        assert!(accel_label_for_active("ggml").is_some());
+        for remote in ["mock", "api", "ollama", "hermes", ""] {
+            assert!(
+                accel_label_for_active(remote).is_none(),
+                "'{remote}' must not claim a local accelerator"
+            );
+        }
+        // The label is the concrete "<vendor>/<accel>" resolution, never "auto".
+        let l = accel_label_for_active("ggml").expect("ggml reports an accelerator");
+        assert!(
+            !l.contains("auto"),
+            "accelerator label is concrete, not auto: {l}"
+        );
+        assert!(
+            l.contains('/'),
+            "accelerator label is vendor/accel shaped: {l}"
+        );
     }
 
     #[tokio::test]
@@ -1168,5 +1633,35 @@ mod tests {
         svc.save_sessions().await;
         assert!(path.exists(), "sessions persisted to disk on shutdown");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn governor_metrics_reflects_shared_governor_decision() {
+        use crate::governor::ResourceGovernor;
+        use amos_power::{BatteryState, Telemetry, Usage};
+
+        let mut svc = AiAgentService::with_security_and_backend(
+            Arc::new(SecurityManager::default()),
+            Arc::new(MockBackend::new()),
+        );
+        let gov = Arc::new(std::sync::Mutex::new(ResourceGovernor::default()));
+        svc.set_governor(Arc::clone(&gov));
+
+        // Pending baseline before any tick.
+        let before = svc.governor_metrics();
+        assert_eq!(before.reason, "pending");
+        assert_eq!(before.ticks, 0);
+
+        // A low-battery observe on the shared governor surfaces as power_save.
+        gov.lock().unwrap().observe(
+            1,
+            Telemetry::new(BatteryState::on_battery(15.0), Usage::default(), None),
+            false,
+            false,
+        );
+        let after = svc.governor_metrics();
+        assert_eq!(after.sensor_mode, "power_save");
+        assert!(after.throttle_background);
+        assert!(after.ticks >= 1);
     }
 }

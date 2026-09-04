@@ -1,0 +1,89 @@
+// AmOS resource-governor gRPC contract: lets the System UI / a per-app process
+// host register apps & jobs into, and read state back from, the daemon's
+// `ResourceGovernor` closed loop (energy → lifecycle → scheduler) over the shared
+// Unix Domain Socket.
+//
+// Transport: the same UDS as ai_agent / android_compat / telephony / sensor.
+// Design & contract: docs/device-bring-up.md §4.
+syntax = "proto3";
+
+package amos_governor;
+
+message Empty {}
+
+message AppRef {
+  string app_id = 1;
+}
+
+// Target lifecycle state for a registered app (see amos-applife AppState).
+// Values carry the enum-name prefix because protobuf enum values share the
+// package namespace; prost strips the `APP_STATE_` prefix into Rust variants.
+enum AppState {
+  APP_STATE_UNSPECIFIED = 0;
+  APP_STATE_FOREGROUND = 1;
+  APP_STATE_BACKGROUND = 2;
+  APP_STATE_CACHED = 3;           // freeze → tombstone
+  APP_STATE_FOREGROUND_SERVICE = 4;
+  APP_STATE_STOPPED = 5;
+}
+
+message MoveAppRequest {
+  string app_id = 1;
+  AppState to = 2;
+}
+
+// Whether a scheduled job is an exact user alarm or deferrable background work.
+enum JobType {
+  JOB_TYPE_UNSPECIFIED = 0;
+  JOB_TYPE_ALARM_EXACT = 1;
+  JOB_TYPE_DEFERRED = 2;
+}
+
+message ScheduleJobRequest {
+  string job_id = 1;
+  JobType job_type = 2;
+  uint64 earliest = 3;
+  uint64 latest = 4;
+}
+
+message AppInfo {
+  string app_id = 1;
+  AppState state = 2;
+}
+
+message JobInfo {
+  string job_id = 1;
+  JobType job_type = 2;
+  uint64 earliest = 3;
+  uint64 latest = 4;
+}
+
+// The daemon's most recent resource-governor decision (what the closed loop is
+// doing right now): the chosen sensor mode + the throttle/cap recommendations.
+message GovernorDecision {
+  string sensor_mode = 1;      // performance | balanced | power_save
+  string reason = 2;           // charging|healthy|battery_low|... (see amos_power::Reason::key)
+  bool cap_inference = 3;
+  bool throttle_background = 4;
+  uint64 ticks = 5;            // governor observe ticks so far (>0 ⇒ it has run)
+}
+
+message GovernorState {
+  repeated AppInfo apps = 1;
+  repeated JobInfo jobs = 2;
+  uint64 background_count = 3;
+  GovernorDecision decision = 4;   // last tick; ticks==0 ⇒ not run yet
+}
+
+// Resource-governor service exposed by the OS daemon (amos-ai), backed by the
+// amos_ai::governor::ResourceGovernor closed loop. A host registers apps/jobs,
+// moves apps through their lifecycle, and reads the current state; the daemon's
+// periodic beat keeps deciding (energy → freeze/thaw/defer/reclaim) over the same
+// instance.
+service Governor {
+  rpc RegisterApp(AppRef) returns (Empty);
+  rpc MoveApp(MoveAppRequest) returns (Empty);
+  rpc UnregisterApp(AppRef) returns (Empty);
+  rpc ScheduleJob(ScheduleJobRequest) returns (Empty);
+  rpc GetState(Empty) returns (GovernorState);
+}

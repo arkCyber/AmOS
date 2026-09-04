@@ -37,8 +37,14 @@
 | 安全层（rate limit/audit/permission） | ✅ | 2026-09-01 已接入 `AiAgentService` 每 RPC 校验 + 速率限制 + token 审计（见 §二.B.8） |
 | **电话（telephony）** | ✅(领域/服务/桥/桌面闭环) | 2026-09-03 起：`amos-telephony` 领域内核 + `proto/telephony.proto` + `TelephonyService`（Mock）挂 `amos-ai` 同一 UDS + Tauri `telephony_*` 命令桥 + `PhoneApp` 拨号接线 + 锁屏紧急呼叫 110 + `Watch` 真实事件流/注入式来电模拟 + 通话录音（`RecordingState`/provider seam/proto/Tauri/UI）；**2026-09-04 桌面闭环**：Tauri `Watch` 事件桥 + 前端**来电浮层**（接听/拒接/录音/挂断）+ `telephony_answer` + 出局拨号 **demo 自动接通**（`demo_server()`）使 拨号→通话→录音→挂断 真实可操作。**2026-09-04 审计校正（见 `docs/telephony.md` §12）**：真电话宿主进程定稿（System UI/`ROLE_DIALER` 持 Context，非 headless daemon 手写 binder）；紧急硬保证责任边界澄清（framework/RIL/厂商，非用户态"内核通路"）；`EmergencyMap` 司法区化（`for_region`/`quick_dial`，未知区域回退全局）；锁屏紧急一键单一来源 + 自恢复；`PhoneApp` 无 daemon 拨号优雅降级（Rust 单测 51 全绿、`tsc --noEmit` 通过）。剩余：P3 真机 Android provider 代码（宿主与要点已定稿，见 `docs/telephony.md` §10.4） |
 | **Radio / connectivity（wifi/蓝牙/飞行）** | ✅(内核/桥/UI) | 2026-09-04：`amos-radio` 领域内核（`RadioManager` 策略 + 飞行级联 + `MockRadioProvider`）+ Tauri `radio_*` 命令桥（进程内，真机属 Android 系统服务故不走 daemon）+ 通知中心接线（持久化镜像、跨窗口广播、未 bridge `flipRadio` 降级、开面板 `radioStatus` 权威同步）。真机 Android provider（`AndroidRadioProvider`，`android` feature JNI 骨架）待设备（见 `docs/radio.md`） |
+| **设备传感器/多媒体领域内核 `amos-sensor`** | ✅(领域/服务总线/daemon) | 2026-09-04：相机 / GPS-GNSS / IMU 领域内核（`SensorKind`/`SensorMode`、`CameraConfig`/`CameraFrame` RGBA8/NV21、`GeoFix`/`FixMode`、`ImuSample`/`Vec3`、采样上限；`SensorProvider` seam + 确定性 `MockSensorProvider`；`SensorManager` 能量策略）**已 `add_service` 挂进 daemon 同一条 UDS**：`proto/sensor.proto`（`amos_sensor`）→ `amos-proto` 生成 → `amos-sensor/src/service.rs` 的 `SensorService`（ListCameras/CaptureCamera/GetGnss/GetImu/GetMode/SetMode/AcquireStream）→ `amos-ai::serve()`（真 UDS e2e：`sensor_rpc_e2e.rs` 单服务 + `rpc_test.rs` 与 AiAgent 同 socket）。**剩余 seam**：真机相机帧/IMU 流桥与 System UI 真 `Context` 接线（GNSS 的 `AndroidSensorProvider` 已真实现、feature `android` 骨架已 `cargo check` 通过；System UI 桌面桥 `sensor_snapshot/set_mode/acquire` + `lib/sensors.ts` 已落地，见 `docs/sensors.md`）。单测 25 + e2e、clippy -D warnings 干净 |
+| **推理性能/功耗 Profiling `amos-profiling`** | ✅(领域/daemon 装配) | 2026-09-04：度量内核（`ProfileTracker` decode/prompt tokens-per-second、TTFT、每 token 延迟、除零守卫；`PowerSource` seam+`MockPowerSource`；`time`/`time_and`；可展示 `ProfileReport`）**已装配进 `amos-ai`**：`amos-ai/src/profiler.rs` `ProfileStore`（Arc 共享）在 **`stream_chat` 与 bidi `Chat` 两条文本解码路径**都按 turn 记录流式 token 数+墙钟与 time-to-first-token（`Cancel` 打断不记），`get_status` 经 `StatusReply.profile`（`ProfileMetrics`，proto 字段 12）暴露，`serve()` 另以健康心跳同周期日志（`amos-ai inference profile`）落 profile；`status_once`/新增 `profile_once`/`sensor_once` 示例打印。**诚实标签**：无 tokenizer 不计 prompt tokens，`decode_tokens_per_sec`=端到端流到客户端的生成 token/s。**剩余 seam**：真机 `EXTRA_VOLTAGE`→`est_energy_j`、传感器 tile（profile 已由 `aiEngine.describeEngine` 解析并渲染进 Settings 诊断区；`AndroidBatteryPowerSource` 骨架已 `cargo check -p amos-profiling --features android` 通过，见 `docs/profiling.md`）。单测 15、clippy -D warnings 干净 |
 | **电话通信录（contacts）** | ✅(领域/UI) | 2026-09-04：`lib/contacts.ts` 纯领域（校验/归一化/损坏自愈、增删改、收藏、搜索按名/号码、重复号码拦截含 +CC 与裸号互判、首字母分组、头像色、号码反查姓名 `contactNameFor`）+ `ContactsApp`（👥，已注册进网格）+ en/zh。持久化 `amos.contacts`。另有 `lib/calllog.ts`（最近/常用通话，持久化 `amos.calllog`：`recordCall`/`recentNumbers`/`frequentNumbers`/`logNameFor`/`normalizeCallLog`）→ 呼叫成功即记录并出「最近」快速拨打条。领域 100% 函数覆盖 + DOM 交互测试（`contacts.test.ts`/`calllog.test.ts`/`ContactsApp.test.tsx`） |
 | **通知三件套 + 策略（system UX）** | ✅ | 2026-09-04：`NotificationBanner`（到达顶部横幅、点按处理）、`useNotificationAlert`（到达按策略 震动 `navigator.vibrate` + Web Audio 铃声）、ring/vibrate 策略位（`lib/sound.ts`）+ DND 一键静音 + 🔔/dock 角标实时未读（DND 隐藏）+ 状态栏 radio/DND 常驻指示 + 响应式跨窗口 store（`useStoreValue`/`store-updated` 权威值）。单元 + DOM + 端到端覆盖 |
+| **节能策略决策内核 `amos-power`** | ✅(内核+daemon 装配) | 2026-09-04：电量/充电/温度/实时功耗/前后台 → `SensorMode`（迟滞）+ `cap_inference`/`throttle_background`；已挂 daemon 周期 beat 并经 `StatusReply.energy` 暴露。真 HAL 采样为 seam（docs/power-policy.md） |
+| **应用生命周期内核 `amos-applife`** | ✅(内核) | 2026-09-04：per-App 状态阶梯 Foreground/Visible/ForegroundService/Background/Cached=墓碑/Stopped + 保护态永不回收 + LRU + 内存压力 `reclaim_candidates`(LMK-proxy)。真 per-app 进程宿主为 seam（docs/app-lifecycle.md） |
+| **后台调度/唤醒对齐内核 `amos-scheduler`** | ✅(内核) | 2026-09-04：AlarmExact vs Deferred + `[earliest,latest]` 窗 + Doze/充电/维护窗门控 + 批量合并对齐 + `next_wake`。真 AlarmManager/JobScheduler/Doze 绑定为 seam（docs/scheduler.md） |
+| **资源闭环 `ResourceGovernor`（daemon）** | ✅(装配已接线) | 2026-09-04：`amos_ai::governor` 把节能+生命周期+调度合成闭环——低电→PowerSave→冻结后台 App+压住 Deferred；恢复/充电+维护窗→解冻+跑合并批；显式内存压力→LRU 回收；已在 `serve()` 周期 beat 运行。per-app 宿主注册 app/job 后即自动治理（bottom-layer-os-audit.md §3.P2 注） |
 | 桌面 Tauri 壳 + 移动 UI | ✅ | 模拟手机桌面的系统 UI |
 
 ---
@@ -46,9 +52,9 @@
 ## 二、核心缺口（按优先级排序）
 
 ### 🔴 A. AI / 推理核心 —— 最高优先级
-1. ~~**真实推理引擎未接入**~~ → **✅ 大幅完成（2026-09-01）**：`ApiBackend`（OpenAI 兼容 SSE）、**`OllamaBackend`**（直连本地 Ollama，`/api/tags` 健康检查）、**`HermesAgentBackend`**（接 Hermes-Rust agent，解析原生 `{"type":"token"}` 帧做真实逐 token 流式，`/health` 探测）均已实现；`AMOS_BACKEND=api|ollama|hermes` 即可接入。`GgmlBackend`（本地 GGML/llama.cpp）为外部 `allama` 子进程（无进程内 C 绑定；引擎/模型缺失时回落 mock，有 `ggml_command_e2e.rs` 门控测试）。
+1. ~~**真实推理引擎未接入**~~ → **✅ 大幅完成（2026-09-01）**：`ApiBackend`（OpenAI 兼容 SSE）、**`OllamaBackend`**（直连本地 Ollama，`/api/tags` 健康检查）、**`HermesAgentBackend`**（接 Hermes-Rust agent，解析原生 `{"type":"token"}` 帧做真实逐 token 流式，`/health` 探测）均已实现；`AMOS_BACKEND=api|ollama|hermes` 即可接入。`GgmlBackend`（本地 GGML/llama.cpp）为外部 `allama` 子进程（无进程内 C 绑定；引擎/模型缺失时回落 mock，有 `ggml_command_e2e.rs` 门控测试）。**2026-09-04**：新增 `AMOS_GGML_STRICT=1` 诚实开关——真实部署里引擎/模型不可用时**直接报错**而非静默回落 mock（默认仍 `off` 保住离线/CI 回落）。
 2. **无进程内模型加载**：本地 GGML/llama.cpp **无进程内 C 绑定**（现走外部 `allama` 子进程；进程内需引入 `llama-cpp-rs`/`candle` 原生依赖）；`ApiBackend` 已不需要本地模型。
-3. **GPU/NPU 加速无实现**：`Config.enable_acceleration` 存在但无对应后端。
+3. **GPU/NPU 加速原无实现** → **✅ 部分（2026-09-04）**：新增 `amos-ai::accelerator`（`crates/amos-ai/src/accelerator.rs`）域——`SoCVendor`（Qualcomm/MediaTek/Host，`AMOS_SOC_VENDOR` 覆盖）、`Accel`（auto/cpu/vulkan/metal/nnapi/qnn/neuropilot）+ `AccelProfile`；`Config.enable_acceleration`/`AMOS_ACCEL` 现在被解析成可上报的芯片画像（android `auto`→NNAPI 共通 NPU；`resolve()` 如实给出降级 reason；`--features qnn/neuropilot` 门控厂商 SDK）。daemon 启动打 `vendor/accel/llama_layers` 日志。真 GPU/NPU **驱动/运行时**接入属真机 + OEM SDK 工作（`docs/qcom-mtk-bringup.md`）。
 4. **无 function calling / 工具调用**：`BackendMetadata.supports_function_calling` 为 false，AI 无法调用系统能力。
 5. **无多模态（图像理解）**：`supports_images` 为 false。
 6. ~~**无会话持久化**~~ → **✅ 已完成（2026-09-01）**：`SessionManager::save/load`（原子 JSON，缺失/损坏非致命降级），重启加载会话并反推 staleness；已接入 daemon（`AMOS_SESSIONS_PATH`）。长期记忆/RAG 仍无（见 7）。
@@ -68,7 +74,7 @@
 
 ### 🟠 D. 移动端 / 真机
 14. **mobile targets 未初始化**：无 `android/`、`ios/` 平台目录，目前只是桌面。
-15. ~~**无真机设备 API**~~ → **✅ 部分完成（2026-09-01）**：**相机**接入 WebView `getUserMedia`（真实取景器 + 拍照存相册，无摄像头时降级演示）；**地图**接入 OpenStreetMap 在线瓦片 + `navigator.geolocation` 定位 + 城市搜索 + 缩放（离线降级）。麦克风、GPS 原生插件、传感器、电话/SMS、联系人仍缺失。
+15. ~~**无真机设备 API**~~ → **✅ 部分完成（2026-09-01 + 2026-09-04）**：**相机**接入 WebView `getUserMedia`（真实取景器 + 拍照存相册，无摄像头时降级演示）；**地图**接入 OpenStreetMap 在线瓦片 + `navigator.geolocation` 定位 + 城市搜索 + 缩放（离线降级）。**2026-09-04**：相机 / GPS-GNSS / IMU 的**领域内核**（`amos-sensor`：`SensorProvider` seam + 确定性 Mock + `SensorManager` 能量策略，见 §一 与 `docs/sensors.md`）已就绪，且其 **gRPC `SensorService` 已挂进 daemon 同一条 UDS**（`amos_ai::serve()` `add_service`，与 AiAgent 同 socket 真 UDS 往返验证）。**仍为后续**：真机 Camera2/Gnss/SensorManager HAL provider（feature `android`）与 System UI Tauri 客户端桥。麦克风、原生 GPS 插件、电话/SMS、联系人等 WebView 侧原生插件仍缺失。
 16. ~~**无锁屏 / 解锁**~~ → **✅ 部分完成（2026-09-01）**：锁屏（时钟/日期/通知预览）+ 数字 PIN 密码 + 上滑/按钮解锁已实现；生物识别（指纹/面容）仍缺失。
 17. ~~**无首次启动引导（onboarding）**~~ → **✅ 已完成（2026-09-01）**：首次开机进入欢迎流程（介绍 → 外观选择 → 可选设置锁屏密码 → 完成），完成标记持久化到 `amos.onboarded`，之后直接进入锁屏。
 18. **无 OTA / 自动更新**。
@@ -77,10 +83,10 @@
 19. ~~**设置不落盘**~~ → **✅ 已完成（2026-09-03）**：`SharedStore`（`amos-tauri/src/store.rs`）现持久化到磁盘——每次写入写回 `AMOS_STATE_FILE`（缺省 `~/.amos/state.json`），重启可恢复且 Rust 侧可读；损坏文件降级为空并可自愈；localStorage 仅作前端缓存。测试覆盖跨实例持久化/删除/损坏容错。
 20. **文件系统无真实访问**：files 应用是 mock 静态列表 → **✅ 部分完成（2026-09-01）**：已改为 store 支撑的虚拟文件系统（建文件夹/建文本/查看/删除），但尚未接真实磁盘/Tauri `fs` 插件。
 21. ~~**快捷设置不生效**~~ → **✅ 大部分完成（2026-09-01 + 2026-09-04）**：深色模式/亮度真实生效（前端主题 + 遮罩）。**wifi/蓝牙/飞行** 已接 `RadioManager` 策略（飞行级联关 Wi-Fi/蓝牙、飞行中禁开）+ Tauri `radio_status/radio_set` 命令桥 + 持久化镜像（`amos.settings` 跨窗口广播）；桌面走 `MockRadioProvider`，未 bridge 时前端 `flipRadio` 同策略降级。真机 Android 射频后端（`AndroidRadioProvider`，`android` feature JNI 骨架，`cargo check --features android` 可编译）待设备接通。`location` 快速开关已接为**系统级定位主开关**（默认开；关时即使某 app 已授权也拦截 `MapsApp` 的 `navigator.geolocation`，2026-09-04）。`dnd` 快速开关已接为**勿扰**（默认关；开启时首页/dock 未读角标隐藏、通知中心列表静音呈现，2026-09-04）。
-22. **无应用生命周期管理**：无后台/墓碑/冻结/进程调度。
+22. **无应用生命周期管理**：无后台/墓碑/冻结/进程调度 → **✅ 内核+装配已落地（2026-09-04）**：`amos-applife` 状态阶梯 + LRU/LMK-proxy 回收（docs/app-lifecycle.md）；daemon `ResourceGovernor` 在低电时自动把后台 App 冻结到 Cached(墓碑)。真 per-app 进程宿主为 runtime seam。
 23. **无全局搜索**（Spotlight 式）。
 24. **无系统托盘、全局快捷键、多显示器支持**。
-25. **无后台任务调度器**。
+25. **无后台任务调度器** → **✅ 内核+装配已落地（2026-09-04）**：`amos-scheduler`（AlarmExact vs Deferred、Doze 门控、合并对齐、next_wake，docs/scheduler.md）；daemon `ResourceGovernor` 在节电/Doze 时压住 Deferred、恢复/维护窗跑合并批。真 AlarmManager/JobScheduler/Doze 绑定为 seam。
 
 ### 🟡 F. 前端应用多为演示占位
 26. ~~相机=mock 取景器，地图=样式化占位，文件=mock 列表，照片/电话/信息/音乐/时钟/笔记 多为静态 UI~~ → **✅ 大幅完成（2026-09-01）**：**相册**、**文件**、**相机**（`getUserMedia`）、**地图**（OSM+定位）、**音乐**（Web Audio 合成播放器 + store 播放列表 + 播放/暂停/上一首/下一首/进度）均已做实。电话/信息仍为演示占位。
@@ -113,7 +119,7 @@
 （来源：`PHASE2_COMPLETION_REPORT.md` / `CODE_COMPLETION_SUMMARY.md`）
 - [x] 集成 `SecurityManager` 到推理 gRPC 服务（✅ 2026-09-01，`server.rs`）
 - [x] 集成 `EnhancedAndroidManager` 到 AndroidManager 服务（✅ 2026-09-01，`service.rs`）
-- [ ] 实现真实 GGML/llama.cpp 后端（现状：外部 `allama` 子进程 + 引擎缺失时回落 mock；无进程内 C 绑定，见 `docs/external-analysis-review.md`）
+- [x] 实现真实 GGML/llama.cpp 后端（✅ 部分 2026-09-04：外部 `allama` 子进程路径 + `AMOS_GGML_STRICT=1` 诚实报错开关已落地；进程内 C 绑定与厂商 NPU 运行时仍待真机 + SDK，见 `docs/qcom-mtk-bringup.md`）
 - [x] 实现 `monitoring.rs`（性能指标/健康检查，✅ 2026-09-03）
 - [ ] 连接池 `pool.rs`、缓存层 `cache.rs`
 - [x] 会话持久化（✅ 2026-09-01，`SessionManager` + `AMOS_SESSIONS_PATH`）

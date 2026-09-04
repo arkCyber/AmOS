@@ -32,6 +32,20 @@ pub mod amos_telephony {
     tonic::include_proto!("amos_telephony");
 }
 
+pub mod amos_sensor {
+    //! Generated types for the device-sensor service:
+    //! `sensor_client` (client), `sensor_server` (server), and messages/enums
+    //! (`CameraList`, `GnssReply`, `ImuReply`, `AcquireReply`, `SensorMode`, ...).
+    tonic::include_proto!("amos_sensor");
+}
+
+pub mod amos_governor {
+    //! Generated types for the resource-governor service:
+    //! `governor_client` (client), `governor_server` (server), and messages/enums
+    //! (`AppInfo`, `JobInfo`, `GovernorState`, `AppState`, `JobType`, ...).
+    tonic::include_proto!("amos_governor");
+}
+
 /// gRPC metadata header carrying the caller's client id.
 ///
 /// The System UI (Tauri core) sends this on every RPC so the daemon's security

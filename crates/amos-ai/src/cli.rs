@@ -64,7 +64,9 @@ ENV:
     AMOS_OLLAMA_HOST      Ollama server base URL (ollama backend, default http://localhost:11434)
     AMOS_OLLAMA_API_KEY   Bearer token for token-gated Ollama /v1 (optional)
     AMOS_HERMES_ENDPOINT  Hermes-Rust agent base URL (hermes backend, default http://127.0.0.1:11438)
-    AMOS_MODEL            Model id for api/ollama/hermes backends (default gpt-4o-mini / hermes3 / hermes-rust)
+    AMOS_MODEL            Model id for api/ollama/hermes backends; for ollama, omit to auto-select
+                          the first model the running Ollama reports installed
+                          (default gpt-4o-mini / hermes3 / hermes-rust)
     AMOS_SESSIONS_PATH    Persist agent sessions to a JSON file on shutdown
     AMOS_SESSION_TIMEOUT_SECS  Idle-session expiry (seconds, default 300)
     AMOS_METRICS_INTERVAL_SECS Health-metrics heartbeat interval (seconds, default 60)

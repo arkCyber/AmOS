@@ -87,6 +87,69 @@ message StatusReply {
   uint32 active_sessions = 5;            // number of live agent sessions
   int64 rpc_total = 6;                   // RPCs seen at the gRPC boundary (monitoring)
   int64 heartbeats = 7;                  // periodic self-health ticks emitted (monitoring)
+
+  // Operational truth (added 2026-09): what inference/ASR engine is actually
+  // serving right now, so a UI/operator never mistakes a degraded (mock) engine
+  // for real inference.
+  string engine = 8;                     // active inference engine kind: mock|api|ollama|hermes|ggml
+  string engine_model = 9;               // concrete model behind `engine` (empty for mock)
+  bool degraded = 10;                    // a real engine was requested but the daemon is serving mock
+  string asr = 11;                       // voice ASR backend in effect: mock|sherpa|off
+
+  // Inference performance / power profile (amos-profiling), added 2026-09-04.
+  // Present on every reply; consumers treat decode_runs == 0 as "no runs yet".
+  ProfileMetrics profile = 12;
+
+  // Energy-governor decision (amos-power), added 2026-09-04. Present on every
+  // reply once the periodic governor has ticked at least once; consumers treat
+  // ticks == 0 as "governor has not run yet".
+  EnergyPolicy energy = 13;
+
+  // Resource-governor (amos_ai::governor::ResourceGovernor) live decision, added
+  // 2026-09-04: what the daemon's energy→lifecycle→scheduler closed loop is doing
+  // (sensor mode + throttle/cap recommendations + tick count). mirrors the
+  // Governor service's GovernorDecision. ticks == 0 ⇒ not run yet.
+  GovernorMetrics governor = 14;
+
+  // Resolved device-acceleration target of the local inference path, added
+  // 2026-09-04 (amos_ai::accelerator): "<vendor>/<accel>", e.g. "android/nnapi" or
+  // "qualcomm/qnn" — reported ONLY when a local engine that uses it is serving
+  // (ggml). Empty otherwise, and never "auto" (always the concrete resolution).
+  // See docs/qcom-mtk-bringup.md. Consumers treat empty as "not applicable".
+  string accelerator = 15;
+}
+
+// Rolling decode-throughput + first-token latency measured by the daemon across
+// its stream_chat text turns (see amos-ai/src/profiler.rs). Honest labels:
+// decode_tokens_per_sec is end-to-end "generated tokens streamed to the client
+// per second" (includes backend/network latency); ttft_ms is the mean wall time
+// from a turn starting until its first token arrives.
+message ProfileMetrics {
+  double decode_tokens_per_sec = 1;      // 0 when decode_runs == 0
+  double ttft_ms = 2;                    // mean first-token latency; 0 when no runs
+  uint64 decode_tokens_total = 3;        // tokens streamed since daemon start
+  uint64 decode_runs = 4;                // completed stream_chat decode turns (>0 ⇒ data)
+}
+
+// Rolling energy-governor decision from amos-ai/src/energy.rs (amos-power). The
+// governor folds battery level / charger state / temperature / live power /
+// foreground-background usage (env-configured on a host, real HAL on-device) into
+// a recommended sensor mode + throttle flags each tick.
+message EnergyPolicy {
+  string sensor_mode = 1;                // performance | balanced | power_save
+  string reason = 2;                     // charging|healthy|power_draw|battery_low|… (see amos_power::Reason::key)
+  bool cap_inference = 3;                // governor recommends capping / deferring inference
+  bool throttle_background = 4;          // governor recommends deferring background work
+  uint64 ticks = 5;                      // periodic governor ticks so far (>0 ⇒ data)
+}
+
+// The daemon's ResourceGovernor live decision (energy → lifecycle → scheduler).
+message GovernorMetrics {
+  string sensor_mode = 1;                // performance | balanced | power_save
+  string reason = 2;                     // charging|healthy|battery_low|… (see amos_power::Reason::key)
+  bool cap_inference = 3;
+  bool throttle_background = 4;
+  uint64 ticks = 5;                      // governor observe ticks so far (>0 ⇒ it has run)
 }
 
 message ListSessionsRequest {}

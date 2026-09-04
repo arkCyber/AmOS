@@ -294,9 +294,13 @@ pub struct BundleResource {
 }
 
 /// Read a resource out of an installed web-bundle at `<root>/<id>/`. Free of
-/// Tauri so it can be unit-tested headlessly; path is sanitised by
-/// `amos_appstore::resolve_request` (refuses `..` / escapes).
+/// Tauri so it can be unit-tested headlessly; the `id` is validated as an app
+/// slug (so `..` etc. can't select a directory outside the root) and the `path`
+/// is sanitised by `amos_appstore::resolve_request` (refuses `..` / escapes).
 pub fn read_bundle_resource(root: &Path, id: &str, path: &str) -> Result<BundleResource, String> {
+    if !amos_appstore::is_valid_app_id(id) {
+        return Err(format!("invalid app id {id:?}"));
+    }
     let dir = root.join(id);
     let file = amos_appstore::resolve_request(&dir, path).map_err(|e| e.to_string())?;
     let bytes = std::fs::read(&file.path).map_err(|e| e.to_string())?;
@@ -304,6 +308,18 @@ pub fn read_bundle_resource(root: &Path, id: &str, path: &str) -> Result<BundleR
         mime: file.content_type.to_string(),
         nosniff: file.nosniff,
         base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+/// Read a resource addressed by an `amos-app://` URI (id + path validated by the
+/// store's `host` module). This is the future custom-protocol seam: a handler
+/// only needs to map the request URI here. Free of Tauri / unit-testable.
+pub fn read_bundle_uri(root: &Path, uri: &str) -> Result<BundleResource, String> {
+    let served = amos_appstore::serve_bundle(root, uri).map_err(|e| e.to_string())?;
+    Ok(BundleResource {
+        mime: served.content_type.to_string(),
+        nosniff: served.nosniff,
+        base64: base64::engine::general_purpose::STANDARD.encode(served.bytes),
     })
 }
 
@@ -319,6 +335,19 @@ pub fn appstore_bundle_resource(
         .web_install_dir()
         .ok_or_else(|| "no web install dir (set AMOS_APPSTORE_INSTALL_DIR)".to_string())?;
     read_bundle_resource(root, &id, &path)
+}
+
+/// Serve one resource addressed by an `amos-app://<id>/<path>` URI.
+#[tauri::command]
+pub fn appstore_bundle_uri(
+    state: State<'_, StoreBridge>,
+    uri: String,
+) -> Result<BundleResource, String> {
+    let root = state
+        .store
+        .web_install_dir()
+        .ok_or_else(|| "no web install dir (set AMOS_APPSTORE_INSTALL_DIR)".to_string())?;
+    read_bundle_uri(root, &uri)
 }
 
 #[cfg(test)]
@@ -443,6 +472,49 @@ mod tests {
         assert!(read_bundle_resource(&root, "org.amos.web", "../secret").is_err());
         assert!(read_bundle_resource(&root, "org.amos.web", "nope.js").is_err());
         assert!(read_bundle_resource(&root, "not-installed", "index.html").is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_bundle_resource_rejects_non_slug_ids_and_read_bundle_uri_serves() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "amos-appstore-bundle-uri-{}-{nonce}",
+            std::process::id()
+        ));
+        let dir = root.join("org.amos.web");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        let html = b"<html>via-uri</html>";
+        std::fs::write(dir.join("index.html"), html).unwrap();
+        std::fs::write(dir.join("assets/app.js"), b"console.log(1)").unwrap();
+
+        // id validation centralizes the netloc check (the old code did root.join(id)
+        // with no guard — `..` could select a directory outside the root).
+        for bad in ["..", "../secret", ".", "A b", "amos/evil"] {
+            assert!(
+                read_bundle_resource(&root, bad, "index.html").is_err(),
+                "id {bad:?} must be rejected"
+            );
+        }
+
+        // URI-addressed serving (the amos-app:// host seam) works end to end.
+        let entry = read_bundle_uri(&root, "amos-app://org.amos.web/").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&entry.base64)
+            .unwrap();
+        assert_eq!(decoded, html);
+
+        let js = read_bundle_uri(&root, "amos-app://org.amos.web/assets/app.js").unwrap();
+        assert_eq!(js.mime, "text/javascript; charset=utf-8");
+
+        // Invalid netloc / traversal / missing via the URI are clean errors.
+        assert!(read_bundle_uri(&root, "http://org.amos.web/").is_err());
+        assert!(read_bundle_uri(&root, "amos-app://../secret").is_err());
+        assert!(read_bundle_uri(&root, "amos-app://org.amos.web/../../etc").is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }

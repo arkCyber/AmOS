@@ -10,11 +10,16 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod accelerator;
 pub mod chat_asr;
 pub mod cli;
 pub mod config;
+pub mod energy;
+pub mod governor;
+pub mod governor_service;
 pub mod inference;
 pub mod monitoring;
+pub mod profiler;
 pub mod security;
 pub mod semantic;
 pub mod server;

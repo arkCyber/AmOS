@@ -5,7 +5,8 @@
       "program": "amos-ai",
       "args": ["--socket", "/tmp/amos-ai.sock"],
       "env": [
-        ["AMOS_BACKEND", "mock"],
+        ["AMOS_BACKEND", "ollama"],
+        ["AMOS_OLLAMA_HOST", "http://localhost:11434"],
         ["AMOS_SOCKET", "/tmp/amos-ai.sock"]
       ],
       "restart": { "max_restarts": 5, "backoff_secs": 1, "backoff_factor": 2 }

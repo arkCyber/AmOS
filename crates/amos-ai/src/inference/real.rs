@@ -9,7 +9,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::time::Duration;
+
+use crate::accelerator::AccelProfile;
 
 /// Context-map key carrying the client `session_id` so a backend with its own
 /// session lineage (e.g. Hermes-Rust) can bind multi-turn memory to it.
@@ -95,13 +98,29 @@ impl Default for BackendStats {
 pub struct GgmlBackend {
     model_path: std::path::PathBuf,
     metadata: BackendMetadata,
+    /// Resolved device-acceleration profile; drives GPU/NPU offload flags for a
+    /// llama.cpp-style engine (see [`crate::accelerator`]). Harmless (empty) for
+    /// the default `allama` runner, which manages its own offload.
+    accel: AccelProfile,
 }
 
 impl GgmlBackend {
-    /// Create a new GGML backend.
+    /// Create a new GGML backend using the environment-resolved accelerator
+    /// profile (`AMOS_ACCEL` / `AMOS_SOC_VENDOR` / `AMOS_GPU_LAYERS`).
     ///
     /// The model file should be in GGUF format (quantized or full precision).
     pub fn new(model_path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::with_accel(model_path, AccelProfile::from_env())
+    }
+
+    /// Create a GGML backend with an explicit accelerator profile. Tests and
+    /// callers that already resolved a profile use this; the daemon passes the
+    /// same [`AccelProfile::from_env`] it logs at startup so the *local engine
+    /// actually offloads* the way the accelerator domain resolved.
+    pub fn with_accel(
+        model_path: impl Into<std::path::PathBuf>,
+        accel: AccelProfile,
+    ) -> Result<Self> {
         let model_path = model_path.into();
 
         if !model_path.exists() {
@@ -125,6 +144,7 @@ impl GgmlBackend {
         Ok(Self {
             model_path,
             metadata,
+            accel,
         })
     }
 }
@@ -138,13 +158,16 @@ impl InferenceBackend for GgmlBackend {
         max_tokens: usize,
     ) -> Result<Box<dyn TokenStream>> {
         // Real local inference through an external llama.cpp-class engine (e.g.
-        // `allama`, which runs GGUF on Metal/CPU). Falls back to the mock token
-        // generator when no engine / model is available so offline tests & the
-        // browser path keep working.
-        let run_name = model_run_name(&self.model_path);
+        // `allama` on Metal/CPU, or a llama.cpp `llama-cli` pointed at by
+        // `AMOS_GGML_BIN` with the accelerator's offload args applied). Falls
+        // back to the mock token generator only when *permitted* (see
+        // `AMOS_GGML_STRICT`) and no engine/model is available.
+        let model_path = self.model_path.clone();
+        let run_name = model_run_name(&model_path);
+        let accel = self.accel;
         let prompt_owned = prompt.to_owned();
         let reply = tokio::task::spawn_blocking(move || {
-            run_external_engine(&run_name, &prompt_owned, max_tokens)
+            run_external_engine(&model_path, &run_name, &prompt_owned, max_tokens, accel)
         })
         .await
         .unwrap_or(None);
@@ -156,7 +179,24 @@ impl InferenceBackend for GgmlBackend {
                 }))
             }
             None => {
-                tracing::warn!(model = %self.model_path.display(), "ggml engine unavailable — using mock tokens");
+                // Default (dev/CI): warn and fall back to the deterministic mock
+                // so offline demos stay alive — the `[amos-ai]` signature makes it
+                // unmistakably mock. For a *real deployment*, the operator can set
+                // `AMOS_GGML_STRICT=1` so an unavailable engine is an honest error
+                // instead of a silent mock (never pretend mock is real inference).
+                if ggml_strict() {
+                    tracing::error!(
+                        model = %self.model_path.display(),
+                        "ggml engine unavailable and AMOS_GGML_STRICT=1 — refusing to \
+                         serve the deterministic mock as if it were real local inference"
+                    );
+                    return Err(anyhow!(
+                        "ggml engine unavailable for model '{}' (is AMOS_GGML_BIN on PATH \
+                         and the model staged?). AMOS_GGML_STRICT=1 forbids the mock fallback",
+                        self.model_path.display()
+                    ));
+                }
+                tracing::warn!(model = %self.model_path.display(), "ggml engine unavailable — using mock tokens (set AMOS_GGML_STRICT=1 to error instead)");
                 let tokens = crate::inference::mock_tokens(prompt);
                 Ok(Box::new(GgmlTokenStream {
                     tokens: tokens.into_iter(),
@@ -245,20 +285,40 @@ fn engine_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Run a one-shot completion through the engine: `allama run <name> -p <prompt>`.
+/// Strict mode: when `AMOS_GGML_STRICT=1`, an unavailable GGML engine/model is an
+/// honest error rather than a silent mock fallback (see [`GgmlBackend::infer`]).
+/// Default `false` keeps offline dev/CI/demos on the `[amos-ai]` mock.
+fn ggml_strict() -> bool {
+    matches!(
+        std::env::var("AMOS_GGML_STRICT").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Run a one-shot completion through the engine.
+///
+/// * Default engine `allama` → `allama run <run> -p <prompt> --nowordwrap`
+///   (`allama` manages its own GPU offload internally).
+/// * Any other `AMOS_GGML_BIN` (a llama.cpp-class CLI such as `llama-cli`) →
+///   `-m <model> -p <prompt> -n <max_tokens>` plus the accelerator profile's
+///   offload flags (see [`engine_offload_args`]).
+///
 /// Logs are silenced with `RUST_LOG=off` and proxy env vars are cleared so the
 /// request stays local. Returns `None` when the engine/model is unavailable.
-fn run_external_engine(run_name: &str, prompt: &str, _max_tokens: usize) -> Option<String> {
+fn run_external_engine(
+    model_path: &Path,
+    run_name: &str,
+    prompt: &str,
+    max_tokens: usize,
+    accel: AccelProfile,
+) -> Option<String> {
     if !engine_available() {
         return None;
     }
     let bin = std::env::var("AMOS_GGML_BIN").unwrap_or_else(|_| "allama".into());
-    let mut cmd = std::process::Command::new(bin);
-    cmd.arg("run")
-        .arg(run_name)
-        .arg("-p")
-        .arg(prompt)
-        .arg("--nowordwrap");
+    let argv = engine_argv(&bin, model_path, run_name, prompt, max_tokens, accel);
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(argv);
     cmd.env("RUST_LOG", "off");
     for p in [
         "ALL_PROXY",
@@ -280,6 +340,60 @@ fn run_external_engine(run_name: &str, prompt: &str, _max_tokens: usize) -> Opti
         None
     } else {
         Some(cleaned)
+    }
+}
+
+/// The full argument vector (args only, program name separate) to run one
+/// completion through the configured GGML engine. Exposed as a pure function so
+/// offload/flag construction is unit-testable without a real engine binary.
+///
+/// * `allama` (default) → `run <run> -p <prompt> --nowordwrap`.
+/// * otherwise (llama.cpp-class CLI) → `-m <model> -p <prompt> -n <max>`
+///   plus [`engine_offload_args`] from the accelerator profile.
+fn engine_argv(
+    bin: &str,
+    model_path: &Path,
+    run_name: &str,
+    prompt: &str,
+    max_tokens: usize,
+    accel: AccelProfile,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if bin.trim() == "allama" {
+        args.extend([
+            "run".to_string(),
+            run_name.to_string(),
+            "-p".to_string(),
+            prompt.to_string(),
+            "--nowordwrap".to_string(),
+        ]);
+    } else {
+        args.push("-m".to_string());
+        args.push(model_path.to_string_lossy().into_owned());
+        args.push("-p".to_string());
+        args.push(prompt.to_string());
+        if max_tokens > 0 {
+            args.push("-n".to_string());
+            args.push(max_tokens.to_string());
+        }
+        args.extend(engine_offload_args(bin, accel));
+    }
+    args
+}
+
+/// GPU/NPU offload flags for a llama.cpp-class engine, from the resolved
+/// accelerator profile. Returns an empty vector for the `allama` runner (it
+/// manages its own offload), or when the profile lands on CPU we explicitly
+/// emit `--n-gpu-layers 0` so a leftover host/GPU default can't sneak in.
+fn engine_offload_args(bin: &str, accel: AccelProfile) -> Vec<String> {
+    let b = bin.trim();
+    if b.is_empty() || b == "allama" {
+        return Vec::new();
+    }
+    if accel.effective() == crate::accelerator::Accel::Cpu {
+        vec!["--n-gpu-layers".to_string(), "0".to_string()]
+    } else {
+        accel.llama_args()
     }
 }
 
@@ -849,7 +963,10 @@ impl BackendKind {
     pub async fn build(&self) -> Result<Box<dyn InferenceBackend>> {
         match self {
             BackendKind::Ggml(path) => {
-                let backend = GgmlBackend::new(path)?;
+                // The daemon resolved + logged the accelerator profile at startup;
+                // hand the *same* profile to the local engine so GGML actually
+                // offloads (llama.cpp-class engine) the way the profile decided.
+                let backend = GgmlBackend::with_accel(path.clone(), AccelProfile::from_env())?;
                 backend.health_check().await?;
                 Ok(Box::new(backend))
             }
@@ -899,6 +1016,153 @@ mod tests {
             assert_eq!(meta.name, "ggml");
             assert!(meta.supports_streaming);
         }
+    }
+
+    #[tokio::test]
+    async fn ggml_strict_mode_errors_instead_of_silent_mock() {
+        // A file that exists but is not a servable GGUF can never be answered by a
+        // real engine, so in strict mode the daemon must surface an error — never
+        // the deterministic mock. This test is the only one to touch
+        // AMOS_GGML_STRICT, so it cannot race with a sibling.
+        std::env::set_var("AMOS_GGML_STRICT", "1");
+        assert!(ggml_strict());
+        let dir = std::env::temp_dir().join(format!("amos-ggml-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("not-a-gguf.gguf");
+        std::fs::write(&model, b"this is not a real GGUF model").unwrap();
+        let backend = GgmlBackend::new(&model).expect("model file exists");
+        let out = backend
+            .infer("hi", &std::collections::HashMap::new(), 8)
+            .await;
+        assert!(
+            out.is_err(),
+            "strict ggml must refuse to serve mock when the engine is unavailable"
+        );
+        // Permissive (default / AMOS_GGML_STRICT=0) must keep the mock fallback.
+        std::env::set_var("AMOS_GGML_STRICT", "0");
+        assert!(!ggml_strict());
+        let out = backend
+            .infer("hi", &std::collections::HashMap::new(), 8)
+            .await;
+        assert!(
+            out.is_ok(),
+            "permissive ggml falls back to mock, not an error"
+        );
+        std::env::remove_var("AMOS_GGML_STRICT");
+        assert!(
+            !ggml_strict(),
+            "absent strict env must default to permissive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deterministic profile (no global-env reads) for engine-argv tests.
+    fn profile(accel: crate::accelerator::Accel) -> AccelProfile {
+        AccelProfile {
+            vendor: crate::accelerator::SoCVendor::Host,
+            accel,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn allama_argv_keeps_its_run_shape() {
+        // `allama` manages its own offload; we must not inject llama.cpp flags.
+        let argv = engine_argv(
+            "allama",
+            Path::new("/m/q.gguf"),
+            "qwen2.5",
+            "hi",
+            16,
+            profile(crate::accelerator::Accel::Metal),
+        );
+        assert_eq!(
+            argv,
+            ["run", "qwen2.5", "-p", "hi", "--nowordwrap"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        // ...and offload args are empty for allama regardless of the profile.
+        assert!(
+            engine_offload_args("allama", profile(crate::accelerator::Accel::Metal)).is_empty()
+        );
+    }
+
+    #[test]
+    fn llamacpp_argv_carries_model_prompt_and_offload() {
+        let model = "/models/qwen2.5:0.5b.gguf";
+        let argv = engine_argv(
+            "llama-cli",
+            Path::new(model),
+            "qwen2.5",
+            "hello",
+            32,
+            profile(crate::accelerator::Accel::Vulkan),
+        );
+        // Positional prefix is llama.cpp-shaped.
+        assert_eq!(argv[0], "-m");
+        assert_eq!(argv[1], model);
+        let p = argv
+            .iter()
+            .position(|a| a.as_str() == "-p")
+            .expect("prompt flag present");
+        assert_eq!(argv[p + 1], "hello");
+        let n = argv
+            .iter()
+            .position(|a| a.as_str() == "-n")
+            .expect("max-tokens flag present");
+        assert_eq!(argv[n + 1], "32");
+        // The accelerator profile's offload made it into the real command line.
+        let pos = argv
+            .iter()
+            .position(|a| a.as_str() == "--n-gpu-layers")
+            .expect("llama.cpp offload switch present");
+        let layers = argv[pos + 1]
+            .parse::<u32>()
+            .expect("offload count is numeric");
+        assert!(layers > 0, "a non-CPU profile must offload (got {layers})");
+    }
+
+    #[test]
+    fn llamacpp_cpu_profile_explicitly_zeroes_offload() {
+        let argv = engine_argv(
+            "llama-cli",
+            Path::new("/m/q.gguf"),
+            "qwen",
+            "hi",
+            8,
+            profile(crate::accelerator::Accel::Cpu),
+        );
+        let pos = argv
+            .iter()
+            .position(|a| a.as_str() == "--n-gpu-layers")
+            .expect("CPU profile still emits the offload switch");
+        assert_eq!(
+            argv[pos + 1],
+            "0",
+            "CPU must explicitly cap offload at zero: {argv:?}"
+        );
+        assert_eq!(
+            engine_offload_args("llama-cli", profile(crate::accelerator::Accel::Cpu)),
+            vec!["--n-gpu-layers".to_string(), "0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn with_accel_preserves_default_constructor_behaviour() {
+        // `with_accel` requires a real file (like `new`); the strict/fallback
+        // contract is unchanged when the profile is threaded through.
+        let dir = std::env::temp_dir().join(format!("amos-ggml-accel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.gguf");
+        std::fs::write(&model, b"not really a gguf").unwrap();
+        let cpu = profile(crate::accelerator::Accel::Cpu);
+        let backend = GgmlBackend::with_accel(&model, cpu).expect("file exists");
+        assert_eq!(backend.metadata().name, "ggml");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

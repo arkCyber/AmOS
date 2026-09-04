@@ -8,6 +8,8 @@ import CameraApp from "../components/CameraApp";
 import { MessagesApp, PhoneApp, MusicApp } from "../components/CommsApps";
 import { AiApp, InterpApp } from "../components/BackendApps";
 import MailApp from "../components/MailApp";
+import RemindersApp from "../components/RemindersApp";
+import VoiceMemosApp from "../components/VoiceMemosApp";
 
 const wrap = (el: ReactNode) => <I18nProvider>{el}</I18nProvider>;
 
@@ -22,6 +24,8 @@ describe("app SSR mount smoke", () => {
     ["ai", <AiApp />, "🤖"],
     ["interpreter", <InterpApp />, "🌐"],
     ["mail", <MailApp />, "已发送"],
+    ["reminders", <RemindersApp />, "新提醒事项"],
+    ["vmemos", <VoiceMemosApp />, "轻点红点开始录音"],
   ];
   for (const [name, el, marker] of cases) {
     test(`${name} renders without throwing`, () => {

@@ -18,6 +18,7 @@ pub mod buttons;
 pub mod interpret;
 pub mod mail;
 pub mod radio;
+pub mod sensors;
 pub mod store;
 pub mod telephony;
 pub mod translate;
@@ -119,6 +120,7 @@ pub fn run() {
             appstore::appstore_upgrade,
             appstore::appstore_uninstall,
             appstore::appstore_bundle_resource,
+            appstore::appstore_bundle_uri,
             telephony::telephony_dial,
             telephony::telephony_end,
             telephony::telephony_status,
@@ -127,7 +129,10 @@ pub fn run() {
             telephony::telephony_start_recording,
             telephony::telephony_stop_recording,
             radio::radio_status,
-            radio::radio_set
+            radio::radio_set,
+            sensors::sensor_snapshot,
+            sensors::sensor_set_mode,
+            sensors::sensor_acquire
         ])
         .setup(|app| {
             // System-wide readiness probe: log the daemon status once on boot.

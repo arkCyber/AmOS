@@ -294,6 +294,17 @@ pub struct DaemonStatus {
     pub uptime_seconds: i64,
     pub gpu_util: u32,
     pub active_sessions: u32,
+    /// Active inference engine kind (mock|api|ollama|hermes|ggml).
+    pub engine: String,
+    /// Concrete model behind `engine` (empty for mock).
+    pub engine_model: String,
+    /// True when a real engine was requested but the daemon serves mock.
+    pub degraded: bool,
+    /// Voice ASR recognizer in effect (mock|sherpa|off).
+    pub asr: String,
+    /// Resolved device-acceleration target of the local GGML engine, e.g.
+    /// "android/nnapi" (empty when a non-local engine is serving).
+    pub accelerator: String,
 }
 
 /// Serializable mirror of the daemon `SessionInfo` so the frontend can render a
@@ -412,6 +423,11 @@ pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, String> {
                     uptime_seconds: r.uptime_seconds,
                     gpu_util: r.gpu_util,
                     active_sessions: r.active_sessions,
+                    engine: r.engine,
+                    engine_model: r.engine_model,
+                    degraded: r.degraded,
+                    asr: r.asr,
+                    accelerator: r.accelerator,
                 });
             }
             Err(e) => {

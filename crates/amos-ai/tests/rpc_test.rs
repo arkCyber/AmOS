@@ -178,3 +178,83 @@ async fn get_status_exposes_live_monitoring_metrics() {
     server.abort();
     let _ = std::fs::remove_file(&path);
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn sensor_service_mounted_and_profile_exposed() {
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-profile-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    wait_for_socket(&path).await;
+
+    // Build a raw channel once, then split it into the two service clients that
+    // share the daemon's single UDS (AiAgent + Sensor).
+    let owned = path.clone();
+    let endpoint = Endpoint::try_from("http://[::1]:50051").unwrap();
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let path = owned.clone();
+            async move {
+                let stream = UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+        .expect("connect channel");
+
+    let mut ai = AiAgentClient::new(channel.clone());
+    let mut sensor = amos_proto::amos_sensor::sensor_client::SensorClient::new(channel);
+
+    // Profile starts empty (present on the wire, no runs yet).
+    let s0 = ai
+        .get_status(StatusRequest {})
+        .await
+        .expect("get_status #0")
+        .into_inner();
+    let p0 = s0.profile.expect("profile field present");
+    assert_eq!(p0.decode_runs, 0, "no decode turns before any chat");
+
+    // The sensor service is mounted on the same socket and answers.
+    let cameras = sensor
+        .list_cameras(amos_proto::amos_sensor::Empty {})
+        .await
+        .expect("sensor list_cameras over the shared UDS")
+        .into_inner();
+    assert!(!cameras.cameras.is_empty(), "mock reports cameras");
+
+    // Run one stream_chat turn to completion so decode profiling fires.
+    let mut stream = ai
+        .stream_chat(AgentRequest {
+            session_id: "profile-session".into(),
+            prompt: "ping".into(),
+            context: Default::default(),
+        })
+        .await
+        .expect("stream_chat")
+        .into_inner();
+    while let Ok(Some(chunk)) = stream.message().await {
+        if chunk.done {
+            break;
+        }
+    }
+
+    // After the turn the daemon reports the decode run + tokens.
+    let s1 = ai
+        .get_status(StatusRequest {})
+        .await
+        .expect("get_status #1")
+        .into_inner();
+    let p1 = s1.profile.expect("profile field present");
+    assert!(
+        p1.decode_runs >= 1,
+        "decode turn recorded (runs={})",
+        p1.decode_runs
+    );
+    assert!(p1.decode_tokens_total > 0, "tokens counted after a turn");
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}

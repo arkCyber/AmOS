@@ -39,12 +39,17 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 | `amos-tts` | text-to-speech: `TtsProvider` trait (Mock + gated Piper) -> playable `TtsAudio` |
 | `amos-appstore` | app-store domain core: `AppManifest` catalog + `Version`, sha256 integrity, Ed25519 publisher signing, `AppStore` engine (download→verify→install/upgrade/uninstall) over a pluggable `StoreProvider` (Mock default; `live` feature adds a real HTTP backend) |
 | `amos-appstore-cli` | headless app-store CLI (demo/catalog/search/install/upgrade/uninstall/status) driving the same engine, mirroring `amos-mail-cli` |
+| `amos-power` | battery/thermal/foreground-aware energy-governor domain core: folds `amos-sensor` `SensorMode` + `amos-profiling` `PowerSource` into a deterministic `SensorMode` decision (low-battery / thermal / power-draw / charging hysteresis) and applies it to a `SensorManager` (`docs/power-policy.md`) |
+| `amos-applife` | app/process lifecycle domain core: per-app `Foreground/Visible/ForegroundService/Background/Cached(tombstone)/Stopped` state ladder + LRU ordering + a deterministic memory-pressure reclaim (LMK-proxy) victim selector (`docs/app-lifecycle.md`) |
+| `amos-scheduler` | background-task scheduler + wakeup-alignment domain core: `AlarmExact` vs `Deferred` jobs with `[earliest,latest]` windows, Doze/charging/maintenance-window gating for deferred work, coalesced due-batching (fewer wakes) and next-wake computation (`docs/scheduler.md`) |
 
 ## RPC contract (`proto/`)
 
 * `ai_agent.proto`: `StreamChat` (server-streaming tokens), `Chat` (bidi),
   `GetStatus`.
 * `android_compat.proto`: `LaunchAndroidApp`, `GetInstalledApps`, `GetAppIcon`.
+* `governor.proto` (`amos_governor`): `RegisterApp`, `MoveApp`, `UnregisterApp`,
+  `ScheduleJob`, `GetState` — drive the daemon's `ResourceGovernor` closed loop.
 
 `amos-ai` serves both services on one UDS; `amos-tauri` uses one cached channel
 for both clients.

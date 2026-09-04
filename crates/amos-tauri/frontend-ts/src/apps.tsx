@@ -7,8 +7,10 @@ import CameraApp from "./components/CameraApp";
 import { AiApp, InterpApp } from "./components/BackendApps";
 import MailApp from "./components/MailApp";
 import StoreApp from "./components/StoreApp";
+import RemindersApp from "./components/RemindersApp";
 import PermissionsApp from "./components/PermissionsApp";
 import ContactsApp from "./components/ContactsApp";
+import VoiceMemosApp from "./components/VoiceMemosApp";
 import ExtApp from "./components/ExtApp";
 import { isExtId } from "./lib/storeApps";
 import type { MessageKey } from "./i18n/locales/zh";
@@ -18,14 +20,17 @@ import Segmented from "./components/Segmented";
 import { GROUP, ROW, LABEL, SUB, FIELD, Switch, chip, btn } from "./components/ui";
 import { WallpaperCard } from "./components/Wallpaper";
 import LockSettings from "./components/LockSettings";
+import SensorPanel from "./components/SensorPanel";
 import { SETTINGS_KEY, BACKUP_KEY, SYNC_STORES, readCloud, setCloudPrefs, snapshotStores, type CloudPrefs } from "./lib/cloud";
 import { readAiConfig, setAiConfig, DEEPSEEK_MODEL, DEEPSEEK_ENDPOINT, type AiProviderId } from "./lib/providers";
+import { describeEngine, type EngineView } from "./lib/aiEngine";
 import type { Locale } from "./i18n/types";
 import { addHistory, calcDisplay, calcEntry, calcFromKey, calcInit, calcPress, ERR } from "./lib/calculator";
 import { zoneClock, stopwatchInit, stopwatchReducer, fmtStopwatch, timerInit, timerReducer, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, defaultWorldCities, lapDeltas, fastestLap, type WorldCity } from "./lib/time";
 import { readStoreValue, writeStoreValue } from "./lib/amosStore";
 import { bridged, getAiStatus, switchAiBackend } from "./lib/backend";
 import { NOTES_KEY, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, fmtTime, normalizeNotes, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeAllTasks, noteListProgress, fmtInline, type Note } from "./lib/notes";
+import { noteTitle, notePreview, noteDayOf } from "./lib/notes";
 import { forecast, dayLabel, displayTemp, convertRange, adjustForecast, WEATHER_CITIES, normalizeWeatherCities, removeWeatherCity, addWeatherCity, type TempUnit, type WCity } from "./lib/weather";
 import {
   PHOTOS_KEY,
@@ -56,6 +61,8 @@ export const APPS: AppMeta[] = [
   { id: "calculator", titleKey: "app.calculator", icon: "🧮" },
   { id: "weather", titleKey: "app.weather", icon: "🌤️" },
   { id: "notes", titleKey: "app.notes", icon: "📝" },
+  { id: "reminders", titleKey: "app.reminders", icon: "✅" },
+  { id: "vmemos", titleKey: "app.vmemos", icon: "🎙️" },
   { id: "photos", titleKey: "app.photos", icon: "🖼️" },
   { id: "files", titleKey: "app.files", icon: "📁" },
   { id: "android", titleKey: "app.android", icon: "🤖" },
@@ -506,12 +513,22 @@ const Settings: FC = () => {
   }));
   const [aiMsg, setAiMsg] = useState("");
   const [aiLive, setAiLive] = useState<string | null>(null);
+  // Truthful engine/ASR snapshot from get_status (engine + degraded + asr).
+  const [aiView, setAiView] = useState<EngineView>({
+    engine: "",
+    engine_model: "",
+    degraded: false,
+    asr: "",
+    accelerator: "",
+    profile: null,
+  });
   // Show the *actual* model the daemon is serving right now (real get_status).
   useEffect(() => {
     if (!bridged()) return;
     getAiStatus().then((s) => {
       const m = s?.model && s.model.trim() ? s.model : "offline";
       setAiLive(m);
+      setAiView(describeEngine(s));
     });
   }, []);
   const pickProvider = (provider: AiProviderId) =>
@@ -528,6 +545,7 @@ const Settings: FC = () => {
         void getAiStatus().then((s) => {
           const m = s?.model && s.model.trim() ? s.model : "offline";
           setAiLive(m);
+          setAiView(describeEngine(s));
         });
       });
     } else {
@@ -636,8 +654,47 @@ const Settings: FC = () => {
           </p>
         )}
         <p className="mt-1 text-[11px] opacity-60">{t("settings.aiCurrent", { model: aiLive ?? "—" })}</p>
+        {aiView.engine && (
+          <p className="mt-0.5 text-[11px] opacity-70">
+            {aiView.engine === "mock"
+              ? t("settings.aiMockEngine")
+              : t("settings.aiRealEngine", {
+                  engine: aiView.engine,
+                  model: aiView.engine_model || aiView.engine,
+                })}
+          </p>
+        )}
+        {aiView.asr && (
+          <p className="text-[11px] opacity-60">{t("settings.aiAsr", { asr: aiView.asr })}</p>
+        )}
+        {aiView.accelerator && (
+          <p className="text-[11px] opacity-60">{t("settings.aiAccel", { accel: aiView.accelerator })}</p>
+        )}
+        {aiView.degraded && (
+          <p
+            role="alert"
+            className="mt-2 rounded-md bg-red-500/15 px-2 py-1 text-[11px] font-medium text-red-700 dark:text-red-300"
+          >
+            {t("settings.aiDegraded")}
+          </p>
+        )}
+        {aiView.profile && aiView.profile.decode_runs > 0 && (
+          <div className="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+            <span className="font-medium opacity-70">{t("settings.aiProfile")}</span>
+            <span className="ml-2">
+              {t("settings.aiProfileTps", { v: aiView.profile.decode_tokens_per_sec.toFixed(1) })}
+            </span>
+            <span className="ml-2">
+              {t("settings.aiProfileTtft", { v: aiView.profile.ttft_ms.toFixed(0) })}
+            </span>
+            <span className="ml-2">
+              {t("settings.aiProfileTokens", { v: String(aiView.profile.decode_tokens_total) })}
+            </span>
+          </div>
+        )}
       </section>
 
+      <SensorPanel />
       <WallpaperCard />
       <LockSettings />
       <p className="px-1 text-xs opacity-50">mode={mode} · dark={String(dark)} · locale={locale}</p>
@@ -887,7 +944,10 @@ const Notes: FC = () => {
   const add = () => {
     const v = text.trim();
     if (!v) return;
-    persist(prependNote(notes, v, Date.now()));
+    const now = Date.now();
+    const next = prependNote(notes, v, now);
+    persist(next);
+    setOpenId(next[0]?.id ?? null); // reveal the freshly added note (iOS list → detail)
     setText("");
   };
   // Edit existing note: one note at a time, saves bump ts; blank/cancel reverts.
@@ -910,6 +970,9 @@ const Notes: FC = () => {
   const editTasks = tasksOf(editVal);
   const [mode, setMode] = useState<"all" | "archived" | "trash">("all");
   const [searchQ, setSearchQ] = useState("");
+  // Which note is expanded (its full body/editor is shown). Task lists & the
+  // note being edited stay expanded so checklists are always actionable.
+  const [openId, setOpenId] = useState<string | null>(null);
   const active = orderPinned(searchNotes(notesOf(notes, undefined), mode === "all" ? searchQ : ""));
   const archived = notesOf(notes, "archived");
   const trashed = notesOf(notes, "trash");
@@ -932,6 +995,53 @@ const Notes: FC = () => {
       {label} ({count})
     </button>
   );
+  /** True when a note should render as a compact (collapsed) iOS-style row:
+   *  plain notes that aren't open or being edited. Checklist notes stay open so
+   *  their boxes are actionable. */
+  const collapsed = (n: Note) => !editingThis(n.id) && openId !== n.id && tasksOf(n.text).length === 0;
+  /** iOS-style collapsed list row: bold title, preview snippet, relative time,
+   *  plus pin / checklist markers. Tapping expands the full body. */
+  const noteRow = (n: Note) => {
+    const dd = noteDayOf(n.ts, Date.now());
+    const dt = new Date(n.ts);
+    const stamp =
+      dd === 0
+        ? fmtTime(n.ts)
+        : dd === -1
+          ? t("note.yesterday")
+          : dt.getFullYear() === new Date().getFullYear()
+            ? `${dt.getMonth() + 1}/${dt.getDate()}`
+            : `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()}`;
+    const title = noteTitle(n.text);
+    const prev = notePreview(n.text);
+    const sum = taskSummary(n.text);
+    return (
+      <button
+        key={n.id}
+        onClick={() => setOpenId(n.id)}
+        className="block w-full rounded-2xl bg-white/60 p-3 text-left shadow-sm ring-1 ring-black/5 transition active:bg-white/80 dark:bg-white/[0.06] dark:ring-white/10"
+      >
+        <div className="flex items-start justify-between gap-2">
+          <span className="truncate text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">
+            {title || t("note.untitled")}
+          </span>
+          <span className="shrink-0 pt-0.5 text-[10px] text-neutral-500">{stamp}</span>
+        </div>
+        {prev && (
+          <p className="mt-0.5 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">{prev}</p>
+        )}
+        <div className="mt-1 flex items-center gap-2 text-[10px] text-neutral-500">
+          {mode === "all" && n.pinned && <span className="text-amber-500">📌</span>}
+          {sum.total > 0 && (
+            <span className="text-accent">
+              ☑ {sum.done}/{sum.total}
+            </span>
+          )}
+          <span className="ml-auto text-accent">{t("note.open")}</span>
+        </div>
+      </button>
+    );
+  };
   return (
     <div className="p-4">
       <textarea
@@ -975,8 +1085,21 @@ const Notes: FC = () => {
         {view.length === 0 ? (
           <p className="py-6 text-center text-sm opacity-60">{t("note.empty")}</p>
         ) : (
-          view.map((n) => (
+          view.map((n) => {
+            if (collapsed(n)) return noteRow(n);
+            return (
             <div key={n.id} className="rounded-2xl bg-white/60 p-3 shadow-sm ring-1 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10">
+              {!editingThis(n.id) && !collapsed(n) && tasksOf(n.text).length === 0 && (
+                <div className="mb-1 flex justify-end">
+                  <button
+                    onClick={() => setOpenId(null)}
+                    className="text-[11px] text-accent"
+                    aria-label={t("note.collapse")}
+                  >
+                    ⌃ {t("note.collapse")}
+                  </button>
+                </div>
+              )}
               {editingThis(n.id) ? (
                 <>
                   <textarea
@@ -1138,7 +1261,8 @@ const Notes: FC = () => {
                 </>
               )}
             </div>
-          ))
+            );
+          })
         )}
       </div>
     </div>
@@ -1417,6 +1541,8 @@ const COMPONENTS: Record<string, FC> = {
   calculator: Calculator,
   weather: Weather,
   notes: Notes,
+  reminders: RemindersApp,
+  vmemos: VoiceMemosApp,
   photos: Photos,
   files: FilesApp,
   android: AndroidApp,

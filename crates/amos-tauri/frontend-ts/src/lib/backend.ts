@@ -70,7 +70,20 @@ export async function subscribe(channel: string, onEvent: (payload: unknown) => 
   }
 }
 
-export type AiStatus = { model?: string; active_sessions?: number } | null;
+export type AiStatus = {
+  model?: string;
+  active_sessions?: number;
+  /** Active inference engine kind: mock|api|ollama|hermes|ggml. */
+  engine?: string;
+  /** Concrete model behind `engine` (empty when mock). */
+  engine_model?: string;
+  /** True when a real engine was requested but the daemon is serving mock. */
+  degraded?: boolean;
+  /** Voice ASR backend in effect: mock|sherpa|off. */
+  asr?: string;
+  /** Resolved device-acceleration target of a local engine ("" when remote/mock). */
+  accelerator?: string;
+} | null;
 
 /** Probe the AI daemon via the same get_status the legacy AI app uses. */
 export async function getAiStatus(): Promise<AiStatus> {
@@ -597,6 +610,11 @@ export async function storeBundleResource(
   path: string,
 ): Promise<BundleResource | null> {
   return invoke<BundleResource>("appstore_bundle_resource", { id, path });
+}
+
+/** One file of an installed web-bundle addressed as an `amos-app://` URI. */
+export async function storeBundleUri(uri: string): Promise<BundleResource | null> {
+  return invoke<BundleResource>("appstore_bundle_uri", { uri });
 }
 
 

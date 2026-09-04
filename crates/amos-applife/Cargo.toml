@@ -1,0 +1,14 @@
+[package]
+name = "amos-applife"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos app/process lifecycle domain core: a pure-std registry + state machine for per-app foreground/visible/foreground-service/background/cached(tombstone)/stopped states with importance ranking, LRU ordering and a memory-pressure reclaim (LMK-proxy) victim selector. Design: docs/app-lifecycle.md."
+
+[lib]
+name = "amos_applife"
+path = "src/lib.rs"
+
+[dependencies]
+# None — this is a pure `std` domain core (transport/platform-agnostic, offline-testable).

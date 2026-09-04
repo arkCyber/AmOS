@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DEEPSEEK_ENDPOINT,
   DEEPSEEK_MODEL,
+  LOCAL_OLLAMA_HOST,
   readAiConfig,
   setAiConfig,
   envFor,
@@ -38,8 +39,12 @@ describe("AI provider config", () => {
     expect("aiModel" in local).toBe(false);
   });
 
-  test("envFor maps local → mock and deepseek → api + endpoint/model/key", () => {
-    expect(envFor({ provider: "local" })).toEqual({ AMOS_BACKEND: "mock" });
+  test("envFor maps local → real Ollama and deepseek → api + endpoint/model/key", () => {
+    // "Local" prefers a real on-device Ollama engine (never a silent mock).
+    expect(envFor({ provider: "local" })).toEqual({
+      AMOS_BACKEND: "ollama",
+      AMOS_OLLAMA_HOST: LOCAL_OLLAMA_HOST,
+    });
     const ds = envFor({
       provider: "deepseek",
       model: DEEPSEEK_MODEL,

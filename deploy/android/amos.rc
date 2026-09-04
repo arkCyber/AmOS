@@ -24,12 +24,28 @@ on property:sys.boot_completed=1
 # - `oneshot` is NOT set: it is a long-running server and init restarts it if
 #   it dies (default restart behavior for class main services).
 # - `oom_score_adj` is lowered so the OS never kills the inference core.
+#
+# Production engine env (kept honest end-to-end):
+#   * AMOS_BACKEND=ollama + AMOS_OLLAMA_HOST → real on-device inference via a
+#     local Ollama engine. AMOS_MODEL is intentionally NOT pinned so the daemon
+#     auto-selects the first installed *chat* model. If no Ollama is reachable the
+#     daemon truthfully serves the deterministic mock and reports `degraded=true`
+#     in get_status (the UI shows the red warning) instead of pretending.
+#   * AMOS_ASR_BACKEND=sherpa + AMOS_SHERPA_MODEL_DIR → real on-device streaming
+#     ASR for the bidi voice channel. Requires the binary to be built with the
+#     `asr-sherpa` feature and the sherpa model files present under
+#     AMOS_SHERPA_MODEL_DIR (push them with scripts/build-android.sh). If either
+#     is missing the daemon reports the honest "voice not configured" state.
 service amos-ai /system/bin/amos-ai --socket /data/amos/ai.sock
     class main
     user root
     group root system
     seclabel u:r:system_app:s0
     setenv AMOS_SOCKET /data/amos/ai.sock
+    setenv AMOS_BACKEND ollama
+    setenv AMOS_OLLAMA_HOST http://localhost:11434
+    setenv AMOS_ASR_BACKEND sherpa
+    setenv AMOS_SHERPA_MODEL_DIR /data/amos/sherpa
     oom_score_adj -1000
 
 # Optional: restart policy — init restarts crashed services automatically for

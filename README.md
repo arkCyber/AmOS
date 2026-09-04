@@ -49,6 +49,11 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-timesync-cli/        # query/sync the calibrated clock (now/status/sync over the shared state file)
     ├── amos-telephony/           # telephony domain core + gRPC service: Number/EmergencyMap, CallSession state machine, TelephonyProvider seams + Mock (docs/telephony.md)
     ├── amos-radio/               # radio/connectivity domain core: wifi/bluetooth/airplane state + RadioProvider seams (Mock / android JNI) + RadioManager airplane policy (docs/radio.md)
+    ├── amos-sensor/              # device-sensor domain core: camera / GPS-GNSS / IMU spec types + SensorProvider seam (Mock / Android `android`-gated: GNSS real via LocationManager) + energy-policy SensorManager (docs/sensors.md)
+    ├── amos-profiling/           # inference performance & power-profiling domain core: prompt/decode tokens-per-second + TTFT + per-token latency, PowerSource seam (Mock / Android `android`-gated battery) + energy estimate (docs/profiling.md)
+    ├── amos-power/               # energy-governor domain core: folds battery/thermal/live-power/foreground-background into a SensorMode decision + applies it to SensorManager (docs/power-policy.md)
+    ├── amos-applife/             # app/process lifecycle domain core: per-app foreground/background/tombstone states + LRU + memory-pressure reclaim (LMK-proxy) (docs/app-lifecycle.md)
+    ├── amos-scheduler/           # background-task scheduler + wakeup-alignment domain core: AlarmExact vs Deferred jobs, Doze/charging/maintenance-window gating + coalesced due-batching + next-wake (docs/scheduler.md)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -95,7 +100,9 @@ Single-command controls for the local ↔ cloud (DeepSeek) inference + translate
 
 ```bash
 # One-click switch AI backend and persist the choice (0600 key file on cloud).
-scripts/ai-backend.sh local                          # local deterministic mock
+scripts/ai-backend.sh local                          # real local Ollama (auto model); mock only if offline
+scripts/ai-backend.sh mock                           # force deterministic mock (dev/offline)
+scripts/ai-backend.sh ollama                         # force the real local Ollama engine
 scripts/ai-backend.sh deepseek "$AMOS_API_KEY"       # DeepSeek cloud (api)
 scripts/ai-backend.sh                                # resume last persisted choice
 
@@ -111,6 +118,11 @@ scripts/supervise-backends.sh
 
 # RPC readiness probe: both daemons must answer get_status running=true.
 make health
+
+# Honesty smoke: prove get_status truthfully reports the active engine/degraded
+# state (mock=not-degraded; requested-but-unreachable real engine=degraded; ollama
+# follows reachability). No GUI / no device.
+make honesty-smoke
 
 # Secrets: cloud keys are stored (0600) at ~/.amos/ai.key, never in the UI store
 # or repo. Provide new keys via AMOS_API_KEY / the switch command; rotate leaked
@@ -138,7 +150,8 @@ cargo build --release
 The daemon routes generation through a pluggable backend selected by `AMOS_BACKEND`:
 
 ```bash
-# Mock (default) — deterministic, no network, for dev/tests
+# Mock (dev/test default) — deterministic, no network. The *runtime* default
+# (scripts/run-backends.sh / ai-backend.sh local) prefers a real local Ollama.
 AMOS_BACKEND=mock cargo run -p amos-ai
 
 # Real external API (OpenAI-compatible, streaming over SSE)
@@ -148,10 +161,12 @@ AMOS_BACKEND=api \
   AMOS_MODEL=gpt-4o-mini \
   cargo run -p amos-ai
 
-# Local Ollama (Hermes / any pulled model) — keyless, streaming, function-calling ready
+# Local Ollama (any pulled model) — keyless, streaming, function-calling ready.
+# Omit AMOS_MODEL to auto-select the first *chat* model Ollama reports installed
+# (embedding models are skipped). Add AMOS_OLLAMA_API_KEY if your Ollama /v1 is
+# token-gated.
 AMOS_BACKEND=ollama \
   AMOS_OLLAMA_HOST=http://localhost:11434 \
-  AMOS_MODEL=hermes3 \
   cargo run -p amos-ai
 
 # Hermes-Rust agent (which itself calls Ollama) — real token streaming + tools
@@ -164,7 +179,13 @@ AMOS_BACKEND=hermes \
 AMOS_BACKEND=ggml AMOS_MODEL_PATH=/path/to/model.gguf cargo run -p amos-ai
 ```
 
-Unrecognized / failing backend selections fall back to mock so the daemon always boots.
+When an explicitly-requested real backend (`api`/`ollama`/`hermes`/`ggml`) cannot
+initialise (unreachable server, missing model, bad key), the daemon logs an
+**error** and serves the deterministic mock so the System UI and health probes
+stay up — it never silently pretends mock output is real inference. `mock` is a
+dev/test default only; the runtime boot path (`run-backends.sh`, `ai-backend.sh
+local`, `supervise-backends.sh`) prefers a real local Ollama and uses mock only
+as the offline/dev fallback.
 
 ## RPC contract (`proto/ai_agent.proto`)
 
@@ -218,11 +239,21 @@ home indicator returns to the launcher. The **AI 助手** app drives the real
 events → streaming tokens + semantic UiCards), same spirit as the single-view chat.
 
 Each app is a React component registered in `APPS` (apps.tsx). Functionality
-included: calculator, clock, notes, messages, settings (persisted), photos,
+included: calculator, clock, **notes** (iOS-style list rows — bold title +
+preview snippet + relative time, checklist & pin markers, expand/collapse),
+**提醒事项 Reminders** (smart lists 全部/今天/计划/旗标/已完成, colour-coded
+custom lists, per-list 已完成 group, in-app search, OS-level due-time
+notifications on any screen), **语音备忘录 Voice Memos** (record/play/rename/
+delete with live clock; recorded audio stored as a **binary Blob** in IndexedDB —
+codec-compressed, no base64 inflation), messages, settings (persisted), photos,
 dialer (real calls: dial → talk → **record** → hang up, plus an incoming-call
 surface), music player, weather, maps, files, camera, android, AI, 同传, and an
 **App Store** (`store` — browse the catalog and install/update/uninstall apps,
 see `docs/appstore.md`).
+
+A few first-party apps (Reminders ✅-style, Voice Memos, Notes) render **bespoke
+Apple-inspired tile icons** (`AppIcon.tsx` `isBespokeTile`) instead of the generic
+emoji-on-gradient tile; every other app keeps the uniform tonal face.
 
 ### Home screen editing (iOS style)
 
@@ -288,6 +319,8 @@ make check         # fast React/TS check (bun test + typecheck)
 - **Radio / connectivity**: quick-settings Wi‑Fi / Bluetooth / Airplane now go through a real policy layer — `crates/amos-radio` (`RadioManager` airplane cascade + guard, `MockRadioProvider`; Android `AndroidRadioProvider` behind the `android` feature, wired into `amos-tauri` via `RadioBridge::from_android`) — persisted `amos.settings`, status-bar indicators, and `scripts/build-android.sh` cross-compiles `amos-radio --features android`. See `docs/radio.md`.
 - **Phone contacts / 通讯录 + call history**: a `contacts` app (👥) with `lib/contacts.ts` (validation, favorites, search by name/number, duplicate guard incl. `+CC`/bare, first-letter groups, colored avatars, number→name lookup) and `lib/calllog.ts` (recent/frequent outgoing calls). Successful bridged calls are recorded, raise a phone notification, and surface "Frequent ⭐"/"Recent" quick-dial strips.
 - **Notifications & Do-Not-Disturb**: arrival banner (`NotificationBanner`, tap-to-acknowledge), ring/vibrate sound policy (`lib/sound.ts`) with Web-Audio chime + `navigator.vibrate`, DND that hides badges/banners, live unread bell/dock badges, and a reactive cross-window store (`useStoreValue` + authoritative `store-updated`).
+- **提醒事项 Reminders + Voice Memos + Notes iOS alignment (`frontend-ts`)**: three first-party apps/refinements benchmarked against iOS — a full **Reminders** app (smart lists, colour-coded custom lists, per-list 已完成, in-app search, one-tap complete-all, past-due snooze, plus an **OS-wide due-time notifier** mounted in the Shell that fires once per reached reminder on any screen using idempotent persisted `amos.reminderFired` markers); a **Voice Memos** recorder whose audio is stored as a **binary Blob** in a MediaStore (IndexedDB in the shell, in-memory fallback) — codec-compressed (Opus), no base64 inflation — with real IndexedDB (`fake-indexeddb`) and end-to-end `fake-mic → recorder → store → read-back` tests; and **Notes** given iOS-style list rows (title + preview + relative time, checklist/pin markers, expand/collapse). Reminders / Voice Memos / Notes also get **bespoke Apple-inspired tile icons** (`AppIcon.isBespokeTile`).
+- **Notes iOS-style list (`frontend-ts`)**: pure helpers `noteTitle/notePreview/noteDayOf`; plain notes collapse to a title + snippet row and expand on tap (with a 收起 toggle); checklist notes stay expanded for quick ticking.
 
 All new domain libs are pure + unit-tested (contacts/calllog at 100% function coverage) with DOM interaction tests; i18n en/zh key-sets are auto-validated.
 
@@ -329,10 +362,15 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/appstore.md](./docs/appstore.md) — App-store core: catalog/package JSON publish contract + download→verify→install (developer onboarding)
 - [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams)
 - [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
+- [docs/sensors.md](./docs/sensors.md) — Device sensors/multimedia domain core: `amos-sensor` camera / GPS-GNSS / IMU spec types + SensorProvider seam + energy-policy SensorManager (real HAL + service-bus wiring left as seams)
+- [docs/profiling.md](./docs/profiling.md) — Inference performance & power profiling domain core: `amos-profiling` prompt/decode tokens-per-second, TTFT, per-token latency, PowerSource seam + energy estimate (daemon assembly + power HAL left as seams)
 - [docs/bidi-voice-asr.md](./docs/bidi-voice-asr.md) — AI-assistant voice wiring: bidi `Payload::Audio` → local ASR (design)
 - [docs/audio-hal-bridge.md](./docs/audio-hal-bridge.md) — Hardware audio (Audio HAL Bridge): `amos-audio` capture/playback traits + resample + mocks + gated TinyALSA/AAudio seams; bidi real-sherpa ASR (`asr-sherpa` feature)
 - [docs/device-poc.md](./docs/device-poc.md) — On-device POC: cross-compile `amos-ai` + run `chat_once` over UDS on a real phone
+- [docs/no-ui-android.md](./docs/no-ui-android.md) — no-UI Android base: init.rc orchestration, `--ai-voice` sherpa cross-build + model push, and a pasteable on-device AI POC acceptance sequence
 - [docs/external-analysis-review.md](./docs/external-analysis-review.md) — Audit of an external gap analysis against the real tree
+- [docs/device-bring-up.md](./docs/device-bring-up.md) — 真机 bring-up 行动件：energy/applife/scheduler 三块 Android 接线的接线点、复用 seam、验收判据，与"daemon 托管生命周期"(可选 gRPC Governor 服务) 路线
+- [docs/qcom-mtk-bringup.md](./docs/qcom-mtk-bringup.md) — QCOM/MTK 真机落地骨架：`amos-ai::accelerator` 芯片/加速器画像 seam、`AMOS_GGML_STRICT` 诚实本地引擎、AAudio→sherpa 语音闭环接线点与验收判据
 - [docs/DELIVERY_NOTES_2026-09-03.md](./docs/DELIVERY_NOTES_2026-09-03.md) — Commit message + changeset + known limits for the telephony/voice/strategy work (2026-09-03)
 
 ## License
@@ -351,12 +389,13 @@ You may use this project under either license at your discretion. See [LICENSE](
 
 ## Roadmap
 
-- [ ] GPU/NPU inference integration (replace mock engine)
-- [ ] Full voice input support (microphone → ASR)
+- [x] GPU/NPU inference — accelerator domain (`amos-ai::accelerator`: SoC vendor detection + `AMOS_ACCEL` resolution → NNAPI/Vulkan/Metal/QNN/NeuroPilot, feature-gated) + honest `AMOS_GGML_STRICT` local-engine mode landed (2026-09-04, `docs/qcom-mtk-bringup.md`); real on-device NPU/GPU drivers still a Qualcomm/MediaTek device bring-up task
+- [x] Voice input — AAudio/TinyALSA HAL seams + real local sherpa ASR (`asr-sherpa`) + bidi `Payload::Audio` + resident capture wiring landed (`docs/audio-hal-bridge.md`); device AAudio capture thread feeding the assistant remains the on-device bring-up step
+- [ ] Full voice input on-device acceptance (microphone → ASR on real Qualcomm/MediaTek silicon)
 - [ ] Multi-window desktop OS features
 - [ ] Mobile platform optimization (iOS/Android)
-- [ ] Extended device API access
-- [ ] Performance profiling and optimization
+- [ ] Extended device API access — domain core + gRPC `SensorService` wired into the daemon UDS + System UI desktop bridge (`sensor_snapshot`/`set_mode`/`acquire` + `lib/sensors.ts`); feature-gated Android skeleton landed (GNSS real via `LocationManager`); device bring-up: camera-frame/IMU stream bridges + System UI real-`Context` wiring (`docs/sensors.md`)
+- [ ] Performance profiling and optimization — metric kernel wired into the daemon's `stream_chat` + bidi `Chat` decode paths, exposed on `get_status.profile`, on the periodic heartbeat log, and rendered in the Settings diagnostics area; battery `PowerSource` Android skeleton landed; device/UI follow-ons: live `EXTRA_VOLTAGE`→`est_energy_j` + sensor tile (`docs/profiling.md`)
 
 ## Support
 

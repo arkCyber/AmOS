@@ -11,6 +11,34 @@ export interface Note {
 
 export const NOTES_KEY = "amos.notes";
 
+/** First meaningful (title) line of a note body — the bold row title (iOS Notes). */
+export function noteTitle(text: string): string {
+  for (const line of text.split("\n")) {
+    const v = line.replace(/^\s*[-*]\s*/, "").trim();
+    if (v) return v;
+  }
+  return text.trim();
+}
+
+/** A whitespace-collapsed preview of the body *after* the title line, for the
+ *  iOS-style list row. `max` caps the length (marker syntax is kept plain). */
+export function notePreview(text: string, max = 140): string {
+  const lines = text.split("\n");
+  const body = lines.slice(1).join(" ").replace(/\s+/g, " ").trim();
+  if (body) return body.length > max ? `${body.slice(0, max)}…` : body;
+  return "";
+}
+
+function startOfDay(ms: number): number {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+/** Whole-day difference from `now` (0 today, -1 yesterday, …) — for the row stamp. */
+export function noteDayOf(ts: number, now: number): number {
+  return Math.round((startOfDay(ts) - startOfDay(now)) / 86_400_000);
+}
+
 // Process-local monotonic counter so ids stay unique even for two notes created
 // in the same millisecond (and deterministic within a process for tests).
 let seq = 0;

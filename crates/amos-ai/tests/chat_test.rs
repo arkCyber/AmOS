@@ -4,7 +4,7 @@
 //! turn, and a Cancel closes the stream.
 
 use amos_proto::ai_agent::{
-    ai_agent_client::AiAgentClient, client_message::Payload, ClientMessage,
+    ai_agent_client::AiAgentClient, client_message::Payload, ClientMessage, StatusRequest,
 };
 use std::path::PathBuf;
 use tokio::net::UnixStream;
@@ -366,6 +366,54 @@ async fn bidi_chat_cancel_interrupts_mid_generation() {
     assert!(
         !saw_done,
         "cancel interrupts generation before the done frame"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bidi_chat_prompt_turn_is_profiled() {
+    // A completed (non-cancelled) bidi text turn must fold into the daemon's
+    // rolling inference profile, exactly like stream_chat (amos-profiling).
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-bidi-prof-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    wait_for_socket(&path).await;
+
+    let mut client = connect(&path).await.expect("connect");
+    let (tx, rx) = mpsc::channel(64);
+    let mut stream = client
+        .chat(ReceiverStream::new(rx))
+        .await
+        .expect("open bidi chat")
+        .into_inner();
+
+    tx.send(prompt("你好，Amos")).await.expect("send prompt");
+    let (_full, done) = collect_until_done(&mut stream).await;
+    assert!(done, "stream must terminate with a done frame");
+
+    // Read profile on a second connection while this one is idle.
+    let mut status = connect(&path).await.expect("status connect");
+    let reply = status
+        .get_status(StatusRequest {})
+        .await
+        .expect("get_status")
+        .into_inner();
+    let profile = reply.profile.expect("profile field present");
+    assert!(
+        profile.decode_runs >= 1,
+        "a completed bidi chat turn must be profiled (runs={})",
+        profile.decode_runs
+    );
+    assert!(
+        profile.decode_tokens_total > 0,
+        "tokens counted after a chat turn"
     );
 
     server.abort();
