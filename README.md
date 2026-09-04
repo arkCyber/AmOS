@@ -360,6 +360,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
 - [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility (dev/prototype; product = no-UI Android base)
 - [docs/lmk-proxy.md](./docs/lmk-proxy.md) — Android Activity/Task lifecycle proxy + LMK (AmOS-controlled freeze/kill of container APKs)
+- [docs/android-lmk-e2e.md](./docs/android-lmk-e2e.md) — Android LMK end-to-end acceptance runbook (real device / live Tauri host)
 - [docs/appstore.md](./docs/appstore.md) — App-store core: catalog/package JSON publish contract + download→verify→install (developer onboarding)
 - [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams)
 - [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
