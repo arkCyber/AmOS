@@ -26,6 +26,7 @@ members = [
     "crates/amos-power",
     "crates/amos-applife",
     "crates/amos-scheduler",
+    "crates/amos-monitor",
 ]
 
 [workspace.package]
@@ -64,6 +65,7 @@ amos-profiling = { path = "crates/amos-profiling" }
 amos-power = { path = "crates/amos-power" }
 amos-applife = { path = "crates/amos-applife" }
 amos-scheduler = { path = "crates/amos-scheduler" }
+amos-monitor = { path = "crates/amos-monitor" }
 
 # ---- profile tuning for fast iteration / smaller mobile binaries ----
 [profile.dev]

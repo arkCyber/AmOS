@@ -1,6 +1,6 @@
 //! [`EnergyGovernor`] — a thin, stateful ticker over the pure rule engine.
 //!
-//! The rule itself is a pure function ([`decide`](crate::decide)); a real
+//! The rule itself is a pure function ([`decide`]); a real
 //! scheduler polls once per cadence and wants the previous decision carried in for
 //! hysteresis. [`EnergyGovernor`] stores exactly that and exposes `observe(&Telemetry)
 //! -> Decision`, returning the fresh decision each tick (deterministic given the

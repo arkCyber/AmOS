@@ -137,6 +137,12 @@ impl Drop for TinyAlsaCapture {
     }
 }
 
+// SAFETY: the whole `TinyAlsaCapture` (opened PCM + spec) is moved as one unit to a
+// single worker thread (the resident capture loop) that is the only reader and the
+// one that closes it on drop. No `Sync`: TinyALSA PCM is not concurrently shareable,
+// which the sole-owner consumer contract enforces.
+unsafe impl Send for TinyAlsaCapture {}
+
 impl AudioCapture for TinyAlsaCapture {
     fn spec(&self) -> AudioSpec {
         self.spec
@@ -193,6 +199,10 @@ impl Drop for TinyAlsaSink {
         }
     }
 }
+
+// SAFETY: sole-owner handoff of the sink between threads (opened once, written/closed
+// by one thread). Not `Sync`; see the `TinyAlsaCapture` rationale.
+unsafe impl Send for TinyAlsaSink {}
 
 impl AudioSink for TinyAlsaSink {
     fn spec(&self) -> AudioSpec {

@@ -35,11 +35,21 @@ pub struct AAudioStream {
 }
 
 // Type aliases mirroring the NDK enums (all `int32_t`).
+#[allow(non_camel_case_types)]
 type aaudio_result_t = i32;
+#[allow(non_camel_case_types)]
 type aaudio_direction_t = i32;
+#[allow(non_camel_case_types)]
 type aaudio_format_t = i32;
+#[allow(non_camel_case_types)]
 type aaudio_performance_mode_t = i32;
 
+// Bind against the NDK's `libaaudio.so` (present from API 26 onward) so that any
+// Android binary/`.so` that links this seam resolves the `AAudio_*` symbols at
+// build time rather than failing at runtime on the device with an unresolved
+// symbol (Android shared libraries tolerate undefined symbols at link time, so
+// without this the error would only surface at `dlopen`/call time).
+#[link(name = "aaudio")]
 extern "C" {
     fn AAudio_createStreamBuilder() -> *mut AAudioStreamBuilder;
     fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder);
@@ -56,6 +66,9 @@ extern "C" {
         stream: *mut *mut AAudioStream,
     ) -> aaudio_result_t;
     fn AAudioStream_requestStart(s: *mut AAudioStream) -> aaudio_result_t;
+    // Not called yet (stop-on-drop is `close`), but part of the NDK surface the
+    // seam is meant to cover; kept so a graceful pause path needs no new FFI.
+    #[allow(dead_code)]
     fn AAudioStream_requestStop(s: *mut AAudioStream) -> aaudio_result_t;
     fn AAudioStream_close(s: *mut AAudioStream) -> aaudio_result_t;
     fn AAudioStream_read(
@@ -162,6 +175,15 @@ impl Drop for AAudioCapture {
     }
 }
 
+// SAFETY: an `AAudioStream` handle is not concurrently shareable, but ownership of
+// the whole `AAudioCapture` (opened stream + spec) can be moved between threads as
+// long as only one thread reads/closes it at a time — precisely how the resident
+// capture worker consumes a mic (`amos-audio::source::PlatformMic`, which requires
+// `Send`). The stream is opened once, handed to a single worker thread, and closed
+// on drop from that thread. No `Sync` is claimed: concurrent `read`/close is UB and
+// is prevented by the sole-owner contract of the consumer.
+unsafe impl Send for AAudioCapture {}
+
 impl AudioCapture for AAudioCapture {
     fn spec(&self) -> AudioSpec {
         self.spec
@@ -221,6 +243,10 @@ impl Drop for AAudioSink {
         }
     }
 }
+
+// SAFETY: sole-owner handoff of the sink between threads (opened once, written/closed
+// by one thread). Not `Sync`; see the `AAudioCapture` rationale.
+unsafe impl Send for AAudioSink {}
 
 impl AudioSink for AAudioSink {
     fn spec(&self) -> AudioSpec {

@@ -326,6 +326,157 @@ pub async fn assistant_voice_stop(voice: State<'_, VoiceSession>) -> Result<(), 
     Ok(())
 }
 
+/// A running device-mic resident capture (the always-on listen worker).
+struct ResidentMicRun {
+    /// Backend label of the capture in use (`aaudio` / `tinyalsa` / `mock`).
+    label: &'static str,
+    handle: ResidentVoiceHandle,
+}
+
+/// Managed state for the always-on **device mic** resident capture: the platform
+/// microphone (AAudio/TinyALSA on device, or an explicit mock for host/dev) fed
+/// into the same resident worker as `VoiceLink::spawn_resident`.
+pub struct DeviceMic {
+    active: std::sync::Arc<std::sync::Mutex<Option<ResidentMicRun>>>,
+}
+
+impl Default for DeviceMic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeviceMic {
+    pub fn new() -> Self {
+        Self {
+            active: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn replace(&self, run: ResidentMicRun) {
+        *self.active.lock().unwrap_or_else(|p| p.into_inner()) = Some(run);
+    }
+
+    /// Take + stop the running capture (join the worker thread). Returns whether
+    /// one was running.
+    fn stop(&self) -> bool {
+        let taken = self.active.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(run) = taken {
+            run.handle.stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The current status (no side effects).
+    fn status(&self) -> DeviceMicStatus {
+        let g = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        match g.as_ref() {
+            Some(run) => DeviceMicStatus {
+                running: true,
+                backend: run.label.to_string(),
+                submitted: run.handle.submitted(),
+            },
+            None => DeviceMicStatus {
+                running: false,
+                backend: "none".to_string(),
+                submitted: 0,
+            },
+        }
+    }
+}
+
+/// Serialisable status of the device-mic resident capture.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeviceMicStatus {
+    pub running: bool,
+    pub backend: String,
+    pub submitted: usize,
+}
+
+/// Open the platform microphone for the always-on listen. On an Android build this
+/// opens the real AAudio (or TinyALSA) capture via [`amos_audio::PlatformMic`]; on
+/// a host with no native backend it fails honestly (no silent fake mic).
+pub fn open_platform_mic() -> Result<amos_audio::PlatformMic, String> {
+    amos_audio::PlatformMic::open_device().map_err(|e| {
+        format!(
+            "device mic unavailable: {e} (on-device needs an Android build with \
+             amos-audio `aaudio`/`tinyalsa`; a host has no native mic — use a mock \
+             capture for host/dev)"
+        )
+    })
+}
+
+/// Tauri command: start the **always-on device mic** — open the platform mic
+/// (AAudio/TinyALSA on device), open a daemon `Chat` stream, and spawn the
+/// resident capture worker that streams speech + auto-finalizes each utterance.
+///
+/// On a host this returns the honest "no native mic" error; the host path for
+/// exercising the same worker is `VoiceLink::spawn_resident(mock, …)`.
+#[tauri::command]
+pub async fn device_mic_start(
+    app: AppHandle,
+    state: State<'_, AiBridge>,
+    voice: State<'_, VoiceSession>,
+    mic: State<'_, DeviceMic>,
+    session_id: Option<String>,
+) -> Result<String, String> {
+    // One listener at a time. Tear down any prior session/capture *first* —
+    // opening a second live mic while the old one still runs would double-open the
+    // device. Cancel the daemon stream before joining so a resident worker blocked
+    // on `feeder.blocking_send` is unblocked by the receiver drop.
+    voice.stop().await;
+    mic.stop();
+
+    // Then open the real platform mic. If the host has none this fails honestly
+    // (no silent fake mic) after we've already cleaned up, never mid-capture.
+    let platform = open_platform_mic()?;
+    let label = platform.backend_label();
+    let native_rate = platform.native_rate();
+
+    let session = session_id.unwrap_or_else(|| "device-mic".to_string());
+    let app = app.clone();
+    let emit = move |e: VoiceEvent| {
+        let _ = app.emit(VOICE_EVENT, to_payload(&e));
+    };
+    let link = VoiceLink::open(&state, session, emit).await?;
+
+    // Trailing-silence segmentation (end_silence_frames = 3 × ~10 ms); feed
+    // silence too so a real VAD recognizer (sherpa) sees the true audio cadence.
+    let handle = spawn_resident_capture::<amos_audio::PlatformMic>(
+        link.feeder(),
+        platform,
+        native_rate,
+        3,
+        true,
+    )
+    .map_err(|e| format!("failed to spawn resident mic worker: {e}"))?;
+
+    mic.replace(ResidentMicRun { label, handle });
+    voice.store(link.feeder());
+    Ok(label.to_string())
+}
+
+/// Tauri command: stop the always-on device mic. Cancel the daemon stream first so
+/// a resident worker blocked on a `blocking_send` is unblocked, then join the
+/// capture worker (frees the mic).
+#[tauri::command]
+pub async fn device_mic_stop(
+    voice: State<'_, VoiceSession>,
+    mic: State<'_, DeviceMic>,
+) -> Result<(), String> {
+    voice.stop().await;
+    mic.stop();
+    Ok(())
+}
+
+/// Tauri command: is the always-on device mic running, on which backend?
+#[tauri::command]
+pub fn device_mic_status(mic: State<'_, DeviceMic>) -> DeviceMicStatus {
+    mic.status()
+}
+
 /// Energy gate used by the resident voice loop: is there audible content above
 /// `threshold` anywhere in this mono f32 frame? Mirrors the frontend's
 /// `hasSignal`. Used to tell "speech" from "silence" for utterance segmentation.
@@ -721,10 +872,14 @@ mod tests {
         )
         .expect("valid capture spawns");
 
+        // Consume until AudioEnd or the deadline. A single idle timeout is *not*
+        // fatal: under CI/CPU load the capture worker can pause >25ms between
+        // pushes, and breaking on the first gap made this test flaky.
         let mut saw_audio = false;
         let mut saw_end = false;
-        for _ in 0..400 {
-            match tokio::time::timeout(std::time::Duration::from_millis(25), rx.recv()).await {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
                 Ok(Some(msg)) => match msg.payload {
                     Some(Payload::Audio(_)) => saw_audio = true,
                     Some(Payload::AudioEnd(_)) => {
@@ -733,7 +888,8 @@ mod tests {
                     }
                     _ => {}
                 },
-                _ => break,
+                Ok(None) => break, // worker finished without an explicit AudioEnd
+                Err(_) => {}       // idle gap under load — keep waiting until the deadline
             }
         }
         assert!(
@@ -746,6 +902,54 @@ mod tests {
         );
         assert_eq!(handle.submitted(), 1, "exactly one utterance submitted");
         handle.stop(); // the finite FrameMic already ended; join is prompt
+    }
+
+    #[tokio::test]
+    async fn platform_mic_facade_drives_the_resident_worker() {
+        use amos_audio::PlatformMic;
+        use amos_proto::ai_agent::client_message::Payload;
+
+        // ~10 ms of loud speech then enough trailing silence to cross the gate —
+        // served through the Send platform-mic facade, exactly how a device AAudio /
+        // TinyALSA capture will feed the resident worker on Android.
+        let mut frames = vec![0.5f32; 160];
+        frames.extend(std::iter::repeat(0.0f32).take(160 * 6));
+        let mic = PlatformMic::from_mock(amos_audio::mock::FrameMic::new(16_000, frames));
+        assert!(
+            !mic.is_native(),
+            "host facade is a mock, never a claimed device"
+        );
+
+        let (feeder, mut rx) = tokio::sync::mpsc::channel(64);
+        let handle = spawn_resident_capture::<PlatformMic>(feeder.clone(), mic, 16_000, 3, false)
+            .expect("facade capture spawns (Send + AudioCapture)");
+
+        // Same deadline-tolerant consume as the FrameMic test above (a single idle
+        // timeout must not be treated as the end of the utterance).
+        let mut saw_audio = false;
+        let mut saw_end = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(msg)) => match msg.payload {
+                    Some(Payload::Audio(_)) => saw_audio = true,
+                    Some(Payload::AudioEnd(_)) => {
+                        saw_end = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(saw_audio, "facade mic must stream speech as Audio payloads");
+        assert!(
+            saw_end,
+            "trailing silence past the gate must finalize with AudioEnd"
+        );
+        assert_eq!(handle.submitted(), 1, "exactly one utterance submitted");
+        handle.stop();
     }
 
     #[test]
@@ -788,5 +992,55 @@ mod tests {
         handle.request_stop();
         let _ = handle.submitted();
         handle.stop();
+    }
+
+    #[test]
+    fn device_mic_empty_status_and_stop_are_noops() {
+        let mic = DeviceMic::new();
+        let st = mic.status();
+        assert!(!st.running);
+        assert_eq!(st.backend, "none");
+        assert_eq!(st.submitted, 0);
+        assert!(!mic.stop(), "nothing running to stop");
+    }
+
+    #[test]
+    fn device_mic_run_then_stop_updates_status() {
+        use amos_audio::PlatformMic;
+
+        // A finite speech+silence clip through the platform-mic facade drives the
+        // resident worker, exactly as a device AAudio capture will.
+        let mut frames = vec![0.5f32; 160];
+        frames.extend(std::iter::repeat(0.0f32).take(160 * 6));
+        let mic = PlatformMic::from_mock(amos_audio::mock::FrameMic::new(16_000, frames));
+        let label = mic.backend_label();
+        let rate = mic.native_rate();
+
+        let (feeder, _rx) = tokio::sync::mpsc::channel(64);
+        let handle =
+            spawn_resident_capture::<PlatformMic>(feeder, mic, rate, 3, false).expect("spawn");
+        let mic_state = DeviceMic::new();
+        mic_state.replace(ResidentMicRun { label, handle });
+
+        let st = mic_state.status();
+        assert!(st.running);
+        assert_eq!(st.backend, "mock");
+
+        assert!(mic_state.stop(), "a running worker is stopped");
+        assert!(!mic_state.status().running);
+    }
+
+    #[test]
+    fn open_platform_mic_on_host_is_an_honest_error() {
+        #[cfg(not(target_os = "android"))]
+        {
+            match open_platform_mic() {
+                Ok(_) => panic!("a host must not report a device mic"),
+                Err(err) => assert!(
+                    err.contains("no native audio capture backend"),
+                    "honest host error expected, got: {err}"
+                ),
+            }
+        }
     }
 }

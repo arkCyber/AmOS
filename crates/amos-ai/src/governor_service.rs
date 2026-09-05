@@ -17,7 +17,7 @@ use amos_applife::{AppId, AppState};
 use amos_proto::amos_governor::{
     governor_server::{Governor, GovernorServer},
     AppInfo, AppRef, AppState as ProtoState, Empty, GovernorDecision, GovernorState, JobInfo,
-    JobType as ProtoJobType, MoveAppRequest, ScheduleJobRequest,
+    JobRef, JobType as ProtoJobType, MoveAppRequest, ScheduleJobRequest,
 };
 use amos_proto::android_compat::{LmkEvent, LmkEventKind};
 use amos_scheduler::ScheduledJob;
@@ -241,6 +241,15 @@ impl Governor for GovernorService {
         Ok(Response::new(Empty {}))
     }
 
+    async fn cancel_job(&self, request: Request<JobRef>) -> Result<Response<Empty>, Status> {
+        let job_id = amos_scheduler::JobId::new(request.into_inner().job_id);
+        let mut g = self.lock();
+        if !g.cancel_job(&job_id) {
+            return Err(Status::not_found(format!("no such job: {job_id}")));
+        }
+        Ok(Response::new(Empty {}))
+    }
+
     async fn get_state(&self, _request: Request<Empty>) -> Result<Response<GovernorState>, Status> {
         let g = self.lock();
         let apps = g
@@ -417,6 +426,49 @@ mod tests {
         assert!(d.ticks >= 1);
         // The frozen app is now Cached → no longer "background".
         assert_eq!(st2.background_count, 0);
+    }
+
+    #[tokio::test]
+    async fn schedule_then_cancel_job_over_the_service() {
+        let shared = Arc::new(Mutex::new(ResourceGovernor::default()));
+        let svc = GovernorService::new(Arc::clone(&shared));
+
+        svc.schedule_job(Request::new(ScheduleJobRequest {
+            job_id: "bg.sync".to_string(),
+            job_type: ProtoJobType::Deferred as i32,
+            earliest: 0,
+            latest: 100,
+        }))
+        .await
+        .unwrap();
+        let st = svc
+            .get_state(Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(st.jobs.len(), 1);
+
+        // Cancel removes the job from the register.
+        svc.cancel_job(Request::new(JobRef {
+            job_id: "bg.sync".to_string(),
+        }))
+        .await
+        .unwrap();
+        let st2 = svc
+            .get_state(Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(st2.jobs.is_empty(), "job cancelled over the service");
+
+        // Cancelling a job that does not exist → NotFound.
+        let err = svc
+            .cancel_job(Request::new(JobRef {
+                job_id: "nope".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[test]

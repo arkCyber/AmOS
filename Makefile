@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check clean honesty-smoke
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-audio-check android-ai-sherpa-check clean honesty-smoke
 
 all: build
 
@@ -80,6 +80,16 @@ gated-check:
 	cargo check -p amos-profiling --features android
 	# Battery/thermal telemetry seam feeding the energy governor (amos-power).
 	cargo check -p amos-power --features android
+	# CPU/NPU frequency-governor sysfs applier (amos-power, `linux` feature):
+	# real scaling_max_freq writes + tempdir tests; host-compiles without a device.
+	cargo check -p amos-power --features linux
+	cargo test -p amos-power --features linux --lib
+	# System working-status sampler (amos-monitor): real /proc reads over an
+	# injected root (`linux`) + on-device Android skeleton (`android`). The linux
+	# tests run entirely over a tempdir fixture — no root/device needed.
+	cargo check -p amos-monitor --features linux
+	cargo test -p amos-monitor --features linux --lib
+	cargo check -p amos-monitor --features android
 
 # Production gate: formatting + clippy must be clean; TS shells must typecheck.
 lint:
@@ -141,6 +151,21 @@ mobile-check:
 	@(command -v java >/dev/null 2>&1 && echo "[ok] java" || echo "[warn] java not found (JDK 17+ needed for Android)")
 	@(test -n "$$ANDROID_HOME" && echo "[ok] ANDROID_HOME=$$ANDROID_HOME" || echo "[warn] ANDROID_HOME unset (Android SDK)")
 	@(command -v xcodebuild >/dev/null 2>&1 && echo "[ok] xcodebuild (iOS)" || echo "[warn] xcodebuild not found (iOS)")
+
+# Cross-compile + link gate for amos-audio's Android audio seams (AAudio/TinyALSA
+# FFI). Compiles every ABI and link-checks AAudio against the NDK's libaaudio.so
+# via the aaudio_link_smoke example. Requires NDK + cargo-ndk + rustup android
+# targets (see scripts/android-audio-check.sh). No device needed.
+android-audio-check:
+	bash scripts/android-audio-check.sh
+
+# Cross-compile gate for amos-ai WITH real sherpa on-device ASR (asr-sherpa) on
+# Android. Stages the sherpa-onnx Android shared lib (upstream archive has no
+# wrapping dir, so auto-download fails; see script), then builds the daemon for
+# arm64-v8a and link-checks libsherpa-onnx-c-api.so. Requires NDK + cargo-ndk +
+# protoc + network. No device needed.
+android-ai-sherpa-check:
+	bash scripts/android-ai-sherpa-check.sh
 
 clean:
 	cargo clean

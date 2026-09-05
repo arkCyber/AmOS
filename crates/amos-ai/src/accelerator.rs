@@ -16,6 +16,17 @@
 //! * On a non-Android host we report [`SoCVendor::Host`] — never a made-up
 //!   Qualcomm/MediaTek claim — unless the operator overrides via
 //!   `AMOS_SOC_VENDOR` (bring-up / cross-compile).
+//!
+//! > **Known honest seams (audit, 2026-09-04, intentionally not guessed-away):**
+//! > (1) `effective()`/`compiled_in()` treat Vulkan/Metal/NNAPI as "available" on
+//! > any target — so a *requested* `nnapi`/`metal` on a non-native OS is reported
+//! > as chosen, and `auto`+Android maps to NNAPI which for a llama.cpp engine means
+//! > **GPU offload** rather than a real NNAPI runtime. Making this target-accurate
+//! > conflicts with the repo's deliberate host `--features qnn,neuropilot`
+//! > cross-compile checks, so it stays a device-bring-up decision.
+//! > (2) `Config.enable_acceleration` (`AMOS_ACCELERATION`) and this module's
+//! > `AMOS_ACCEL` are two independent knobs; wiring the former into `AccelProfile`
+//! > is pending. Both are surfaced here so nobody mistakes them for one flag.
 
 /// Env var naming the accelerator strategy: `auto|cpu|vulkan|metal|nnapi|qnn|neuropilot|off`.
 pub const AMOS_ACCEL_ENV: &str = "AMOS_ACCEL";
@@ -371,5 +382,62 @@ mod tests {
         let p = AccelProfile::from_env();
         assert_eq!(p.accel, Accel::Auto, "unknown value must fall back to Auto");
         std::env::remove_var(AMOS_ACCEL_ENV);
+    }
+
+    #[test]
+    fn resolve_cpu_and_off_are_intentional_without_reason() {
+        let cpu = profile(Accel::Cpu, SoCVendor::Host);
+        assert_eq!(cpu.resolve(), (Accel::Cpu, None));
+        let off = profile(Accel::Off, SoCVendor::Host);
+        assert_eq!(off.resolve(), (Accel::Cpu, None));
+    }
+
+    #[test]
+    fn resolve_gpu_request_is_honored_without_reason_when_compiled_in() {
+        let vulkan = profile(Accel::Vulkan, SoCVendor::Host);
+        assert_eq!(vulkan.resolve(), (Accel::Vulkan, None));
+        let metal = profile(Accel::Metal, SoCVendor::Host);
+        assert_eq!(metal.resolve(), (Accel::Metal, None));
+    }
+
+    #[test]
+    fn disabled_profile_never_offloads() {
+        // `enabled: false` is what `Config.enable_acceleration=false` must map to;
+        // the effective runtime is CPU with an explicit zero offload.
+        let p = AccelProfile {
+            vendor: SoCVendor::Qualcomm,
+            accel: Accel::Metal,
+            enabled: false,
+        };
+        assert_eq!(p.effective(), Accel::Cpu);
+        assert_eq!(p.n_gpu_layers(), 0);
+        assert_eq!(p.llama_args(), vec!["--n-gpu-layers", "0"]);
+        assert_eq!(p.ollama_hint(), "cpu");
+        assert_eq!(p.label(), "qualcomm/cpu");
+    }
+
+    #[test]
+    fn cpu_and_off_profiles_emit_explicit_zero_offload() {
+        for a in [Accel::Cpu, Accel::Off] {
+            let p = profile(a, SoCVendor::Host);
+            assert_eq!(p.effective(), Accel::Cpu);
+            assert_eq!(p.n_gpu_layers(), 0);
+            assert_eq!(p.llama_args(), vec!["--n-gpu-layers", "0"]);
+        }
+    }
+
+    #[test]
+    fn label_joins_vendor_and_resolved_accel() {
+        assert_eq!(profile(Accel::Metal, SoCVendor::Host).label(), "host/metal");
+        assert_eq!(
+            profile(Accel::Cpu, SoCVendor::Qualcomm).label(),
+            "qualcomm/cpu"
+        );
+        // Auto always resolves to a concrete label, never "auto".
+        let auto = profile(Accel::Auto, SoCVendor::Host).label();
+        assert!(
+            !auto.contains("auto"),
+            "Auto must resolve before labelling: {auto}"
+        );
     }
 }

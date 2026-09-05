@@ -27,8 +27,8 @@
   需要的 `CameraDevice`+`ImageReader` / `SensorEventListener` 桥在设备上验证前返回显式
   `Provider` 错误（诚实不假装）。宿主 = System UI APK（持 `Context`）。`cargo check -p amos-sensor
   --features android` 可编译（已入 `make gated-check`）。
-- ⏳ **真机流桥 + 接线**：把 `AndroidSensorProvider`（GNSS 已就绪）的相机帧 / IMU 采样桥补上，
-  并在 System UI 启动时以真 `Context` 构造 `SensorManager`（替换 mock）——需设备 bring-up。
+- ✅ **真机流桥 backend（2026-09-04）**：新增 `amos-sensor/src/stream.rs` —— 相机/IMU 这类**流**的正确读法。线程安全 atomic 最新样本桥 `ImuLatest` / `FrameLatest`（生产者线程 push 最新值，读端取最新；帧负载按 config 校验、`seq` 单调）+ 非 gated 的 `LiveSensorProvider`（实现 `SensorProvider`，读这些缓存）。`AndroidSensorProvider` 现在**持有**一个 `LiveSensorProvider`，`imu_sample`/`camera_capture` 经它返回最新真值（此前是硬编码报错）。host 装配测试（6 项）：跨线程 push→`SensorManager` 读、首样本前诚实 `Provider` 错、帧校验、not-found、PowerSave 门控叠加。`cargo check --features android` 编译绿。
+- ⏳ **真机流桥接线（设备 glue + System UI Context）**：`AndroidSensorProvider` 的 GNSS 已真同步；IMU 需在 System UI APK 里用真 `Context` 注册 `SensorEventListener`、相机需 `Camera2` `CameraDevice` + NV21 `ImageReader`，各在其监听线程调 `record_imu`/`record_frame`/`set_cameras` 把样本推进上面的桥（即本轮的**生产者侧**，仍是设备 bring-up 步骤）。
 - ✅ **System UI 桌面桥（2026-09-04）**：Tauri `sensor_snapshot` / `sensor_set_mode` /
   `sensor_acquire` 命令桥（`amos-tauri/src/sensors.rs`，仿 telephony 桥）+ 前端 `lib/sensors.ts`
   （类型 + `normalizeSnapshot` 等纯归一化 + 命令包装，`__tests__/sensors.test.ts`）——桌面/mock daemon
@@ -79,7 +79,7 @@
 ## 5. 验证
 
 ```bash
-cargo test -p amos-sensor                      # 25 项单测（spec/provider/manager/error/service）+ 1 项真 UDS e2e（tests/sensor_rpc_e2e.rs）
+cargo test -p amos-sensor                      # 34 项单测（spec/provider/manager/error/service/stream）+ 1 项真 UDS e2e（tests/sensor_rpc_e2e.rs）
 cargo clippy -p amos-sensor --all-targets -- -D warnings
 cargo fmt -p amos-sensor
 # daemon 侧（Sensor 挂同一 UDS + Profile 在 get_status）：
@@ -88,12 +88,46 @@ cargo test -p amos-ai --test rpc_test sensor_service_mounted_and_profile_exposed
 cargo run -p amos-ai --example sensor_once -- /tmp/amos-ai.sock
 ```
 
-## 6. 下一步（超出本次）
+## 6. 最新样本流桥 backend（2026-09-04）
 
-- **真机流桥（需设备 bring-up）**：`AndroidSensorProvider` 的 GNSS 已就绪；把相机帧与 IMU 采样桥补上
-  - Camera → `Camera2`/`CameraDevice` 捕获会话 + NV21 `ImageReader`（权限 `CAMERA`，热点——发热源，纳入功率策略）。
-  - IMU → `SensorManager` 注册 `TYPE_ACCELEROMETER`/`TYPE_GYROSCOPE` `SensorEventListener`，把最新
-    样本缓存进 atomic，`imu_sample` 读缓存（`BODY_SENSORS`）。
+Camera/IMU 是**流**不是 getter：Android 把每个新帧/运动样本投递给监听器（`SensorEventListener`、
+`ImageReader`），AmOS 按需取最新值。此前 `AndroidSensorProvider` 对二者直接返回"not yet wired"错，
+**没有**任何样本落地处。本轮补上 `crates/amos-sensor/src/stream.rs`（非 gated、host 全绿）：
+
+```text
+[ Android SensorEventListener / Camera2 ImageReader ]    [ host/dev feeder ]
+      onSensorChanged / onImageAvailable                          │
+        └──────────►  ImuLatest / FrameLatest  ◄──────────────────┘
+                       （线程安全 atomic：生产者 push 最新，读端取最新）
+                                  ▲ SensorProvider（LiveSensorProvider）
+                                SensorManager（能量门控）
+```
+
+- `ImuLatest`：只存最新 `ImuSample`；时间戳乱序（更旧）的 push 被丢弃，读端永不回退。
+- `FrameLatest`：按相机存最新 `CameraFrame`；负载长度按 `CameraConfig::frame_len` 校验后才收，
+  每相机 `seq` 单调递增。
+- `LiveSensorProvider`（`Send + Sync`，实现 `SensorProvider`）：上面缓存的读侧；生产者推入前读
+  返回显式 `Provider("no … yet")`（诚实，不伪造）。GNSS 不在其中（Android 走同步 `LocationManager`）。
+- `AndroidSensorProvider` 现在**持有**一个 `LiveSensorProvider`：`camera_configs` / `camera_capture`
+  / `imu_rate_hz` / `imu_sample` 经它读取；并暴露生产者入口 `set_cameras` / `set_imu_rate_hz` /
+  `record_imu` / `record_frame`（+ `imu_store`/`frame_store` 共享给监听线程）。GNSS 保持真同步 JNI。
+- **host 装配测试（9 项，`stream::tests`）**：跨线程 push → `SensorManager` 读最新；首样本前诚实错；
+  帧负载校验与 `seq` 递增；未配置相机 `CameraNotFound`；PowerSave 门控叠加在 `LiveSensorProvider`
+  之上依然生效；`clear`/`clear_samples`（detach 清空防陈旧回读）。
+
+**接线（设备 glue，需真机，属 §7 生产者侧）**：System UI APK 用真 `Context` 注册
+`SensorEventListener`（`TYPE_ACCELEROMETER`/`TYPE_GYROSCOPE`，`BODY_SENSORS`）与 `Camera2`
+`CameraDevice` 捕获会话 + NV21 `ImageReader`（`CAMERA`），各自监听线程调上面的 `record_*` 把样本
+推进同一桥；真机 `set_cameras` 上报 `CameraCharacteristics` 协商出的能力。相机原始帧字节走独立媒体
+通道（本服务只给帧元数据+尺寸）。
+
+## 7. 下一步（超出本次）
+
+- **真机流桥（需设备 bring-up，生产者侧 glue）**：把 §6 的 `LiveSensorProvider` 生产者接上
+  - IMU → System UI 用真 `Context` 注册 `TYPE_ACCELEROMETER`/`TYPE_GYROSCOPE` `SensorEventListener`，
+    在其 `onSensorChanged` 调 `AndroidSensorProvider::record_imu`（`BODY_SENSORS`）。
+  - Camera → `Camera2`/`CameraDevice` 捕获会话 + NV21 `ImageReader`，`onImageAvailable` 调
+    `record_frame`（权限 `CAMERA`，热点——发热源，纳入功率策略）；`set_cameras` 上报能力。
 - **System UI 接线（桌面已通，真机剩 Context 替换）**：`sensor_*` Tauri 命令桥 + 前端 `lib/sensors.ts` +
   设置页**传感器 tile**（`components/SensorPanel.tsx`，桌面 mock daemon 可读能量档/相机/定位/惯性）已落地；
   **真机**：System UI 启动时用真 `Context` 调 `AndroidSensorProvider::new` 构造 `SensorManager`（替换

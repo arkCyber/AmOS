@@ -2,7 +2,7 @@
 //!
 //! This closes the audit gap that AmOS has *isolated energy-policy knobs but no
 //! closed-loop decision layer* (`docs/bottom-layer-os-audit.md` §2.B / §3.P2 #11):
-//! `amos-sensor` can already gate continuous sampling by [`SensorMode`] and
+//! `amos-sensor` can already gate continuous sampling by `SensorMode` and
 //! `amos-profiling` can measure live board power, but nothing folds battery
 //! state-of-charge, charger state, die temperature, live power **and** whether the
 //! heavy consumer is in the foreground into *one* recommended energy mode.
@@ -41,10 +41,18 @@
 //!   [`decide`] rule with entry/exit hysteresis (battery low band, thermal).
 //! * [`governor`] — [`EnergyGovernor`], a thin stateful ticker that keeps the last
 //!   decision and returns a fresh one per poll (what a periodic scheduler drives).
+//! * [`freq`] — CPU/NPU frequency domain: turns a `SensorMode`/[`Decision`] into
+//!   concrete per-cluster + NPU frequency ceilings ([`FreqPlan`]), protecting the
+//!   responsive `Little` cluster while capping the inference-hogging domains.
+//!   [`FrequencyGovernor`] is a stateful DVFS ticker that surfaces a [`FreqPlan`]
+//!   only when it actually changed (no redundant sysfs writes per poll);
+//!   [`ComposedGovernor`] also pushes the decided `SensorMode` into a real
+//!   `SensorManager` every tick, driving "decision → sampling + frequency".
 //!
 //! The decision core is pure `std` and offline-testable; it depends only on the
 //! `amos-sensor`/`amos-profiling` **domain** types, so `cargo test -p amos-power`
-//! needs no device, HAL or network.
+//! needs no device, HAL or network. A Linux cpufreq sysfs applier that realizes a
+//! [`FreqPlan`] on real hardware is feature-gated `linux`.
 //!
 //! Design: `docs/power-policy.md`.
 
@@ -54,16 +62,25 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod freq;
 pub mod governor;
 pub mod policy;
 pub mod types;
 
 #[cfg(feature = "android")]
 pub mod android;
+#[cfg(feature = "linux")]
+pub mod linux;
 
+pub use freq::{
+    cap_khz, cpu_percent, npu_percent, plan, plan_from_decision, Cluster, ClusterKind,
+    ComposedGovernor, FreqCap, FreqPlan, FrequencyGovernor,
+};
 pub use governor::EnergyGovernor;
 pub use policy::{decide, Decision, Policy, Reason};
 pub use types::{BatteryState, Telemetry, Usage};
 
 #[cfg(feature = "android")]
 pub use android::AndroidBatteryTelemetry;
+#[cfg(feature = "linux")]
+pub use linux::{default_cpufreq_root, LinuxFreqGovernor};

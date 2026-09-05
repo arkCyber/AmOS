@@ -129,5 +129,45 @@ cargo build -p amos-audio --features aaudio  --target aarch64-linux-android --re
 - 在 AI 应用 UI 上落一个"常驻听麦"控件：`VoiceMicButton` 改用
   `assistantVoiceStart/Feed/End` 流式推 `Payload::Audio`（替代整段 WAV `transcribe_audio`），
   并订阅 `assistant-voice-event` 渲染中间/最终回复。
-- 设备 AAudio 采集线程（`amos-audio`）真正喂进 `assistant_voice_feed`。
+- **设备 AAudio 采集线程（`amos-audio`）真正喂进 `assistant_voice_feed`。**
 - 逐句语义卡等 UI 中间态（`AudioEnd` 的 wire 语义已落地）。
+
+## 平台麦克风 facade：把设备 seam 接进常驻管线（2026-09-04，Option-A seam）
+
+常驻采集线程 `spawn_resident_capture` 是泛型 `C: amos_audio::AudioCapture + Send`，但原始的
+`AAudioCapture`/`TinyAlsaCapture` 因持有裸句柄既**不是 `Send`**、也无法装箱成
+`dyn AudioCapture`（旧 trait 的 `for_each<F>` 泛型默认方法让 trait 非 object-safe）。因此"设备
+麦喂进常驻 worker"之前**在代码面没有入口**。本轮补上：
+
+```text
+[ AAudioCapture / TinyAlsaCapture ]        [ mock: FrameMic / SineMic ]
+            │                                        │
+            └──────────► PlatformMic ◄───────────────┘
+            (Send, AudioCapture; open_device()/from_mock())
+                        │ read()
+                        ▼
+   spawn_resident_capture：16k 下采样 → Payload::Audio → 尾静音门 AudioEnd
+```
+
+- **`AudioCapture` 变 object-safe**（`amos-audio/src/capture.rs`）：唯一的泛型默认方法
+  `for_each` 移到 `AudioCaptureExt`（blanket impl）扩展 trait，`AudioCapture` 本体只剩
+  `spec`/`read`，可 `Box<dyn AudioCapture>`。唯一外部消费方 `amos-tauri` 不受影响（host 全绿）。
+- **`unsafe impl Send`**：给 `AAudioCapture`/`AAudioSink`/`TinyAlsaCapture`/`TinyAlsaSink` 补
+  上（单所有者移交：开一次 → 交给唯一 worker 线程 → drop 关闭；不 claim `Sync`），使真设备捕获
+  满足 resident worker 的 `Send` 约束。
+- **`amos-audio/src/source.rs` facade**：
+  - `PlatformMicKind::detect()`：`feature`+`target_os` 如实解析 —— Android + `aaudio` → `Aaudio`
+    （app 侧听麦，**优先**）；Android + `tinyalsa`（且无 aaudio）→ `TinyAlsa`；host → `Host`。
+  - `PlatformMic`（`Send`）：`open_device()` 在 Android 以 **16 kHz** 打开真麦（常驻 worker 无需
+    再下采样）；host 上返回**明确报错**（"no native backend，用 from_mock"），绝不静默伪造音频。
+    `from_mock()` 给 host/dev/CI 一个确定性捕获。
+  - 已 re-export 到 crate root（`amos_audio::PlatformMic` / `PlatformMicKind`）。
+- **host 端证明该 seam 喂进常驻管线**：`assistant_voice.rs` 单测
+  `platform_mic_facade_drives_the_resident_worker` —— 用 `PlatformMic::from_mock` 的
+  语音+尾静音捕获走真实 `spawn_resident_capture`，断言 `Audio` 流出、`AudioEnd` 收句、
+  `submitted()==1`（无需 daemon/设备）。
+
+**验收（设备 bring-up）**：Android/NDK 交叉构建 `cargo build -p amos-audio --features aaudio
+--target aarch64-linux-android` 后，System UI 在 `PlatformMic::open_device()` 上跑
+`VoiceLink::spawn_resident`，对着真机麦说话 → sherpa 真实转写作答、`get_status.asr` 报 sherpa。
+host 只能保证上述 seam 可编译、可单测；设备端行为仍需真机验收（诚实边界不变）。

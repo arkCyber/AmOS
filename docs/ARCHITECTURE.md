@@ -42,6 +42,7 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 | `amos-power` | battery/thermal/foreground-aware energy-governor domain core: folds `amos-sensor` `SensorMode` + `amos-profiling` `PowerSource` into a deterministic `SensorMode` decision (low-battery / thermal / power-draw / charging hysteresis) and applies it to a `SensorManager` (`docs/power-policy.md`) |
 | `amos-applife` | app/process lifecycle domain core: per-app `Foreground/Visible/ForegroundService/Background/Cached(tombstone)/Stopped` state ladder + LRU ordering + a deterministic memory-pressure reclaim (LMK-proxy) victim selector (`docs/app-lifecycle.md`) |
 | `amos-scheduler` | background-task scheduler + wakeup-alignment domain core: `AlarmExact` vs `Deferred` jobs with `[earliest,latest]` windows, Doze/charging/maintenance-window gating for deferred work, coalesced due-batching (fewer wakes) and next-wake computation (`docs/scheduler.md`) |
+| `amos-monitor` | system working-status (health) domain core: folds `SystemSampler` load (CPU/mem) + `amos-profiling` battery/power + `amos-applife` process counts into one honest `SystemHealth` (`docs/system-monitor.md`) |
 
 ## RPC contract (`proto/`)
 

@@ -24,6 +24,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+/// Desktop geometry / split-screen domain (see [`crate::layout`]).
+pub mod layout;
+/// Split-screen session over two windows (see [`crate::split`]).
+pub mod split;
+
 /// Opaque identifier for a window, allocated by [`WindowManager::register`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WindowId(pub u64);
@@ -176,13 +181,14 @@ impl WindowManager {
         meta.state = WindowState::Hidden;
         events.push(WmEvent::Hidden(id));
         if was_focused {
-            self.focus_stack.retain(|x| *x != id);
-            events.push(WmEvent::FocusChanged(self.focused()));
+            let fallback = self.promote_fallback_after(id);
+            events.push(WmEvent::FocusChanged(fallback));
         }
         events
     }
 
-    /// Permanently close `id` (except the Launcher, which is immortal).
+    /// Permanently close `id` (except the Launcher, which is immortal). The window
+    /// is removed from the recents stack whether or not it was focused.
     pub fn close(&mut self, id: WindowId) -> Vec<WmEvent> {
         let mut events = Vec::new();
         let was_focused = self.focused() == Some(id);
@@ -191,12 +197,28 @@ impl WindowManager {
             return events;
         }
         self.windows.retain(|w| w.id != id);
-        self.focus_stack.retain(|x| *x != id);
+        // Purge the closed window from recents and, if it was the top, promote the
+        // next most-recent window to Focused so `focused()` stays consistent.
+        let fallback = self.promote_fallback_after(id);
         events.push(WmEvent::Closed(id));
         if was_focused {
-            events.push(WmEvent::FocusChanged(self.focused()));
+            events.push(WmEvent::FocusChanged(fallback));
         }
         events
+    }
+
+    /// After removing a *focused* window from the recents stack, promote the new
+    /// top of the stack to [`WindowState::Focused`] so `focused()` always agrees
+    /// with exactly one window being `Focused`. Returns the new focus (if any).
+    fn promote_fallback_after(&mut self, removed: WindowId) -> Option<WindowId> {
+        self.focus_stack.retain(|x| *x != removed);
+        let fallback = self.focus_stack.back().copied();
+        if let Some(fb) = fallback {
+            if let Some(m) = self.windows.iter_mut().find(|w| w.id == fb) {
+                m.state = WindowState::Focused;
+            }
+        }
+        fallback
     }
 
     /// Return to the home screen: focus the Launcher.
@@ -233,6 +255,23 @@ impl WindowManager {
             .iter()
             .find(|w| w.kind == WindowKind::Launcher)
             .map(|w| w.id)
+    }
+
+    /// The most recent two **shown, non-Launcher** windows, front-to-back — the
+    /// natural candidates the host offers for entering split-screen. Fewer than
+    /// two means there is nothing to split.
+    pub fn split_candidates(&self) -> Vec<WindowId> {
+        self.focus_stack
+            .iter()
+            .rev()
+            .filter(|id| {
+                self.state_of(**id) != Some(WindowState::Hidden)
+                    && self.windows.iter().find(|w| w.id == **id).map(|w| w.kind)
+                        != Some(WindowKind::Launcher)
+            })
+            .take(2)
+            .copied()
+            .collect()
     }
 }
 
@@ -367,14 +406,27 @@ mod tests {
             .filter(|id| wm.state_of(**id) == Some(WindowState::Focused))
             .count();
         assert!(focused_count <= 1, ">1 focused windows: {focused_count}");
-        // If exactly one window is Focused, the reported `focused()` agrees with it.
-        if focused_count == 1 {
-            let f = wm
-                .windows()
-                .iter()
-                .find(|id| wm.state_of(**id) == Some(WindowState::Focused))
-                .copied();
-            assert_eq!(wm.focused(), f);
+        // `focused()` must agree with the Focused *state* in both directions:
+        // exactly the single Focused window is reported, and the reported window
+        // is actually in the Focused state (catches demote-then-fallback bugs).
+        match wm.focused() {
+            Some(f) => {
+                assert_eq!(
+                    focused_count, 1,
+                    "focused()={f:?} but {focused_count} windows are Focused"
+                );
+                assert_eq!(wm.state_of(f), Some(WindowState::Focused));
+                let only = wm
+                    .windows()
+                    .iter()
+                    .find(|id| wm.state_of(**id) == Some(WindowState::Focused))
+                    .copied();
+                assert_eq!(only, Some(f), "focused() and the Focused state disagree");
+            }
+            None => assert_eq!(
+                focused_count, 0,
+                "no focus reported but {focused_count} windows are Focused"
+            ),
         }
         // The Launcher is immortal and never hidden. (It is *not* required to be
         // the last entry in `z_order`: `home()`/focus legitimately raise it to the
@@ -437,5 +489,84 @@ mod tests {
             }
             assert_wm_invariants(&wm);
         }
+    }
+
+    #[test]
+    fn hiding_focused_promotes_fallback_to_focused_state() {
+        let mut wm = WindowManager::new();
+        let a = wm.register(WindowKind::App).0;
+        let b = wm.register(WindowKind::App).0;
+        wm.open(a);
+        wm.open(b);
+        assert_eq!(wm.focused(), Some(b));
+
+        wm.hide(b);
+        assert_eq!(wm.focused(), Some(a), "focus falls back to previous app");
+        assert_eq!(
+            wm.state_of(a),
+            Some(WindowState::Focused),
+            "fallback window must be Focused, not merely Shown"
+        );
+        assert_eq!(wm.state_of(b), Some(WindowState::Hidden));
+        assert_eq!(
+            wm.windows()
+                .iter()
+                .filter(|id| wm.state_of(**id) == Some(WindowState::Focused))
+                .count(),
+            1,
+            "exactly one Focused window after hiding the focused one"
+        );
+    }
+
+    #[test]
+    fn closing_focused_promotes_launcher_when_nothing_left() {
+        let mut wm = WindowManager::new();
+        let launcher = wm.launcher().unwrap();
+        let app = wm.register(WindowKind::App).0;
+        wm.open(app);
+        assert_eq!(wm.focused(), Some(app));
+
+        wm.close(app);
+        assert_eq!(wm.focused(), Some(launcher));
+        assert_eq!(wm.state_of(launcher), Some(WindowState::Focused));
+        assert_eq!(wm.windows().len(), 1, "only the launcher remains");
+    }
+
+    #[test]
+    fn closing_a_background_window_purges_it_from_recents() {
+        let mut wm = WindowManager::new();
+        let a = wm.register(WindowKind::App).0;
+        let b = wm.register(WindowKind::App).0;
+        wm.open(a);
+        wm.open(b); // b focused, a is background
+        wm.close(a); // closing a non-focused window
+
+        assert!(
+            !wm.z_order().contains(&a),
+            "closed background window must leave the recents/z-order"
+        );
+        assert_eq!(wm.focused(), Some(b));
+        assert_eq!(wm.state_of(b), Some(WindowState::Focused));
+        assert_wm_invariants(&wm);
+    }
+
+    #[test]
+    fn split_candidates_returns_front_two_shown_non_launcher() {
+        let mut wm = WindowManager::new();
+        let a = wm.register(WindowKind::App).0;
+        let b = wm.register(WindowKind::App).0;
+        let _sys = wm.register(WindowKind::System).0; // stays hidden
+        wm.open(a);
+        wm.open(b);
+
+        assert_eq!(
+            wm.split_candidates(),
+            vec![b, a],
+            "front two shown, non-Launcher windows"
+        );
+
+        // Hiding the focused app removes it from the candidates.
+        wm.hide(b);
+        assert_eq!(wm.split_candidates(), vec![a]);
     }
 }

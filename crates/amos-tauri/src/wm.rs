@@ -14,9 +14,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use amos_wm::layout::{Bounds, Size, SplitAxis};
+use amos_wm::split::SplitScreen;
 use amos_wm::{WindowId, WindowKind, WindowManager, WmEvent};
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+
+/// Default full OS window area the split layout sub-divides (0,0 origin).
+const DEFAULT_SCREEN: Bounds = Bounds::new(0, 0, 1080, 1920);
+/// Divider gap between split panes (px).
+const SPLIT_GAP: u32 = 8;
+/// Minimum size any split pane must keep.
+const SPLIT_MIN: Size = Size::new(360, 480);
+/// Tauri event broadcast after any layout change, so **non-initiating** windows /
+/// surfaces can refresh their geometry without round-tripping a command.
+pub const LAYOUT_EVENT: &str = "layout-changed";
 
 /// Tauri label of the launcher window (declared in `tauri.conf.json`).
 const LAUNCHER_LABEL: &str = "main";
@@ -42,6 +54,10 @@ struct WmCore {
     /// composited from Waydroid) — tracked in the state machine for focus/z-order
     /// but **not** backed by a Tauri WebviewWindow.
     external: HashSet<WindowId>,
+    /// Full OS window area the split layout sub-divides (0,0 origin).
+    screen: Bounds,
+    /// Active split-screen session (which two windows share the screen), if any.
+    split: Option<SplitScreen>,
 }
 
 impl Default for WmState {
@@ -72,6 +88,8 @@ impl WmState {
                 by_label,
                 kinds,
                 external: HashSet::new(),
+                screen: DEFAULT_SCREEN,
+                split: None,
             }),
         }
     }
@@ -288,6 +306,157 @@ impl WmState {
             windows,
         })
     }
+
+    /// The full OS window area the split layout sub-divides (0,0 origin).
+    pub fn screen(&self) -> Result<Bounds, String> {
+        Ok(self.lock()?.screen)
+    }
+
+    /// Set the full window area used for split layout. If a split is active it is
+    /// kept only when its divider still fits the new screen; otherwise the split
+    /// ends (honest — never silently re-clamped).
+    pub fn set_screen(&self, width: u32, height: u32) -> Result<LayoutSnapshot, String> {
+        let mut core = self.lock()?;
+        let screen = Bounds::new(0, 0, width.max(1), height.max(1));
+        core.screen = screen;
+        if let Some(s) = core.split.as_mut() {
+            if !s.set_screen(screen) {
+                core.split = None;
+            }
+        }
+        layout_core(&core)
+    }
+
+    /// Enter a split between two registered, distinct, non-Launcher windows.
+    pub fn enter_split(&self, a: &str, b: &str, axis: &str) -> Result<LayoutSnapshot, String> {
+        let mut core = self.lock()?;
+        let ia = *core
+            .by_label
+            .get(a)
+            .ok_or_else(|| format!("window '{a}' is not registered"))?;
+        let ib = *core
+            .by_label
+            .get(b)
+            .ok_or_else(|| format!("window '{b}' is not registered"))?;
+        if ia == ib {
+            return Err("cannot split a window with itself".to_string());
+        }
+        if core.kinds.get(&ia).map(String::as_str) == Some("Launcher")
+            || core.kinds.get(&ib).map(String::as_str) == Some("Launcher")
+        {
+            return Err("the Launcher cannot be split".to_string());
+        }
+        let axis = parse_axis(axis)?;
+        let screen = core.screen;
+        let sp = SplitScreen::new(ia, ib, screen, axis, SPLIT_GAP, SPLIT_MIN)
+            .ok_or_else(|| "screen too small to split those two windows".to_string())?;
+        core.split = Some(sp);
+        layout_core(&core)
+    }
+
+    /// Set the divider so the primary pane takes `percent` (1..=99).
+    pub fn split_resize(&self, percent: u32) -> Result<LayoutSnapshot, String> {
+        let mut core = self.lock()?;
+        let sp = core
+            .split
+            .as_mut()
+            .ok_or_else(|| "no active split".to_string())?;
+        if !sp.resize_to(percent) {
+            return Err(
+                "that divider share is not feasible at the current minimum size".to_string(),
+            );
+        }
+        layout_core(&core)
+    }
+
+    /// Move the divider by `delta` percentage points.
+    pub fn split_move(&self, delta: i32) -> Result<LayoutSnapshot, String> {
+        let mut core = self.lock()?;
+        let sp = core
+            .split
+            .as_mut()
+            .ok_or_else(|| "no active split".to_string())?;
+        if !sp.resize_by(delta) {
+            return Err(
+                "that divider move is not feasible at the current minimum size".to_string(),
+            );
+        }
+        layout_core(&core)
+    }
+
+    /// Swap which window is in the primary (first) pane.
+    pub fn split_swap(&self) -> Result<LayoutSnapshot, String> {
+        let mut core = self.lock()?;
+        let sp = core
+            .split
+            .as_mut()
+            .ok_or_else(|| "no active split".to_string())?;
+        sp.swap();
+        layout_core(&core)
+    }
+
+    /// End the active split (windows return to fullscreen / previous layout).
+    pub fn split_exit(&self) -> Result<LayoutSnapshot, String> {
+        let mut core = self.lock()?;
+        core.split = None;
+        layout_core(&core)
+    }
+
+    /// Apply the active split's pane rects to the **real** Tauri windows: each pane
+    /// window is moved/resized to its bounds. External or not-yet-created windows
+    /// are skipped (their geometry is owned elsewhere / comes later). No-op when
+    /// there is no active split. Best-effort — a window that fails to resize is
+    /// ignored rather than aborting the whole layout.
+    pub fn apply_split_to_real(&self, app: &AppHandle) -> Result<(), String> {
+        let snapshot = self.layout_snapshot()?;
+        let Some(info) = &snapshot.split else {
+            return Ok(());
+        };
+        for pane in &info.panes {
+            let Some(window) = app.get_webview_window(&pane.label) else {
+                continue; // external surface or not created yet
+            };
+            let _ = window.set_position(tauri::LogicalPosition::new(pane.x as f64, pane.y as f64));
+            let _ = window.set_size(tauri::LogicalSize::new(
+                pane.width as f64,
+                pane.height as f64,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The two window labels in the active split, if any (pane order: primary,
+    /// secondary). Used by the host to restore those windows when the split ends.
+    pub fn split_labels(&self) -> Result<Option<(String, String)>, String> {
+        let core = self.lock()?;
+        Ok(match &core.split {
+            Some(sp) => match (
+                core.labels.get(&sp.primary).cloned(),
+                core.labels.get(&sp.secondary).cloned(),
+            ) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            },
+            None => None,
+        })
+    }
+
+    /// The labels the host offers for entering a split (front two shown, non-Launcher).
+    pub fn split_candidates_labels(&self) -> Result<Vec<String>, String> {
+        let core = self.lock()?;
+        Ok(core
+            .wm
+            .split_candidates()
+            .into_iter()
+            .filter_map(|id| core.labels.get(&id).cloned())
+            .collect())
+    }
+
+    /// App-free snapshot of the current layout state.
+    pub fn layout_snapshot(&self) -> Result<LayoutSnapshot, String> {
+        let core = self.lock()?;
+        layout_core(&core)
+    }
 }
 
 /// Serializable view of a single window (enums aren't ergonomic over IPC).
@@ -309,7 +478,263 @@ pub struct WmSnapshot {
     pub windows: Vec<WindowInfo>,
 }
 
+// ---- Multi-window layout (screen + split) — state + commands ----
+
+/// Serializable pane rect for one split window.
+#[derive(Serialize, Clone, Debug)]
+pub struct PaneLayout {
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Serializable view of an active split session.
+#[derive(Serialize, Clone, Debug)]
+pub struct SplitLayoutInfo {
+    /// `"vertical"` (left/right) or `"horizontal"` (top/bottom).
+    pub axis: String,
+    /// First pane's share of the usable extent (1..=99).
+    pub percent: u32,
+    /// Window in the first (primary) pane.
+    pub primary: String,
+    /// Window in the second pane.
+    pub secondary: String,
+    /// The two pane rects (index 0 = primary).
+    pub panes: Vec<PaneLayout>,
+}
+
+/// Serializable snapshot of the layout sub-state.
+#[derive(Serialize, Clone, Debug)]
+pub struct LayoutSnapshot {
+    pub screen_w: u32,
+    pub screen_h: u32,
+    /// The active split, if any.
+    pub split: Option<SplitLayoutInfo>,
+    /// The labels the host offers for entering a split.
+    pub candidates: Vec<String>,
+}
+
+fn parse_axis(s: &str) -> Result<SplitAxis, String> {
+    match s {
+        "vertical" | "v" => Ok(SplitAxis::Vertical),
+        "horizontal" | "h" => Ok(SplitAxis::Horizontal),
+        other => Err(format!(
+            "unknown split axis: {other:?} (vertical|horizontal)"
+        )),
+    }
+}
+
+fn pane(label: String, b: Bounds) -> PaneLayout {
+    PaneLayout {
+        label,
+        x: b.x,
+        y: b.y,
+        width: b.width,
+        height: b.height,
+    }
+}
+
+/// Build a [`LayoutSnapshot`] from an already-locked core (no re-locking).
+fn layout_core(core: &WmCore) -> Result<LayoutSnapshot, String> {
+    let split = match &core.split {
+        Some(sp) => {
+            let (a, b) = sp
+                .bounds()
+                .ok_or_else(|| "split geometry is not available".to_string())?;
+            let primary = core.labels.get(&sp.primary).cloned().unwrap_or_default();
+            let secondary = core.labels.get(&sp.secondary).cloned().unwrap_or_default();
+            Some(SplitLayoutInfo {
+                axis: match sp.axis {
+                    SplitAxis::Vertical => "vertical",
+                    SplitAxis::Horizontal => "horizontal",
+                }
+                .to_string(),
+                percent: sp.percent(),
+                primary: primary.clone(),
+                secondary: secondary.clone(),
+                panes: vec![pane(primary, a), pane(secondary, b)],
+            })
+        }
+        None => None,
+    };
+    let candidates = core
+        .wm
+        .split_candidates()
+        .into_iter()
+        .filter_map(|id| core.labels.get(&id).cloned())
+        .collect();
+    Ok(LayoutSnapshot {
+        screen_w: core.screen.width,
+        screen_h: core.screen.height,
+        split,
+        candidates,
+    })
+}
+
+/// Common tail of a mutating layout command: apply the (possibly empty) split to
+/// the real windows, broadcast a `layout-changed` event with the new snapshot, and
+/// return it. Emitting the *authoritative* reply lets non-initiating surfaces
+/// refresh without their own command round-trip.
+fn finish_layout(
+    app: &AppHandle,
+    state: &WmState,
+    snap: &LayoutSnapshot,
+) -> Result<LayoutSnapshot, String> {
+    state.apply_split_to_real(app)?;
+    let _ = app.emit(LAYOUT_EVENT, snap);
+    Ok(snap.clone())
+}
+
 // ---- Tauri commands (frontend: `invoke('wm_open', { label })`) ----
+
+/// Read-only snapshot of the multi-window layout state.
+#[tauri::command]
+pub fn wm_layout_snapshot(state: State<'_, WmState>) -> Result<LayoutSnapshot, String> {
+    state.layout_snapshot()
+}
+
+/// Set the full window area the split layout sub-divides (re-applies any live
+/// split to the real windows + broadcasts `layout-changed`).
+#[tauri::command]
+pub fn wm_layout_set_screen(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    width: u32,
+    height: u32,
+) -> Result<LayoutSnapshot, String> {
+    let snap = state.set_screen(width, height)?;
+    finish_layout(&app, &state, &snap)
+}
+
+/// Enter a split between two windows (`axis`: `vertical`|`horizontal`) and apply
+/// the panes to the real windows.
+#[tauri::command]
+pub fn wm_split(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    primary: String,
+    secondary: String,
+    axis: String,
+) -> Result<LayoutSnapshot, String> {
+    let snap = state.enter_split(&primary, &secondary, &axis)?;
+    finish_layout(&app, &state, &snap)
+}
+
+/// Set the divider so the primary pane takes `percent` (1..=99), re-applying to
+/// the real windows.
+#[tauri::command]
+pub fn wm_split_resize(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    percent: u32,
+) -> Result<LayoutSnapshot, String> {
+    let snap = state.split_resize(percent)?;
+    finish_layout(&app, &state, &snap)
+}
+
+/// Move the divider by `delta` percentage points, re-applying to the real windows.
+#[tauri::command]
+pub fn wm_split_move(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    delta: i32,
+) -> Result<LayoutSnapshot, String> {
+    let snap = state.split_move(delta)?;
+    finish_layout(&app, &state, &snap)
+}
+
+/// Swap which window is in the primary pane, re-applying to the real windows and
+/// giving the **new primary** window OS focus (input routing follows the swap).
+#[tauri::command]
+pub fn wm_split_swap(app: AppHandle, state: State<'_, WmState>) -> Result<LayoutSnapshot, String> {
+    let snap = state.split_swap()?;
+    finish_layout(&app, &state, &snap)?;
+    // After a swap, focus the window that is now the primary pane.
+    if let Some((primary, _)) = state.split_labels()? {
+        if let Some(w) = app.get_webview_window(&primary) {
+            let _ = w.set_focus();
+        }
+    }
+    Ok(snap)
+}
+
+/// End the active split: restore the two windows to fullscreen (maximize them),
+/// clear the split state, and broadcast `layout-changed`.
+#[tauri::command]
+pub fn wm_split_exit(app: AppHandle, state: State<'_, WmState>) -> Result<LayoutSnapshot, String> {
+    // Remember which windows were split before clearing, so we can restore them.
+    let pair = state.split_labels()?;
+    let snap = state.split_exit()?;
+    if let Some((a, b)) = pair {
+        for label in [a, b] {
+            if let Some(w) = app.get_webview_window(&label) {
+                // Returning a split pane to the "full" screen = maximize. Honest
+                // fallback when no exact pre-split geometry was captured.
+                let _ = w.maximize();
+            }
+        }
+    }
+    finish_layout(&app, &state, &snap)
+}
+
+/// GUI demo entry for the real multi-window host: pick the two front split
+/// candidates, `enter_split` them, then animate a divider cycle — resize 40 →
+/// swap → resize 60 → swap — and finally `exit`. Every step is applied to the
+/// real windows and broadcast as `layout-changed`, so a dev window can watch the
+/// panes move. Requires a live multi-window Tauri app to be visually meaningful.
+#[tauri::command]
+pub async fn wm_split_demo(
+    app: AppHandle,
+    state: State<'_, WmState>,
+) -> Result<LayoutSnapshot, String> {
+    let candidates = state.split_candidates_labels()?;
+    if candidates.len() < 2 {
+        return Err("need at least two open windows to run the split demo".to_string());
+    }
+    let a = candidates[0].clone();
+    let b = candidates[1].clone();
+
+    let step_ms = std::time::Duration::from_millis(500);
+    let mut snap = state.enter_split(&a, &b, "vertical")?;
+    finish_layout(&app, &state, &snap)?;
+    tokio::time::sleep(step_ms).await;
+
+    snap = state.split_resize(40)?;
+    finish_layout(&app, &state, &snap)?;
+    tokio::time::sleep(step_ms).await;
+
+    snap = state.split_swap()?;
+    finish_layout(&app, &state, &snap)?;
+    tokio::time::sleep(step_ms).await;
+
+    snap = state.split_resize(60)?;
+    finish_layout(&app, &state, &snap)?;
+    tokio::time::sleep(step_ms).await;
+
+    snap = state.split_swap()?;
+    finish_layout(&app, &state, &snap)?;
+    tokio::time::sleep(step_ms).await;
+
+    // Restore: maximize the two windows and clear the split.
+    let pair = state.split_labels()?;
+    snap = state.split_exit()?;
+    if let Some((x, y)) = pair {
+        for label in [x, y] {
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.maximize();
+            }
+        }
+    }
+    finish_layout(&app, &state, &snap)
+}
+
+/// The window labels the host can offer for entering a split.
+#[tauri::command]
+pub fn wm_split_candidates(state: State<'_, WmState>) -> Result<Vec<String>, String> {
+    state.split_candidates_labels()
+}
 
 /// Open (create + focus) the window for `label`; returns the new snapshot.
 #[tauri::command]
@@ -548,5 +973,73 @@ mod tests {
             ctx.peek("ai").is_some(),
             "context still present for its target"
         );
+    }
+
+    #[test]
+    fn layout_split_resize_swap_exit_round_trip() {
+        let s = WmState::new();
+        s.open_surface("legacy:notes").unwrap();
+        s.open_surface("legacy:maps").unwrap();
+        assert_eq!(
+            s.layout_snapshot().unwrap().candidates,
+            vec!["legacy:maps", "legacy:notes"],
+            "front two shown, non-Launcher surfaces are split candidates"
+        );
+
+        let snap = s
+            .enter_split("legacy:notes", "legacy:maps", "vertical")
+            .unwrap();
+        let info = snap.split.expect("split active");
+        assert_eq!(info.primary, "legacy:notes");
+        assert_eq!(info.secondary, "legacy:maps");
+        assert_eq!(info.axis, "vertical");
+        assert_eq!(snap.screen_w, 1080);
+        assert_eq!(
+            s.split_labels().unwrap(),
+            Some(("legacy:notes".to_string(), "legacy:maps".to_string()))
+        );
+        assert_eq!(info.panes.len(), 2);
+        // The two panes tile the screen minus the divider gap.
+        let total: u64 = info.panes.iter().map(|p| u64::from(p.width)).sum();
+        assert_eq!(total + u64::from(SPLIT_GAP), 1080);
+
+        // Feasible divider move.
+        let r = s.split_resize(40).unwrap().split.unwrap();
+        assert_eq!(r.percent, 40);
+
+        // Swap flips which window is primary.
+        let sw = s.split_swap().unwrap().split.unwrap();
+        assert_eq!(sw.primary, "legacy:maps");
+        assert_eq!(sw.secondary, "legacy:notes");
+
+        // Exit clears the split (and the host then maximizes those windows).
+        assert!(s.split_exit().unwrap().split.is_none());
+        assert_eq!(s.split_labels().unwrap(), None);
+    }
+
+    #[test]
+    fn layout_split_rejects_bad_input_and_set_screen_can_end_a_split() {
+        let s = WmState::new();
+        s.open_surface("legacy:a").unwrap();
+        s.open_surface("legacy:b").unwrap();
+
+        // Same window twice.
+        assert!(s.enter_split("legacy:a", "legacy:a", "vertical").is_err());
+        // Unknown axis.
+        assert!(s.enter_split("legacy:a", "legacy:b", "diagonal").is_err());
+        // Launcher cannot be split.
+        assert!(s.enter_split("main", "legacy:a", "vertical").is_err());
+        // A divider share below the minimum size is rejected.
+        let _ = s.enter_split("legacy:a", "legacy:b", "vertical").unwrap();
+        assert!(
+            s.split_resize(5).is_err(),
+            "5% pane is below the minimum size"
+        );
+        assert_eq!(s.layout_snapshot().unwrap().split.unwrap().percent, 50);
+
+        // Shrinking the screen below the min panes ends the split (no silent clamp).
+        let snap = s.set_screen(200, 100).unwrap();
+        assert!(snap.split.is_none());
+        assert_eq!((snap.screen_w, snap.screen_h), (200, 100));
     }
 }

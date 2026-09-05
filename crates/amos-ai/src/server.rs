@@ -1,6 +1,7 @@
 //! gRPC service implementation served over a Unix Domain Socket.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::energy::{EnergySnapshot, EnergyStore};
-use crate::governor::ResourceGovernor;
+use crate::governor::{parse_kinds_env, DvfsDriver, ResourceGovernor};
 use crate::inference::real::{BackendKind, InferenceBackend, MockBackend, OllamaBackend};
 use crate::monitoring::Monitor;
 use crate::profiler::{ProfileSnapshot, ProfileStore};
@@ -57,6 +58,14 @@ pub struct AiAgentService {
     /// The shared resource-governor closed loop (set by `serve()` so `get_status`
     /// can report what the governor is doing; `None` for a standalone service).
     governor: Option<Arc<std::sync::Mutex<ResourceGovernor>>>,
+    /// The optional resident DVFS driver (discovered from `AMOS_CPUFREQ_ROOT`);
+    /// `get_status` reports its applied/failed write counters.
+    dvfs: Option<Arc<std::sync::Mutex<DvfsDriver>>>,
+    /// OS system working-status sampler (CPU/memory, amos-monitor). Sampled on
+    /// each `get_status` (advancing the busy% delta baseline) and folded into
+    /// `StatusReply.system`. Real `/proc` on Linux/Android; honest "unknown" where
+    /// `/proc` is absent (e.g. macOS dev) — never a fabricated reading.
+    system_sampler: Arc<dyn amos_monitor::SystemSampler>,
 }
 
 impl AiAgentService {
@@ -108,6 +117,8 @@ impl AiAgentService {
             profile: Arc::new(ProfileStore::new()),
             energy: Arc::new(EnergyStore::new()),
             governor: None,
+            dvfs: None,
+            system_sampler: default_system_sampler(),
         }
     }
 
@@ -134,6 +145,8 @@ impl AiAgentService {
             profile: Arc::new(ProfileStore::new()),
             energy: Arc::new(EnergyStore::new()),
             governor: None,
+            dvfs: None,
+            system_sampler: default_system_sampler(),
         }
     }
 
@@ -178,10 +191,24 @@ impl AiAgentService {
         Arc::clone(&self.energy)
     }
 
+    /// Shared handle to the OS system-load sampler (real `/proc` on Linux/Android;
+    /// honest "unknown" elsewhere). Shared so `get_status` and the periodic system
+    /// heartbeat advance the same busy% delta baseline.
+    pub fn system_sampler(&self) -> Arc<dyn amos_monitor::SystemSampler> {
+        Arc::clone(&self.system_sampler)
+    }
+
     /// Attach the daemon's shared resource-governor closed loop so `get_status`
     /// reports its live decision (called by `serve()`).
     pub fn set_governor(&mut self, governor: Arc<std::sync::Mutex<ResourceGovernor>>) {
         self.governor = Some(governor);
+    }
+
+    /// Attach the optional shared DVFS driver so `get_status` can report its
+    /// applied/failed write counters (called by `serve()`; absent on hosts with no
+    /// `AMOS_CPUFREQ_ROOT`).
+    pub fn set_dvfs(&mut self, dvfs: Option<Arc<std::sync::Mutex<DvfsDriver>>>) {
+        self.dvfs = dvfs;
     }
 
     /// Fold the current [`ProfileStore`] snapshot into the wire `ProfileMetrics`.
@@ -211,6 +238,14 @@ impl AiAgentService {
     /// `GovernorMetrics` (pending baseline when the governor is not attached / has
     /// not run yet).
     fn governor_metrics(&self) -> GovernorMetrics {
+        // DVFS write counters (0 when no DVFS beat is active).
+        let (dvfs_applied, dvfs_failed) = match &self.dvfs {
+            Some(d) => {
+                let d = d.lock().unwrap_or_else(|p| p.into_inner());
+                (d.applied_total(), d.failed_total())
+            }
+            None => (0, 0),
+        };
         match &self.governor {
             Some(g) => {
                 let g = g.lock().unwrap_or_else(|p| p.into_inner());
@@ -221,6 +256,9 @@ impl AiAgentService {
                         cap_inference: o.cap_inference,
                         throttle_background: o.throttle_background,
                         ticks: g.ticks(),
+                        dvfs_applied,
+                        dvfs_failed,
+                        dropped: o.dropped.len() as u64,
                     },
                     None => GovernorMetrics {
                         sensor_mode: "balanced".to_string(),
@@ -228,6 +266,9 @@ impl AiAgentService {
                         cap_inference: false,
                         throttle_background: false,
                         ticks: 0,
+                        dvfs_applied,
+                        dvfs_failed,
+                        dropped: 0,
                     },
                 }
             }
@@ -237,7 +278,65 @@ impl AiAgentService {
                 cap_inference: false,
                 throttle_background: false,
                 ticks: 0,
+                dvfs_applied,
+                dvfs_failed,
+                dropped: 0,
             },
+        }
+    }
+
+    /// Fold the OS system working status into the wire `SystemHealth` (amos-monitor).
+    ///
+    /// Samples the system sampler (advancing its busy% delta baseline so the next
+    /// read reports a real window), folds the shared governor's registered app
+    /// lifecycle into per-tier process counts, and reports battery honestly as
+    /// "unknown" here (battery/thermal/power live on the energy-governor block
+    /// above, which this block must not duplicate). Absent optionals = unknown.
+    fn system_metrics(&self) -> amos_proto::ai_agent::SystemHealth {
+        // Shared fold (sampler load + energy battery + governor counts) that the
+        // periodic system heartbeat also logs, so both tell one consistent story.
+        let h = fold_system_health(
+            self.system_sampler.as_ref(),
+            self.energy.snapshot(),
+            self.governor.as_ref().map(|g| g.as_ref()),
+        );
+        let l = &h.load;
+        amos_proto::ai_agent::SystemHealth {
+            load: Some(amos_proto::ai_agent::SystemLoad {
+                cpu_busy_pct: l.cpu.busy_pct,
+                mem_total_bytes: l.memory.total_bytes,
+                mem_available_bytes: l.memory.available_bytes,
+            }),
+            battery: Some(amos_proto::ai_agent::SystemBattery {
+                level_pct: h.battery.level_pct,
+                charging: h.battery.charging,
+                live_power_mw: h.battery.live_power_mw,
+            }),
+            processes: Some(amos_proto::ai_agent::ProcessCounts {
+                running: h.processes.running as u32,
+                cached: h.processes.cached as u32,
+                stopped: h.processes.stopped as u32,
+            }),
+            sampler: self.system_sampler.name().to_string(),
+            apps: self.governor_apps(),
+        }
+    }
+
+    /// The governor's tracked apps as (id, lifecycle-key) pairs for the Task-Manager
+    /// listing (empty when nothing is registered).
+    fn governor_apps(&self) -> Vec<amos_proto::ai_agent::AppProcess> {
+        match &self.governor {
+            Some(g) => {
+                let g = g.lock().unwrap_or_else(|p| p.into_inner());
+                g.app_entries()
+                    .into_iter()
+                    .map(|(id, state)| amos_proto::ai_agent::AppProcess {
+                        id: id.0,
+                        state: state.key().to_string(),
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
         }
     }
 
@@ -258,6 +357,83 @@ impl AiAgentService {
 /// dev/test `mock` (or an empty/unknown value).
 fn is_real_backend(kind: &str) -> bool {
     matches!(kind, "api" | "ollama" | "hermes" | "ggml")
+}
+
+/// Trim + parse a non-negative integer; `None` for empty / malformed input.
+fn parse_trimmed_u32(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        t.parse::<u32>().ok()
+    }
+}
+
+/// Split a comma-separated list of sysfs node paths, trimming + dropping empties.
+/// Malformed members are simply dropped so a bad value never takes the daemon down.
+fn parse_node_paths(s: &str) -> Vec<std::path::PathBuf> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// Read an optional non-negative integer from the environment (trimmed); `None`
+/// for unset/empty/unparseable so a bad value never takes the daemon down.
+pub fn opt_env_u32(key: &str) -> Option<u32> {
+    std::env::var(key).ok().and_then(|v| parse_trimmed_u32(&v))
+}
+
+/// Build the daemon's system-load sampler (real `/proc` on Linux/Android) and
+/// take one warm read so a subsequent `get_status` has a busy% delta baseline
+/// instead of reporting "unknown" on its first probe. On hosts without `/proc`
+/// (e.g. macOS dev) reads are honest "unknown".
+fn default_system_sampler() -> Arc<dyn amos_monitor::SystemSampler> {
+    let sampler: Arc<dyn amos_monitor::SystemSampler> =
+        Arc::new(amos_monitor::LinuxSystemSampler::new());
+    let _ = sampler.snapshot();
+    sampler
+}
+
+/// Fold the OS system working status (sampler load + energy-governor battery +
+/// governor app counts) into the crate-level [`amos_monitor::SystemHealth`]. Shared
+/// by `get_status` (proto mapping) and the periodic system heartbeat so both tell
+/// the same story from one fold. Absent values are honest "unknown".
+fn fold_system_health(
+    sampler: &dyn amos_monitor::SystemSampler,
+    energy: EnergySnapshot,
+    governor: Option<&std::sync::Mutex<ResourceGovernor>>,
+) -> amos_monitor::SystemHealth {
+    use amos_applife::AppState;
+    let load = sampler.snapshot();
+    let mut processes = amos_monitor::ProcessSummary::default();
+    if let Some(g) = governor {
+        let g = g.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, state) in g.app_entries() {
+            match state {
+                AppState::Cached => processes.cached += 1,
+                AppState::Stopped => processes.stopped += 1,
+                _ => processes.running += 1,
+            }
+        }
+    }
+    // Charging is only reported once the energy governor has actually ticked (before
+    // that it is the "pending" baseline — unknown, never fabricated).
+    let charging = if energy.ticks > 0 {
+        Some(energy.charging)
+    } else {
+        None
+    };
+    amos_monitor::SystemHealth {
+        load,
+        battery: amos_monitor::BatteryStatus {
+            level_pct: energy.level_pct,
+            charging,
+            live_power_mw: energy.power_mw,
+        },
+        processes,
+    }
 }
 
 /// Human label of the voice ASR recognizer that `ChatAsr` would build from the
@@ -937,6 +1113,7 @@ impl AiAgent for AiAgentService {
             profile: Some(self.profile_metrics()),
             energy: Some(self.energy_metrics()),
             governor: Some(self.governor_metrics()),
+            system: Some(self.system_metrics()),
         }))
     }
 
@@ -1104,7 +1281,46 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     // and the governor beat feeds host-driven reclaims through the same fan-out.
     let lmk_events: tokio::sync::broadcast::Sender<amos_proto::android_compat::LmkEvent> =
         tokio::sync::broadcast::channel(128).0;
+    // Optional resident DVFS beat: when `AMOS_CPUFREQ_ROOT` points at a Linux
+    // cpufreq sysfs tree (device bring-up), discover the CPU domains once and each
+    // beat apply the frequency plan the ResourceGovernor decision implies — only
+    // when it changed. Inert on hosts without such a root (CI/desktop unchanged).
+    let dvfs_root = std::env::var("AMOS_CPUFREQ_ROOT").ok();
+    // Optional NPU hardware max (kHz): lets the governor's `freq_plan` emit NPU
+    // ceilings (Balanced ~85% / PowerSave lower) on device; unset = no NPU cap.
+    let npu_max_khz = opt_env_u32("AMOS_CPUFREQ_NPU_MAX_KHZ");
+    // Optional NPU devfreq max-freq node(s) to actually write (comma-separated,
+    // e.g. "/sys/class/devfreq/1d84000.npu/max_freq"). Empty = only compute plans.
+    let npu_paths = std::env::var("AMOS_CPUFREQ_NPU_NODES")
+        .ok()
+        .map(|v| parse_node_paths(&v))
+        .unwrap_or_default();
+    let mut dvfs_driver = dvfs_root.as_deref().and_then(|r| {
+        tracing::info!(
+            root = %r,
+            npu_max_khz,
+            npu_nodes = npu_paths.len(),
+            "amos-ai enabling resident DVFS beat"
+        );
+        DvfsDriver::from_cpufreq_root(Path::new(r), 64, npu_max_khz, npu_paths.clone())
+    });
+    // Device bring-up may override the kind heuristic with the real topology:
+    // `AMOS_GOVERNOR_CPU_KINDS="0:Little,4:Big"` (kind case-insensitive).
+    if let (Ok(kinds_env), Some(drv)) = (
+        std::env::var("AMOS_GOVERNOR_CPU_KINDS"),
+        dvfs_driver.as_mut(),
+    ) {
+        let kinds = parse_kinds_env(&kinds_env);
+        if !kinds.is_empty() {
+            tracing::info!(kinds = %kinds_env, "amos-ai dvfs kind override");
+            drv.relabel_kinds(&kinds);
+        }
+    }
+    // Share the driver between the beat (writes) and get_status (read counters).
+    let dvfs: Option<Arc<std::sync::Mutex<DvfsDriver>>> =
+        dvfs_driver.map(|d| Arc::new(std::sync::Mutex::new(d)));
     let governor_beat = {
+        let dvfs_beat = dvfs.clone();
         let gov = Arc::clone(&governor);
         let ahost = Arc::clone(&android_host);
         let aproxy = Arc::clone(&android_proxy);
@@ -1129,11 +1345,42 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
                     &o, &ahost, &aproxy, &amanager, &levents,
                 )
                 .await;
+                // Resident DVFS: apply the frequency plan implied by the latest
+                // energy decision, only when the ceilings actually changed.
+                if let Some(darc) = &dvfs_beat {
+                    let plan = {
+                        let drv = darc.lock().unwrap_or_else(|p| p.into_inner());
+                        let g = gov.lock().unwrap_or_else(|p| p.into_inner());
+                        g.freq_plan(drv.clusters(), drv.npu_max_khz())
+                    };
+                    if let Some(p) = plan {
+                        let rep = {
+                            let mut drv = darc.lock().unwrap_or_else(|p| p.into_inner());
+                            drv.apply_if_changed(&p)
+                        };
+                        if let Some(rep) = rep {
+                            if rep.is_clean() {
+                                tracing::info!(
+                                    mode = o.sensor_mode,
+                                    applied = rep.applied,
+                                    "amos-ai dvfs applied"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    mode = o.sensor_mode,
+                                    partial = %rep,
+                                    "amos-ai dvfs partial"
+                                );
+                            }
+                        }
+                    }
+                }
                 let acted = !o.fired_alarms.is_empty()
                     || !o.ran_deferred.is_empty()
                     || !o.frozen.is_empty()
                     || !o.thawed.is_empty()
-                    || !o.reclaimed.is_empty();
+                    || !o.reclaimed.is_empty()
+                    || !o.dropped.is_empty();
                 if acted {
                     tracing::info!(
                         sensor_mode = o.sensor_mode,
@@ -1143,6 +1390,7 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
                         frozen = o.frozen.len(),
                         thawed = o.thawed.len(),
                         reclaimed = o.reclaimed.len(),
+                        dropped = o.dropped.len(),
                         background_count = o.background_count,
                         "amos-ai resource governor acted"
                     );
@@ -1151,9 +1399,36 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         })
     };
     // Make get_status report the shared governor's live decision (same instance the
-    // beat ticks and the Governor gRPC service mutates).
+    // beat ticks and the Governor gRPC service mutates) + the DVFS write counters.
     ai_service.set_governor(Arc::clone(&governor));
+    ai_service.set_dvfs(dvfs);
     let svc_monitor = Arc::clone(&monitor);
+
+    // Periodic system working-status heartbeat: logs one `SystemHealth::summary()`
+    // line on the same cadence as the other beats (CPU busy% is a delta, so a
+    // periodic read keeps it meaningful; battery/process tiers fold the SAME shared
+    // governor/energy the get_status path uses). Aborted on shutdown below.
+    let sys_sampler = ai_service.system_sampler();
+    let sys_energy = ai_service.energy();
+    let sys_gov = Arc::clone(&governor);
+    let sys_interval = interval.max(Duration::from_millis(100));
+    let system_beat = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sys_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let health = fold_system_health(
+                sys_sampler.as_ref(),
+                sys_energy.snapshot(),
+                Some(sys_gov.as_ref()),
+            );
+            tracing::info!(
+                sampler = sys_sampler.name(),
+                "amos-ai system working status: {}",
+                health.summary()
+            );
+        }
+    });
 
     let server = tonic::transport::Server::builder()
         .add_service(AiAgentServer::with_interceptor(
@@ -1206,6 +1481,7 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     profile_beat.abort();
     energy_beat.abort();
     governor_beat.abort();
+    system_beat.abort();
 
     // Persist sessions (if `AMOS_SESSIONS_PATH` is set) before exiting.
     if let Some(p) = &sessions_path {
@@ -1710,5 +1986,212 @@ mod tests {
         assert_eq!(after.sensor_mode, "power_save");
         assert!(after.throttle_background);
         assert!(after.ticks >= 1);
+        assert_eq!(after.dropped, 0, "no deferred window expired in this tick");
+    }
+
+    #[test]
+    fn governor_metrics_surfaces_expired_deferred_count() {
+        use amos_power::{BatteryState, Telemetry, Usage};
+        use amos_scheduler::{JobId, ScheduledJob};
+
+        let mut svc = AiAgentService::with_security_and_backend(
+            Arc::new(SecurityManager::default()),
+            Arc::new(MockBackend::new()),
+        );
+        let gov = Arc::new(std::sync::Mutex::new(ResourceGovernor::default()));
+        // A deferred job whose [0,3] window fully passes while PowerSave throttles it.
+        gov.lock()
+            .unwrap()
+            .schedule(ScheduledJob::deferred(JobId::new("expired"), 0, 3).unwrap())
+            .unwrap();
+        svc.set_governor(Arc::clone(&gov));
+
+        // now=50, low battery (PowerSave) → the expired deferred is dropped.
+        gov.lock().unwrap().observe(
+            50,
+            Telemetry::new(BatteryState::on_battery(15.0), Usage::default(), None),
+            false,
+            false,
+        );
+        let m = svc.governor_metrics();
+        assert_eq!(m.sensor_mode, "power_save");
+        assert_eq!(m.dropped, 1, "expired deferred surfaced on the wire");
+    }
+
+    #[test]
+    fn governor_metrics_reports_dvfs_write_counters() {
+        use crate::governor::DvfsDriver;
+        use amos_power::plan;
+        use amos_sensor::SensorMode;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("amos-ai-dvfs-status-{}-{seq}", std::process::id()));
+        for (cpu, max) in [(0u32, 1_800_000u32), (4, 2_500_000u32)] {
+            let dir = root.join(format!("cpu{cpu}/cpufreq"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cpuinfo_max_freq"), format!("{max}\n")).unwrap();
+            std::fs::write(dir.join("scaling_max_freq"), "999999\n").unwrap();
+        }
+
+        // One applied PowerSave plan over the discovered topology => 2 writes.
+        let mut d = DvfsDriver::from_cpufreq_root(&root, 8, None, Vec::new()).unwrap();
+        let ps = plan(SensorMode::PowerSave, d.clusters(), None);
+        assert!(d.apply_if_changed(&ps).is_some());
+        let shared = Arc::new(std::sync::Mutex::new(d));
+
+        let mut svc = AiAgentService::with_security_and_backend(
+            Arc::new(SecurityManager::default()),
+            Arc::new(MockBackend::new()),
+        );
+        svc.set_dvfs(Some(shared));
+        let m = svc.governor_metrics();
+        assert_eq!(m.dvfs_applied, 2);
+        assert_eq!(m.dvfs_failed, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn system_metrics_folds_governor_process_counts_and_stays_honest() {
+        use crate::governor::ResourceGovernor;
+        use amos_applife::AppId;
+
+        let mut svc = AiAgentService::with_security_and_backend(
+            Arc::new(SecurityManager::default()),
+            Arc::new(MockBackend::new()),
+        );
+        // Deterministic host sampler: 8 GB total, 2 GB available, no CPU baseline.
+        svc.system_sampler = Arc::new(amos_monitor::MockSystemSampler::new(
+            8_000_000_000,
+            2_000_000_000,
+        ));
+
+        // One live foreground app registered into the shared governor.
+        let gov = Arc::new(std::sync::Mutex::new(ResourceGovernor::default()));
+        gov.lock()
+            .unwrap()
+            .register_app(AppId::new("com.amos.photos"))
+            .unwrap();
+        svc.set_governor(Arc::clone(&gov));
+
+        let h = svc.system_metrics();
+        assert_eq!(h.sampler, "mock");
+
+        // CPU honest "unknown" on the first read (no baseline yet) — never a number.
+        let load = h.load.expect("load block present");
+        assert_eq!(
+            load.cpu_busy_pct, None,
+            "first mock read has no CPU baseline"
+        );
+        assert_eq!(load.mem_total_bytes, Some(8_000_000_000));
+        assert_eq!(load.mem_available_bytes, Some(2_000_000_000));
+
+        // The one live foreground app is counted as running; nothing cached/stopped.
+        let procs = h.processes.expect("process block present");
+        assert_eq!(procs.running, 1);
+        assert_eq!(procs.cached, 0);
+        assert_eq!(procs.stopped, 0);
+
+        // ... and appears in the per-app list by id + lifecycle key.
+        assert_eq!(h.apps.len(), 1);
+        assert_eq!(h.apps[0].id, "com.amos.photos");
+        assert_eq!(h.apps[0].state, "foreground");
+
+        // Battery comes from the energy-governor store; not ticked yet → pending →
+        // level honestly unknown (never fabricated).
+        assert_eq!(h.battery.expect("battery block present").level_pct, None);
+    }
+
+    #[test]
+    fn system_metrics_threads_energy_battery_level() {
+        use amos_power::Telemetry;
+
+        let svc = AiAgentService::with_security_and_backend(
+            Arc::new(SecurityManager::default()),
+            Arc::new(MockBackend::new()),
+        );
+        // Tick the energy governor with an explicit 62% on-battery read → the system
+        // block reflects it (single-surface battery from the authoritative source).
+        svc.energy().tick_with(Telemetry::new(
+            amos_power::BatteryState::on_battery(62.0),
+            amos_power::Usage::default(),
+            None,
+        ));
+        let h = svc.system_metrics();
+        let b = h.battery.expect("battery block present");
+        assert_eq!(b.level_pct, Some(62.0));
+        assert_eq!(b.charging, Some(false), "on-battery → not charging");
+    }
+
+    #[test]
+    fn fold_system_health_shares_sampler_energy_and_governor() {
+        use amos_applife::AppId;
+        use amos_power::{BatteryState, Telemetry, Usage};
+
+        let sampler = amos_monitor::MockSystemSampler::new(8_000_000_000, 2_000_000_000);
+        let energy = EnergyStore::new();
+        energy.tick_with(Telemetry::new(
+            BatteryState::on_battery(62.0),
+            Usage::default(),
+            None,
+        ));
+        let gov = std::sync::Mutex::new(ResourceGovernor::default());
+        gov.lock()
+            .unwrap()
+            .register_app(AppId::new("com.amos.photos"))
+            .unwrap();
+
+        let h = fold_system_health(&sampler, energy.snapshot(), Some(&gov));
+        assert_eq!(
+            h.load.memory.used_pct(),
+            Some(75.0),
+            "8 GB total, 2 GB avail"
+        );
+        assert_eq!(h.battery.level_pct, Some(62.0));
+        assert_eq!(h.battery.charging, Some(false), "on-battery → not charging");
+        assert_eq!(h.processes.running, 1);
+        assert!(h.summary().contains("battery=62%"), "{}", h.summary());
+
+        // Pending energy baseline → battery honest unknown, charging unreported.
+        let pending = fold_system_health(&sampler, EnergySnapshot::pending(), Some(&gov));
+        assert_eq!(pending.battery.level_pct, None);
+        assert_eq!(pending.battery.charging, None);
+        assert_eq!(pending.processes.running, 1, "process tiers still fold");
+    }
+
+    #[test]
+    fn parse_trimmed_u32_is_hermetic_and_lenient() {
+        assert_eq!(parse_trimmed_u32("1500000"), Some(1_500_000));
+        assert_eq!(
+            parse_trimmed_u32("  2100000  "),
+            Some(2_100_000),
+            "trims whitespace"
+        );
+        assert_eq!(parse_trimmed_u32(""), None, "empty → None");
+        assert_eq!(parse_trimmed_u32("  "), None, "blank → None");
+        assert_eq!(parse_trimmed_u32("nope"), None, "non-numeric → None");
+        assert_eq!(parse_trimmed_u32("-5"), None, "negative rejected (u32)");
+    }
+
+    #[test]
+    fn parse_node_paths_splits_trims_and_drops_empties() {
+        use std::path::PathBuf;
+        let p = parse_node_paths(
+            " /sys/class/devfreq/npu/max_freq ,,/sys/class/devfreq/npu2/max_freq ,  ",
+        );
+        assert_eq!(
+            p,
+            vec![
+                PathBuf::from("/sys/class/devfreq/npu/max_freq"),
+                PathBuf::from("/sys/class/devfreq/npu2/max_freq"),
+            ]
+        );
+        assert!(parse_node_paths("").is_empty(), "empty → no nodes");
+        assert!(
+            parse_node_paths(" , , ").is_empty(),
+            "only blanks → no nodes"
+        );
     }
 }

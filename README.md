@@ -50,10 +50,11 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-telephony/           # telephony domain core + gRPC service: Number/EmergencyMap, CallSession state machine, TelephonyProvider seams + Mock (docs/telephony.md)
     ├── amos-radio/               # radio/connectivity domain core: wifi/bluetooth/airplane state + RadioProvider seams (Mock / android JNI) + RadioManager airplane policy (docs/radio.md)
     ├── amos-sensor/              # device-sensor domain core: camera / GPS-GNSS / IMU spec types + SensorProvider seam (Mock / Android `android`-gated: GNSS real via LocationManager) + energy-policy SensorManager (docs/sensors.md)
-    ├── amos-profiling/           # inference performance & power-profiling domain core: prompt/decode tokens-per-second + TTFT + per-token latency, PowerSource seam (Mock / Android `android`-gated battery) + energy estimate (docs/profiling.md)
-    ├── amos-power/               # energy-governor domain core: folds battery/thermal/live-power/foreground-background into a SensorMode decision + applies it to SensorManager (docs/power-policy.md)
+    ├── amos-profiling/           # inference performance & power-profiling domain core: prompt/decode tokens-per-second + TTFT + per-token latency, real power model `BatterySample` (µA×mV) + `mean_power_mw` window averaging, PowerSource seam (Mock / Android `android`-gated battery: live `CURRENT_NOW` × self-refreshed `EXTRA_VOLTAGE`) → honest `est_energy_j` (docs/profiling.md)
+    ├── amos-power/               # energy-governor domain core: folds battery/thermal/live-power/foreground-background into a SensorMode decision + applies it to SensorManager; CPU/NPU frequency domain (`FreqPlan`, protects the little cluster) + dedup `FrequencyGovernor` + Linux `scaling_max_freq` cap/restore applier (`feature linux`) (docs/power-policy.md)
     ├── amos-applife/             # app/process lifecycle domain core: per-app foreground/background/tombstone states + LRU + memory-pressure reclaim (LMK-proxy) (docs/app-lifecycle.md)
     ├── amos-scheduler/           # background-task scheduler + wakeup-alignment domain core: AlarmExact vs Deferred jobs, Doze/charging/maintenance-window gating + coalesced due-batching + next-wake (docs/scheduler.md)
+    ├── amos-monitor/             # system working-status (health) domain core: folds SystemSampler load (CPU/mem) + amos-profiling battery/power + amos-applife process counts into one honest SystemHealth (real /proc `linux` sampler, `android` skeleton) (docs/system-monitor.md)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -365,9 +366,13 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams)
 - [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
 - [docs/sensors.md](./docs/sensors.md) — Device sensors/multimedia domain core: `amos-sensor` camera / GPS-GNSS / IMU spec types + SensorProvider seam + energy-policy SensorManager (real HAL + service-bus wiring left as seams)
-- [docs/profiling.md](./docs/profiling.md) — Inference performance & power profiling domain core: `amos-profiling` prompt/decode tokens-per-second, TTFT, per-token latency, PowerSource seam + energy estimate (daemon assembly + power HAL left as seams)
+- [docs/profiling.md](./docs/profiling.md) — Inference performance & power profiling domain core: `amos-profiling` prompt/decode tokens-per-second, TTFT, per-token latency, real `BatterySample` power model + `mean_power_mw`, PowerSource seam (live `CURRENT_NOW` × `EXTRA_VOLTAGE`) + honest energy estimate (`est_energy_j`)
+- [docs/power-policy.md](./docs/power-policy.md) — Energy Governor → CPU/NPU frequency closed loop: `amos-power` folds battery/thermal/live-power/foreground-background into a `SensorMode` decision, then maps it to per-cluster + NPU frequency ceilings (`FreqPlan`/`FrequencyGovernor`) and a Linux `scaling_max_freq` cap/restore applier (`feature linux`)
+- [docs/system-monitor.md](./docs/system-monitor.md) — System working status (health): `amos-monitor` folds CPU/memory load, battery/power and per-app process tiers into one honest `SystemHealth`, exposed as `GetStatus.system` and surfaced through a `system_health` Tauri bridge to a live Settings panel
+- [docs/dvfs-power-bringup.md](./docs/dvfs-power-bringup.md) — 真机 bring-up runbook：电源/DVFS 子系统部署与验收（env 开关、架构速览、host 验证命令、设备步骤/判据、诚实边界）
 - [docs/bidi-voice-asr.md](./docs/bidi-voice-asr.md) — AI-assistant voice wiring: bidi `Payload::Audio` → local ASR (design)
 - [docs/audio-hal-bridge.md](./docs/audio-hal-bridge.md) — Hardware audio (Audio HAL Bridge): `amos-audio` capture/playback traits + resample + mocks + gated TinyALSA/AAudio seams; bidi real-sherpa ASR (`asr-sherpa` feature)
+- [docs/aaudio-sherpa-bringup.md](./docs/aaudio-sherpa-bringup.md) — 真机 bring-up runbook: NDK 交叉编译/链接验收 (compile-all-ABI + AAudio `#[link]` DT_NEEDED) + `make android-audio-check`/CI 门 + device wiring/acceptance checklist
 - [docs/device-poc.md](./docs/device-poc.md) — On-device POC: cross-compile `amos-ai` + run `chat_once` over UDS on a real phone
 - [docs/no-ui-android.md](./docs/no-ui-android.md) — no-UI Android base: init.rc orchestration, `--ai-voice` sherpa cross-build + model push, and a pasteable on-device AI POC acceptance sequence
 - [docs/external-analysis-review.md](./docs/external-analysis-review.md) — Audit of an external gap analysis against the real tree
@@ -375,6 +380,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/qcom-mtk-bringup.md](./docs/qcom-mtk-bringup.md) — QCOM/MTK 真机落地骨架：`amos-ai::accelerator` 芯片/加速器画像 seam、`AMOS_GGML_STRICT` 诚实本地引擎、AAudio→sherpa 语音闭环接线点与验收判据
 - [docs/DELIVERY_NOTES_2026-09-03.md](./docs/DELIVERY_NOTES_2026-09-03.md) — Commit message + changeset + known limits for the telephony/voice/strategy work (2026-09-03)
 - [docs/DELIVERY_NOTES_2026-09-05.md](./docs/DELIVERY_NOTES_2026-09-05.md) — Commit message + changeset + known limits for the Android LMK-proxy / bidirectional bridge / WatchLmk / System-UI surface-teardown work (2026-09-05)
+- [docs/DELIVERY_NOTES_2026-09-05-system-monitor.md](./docs/DELIVERY_NOTES_2026-09-05-system-monitor.md) — Commit message + changeset + known limits for the system working-status (amos-monitor) domain core + daemon/Tauri/frontend wiring (2026-09-05)
 
 ## License
 
@@ -398,7 +404,7 @@ You may use this project under either license at your discretion. See [LICENSE](
 - [ ] Multi-window desktop OS features
 - [ ] Mobile platform optimization (iOS/Android)
 - [ ] Extended device API access — domain core + gRPC `SensorService` wired into the daemon UDS + System UI desktop bridge (`sensor_snapshot`/`set_mode`/`acquire` + `lib/sensors.ts`); feature-gated Android skeleton landed (GNSS real via `LocationManager`); device bring-up: camera-frame/IMU stream bridges + System UI real-`Context` wiring (`docs/sensors.md`)
-- [ ] Performance profiling and optimization — metric kernel wired into the daemon's `stream_chat` + bidi `Chat` decode paths, exposed on `get_status.profile`, on the periodic heartbeat log, and rendered in the Settings diagnostics area; battery `PowerSource` Android skeleton landed; device/UI follow-ons: live `EXTRA_VOLTAGE`→`est_energy_j` + sensor tile (`docs/profiling.md`)
+- [ ] Performance profiling and optimization — metric kernel wired into the daemon's `stream_chat` + bidi `Chat` decode paths, exposed on `get_status.profile`, on the periodic heartbeat log, and rendered in the Settings diagnostics area; **real power model landed** (`BatterySample`/`mean_power_mw`, Android source reads live `CURRENT_NOW` × `EXTRA_VOLTAGE` → `est_energy_j`); **Energy-Governor → CPU/NPU frequency closed loop landed** (`freq` domain + `FrequencyGovernor` + Linux `scaling_max_freq` cap/restore seam, and `ResourceGovernor::freq_plan` composition bridge). Remaining device/UI follow-ons: System-UI ticker sampling real battery + injecting chip topology + cpufreq write privileges (`docs/profiling.md`, `docs/power-policy.md`)
 
 ## Support
 

@@ -30,15 +30,17 @@
 //! * [`types`] — [`Phase`] (PromptEval / Decode) and [`Record`].
 //! * [`tracker`] — [`ProfileTracker`]: lossless sums + tokens/s, ms-per-token,
 //!   TTFT and merge. Division-by-zero guarded (empty → `None`, never `NaN`).
-//! * [`power`] — the [`PowerSource`] seam + deterministic [`MockPowerSource`]
-//!   + `power × time` energy math.
+//! * [`power`] — the [`PowerSource`] seam + deterministic [`MockPowerSource`],
+//!   the real [`BatterySample`] voltage×current model
+//!   ([`BatterySample::power_mw`]), [`mean_power_mw`] window averaging, and
+//!   `power × time` energy math.
 //! * [`measure`] — [`time`]/[`time_and`] helpers that wrap a model call in an
 //!   `Instant` and return the wall `Duration` to record.
 //! * [`report`] — an owned, displayable [`ProfileReport`] snapshot.
 //!
 //! The domain core is pure `std` on the host (no tokio / FFI), so the default
 //! workspace build stays light and green. An optional real Android power backend
-//! ([`android`]) is feature-gated `android` + `jni`, for on-device System UI builds.
+//! (`android`) is feature-gated `android` + `jni`, for on-device System UI builds.
 
 // P0-1 gate: production code must not panic on programmer error (tests exempt).
 #![cfg_attr(
@@ -56,7 +58,7 @@ pub mod types;
 pub mod android;
 
 pub use measure::{time, time_and};
-pub use power::{energy_joules, MockPowerSource, PowerSource};
+pub use power::{energy_joules, mean_power_mw, BatterySample, MockPowerSource, PowerSource};
 pub use report::{fmt_opt, ProfileReport};
 pub use tracker::{safe_div, ProfileTracker};
 pub use types::{Phase, Record};

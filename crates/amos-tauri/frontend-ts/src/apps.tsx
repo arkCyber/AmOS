@@ -21,6 +21,8 @@ import { GROUP, ROW, LABEL, SUB, FIELD, Switch, chip, btn } from "./components/u
 import { WallpaperCard } from "./components/Wallpaper";
 import LockSettings from "./components/LockSettings";
 import SensorPanel from "./components/SensorPanel";
+import SystemPanel from "./components/SystemPanel";
+import TaskManager from "./components/TaskManager";
 import { SETTINGS_KEY, BACKUP_KEY, SYNC_STORES, readCloud, setCloudPrefs, snapshotStores, type CloudPrefs } from "./lib/cloud";
 import { readAiConfig, setAiConfig, DEEPSEEK_MODEL, DEEPSEEK_ENDPOINT, type AiProviderId } from "./lib/providers";
 import { describeEngine, type EngineView } from "./lib/aiEngine";
@@ -695,6 +697,8 @@ const Settings: FC = () => {
       </section>
 
       <SensorPanel />
+      <SystemPanel />
+      <TaskManager />
       <WallpaperCard />
       <LockSettings />
       <p className="px-1 text-xs opacity-50">mode={mode} · dark={String(dark)} · locale={locale}</p>

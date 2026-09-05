@@ -46,6 +46,10 @@ message ScheduleJobRequest {
   uint64 latest = 4;
 }
 
+message JobRef {
+  string job_id = 1;
+}
+
 message AppInfo {
   string app_id = 1;
   AppState state = 2;
@@ -85,5 +89,6 @@ service Governor {
   rpc MoveApp(MoveAppRequest) returns (Empty);
   rpc UnregisterApp(AppRef) returns (Empty);
   rpc ScheduleJob(ScheduleJobRequest) returns (Empty);
+  rpc CancelJob(JobRef) returns (Empty);
   rpc GetState(Empty) returns (GovernorState);
 }

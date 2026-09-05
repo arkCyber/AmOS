@@ -22,6 +22,11 @@ jni = { version = "0.21", optional = true }
 
 [features]
 default = []
+# Host-compilable Linux cpufreq/devfreq sysfs applier for the frequency governor
+# (`src/linux.rs`): real `scaling_max_freq` writes on a Linux/Android device, and
+# offline tests over a tempdir. `cargo check -p amos-power --features linux`
+# validates it compiles (runtime needs a root-capable device with cpufreq).
+linux = []
 # Enables `src/android.rs` (AndroidBatteryTelemetry). Intended for on-device builds
 # of the System UI APK; excluded from desktop/CI. `cargo check --features android`
 # validates it *compiles* (runtime needs a real Android VM + a Context).

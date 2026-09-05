@@ -12,9 +12,11 @@
 //! seams (`amos-radio` / `amos-telephony` / `amos-profiling`):
 //! * level (%), charging flag and temperature (°C) are read for real from the
 //!   sticky battery broadcast (no permission needed for these extras);
-//! * instantaneous board **power (mW)** is *not* on the sticky intent — pair this
-//!   with [`amos_profiling::android::AndroidBatteryPowerSource`] (`CURRENT_NOW`) if
-//!   a live draw is wanted;
+//! * instantaneous board **power (mW)** is *not* on the sticky intent — fold a
+//!   live [`PowerSource`](amos_profiling::PowerSource) in via
+//!   [`snapshot_with_power`](AndroidBatteryTelemetry::snapshot_with_power), pairing
+//!   this with `amos_profiling::android::AndroidBatteryPowerSource` (real
+//!   `CURRENT_NOW` × `EXTRA_VOLTAGE`) for an accurate draw under a heavy LLM;
 //! * a failed / absent reading yields `BatteryState::default()` (unknown) — honest,
 //!   never a fabricated charge.
 //!
@@ -24,6 +26,8 @@
 
 use jni::objects::{GlobalRef, JObject, JValue};
 use jni::{JNIEnv, JavaVM};
+
+use amos_profiling::PowerSource;
 
 use crate::types::{BatteryState, Telemetry, Usage};
 
@@ -88,6 +92,17 @@ impl AndroidBatteryTelemetry {
             Some(b) => Telemetry::new(b, self.usage, None),
             None => self.default_telemetry(),
         }
+    }
+
+    /// One telemetry snapshot **with** the instantaneous board power (mW) sampled
+    /// from a live [`PowerSource`]. This is how the on-device governor gets a real
+    /// draw under a heavy LLM: pair with
+    /// `amos_profiling::android::AndroidBatteryPowerSource` (real `CURRENT_NOW` ×
+    /// `EXTRA_VOLTAGE`), whose reading drives the `PowerDraw` policy branch. A
+    /// non-finite / absent power reading is folded as `None` (unknown), never a
+    /// fabricated number.
+    pub fn snapshot_with_power(&self, power: &dyn PowerSource) -> Telemetry {
+        self.snapshot().with_power_from(power)
     }
 
     fn default_telemetry(&self) -> Telemetry {

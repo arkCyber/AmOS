@@ -155,6 +155,25 @@ impl Scheduler {
         exact
     }
 
+    /// Drop deferred jobs whose window has fully passed (`latest < now`) without
+    /// running, returning their ids so a caller can log them as "dropped, never
+    /// ran". Exact alarms are never dropped here (they are user-visible and due
+    /// from `earliest` on — the caller is the authority on firing them). Keeps the
+    /// register from silently accumulating expired deferred work that would skew
+    /// `len()`/`counts()`/`entries()` forever.
+    pub fn expire(&mut self, now: u64) -> Vec<JobId> {
+        let expired: Vec<JobId> = self
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.job_type == JobType::Deferred && j.latest < now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            self.jobs.remove(id);
+        }
+        expired
+    }
+
     /// Outstanding job count split by kind: `(exact, deferred)`.
     pub fn counts(&self) -> (usize, usize) {
         let exact = self
@@ -291,5 +310,29 @@ mod tests {
         assert_eq!(s.len(), 3);
         assert!(s.cancel(&JobId::new("d1")));
         assert_eq!(s.counts(), (1, 1));
+    }
+
+    #[test]
+    fn expire_drops_passed_deferred_but_never_exact_alarms() {
+        let mut s = Scheduler::new();
+        // A deferred job whose window fully passed while it never ran.
+        s.register(ScheduledJob::deferred(JobId::new("expired"), 0, 5).unwrap())
+            .unwrap();
+        // A still-valid deferred and an exact alarm far in the future.
+        s.register(ScheduledJob::deferred(JobId::new("valid"), 0, 200).unwrap())
+            .unwrap();
+        s.register(ScheduledJob::alarm(JobId::new("ring"), 100).unwrap())
+            .unwrap();
+
+        // At now=50 the expired window (5) has fully passed; it is not runnable and
+        // not already fired, but it must not linger forever.
+        let dropped = s.expire(50);
+        assert_eq!(dropped, vec![JobId::new("expired")]);
+        assert_eq!(s.counts(), (1, 1), "valid deferred + exact alarm remain");
+        assert!(!s.contains(&JobId::new("expired")), "expired job removed");
+
+        // The exact alarm is never dropped by expiry.
+        assert!(s.expire(50).is_empty());
+        assert!(s.contains(&JobId::new("ring")));
     }
 }

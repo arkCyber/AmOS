@@ -1,0 +1,27 @@
+[package]
+name = "amos-monitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos system working-status (health) domain core: a transport-/platform-agnostic aggregator that folds system load (CPU/memory via a SystemSampler seam), live battery/power (amos-profiling PowerSource) and per-app lifecycle counts (amos-applife AppLifecycle) into one honest SystemHealth snapshot. Pure std; real /proc + Android battery reads are feature-gated seams. Design: docs/system-monitor.md."
+
+[lib]
+name = "amos_monitor"
+path = "src/lib.rs"
+
+[dependencies]
+# Live board power / battery model we fold into the health snapshot (pure std).
+amos-profiling.workspace = true
+# Per-app process lifecycle counts we summarise (pure std).
+amos-applife.workspace = true
+
+[features]
+default = []
+# Host-compilable /proc-based CPU/memory sampler (`src/linux.rs`): real reads on a
+# Linux/Android device, offline tests over an injected procfs root tempdir.
+linux = []
+# Compile-gated `src/android.rs` skeleton for the on-device System UI APK build
+# (real Android SystemStatus reads remain device bring-up). Validated with
+# `cargo check -p amos-monitor --features android`.
+android = []

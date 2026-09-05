@@ -60,7 +60,7 @@ pub struct Usage {
 pub struct Telemetry {
     pub battery: BatteryState,
     /// Live average board power draw in mW (from a
-    /// [`PowerSource`](amos_profiling::PowerSource)); `None` when unavailable.
+    /// [`PowerSource`]); `None` when unavailable.
     pub power_mw: Option<f64>,
     pub usage: Usage,
 }

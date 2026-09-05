@@ -24,13 +24,18 @@ prompt-eval / decode 的吞吐、TTFT、每 token 延迟或一次推理消耗的
   **time-to-first-token**；被 `Cancel` 打断的 turn 不记（避免半截样本）。`get_status` 经
   `StatusReply.profile`（`ProfileMetrics`，proto 字段 12）暴露；`serve()` 另以与健康心跳相同周期
   `ProfileStore::spawn_periodic_log` 输出 profile 行（`amos-ai inference profile`），无需 RPC。
-- ✅ **真机功耗骨架（`feature android`，2026-09-04）**：`amos-profiling/src/android.rs`
-  `AndroidBatteryPowerSource`（仿其它 `android.rs` seam）——`BatteryManager#getLongProperty(
-  CURRENT_NOW)`（µA）真实读取 × 电压（构造参数，默认 3700 mV；真机应传 `EXTRA_VOLTAGE`）→ mW；
-  读不到即 `0.0`（诚实 "不可用"）。`cargo check -p amos-profiling --features android` 可编译（已入
-  `make gated-check`）。
-- ⏳ **真机电压接线**：在 System UI 接 `ACTION_BATTERY_CHANGED` 粘性广播取实时 `EXTRA_VOLTAGE`
-  （mV）传入 `with_voltage_mv`，把 `est_energy_j` 一并报进 profile（需设备 bring-up）。
+- ✅ **真机功耗骨架（`feature android`，2026-09-04；实时电压 2026-09-05）**：
+  `amos-profiling/src/android.rs` `AndroidBatteryPowerSource`（仿其它 `android.rs`
+  seam）——`BatteryManager#getLongProperty(CURRENT_NOW)`（µA）真实读取 × **实时
+  `ACTION_BATTERY_CHANGED` 粘性广播 `EXTRA_VOLTAGE`（mV）**（每次采样自刷新；仅当广播
+  不可用时回退构造参数标称 3700 mV）→ mW。物理换算 `mW = µA × mV / 1e6` 抽成
+  平台无关、host 可测的 `power::BatterySample{current_ua, voltage_mv}`；采样无效即
+  `0.0`（诚实 "不可用"）。`cargo check -p amos-profiling --features android` 可编译
+  （已入 `make gated-check`）。
+- ⏳ **真机 System UI 接线**：把 `AndroidBatteryPowerSource::sample/read_mw` 接到 profiler
+  的 `ProfileReport`（`avg_power_mw` → `est_energy_j`）；每轮推理按窗口多次采样经
+  `power::mean_power_mw`（忽略无效 "unknown" 采样、全无效返 `None`）取平均 mW，喂给 `est_energy_j`
+  可得更真实的焦耳值（需设备 bring-up 验证广播/属性读取）。
 
 > 诚实说明：daemon 无 tokenizer，**不**计 prompt tokens，也不把 mock/远端 `tokens/s` 冒充为芯片
 > 推理吞吐。`ProfileMetrics` 只报可端到端量到的数字（decode_tokens_per_sec 是「流到客户端的生成
@@ -66,7 +71,7 @@ prompt tokens/s；**decode**——逐 token 自回归，decode tokens/s 及其�
 ## 4. 验证
 
 ```bash
-cargo test -p amos-profiling                     # 15 项（types/tracker/power/measure/report）
+cargo test -p amos-profiling                     # 23 项（types/tracker/power/measure/report）
 cargo clippy -p amos-profiling --all-targets -- -D warnings
 cargo fmt -p amos-profiling
 # daemon 装配（stream_chat + bidi Chat 都记录；get_status 暴露）：
@@ -83,6 +88,8 @@ cargo run -p amos-ai --example profile_once -- /tmp/amos-ai.sock hello
   `describeEngine` 现解析 `StatusReply.profile`，`apps.tsx` 在 AI 段显示 decode tok/s / TTFT / 累计
   token）；**设备传感器 tile 已落地**（`components/SensorPanel.tsx`：能量档切换 + 相机/定位/惯性
   读数，走 `sensor_*` 桥 + `lib/sensors.ts`，桌面 mock daemon 即可用）。**仍待（设备）**：把真功耗
-  读数 `AndroidBatteryPowerSource::read_mw` 接到 profiler 的 `ProfileReport`（`est_energy_j`）。
-- **联动 `amos-sensor`**：跑本地 LLM / 视频预览时切 `SensorMode::PowerSave` 采样档并记录热/电；
-  达成路线图「性能分析与功耗优化」的可量化闭环。
+  读数 `AndroidBatteryPowerSource::sample/read_mw`（实时 `CURRENT_NOW`×`EXTRA_VOLTAGE`）接到 profiler
+  的 `ProfileReport`（`est_energy_j`）。
+- **联动 `amos-power`（Energy Governor → CPU/NPU 频率）**：`EnergyGovernor` 的 `Decision.sensor_mode`
+  经 `amos-power::freq::plan` 映射成各 CPU cluster + NPU 频率上限，`LinuxFreqGovernor` 写
+  `scaling_max_freq` 落地，跑 LLM 时保护 UI/电话所在小核、限推理热点，达成「性能分析与功耗优化」闭环。

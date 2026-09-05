@@ -34,6 +34,10 @@
 //!   device-rate → 16 kHz path; plus a one-shot [`resample_linear`].
 //! * [`mock`] — [`SineMic`] / [`FrameMic`] / [`SilenceMic`] captures and a
 //!   [`MockSink`] / [`NullSink`], all deterministic and offline.
+//! * [`source`] — the **platform-mic facade**: [`PlatformMic`] (a `Send`
+//!   [`AudioCapture`]) + honest [`PlatformMicKind::detect`], resolving AAudio /
+//!   TinyALSA on Android and a clear "no native mic" error (or an explicit mock)
+//!   on a host build. This is what the always-on voice worker consumes.
 //! * [`android`] — **compile-time-gated** direct TinyALSA / AAudio FFI bindings
 //!   (feature `tinyalsa` / `aaudio` + `target_os = "android"`). On a host build
 //!   these modules are empty so the default workspace stays light and green.
@@ -57,6 +61,7 @@ pub mod error;
 pub mod mock;
 pub mod resample;
 pub mod sink;
+pub mod source;
 pub mod spec;
 
 // On Android (and only with the matching feature) `android` is a directory of
@@ -66,10 +71,11 @@ pub mod spec;
 #[cfg(all(any(feature = "tinyalsa", feature = "aaudio"), target_os = "android"))]
 pub mod android;
 
-pub use capture::AudioCapture;
+pub use capture::{AudioCapture, AudioCaptureExt};
 pub use error::AudioError;
 pub use resample::{resample_linear, LinearDownsampler};
 pub use sink::AudioSink;
+pub use source::{PlatformMic, PlatformMicKind};
 pub use spec::{AudioSpec, ASR_SAMPLE_RATE};
 
 #[cfg(all(feature = "aaudio", target_os = "android"))]

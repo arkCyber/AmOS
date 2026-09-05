@@ -20,9 +20,13 @@ amos-android.workspace = true
 amos-telephony.workspace = true
 amos-sensor.workspace = true
 amos-profiling.workspace = true
-amos-power.workspace = true
+amos-power = { workspace = true, features = ["linux"] }
 amos-applife.workspace = true
 amos-scheduler.workspace = true
+# System working-status aggregator + real /proc sampler (CPU/mem) folded into
+# get_status.system. The `linux` feature only adds std::fs reads of /proc (absent
+# at runtime on macOS/dev → honest "unknown", never fabricated).
+amos-monitor = { workspace = true, features = ["linux"] }
 amos-asr = { path = "../amos-asr" }
 tokio.workspace = true
 tokio-stream.workspace = true

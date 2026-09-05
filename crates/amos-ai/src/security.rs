@@ -89,9 +89,11 @@ impl TokenBucket {
 
     fn refill(&mut self) {
         let now = current_timestamp();
-        let elapsed = now - self.last_refill;
-        let new_tokens = (elapsed as usize) * self.refill_rate;
-        self.tokens = std::cmp::min(self.capacity, self.tokens + new_tokens);
+        // Saturate so a wall-clock regression (NTP step-back) can never underflow
+        // into a panic or a huge wrap.
+        let elapsed = now.saturating_sub(self.last_refill);
+        let new_tokens = (elapsed as usize).saturating_mul(self.refill_rate);
+        self.tokens = std::cmp::min(self.capacity, self.tokens.saturating_add(new_tokens));
         self.last_refill = now;
     }
 
@@ -394,18 +396,33 @@ impl SecurityManager {
         }
     }
 
-    /// Log token consumption.
+    /// Log token consumption and its outcome. Over-quota generation is recorded as
+    /// [`AuditResult::Rejected`], never as a success.
     pub async fn log_tokens(&self, client_id: &str, count: usize) {
-        let _ = self.rate_limiter.check_tokens(client_id, count).await;
-        self.audit_logger
-            .log(
-                client_id.to_string(),
-                "generate".to_string(),
-                "tokens".to_string(),
-                AuditResult::Success,
-                format!("{} tokens", count),
-            )
-            .await;
+        match self.rate_limiter.check_tokens(client_id, count).await {
+            Ok(()) => {
+                self.audit_logger
+                    .log(
+                        client_id.to_string(),
+                        "generate".to_string(),
+                        "tokens".to_string(),
+                        AuditResult::Success,
+                        format!("{} tokens", count),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                self.audit_logger
+                    .log(
+                        client_id.to_string(),
+                        "generate".to_string(),
+                        "tokens".to_string(),
+                        AuditResult::Rejected,
+                        format!("tokens over quota ({count}): {e}"),
+                    )
+                    .await;
+            }
+        }
     }
 
     /// Spawn a background task that periodically drops idle client buckets to
@@ -520,5 +537,56 @@ mod tests {
         assert_eq!(b.len(), 1, "idle client dropped");
         assert!(b.contains_key("active"), "active client retained");
         assert!(!b.contains_key("idle"), "idle client gone");
+    }
+
+    #[test]
+    fn token_bucket_refill_handles_clock_regression_and_huge_elapsed() {
+        // Clock regression (last_refill in the future): no panic, no refill.
+        let mut behind = TokenBucket::new(100, 10);
+        behind.tokens = 0;
+        behind.last_refill = current_timestamp() + 10_000;
+        behind.refill();
+        assert_eq!(behind.tokens, 0, "no refill while the clock is behind");
+
+        // Huge elapsed must saturate to capacity, never overflow/panic.
+        let mut huge = TokenBucket::new(1000, 1);
+        huge.tokens = 0;
+        huge.last_refill = current_timestamp().saturating_sub(u64::MAX / 2);
+        huge.refill();
+        assert_eq!(huge.tokens, huge.capacity, "huge elapsed caps at capacity");
+    }
+
+    #[tokio::test]
+    async fn log_tokens_over_quota_is_audited_as_rejected() {
+        let cfg = RateLimitConfig {
+            requests_per_second: 100,
+            tokens_per_hour: 10, // tiny quota so over-quota is easy to hit
+            ..Default::default()
+        };
+        let sm = SecurityManager::new(cfg);
+        sm.permission_manager
+            .grant("client".to_string(), Permission::Admin)
+            .await;
+
+        sm.log_tokens("client", 5).await; // within quota → Success
+        sm.log_tokens("client", 10).await; // over remaining → Rejected
+
+        let recent = sm.audit_logger.get_recent(10).await;
+        let token_entries: Vec<_> = recent
+            .iter()
+            .filter(|e| e.operation == "generate")
+            .collect();
+        assert!(
+            token_entries
+                .iter()
+                .any(|e| e.result == AuditResult::Rejected),
+            "over-quota generation must be audited as rejected"
+        );
+        assert!(
+            token_entries
+                .iter()
+                .any(|e| e.result == AuditResult::Success),
+            "in-quota generation is audited as success"
+        );
     }
 }

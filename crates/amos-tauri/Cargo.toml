@@ -26,6 +26,10 @@ amos-tts = { path = "../amos-tts" }
 amos-asr = { path = "../amos-asr", optional = true }
 amos-audio = { path = "../amos-audio" }
 amos-radio = { path = "../amos-radio" }
+# amos-sensor: device-sensor domain core — the System UI's own sensor read side
+# (LiveSensorProvider stream bus + SensorManager energy policy) backs the local
+# `sensor_host` commands; its `android` feature adds the on-device backend.
+amos-sensor = { path = "../amos-sensor" }
 # Real Android radio provider (via amos-radio/android). Optional: only pulled in
 # when amos-tauri's `android` feature is on (System UI APK on-device build).
 jni = { version = "0.21", optional = true }
@@ -51,9 +55,18 @@ tracing.workspace = true
 [features]
 default = []
 # On-device System UI: back RadioBridge with amos-radio's AndroidRadioProvider
-# (jni). Desktop/CI omit it so no JNI stack is compiled. Host `cargo check
-# --features android` still validates that the wiring compiles.
-android = ["dep:jni", "amos-radio/android"]
+# and sensor_host with amos-sensor's AndroidSensorProvider (both jni). Desktop/CI
+# omit it so no JNI stack is compiled. Host `cargo check --features android` still
+# validates that the wiring compiles. `amos-audio/aaudio` lets PlatformMic::open_device
+# open the real NDK AAudio mic (API >= 26) so the always-on assistant-voice worker
+# can capture on-device; TinyALSA is deliberately *not* enabled here (it is the
+# system-component seam, not the app path).
+android = [
+    "dep:jni",
+    "amos-radio/android",
+    "amos-sensor/android",
+    "amos-audio/aaudio",
+]
 sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]
 piper-tts = ["amos-tts/piper"]
 # Real HTTP app-store backend for the StoreBridge (remote catalog + package

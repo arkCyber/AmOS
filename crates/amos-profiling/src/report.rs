@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use crate::power::energy_joules;
+use crate::power::{energy_joules, mean_power_mw, BatterySample};
 use crate::tracker::ProfileTracker;
 
 /// A point-in-time snapshot of inference performance + energy for one run window.
@@ -54,6 +54,16 @@ impl ProfileReport {
             avg_power_mw,
             est_energy_j,
         }
+    }
+
+    /// Compute a report whose power figure is the **window mean** of the
+    /// instantaneous voltage×current [`BatterySample`]s taken across the run
+    /// ([`mean_power_mw`]). This is the honest way to feed `est_energy_j`: average
+    /// several `CURRENT_NOW` × `EXTRA_VOLTAGE` reads over the wall window rather
+    /// than trusting one noisy instantaneous sample. When no valid sample exists
+    /// the report has `avg_power_mw`/`est_energy_j` = `None` (no fabricated energy).
+    pub fn compute_sampled(tracker: &ProfileTracker, samples: &[BatterySample]) -> Self {
+        Self::compute(tracker, mean_power_mw(samples))
     }
 }
 
@@ -114,6 +124,30 @@ mod tests {
         let mut t = ProfileTracker::new();
         t.record(Phase::Decode, 4, Duration::from_millis(100));
         let r = ProfileReport::compute(&t, None);
+        assert_eq!(r.avg_power_mw, None);
+        assert_eq!(r.est_energy_j, None);
+    }
+
+    #[test]
+    fn report_compute_sampled_uses_window_mean_power() {
+        let mut t = ProfileTracker::new();
+        t.record(Phase::Decode, 50, Duration::from_secs(2)); // 2 s wall
+                                                             // Two instantaneous reads: 4 W then 2 W → mean 3 W → est_energy 6 J.
+        let samples = [
+            BatterySample::new(1_000_000, 4000),
+            BatterySample::new(500_000, 4000),
+        ];
+        let r = ProfileReport::compute_sampled(&t, &samples);
+        assert_eq!(r.avg_power_mw, Some(3000.0));
+        assert!((r.est_energy_j.unwrap() - 6.0).abs() < 1e-9, "{r}");
+    }
+
+    #[test]
+    fn report_compute_sampled_all_unknown_has_no_fabricated_energy() {
+        let mut t = ProfileTracker::new();
+        t.record(Phase::Decode, 50, Duration::from_secs(2));
+        // No valid samples → no fabricated power or energy.
+        let r = ProfileReport::compute_sampled(&t, &[BatterySample::new(0, 0)]);
         assert_eq!(r.avg_power_mw, None);
         assert_eq!(r.est_energy_j, None);
     }

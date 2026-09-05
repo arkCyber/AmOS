@@ -117,6 +117,49 @@ message StatusReply {
   // (ggml). Empty otherwise, and never "auto" (always the concrete resolution).
   // See docs/qcom-mtk-bringup.md. Consumers treat empty as "not applicable".
   string accelerator = 15;
+
+  // System working-status (amos-monitor), added 2026-09-05: unified OS load
+  // (CPU/memory) + per-process lifecycle counts + (honestly) unknown battery when
+  // not available. Present on every reply; absent Optionals mean "unknown", never
+  // a fabricated reading. Backing sampler named in `sampler`.
+  SystemHealth system = 16;
+}
+
+// Unified "system working status" folded from amos-monitor (docs/system-monitor.md).
+message SystemHealth {
+  SystemLoad load = 1;              // CPU / memory load from the active sampler
+  SystemBattery battery = 2;        // level/power; fields absent = unknown
+  ProcessCounts processes = 3;      // per-process lifecycle tiers
+  string sampler = 4;               // sampler backend: linux-proc | mock | android | ...
+  repeated AppProcess apps = 5;     // per-app processes the governor tracks (empty on
+                                    // hosts where nothing is registered yet)
+}
+
+message AppProcess {
+  string id = 1;                    // app/process id ("com.amos.photos", …)
+  string state = 2;                 // lifecycle key: foreground|visible|foreground_service|
+                                    // background|cached|stopped
+}
+
+message SystemLoad {
+  // Mean busy% over the sampler's last window (0..100). Absent on the first read
+  // after start (busy% is a delta) or when the platform cannot report it.
+  optional double cpu_busy_pct = 1;
+  optional uint64 mem_total_bytes = 2;      // absent = unknown
+  optional uint64 mem_available_bytes = 3;  // absent = unknown (used% derived)
+}
+
+message SystemBattery {
+  // Absent = unknown (never a fabricated reading).
+  optional double level_pct = 1;
+  optional bool charging = 2;
+  optional double live_power_mw = 3;
+}
+
+message ProcessCounts {
+  uint32 running = 1;   // live processes (any state except Stopped)
+  uint32 cached = 2;    // frozen tombstone tier
+  uint32 stopped = 3;   // dead but kept saved state
 }
 
 // Rolling decode-throughput + first-token latency measured by the daemon across
@@ -150,6 +193,9 @@ message GovernorMetrics {
   bool cap_inference = 3;
   bool throttle_background = 4;
   uint64 ticks = 5;                      // governor observe ticks so far (>0 ⇒ it has run)
+  uint64 dvfs_applied = 6;               // total scaling_max_freq writes applied by the DVFS beat
+  uint64 dvfs_failed = 7;                // total DVFS write failures the seam reported
+  uint64 dropped = 8;                    // deferred jobs whose window expired (never ran) this tick
 }
 
 message ListSessionsRequest {}

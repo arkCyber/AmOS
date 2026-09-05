@@ -19,6 +19,7 @@ pub mod governor;
 pub mod governor_service;
 pub mod inference;
 pub mod monitoring;
+pub mod privacy;
 pub mod profiler;
 pub mod security;
 pub mod semantic;

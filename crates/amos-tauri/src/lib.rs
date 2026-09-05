@@ -24,6 +24,8 @@ pub mod radio;
 pub mod sensor_host;
 pub mod sensors;
 pub mod store;
+pub mod system;
+pub mod taskmgr;
 pub mod telephony;
 pub mod translate;
 pub mod tts;
@@ -156,7 +158,11 @@ pub fn run() {
             sensor_host::sensor_host_set_mode,
             sensor_host::sensor_host_record_imu,
             sensor_host::sensor_host_record_frame,
-            sensor_host::sensor_host_acquire
+            sensor_host::sensor_host_acquire,
+            system::system_health,
+            taskmgr::taskmgr_snapshot,
+            taskmgr::taskmgr_app_action,
+            taskmgr::taskmgr_job_action
         ])
         .setup(|app| {
             // System-wide readiness probe: log the daemon status once on boot.

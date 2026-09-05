@@ -348,7 +348,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "asr-sherpa")]
+#[cfg(all(test, feature = "asr-sherpa"))]
 mod sherpa_tests {
     use super::*;
     use std::path::Path;

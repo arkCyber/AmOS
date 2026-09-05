@@ -107,9 +107,12 @@ export AMOS_GGML_BIN=llama-cli     # 或设备上的 llama.cpp 可执行文件
 - 仍用默认 `allama` 时命令保持 `allama run …`（不注入 llama.cpp 参数），行为不变。
 
 ### 2.3 语音闭环（真采集 → sherpa → 推理）
-- `crates/amos-audio` 的 **AAudio** seam（`target_os="android"` + `--features aaudio`）：
-  把 `AAudioCapture::open(16000)` 交给 `amos-tauri/src/assistant_voice.rs` 的
-  `VoiceLink::spawn_resident` / resident 采集线程（`docs/audio-hal-bridge.md` §"System UI 侧"）。
+- `crates/amos-audio` 的 **AAudio/TinyALSA** seam 经 `PlatformMic` facade 接入
+  （`amos_audio::PlatformMic::open_device()` 在 Android 以 16 kHz 开真麦；`PlatformMic` 是
+  `Send + AudioCapture`，`AudioCapture` 现为 object-safe）。把它交给
+  `amos-tauri/src/assistant_voice.rs` 的 `VoiceLink::spawn_resident` / resident 采集线程
+  （`docs/audio-hal-bridge.md` §"System UI 侧"/"平台麦克风 facade"）。host 端已用
+  `from_mock` 验证 facade→常驻管线（Audio→AudioEnd）。
 - `amos-ai` 需带 `--features asr-sherpa` + `AMOS_SHERPA_MODEL_DIR` 指向真模型（`scripts/fetch-models.sh`）。
 - System UI AI 对话"按住说话"→ 流式 `Payload::Audio` → sherpa 转写 → 本地推理 → 回读。
 

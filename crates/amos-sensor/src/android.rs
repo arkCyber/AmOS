@@ -7,16 +7,19 @@
 //! This module is that host: it takes a `JavaVM` + a global ref to the app `Context`
 //! and implements the [`SensorProvider`] seam for the real HAL.
 //!
-//! Status — **honest on-device skeleton**, mirroring `amos-telephony/src/android.rs`:
+//! Status — **honest on-device backend** (mirroring `amos-telephony/src/android.rs`):
 //! * **GNSS is real + synchronous**: `LocationManager#getLastKnownLocation("gps")`
 //!   (an `ACCESS_FINE_LOCATION` grant is required at runtime). Returns `Ok(None)`
 //!   when the receiver is disabled or has no fix yet.
-//! * **Camera + IMU are not wired yet** (they are *streams*, not getters): a live
-//!   IMU sample needs a `SensorEventListener` bridge storing the latest sample into
-//!   an atomic cache; camera frames need a `CameraDevice` capture session +
-//!   `ImageReader`. Until those device-validated bridges land the methods return an
-//!   explicit [`SensorError::Provider`] error rather than pretending (same honesty
-//!   rule telephony uses for `answer`/`end`/recording).
+//! * **Camera + IMU are wired through the live latest-sample bridge**
+//!   (`crate::stream`): the reads below return the newest value the on-device glue
+//!   has pushed. The glue is the *producer*: a `SensorManager` + `SensorEventListener`
+//!   (IMU) and a `Camera2` `CameraDevice` capture session + `ImageReader` (frame)
+//!   registered by the System UI APK, each calling [`AndroidSensorProvider::record_imu`]
+//!   / [`AndroidSensorProvider::record_frame`] (or `set_cameras`/`set_imu_rate_hz`)
+//!   from its listener thread. Until the glue pushes, a pull returns an explicit
+//!   [`SensorError::Provider`] — never a fabricated sample. (Same honesty rule
+//!   telephony uses for `answer`/`end`/recording.)
 //!
 //! Runtime requires a real Android VM (`jni::JavaVM`) + a `GlobalRef` to the app
 //! `Context`; not runnable on the desktop host. `cargo check --features android`
@@ -66,16 +69,56 @@ fn system_service<'e>(env: &mut JNIEnv<'e>, ctx: &JObject<'e>, name: &str) -> Re
 pub struct AndroidSensorProvider {
     vm: JavaVM,
     context: AndroidContext,
+    /// Live camera/IMU read-side: a device `SensorManager` / `Camera2` glue (see
+    /// `docs/sensors.md`) pushes each new sample/frame in via [`Self::record_imu`]
+    /// / [`Self::record_frame`]; the reads below return the latest value.
+    live: crate::stream::LiveSensorProvider,
 }
 
 impl AndroidSensorProvider {
     /// Construct from a `JavaVM` + a global ref to the app `Context`. `env` is only
-    /// used to create the global ref.
+    /// used to create the global ref. GNSS becomes live immediately; camera / IMU
+    /// are live once [`Self::set_cameras`] + the sensor glue start pushing.
     pub fn new(vm: JavaVM, env: &JNIEnv<'_>, context: JObject<'_>) -> Result<Self> {
         Ok(Self {
             vm,
             context: AndroidContext(env.new_global_ref(context).map_err(jerr)?),
+            live: crate::stream::LiveSensorProvider::default(),
         })
+    }
+
+    /// Advertise the physical cameras (from `CameraManager.getCameraIdList` +
+    /// `CameraCharacteristics`) so the manager can negotiate / gate them.
+    pub fn set_cameras(&self, cameras: Vec<CameraConfig>) {
+        self.live.set_cameras(cameras);
+    }
+
+    /// Report the IMU sampling rate a registered listener is running at.
+    pub fn set_imu_rate_hz(&self, hz: u32) {
+        self.live.set_imu_rate_hz(hz);
+    }
+
+    /// Producer entry: a `SensorEventListener`/`ASensorEventQueue` glue stores the
+    /// newest IMU sample here (called from the sensor thread).
+    pub fn record_imu(&self, sample: ImuSample) {
+        self.live.record_imu(sample);
+    }
+
+    /// Producer entry: a `Camera2`/`ImageReader` glue stores the newest frame here
+    /// (called from the image thread). The payload is validated against `cfg`.
+    pub fn record_frame(&self, cfg: CameraConfig, bytes: Vec<u8>) -> Result<()> {
+        self.live.record_frame(cfg, bytes)
+    }
+
+    /// The latest-sample stores, so glue running on its own thread can push without
+    /// holding the whole provider.
+    pub fn imu_store(&self) -> &crate::stream::ImuLatest {
+        self.live.imu_store()
+    }
+
+    /// The latest-frame stores (see [`Self::imu_store`]).
+    pub fn frame_store(&self) -> &crate::stream::FrameLatest {
+        self.live.frame_store()
     }
 
     fn attach(&self) -> Result<JNIEnv<'_>> {
@@ -191,17 +234,17 @@ impl SensorProvider for AndroidSensorProvider {
     }
 
     fn camera_configs(&self) -> Vec<CameraConfig> {
-        // Capability negotiation (supported sizes / FPS / formats) needs
-        // `CameraCharacteristics` from a `CameraManager` — device-validated work.
-        Vec::new()
+        // Capabilities come from a `CameraManager` glue calling `set_cameras`
+        // once it has negotiated `CameraCharacteristics` (device step). Before
+        // that, no camera is advertised — honest, not a guessed capability.
+        self.live.camera_configs()
     }
 
-    fn camera_capture(&self, _id: CameraId) -> Result<CameraFrame> {
-        Err(SensorError::Provider(
-            "on-device camera capture requires a CameraDevice/ImageReader bridge \
-             (not yet wired)"
-                .to_string(),
-        ))
+    fn camera_capture(&self, id: CameraId) -> Result<CameraFrame> {
+        // Returns the newest frame the Camera2/ImageReader glue pushed (via
+        // `record_frame`); `CameraNotFound` when `id` isn't advertised, and an
+        // explicit `Provider` error before the first frame — never a fake frame.
+        self.live.camera_capture(id)
     }
 
     fn gnss_enabled(&self) -> bool {
@@ -213,16 +256,14 @@ impl SensorProvider for AndroidSensorProvider {
     }
 
     fn imu_rate_hz(&self) -> u32 {
-        // A live rate requires a SensorManager listener registration; 0 = not
-        // negotiated yet (the domain core treats 0 as "unknown / unconfigured").
-        0
+        // Set by the sensor glue via `set_imu_rate_hz` once a listener is live;
+        // 0 = not negotiated yet (the domain core treats 0 as "unknown").
+        self.live.imu_rate_hz()
     }
 
     fn imu_sample(&self) -> Result<ImuSample> {
-        Err(SensorError::Provider(
-            "on-device IMU read requires a SensorEventListener bridge caching the latest \
-             sample (not yet wired)"
-                .to_string(),
-        ))
+        // Returns the newest sample a SensorManager/SensorEventListener glue pushed
+        // (via `record_imu`); an explicit `Provider` error before the first one.
+        self.live.imu_sample()
     }
 }

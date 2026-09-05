@@ -162,6 +162,16 @@ async fn get_status_exposes_live_monitoring_metrics() {
     assert!(s1.running);
     assert!(s1.rpc_total >= 1, "first probe itself is counted");
 
+    // get_status.system (amos-monitor) rides the same reply over the wire: the
+    // backing sampler is named and load/battery/process sub-blocks are present.
+    // Their values may be "unknown" (None) on hosts without /proc (e.g. macOS dev)
+    // — never a fabricated reading.
+    let sys = s1.system.expect("system block present on get_status");
+    assert!(!sys.sampler.is_empty(), "backing sampler is named");
+    assert!(sys.load.is_some(), "load sub-block present");
+    assert!(sys.battery.is_some(), "battery sub-block present");
+    assert!(sys.processes.is_some(), "process sub-block present");
+
     let s2 = client
         .get_status(StatusRequest {})
         .await

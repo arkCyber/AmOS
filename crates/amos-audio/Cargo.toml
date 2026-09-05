@@ -27,3 +27,13 @@ aaudio = []
 [[example]]
 name = "mic_to_asr"
 required-features = []
+
+# Build-only AAudio *link* smoke for the Android NDK. An Android executable cannot
+# carry undefined symbols, so `cargo ndk ... --example aaudio_link_smoke --features
+# aaudio` fails at the link step if the AAudio_* externs cannot be resolved against
+# the NDK's libaaudio.so (API >= 26). On a non-Android host this is a cfg'd no-op, so
+# the default workspace/test build is unaffected.
+[[example]]
+name = "aaudio_link_smoke"
+required-features = ["aaudio"]
+

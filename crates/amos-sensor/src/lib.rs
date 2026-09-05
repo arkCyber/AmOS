@@ -32,6 +32,11 @@
 //!   deterministic [`MockSensorProvider`].
 //! * [`manager`] — [`SensorManager`], which owns the provider and the energy
 //!   policy: single-shot reads always allowed, continuous streams gated by mode.
+//! * [`stream`] — the **latest-sample bridge** for camera / IMU *streams*:
+//!   thread-safe [`ImuLatest`] / [`FrameLatest`] stores that a device HAL (or a
+//!   host simulator) pushes into, plus [`LiveSensorProvider`], a real
+//!   [`SensorProvider`] read-side over them (what the Android backend and any
+//!   host/dev bring-up share).
 //! * [`service`] — the gRPC `SensorService` (proto `amos_sensor`) that exposes
 //!   the manager over the daemon's shared UDS; [`mock_server`] yields a
 //!   ready-to-mount [`SensorServer`] backed by the deterministic mock.
@@ -52,6 +57,7 @@ pub mod manager;
 pub mod provider;
 pub mod service;
 pub mod spec;
+pub mod stream;
 
 #[cfg(feature = "android")]
 pub mod android;
@@ -65,6 +71,7 @@ pub use spec::{
     Resolution, SensorKind, SensorMode, Vec3, CAMERA_SAVE_MAX_FPS, GNSS_SAVE_MAX_HZ,
     IMU_SAVE_MAX_HZ, MAX_FRAME_BYTES,
 };
+pub use stream::{FrameLatest, ImuLatest, LiveSensorProvider, SharedLiveProvider};
 
 #[cfg(feature = "android")]
 pub use android::AndroidSensorProvider;

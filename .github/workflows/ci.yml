@@ -92,3 +92,40 @@ jobs:
       - name: Compile sherpa + Piper backends
         run: make gated-check
 
+  # Android NDK gate for amos-audio's hand-written audio seams (AAudio/TinyALSA).
+  # Cross-compiles every Android ABI and link-checks AAudio against the NDK's
+  # libaaudio.so via the aaudio_link_smoke example. The FFI is only compiled for
+  # target_os = "android", so this is the *only* place its signatures are ever
+  # validated — without it, a host-green `make test` never touches the seam.
+  android-audio-seams:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Install protoc (for amos-proto / amos-ai build)
+        uses: arduino/setup-protoc@v3
+
+      - name: Install Android SDK + NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK (AAudio ships from API 26)
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "ndk;26.1.10909125"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile + link AAudio/TinyALSA seams for Android
+        run: make android-audio-check
+
+      - name: Compile + link amos-ai with real sherpa on-device ASR (Android)
+        run: make android-ai-sherpa-check
+

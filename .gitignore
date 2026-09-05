@@ -83,3 +83,6 @@ target/
 
 # downloaded model files (large; fetch via scripts/fetch-models.sh)
 /models/
+
+# rustc internal-compiler-error dumps (do not commit)
+rustc-ice-*.txt

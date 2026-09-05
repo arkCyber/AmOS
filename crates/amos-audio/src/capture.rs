@@ -11,9 +11,15 @@ use crate::spec::AudioSpec;
 /// the device at the requested rate, the caller wraps it in a
 /// [`crate::LinearDownsampler`] to reach the 16 kHz ASR/wire spec.
 ///
-/// The API is deliberately synchronous and allocation-light: on Android the
-/// real backends map 1:1 onto a TinyALSA/AAudio read of a period into a ring
-/// buffer, and the daemon / UI can drive it from a dedicated audio thread.
+/// The API is deliberately synchronous, allocation-light and **object-safe** (no
+/// generic methods), so a capture can be stored behind `Box<dyn AudioCapture>`
+/// (e.g. [`crate::PlatformMic`]) and handed across threads. The only generic
+/// convenience, [`for_each`](AudioCaptureExt::for_each), lives on the
+/// [`AudioCaptureExt`] extension trait to keep this one dispatchable.
+///
+/// On Android the real backends map 1:1 onto a TinyALSA/AAudio read of a period
+/// into a ring buffer, and the daemon / UI can drive it from a dedicated audio
+/// thread.
 pub trait AudioCapture {
     /// The spec this source is delivering (its *native* rate — resample after
     /// the fact if it does not already match [`AudioSpec::asr`]).
@@ -27,7 +33,12 @@ pub trait AudioCapture {
     /// * `Err` reports a device failure or a malformed request (e.g. a spec that
     ///   does not satisfy [`AudioSpec::is_valid`]).
     fn read(&mut self, out: &mut [f32]) -> Result<usize, AudioError>;
+}
 
+/// Provided helpers for any [`AudioCapture`]. Kept separate (blanket-implemented)
+/// so the core trait stays object-safe: a *generic* default method would stop a
+/// capture from being boxed as `dyn AudioCapture`.
+pub trait AudioCaptureExt: AudioCapture {
     /// Drain a live source continuously, calling `on_samples` for every read.
     ///
     /// `chunk` is the request size for each read. Returns `Ok(())` after the
@@ -48,6 +59,8 @@ pub trait AudioCapture {
         }
     }
 }
+
+impl<T: AudioCapture> AudioCaptureExt for T {}
 
 #[cfg(test)]
 mod tests {
