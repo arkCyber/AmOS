@@ -4,6 +4,7 @@ import AndroidApp from "./components/AndroidApp";
 import { MessagesApp, PhoneApp, MusicApp } from "./components/CommsApps";
 import MapsApp from "./components/MapsApp";
 import CameraApp from "./components/CameraApp";
+import MagnifierApp from "./components/MagnifierApp";
 import { AiApp, InterpApp } from "./components/BackendApps";
 import MailApp from "./components/MailApp";
 import StoreApp from "./components/StoreApp";
@@ -17,12 +18,14 @@ import type { MessageKey } from "./i18n/locales/zh";
 import { useI18n } from "./i18n";
 import { useTheme, type ThemeMode } from "./theme";
 import Segmented from "./components/Segmented";
+import { ClipboardTray } from "./components/ClipboardTray";
 import { GROUP, ROW, LABEL, SUB, FIELD, Switch, chip, btn } from "./components/ui";
 import { WallpaperCard } from "./components/Wallpaper";
 import LockSettings from "./components/LockSettings";
 import SensorPanel from "./components/SensorPanel";
 import SystemPanel from "./components/SystemPanel";
 import TaskManager from "./components/TaskManager";
+import LmkDebugPanel from "./components/LmkDebugPanel";
 import { SETTINGS_KEY, BACKUP_KEY, SYNC_STORES, readCloud, setCloudPrefs, snapshotStores, type CloudPrefs } from "./lib/cloud";
 import { readAiConfig, setAiConfig, DEEPSEEK_MODEL, DEEPSEEK_ENDPOINT, type AiProviderId } from "./lib/providers";
 import { describeEngine, type EngineView } from "./lib/aiEngine";
@@ -30,7 +33,9 @@ import type { Locale } from "./i18n/types";
 import { addHistory, calcDisplay, calcEntry, calcFromKey, calcInit, calcPress, ERR } from "./lib/calculator";
 import { zoneClock, stopwatchInit, stopwatchReducer, fmtStopwatch, timerInit, timerReducer, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, defaultWorldCities, lapDeltas, fastestLap, type WorldCity } from "./lib/time";
 import { readStoreValue, writeStoreValue } from "./lib/amosStore";
+import { AUTOOFF_STORE_KEY, clampAutoOffSec } from "./lib/display";
 import { bridged, getAiStatus, switchAiBackend } from "./lib/backend";
+import { clipboardRead, clipboardWrite, entryText } from "./lib/clipboard";
 import { NOTES_KEY, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, fmtTime, normalizeNotes, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeAllTasks, noteListProgress, fmtInline, type Note } from "./lib/notes";
 import { noteTitle, notePreview, noteDayOf } from "./lib/notes";
 import { forecast, dayLabel, displayTemp, convertRange, adjustForecast, WEATHER_CITIES, normalizeWeatherCities, removeWeatherCity, addWeatherCity, type TempUnit, type WCity } from "./lib/weather";
@@ -79,6 +84,7 @@ export const APPS: AppMeta[] = [
   { id: "store", titleKey: "app.store", icon: "🛍️" },
   { id: "privacy", titleKey: "app.privacy", icon: "🛡️" },
   { id: "contacts", titleKey: "app.contacts", icon: "👥" },
+  { id: "magnifier", titleKey: "app.magnifier", icon: "🔍" },
 ];
 
 export function appTitleKey(id: string): MessageKey | null {
@@ -515,6 +521,16 @@ const Settings: FC = () => {
   }));
   const [aiMsg, setAiMsg] = useState("");
   const [aiLive, setAiLive] = useState<string | null>(null);
+  // Auto screen-off timeout (seconds as a string for the segmented control;
+  // "0" = off). Written to the shared store so the Shell's reactive watcher
+  // re-arms immediately.
+  const [autoOffStr, setAutoOffStr] = useState(() =>
+    String(clampAutoOffSec(readStoreValue<unknown>(AUTOOFF_STORE_KEY, 0))),
+  );
+  const pickAutoOff = (v: string) => {
+    writeStoreValue(AUTOOFF_STORE_KEY, Number(v));
+    setAutoOffStr(v);
+  };
   // Truthful engine/ASR snapshot from get_status (engine + degraded + asr).
   const [aiView, setAiView] = useState<EngineView>({
     engine: "",
@@ -566,6 +582,21 @@ const Settings: FC = () => {
         <div className={ROW}>
           <span className={LABEL}>{t("settings.language")}</span>
           <Segmented value={locale} options={langOpts} onChange={setLocale} ariaLabel="language" />
+        </div>
+        <div className={SUB} />
+        <div className={ROW}>
+          <span className={LABEL}>{t("settings.autoOff")}</span>
+          <Segmented
+            value={autoOffStr}
+            options={[
+              { value: "0", label: t("settings.autoOffOff") },
+              { value: "15", label: t("settings.autoOff15") },
+              { value: "30", label: t("settings.autoOff30") },
+              { value: "60", label: t("settings.autoOff60") },
+            ]}
+            onChange={pickAutoOff}
+            ariaLabel="auto-screen-off"
+          />
         </div>
       </section>
 
@@ -699,6 +730,7 @@ const Settings: FC = () => {
       <SensorPanel />
       <SystemPanel />
       <TaskManager />
+      <LmkDebugPanel />
       <WallpaperCard />
       <LockSettings />
       <p className="px-1 text-xs opacity-50">mode={mode} · dark={String(dark)} · locale={locale}</p>
@@ -957,6 +989,7 @@ const Notes: FC = () => {
   // Edit existing note: one note at a time, saves bump ts; blank/cancel reverts.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editVal, setEditVal] = useState("");
+  const [trayOpen, setTrayOpen] = useState(false);
   const beginEdit = (n: Note) => {
     setEditingId(n.id);
     setEditVal(n.text);
@@ -969,6 +1002,19 @@ const Notes: FC = () => {
     if (!editingId) return;
     persist(editNote(notes, editingId, editVal, Date.now()));
     cancelEdit();
+  };
+  // Copy the note body onto the AmOS global clipboard (works from any window).
+  const copyEditing = async () => {
+    if (!editingId) return;
+    await clipboardWrite({ kind: "text", text: editVal });
+  };
+  // Paste the newest AmOS-clipboard text into the note editor (foreground-gated on
+  // the Rust side: only works when this window is focused). Non-text payloads no-op.
+  const pasteEditing = async () => {
+    const e = await clipboardRead();
+    const text = e ? entryText(e) : "";
+    if (!text) return;
+    setEditVal((v) => (v && v.trim() ? `${v}\n${text}` : text));
   };
   const editingThis = (id: string) => editingId === id;
   const editTasks = tasksOf(editVal);
@@ -1136,6 +1182,31 @@ const Notes: FC = () => {
                   <div className="mt-2 flex items-center justify-between text-[11px]">
                     <span className="opacity-60">{fmtTime(n.ts)}</span>
                     <div className="flex gap-2">
+                      <button
+                        onClick={() => void copyEditing()}
+                        aria-label="Copy to AmOS clipboard"
+                        title="复制到系统剪贴板"
+                        className="opacity-70 hover:opacity-100"
+                      >
+                        ⧉
+                      </button>
+                      <button
+                        onClick={() => void pasteEditing()}
+                        aria-label="Paste from AmOS clipboard"
+                        title="从系统剪贴板粘贴（需前台窗口）"
+                        className="opacity-70 hover:opacity-100"
+                      >
+                        📋
+                      </button>
+                      <button
+                        onClick={() => setTrayOpen((o) => !o)}
+                        aria-label="Clipboard history"
+                        aria-pressed={trayOpen}
+                        title="剪贴板历史"
+                        className="opacity-70 hover:opacity-100"
+                      >
+                        🕘
+                      </button>
                       <button onClick={cancelEdit} className="opacity-70 hover:underline">
                         {t("note.cancel")}
                       </button>
@@ -1144,6 +1215,20 @@ const Notes: FC = () => {
                       </button>
                     </div>
                   </div>
+                  {trayOpen && (
+                    <div className="relative mt-2">
+                      <ClipboardTray
+                        open
+                        onClose={() => setTrayOpen(false)}
+                        onPick={(e) => {
+                          const pasted = entryText(e);
+                          if (!pasted) return;
+                          setEditVal((v) => (v && v.trim() ? `${v}\n${pasted}` : pasted));
+                          setTrayOpen(false);
+                        }}
+                      />
+                    </div>
+                  )}
                 </>
               ) : (
                 <>
@@ -1561,6 +1646,7 @@ const COMPONENTS: Record<string, FC> = {
   store: StoreApp,
   privacy: PermissionsApp,
   contacts: ContactsApp,
+  magnifier: MagnifierApp,
 };
 
 /** Get the component for an app id, or a "not ported yet" placeholder. */

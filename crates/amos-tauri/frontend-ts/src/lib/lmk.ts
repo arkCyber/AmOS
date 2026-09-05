@@ -118,7 +118,6 @@ export async function startLmkSurfaceWatcher(): Promise<() => void> {
 
 /** Default cadence for the background periodic reconcile (ms). */
 export const RECONCILE_INTERVAL_MS = 30_000;
-
 /**
  * Run one reconcile immediately (catches surfaces stale from before the shell
  * started watching), then every `intervalMs`. Returns a stop() that clears the
@@ -132,3 +131,36 @@ export function startPeriodicReconcile(intervalMs = RECONCILE_INTERVAL_MS): () =
   }, intervalMs);
   return () => window.clearInterval(id);
 }
+
+// ---- LMK debug / user entry (bring-up `docs/android-lmk-e2e.md` G3) ---------
+
+/** One container app the daemon LMK reclaimed/froze in a trigger round. */
+export interface LmkVictim {
+  package_name: string;
+  window_id: string;
+  killed: boolean;
+}
+
+/** Outcome of an `android_lmk_debug` call (serialized from `LmkDebugOutcome`). */
+export interface LmkDebugOutcome {
+  victims: LmkVictim[];
+  note: string;
+}
+
+/**
+ * Drive the daemon LMK from the System UI (bring-up debug entry):
+ * `action` `"trigger"` asks the daemon to reclaim LRU victims (budget defaults to
+ * 1); `"apply_freeze" | "apply_thaw" | "apply_reclaim"` target one container app
+ * by `packageName`. Returns `null` when not bridged / daemon down.
+ */
+export async function androidLmkDebug(
+  action: "trigger" | "apply_freeze" | "apply_thaw" | "apply_reclaim",
+  packageName?: string,
+  budget?: number,
+): Promise<LmkDebugOutcome | null> {
+  const args: Record<string, unknown> = { action };
+  if (packageName !== undefined) args.packageName = packageName;
+  if (budget !== undefined) args.budget = budget;
+  return invoke<LmkDebugOutcome>("android_lmk_debug", args);
+}
+

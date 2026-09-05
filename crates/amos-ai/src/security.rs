@@ -11,6 +11,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::audit::AuditFile;
+
 /// Audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -197,6 +199,12 @@ pub struct AuditLogger {
     entries: Arc<RwLock<Vec<AuditEntry>>>,
     /// Maximum number of entries to keep in memory.
     max_entries: usize,
+    /// Optional durable JSON-lines sink; when present every [`log`] is also
+    /// appended there (via the unified [`AuditFile`]) so the audit survives
+    /// restarts. Disk failures are logged, never fatal.
+    ///
+    /// [`log`]: AuditLogger::log
+    sink: Option<AuditFile>,
 }
 
 impl Default for AuditLogger {
@@ -206,15 +214,34 @@ impl Default for AuditLogger {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger.
+    /// Create a new, memory-only audit logger.
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: Arc::new(RwLock::new(Vec::with_capacity(max_entries))),
             max_entries,
+            sink: None,
         }
     }
 
-    /// Log an audit entry.
+    /// Create a durable audit logger that appends to a JSON-lines [`AuditFile`]
+    /// at `path` (created if absent) in addition to the in-memory ring.
+    pub fn new_persistent(max_entries: usize, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let sink = AuditFile::open(path, max_entries)?;
+        Ok(Self {
+            entries: Arc::new(RwLock::new(Vec::with_capacity(max_entries))),
+            max_entries,
+            sink: Some(sink),
+        })
+    }
+
+    /// The path of the durable sink, if one was configured.
+    pub fn durable_path(&self) -> Option<&std::path::Path> {
+        self.sink.as_ref().and_then(AuditFile::path)
+    }
+
+    /// Log an audit entry. When a durable sink was configured the entry is also
+    /// appended there (normalised to [`crate::audit::AuditRecord`]); a disk
+    /// error is logged, never fatal.
     pub async fn log(
         &self,
         client_id: String,
@@ -231,17 +258,27 @@ impl AuditLogger {
             result,
             details,
         };
+        tracing::debug!("audit: {:?}", entry);
 
-        let mut entries = self.entries.write().await;
-        entries.push(entry.clone());
+        // Keep the bounded in-memory ring first.
+        {
+            let mut entries = self.entries.write().await;
+            entries.push(entry.clone());
 
-        // Trim old entries if necessary.
-        if entries.len() > self.max_entries {
-            let remove_count = entries.len() - self.max_entries;
-            let _ = entries.drain(0..remove_count).collect::<Vec<_>>();
+            // Trim old entries if necessary.
+            if entries.len() > self.max_entries {
+                let remove_count = entries.len() - self.max_entries;
+                let _ = entries.drain(0..remove_count).collect::<Vec<_>>();
+            }
         }
 
-        tracing::debug!("audit: {:?}", entry);
+        // Best-effort durable append through the unified sink.
+        if let Some(sink) = &self.sink {
+            let rec = crate::audit::AuditRecord::from(entry);
+            if let Err(e) = sink.log(rec).await {
+                tracing::warn!("audit file append failed: {e:#}");
+            }
+        }
     }
 
     /// Get recent audit entries.
@@ -588,5 +625,38 @@ mod tests {
                 .any(|e| e.result == AuditResult::Success),
             "in-quota generation is audited as success"
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_logger_appends_to_durable_audit_file() {
+        let dir = std::env::temp_dir().join(format!("amos-sec-audit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+
+        let logger = AuditLogger::new_persistent(64, &path).unwrap();
+        assert_eq!(logger.durable_path(), Some(path.as_path()));
+        logger
+            .log(
+                "client-a".to_string(),
+                "generate".to_string(),
+                "tokens".to_string(),
+                AuditResult::Success,
+                "ok".to_string(),
+            )
+            .await;
+
+        // The in-memory ring sees the entry for this session…
+        let session = logger.get_recent(10).await;
+        assert_eq!(session.len(), 1);
+
+        // …and the same event was appended to the durable JSON-lines file, so a
+        // fresh reader (restart) recovers it from disk via the unified sink.
+        let sink = AuditFile::open(&path, 64).unwrap();
+        assert_eq!(sink.count().await, 1, "entry persisted to the audit file");
+        let rec = sink.recent(10).await;
+        assert_eq!(rec[0].principal, "client-a");
+        assert_eq!(rec[0].outcome, crate::audit::Outcome::Success);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,35 @@
+<!--
+  AmOS System UI — Android manifest permissions (real-device fragment).
+
+  This is NOT a complete manifest. When the Tauri-Android project is generated
+  (cargo tauri android init), merge these <uses-permission> entries into
+  gen/android/app/src/main/AndroidManifest.xml of the System UI app.
+
+  Notes:
+   * CAMERA is required both by the native producers (AmosGlue/CameraGlue/
+     FlashlightGlue torch) and, when the WebView getUserMedia path is used, by the
+     Android runtime check + the WebView's own onPermissionRequest grant.
+   * RECORD_AUDIO gates the native AAudio mic (assistant voice). INTERNET is
+     needed for the store/catalog and the AI daemon's cloud backends.
+   * The magnifier / camera WebView demo fallback needs no permission; only the
+     live feed does. See docs/REAL_DEVICE_SYSTEM_UI_AUDIT.md § "WebView vs native".
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Magnifier / Camera live feed + native Camera2 preview producer + torch. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+    <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
+
+    <!-- On-device assistant voice: NDK AAudio mic (amos-audio/aaudio). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Real outbound dialing: the AmOS Phone dialer fires ACTION_CALL through
+         Android Telecom (needs runtime CALL_PHONE grant; see docs/telephony.md). -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+
+</manifest>

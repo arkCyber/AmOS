@@ -9,6 +9,18 @@ export type QuickSettings = Partial<Record<QuickKey, boolean>>;
 export const NOTIF_KEY = "amos.notifications";
 export const SETTINGS_KEY = "amos.settings";
 
+/** Durable torch (illumination) store key — distinct from the preference
+ * quick-settings because the torch is ephemeral hardware state, not a setting. */
+export const FLASHLIGHT_KEY = "amos.flashlight";
+
+/** Durable shape of the torch store (mirrors the Rust FlashlightPayload). */
+export interface FlashlightStore {
+  /** Whether the torch is currently lit. */
+  on: boolean;
+  /** Whether this device actually has a usable torch (rear camera + flash). */
+  torch_present: boolean;
+}
+
 /** Upper bound on in-memory notifications after normalization. Guards against a
  * pathologically large/bogus store being rendered in full on every open. */
 export const NOTIF_CAP = 100;
@@ -25,6 +37,28 @@ export interface Notif {
 /** Pure: flip one quick-toggle boolean (immutable). */
 export function flipQuick(s: QuickSettings, key: QuickKey): QuickSettings {
   return { ...s, [key]: !s[key] };
+}
+
+/** True when the torch is currently lit in the store. */
+export function torchOn(s: FlashlightStore): boolean {
+  return s.on && s.torch_present;
+}
+
+/** Pure: flip the torch on/off, mirroring the backend's on/off bit (immutable).
+ * Hardware presence is untouched — flipping never invents a torch. */
+export function flipFlashlight(s: FlashlightStore): FlashlightStore {
+  return { ...s, on: !s.on };
+}
+
+/** Corruption guard for the torch store. Defaults to a device that *has* a torch
+ * (so the control-center tile works offline) but is dark. */
+export function normalizeFlashlight(v: unknown): FlashlightStore {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { on: false, torch_present: true };
+  const o = v as Record<string, unknown>;
+  return {
+    on: typeof o.on === "boolean" ? o.on : false,
+    torch_present: typeof o.torch_present === "boolean" ? o.torch_present : true,
+  };
 }
 
 /**

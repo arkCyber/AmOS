@@ -15,26 +15,10 @@ use amos_proto::amos_governor::{
     AppRef as ProtoAppRef, Empty as GovernorEmpty, JobRef as ProtoJobRef, MoveAppRequest,
 };
 use serde::Serialize;
-use tokio::net::UnixStream;
-use tonic::transport::{Endpoint, Uri};
-use tower::service_fn;
-
 use crate::ai_bridge::with_client_id;
 
 async fn build_channel() -> Result<tonic::transport::Channel, String> {
-    let path = amos_proto::socket::default_socket_path();
-    let owned = path.clone();
-    let endpoint = Endpoint::try_from("http://[::1]:50051").map_err(|e| e.to_string())?;
-    endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = owned.clone();
-            async move {
-                let stream = UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-            }
-        }))
-        .await
-        .map_err(|e| format!("OS daemon unavailable at {path:?}: {e}"))
+    crate::daemon::channel().await
 }
 
 async fn connect() -> Result<GovernorClient<tonic::transport::Channel>, String> {

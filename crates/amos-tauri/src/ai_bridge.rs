@@ -19,11 +19,8 @@ use amos_proto::android_compat::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Endpoint, Uri};
-use tower::service_fn;
 
 /// Wrap an outbound RPC payload in a `Request` carrying the caller identity, so
 /// the daemon's security layer can apply per-client rate limits and attribute
@@ -271,19 +268,7 @@ impl AiBridge {
 
 /// Open a gRPC channel routed over the amos Unix Domain Socket.
 async fn build_channel() -> Result<tonic::transport::Channel, String> {
-    let path = amos_proto::socket::default_socket_path();
-    // The URI host/port are unused for UDS; the connector below ignores them.
-    let endpoint = Endpoint::try_from("http://[::1]:50051").map_err(|e| e.to_string())?;
-    endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = path.clone();
-            async move {
-                let stream = UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-            }
-        }))
-        .await
-        .map_err(|e| e.to_string())
+    crate::daemon::channel().await
 }
 
 /// Serializable snapshot of the daemon status (prost types don't impl serde).
@@ -442,17 +427,38 @@ pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, String> {
     }
 }
 
+/// Merge the AI system context for a request: prefer the `SystemContext` entry
+/// addressed to `target` (the multi-window "selection → AI" flow); otherwise fall
+/// back to the newest text in the *global clipboard* so the agent can also see
+/// what the user most recently copied anywhere. Either way it lands under the
+/// `system_selection` key, keeping the wire/proto unchanged.
+fn merge_system_selection(
+    ctx: &SystemContext,
+    target: &str,
+    clip: &crate::clipboard::GlobalClipboard,
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    inject_context(ctx, target, out);
+    if out.get("system_selection").is_none() {
+        if let Some(text) = clip.latest_text() {
+            out.insert("system_selection".into(), text);
+        }
+    }
+}
+
 /// Tauri command: kick off an AI generation and stream tokens to the WebView.
 ///
 /// If a `SystemContext` entry is addressed to the requesting window (via
 /// `target_window`), its text is injected into `AgentRequest.context` under the
 /// `system_selection` key so the multi-window "selection → AI" flow works
-/// without any new protocol (see `docs/multi-window.md` §3).
+/// without any new protocol (see `docs/multi-window.md` §3); otherwise the
+/// newest text on the global clipboard is used instead.
 #[tauri::command]
 pub async fn ask_ai_agent(
     app: AppHandle,
     state: State<'_, AiBridge>,
     ctx: State<'_, SystemContext>,
+    clip: State<'_, std::sync::Arc<crate::clipboard::GlobalClipboard>>,
     prompt: String,
     session_id: Option<String>,
     target_window: Option<String>,
@@ -460,10 +466,11 @@ pub async fn ask_ai_agent(
     let sid = session_id.unwrap_or_else(|| "default".to_string());
 
     // Merge the system-wide selection context (addressed to this window) into
-    // the request before it crosses the wire.
+    // the request before it crosses the wire, falling back to the global
+    // clipboard's newest text when no per-window entry is attached.
     let mut context = std::collections::HashMap::new();
     let target = target_window.unwrap_or_else(|| "ai".to_string());
-    inject_context(&ctx, &target, &mut context);
+    merge_system_selection(&ctx, &target, clip.inner(), &mut context);
 
     let request = AgentRequest {
         session_id: sid.clone(),
@@ -585,12 +592,14 @@ pub async fn clear_ai_sessions(state: State<'_, AiBridge>) -> Result<u32, String
 /// push a `Cancel` (or a follow-up prompt) via `cancel_ai_session`.
 ///
 /// System-wide context addressed to `target_window` is injected into the prompt
-/// (the bidi `ClientMessage` carries no context field, so it is prefixed).
+/// (the bidi `ClientMessage` carries no context field, so it is prefixed),
+/// falling back to the newest text on the global clipboard.
 #[tauri::command]
 pub async fn chat_agent(
     app: AppHandle,
     state: State<'_, AiBridge>,
     ctx: State<'_, SystemContext>,
+    clip: State<'_, std::sync::Arc<crate::clipboard::GlobalClipboard>>,
     prompt: String,
     session_id: Option<String>,
     target_window: Option<String>,
@@ -598,9 +607,10 @@ pub async fn chat_agent(
     let sid = session_id.unwrap_or_else(|| "default".to_string());
     let target = target_window.unwrap_or_else(|| "ai".to_string());
 
-    // Inject the system-wide selection context addressed to this window.
+    // Inject the system-wide selection context addressed to this window,
+    // preferring it over the global clipboard's newest text.
     let mut context = std::collections::HashMap::new();
-    inject_context(&ctx, &target, &mut context);
+    merge_system_selection(&ctx, &target, clip.inner(), &mut context);
     let mut prompt = prompt;
     if let Some(selection) = context.get("system_selection") {
         prompt = format!("[系统上下文] {selection}\n\n{prompt}");
@@ -844,5 +854,51 @@ pub async fn android_lmk_tasks(
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_system_selection;
+    use crate::clipboard::GlobalClipboard;
+    use crate::wm::SystemContext;
+    use std::collections::HashMap;
+
+    #[test]
+    fn target_system_context_wins_over_global_clipboard() {
+        let ctx = SystemContext::new();
+        ctx.set("ai", "notes", "attached selection");
+        let clip = GlobalClipboard::new();
+        clip.write_plain("browser", "browser", "last copied")
+            .unwrap();
+        let mut out = HashMap::new();
+        merge_system_selection(&ctx, "ai", &clip, &mut out);
+        assert_eq!(
+            out.get("system_selection").map(String::as_str),
+            Some("attached selection")
+        );
+    }
+
+    #[test]
+    fn empty_system_context_falls_back_to_global_clipboard() {
+        let ctx = SystemContext::new();
+        let clip = GlobalClipboard::new();
+        clip.write_plain("browser", "browser", "last copied")
+            .unwrap();
+        let mut out = HashMap::new();
+        merge_system_selection(&ctx, "ai", &clip, &mut out);
+        assert_eq!(
+            out.get("system_selection").map(String::as_str),
+            Some("last copied")
+        );
+    }
+
+    #[test]
+    fn empty_everything_injects_nothing() {
+        let ctx = SystemContext::new();
+        let clip = GlobalClipboard::new();
+        let mut out = HashMap::new();
+        merge_system_selection(&ctx, "ai", &clip, &mut out);
+        assert!(out.is_empty());
     }
 }

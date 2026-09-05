@@ -15,32 +15,11 @@
 use amos_proto::ai_agent::ai_agent_client::AiAgentClient;
 use amos_proto::ai_agent::{StatusRequest, SystemHealth as WireSystemHealth};
 use serde::Serialize;
-use tokio::net::UnixStream;
-use tonic::transport::{Endpoint, Uri};
-use tower::service_fn;
 
 use crate::ai_bridge::with_client_id;
 
-/// The OS daemon socket — the same one `ai_bridge`/`sensors` use.
-fn socket_path() -> std::path::PathBuf {
-    amos_proto::socket::default_socket_path()
-}
-
 async fn build_channel() -> Result<tonic::transport::Channel, String> {
-    let socket = socket_path();
-    let owned = socket.clone();
-    let endpoint = Endpoint::try_from("http://[::1]:50051").map_err(|e| e.to_string())?;
-    let channel = endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = owned.clone();
-            async move {
-                let stream = UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-            }
-        }))
-        .await
-        .map_err(|e| format!("OS daemon unavailable at {socket:?}: {e}"))?;
-    Ok(channel)
+    crate::daemon::channel().await
 }
 
 /// Serializable mirror of the daemon `get_status.system` block. Option fields are

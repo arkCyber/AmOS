@@ -16,6 +16,8 @@ import { zh, type MessageKey } from "./i18n/locales/zh";
 import { isExtId, loadStoreTiles, subscribeStoreTiles, tileById, type StoreTile } from "./lib/storeApps";
 import { useStoreValue } from "./lib/useStoreValue";
 import { bridged, subscribe } from "./lib/backend";
+import { clampAutoOffSec, dueForAutoSleep, setScreenState, AUTOOFF_STORE_KEY } from "./lib/display";
+import { useCallKeepAwake, useScreenHold } from "./lib/keepAwake";
 import { useNotificationAlert } from "./lib/useNotificationAlert";
 import { startLmkSurfaceWatcher, startPeriodicReconcile } from "./lib/lmk";
 import { useDueReminderAlerts } from "./lib/reminderNotify";
@@ -27,24 +29,43 @@ import {
 
 function HomeIndicator({ onHome }: { onHome: () => void }) {
   const startY = useRef<number | null>(null);
+  const firedRef = useRef(false);
+  // Fire once per gesture (a swipe-up also synthesizes a click); log for on-device
+  // diagnostics via chrome://inspect or `adb logcat` (WebView console).
+  const go = (src: "tap" | "swipe-up") => {
+    if (firedRef.current) return;
+    firedRef.current = true;
+    console.info(`[shell] HomeIndicator ${src} -> home`);
+    onHome();
+    window.setTimeout(() => {
+      firedRef.current = false;
+    }, 250);
+  };
   return (
     <div
-      className="flex justify-center py-1.5"
+      className="flex justify-center pt-1"
+      // Guarantee the pill sits well ABOVE the Android system-gesture strip (the
+      // likely cause of "home does nothing"): at least 24px of padding below it,
+      // more if the OS reports a larger bottom inset. env() may be 0 if the WebView
+      // is not treated as edge-to-edge, so we never trust it alone.
+      style={{ paddingBottom: "max(24px, env(safe-area-inset-bottom))" }}
       onTouchStart={(e) => {
+        firedRef.current = false;
         startY.current = e.touches[0]?.clientY ?? null;
       }}
       onTouchEnd={(e) => {
         const sy = startY.current;
         startY.current = null;
         const ey = e.changedTouches[0]?.clientY ?? sy;
-        if (sy !== null && ey !== null && ey < sy - 40) onHome(); // swipe up
+        if (sy !== null && ey !== null && ey < sy - 40) go("swipe-up"); // swipe up
       }}
     >
       <button
-        onClick={onHome}
+        onClick={() => go("tap")}
         aria-label="home"
         title="Home"
-        className="h-1.5 w-28 rounded-full bg-neutral-400/80 active:bg-accent dark:bg-neutral-600/80"
+        // Generous hit area so the tap reliably lands (h-3 + the tap maps to a click).
+        className="h-3 w-32 cursor-pointer rounded-full bg-neutral-400/90 active:bg-accent dark:bg-neutral-600/90"
       />
     </div>
   );
@@ -214,7 +235,16 @@ function Shell() {
     closeAll();
     setActive(id);
   };
-  const back = () => setActive(null);
+  // Single "return to AmOS home" entry used by the app's back arrow, the bottom home
+  // pill, and the hardware-home action — logging so an on-device "home does nothing"
+  // is diagnosable (WebView console via chrome://inspect or adb logcat).
+  const goHome = (src: string) => {
+    console.info(`[shell] go-home from ${src}`);
+    setEditMode(false);
+    closeAll();
+    setActive(null);
+  };
+  const back = () => goHome("app-back");
 
   // Clean up the pulse timer if the shell unmounts.
   useEffect(() => {
@@ -273,13 +303,77 @@ function Shell() {
   runRef.current = (action) => {
     if (lockedRef.current) return; // locked: the system must be unlocked first
     if (action === "home") {
-      setEditMode(false);
-      closeAll();
-      setActive(null);
+      goHome("hardware-home");
     } else if (action === "ai" || action === "voice") {
       open("ai");
     }
   };
+
+  // ---- Display protection (auto screen-off) --------------------------------
+  // When enabled (`amos.displayAutoOffSec` > 0) and the shell is not locked, an
+  // idle watcher sleeps the screen after N seconds without interaction. Locking
+  // (auto or the TopBar 🔒) is phone-equivalent to turning the screen off, so
+  // every lock path reports `screen_on = false` to the daemon via the shared
+  // screen-state file (energy governor then defers/freezes); unlocking reports
+  // it back on. Docs/display-idle.md.
+  // Reactive auto screen-off timeout (seconds; 0 = off). Subscribed to the store
+  // so a live write (e.g. a future Settings row, another window) re-arms the
+  // watcher without a remount — not a one-shot read.
+  const autoOffRaw = useStoreValue<unknown>(AUTOOFF_STORE_KEY, 0);
+  const autoOffSec = clampAutoOffSec(autoOffRaw);
+  // Single screen-off entry used by the TopBar lock button AND the idle watcher,
+  // so both paths report one consistent state to the daemon.
+  const lockScreen = () => {
+    setLocked(true);
+    void setScreenState(false);
+  };
+  const handleUnlock = () => {
+    setLocked(false);
+    void setScreenState(true);
+  };
+  const lastActivityRef = useRef(Date.now());
+  // Keep-awake reasons: an active call (today) or a future nav/video session
+  // asserts a screen hold; the idle watcher must not auto-sleep while any is held.
+  useCallKeepAwake();
+  const screenHeld = useScreenHold();
+  const screenHeldRef = useRef(screenHeld);
+  screenHeldRef.current = screenHeld;
+  useEffect(() => {
+    if (autoOffSec <= 0) return; // feature off by default
+    const mark = () => {
+      lastActivityRef.current = Date.now();
+    };
+    window.addEventListener("keydown", mark);
+    window.addEventListener("pointerdown", mark);
+    window.addEventListener("touchstart", mark);
+    const id = window.setInterval(() => {
+      if (lockedRef.current) return; // already on the lock screen
+      const now = Date.now();
+      const due = dueForAutoSleep(
+        Math.floor(lastActivityRef.current / 1000),
+        Math.floor(now / 1000),
+        autoOffSec,
+        screenHeldRef.current,
+      );
+      if (due) lockScreen();
+    }, 1000);
+    return () => {
+      window.removeEventListener("keydown", mark);
+      window.removeEventListener("pointerdown", mark);
+      window.removeEventListener("touchstart", mark);
+      window.clearInterval(id);
+    };
+    // lockScreen is stable across the component; the dependency set is fixed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOffSec]);
+
+  // Re-assert the screen is ON on boot (the shell starts unlocked = display
+  // visible): clears a stale `off` left by a previous run so the daemon never
+  // keeps deferring/freezing as if the screen were still dark. No-op offline.
+  useEffect(() => {
+    if (!lockedRef.current) void setScreenState(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Route real `hardware-button` events from the Rust core (Home/Voice/AI).
   useEffect(() => {
@@ -339,7 +433,7 @@ function Shell() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  if (locked) return <LockScreen onUnlock={() => setLocked(false)} />;
+  if (locked) return <LockScreen onUnlock={handleUnlock} />;
 
   if (active) {
     const key = appTitleKey(active);
@@ -373,7 +467,7 @@ function Shell() {
     >
       <StatusBar />
       <TopBar
-        onLock={() => setLocked(true)}
+        onLock={lockScreen}
         onRecents={() => setRecentsOpen(true)}
         onSearch={() => setSpotOpen(true)}
         onNotify={() => setNcOpen(true)}

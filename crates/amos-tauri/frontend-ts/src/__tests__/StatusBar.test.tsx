@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import StatusBar from "../components/StatusBar";
 import { writeStoreValue } from "../lib/amosStore";
-import { SETTINGS_KEY } from "../lib/settings";
+import { FLASHLIGHT_KEY, SETTINGS_KEY } from "../lib/settings";
 
 try {
   GlobalRegistrator.register();
@@ -60,5 +60,29 @@ describe("StatusBar radio / DND indicators", () => {
       writeStoreValue(SETTINGS_KEY, { dnd: true });
     });
     expect(host.textContent).toContain("🌒");
+  });
+
+  test("torch indicator 🔦 appears only while the torch is lit", async () => {
+    const host = mount();
+    await act(async () => {});
+    expect(host.textContent).not.toContain("🔦");
+
+    // Torch present but off → no indicator.
+    await act(async () => {
+      writeStoreValue(FLASHLIGHT_KEY, { on: false, torch_present: true });
+    });
+    expect(host.textContent).not.toContain("🔦");
+
+    // Lit → indicator.
+    await act(async () => {
+      writeStoreValue(FLASHLIGHT_KEY, { on: true, torch_present: true });
+    });
+    expect(host.textContent).toContain("🔦");
+
+    // OS turns it off (external note) → indicator disappears.
+    await act(async () => {
+      writeStoreValue(FLASHLIGHT_KEY, { on: false, torch_present: true });
+    });
+    expect(host.textContent).not.toContain("🔦");
   });
 });

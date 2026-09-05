@@ -103,6 +103,46 @@ pub fn simulate_button(
     Ok(())
 }
 
+#[cfg(feature = "android")]
+pub fn install_android_app(app: AppHandle) {
+    android_impl::install_app(app);
+}
+
+/// Android device seam (feature `android`): lets the native `MainActivity` hand a
+/// physical **camera** / shutter key press up so it can be re-mapped to the AmOS
+/// **Home** action instead of launching the OS camera. Mirrors the repo's
+/// Kotlin→Rust upcall pattern.
+#[cfg(feature = "android")]
+mod android_impl {
+    use super::*;
+    use std::sync::OnceLock;
+    use tauri::Manager;
+
+    static APP: OnceLock<AppHandle> = OnceLock::new();
+
+    pub fn install_app(app: AppHandle) {
+        let _ = APP.set(app);
+    }
+
+    /// `MainActivity.onPhysicalHome()` — a physical camera key was pressed and
+    /// consumed; route it as the AmOS Home button (`HardwareButton::Home` →
+    /// frontend `buttonActionOf("home")` → go to the launcher / home screen).
+    ///
+    /// # Safety
+    /// `env`/`this` are the standard JNI instance-method args, valid for the call.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_com_amos_ai_MainActivity_onPhysicalHome(
+        _env: *mut jni::sys::JNIEnv,
+        _this: jni::sys::jobject,
+    ) {
+        let Some(app) = APP.get() else {
+            return;
+        };
+        let buttons = app.state::<HardwareButtons>();
+        buttons.press(app, HardwareButton::Home);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

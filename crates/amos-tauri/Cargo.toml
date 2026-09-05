@@ -26,6 +26,9 @@ amos-tts = { path = "../amos-tts" }
 amos-asr = { path = "../amos-asr", optional = true }
 amos-audio = { path = "../amos-audio" }
 amos-radio = { path = "../amos-radio" }
+amos-flashlight.workspace = true
+amos-display.workspace = true
+async-trait = "0.1"
 # amos-sensor: device-sensor domain core — the System UI's own sensor read side
 # (LiveSensorProvider stream bus + SensorManager energy policy) backs the local
 # `sensor_host` commands; its `android` feature adds the on-device backend.
@@ -64,6 +67,7 @@ default = []
 android = [
     "dep:jni",
     "amos-radio/android",
+    "amos-flashlight/android",
     "amos-sensor/android",
     "amos-audio/aaudio",
 ]
@@ -72,6 +76,13 @@ piper-tts = ["amos-tts/piper"]
 # Real HTTP app-store backend for the StoreBridge (remote catalog + package
 # downloads). Off by default so the UI build stays offline-green.
 appstore-live = ["amos-appstore/live"]
+# On-device / host-target TCP transport for the AI daemon bridge (docs "AmOS on a
+# retail Android" bring-up): when enabled (plus/or `AMOS_TCP_ADDR` env), the System
+# UI connects to `amos-ai` over loopback TCP instead of a Unix socket. Needed on a
+# non-root retail device where a shell-run daemon cannot create a Unix socket under
+# SELinux but can bind loopback TCP (see crates/amos-ai/src/server.rs
+# `resolve_tcp_addr`). Desktop host builds omit it (UDS), unless AMOS_TCP_ADDR is set.
+tcp = []
 
 # Integration tests spawn the real amos-ai tonic server in-process so the AI
 # bridge command core can be exercised headlessly over UDS (no Tauri/GUI).

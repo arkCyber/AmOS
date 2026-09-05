@@ -52,8 +52,8 @@ describe("durable permission ledger (pure)", () => {
   });
 
   test("typed helpers compile for all known capabilities", () => {
-    const caps: Capability[] = ["camera", "microphone", "location", "notifications"];
-    expect(caps).toHaveLength(4);
+    const caps: Capability[] = ["camera", "microphone", "location", "contacts", "storage", "notifications"];
+    expect(caps).toHaveLength(6);
   });
 
   test("saveLedger/loadLedger round-trip through the durable store", () => {

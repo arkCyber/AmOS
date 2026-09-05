@@ -27,6 +27,7 @@ amos-scheduler.workspace = true
 # get_status.system. The `linux` feature only adds std::fs reads of /proc (absent
 # at runtime on macOS/dev → honest "unknown", never fabricated).
 amos-monitor = { workspace = true, features = ["linux"] }
+amos-display.workspace = true
 amos-asr = { path = "../amos-asr" }
 tokio.workspace = true
 tokio-stream.workspace = true

@@ -11,6 +11,7 @@
 )]
 
 pub mod accelerator;
+pub mod audit;
 pub mod chat_asr;
 pub mod cli;
 pub mod config;
@@ -20,6 +21,7 @@ pub mod governor_service;
 pub mod inference;
 pub mod monitoring;
 pub mod privacy;
+pub mod privacy_service;
 pub mod profiler;
 pub mod security;
 pub mod semantic;

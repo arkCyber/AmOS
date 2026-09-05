@@ -2,20 +2,33 @@ import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
 import { readStoreValue, writeStoreValue } from "../lib/amosStore";
-import { bridged, radioSet, radioStatus, type RadioPayload } from "../lib/backend";
+import { useStoreValue } from "../lib/useStoreValue";
+import {
+  bridged,
+  flashlightSet,
+  flashlightStatus,
+  radioSet,
+  radioStatus,
+  type FlashlightPayload,
+  type RadioPayload,
+} from "../lib/backend";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import {
+  FLASHLIGHT_KEY,
   NOTIF_KEY,
   SETTINGS_KEY,
   dndActive,
+  flipFlashlight,
   flipLocation,
   flipQuick,
   flipRadio,
   locationEnabled,
+  normalizeFlashlight,
   normalizeNotifs,
   normalizeQuick,
   removeNotif,
   seedNotifs,
+  type FlashlightStore,
   type Notif,
   type QuickKey,
   type QuickSettings,
@@ -45,6 +58,10 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
     writeStoreValue(NOTIF_KEY, s);
     return s;
   });
+  // Torch is read reactively from the shared store so OS-driven changes pushed
+  // via `store-updated` (from Rust: the status bar AND an open tile) reflect
+  // live, without open-panel polling.
+  const flash = normalizeFlashlight(useStoreValue<unknown>(FLASHLIGHT_KEY, {}));
   const rootRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(open, rootRef, onClose);
   const quiet = dndActive(settings);
@@ -58,15 +75,28 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
     airplane: r.airplane,
   });
 
-  // When the panel opens inside Tauri, sync radio tiles from the authoritative
-  // backend snapshot (e.g. airplane mode was toggled from another window). We
-  // only touch React state here — durability lives in the shared store.
+  // Merge an authoritative torch snapshot into the local store mirror.
+  const mergeFlash = (p: FlashlightPayload): FlashlightStore => ({
+    on: p.on,
+    torch_present: p.torch_present,
+  });
+
+  // When the panel opens inside Tauri, sync radio + torch tiles from the
+  // authoritative backend snapshot (e.g. airplane mode or the torch was toggled
+  // from another window). We only touch React state here — durability lives in
+  // the shared store.
   useEffect(() => {
     if (!open || !bridged()) return;
     let cancelled = false;
     radioStatus().then((snap) => {
       if (!snap || cancelled) return;
       setSettings((prev) => mergeRadio(prev, snap));
+    });
+    flashlightStatus().then((snap) => {
+      if (!snap || cancelled) return;
+      // Mirror the authoritative snapshot into the shared store; the reactive
+      // read (flash) adopts it and cross-window surfaces stay consistent.
+      writeStoreValue(FLASHLIGHT_KEY, mergeFlash(snap));
     });
     return () => {
       cancelled = true;
@@ -127,6 +157,29 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
     setSettings(next);
     writeStoreValue(SETTINGS_KEY, next);
   };
+  // Torch toggles go through the real `flashlight_*` backend when it is
+  // reachable (authoritative snapshot); outside Tauri we fall back to the same
+  // local flip so the UI still behaves identically. Durability lives in the
+  // dedicated `amos.flashlight` store.
+  const toggleFlash = async () => {
+    const nextOn = !flash.on;
+    if (bridged()) {
+      const snap = await flashlightSet(nextOn);
+      if (snap) {
+        // Write the authoritative snapshot into the shared store; the reactive
+        // read (flash) adopts it and cross-window surfaces stay in sync.
+        writeStoreValue(FLASHLIGHT_KEY, mergeFlash(snap));
+        return;
+      }
+      // Rejected/unavailable (e.g. no torch hardware): don't keep a stale tile —
+      // pull the authoritative state instead.
+      const live = await flashlightStatus();
+      if (live) writeStoreValue(FLASHLIGHT_KEY, mergeFlash(live));
+      return;
+    }
+    const next = flipFlashlight(flash);
+    writeStoreValue(FLASHLIGHT_KEY, next);
+  };
   const clear = () => {
     setNotifs([]);
     writeStoreValue(NOTIF_KEY, []);
@@ -154,6 +207,32 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
           {t("common.done")}
         </button>
       </div>
+
+      {/* Torch / flashlight — illumination control (ephemeral hardware state).
+          A dedicated full-width tile above the preference quick-settings. */}
+      <button
+        onClick={toggleFlash}
+        aria-pressed={flash.on}
+        disabled={!flash.torch_present}
+        className={
+          "mt-3 flex items-center justify-between rounded-3xl px-4 py-3 text-sm font-semibold transition active:scale-[0.98] disabled:opacity-40 " +
+          (flash.on
+            ? "bg-amber-400 text-neutral-900 shadow-[0_6px_16px_rgba(245,158,11,0.45)]"
+            : "bg-white/55 text-neutral-800 ring-1 ring-white/50 shadow-sm dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10")
+        }
+      >
+        <span className="flex items-center gap-2.5">
+          <span className="text-xl leading-none">{flash.on ? "🔦" : "🔆"}</span>
+          {t("q.flashlight")}
+        </span>
+        {!flash.torch_present ? (
+          <span className="text-xs font-medium opacity-50">{t("nc.torchNone")}</span>
+        ) : (
+          <span className={"text-xs font-medium " + (flash.on ? "opacity-80" : "opacity-50")}>
+            {flash.on ? t("nc.torchOn") : t("nc.torchOff")}
+          </span>
+        )}
+      </button>
 
       {/* Quick settings — iOS Control-Center style translucent tiles */}
       <div className="mt-4 grid grid-cols-3 gap-2.5">

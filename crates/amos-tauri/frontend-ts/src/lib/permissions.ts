@@ -15,14 +15,30 @@
  */
 import { readStoreValue, writeStoreValue } from "./amosStore";
 
-/** A sensitive capability an app may request. */
-export type Capability = "camera" | "microphone" | "location" | "notifications";
+/**
+ * A sensitive capability an app may request.
+ *
+ * The vocabulary mirrors the daemon's `amos-ai::privacy::Resource` wire keys for
+ * the OS resources that the daemon gate-keeps (`camera` / `microphone` /
+ * `location` / `contacts` / `storage`). `notifications` is a **local-only**
+ * capability — it has no daemon resource and is not part of the OS permission
+ * store (see `lib/privacyBackend.ts`).
+ */
+export type Capability =
+  | "camera"
+  | "microphone"
+  | "location"
+  | "contacts"
+  | "storage"
+  | "notifications";
 
 /** Every capability the OS knows about (drives dashboards / prompts). */
 export const CAPABILITIES: readonly Capability[] = [
   "camera",
   "microphone",
   "location",
+  "contacts",
+  "storage",
   "notifications",
 ];
 

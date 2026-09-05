@@ -1,0 +1,17 @@
+[package]
+name = "amos-web3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos Web3 / EVM digital-signature domain core: deterministic secp256k1 keys from a 32-byte seed, keccak256, EVM address derivation, EIP-191 personal_sign and EIP-712 typed-data hashing/signing/verification — pure Rust with no PRNG in the core (OS entropy is an explicit caller seam)."
+
+[lib]
+name = "amos_web3"
+path = "src/lib.rs"
+
+[dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
+sha3 = "0.10"
+serde_json = "1"
+thiserror = "1"

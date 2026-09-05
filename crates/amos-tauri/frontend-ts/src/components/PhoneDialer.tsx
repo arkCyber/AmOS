@@ -3,13 +3,14 @@ import { useI18n } from "../i18n";
 import { readStoreValue } from "../lib/amosStore";
 import {
   onTelephonyEvent,
+  realDial,
   telephonyDial,
   telephonyEnd,
   telephonySimulateIncoming,
   telephonyStartRecording,
   telephonyStopRecording,
 } from "../lib/backend";
-import { KEYS, backspace, clearDial, pushKey, MAX_DIAL_LEN } from "../lib/phone";
+import { KEYS, backspace, clearDial, pushKey, MAX_DIAL_LEN, fmtCallDuration } from "../lib/phone";
 import { EMERGENCY_NUMBERS, EMERGENCY_QUICK_NUMBER } from "../lib/emergency";
 import {
   CONTACTS_KEY,
@@ -45,6 +46,9 @@ export function PhoneApp() {
   const [padOpen, setPadOpen] = useState(false);
   const [dtmf, setDtmf] = useState("");
   const activeRef = useRef<string | null>(null);
+  // Live elapsed call timer: seconds since the call reached Active (resets on end).
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const activeAtRef = useRef<number | null>(null);
   const [contacts] = useState<Contact[]>(() =>
     normalizeContacts(readStoreValue(CONTACTS_KEY, [])),
   );
@@ -64,11 +68,23 @@ export function PhoneApp() {
     setTalking(false);
     setActiveId(null);
     activeRef.current = null;
+    activeAtRef.current = null;
+    setElapsedSec(0);
     setRecording("Off");
     setMuted(false);
     setPadOpen(false);
     setDtmf("");
     setDialError(null);
+    // Real outbound call first (on-device Android build): hand the number to the OS
+    // telecom stack via ACTION_CALL. On success the in-call screen is the *system*
+    // one, so we leave our own mock in-call UI alone. Unavailable (desktop / not
+    // bound / no CALL_PHONE) → false → fall through to the daemon mock path as before.
+    // Emergency numbers keep the privileged (rate-limit-exempt, audited) mock path.
+    if (!emergency && (await realDial(target))) {
+      setCalling(false);
+      setTalking(false);
+      return;
+    }
     const res = await telephonyDial(target, emergency);
     if (res) {
       setActiveId(res.id);
@@ -129,12 +145,16 @@ export function PhoneApp() {
     return onTelephonyEvent((call) => {
       if (call.id !== activeRef.current) return;
       setRecording(call.recording as "Off" | "On" | "Failed");
-      if (call.state === "Active") setTalking(true);
-      else if (call.state === "Ended") {
+      if (call.state === "Active") {
+        setTalking(true);
+        activeAtRef.current = Date.now();
+      } else if (call.state === "Ended") {
         setCalling(false);
         setTalking(false);
         setActiveId(null);
         activeRef.current = null;
+        activeAtRef.current = null;
+        setElapsedSec(0);
         setRecording("Off");
         setMuted(false);
         setPadOpen(false);
@@ -142,6 +162,18 @@ export function PhoneApp() {
       }
     });
   }, []);
+
+  // Elapsed call timer while talking (Active): recompute from the wall-clock start so
+  // it stays accurate even if `setInterval` is throttled; stops when not talking.
+  useEffect(() => {
+    if (!talking) return;
+    const id = window.setInterval(() => {
+      if (activeAtRef.current != null) {
+        setElapsedSec(Math.floor((Date.now() - activeAtRef.current) / 1000));
+      }
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [talking]);
 
   const tabs: { id: PhoneTab; label: string }[] = [
     { id: "keys", label: t("phone.tabKeys") },
@@ -301,6 +333,14 @@ export function PhoneApp() {
           {talking ? t("phone.talking") : t("phone.call")}
           {!talking && num ? " …" : ""}
         </div>
+        {talking && (
+          <div
+            aria-label="call duration"
+            className="mt-0.5 text-xs tabular-nums tracking-widest text-accent/80"
+          >
+            {fmtCallDuration(elapsedSec)}
+          </div>
+        )}
       </div>
       {recording === "On" && (
         <p className="flex items-center gap-1.5 text-xs font-medium text-danger">

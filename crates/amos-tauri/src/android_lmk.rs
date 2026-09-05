@@ -9,14 +9,14 @@
 //! `telephony.rs::spawn_telephony_watch` (same socket, same backoff-reconnect).
 
 use amos_proto::android_compat::{
-    android_manager_client::AndroidManagerClient, Empty, LmkEvent, LmkEventKind,
+    android_manager_client::AndroidManagerClient, Empty, HostAction, HostActionRequest, LmkEvent,
+    LmkEventKind, LmkRequest, LmkResponse, LmkVictim, MemoryPressure,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tokio::net::UnixStream;
 use tokio::time::{sleep, Duration};
-use tonic::transport::{Endpoint, Uri};
-use tower::service_fn;
+
+use crate::ai_bridge::with_client_id;
 
 /// Tauri event name carrying one [`LmkSurfacePayload`] per daemon `WatchLmk` event.
 pub const LMK_SURFACE_EVENT: &str = "lmk-surface";
@@ -34,27 +34,8 @@ pub struct LmkSurfacePayload {
     pub close_surface: bool,
 }
 
-/// The OS daemon socket — the same one `ai_bridge`/`telephony` use (`AMOS_SOCKET`
-/// wins, else the platform default, e.g. `/tmp/amos-ai.sock`).
-fn socket_path() -> std::path::PathBuf {
-    amos_proto::socket::default_socket_path()
-}
-
 async fn build_android_client() -> Result<AndroidManagerClient<tonic::transport::Channel>, String> {
-    let socket = socket_path();
-    let owned = socket.clone();
-    let endpoint = Endpoint::try_from("http://[::1]:50051").map_err(|e| e.to_string())?;
-    let channel = endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = owned.clone();
-            async move {
-                let stream = UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-            }
-        }))
-        .await
-        .map_err(|e| format!("OS daemon unavailable at {socket:?}: {e}"))?;
-    Ok(AndroidManagerClient::new(channel))
+    Ok(AndroidManagerClient::new(crate::daemon::channel().await?))
 }
 
 /// Map a daemon `LmkEvent` to the shell-facing payload.
@@ -110,6 +91,111 @@ pub fn spawn_lmk_watch(app: AppHandle) {
     });
 }
 
+/// Serializable victim row returned by an LMK trigger (prost structs are not
+/// `Serialize`). The shell can show which container app was reclaimed/frozen.
+#[derive(Clone, Debug, Serialize)]
+pub struct LmkVictimOutcome {
+    pub package_name: String,
+    pub window_id: String,
+    /// `true` = killed (surface torn down); `false` = frozen to Cached.
+    pub killed: bool,
+}
+
+/// Pure mapper from a proto `LmkVictim` to a shell-facing row.
+fn victim_outcome(v: &LmkVictim) -> LmkVictimOutcome {
+    LmkVictimOutcome {
+        package_name: v.package_name.clone(),
+        window_id: v.window_id.clone(),
+        killed: v.killed,
+    }
+}
+
+/// Outcome of a debug LMK command: any victims reclaimed + a human note.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LmkDebugOutcome {
+    pub victims: Vec<LmkVictimOutcome>,
+    pub note: String,
+}
+
+/// System-UI debug/user actions the shell can drive into the daemon's Android
+/// manager LMK half (bring-up entry for `docs/android-lmk-e2e.md` G3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LmkDebugAction {
+    /// Ask the daemon's LMK to reclaim (kill LRU cached/background) this round.
+    TriggerCritical,
+    /// Apply a host-governor decision back to one container app.
+    ApplyFreeze,
+    ApplyThaw,
+    ApplyReclaim,
+}
+
+/// Parse a frontend action token. `None` for unknown / malformed.
+fn parse_debug_action(s: &str) -> Option<LmkDebugAction> {
+    match s {
+        "trigger" | "trigger_critical" => Some(LmkDebugAction::TriggerCritical),
+        "freeze" | "apply_freeze" => Some(LmkDebugAction::ApplyFreeze),
+        "thaw" | "apply_thaw" => Some(LmkDebugAction::ApplyThaw),
+        "reclaim" | "apply_reclaim" => Some(LmkDebugAction::ApplyReclaim),
+        _ => None,
+    }
+}
+
+/// The proto `HostAction` a non-trigger debug action applies (`None` for the LMK
+/// trigger, which is a daemon-side reclaim instead of a targeted host decision).
+fn action_to_host(a: LmkDebugAction) -> Option<HostAction> {
+    match a {
+        LmkDebugAction::ApplyFreeze => Some(HostAction::Freeze),
+        LmkDebugAction::ApplyThaw => Some(HostAction::Thaw),
+        LmkDebugAction::ApplyReclaim => Some(HostAction::Reclaim),
+        LmkDebugAction::TriggerCritical => None,
+    }
+}
+
+/// Tauri command: System-UI debug/user entry to drive the daemon LMK (bring-up
+/// G3). `action` is one of the [`LmkDebugAction`] tokens; `trigger` reclaims LRU
+/// victims (budget defaults to 1), the `*_apply` actions target one container app
+/// by `package_name`. Absent daemon → descriptive error (UI shows offline).
+#[tauri::command]
+pub async fn android_lmk_debug(
+    action: String,
+    package_name: Option<String>,
+    budget: Option<u64>,
+) -> Result<LmkDebugOutcome, String> {
+    let act = parse_debug_action(&action)
+        .ok_or_else(|| format!("unknown lmk debug action '{action}'"))?;
+    let mut client = build_android_client().await?;
+
+    if let Some(host) = action_to_host(act) {
+        let pkg =
+            package_name.ok_or_else(|| format!("lmk debug '{action}' requires a package_name"))?;
+        client
+            .apply_host_decision(with_client_id(HostActionRequest {
+                package_name: pkg.clone(),
+                action: host as i32,
+            }))
+            .await
+            .map_err(|e| format!("apply_host_decision '{pkg}' failed: {e}"))?;
+        return Ok(LmkDebugOutcome {
+            victims: Vec::new(),
+            note: format!("applied host decision to {pkg}"),
+        });
+    }
+
+    // LMK trigger: ask the daemon to reclaim victims this round.
+    let resp: LmkResponse = client
+        .trigger_lmk(with_client_id(LmkRequest {
+            pressure: MemoryPressure::Critical as i32,
+            budget: budget.unwrap_or(1),
+        }))
+        .await
+        .map_err(|e| format!("trigger_lmk failed: {e}"))?
+        .into_inner();
+    Ok(LmkDebugOutcome {
+        victims: resp.victims.iter().map(victim_outcome).collect(),
+        note: format!("trigger_lmk returned {} victim(s)", resp.victims.len()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +238,54 @@ mod tests {
         let p = surface_payload(&event(LmkEventKind::Unspecified, "waydroid_x"));
         assert!(!p.close_surface);
         assert_eq!(p.kind, "unknown");
+    }
+
+    #[test]
+    fn parses_debug_actions_and_rejects_unknown() {
+        assert_eq!(
+            parse_debug_action("trigger"),
+            Some(LmkDebugAction::TriggerCritical)
+        );
+        assert_eq!(
+            parse_debug_action("apply_reclaim"),
+            Some(LmkDebugAction::ApplyReclaim)
+        );
+        assert_eq!(
+            parse_debug_action("freeze"),
+            Some(LmkDebugAction::ApplyFreeze)
+        );
+        assert_eq!(parse_debug_action(""), None);
+        assert_eq!(parse_debug_action("nuke"), None);
+    }
+
+    #[test]
+    fn maps_debug_actions_to_host_actions() {
+        assert_eq!(
+            action_to_host(LmkDebugAction::ApplyFreeze),
+            Some(HostAction::Freeze)
+        );
+        assert_eq!(
+            action_to_host(LmkDebugAction::ApplyThaw),
+            Some(HostAction::Thaw)
+        );
+        assert_eq!(
+            action_to_host(LmkDebugAction::ApplyReclaim),
+            Some(HostAction::Reclaim)
+        );
+        // The raw LMK trigger is daemon-side, not a targeted host action.
+        assert_eq!(action_to_host(LmkDebugAction::TriggerCritical), None);
+    }
+
+    #[test]
+    fn maps_lmk_victims_to_serializable_rows() {
+        let v = LmkVictim {
+            package_name: "com.tencent.mm".into(),
+            window_id: "waydroid_3".into(),
+            killed: true,
+        };
+        let o = victim_outcome(&v);
+        assert_eq!(o.package_name, "com.tencent.mm");
+        assert_eq!(o.window_id, "waydroid_3");
+        assert!(o.killed);
     }
 }

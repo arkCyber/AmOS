@@ -1215,20 +1215,49 @@ impl AiAgent for AiAgentService {
     }
 }
 
-/// Bind the UDS, harden its permissions, and run the tonic server until a
-/// shutdown signal arrives, then clean up the socket file.
-pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
-    let listener = tokio::net::UnixListener::bind(&path)?;
-
-    // Restrict access: only the owning OS user may connect to the daemon.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .context("failed to harden socket permissions")?;
+/// Resolve an optional TCP listen address from `AMOS_TCP_ADDR` (e.g. `127.0.0.1:8787`).
+///
+/// When set, the daemon serves the same gRPC stack over **loopback TCP** instead of
+/// a Unix socket. This is the "host-target split" transport used for on-device lab
+/// bring-up on a *retail* (non-root, SELinux-enforcing) Android: a `shell` process
+/// there cannot create a Unix socket file (`avc: denied … tclass=sock_file`), but it
+/// can bind loopback TCP — so the daemon can run with no root, and a System UI on the
+/// same device (or on the host, via `adb forward`) reaches it over TCP.
+fn resolve_tcp_addr() -> Option<std::net::SocketAddr> {
+    let raw = std::env::var("AMOS_TCP_ADDR").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
     }
+    raw.parse().ok()
+}
 
-    let incoming = UnixListenerStream::new(listener);
+/// Run the tonic gRPC stack until a shutdown signal arrives.
+///
+/// Transport: if `AMOS_TCP_ADDR` is set we serve over loopback TCP (see
+/// [`resolve_tcp_addr`]); otherwise we bind the Unix socket at `path`, harden it to
+/// `0700`, and clean it up on shutdown.
+pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
+    let tcp_addr = resolve_tcp_addr();
+
+    // Bind the Unix socket only in the UDS transport. In TCP mode a shell process on
+    // a retail Android device cannot create a socket file under SELinux, so we skip
+    // binding entirely (loopback TCP needs no root).
+    let incoming: Option<UnixListenerStream> = if tcp_addr.is_some() {
+        None
+    } else {
+        let listener = tokio::net::UnixListener::bind(&path)?;
+
+        // Restrict access: only the owning OS user may connect to the daemon.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .context("failed to harden socket permissions")?;
+        }
+
+        Some(UnixListenerStream::new(listener))
+    };
     // The single UDS serves BOTH gRPC services: the AI agent and the Android
     // compat layer, so Tauri talks to the whole OS backend over one connection.
     // The runtime is auto-selected: real Waydroid on device, in-process demo
@@ -1469,12 +1498,37 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         // move apps through their lifecycle, driving the SAME shared governor the
         // periodic beat ticks (docs/device-bring-up.md §4).
         .add_service(crate::governor_service::server(Arc::clone(&governor)))
-        .serve_with_incoming(incoming);
+        // OS-permissions service (proto privacy.proto): the daemon's authoritative
+        // PrivacyManager — grant/revoke/ask/audit over the shared UDS. Persistence
+        // (grants JSON + durable unified audit) is enabled by AMOS_PRIVACY_PATH;
+        // unset ⇒ fresh deny-by-default, in-memory (docs/permissions-sandbox-audit-plan.md).
+        .add_service({
+            let (privacy, persist) = crate::privacy_service::bootstrap();
+            crate::privacy_service::server(privacy, persist)
+        })
+        ;
 
-    tokio::select! {
-        result = server => { result?; }
-        _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received");
+    // The transport decides how the fully-built tonic server consumes its connection
+    // source: TCP (`.serve`) when `AMOS_TCP_ADDR` was set, else the Unix stream bound
+    // above. Only one arm runs; in the other mode that resource was never created.
+    match tcp_addr {
+        Some(addr) => {
+            tokio::select! {
+                result = server.serve(addr) => { result?; }
+                _ = shutdown_signal() => {
+                    tracing::info!("shutdown signal received");
+                }
+            }
+        }
+        None => {
+            if let Some(incoming) = incoming {
+                tokio::select! {
+                    result = server.serve_with_incoming(incoming) => { result?; }
+                    _ = shutdown_signal() => {
+                        tracing::info!("shutdown signal received");
+                    }
+                }
+            }
         }
     }
     heartbeat.abort();

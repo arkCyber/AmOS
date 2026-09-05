@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use amos_applife::{AppId, AppLifecycle, AppState};
 use amos_power::{
     linux::FreqApplyReport, plan, Cluster, ClusterKind, Decision, EnergyGovernor, FreqPlan,
-    LinuxFreqGovernor, Policy, Telemetry,
+    LinuxFreqGovernor, OverlapPolicy, Policy, Telemetry,
 };
 use amos_scheduler::{JobId, JobType, PowerState, ScheduledJob, Scheduler};
 use amos_sensor::SensorMode;
@@ -324,7 +324,21 @@ impl DvfsDriver {
         npu_max_khz: Option<u32>,
         npu_paths: Vec<PathBuf>,
     ) -> Option<Self> {
-        let domains = LinuxFreqGovernor::discover(root, cpu_max);
+        // Discover the CPUFreq domains. `Dedupe` treats the earliest (low-rep)
+        // claim as authoritative: a policy whose cpus overlap an earlier domain is
+        // dropped (a stray duplicate must not double-apply caps to the same
+        // silicon). Any overlap that was seen is surfaced so a malformed sysfs tree
+        // is never silent.
+        let disc = LinuxFreqGovernor::discover_with_policy(root, cpu_max, OverlapPolicy::Dedupe);
+        for o in &disc.overlaps {
+            tracing::warn!(
+                "cpufreq overlap: domain rep {} overlaps domain rep {} on cpu {} (later owner dropped)",
+                o.rep_cpu,
+                o.prior_rep_cpu,
+                o.cpu
+            );
+        }
+        let domains = disc.domains;
         if domains.is_empty() {
             return None;
         }
@@ -717,5 +731,64 @@ mod tests {
             ]
         );
         assert!(parse_kinds_env("").is_empty());
+    }
+
+    #[test]
+    fn dvfs_discovery_dedupes_overlapping_policies_and_warns() {
+        // A minimal Subscriber that just counts WARN events, so we can assert the
+        // overlap warning actually fires without pulling in a logging backend.
+        struct WarnProbe {
+            warns: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl tracing::Subscriber for WarnProbe {
+            fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+            fn event(&self, ev: &tracing::Event<'_>) {
+                if ev.metadata().level() == &tracing::Level::WARN {
+                    self.warns.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _id: &tracing::span::Id) {}
+            fn exit(&self, _id: &tracing::span::Id) {}
+        }
+
+        let root = TempDir::new();
+        // Overlapping sysfs: cpu0's little policy claims "0 1 2" (1.8 GHz) while a
+        // stray big policy on cpu2 claims "2 3" (2.5 GHz) — cpu2 overlaps cpu0's
+        // domain *and* owns its own policy.
+        for (cpu, related, max) in [(0u32, "0 1 2", 1_800_000u32), (2u32, "2 3", 2_500_000u32)] {
+            let dir = root.path().join(format!("cpu{cpu}/cpufreq"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("cpuinfo_max_freq"), format!("{max}\n")).unwrap();
+            fs::write(dir.join("related_cpus"), related).unwrap();
+            fs::write(dir.join("scaling_max_freq"), "999999\n").unwrap();
+        }
+
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = tracing::subscriber::set_default(WarnProbe {
+            warns: warns.clone(),
+        });
+
+        // from_cpufreq_root runs with OverlapPolicy::Dedupe: the stray cpu2 owner is
+        // dropped, leaving only cpu0's domain (still discoverable, so the driver is
+        // Some) — while a WARN is emitted for the overlap.
+        let d = DvfsDriver::from_cpufreq_root(root.path(), 4, None, Vec::new())
+            .expect("topology discovered after dedupe");
+        assert_eq!(d.clusters().len(), 1, "stray overlapping owner dropped");
+        assert_eq!(d.clusters()[0].id, 0);
+        assert_eq!(d.clusters()[0].max_khz, 1_800_000);
+
+        drop(guard);
+        assert_eq!(
+            warns.load(Ordering::Relaxed),
+            1,
+            "exactly one overlap WARN should have fired"
+        );
     }
 }

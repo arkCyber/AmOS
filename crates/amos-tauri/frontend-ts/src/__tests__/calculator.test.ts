@@ -20,6 +20,22 @@ describe("calculator", () => {
     expect(calcDisplay(s)).toBe("0");
   });
 
+  test("\"=\" then \".\" starts a fresh 0. entry (justEq dot branch)", () => {
+    let s = calcInit();
+    for (const k of ["2", "+", "3", "=", "."]) s = calcPress(s, k);
+    expect(calcDisplay(s)).toBe("0.");
+  });
+
+  test("backspace drops the last digit and floors at 0", () => {
+    let s = calcInit();
+    for (const k of ["1", "2", "⌫"]) s = calcPress(s, k);
+    expect(calcDisplay(s)).toBe("1");
+    s = calcPress(s, "⌫");
+    expect(calcDisplay(s)).toBe("0");
+    s = calcPress(s, "⌫");
+    expect(calcDisplay(s)).toBe("0"); // stays at 0
+  });
+
   test("= then a digit starts a fresh number", () => {
     expect(calcRun(["2", "+", "3", "=", "7"])).toBe("7");
   });

@@ -1,0 +1,7 @@
+# Local-only build aid for cross-compiling the Android System UI on this machine
+# (not intended for commit): the Tauri rust plugin links -laudio against NDK API 24,
+# which has no libaaudio.so; point ONLY the arm64 target at an API dir that ships it.
+[target.aarch64-linux-android]
+rustflags = [
+  "-C", "link-arg=-L/opt/homebrew/share/android-commandlinetools/ndk/26.1.10909125/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/34",
+]

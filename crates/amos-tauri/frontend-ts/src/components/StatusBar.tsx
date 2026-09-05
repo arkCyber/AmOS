@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { batteryPercent, fmtClock } from "../lib/time";
-import { SETTINGS_KEY, applyConnectivity, normalizeQuick, radioIcons } from "../lib/settings";
+import { SETTINGS_KEY, FLASHLIGHT_KEY, applyConnectivity, normalizeFlashlight, normalizeQuick, radioIcons, torchOn } from "../lib/settings";
 import { useStoreValue } from "../lib/useStoreValue";
 import { useOnline } from "../lib/useOnline";
 import { useAlertPolicy } from "../lib/sound";
@@ -15,8 +15,10 @@ const GLYPH: Record<string, string> = {
 export default function StatusBar() {
   const [now, setNow] = useState(() => new Date());
   const settings = useStoreValue<unknown>(SETTINGS_KEY, {});
+  const flashStore = useStoreValue<unknown>(FLASHLIGHT_KEY, {});
   const online = useOnline();
   const quick = normalizeQuick(settings);
+  const flashOn = torchOn(normalizeFlashlight(flashStore));
   // Wi-Fi reads as "on" only when enabled AND the host is actually online.
   const icons = applyConnectivity(radioIcons(quick), online);
   const { dnd, effective } = useAlertPolicy();
@@ -43,6 +45,11 @@ export default function StatusBar() {
             title={dnd ? "Do Not Disturb" : "alerts muted"}
           >
             {alertGlyph}
+          </span>
+        )}
+        {flashOn && (
+          <span aria-label="flashlight on" title="Flashlight">
+            🔦
           </span>
         )}
         {icons.map((ic) => (

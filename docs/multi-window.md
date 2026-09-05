@@ -82,6 +82,32 @@ fn apply(&mut self, e: WmEvent) {
 > 这正好发挥已有 `AgentRequest.context`（`map<string,string>`）与「统一 gRPC 管道」
 > 的架构红利——无需新协议，只是把上下文从「单窗口内直接读」改为「多窗口经后端注入」。
 
+### 3.5 实现状态（已落地，2026-09-05）
+
+> 该方案已落地为 `crates/amos-tauri/src/clipboard.rs` 的**全局剪贴板服务**
+> `GlobalClipboard`（多格式 `ClipboardPayload`：`text/html/image/uris`；有界历史
+> `HISTORY_LIMIT=32`、seq 单调、同内容合并）。配套：
+>
+> * 命令 `clipboard_write / clipboard_read / clipboard_history / clipboard_clear`，
+>   已注册进 `lib.rs` 并托管 `Arc<GlobalClipboard>`；
+> * **前台读取权限** `require_foreground`：paste/history/clear 仅允许当前焦点窗口
+>   （对照 `WmState`），后台窗口可写不可偷读（OS 剪贴板隐私规则）；
+> * 写后广播 `clipboard-changed`；TS 封装 `frontend-ts/src/lib/clipboard.ts`；
+>   广播仅发**元数据通知 `ClipboardNotice`**（seq/时间/来源），不含内容——后台窗口
+>   无法靠订阅拿到正文，真正粘贴走前台校验的 `clipboard_read(seq)`；
+> * **历史浮层 UI**：`frontend-ts/src/components/ClipboardTray.tsx`——`clipboardHistory`
+>   列出最近条目、每次 `clipboard-changed` 通知自动重取、点按把前台 `clipboardRead`
+>   到的条目回填粘贴；Notes 编辑器已接 **⧉ 复制 / 📋 粘贴 / 🕘 历史浮层**（共 6 项
+>   前端单测：3 纯逻辑 + 3 DOM）；
+> * **Android 容器桥**：`clipboard_glue.rs`（feature `android`，JNI）+
+>   `ClipboardGlue.kt`（`attach`/`pushTextClipboard`/`onContainerCopy`）把
+>   Webview↔容器双向打通（容器桥为真机 bring-up，Rust 侧已 compile-check）。
+>
+> AI 侧做了**兼容回退**：`ai_bridge::ask_ai_agent / chat_agent` 仍优先注入指向本
+> 窗口的 `SystemContext` 条目；无该条目时回退取全局剪贴板最新文本，均落在
+> `AgentRequest.context["system_selection"]`，协议不变。原 `SystemContext` 保留
+> 为“选区→AI”的定向通道，与全局剪贴板并行。
+
 ## 4. 落地步骤（建议顺序）
 
 1. ✅ **窗口状态机**：`amos-wm` 已建（可单测；`register` 现在也会发出 `Created` 事件，适配层可据此创建真实窗口）。

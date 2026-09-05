@@ -5,8 +5,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nProvider } from "../i18n";
 import { ThemeProvider } from "../theme";
 import NotificationCenter from "../components/NotificationCenter";
-import { readStoreValue } from "../lib/amosStore";
-import { SETTINGS_KEY, type QuickSettings } from "../lib/settings";
+import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+import {
+  FLASHLIGHT_KEY,
+  SETTINGS_KEY,
+  type FlashlightStore,
+  type QuickSettings,
+} from "../lib/settings";
 
 try {
   GlobalRegistrator.register();
@@ -48,6 +53,27 @@ function tileByText(host: HTMLElement, label: string): HTMLButtonElement | null 
 }
 const stored = () =>
   readStoreValue<QuickSettings>(SETTINGS_KEY, {}) as QuickSettings;
+const storedFlash = () =>
+  readStoreValue<FlashlightStore>(FLASHLIGHT_KEY, {} as FlashlightStore) as FlashlightStore;
+
+/** Mount with a pre-seeded torch store (before first render reads it). */
+function mountWithTorch(flash: FlashlightStore) {
+  window.localStorage.clear();
+  window.localStorage.setItem("amos-ui.locale", "en");
+  window.localStorage.setItem(FLASHLIGHT_KEY, JSON.stringify(flash));
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  root.render(
+    <ThemeProvider>
+      <I18nProvider>
+        <NotificationCenter open onClose={() => {}} />
+      </I18nProvider>
+    </ThemeProvider>,
+  );
+  mounted.push({ root, host });
+  return host;
+}
 
 describe("NotificationCenter quick tiles", () => {
   test("location master starts ON and toggling it turns it OFF", async () => {
@@ -74,5 +100,69 @@ describe("NotificationCenter quick tiles", () => {
       dark!.click();
     });
     expect(dark!.getAttribute("aria-pressed")).not.toBe(pressed0);
+  });
+
+  test("torch tile toggles on and persists the dedicated store (unbridged fallback)", async () => {
+    // Default torch store (present but off).
+    const host = mountWithTorch({ on: false, torch_present: true });
+    await act(async () => {});
+    const torch = tileByText(host, "Flashlight");
+    expect(torch).not.toBeNull();
+    expect(torch!.getAttribute("aria-pressed")).toBe("false");
+    expect(torch!.disabled).toBe(false);
+    expect(torch!.textContent).toContain("OFF");
+
+    await act(async () => {
+      torch!.click();
+    });
+    expect(torch!.getAttribute("aria-pressed")).toBe("true");
+    expect(torch!.textContent).toContain("ON");
+    expect(storedFlash().on).toBe(true);
+    expect(storedFlash().torch_present).toBe(true); // presence preserved
+
+    // Toggle back off.
+    await act(async () => {
+      torch!.click();
+    });
+    expect(storedFlash().on).toBe(false);
+  });
+
+  test("torch tile is disabled + labelled when the device has no torch", async () => {
+    const host = mountWithTorch({ on: false, torch_present: false });
+    await act(async () => {});
+    const torch = tileByText(host, "Flashlight");
+    expect(torch).not.toBeNull();
+    expect(torch!.disabled).toBe(true);
+    expect(torch!.textContent).toContain("No torch");
+    // Clicking must not invent a lit torch.
+    await act(async () => {
+      torch!.click();
+    });
+    expect(storedFlash().on).toBe(false);
+    expect(storedFlash().torch_present).toBe(false);
+  });
+
+  test("open tile reflects an OS-driven store push live (no click)", async () => {
+    const host = mount();
+    await act(async () => {});
+    const torch = tileByText(host, "Flashlight");
+    expect(torch).not.toBeNull();
+    expect(torch!.getAttribute("aria-pressed")).toBe("false");
+
+    // Simulate the Rust `store-updated` live push the device seam emits when the
+    // OS changes the torch (another app / thermal / capture): the open tile must
+    // flip to lit without any click or re-open.
+    await act(async () => {
+      writeStoreValue(FLASHLIGHT_KEY, { on: true, torch_present: true });
+    });
+    expect(torch!.getAttribute("aria-pressed")).toBe("true");
+    expect(torch!.textContent).toContain("ON");
+
+    // And an external OFF (e.g. OS turns it off) drops it back immediately.
+    await act(async () => {
+      writeStoreValue(FLASHLIGHT_KEY, { on: false, torch_present: true });
+    });
+    expect(torch!.getAttribute("aria-pressed")).toBe("false");
+    expect(torch!.textContent).toContain("OFF");
   });
 });

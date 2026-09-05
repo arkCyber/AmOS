@@ -1,0 +1,29 @@
+[package]
+name = "amos-flashlight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos flashlight domain core: illumination (torch) on/off state, a pluggable FlashlightProvider seam (Mock + Android CameraManager torch backend), and hardware-presence policy enforced by a FlashlightManager. Design: docs/flashlight.md."
+
+[lib]
+name = "amos_flashlight"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "1"
+tokio.workspace = true
+# Real Android torch backend (Android CameraManager#setTorchMode via JNI).
+# Optional: only pulled in when the `android` feature is enabled, so desktop/CI
+# builds stay free of the JNI stack.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enables `src/android.rs` (AndroidFlashlightProvider). Intended for on-device
+# builds of the System UI APK (cross-compiled for aarch64-linux-android); the
+# module is deliberately excluded from desktop/CI. Runtime still requires a real
+# Android VM + a Context; `cargo check --features android` validates that it
+# *compiles*.
+android = ["dep:jni"]

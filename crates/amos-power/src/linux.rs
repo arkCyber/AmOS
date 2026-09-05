@@ -66,6 +66,45 @@ impl DiscoveredDomain {
     }
 }
 
+/// How [`LinuxFreqGovernor::discover_with_policy`] should treat a cpufreq policy
+/// whose cpus *overlap* an earlier (lower-rep) domain — e.g. cpu2 is both a member
+/// of cpu0's `related_cpus` group *and* the rep of its own policy. Real kernels
+/// don't produce this; it signals malformed sysfs or a hotplug race, so the policy
+/// picks whether the overlap is surfaced or dropped (the caller gets told either
+/// way via [`Discovery::overlaps`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlapPolicy {
+    /// Keep every min-owned domain (today's behaviour, fully backward compatible);
+    /// overlapping membership is still reported in [`Discovery::overlaps`] so the
+    /// caller can log/warn without changing what it applies.
+    Surface,
+    /// The earliest (lowest-rep) claim is authoritative: a later domain whose cpu
+    /// was already claimed by an earlier one is **dropped** and reported. Use when
+    /// a stray duplicate policy must not double-apply caps to the same silicon.
+    Dedupe,
+}
+
+/// One overlapping policy caught during discovery: cpu `cpu` already belongs to the
+/// domain repped by `prior_rep_cpu`, yet is also (or the owner within) the domain
+/// repped by `rep_cpu`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlap {
+    /// Rep of the later domain that overlapped an earlier one.
+    pub rep_cpu: u32,
+    /// Rep of the earlier domain that first claimed the shared cpu.
+    pub prior_rep_cpu: u32,
+    /// The concrete cpu that was claimed twice.
+    pub cpu: u32,
+}
+
+/// Result of a policy-aware discovery: the discovered domains plus every overlap
+/// that was seen while scanning (regardless of whether [`OverlapPolicy`] kept it).
+#[derive(Clone, Debug)]
+pub struct Discovery {
+    pub domains: Vec<DiscoveredDomain>,
+    pub overlaps: Vec<Overlap>,
+}
+
 /// Parse a space-separated list of cpus (e.g. a `related_cpus` file) into a
 /// vector. Unparseable entries are skipped.
 fn parse_cpu_list(text: &str) -> Vec<u32> {
@@ -182,8 +221,27 @@ impl LinuxFreqGovernor {
     /// discoverable from generic sysfs — callers label each domain by platform via
     /// [`DiscoveredDomain::cluster`], then feed the result to
     /// [`crate::freq::plan`] and the reps to `new`.
+    ///
+    /// This is equivalent to [`Self::discover_with_policy`] with
+    /// [`OverlapPolicy::Surface`] (backward compatible): overlapping policies are
+    /// surfaced as-is and any overlaps they imply are discarded.
     pub fn discover(root: &Path, cpu_max: u32) -> Vec<DiscoveredDomain> {
+        Self::discover_with_policy(root, cpu_max, OverlapPolicy::Surface).domains
+    }
+
+    /// Discover the cpufreq domains like [`Self::discover`], but apply an
+    /// [`OverlapPolicy`] to policies whose cpus overlap an earlier domain, and
+    /// report every overlap that was seen.
+    ///
+    /// Mirrors (`related_cpus` whose min `< cpu`) are still skipped by the usual
+    /// low-rep rule *before* overlap detection, so only a cpu that owns its own
+    /// policy *and* was already claimed by an earlier domain reaches the policy.
+    pub fn discover_with_policy(root: &Path, cpu_max: u32, policy: OverlapPolicy) -> Discovery {
+        use std::collections::HashMap;
         let mut domains = Vec::new();
+        let mut overlaps = Vec::new();
+        // cpu -> rep of the domain that first claimed it.
+        let mut claimed: HashMap<u32, u32> = HashMap::new();
         for cpu in 0..cpu_max {
             let dir = root.join(format!("cpu{cpu}/cpufreq"));
             let Some(max_khz) = Self::read_khz(&dir.join("cpuinfo_max_freq")) else {
@@ -204,13 +262,27 @@ impl LinuxFreqGovernor {
                 continue; // per-member mirror of a policy we already own from `min`
             }
             cpus.sort_unstable();
+            // Overlap: at least one member was already claimed by an earlier domain.
+            if let Some((prior, c)) = cpus.iter().find_map(|m| claimed.get(m).map(|r| (*r, *m))) {
+                overlaps.push(Overlap {
+                    rep_cpu: cpu,
+                    prior_rep_cpu: prior,
+                    cpu: c,
+                });
+                if policy == OverlapPolicy::Dedupe {
+                    continue; // earliest claim is authoritative; drop this later owner
+                }
+            }
+            for &m in &cpus {
+                claimed.entry(m).or_insert(cpu);
+            }
             domains.push(DiscoveredDomain {
                 rep_cpu: cpu,
                 cpus,
                 max_khz,
             });
         }
-        domains
+        Discovery { domains, overlaps }
     }
 
     /// Representative cpu of a cluster, if the topology lists one.
@@ -675,5 +747,160 @@ mod tests {
         assert!(rep2.is_clean(), "failures: {:?}", rep2.failures);
         assert_eq!(read_scaling(root.path(), 0), 1_440_000);
         assert_eq!(read_scaling(root.path(), 4), 1_250_000);
+    }
+
+    #[test]
+    fn discover_and_apply_are_stable_on_sparse_noncontiguous_topology() {
+        use crate::freq::plan;
+        use amos_sensor::SensorMode;
+
+        // Degenerate topology: cpu numbering has holes (1,3,4 absent) and the big
+        // policy's members are *non-contiguous* (cpus 2 and 5 share a policy, but
+        // cpu5 — the high member — has no own sysfs dir; only rep cpu2 does).
+        let root = TestRoot::new();
+        prep_cpu(root.path(), 0, 1_800_000); // own-policy little domain, cpu0
+        let big = root.path().join("cpu2/cpufreq");
+        fs::create_dir_all(&big).unwrap();
+        fs::write(big.join("cpuinfo_max_freq"), "2500000\n").unwrap();
+        fs::write(big.join("related_cpus"), "2 5\n").unwrap();
+        fs::write(big.join("scaling_max_freq"), "999999\n").unwrap();
+
+        // Discover over cpu0..cpu6: the holes are skipped, the non-contiguous group
+        // is one domain keyed at its min rep (2), and the ghost member cpu5 is not
+        // double-counted into its own domain.
+        let domains = LinuxFreqGovernor::discover(root.path(), 6);
+        assert_eq!(
+            domains,
+            vec![
+                DiscoveredDomain {
+                    rep_cpu: 0,
+                    cpus: vec![0],
+                    max_khz: 1_800_000,
+                },
+                DiscoveredDomain {
+                    rep_cpu: 2,
+                    cpus: vec![2, 5],
+                    max_khz: 2_500_000,
+                },
+            ]
+        );
+
+        // Label by platform + plan a PowerSave cap straight off discovery, then
+        // apply: writes must land only on the *reps* (cpu0 / cpu2), never creating
+        // or touching the ghost member cpu5.
+        let clusters: Vec<Cluster> = domains
+            .iter()
+            .map(|d| {
+                let kind = if d.rep_cpu < 2 {
+                    ClusterKind::Little
+                } else {
+                    ClusterKind::Big
+                };
+                d.cluster(kind)
+            })
+            .collect();
+        let gov =
+            LinuxFreqGovernor::new(root.path().to_path_buf(), vec![(0, 0), (2, 2)], Vec::new());
+        let ps = plan(SensorMode::PowerSave, &clusters, None);
+        let rep = gov.apply(&ps);
+        assert!(rep.is_clean(), "failures: {:?}", rep.failures);
+        assert_eq!(read_scaling(root.path(), 0), 1_440_000); // little 1.8 GHz × 80%
+        assert_eq!(read_scaling(root.path(), 2), 1_250_000); // big   2.5 GHz × 50%
+        assert!(
+            !root.path().join("cpu5/cpufreq").exists(),
+            "apply must not materialise the ghost member's sysfs dir"
+        );
+    }
+
+    #[test]
+    fn discover_surfaces_overlapping_policies_deterministically() {
+        // Malformed-ish input: cpu2 is both a *member* of cpu0's policy (related
+        // "0 1 2") and the rep of its own policy (related "2 3"). discover does not
+        // silently merge overlapping groups; it keys each domain by its own min and
+        // surfaces the overlap as-is (no panic), which a caller can then reconcile.
+        let root = TestRoot::new();
+        for (cpu, related, max) in [(0u32, "0 1 2", 1_800_000u32), (2u32, "2 3", 2_500_000u32)] {
+            let dir = root.path().join(format!("cpu{cpu}/cpufreq"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("cpuinfo_max_freq"), format!("{max}\n")).unwrap();
+            fs::write(dir.join("related_cpus"), related).unwrap();
+        }
+
+        let domains = LinuxFreqGovernor::discover(root.path(), 4);
+        assert_eq!(
+            domains,
+            vec![
+                DiscoveredDomain {
+                    rep_cpu: 0,
+                    cpus: vec![0, 1, 2],
+                    max_khz: 1_800_000,
+                },
+                DiscoveredDomain {
+                    rep_cpu: 2,
+                    cpus: vec![2, 3],
+                    max_khz: 2_500_000,
+                },
+            ],
+            "overlap is surfaced, not merged or dropped; cpu2 appears in both"
+        );
+    }
+
+    #[test]
+    fn discover_respects_cpu_max_larger_than_present_cpus() {
+        // cpu_max is a scan upper bound, not a "how many exist" count: with only
+        // cpu0 and cpu4 present under a cpu_max of 64, discover must return exactly
+        // those two domains (no phantom for the absent 1..=63, no index panic).
+        let root = TestRoot::new();
+        prep_cpu(root.path(), 0, 1_800_000);
+        prep_cpu(root.path(), 4, 2_500_000);
+
+        let domains = LinuxFreqGovernor::discover(root.path(), 64);
+        assert_eq!(domains.len(), 2);
+        assert_eq!(domains[0].rep_cpu, 0);
+        assert_eq!(domains[0].cpus, vec![0]);
+        assert_eq!(domains[0].max_khz, 1_800_000);
+        assert_eq!(domains[1].rep_cpu, 4);
+        assert_eq!(domains[1].cpus, vec![4]);
+        assert_eq!(domains[1].max_khz, 2_500_000);
+    }
+
+    #[test]
+    fn overlap_policy_surfaces_reports_and_dedupes() {
+        let root = TestRoot::new();
+        for (cpu, related, max) in [(0u32, "0 1 2", 1_800_000u32), (2u32, "2 3", 2_500_000u32)] {
+            let dir = root.path().join(format!("cpu{cpu}/cpufreq"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("cpuinfo_max_freq"), format!("{max}\n")).unwrap();
+            fs::write(dir.join("related_cpus"), related).unwrap();
+        }
+
+        // Surface: both min-owned domains are kept (backward compatible) but the
+        // overlap (cpu2 claimed by cpu0's domain yet owning its own policy) is
+        // reported so the caller can log it.
+        let surf = LinuxFreqGovernor::discover_with_policy(root.path(), 4, OverlapPolicy::Surface);
+        assert_eq!(surf.domains.len(), 2);
+        assert_eq!(
+            surf.overlaps,
+            vec![Overlap {
+                rep_cpu: 2,
+                prior_rep_cpu: 0,
+                cpu: 2,
+            }]
+        );
+
+        // Dedupe: the later overlapping owner (cpu2) is dropped — the earliest
+        // (cpu0) claim is authoritative — and the same overlap is still reported.
+        let dedupe = LinuxFreqGovernor::discover_with_policy(root.path(), 4, OverlapPolicy::Dedupe);
+        assert_eq!(dedupe.domains.len(), 1);
+        assert_eq!(dedupe.domains[0].rep_cpu, 0);
+        assert_eq!(dedupe.domains[0].cpus, vec![0, 1, 2]);
+        assert_eq!(
+            dedupe.overlaps,
+            vec![Overlap {
+                rep_cpu: 2,
+                prior_rep_cpu: 0,
+                cpu: 2,
+            }]
+        );
     }
 }

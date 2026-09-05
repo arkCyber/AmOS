@@ -22,10 +22,7 @@ use amos_proto::amos_telephony::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tokio::net::UnixStream;
 use tokio::time::{sleep, Duration};
-use tonic::transport::{Endpoint, Uri};
-use tower::service_fn;
 
 /// Tauri event name carrying one `TelephonyCallPayload` per daemon `Watch` event.
 pub const TELEPHONY_EVENT: &str = "telephony-event";
@@ -49,27 +46,8 @@ pub struct TelephonyDialPayload {
     pub id: String,
 }
 
-/// The OS daemon socket — the same one `ai_bridge`/`translate` use (`AMOS_SOCKET`
-/// wins, else the platform default, e.g. `/tmp/amos-ai.sock`).
-fn socket_path() -> std::path::PathBuf {
-    amos_proto::socket::default_socket_path()
-}
-
 async fn build_channel() -> Result<tonic::transport::Channel, String> {
-    let socket = socket_path();
-    let owned = socket.clone();
-    let endpoint = Endpoint::try_from("http://[::1]:50051").map_err(|e| e.to_string())?;
-    let channel = endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = owned.clone();
-            async move {
-                let stream = UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-            }
-        }))
-        .await
-        .map_err(|e| format!("OS daemon unavailable at {socket:?}: {e}"))?;
-    Ok(channel)
+    crate::daemon::channel().await
 }
 
 fn call_payload(c: &CallSnapshot) -> TelephonyCallPayload {
@@ -123,6 +101,12 @@ pub async fn telephony_dial(
 /// End a live call by id.
 #[tauri::command]
 pub async fn telephony_end(call_id: String) -> Result<(), String> {
+    // When AmOS is the default phone app, a real Telecom call is in flight — hang up
+    // the real call via the bound AmosInCallService instead of the daemon (mock).
+    #[cfg(feature = "android")]
+    if crate::incall::real_hang_up().unwrap_or(false) {
+        return Ok(());
+    }
     let mut client = TelephonyClient::new(build_channel().await?);
     client
         .end(EndRequest {
@@ -173,6 +157,11 @@ pub async fn telephony_stop_recording(call_id: String) -> Result<TelephonyCallPa
 /// the `Watch` stream and is delivered to the UI as a `telephony-event`.
 #[tauri::command]
 pub async fn telephony_answer(call_id: String) -> Result<(), String> {
+    // Real incoming call (default phone app): answer via the bound in-call service.
+    #[cfg(feature = "android")]
+    if crate::incall::real_answer().unwrap_or(false) {
+        return Ok(());
+    }
     let mut client = TelephonyClient::new(build_channel().await?);
     client
         .answer(AnswerRequest {

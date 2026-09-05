@@ -1,0 +1,90 @@
+// AmOS OS-permissions (PrivacyManager) gRPC contract: lets the System UI / a
+// per-app process host grant, revoke, and *ask* the daemon's authoritative
+// `PrivacyManager` whether an app may access a sensitive resource, over the
+// same shared Unix Domain Socket as ai_agent / governor / sensor / ...
+//
+// Resources are addressed by their **stable wire key** (matches
+// `amos-ai::privacy::Resource::key`): "microphone" | "camera" | "contacts" |
+// "location" | "storage". Unknown keys are rejected with INVALID_ARGUMENT
+// (deny-by-default is never weakened by an unknown resource).
+//
+// The daemon is the single authority: `Authorize` is the one chokepoint and
+// every decision is audited (both in the manager's bounded trail and, when
+// configured, mirrored to the durable unified audit file). The System UI is
+// only a client that renders grants and forwards user choices.
+//
+// Domain core & honesty boundaries: docs/permissions-sandbox-audit-plan.md.
+syntax = "proto3";
+
+package amos_privacy;
+
+// An app (or other principal) id.
+message AppRef {
+  string app_id = 1;
+}
+
+// A grant to (or access check for) one app + one sensitive resource.
+message ResourceRef {
+  string app_id = 1;
+  string resource = 2; // stable wire key, see file header
+}
+
+// grant / revoke carry the same shape.
+message GrantRequest {
+  string app_id = 1;
+  string resource = 2;
+}
+
+message GrantReply {
+  bool ok = 1;
+  string message = 2;
+}
+
+message DecisionReply {
+  string app_id = 1;
+  string resource = 2;
+  bool granted = 3; // true iff the app holds a grant (Authorize audits the check)
+}
+
+// The resources an app currently holds (deny-by-default => often empty).
+message AppGrants {
+  string app_id = 1;
+  repeated string resources = 2;
+}
+
+// Normalised audit record (mirrors amos-ai::audit::AuditRecord). `outcome` is
+// one of "granted" | "denied" | "success" | "rejected" | "error".
+message AuditRecord {
+  uint64 ts = 1;
+  string principal = 2;
+  string op = 3;
+  string resource = 4;
+  string outcome = 5;
+  string details = 6;
+}
+
+// Optional filters over the recent audit window; empty = any.
+message AuditQuery {
+  string app_id = 1;
+  string resource = 2;
+  uint32 limit = 3; // clamp: 1..=1000 (0 => default 200)
+}
+
+message AuditReply {
+  repeated AuditRecord records = 1; // newest first
+}
+
+service PrivacyService {
+  // Grant one resource to an app (persists when the daemon has a state file).
+  rpc Grant(GrantRequest) returns (GrantReply);
+  // Revoke one resource from an app.
+  rpc Revoke(GrantRequest) returns (GrantReply);
+  // Revoke every grant for an app (uninstall / sandbox teardown).
+  rpc RevokeAll(AppRef) returns (GrantReply);
+  // The single decision chokepoint: answer + audit one access request.
+  rpc Authorize(ResourceRef) returns (DecisionReply);
+  // Cheap, non-auditing check: the resources an app currently holds.
+  rpc Granted(AppRef) returns (AppGrants);
+  // Recent audited access decisions (newest first, optional filters).
+  rpc RecentAudit(AuditQuery) returns (AuditReply);
+}

@@ -163,6 +163,13 @@ fn snapshot_of(d: &Decision, ticks: u64, t: &Telemetry) -> EnergySnapshot {
 /// Sample a [`Telemetry`] for one governor tick from `AMOS_ENERGY_*` environment
 /// variables (host/dev). Unset optional readings stay `None` (unknown) — the
 /// policy never assumes a healthy battery. Real on-device samplers replace this.
+///
+/// `screen_on` is resolved with the display-protection contract first: if
+/// `AMOS_SCREEN_STATE_PATH` names a readable file whose content is `off`, the
+/// screen is genuinely off (the System UI host wrote it on idle); otherwise it
+/// falls back to the legacy `AMOS_ENERGY_SCREEN_ON` flag, then to `true`. This is
+/// what lets "auto screen-off" actually reach the governor — see
+/// `docs/display-idle.md` and `crates/amos-display`.
 pub fn telemetry_from_env() -> Telemetry {
     let battery = BatteryState {
         level_pct: env_f64("AMOS_ENERGY_LEVEL_PCT"),
@@ -170,11 +177,27 @@ pub fn telemetry_from_env() -> Telemetry {
         temperature_c: env_f64("AMOS_ENERGY_TEMP_C"),
     };
     let usage = Usage {
-        screen_on: env_flag("AMOS_ENERGY_SCREEN_ON").unwrap_or(true),
+        screen_on: resolve_screen_on(),
         foreground_heavy: env_flag("AMOS_ENERGY_FOREGROUND_HEAVY").unwrap_or(false),
         inference_active: env_flag("AMOS_ENERGY_INFERENCE_ACTIVE").unwrap_or(false),
     };
     Telemetry::new(battery, usage, env_f64("AMOS_ENERGY_POWER_MW"))
+}
+
+/// Resolve the *authoritative* screen on/off for one governor tick.
+///
+/// 1. If `AMOS_SCREEN_STATE_PATH` points at a readable `on`/`off` file (written
+///    by the System UI on idle/wake), that wins — the display is really off.
+/// 2. Otherwise the legacy `AMOS_ENERGY_SCREEN_ON` flag decides (host/dev).
+/// 3. Otherwise (nothing configured) we conservatively assume the screen is on —
+///    the governor must not start throttling as if asleep with no signal.
+fn resolve_screen_on() -> bool {
+    let from_file = amos_display::screen_state_path()
+        .and_then(|p| amos_display::read_screen_state_from(&p))
+        .map(|s| s == amos_display::ScreenState::On);
+    from_file
+        .or_else(|| env_flag("AMOS_ENERGY_SCREEN_ON"))
+        .unwrap_or(true)
 }
 
 /// Parse an optional float env var; garbage / empty → `None`.
@@ -255,5 +278,33 @@ mod tests {
         std::env::remove_var("AMOS_ENERGY_CHARGING");
         std::env::remove_var("AMOS_ENERGY_TEMP_C");
         std::env::remove_var("AMOS_ENERGY_POWER_MW");
+    }
+
+    #[test]
+    fn screen_state_file_overrides_env_flag() {
+        // SAFETY: we touch only AMOS_SCREEN_STATE_PATH / AMOS_ENERGY_SCREEN_ON,
+        // which no other test in this binary reads, so no cross-test race (repo
+        // convention). The file is written under a unique temp path.
+        let path =
+            std::env::temp_dir().join(format!("amos-ai-screen-{}.state", std::process::id()));
+        // File says "off" → the screen is genuinely off, regardless of the flag.
+        std::fs::write(&path, "off").expect("temp write");
+        std::env::set_var("AMOS_SCREEN_STATE_PATH", &path);
+        std::env::set_var("AMOS_ENERGY_SCREEN_ON", "1");
+        assert!(!telemetry_from_env().usage.screen_on);
+        // File says "on" → the screen is on, again regardless of the flag.
+        std::fs::write(&path, "on").expect("temp write");
+        std::env::set_var("AMOS_ENERGY_SCREEN_ON", "0");
+        assert!(telemetry_from_env().usage.screen_on);
+        // No file contract → falls back to the legacy flag.
+        std::env::remove_var("AMOS_SCREEN_STATE_PATH");
+        std::env::set_var("AMOS_ENERGY_SCREEN_ON", "1");
+        assert!(telemetry_from_env().usage.screen_on);
+        std::env::set_var("AMOS_ENERGY_SCREEN_ON", "0");
+        assert!(!telemetry_from_env().usage.screen_on);
+        // Cleanup.
+        std::env::remove_var("AMOS_SCREEN_STATE_PATH");
+        std::env::remove_var("AMOS_ENERGY_SCREEN_ON");
+        let _ = std::fs::remove_file(&path);
     }
 }

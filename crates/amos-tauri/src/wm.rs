@@ -36,6 +36,18 @@ const LAUNCHER_LABEL: &str = "main";
 /// Web path (relative to `frontendDist`) every app window loads.
 const APP_ENTRY: &str = "index.html";
 
+/// Restore a window to "full" screen. Desktop Tauri has a real `maximize`; on
+/// Android (the System UI APK) windows are always fullscreen, and `WebviewWindow`
+/// has no `maximize`, so this is a cross-target no-op that still compiles.
+#[cfg(desktop)]
+fn window_maximize(w: &tauri::WebviewWindow) {
+    let _ = w.maximize();
+}
+#[cfg(not(desktop))]
+fn window_maximize(_w: &tauri::WebviewWindow) {
+    /* mobile: single always-fullscreen window — nothing to restore */
+}
+
 /// Shared state: the transport-agnostic `WindowManager` plus a registry that
 /// maps `WindowId` ⇄ Tauri window label.
 pub struct WmState {
@@ -672,7 +684,7 @@ pub fn wm_split_exit(app: AppHandle, state: State<'_, WmState>) -> Result<Layout
             if let Some(w) = app.get_webview_window(&label) {
                 // Returning a split pane to the "full" screen = maximize. Honest
                 // fallback when no exact pre-split geometry was captured.
-                let _ = w.maximize();
+                window_maximize(&w);
             }
         }
     }
@@ -723,7 +735,7 @@ pub async fn wm_split_demo(
     if let Some((x, y)) = pair {
         for label in [x, y] {
             if let Some(w) = app.get_webview_window(&label) {
-                let _ = w.maximize();
+                window_maximize(&w);
             }
         }
     }

@@ -46,6 +46,14 @@ pub mod amos_governor {
     tonic::include_proto!("amos_governor");
 }
 
+pub mod amos_privacy {
+    //! Generated types for the OS-permissions (PrivacyManager) service:
+    //! `privacy_service_client` (client), `privacy_service_server` (server), and
+    //! messages (`GrantRequest`, `ResourceRef`, `DecisionReply`, ...). Resources
+    //! are addressed by their stable wire key, see `proto/privacy.proto`.
+    tonic::include_proto!("amos_privacy");
+}
+
 /// gRPC metadata header carrying the caller's client id.
 ///
 /// The System UI (Tauri core) sends this on every RPC so the daemon's security

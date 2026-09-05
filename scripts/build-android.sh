@@ -5,6 +5,8 @@
 #   target/aarch64-linux-android/release/ for staging into /system/bin/ (amos.rc).
 # * amos-radio with --features android compiles the jni AndroidRadioProvider —
 #   a *lib* the System UI APK links (cargo tauri android build --features android).
+# * amos-flashlight with --features android compiles the jni AndroidFlashlightProvider
+#   (CameraManager torch), same link target as radio.
 # * `--ai-voice` additionally builds amos-ai with the `asr-sherpa` feature so the
 #   shipped daemon can run the real on-device ASR the init.rc now requests
 #   (AMOS_ASR_BACKEND=sherpa + AMOS_SHERPA_MODEL_DIR=/data/amos/sherpa). This
@@ -39,8 +41,20 @@ fi
 
 TARGET=aarch64-linux-android
 HOST_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-LINKER="$NDK/toolchains/llvm/prebuilt/${HOST_OS}-x86_64/bin/${TARGET}34-clang"
-echo "linker: $LINKER"
+LLVM_PREBUILT="$NDK/toolchains/llvm/prebuilt"
+PREBUILT="$LLVM_PREBUILT/${HOST_OS}-x86_64"
+
+# Pick the highest API level this NDK ships for the target (NDK 23 tops out at
+# 31, newer NDKs ship 34+). Hard-coding one level breaks on every other NDK.
+candidate=$(ls "$PREBUILT"/bin/"$TARGET"*-clang 2>/dev/null | sort -V | tail -n1)
+if [ -z "$candidate" ]; then
+  echo "error: no aarch64-linux-android*-clang found under $PREBUILT/bin" >&2
+  exit 1
+fi
+# name is aarch64-linux-android<NN>-clang → strip to <NN>.
+_api=$(basename "$candidate"); _api=${_api#"$TARGET"}; _api=${_api%-clang}
+LINKER="$PREBUILT/bin/${TARGET}${_api}-clang"
+echo "linker: $LINKER (API $_api)"
 
 # Generate the cross-compile config in the workspace's .cargo/config.toml.
 mkdir -p .cargo
@@ -71,12 +85,21 @@ echo "--- compiling radio/connectivity crate (android provider) for $TARGET ---"
 cargo build --release --target "$TARGET" -p amos-radio --features android
 
 echo
+echo "--- compiling flashlight/torch crate (android provider) for $TARGET ---"
+# amos-flashlight with `--features android` pulls in the jni-based
+# AndroidFlashlightProvider (CameraManager#setTorchMode on the rear flash). Pure
+# Rust + jni — no extra NDK C libs — but gated behind the feature so desktop
+# builds skip it. The System UI APK links it via FlashlightGlue.attach.
+cargo build --release --target "$TARGET" -p amos-flashlight --features android
+
+echo
 echo "Built binaries:"
 find "target/$TARGET/release" -maxdepth 1 -type f \
   -name 'amos-ai' -o -name 'amos-ai.exe' | sort
 echo
 echo "System UI: enable amos-tauri's 'android' feature so its RadioBridge is backed"
-echo "  by AndroidRadioProvider, then build the APK:"
+echo "  by AndroidRadioProvider and its FlashlightBridge by AndroidFlashlightProvider"
+echo "  (CameraManager torch), then build the APK:"
 echo "  cd crates/amos-tauri && cargo tauri android build --features android"
 echo
 echo "Stage to device (example):"

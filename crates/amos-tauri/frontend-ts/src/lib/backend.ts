@@ -9,6 +9,7 @@ interface TauriBridge {
 }
 
 function bridge(): TauriBridge | null {
+  if (typeof window === "undefined") return null;
   const w = window as unknown as { __TAURI_INTERNALS__?: TauriBridge };
   return w && typeof w.__TAURI_INTERNALS__ === "object" ? (w.__TAURI_INTERNALS__ as TauriBridge) : null;
 }
@@ -335,6 +336,18 @@ export async function telephonyDial(
   return invoke<TelephonyDialResult>("telephony_dial", { number, emergency });
 }
 
+/**
+ * Place a **real** outbound call through Android Telecom (`ACTION_CALL`), bypassing
+ * the daemon's mock. Returns `true` when the call was handed to the OS; `false` when
+ * real dialing is unavailable (desktop host, or on-device build without the bound
+ * context / `CALL_PHONE` grant) so the caller can fall back to `telephonyDial`.
+ * Emergency numbers intentionally go through the privileged mock path (see dialer).
+ */
+export async function realDial(number: string): Promise<boolean> {
+  const status = await invoke<string>("real_dial", { number });
+  return typeof status === "string";
+}
+
 /** End a live call by id. */
 export async function telephonyEnd(callId: string): Promise<void | null> {
   return invoke<void>("telephony_end", { callId });
@@ -411,6 +424,22 @@ export async function radioSet(
   enabled: boolean,
 ): Promise<RadioPayload | null> {
   return invoke<RadioPayload>("radio_set", { key, enabled });
+}
+
+/* ---- Flashlight / torch (flashlight_*). Illumination on/off. Like the radios,
+ *       the Android torch (CameraManager) is reachable only from the System UI,
+ *       so it does NOT round-trip through the headless daemon. ---- */
+export type FlashlightPayload = { on: boolean; torch_present: boolean; available: boolean };
+
+/** Read the current flashlight state (torch on/off + hardware presence). */
+export async function flashlightStatus(): Promise<FlashlightPayload | null> {
+  return invoke<FlashlightPayload>("flashlight_status");
+}
+
+/** Set the torch on/off. Returns the authoritative resulting state (the backend
+ * refuses to light a torch when no usable flash hardware exists). */
+export async function flashlightSet(enabled: boolean): Promise<FlashlightPayload | null> {
+  return invoke<FlashlightPayload>("flashlight_set", { enabled });
 }
 
 /* ---- Mail (amos-mail bridge: mail_mailboxes / mail_list / mail_inbox /

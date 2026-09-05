@@ -48,11 +48,27 @@ object AmosGlue {
         // GNSS/radios already bound on the Rust side (SensorHost::bind_android).
         SensorGlue.attach(context.applicationContext)
         CameraGlue.attach(context.applicationContext)
+        ClipboardGlue.bind(context.applicationContext)
+        // Bind the real torch (rear camera flash) so FlashlightBridge boots with
+        // the AndroidFlashlightProvider instead of the desktop Mock.
+        FlashlightGlue.bind(context.applicationContext)
     }
 
     /** Stop the producers and release the camera/sensor hardware. */
     fun onStop(context: Context) {
         SensorGlue.detach()
         CameraGlue.detach()
+        ClipboardGlue.detach()
+    }
+
+    /**
+     * Re-bind the real torch once the user grants CAMERA at runtime: the first
+     * [onStart] bind may have run before the runtime-permission dialog was
+     * answered, so it was a no-op. Wire this to the generated Activity's
+     * `onRequestPermissionsResult` (request code [REQ_SENSORS]) when the CAMERA
+     * result is `PackageManager.PERMISSION_GRANTED`. Idempotent.
+     */
+    fun onCameraPermissionGranted(context: Context) {
+        FlashlightGlue.bind(context.applicationContext)
     }
 }

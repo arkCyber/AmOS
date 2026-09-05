@@ -83,4 +83,4 @@ pub use types::{BatteryState, Telemetry, Usage};
 #[cfg(feature = "android")]
 pub use android::AndroidBatteryTelemetry;
 #[cfg(feature = "linux")]
-pub use linux::{default_cpufreq_root, LinuxFreqGovernor};
+pub use linux::{default_cpufreq_root, Discovery, LinuxFreqGovernor, Overlap, OverlapPolicy};

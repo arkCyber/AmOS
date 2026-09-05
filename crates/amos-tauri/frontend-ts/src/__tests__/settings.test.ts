@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { flipQuick, flipRadio, applyConnectivity, flipLocation, locationEnabled, dndActive, radioIcons, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, NOTIF_CAP, type Notif } from "../lib/settings";
+import { flipQuick, flipRadio, applyConnectivity, flipLocation, locationEnabled, dndActive, radioIcons, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, NOTIF_CAP, flipFlashlight, torchOn, normalizeFlashlight, type Notif, type FlashlightStore } from "../lib/settings";
 import {
   SETTINGS_KEY,
   readCloud,
@@ -213,5 +213,29 @@ describe("settings / NC helpers", () => {
     expect(out.length).toBe(NOTIF_CAP);
     expect(out[0]!.id).toBe("id40"); // oldest id0..id39 evicted
     expect(out[out.length - 1]!.id).toBe(`id${NOTIF_CAP + 39}`); // newest tail intact
+  });
+
+  test("flashlight helpers flip/torch/guard are consistent and immutable", () => {
+    const off: FlashlightStore = { on: false, torch_present: true };
+    const on = flipFlashlight(off);
+    expect(on.on).toBe(true);
+    expect(on.torch_present).toBe(true); // presence never invented by a flip
+    expect(off.on).toBe(false); // immutable
+
+    expect(torchOn({ on: true, torch_present: true })).toBe(true);
+    expect(torchOn({ on: false, torch_present: true })).toBe(false);
+    // Cannot be "lit" when no torch exists, even if the bit says on.
+    expect(torchOn({ on: true, torch_present: false })).toBe(false);
+  });
+
+  test("normalizeFlashlight defaults to a present-but-dark torch on garbage/absent", () => {
+    const d: FlashlightStore = { on: false, torch_present: true };
+    expect(normalizeFlashlight(null)).toEqual(d);
+    expect(normalizeFlashlight("nope")).toEqual(d);
+    expect(normalizeFlashlight([1, 2])).toEqual(d);
+    expect(normalizeFlashlight({ on: true, torch_present: true })).toEqual({ on: true, torch_present: true });
+    // Non-boolean bits fall back conservatively.
+    expect(normalizeFlashlight({ on: 1, torch_present: "yes" })).toEqual(d);
+    expect(normalizeFlashlight({ on: false, torch_present: false })).toEqual({ on: false, torch_present: false });
   });
 });

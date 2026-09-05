@@ -18,9 +18,19 @@ pub mod android_lmk;
 pub mod appstore;
 pub mod assistant_voice;
 pub mod buttons;
+pub mod clipboard;
+#[cfg(feature = "android")]
+pub mod clipboard_glue;
+pub mod daemon;
+pub mod display;
+pub mod flashlight;
+#[cfg(feature = "android")]
+pub mod incall;
 pub mod interpret;
 pub mod mail;
+pub mod privacy_client;
 pub mod radio;
+pub mod real_dial;
 pub mod sensor_host;
 pub mod sensors;
 pub mod store;
@@ -32,8 +42,9 @@ pub mod tts;
 pub mod wm;
 
 use ai_bridge::AiBridge;
+use std::sync::Arc;
 use store::SharedStore;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use wm::{SystemContext, WmState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -46,9 +57,17 @@ pub fn run() {
     // in-process (Android services are reachable from the System UI APK, not the
     // headless daemon), so we seed the radio bridge from the persisted
     // `amos.settings` so radios survive restarts without the UI re-applying them.
+    let clipboard = Arc::new(clipboard::GlobalClipboard::new());
     let shared_store = SharedStore::new();
     let radio_seed = radio::seed_from_settings(shared_store.get("amos.settings").as_deref());
     let radio_bridge = radio::RadioBridge::mock_seeded(radio_seed);
+    // Same in-process rationale as the radios: the Android torch (CameraManager)
+    // is reachable only from the System UI APK, so flashlight lives here too.
+    // On-device boot prefers the real Android provider (installed by the Kotlin
+    // FlashlightGlue upcall); desktop/CI always falls back to the seeded Mock.
+    let flashlight_seed =
+        flashlight::seed_from_settings(shared_store.get(flashlight::FLASHLIGHT_KEY).as_deref());
+    let flashlight_bridge = flashlight::boot_bridge(flashlight_seed);
 
     tauri::Builder::default()
         .manage(AiBridge::new())
@@ -56,8 +75,11 @@ pub fn run() {
         .manage(assistant_voice::DeviceMic::new())
         .manage(WmState::new())
         .manage(SystemContext::new())
+        .manage(clipboard.clone())
         .manage(shared_store)
         .manage(radio_bridge)
+        .manage(flashlight_bridge)
+        .manage(display::DisplayPowerBridge::file_default())
         .manage(buttons::HardwareButtons::new())
         .manage(interpret::InterpretationBridge::new())
         .manage(tts::TtsBridge::new())
@@ -85,6 +107,7 @@ pub fn run() {
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,
             ai_bridge::android_lmk_tasks,
+            android_lmk::android_lmk_debug,
             buttons::simulate_button,
             wm::wm_open,
             wm::wm_focus,
@@ -104,6 +127,10 @@ pub fn run() {
             wm::system_set_context,
             wm::system_clear_context,
             wm::system_peek_context,
+            clipboard::clipboard_write,
+            clipboard::clipboard_read,
+            clipboard::clipboard_history,
+            clipboard::clipboard_clear,
             store::store_get,
             store::store_set,
             store::store_remove,
@@ -151,6 +178,8 @@ pub fn run() {
             telephony::telephony_stop_recording,
             radio::radio_status,
             radio::radio_set,
+            flashlight::flashlight_status,
+            flashlight::flashlight_set,
             sensors::sensor_snapshot,
             sensors::sensor_set_mode,
             sensors::sensor_acquire,
@@ -160,11 +189,32 @@ pub fn run() {
             sensor_host::sensor_host_record_frame,
             sensor_host::sensor_host_acquire,
             system::system_health,
+            display::screen_state_set,
+            display::screen_state_get,
+            privacy_client::perm_authorize,
+            privacy_client::perm_grant,
+            privacy_client::perm_revoke,
+            privacy_client::perm_granted,
+            privacy_client::perm_recent_audit,
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
-            taskmgr::taskmgr_job_action
+            taskmgr::taskmgr_job_action,
+            real_dial::real_dial
         ])
         .setup(|app| {
+            // Arm the native clipboard ingest bus with the managed GlobalClipboard
+            // so container-originated copies land in the shared buffer, and install
+            // an announce hook so those ingests broadcast a metadata-only
+            // `clipboard-changed` notice to foreground UIs (same as Webview writes).
+            let _ = clipboard::arm_ingest(
+                app.state::<Arc<clipboard::GlobalClipboard>>()
+                    .inner()
+                    .clone(),
+            );
+            let handle = app.handle().clone();
+            let _ = clipboard::set_notifier(move |entry: &clipboard::ClipboardEntry| {
+                let _ = handle.emit("clipboard-changed", clipboard::ClipboardNotice::from(entry));
+            });
             // System-wide readiness probe: log the daemon status once on boot.
             let bridge = app.state::<AiBridge>();
             match tauri::async_runtime::block_on(ai_bridge::fetch_status(&bridge)) {
@@ -179,6 +229,20 @@ pub fn run() {
             // so the shell can tear down / refresh a `legacy` surface when its
             // Android app is reclaimed/destroyed (reconnects if the daemon starts).
             android_lmk::spawn_lmk_watch(app.handle().clone());
+            // On device, arm the torch device-seam UI pusher so OS-driven torch
+            // changes (TorchCallback) reach the System UI live via the shared
+            // store's `store-updated` event (status bar + open control-center).
+            #[cfg(feature = "android")]
+            flashlight::install_ui_pusher(app.handle().clone());
+            // Real in-call bridge (default-dialer / InCallService): give the Rust side
+            // an AppHandle so Kotlin-pushed real call states reach the WebView as
+            // `telephony-event`, and so telephony answer/end can drive the real call.
+            #[cfg(feature = "android")]
+            incall::set_app(app.handle().clone());
+            // Physical camera key → AmOS Home: hand the seam an AppHandle so the
+            // MainActivity's intercepted camera key can route as Home.
+            #[cfg(feature = "android")]
+            buttons::install_android_app(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

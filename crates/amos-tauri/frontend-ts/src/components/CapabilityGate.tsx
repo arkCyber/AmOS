@@ -1,6 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useI18n } from "../i18n";
+import { bridged } from "../lib/backend";
 import { capSet, grantCap, loadLedger, revokeCap, saveLedger, type Capability } from "../lib/permissions";
+import { daemonAuthorize, daemonGrant } from "../lib/privacyBackend";
 
 export interface CapabilityControl {
   granted: boolean;
@@ -21,7 +23,24 @@ export function useCapability(appId: string, cap: Capability): CapabilityControl
   const [granted, setGranted] = useState(() => capSet(loadLedger(), appId, cap));
   const [refused, setRefused] = useState(false);
 
+  // Online: reconcile with the daemon's authoritative store. A daemon "denied"
+  // overrides a stale local grant so the gate honours the OS permission store.
+  // Offline (no bridge) or local-only capability (notifications) → no probe, so
+  // the fast local cache is kept unchanged (no flash, offline parity).
+  useEffect(() => {
+    if (!bridged()) return;
+    let alive = true;
+    void daemonAuthorize(appId, cap).then((grantedOnline) => {
+      if (alive && grantedOnline !== null) setGranted(grantedOnline);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [appId, cap]);
+
   const allow = () => {
+    // Authoritative side-effect (best-effort; offline it's a no-op) + local cache.
+    void daemonGrant(appId, cap);
     saveLedger(grantCap(loadLedger(), appId, cap));
     setGranted(true);
     setRefused(false);

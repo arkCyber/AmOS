@@ -1,0 +1,14 @@
+[package]
+name = "amos-display"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos display-protection (auto screen-off / idle) domain core: a deterministic, pure-std ScreenState + IdlePolicy controller that decides when an interactive display On↔Off turns itself off on idle (battery vs charging timeouts, hold-while-call), plus the AMOS_SCREEN_STATE_PATH file contract both the daemon energy beat and the System UI host share. Design: docs/display-idle.md."
+
+[lib]
+name = "amos_display"
+path = "src/lib.rs"
+
+[dependencies]
+# None — pure `std` domain core (transport/platform-agnostic, offline-testable).

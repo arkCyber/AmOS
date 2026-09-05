@@ -5,6 +5,7 @@ import { I18nProvider } from "../i18n";
 import FilesApp from "../components/FilesApp";
 import MapsApp from "../components/MapsApp";
 import CameraApp from "../components/CameraApp";
+import MagnifierApp from "../components/MagnifierApp";
 import { MessagesApp, PhoneApp, MusicApp } from "../components/CommsApps";
 import { AiApp, InterpApp } from "../components/BackendApps";
 import MailApp from "../components/MailApp";
@@ -18,6 +19,7 @@ describe("app SSR mount smoke", () => {
     ["files", <FilesApp />, "＋ 文件夹"],
     ["maps", <MapsApp />, "📍"],
     ["camera", <CameraApp />, "🏔️"],
+    ["magnifier", <MagnifierApp />, "放大镜"],
     ["messages", <MessagesApp />, "➤"],
     ["phone", <PhoneApp />, "⌫"],
     ["music", <MusicApp />, "▶"],

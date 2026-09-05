@@ -55,6 +55,7 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-applife/             # app/process lifecycle domain core: per-app foreground/background/tombstone states + LRU + memory-pressure reclaim (LMK-proxy) (docs/app-lifecycle.md)
     ├── amos-scheduler/           # background-task scheduler + wakeup-alignment domain core: AlarmExact vs Deferred jobs, Doze/charging/maintenance-window gating + coalesced due-batching + next-wake (docs/scheduler.md)
     ├── amos-monitor/             # system working-status (health) domain core: folds SystemSampler load (CPU/mem) + amos-profiling battery/power + amos-applife process counts into one honest SystemHealth (real /proc `linux` sampler, `android` skeleton) (docs/system-monitor.md)
+    ├── amos-display/             # display-protection / auto screen-off domain core: deterministic ScreenState + IdlePolicy (battery vs charging timeouts, hold-while-call) + the AMOS_SCREEN_STATE_PATH file contract the daemon energy beat and the System UI host share (docs/display-idle.md)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -381,6 +382,10 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/DELIVERY_NOTES_2026-09-03.md](./docs/DELIVERY_NOTES_2026-09-03.md) — Commit message + changeset + known limits for the telephony/voice/strategy work (2026-09-03)
 - [docs/DELIVERY_NOTES_2026-09-05.md](./docs/DELIVERY_NOTES_2026-09-05.md) — Commit message + changeset + known limits for the Android LMK-proxy / bidirectional bridge / WatchLmk / System-UI surface-teardown work (2026-09-05)
 - [docs/DELIVERY_NOTES_2026-09-05-system-monitor.md](./docs/DELIVERY_NOTES_2026-09-05-system-monitor.md) — Commit message + changeset + known limits for the system working-status (amos-monitor) domain core + daemon/Tauri/frontend wiring (2026-09-05)
+- [docs/display-idle.md](./docs/display-idle.md) — Display protection / auto screen-off (idle → sleep → lock): `amos-display` ScreenState + IdlePolicy kernel, the `AMOS_SCREEN_STATE_PATH` file contract, and how a sleeping screen now reaches the energy governor as `screen_on = false`
+- [docs/DELIVERY_NOTES_2026-09-05-display-protection.md](./docs/DELIVERY_NOTES_2026-09-05-display-protection.md) — Commit message + changeset + known limits for the display-protection / auto screen-off work (2026-09-05)
+- [docs/identity-web3.md](./docs/identity-web3.md) — Digital identity & Web3 signing domain core: `amos-identity` (`did:key`, key/keystore) + `amos-web3` (secp256k1, EVM address, EIP-191/EIP-712) — deterministic, no PRNG in the core, honest entropy/at-rest seams
+- [docs/DELIVERY_NOTES_2026-09-05-did-web3.md](./docs/DELIVERY_NOTES_2026-09-05-did-web3.md) — Commit message + changeset + known limits for the DID/Web3 signing domain-core work (2026-09-05)
 
 ## License
 
