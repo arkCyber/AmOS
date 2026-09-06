@@ -361,6 +361,8 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
 - [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility (dev/prototype; product = no-UI Android base)
+- [docs/microg.md](./docs/microg.md) — MicroG in AmOS: self-built AOSP guest + signature spoofing fixed preinstall layer (decision + Phase 0–3 plan; planned, not yet implemented)
+- [docs/microg-implementation-review.md](./docs/microg-implementation-review.md) — MicroG proposal vs review side-by-side (claims → AmOS reality / recommended correction)
 - [docs/lmk-proxy.md](./docs/lmk-proxy.md) — Android Activity/Task lifecycle proxy + LMK (AmOS-controlled freeze/kill of container APKs)
 - [docs/android-lmk-e2e.md](./docs/android-lmk-e2e.md) — Android LMK end-to-end acceptance runbook (real device / live Tauri host)
 - [docs/appstore.md](./docs/appstore.md) — App-store core: catalog/package JSON publish contract + download→verify→install (developer onboarding)
