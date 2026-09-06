@@ -63,6 +63,9 @@
 
 **全部已注册 dock/主屏 app 均已迁到 Svelte 并接线（PROD 切 Svelte）；React 体一律保留作 bun 回退。** 后续只剩「减法期」：真机逐屏验收通过后删除对应 React 实现体及其 `src/__tests__/*dom*`，把覆盖并入 vitest。
 
+> **减法期进度（首刀已完成，2026-09-07）**：**calculator** 的 React 实现体已删除（`apps.tsx` 内联 FC + 专用 import），`CalculatorEntry` 直接 mount Svelte、无回退；其 happy-dom `calculator-dom.test.tsx` 与 `calculator-parity.test.ts` 删除，±/AC→C 覆盖并入 `svelte-tests/calculator.test.ts`。calculator 成为第一个「纯 Svelte」屏（主包剔除其字节）。
+
+
 > **HomeDock（主屏容器本身，非 app 屏）已迁到 Svelte 5 并接线（2026-09）**：把 home 主屏（小组件+4×3 分页图标网格+单行底部 dock 栏+徽标/DND/横滑翻页/HTML5 拖拽重排/软启动脉冲）从 `components/HomeDock.tsx`(React) 迁到 `src/svelte/HomeDock.svelte`(runes)；同时新增两个「受控屏」通用基建并复用：
 > - **`lib/appIcon.ts`**（框架无关纯模块）：色调/确定性渐变/9 组 bespoke SVG 字形收敛为单一真相源，React `AppIcon.tsx` 与 `src/svelte/AppIcon.svelte` 同源渲染（消除双实现漂移=审计头号回归源）；已在产物 CSS 验证无 Tailwind 裁类。
 > - **`src/svelte/propsBus.ts` + `components/SveltePropsHost.tsx`**：通用 React⇄Svelte「受控屏」通道（下行 `svelte/store` 原位推 props、不重挂不丢内部态；上行事件回传；卸载 dispose）。因 Svelte 5 **无 `$setProps`**，HomeDock 走该通道接收 `{layout,ext,pulseId}`、回传 `open/move/search`；`App.tsx` home 分支 `svelteEnabled()? SveltePropsHost : HomeDock`（PROD 走 Svelte / bun·dev 走 React），壳仍为 React（保留 lock/app/edit/sheets 编排）。另补 React 原版行为对齐：网格缩小时 `gridPage` 收敛（防再扩容自动回跳）。

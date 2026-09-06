@@ -112,3 +112,38 @@ describe("CalculatorApp.svelte — reactive i18n (in place, no remount)", () => 
     expect(host.container.textContent ?? "").toContain("History");
   });
 });
+
+describe("CalculatorApp.svelte — sign toggle + clear-key label (folded from the retired React dom tests)", () => {
+  const statusText = (host: ReturnType<typeof renderCalc>) =>
+    host.container.querySelector('[role="status"]')?.textContent ?? "";
+  const clearBtn = (host: ReturnType<typeof renderCalc>) =>
+    host.container.querySelector(
+      'button[aria-label="AC"], button[aria-label="C"]',
+    ) as HTMLButtonElement | null;
+
+  test("± toggles the sign of the shown entry and 0 is a no-op", async () => {
+    const host = renderCalc();
+    await tap(host, "5");
+    expect(statusText(host)).toBe("5");
+    await tap(host, "±");
+    expect(statusText(host)).toBe("-5");
+    await tap(host, "±");
+    expect(statusText(host)).toBe("5");
+    // a fresh 0 followed by ± must not produce "-0"
+    await tap(host, "C");
+    expect(statusText(host)).toBe("0");
+    await tap(host, "±");
+    expect(statusText(host)).toBe("0");
+  });
+
+  test("clear key reads AC fresh, flips to C while typing, and resets", async () => {
+    const host = renderCalc();
+    expect(clearBtn(host)?.getAttribute("aria-label")).toBe("AC");
+    await tap(host, "7");
+    expect(clearBtn(host)?.getAttribute("aria-label")).toBe("C");
+    await fireEvent.click(clearBtn(host) as HTMLButtonElement);
+    expect(statusText(host)).toBe("0");
+    expect(clearBtn(host)?.getAttribute("aria-label")).toBe("AC");
+  });
+});
+

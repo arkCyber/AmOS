@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useReducer, useRef, useState, type FC } from "react";
+import { Fragment, useEffect, useReducer, useState, type FC } from "react";
 import FilesApp from "./components/FilesApp";
 import AndroidApp from "./components/AndroidApp";
 import { MessagesApp, PhoneApp, MusicApp } from "./components/CommsApps";
@@ -30,7 +30,6 @@ import { SETTINGS_KEY, BACKUP_KEY, SYNC_STORES, readCloud, setCloudPrefs, snapsh
 import { readAiConfig, setAiConfig, DEEPSEEK_MODEL, DEEPSEEK_ENDPOINT, type AiProviderId } from "./lib/providers";
 import { describeEngine, type EngineView } from "./lib/aiEngine";
 import type { Locale } from "./i18n/types";
-import { addHistory, calcClearLabel, calcEntry, calcFontPx, calcFromKey, calcInit, calcPress, ERR } from "./lib/calculator";
 import { zoneClock, stopwatchInit, stopwatchReducer, fmtStopwatch, timerInit, timerReducer, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, defaultWorldCities, lapDeltas, fastestLap, type WorldCity } from "./lib/time";
 import { readStoreValue, writeStoreValue } from "./lib/amosStore";
 import { AUTOOFF_STORE_KEY, clampAutoOffSec, WAKE_HOME_KEY, wakeHomeEnabled } from "./lib/display";
@@ -725,173 +724,6 @@ const Settings: FC = () => {
   );
 };
 
-/* ---- Calculator (pure logic in lib/calculator.ts, UI here) ---- */
-const Calculator: FC = () => {
-  const { t } = useI18n();
-  const [st, setSt] = useState(() => calcInit());
-  const [history, setHistory] = useState<{ expr: string; result: string }[]>([]);
-  const [showHist, setShowHist] = useState(false);
-  const press = (k: string) => {
-    if (k === "=") {
-      // Record the completed computation (before the reducer consumes it).
-      const entry = calcEntry(st);
-      setSt((s) => calcPress(s, k));
-      if (entry) setHistory((h) => addHistory(h, entry));
-    } else {
-      setSt((s) => calcPress(s, k));
-    }
-  };
-  // iOS layout: the operator column (incl. =) is orange, the top function row
-  // (C / ± / %) is a light grey, digits sit on the dark grey body.
-  // NOTE: like the real iOS Calculator there is no on-screen backspace in the
-  // 4×5 grid (Apple exposes AC/±/%/÷ up top). The reducer still supports "⌫"
-  // and it stays reachable via a physical Delete/Backspace (see calcFromKey),
-  // which this OS shell passes through on desktop.
-  const LAYOUT: string[][] = [
-    ["C", "±", "%", "÷"],
-    ["7", "8", "9", "×"],
-    ["4", "5", "6", "−"],
-    ["1", "2", "3", "+"],
-    ["0", ".", "="],
-  ];
-  const OPER = new Set(["÷", "×", "−", "+", "="]);
-  const FUNC = new Set(["C", "±", "%"]);
-  const keyCls = (k: string) =>
-    OPER.has(k)
-      ? "bg-[#ff9f0a] text-white" // iOS orange
-      : FUNC.has(k)
-        ? "bg-[#a5a5a5] text-black" // iOS light-grey functions
-        : "bg-[#333] text-white"; // iOS dark-grey digits
-
-  // Display layers: a dim "current operation" line above the big, thin, right-
-  // aligned result that auto-shrinks as it grows (iOS behaviour) so nothing is
-  // truncated. The keypad is a fixed-height bottom block sized purely by its
-  // column width — it never stretches with the window height.
-  const big = st.cur === ERR ? t("calc.error") : st.cur;
-  const operand = st.acc ? st.acc.trimEnd() : "";
-  const isErr = st.cur === ERR;
-  const clearGlyph = calcClearLabel(st);
-
-  // Physical keyboard support: Enter/Backspace/Delete/Escape, digits, +−×÷% …
-  // Keep the latest `press` in a ref so the window listener is registered only
-  // once (no unbind/rebind churn on every keystroke).
-  const pressRef = useRef(press);
-  pressRef.current = press;
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const label = calcFromKey(e.key, e.ctrlKey || e.metaKey || e.altKey);
-      if (label == null) return;
-      e.preventDefault();
-      pressRef.current(label);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  return (
-    // The Calculator is always a dark surface (like the real iOS app) regardless
-    // of the surrounding shell theme. min-h-full (not h-full) lets the page
-    // scroll on extremely short viewports so the keypad is never clipped.
-    <div className="flex min-h-full flex-col bg-black text-white">
-      <div className="flex justify-end px-4 pt-2">
-        <button
-          onClick={() => setShowHist((v) => !v)}
-          className={
-            "rounded-full px-3 py-1 text-[13px] leading-none transition active:scale-95 " +
-            (showHist
-              ? "bg-[#ff9f0a] text-white"
-              : "bg-white/10 text-white/70 hover:bg-white/20")
-          }
-        >
-          {t("calc.history")}
-          {history.length > 0 ? ` (${history.length})` : ""}
-        </button>
-      </div>
-
-      {/* Big iOS-style display region (fills all space above the keypad). */}
-      <div className="relative min-h-0 flex-1 px-5">
-        {showHist &&
-          (history.length > 0 ? (
-            <div className="fade-in absolute inset-x-4 top-1 max-h-[70%] overflow-auto rounded-xl bg-white/10 p-2 text-sm backdrop-blur-md">
-              {history.map((h, i) => (
-                <div
-                  key={`${i}-${h.expr}`}
-                  className="flex items-baseline justify-end gap-2 py-0.5"
-                >
-                  <span className="text-white/60">{h.expr} =</span>
-                  <span className="tabular-nums font-medium text-white">{h.result}</span>
-                </div>
-              ))}
-              <button
-                onClick={() => setHistory([])}
-                className="mt-1 w-full rounded-md py-0.5 text-xs text-white/60 hover:text-white"
-              >
-                {t("calc.clear")}
-              </button>
-            </div>
-          ) : (
-            <div className="fade-in absolute inset-x-4 top-1 rounded-xl bg-white/10 p-2 text-center text-xs text-white/70 backdrop-blur-md">
-              {t("calc.empty")}
-            </div>
-          ))}
-        <div className="flex h-full flex-col justify-end pb-2">
-          {operand && (
-            <div
-              aria-hidden="true"
-              className="truncate pb-1 text-right text-2xl font-light tabular-nums text-white/45"
-            >
-              {operand}
-            </div>
-          )}
-          <div
-            role="status"
-            className="truncate text-right font-thin leading-none tabular-nums"
-            style={{
-              // Errors get a fixed, moderate size (the localized word shouldn't
-              // blow up to the full display height); numbers auto-shrink by length.
-              fontSize: isErr ? 40 : calcFontPx(big),
-              color: isErr ? "rgb(var(--danger))" : undefined,
-            }}
-          >
-            {big}
-          </div>
-        </div>
-      </div>
-
-      {/* Keypad pinned to the bottom, square keys sized by column width. */}
-      <div className="px-2 pb-3">
-        <div className="grid grid-cols-4 gap-x-3 gap-y-3">
-          {LAYOUT.map((row, ri) => (
-            <Fragment key={ri}>
-              {row.map((k) => {
-                const wide = k === "0" && ri === LAYOUT.length - 1;
-                const glyph = k === "C" ? clearGlyph : k;
-                return (
-                  <button
-                    key={k}
-                    onClick={() => press(k)}
-                    aria-label={glyph}
-                    className={
-                      "flex select-none items-center rounded-full text-[26px] leading-none transition active:brightness-150 active:scale-95 " +
-                      (wide
-                        ? "col-span-2 justify-start pl-8 text-left"
-                        : "aspect-square justify-center") +
-                      " " +
-                      keyCls(k)
-                    }
-                  >
-                    {glyph}
-                  </button>
-                );
-              })}
-            </Fragment>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-};
-
 /* ---- Svelte migration seam (React → Svelte) ----
  * Each migrated screen keeps its long-standing React implementation as the
  * reference + bun-test path (the happy-dom suite has no .svelte loader) and is
@@ -945,8 +777,7 @@ const loadCamera = () => import("./svelte/CameraApp.svelte");
 const loadInterp = () => import("./svelte/InterpApp.svelte");
 const loadAi = () => import("./svelte/AiApp.svelte");
 
-const CalculatorEntry: FC = () =>
-  svelteEnabled() ? <SvelteAppHost load={loadCalculator} /> : <Calculator />;
+const CalculatorEntry: FC = () => <SvelteAppHost load={loadCalculator} />;
 
 /* ---- Weather (localized 5-day forecast; data in lib/weather.ts) ---- */
 const Weather: FC = () => {

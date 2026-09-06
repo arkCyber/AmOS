@@ -1,9 +1,10 @@
 <script lang="ts">
-  // CalculatorApp.svelte — Svelte 5 (runes) port of the iOS-style calculator that
-  // lives as a React FC in src/apps.tsx. The reduction logic is NOT reimplemented:
-  // it reuses the same pure reducer in src/lib/calculator.ts shared by the React
-  // UI (single source of truth, already unit-tested there). This component is
-  // intentionally React-free; all state is runes ($state/$derived/$effect).
+  // CalculatorApp.svelte — Svelte 5 (runes) implementation of the iOS-style
+  // calculator. The reduction logic is NOT reimplemented: it reuses the single
+  // pure reducer in src/lib/calculator.ts (single source of truth, already
+  // unit-tested there). The former React body (src/apps.tsx) was removed in the
+  // "subtraction" phase — this Svelte screen is now the only implementation and
+  // is mounted directly by apps.tsx CalculatorEntry (no React fallback).
 
   // Shared, non-reactive constants + colour map (iOS palette). Recreated per
   // component instance — cheap and dependency-free.
