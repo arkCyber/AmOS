@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import WeatherApp from "../src/svelte/WeatherApp.svelte";
 import { setLocale } from "../src/svelte/locale.svelte";
+import { readStoreValue } from "../src/lib/amosStore";
 
 afterEach(() => {
   cleanup();
@@ -65,6 +66,19 @@ describe("WeatherApp.svelte", () => {
     // Beijing gone from selectors; Tokyo becomes active selection
     expect(txt(host)).not.toContain("北京");
     expect(host.container.querySelectorAll("button[aria-pressed]").length).toBe(3);
+  });
+
+  test("the + button persists the added city to the shared amos.weather.cities store", async () => {
+    // Folded from the retired React weather-dom test: the added city must land in
+    // the shared amos.weather.cities store (round-trip via readStoreValue), not just
+    // in local component state.
+    const host = render(WeatherApp);
+    const add = buttons(host).find((b) => (b.textContent ?? "").includes("+"));
+    expect(add).toBeTruthy();
+    await fireEvent.click(add as HTMLButtonElement);
+    const stored = readStoreValue<unknown>("amos.weather.cities", []);
+    const ids = (stored as { id: string }[]).map((c) => c.id);
+    expect(ids).toContain("paris");
   });
 
   test("reactive i18n: labels switch language in place when the shell changes locale", async () => {

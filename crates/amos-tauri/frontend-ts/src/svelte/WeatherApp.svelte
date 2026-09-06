@@ -1,8 +1,10 @@
 <script lang="ts">
-  // WeatherApp.svelte — Svelte 5 (runes) port of the React `Weather` FC in
-  // src/apps.tsx. Logic is NOT reimplemented: it reuses lib/weather.ts (pure) and
-  // persists through the shared amos.* store (lib/amosStore). It demonstrates the
-  // Svelte infrastructure layer:
+  // WeatherApp.svelte — Svelte 5 (runes) implementation of the weather screen.
+  // Logic is NOT reimplemented: it reuses lib/weather.ts (pure) and persists
+  // through the shared amos.* store (lib/amosStore). The former React `Weather`
+  // FC (src/apps.tsx) was removed in the subtraction phase — this is now the only
+  // implementation, mounted directly by apps.tsx WeatherEntry (no React fallback).
+  // It demonstrates the Svelte infrastructure layer:
   //   • reactive i18n singleton (locale.svelte.ts) — `t()`/`locale()` update in
   //     place when the React shell switches language (no remount/state loss);
   //   • store persistence via runes $state + $effect (mirrors useState+useEffect).

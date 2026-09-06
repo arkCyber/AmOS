@@ -14,7 +14,6 @@ import ContactsApp from "./components/ContactsApp";
 import VoiceMemosApp from "./components/VoiceMemosApp";
 import ExtApp from "./components/ExtApp";
 import { isExtId } from "./lib/storeApps";
-import type { MessageKey } from "./i18n/locales/zh";
 import { useI18n } from "./i18n";
 import { useTheme, type ThemeMode } from "./theme";
 import Segmented from "./components/Segmented";
@@ -37,7 +36,6 @@ import { bridged, getAiStatus, switchAiBackend, exportTxtFile } from "./lib/back
 import { clipboardRead, clipboardWrite, entryText } from "./lib/clipboard";
 import { NOTES_KEY, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, fmtTime, normalizeNotes, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeAllTasks, noteListProgress, fmtInline, hasTag, tagsOf, setManyState, setPinned, removeMany, exportBaseName, noteExportText, type Note } from "./lib/notes";
 import { noteTitle, notePreview, noteDayOf } from "./lib/notes";
-import { forecast, dayLabel, displayTemp, convertRange, adjustForecast, WEATHER_CITIES, normalizeWeatherCities, removeWeatherCity, addWeatherCity, type TempUnit, type WCity } from "./lib/weather";
 import {
   PHOTOS_KEY,
   seedPhotos,
@@ -779,115 +777,7 @@ const loadAi = () => import("./svelte/AiApp.svelte");
 
 const CalculatorEntry: FC = () => <SvelteAppHost load={loadCalculator} />;
 
-/* ---- Weather (localized 5-day forecast; data in lib/weather.ts) ---- */
-const Weather: FC = () => {
-  const { t, locale } = useI18n();
-  const base = new Date();
-  const baseDays = forecast();
-  // Editable city subset (persisted) + remembered selection.
-  const [cities, setCities] = useState<WCity[]>(() =>
-    normalizeWeatherCities(readStoreValue<unknown>("amos.weather.cities", undefined)),
-  );
-  useEffect(() => {
-    writeStoreValue("amos.weather.cities", cities);
-  }, [cities]);
-  const [selId, setSelId] = useState<string>(() => {
-    const saved = readStoreValue<string>("amos.weather.city", "");
-    return normalizeWeatherCities(undefined).some((c) => c.id === saved) ? saved : "";
-  });
-  useEffect(() => {
-    writeStoreValue("amos.weather.city", selId);
-  }, [selId]);
-  const active = cities.find((c) => c.id === selId) ?? cities[0];
-  const days = adjustForecast(baseDays, active?.offset ?? 0);
-  const [unit, setUnit] = useState<TempUnit>("c");
-  const missingCity = WEATHER_CITIES.find((c) => !cities.some((x) => x.id === c.id));
-  const [edit, setEdit] = useState(false);
-  const select = (id: string) => setSelId(id);
-  const unitBtn = (u: TempUnit, label: string) => (
-    <button onClick={() => setUnit(u)} className={chip(unit === u)}>
-      {label}
-    </button>
-  );
-  return (
-    <div className="p-4">
-      <div className="mb-2 flex flex-wrap items-center gap-1.5">
-        {cities.map((c) => (
-          <button
-            key={c.id}
-            onClick={() => select(c.id)}
-            aria-pressed={active?.id === c.id}
-            className={chip(active?.id === c.id)}
-          >
-            {t(`weather.city.${c.id}` as MessageKey)}
-          </button>
-        ))}
-        <div className="ml-auto flex items-center gap-1.5">
-          {missingCity && (
-            <button
-              onClick={() => setCities(addWeatherCity(cities, missingCity))}
-              className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
-            >
-              + {t("weather.addCity")}
-            </button>
-          )}
-          <button
-            onClick={() => setEdit((e) => !e)}
-            className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
-          >
-            {edit ? t("common.done") : t("weather.edit")}
-          </button>
-          {unitBtn("c", "℃")}
-          {unitBtn("f", "℉")}
-        </div>
-      </div>
-      {edit && (
-        <div className="mb-2 flex flex-wrap gap-1.5">
-          {cities.map((c) => (
-            <button
-              key={c.id}
-              onClick={() => {
-                const next = removeWeatherCity(cities, c.id);
-                setCities(next);
-                if (active?.id === c.id) setSelId(next[0]?.id ?? "");
-              }}
-              className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] text-danger dark:bg-neutral-700"
-            >
-              {t(`weather.city.${c.id}` as MessageKey)} ✕
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="py-4 text-center">
-        <div className="text-6xl">{days[0]?.icon ?? ""}</div>
-        <div className="text-5xl font-thin">{days[0] ? displayTemp(days[0].temp, unit) : ""}</div>
-        <div className="text-sm opacity-60">{days[0] ? convertRange(days[0].range, unit) : ""}</div>
-        <div className="mt-1 text-xs opacity-60">
-          {t("weather.humidity")} {days[0]?.humidity ?? "—"}% · {t("weather.wind")}{" "}
-          {days[0]?.wind ?? "—"}
-        </div>
-      </div>
-      <div className={"divide-y divide-black/5 dark:divide-white/10 " + GROUP}>
-        {days.map((d) => {
-          const label = d.daysFromNow === 0 ? t("weather.today") : dayLabel(locale, base, d.daysFromNow);
-          return (
-            <div key={d.daysFromNow} className="flex items-center justify-between gap-2 px-3.5 py-2.5">
-              <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
-              <span className="text-xl">{d.icon}</span>
-              <span className="flex w-16 flex-col items-end">
-                <span className="text-sm font-semibold tabular-nums">{convertRange(d.range, unit)}</span>
-                <span className="text-[10px] opacity-60">💧{d.humidity}%</span>
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-};
-
-const WeatherEntry: FC = () =>
-  svelteEnabled() ? <SvelteAppHost load={loadWeather} /> : <Weather />;
+const WeatherEntry: FC = () => <SvelteAppHost load={loadWeather} />;
 
 const ContactsEntry: FC = () =>
   svelteEnabled() ? <SvelteAppHost load={loadContacts} /> : <ContactsApp />;

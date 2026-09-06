@@ -65,6 +65,9 @@
 
 > **减法期进度（首刀已完成，2026-09-07）**：**calculator** 的 React 实现体已删除（`apps.tsx` 内联 FC + 专用 import），`CalculatorEntry` 直接 mount Svelte、无回退；其 happy-dom `calculator-dom.test.tsx` 与 `calculator-parity.test.ts` 删除，±/AC→C 覆盖并入 `svelte-tests/calculator.test.ts`。calculator 成为第一个「纯 Svelte」屏（主包剔除其字节）。
 
+> **减法期之二：weather（2026-09-07）**：`apps.tsx` 天气 React FC（~106 行 + 专用 `lib/weather` import）已删除，`WeatherEntry` 直接 mount Svelte、无回退；happy-dom `weather-dom.test.tsx` 与 `weather-parity.test.ts` 删除，新增城市持久化覆盖并入 `svelte-tests/weather.svelte.test.ts`。weather 成为第二个「纯 Svelte」屏。
+
+
 
 > **HomeDock（主屏容器本身，非 app 屏）已迁到 Svelte 5 并接线（2026-09）**：把 home 主屏（小组件+4×3 分页图标网格+单行底部 dock 栏+徽标/DND/横滑翻页/HTML5 拖拽重排/软启动脉冲）从 `components/HomeDock.tsx`(React) 迁到 `src/svelte/HomeDock.svelte`(runes)；同时新增两个「受控屏」通用基建并复用：
 > - **`lib/appIcon.ts`**（框架无关纯模块）：色调/确定性渐变/9 组 bespoke SVG 字形收敛为单一真相源，React `AppIcon.tsx` 与 `src/svelte/AppIcon.svelte` 同源渲染（消除双实现漂移=审计头号回归源）；已在产物 CSS 验证无 Tailwind 裁类。
