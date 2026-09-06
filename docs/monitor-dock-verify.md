@@ -44,6 +44,7 @@ cd crates/amos-tauri/frontend-ts
 bunx vitest run svelte-tests/monitor-app.svelte.test.ts   # A3/A5/A6 状态机（离线/空态/总览/恢复）
 bunx vitest run svelte-tests/monitor.svelte.test.ts       # 明细面板 SystemPanel/TaskManager
 bunx vitest run svelte-tests/shell.svelte.test.ts         # A2 入口：monitor dock → app 屏
+bunx vitest run svelte-tests/monitor-react-entry.test.ts # A2 入口（React 壳 COMPONENTS→SvelteAppHost→MonitorApp）
 bun run typecheck && bun run typecheck:svelte && bun run test   # 全量 gate
 ```
 
