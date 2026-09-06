@@ -80,6 +80,7 @@ describe("amos home layout & recents (pure logic)", () => {
     "mail",
     "clock",
     "maps",
+    "monitor",
   ];
 
   test("defaultLayout docks the dock-first apps and pages the rest", () => {

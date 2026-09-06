@@ -1,7 +1,7 @@
 /**
  * appMeta.ts — React-free built-in app metadata (single source of truth).
  *
- * id → { titleKey, icon } for the 22 built-in apps. This used to live inside the
+ * id → { titleKey, icon } for the 23 built-in apps. This used to live inside the
  * React `apps.tsx`; extracting it here lets a Svelte shell / registry consume the
  * same data without pulling React, and `apps.tsx` re-exports it so nothing drifts.
  */
@@ -38,6 +38,7 @@ export const APP_META: AppMeta[] = [
   { id: "privacy", titleKey: "app.privacy", icon: "🛡️" },
   { id: "contacts", titleKey: "app.contacts", icon: "👥" },
   { id: "magnifier", titleKey: "app.magnifier", icon: "🔍" },
+  { id: "monitor", titleKey: "app.monitor", icon: "📈" },
 ];
 
 export function appMetaById(id: string): AppMeta | undefined {

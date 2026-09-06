@@ -35,6 +35,7 @@ export const SVELTE_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   privacy: () => import("./PermissionsApp.svelte"),
   contacts: () => import("./ContactsApp.svelte"),
   magnifier: () => import("./MagnifierApp.svelte"),
+  monitor: () => import("./MonitorApp.svelte"),
 };
 
 /** Resolve the Svelte screen loader for an app id; undefined if unregistered. */

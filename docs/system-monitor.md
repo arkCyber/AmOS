@@ -106,6 +106,15 @@ as "—", never fabricated) mounted in Settings beside `SensorPanel`, with en/zh
 busy% is a window delta; a busy-ref guard prevents overlap) — offline / no data means no
 timer, so tests never leak one.
 
+**Dock dashboard (frontend-ts, 2026-09-07):** a dedicated「系统监控 / System Monitor」dock
+app (`MonitorApp.svelte`) registers `monitor` as the 23rd built-in app through the single
+source `lib/appMeta` + `svelte/appRegistry` + `apps.tsx` `COMPONENTS` and is added to
+`DEFAULT_DOCK` (fresh installs land it on the dock). The screen renders a live overview
+strip (big CPU / memory / battery readouts with accessible `role=progressbar` bars,
+adaptive polling — 2.5 s online / 5 s reconnect probe offline with auto-recovery) above the
+same self-contained `SystemPanel` / `TaskManager` panels the Settings screen renders, with
+explicit offline ("not connected") / no-data empty states instead of a blank page.
+
 Honest boundary: the `system` block's **battery comes from the energy-governor store**
 (`level_pct`/`charging`/`live_power_mw`, threaded in `system_metrics()`); before the
 governor's first tick it is the "pending" baseline → level/power unknown, charging

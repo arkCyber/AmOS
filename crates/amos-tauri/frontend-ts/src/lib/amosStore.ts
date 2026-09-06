@@ -11,7 +11,7 @@ export interface HomeLayout {
 export const LAYOUT_KEY = "amos.home.layout";
 export const RECENTS_KEY = "amos.recents";
 
-export const DEFAULT_DOCK = ["phone", "messages", "ai", "interpreter", "mail"];
+export const DEFAULT_DOCK = ["phone", "messages", "ai", "interpreter", "mail", "monitor"];
 
 declare global {
   interface Window {

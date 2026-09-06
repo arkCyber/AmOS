@@ -772,6 +772,7 @@ const loadStore = () => import("./svelte/StoreApp.svelte");
 const loadCamera = () => import("./svelte/CameraApp.svelte");
 const loadInterp = () => import("./svelte/InterpApp.svelte");
 const loadAi = () => import("./svelte/AiApp.svelte");
+const loadMonitor = () => import("./svelte/MonitorApp.svelte");
 
 const CalculatorEntry: FC = () => <SvelteAppHost load={loadCalculator} />;
 
@@ -834,6 +835,8 @@ const InterpEntry: FC = () =>
 
 const AiEntry: FC = () =>
   svelteEnabled() ? <SvelteAppHost load={loadAi} /> : <AiApp />;
+
+const MonitorEntry: FC = () => <SvelteAppHost load={loadMonitor} />;
 
 /* ---- Notes (persisted via the shared amos.notes store) ---- */
 const Notes: FC = () => {
@@ -1879,6 +1882,7 @@ const COMPONENTS: Record<string, FC> = {
   privacy: PermissionsEntry,
   contacts: ContactsEntry,
   magnifier: MagnifierEntry,
+  monitor: MonitorEntry,
 };
 
 /** Get the component for an app id, or a "not ported yet" placeholder. */
