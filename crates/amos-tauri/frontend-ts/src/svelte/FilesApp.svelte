@@ -1,8 +1,10 @@
 <script lang="ts">
-  // FilesApp.svelte — Svelte 5 (runes) port of the React FilesApp. All logic
-  // reuses pure lib/files.ts. (Work-in-progress Files port: built to be
-  // compilable/green without being wired into COMPONENTS yet; wiring + vitest in
-  // a follow-up pass.)
+  // FilesApp.svelte — Svelte 5 (runes) implementation of the file manager. All
+  // logic reuses pure lib/files.ts. Feature-complete (create folder/file, rename,
+  // move, single + multi-select batch delete/move, favorites, search, sort,
+  // all/fav/recent views). The former React body (src/components/FilesApp.tsx)
+  // was removed in the subtraction phase — this is now the only implementation,
+  // mounted directly by apps.tsx FilesEntry (no React fallback).
   import {
     FILES_FAV_KEY,
     FILES_KEY,

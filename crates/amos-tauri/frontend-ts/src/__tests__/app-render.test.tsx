@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import type { ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import { I18nProvider } from "../i18n";
-import FilesApp from "../components/FilesApp";
 import MapsApp from "../components/MapsApp";
 import CameraApp from "../components/CameraApp";
 import MagnifierApp from "../components/MagnifierApp";
@@ -16,7 +15,6 @@ const wrap = (el: ReactNode) => <I18nProvider>{el}</I18nProvider>;
 
 describe("app SSR mount smoke", () => {
   const cases: [string, ReactNode, string][] = [
-    ["files", <FilesApp />, "＋ 文件夹"],
     ["maps", <MapsApp />, "📍"],
     ["camera", <CameraApp />, "🏔️"],
     ["magnifier", <MagnifierApp />, "放大镜"],

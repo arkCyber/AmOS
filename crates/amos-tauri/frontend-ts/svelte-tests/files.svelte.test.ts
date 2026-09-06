@@ -39,3 +39,37 @@ describe("FilesApp.svelte", () => {
     expect(txt(host)).toContain("空文件夹");
   });
 });
+
+describe("FilesApp.svelte — multi-select batch delete (folded from the retired React files-select tests)", () => {
+  test("selecting rows and pressing delete removes them all at once", async () => {
+    const host = render(FilesApp);
+    // seed = folder 文档 + file 说明.txt
+    expect(btnContaining(host, "文档")).toBeTruthy();
+    expect(btnContaining(host, "说明.txt")).toBeTruthy();
+
+    await fireEvent.click(btnContaining(host, "选择")!); // enter select mode
+    await fireEvent.click(btnContaining(host, "文档")!);
+    await fireEvent.click(btnContaining(host, "说明.txt")!);
+    const del = btnContaining(host, "删除所选");
+    expect(del).toBeTruthy();
+    await fireEvent.click(del!);
+    expect(btnContaining(host, "文档")).toBeUndefined();
+    expect(btnContaining(host, "说明.txt")).toBeUndefined();
+    expect(txt(host)).toContain("空文件夹");
+  });
+
+  test("select-all selects every visible row, then a single delete clears them", async () => {
+    const host = render(FilesApp);
+    await fireEvent.click(btnContaining(host, "选择")!);
+    const allBtn = btnContaining(host, "全选");
+    expect(allBtn?.textContent).toContain("2");
+    await fireEvent.click(allBtn!);
+    const del = btnContaining(host, "删除所选");
+    expect(del?.textContent).toContain("2");
+    await fireEvent.click(del!);
+    expect(btnContaining(host, "文档")).toBeUndefined();
+    expect(btnContaining(host, "说明.txt")).toBeUndefined();
+    expect(txt(host)).toContain("空文件夹");
+  });
+});
+

@@ -1,5 +1,4 @@
 import { Fragment, useEffect, useReducer, useState, type FC } from "react";
-import FilesApp from "./components/FilesApp";
 import AndroidApp from "./components/AndroidApp";
 import { MessagesApp, PhoneApp, MusicApp } from "./components/CommsApps";
 import MapsApp from "./components/MapsApp";
@@ -795,8 +794,7 @@ const MusicEntry: FC = () =>
 const NotesEntry: FC = () =>
   svelteEnabled() ? <SvelteAppHost load={loadNotes} /> : <Notes />;
 
-const FilesEntry: FC = () =>
-  svelteEnabled() ? <SvelteAppHost load={loadFiles} /> : <FilesApp />;
+const FilesEntry: FC = () => <SvelteAppHost load={loadFiles} />;
 
 const PhotosEntry: FC = () =>
   svelteEnabled() ? <SvelteAppHost load={loadPhotos} /> : <Photos />;
