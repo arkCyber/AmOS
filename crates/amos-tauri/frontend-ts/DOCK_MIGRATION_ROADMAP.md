@@ -68,6 +68,9 @@
 > **减法期之二：weather（2026-09-07）**：`apps.tsx` 天气 React FC（~106 行 + 专用 `lib/weather` import）已删除，`WeatherEntry` 直接 mount Svelte、无回退；happy-dom `weather-dom.test.tsx` 与 `weather-parity.test.ts` 删除，新增城市持久化覆盖并入 `svelte-tests/weather.svelte.test.ts`。weather 成为第二个「纯 Svelte」屏。
 
 
+> **减法期之三：privacy/permissions（2026-09-07）**：`components/PermissionsApp.tsx`(React 整文件 ~213 行) 已删除，`PermissionsEntry` 直接 mount Svelte、无回退；`permissions-parity.test.ts` 删除（离线行为已被 `permissions.svelte.test.ts` 覆盖，无 React happy-dom 测试）。permissions 成为第三个「纯 Svelte」屏。备注：**contacts 暂不减法**——其 React DOM 测试含桥接耦合的拨号/Recent/Frequent/通知与 Edit 行为，Svelte 版对这些的覆盖未齐，须待补齐后再减。
+
+
 
 > **HomeDock（主屏容器本身，非 app 屏）已迁到 Svelte 5 并接线（2026-09）**：把 home 主屏（小组件+4×3 分页图标网格+单行底部 dock 栏+徽标/DND/横滑翻页/HTML5 拖拽重排/软启动脉冲）从 `components/HomeDock.tsx`(React) 迁到 `src/svelte/HomeDock.svelte`(runes)；同时新增两个「受控屏」通用基建并复用：
 > - **`lib/appIcon.ts`**（框架无关纯模块）：色调/确定性渐变/9 组 bespoke SVG 字形收敛为单一真相源，React `AppIcon.tsx` 与 `src/svelte/AppIcon.svelte` 同源渲染（消除双实现漂移=审计头号回归源）；已在产物 CSS 验证无 Tailwind 裁类。

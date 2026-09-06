@@ -9,7 +9,6 @@ import { AiApp, InterpApp } from "./components/BackendApps";
 import MailApp from "./components/MailApp";
 import StoreApp from "./components/StoreApp";
 import RemindersApp from "./components/RemindersApp";
-import PermissionsApp from "./components/PermissionsApp";
 import ContactsApp from "./components/ContactsApp";
 import VoiceMemosApp from "./components/VoiceMemosApp";
 import ExtApp from "./components/ExtApp";
@@ -782,8 +781,7 @@ const WeatherEntry: FC = () => <SvelteAppHost load={loadWeather} />;
 const ContactsEntry: FC = () =>
   svelteEnabled() ? <SvelteAppHost load={loadContacts} /> : <ContactsApp />;
 
-const PermissionsEntry: FC = () =>
-  svelteEnabled() ? <SvelteAppHost load={loadPermissions} /> : <PermissionsApp />;
+const PermissionsEntry: FC = () => <SvelteAppHost load={loadPermissions} />;
 
 const ClockEntry: FC = () =>
   svelteEnabled() ? <SvelteAppHost load={loadClock} /> : <Clock />;

@@ -1,9 +1,11 @@
 <script lang="ts">
-  // PermissionsApp.svelte — Svelte 5 (runes) port of the React PermissionsApp
-  // (src/components/PermissionsApp.tsx): privacy & permissions dashboard. All
-  // ledger logic reuses pure lib/permissions.ts; the local ledger (amos.permissions)
-  // is the display cache and works fully offline. The daemon "recent access"
-  // audit section only appears when the bridge answers (offline → hidden).
+  // PermissionsApp.svelte — Svelte 5 (runes) implementation of the privacy &
+  // permissions dashboard. Ledger logic reuses pure lib/permissions.ts; the local
+  // ledger (amos.permissions) is the display cache and works fully offline. The
+  // daemon "recent access" audit section only appears when the bridge answers
+  // (offline → hidden). The former React body (src/components/PermissionsApp.tsx)
+  // was removed in the subtraction phase — this is now the only implementation,
+  // mounted directly by apps.tsx PermissionsEntry (no React fallback).
   import { bridged } from "../lib/backend";
   import {
     CAPABILITIES,
