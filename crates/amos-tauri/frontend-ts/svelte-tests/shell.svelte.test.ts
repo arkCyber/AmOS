@@ -126,6 +126,22 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
   });
 
+  test("tapping the monitor dock tile opens the System Monitor app surface", async () => {
+    applyLayout({ page: [], dock: ["monitor"], hidden: [] });
+    const { container } = render(Shell);
+    await tick();
+    const tile = container.querySelector(
+      `button[aria-label="${zh["app.monitor"]}"]`,
+    ) as HTMLButtonElement | null;
+    expect(tile).toBeTruthy();
+    await fireEvent.click(tile!);
+    await tick();
+    const surf = container.querySelector('[data-testid="app-surface"]');
+    expect(surf).toBeTruthy();
+    // The app chrome shows the localized title (registry resolved `monitor`).
+    expect(surf!.textContent ?? "").toContain(zh["app.monitor"]);
+  });
+
   test("unlocking from the LockScreen returns Shell to the home surface", async () => {
     // No PIN configured → LockScreen shows a plain unlock button.
     lock();
