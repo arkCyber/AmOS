@@ -26,8 +26,9 @@
     type SystemStatus,
   } from "../lib/system";
   import { bridged } from "../lib/backend";
+  import { amosLog, amosWarn } from "../lib/debugLog";
   import { t } from "./locale.svelte";
-  import { onDestroy } from "svelte";
+  import { onDestroy, onMount } from "svelte";
 
   const REFRESH_MS = 2500; // live poll while the daemon is reachable
   const RECONNECT_MS = 5000; // lighter probe cadence while it is not
@@ -44,6 +45,7 @@
   let inflight = false;
   // Drop in-flight writes after the screen unmounts (keeps the async path clean).
   let disposed = false;
+  onMount(() => amosLog("monitor", "mounted", { bridged: online }));
   onDestroy(() => {
     disposed = true;
   });
@@ -61,6 +63,7 @@
       })
       .catch(() => {
         /* daemon went away mid-flight → keep the previous reading */
+        amosWarn("monitor", "health read failed", { online });
       })
       .finally(() => {
         if (disposed) return;
@@ -92,6 +95,27 @@
     const ms = online ? REFRESH_MS : RECONNECT_MS;
     const id = window.setInterval(refresh, ms);
     return () => window.clearInterval(id);
+  });
+
+  // On-device diagnosis ([amos][monitor] → adb logcat): report which surface the
+  // screen resolved to (offline / noData / overview) each time it transitions,
+  // plus the live readings behind it — mirrors the Shell/Dock markers so "the
+  // monitor shows no numbers on device" is greppable straight from the log.
+  let lastSurface: "offline" | "noData" | "overview" | null = null;
+  $effect(() => {
+    const label: "offline" | "noData" | "overview" = online
+      ? overviewAny
+        ? "overview"
+        : "noData"
+      : "offline";
+    if (label === lastSurface) return;
+    lastSurface = label;
+    amosLog("monitor", `surface=${label}`, {
+      online,
+      cpu: sys.cpu_busy_pct,
+      memTotal: sys.mem_total_bytes,
+      battery: sys.battery_level_pct,
+    });
   });
 
   const pctLabel = (v: number | null): string => (v === null ? "—" : `${Math.round(v)}%`);

@@ -34,3 +34,34 @@
 - A1–A9 全部通过视为本屏验收通过；A8 视无障碍复核环境可选（有 TalkBack 才做）。
 - macOS dev（无 `/proc`）如实 unknown → A3 显示「暂无系统数据」空态而非假数据——属
   预期（诚实边界），**不**作为失败；请在真机/可采样 Linux 上判 A3。
+
+## 半自动冒烟（无真机，headless 先行）
+
+下列自动化已覆盖上表多数“状态机/渲染”项，真机只补“真实读数 + 像素/手势”：
+
+```bash
+cd crates/amos-tauri/frontend-ts
+bunx vitest run svelte-tests/monitor-app.svelte.test.ts   # A3/A5/A6 状态机（离线/空态/总览/恢复）
+bunx vitest run svelte-tests/monitor.svelte.test.ts       # 明细面板 SystemPanel/TaskManager
+bunx vitest run svelte-tests/shell.svelte.test.ts         # A2 入口：monitor dock → app 屏
+bun run typecheck && bun run typecheck:svelte && bun run test   # 全量 gate
+```
+
+未自动覆盖、须真机判的：A1（布局落位）依赖持久化布局语义、A4 真数据值、A7 对真实管控进程操作、A8 读屏实测、A10 观感。
+
+## 真机排查（logcat）
+
+屏带命名空间日志（`lib/debugLog.ts`，默认开；`localStorage amos.debug.log=0` 可关）：
+
+```bash
+adb logcat -s chromium  # 或按 WebView tag；过滤即可
+adb logcat | grep '\[amos\]\[monitor\]'
+```
+
+标记语义：
+- `[amos][monitor] mounted { bridged }` — 屏已挂载；
+- `[amos][monitor] surface=offline|noData|overview { online, cpu, memTotal, battery }` — 每次表面状态翻转一行，直接判定「是否卡在无数据/离线」；
+- `[amos][monitor] health read failed`（warn）— 桥在但读取抛错。
+
+对照 shell/dock 的 `[amos][shell] surface=app:monitor` / `[amos][dock] mounted` 一起看，即可定位「点了没进屏 / 进屏没数字 / 读数被空态覆盖」是哪一层。
+

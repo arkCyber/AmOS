@@ -154,4 +154,22 @@ describe("MonitorApp.svelte — overview dashboard", () => {
     expect(byTest(container, "monitor-overview")).toBeTruthy();
     expect(txt(container)).toContain("50%");
   });
+
+  test("emits [amos][monitor] lifecycle markers for on-device logcat diagnosis", async () => {
+    const seen: string[] = [];
+    const origInfo = console.info;
+    const origWarn = console.warn;
+    console.info = (...a: unknown[]) => void seen.push(a.map(String).join(" "));
+    console.warn = (...a: unknown[]) => void seen.push(a.map(String).join(" "));
+    try {
+      render(MonitorApp); // offline in this test
+      await settle();
+      const joined = seen.join("\n");
+      expect(joined).toContain("[amos][monitor] mounted");
+      expect(joined).toContain("[amos][monitor] surface=offline");
+    } finally {
+      console.info = origInfo;
+      console.warn = origWarn;
+    }
+  });
 });
