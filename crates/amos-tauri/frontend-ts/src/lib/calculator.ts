@@ -125,6 +125,12 @@ export function calcPress(st: CalcState, label: string): CalcState {
     } else if (!cur.includes(".")) {
       cur += ".";
     }
+  } else if (label === "±") {
+    // iOS change-sign on the current entry. Negating 0 (including the 0 the
+    // reducer stages right after an operator) is a no-op so "-0" never appears.
+    if (cur !== "0" && cur !== "0.") {
+      cur = cur.startsWith("-") ? cur.slice(1) : `-${cur}`;
+    }
   } else if (label === "C") {
     acc = "";
     cur = "0";
@@ -166,6 +172,37 @@ export function calcPress(st: CalcState, label: string): CalcState {
 export function calcDisplay(st: CalcState): string {
   if (st.justEq) return st.cur;
   return st.acc ? `${st.acc}${st.cur === "0" ? "" : st.cur}` : st.cur;
+}
+
+/**
+ * Which glyph the top-left clear key should show, mirroring iOS: it reads "AC"
+ * while the calculator is effectively reset (no pending operator and either a
+ * bare 0 or a completed "="), and "C" once the user has started an entry.
+ * Both presses perform the same full clear in this reducer — only the label
+ * differs, matching how iOS signals the reset scope.
+ */
+export function calcClearLabel(st: CalcState): string {
+  // Once ERR the only way out is a full clear (the reducer ignores every other
+  // key), so it always reads "AC" — mirroring iOS after an error.
+  if (st.cur === ERR) return "AC";
+  if (!st.acc && (st.cur === "0" || st.justEq)) return "AC";
+  return "C";
+}
+
+/**
+ * Display font size (px) for the big result line, stepping down as the text
+ * grows so long numbers auto-shrink like iOS instead of overflowing. Pure and
+ * measured on the raw string length (code units).
+ */
+export function calcFontPx(text: string): number {
+  const n = text.length;
+  if (n <= 6) return 64;
+  if (n <= 8) return 54;
+  if (n <= 10) return 46;
+  if (n <= 13) return 38;
+  if (n <= 16) return 32;
+  if (n <= 20) return 27;
+  return 23;
 }
 
 /** Run a whole sequence of presses, returning the display text. */

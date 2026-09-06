@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { addHistory, calcDisplay, calcEntry, calcFromKey, calcInit, calcPress, calcRun, ERR } from "../lib/calculator";
+import { addHistory, calcClearLabel, calcDisplay, calcEntry, calcFontPx, calcFromKey, calcInit, calcPress, calcRun, ERR } from "../lib/calculator";
 
 describe("calculator", () => {
   test("adds 2 + 3 = 5", () => {
@@ -143,5 +143,49 @@ describe("calculator", () => {
     s = calcPress(s, "C");
     expect(calcRun(["9", "÷", "3", "="])).toBe("3");
     expect(calcRun(["9", "÷", "3", "×", "0", "="])).toBe("0");
+  });
+
+  test("± toggles the sign of the current entry (0 is a no-op)", () => {
+    expect(calcRun(["9", "±"])).toBe("-9");
+    expect(calcRun(["9", "±", "±"])).toBe("9");
+    expect(calcRun(["0", "±"])).toBe("0"); // negating zero stays zero (no "-0")
+    // 2 + (-3) = -1 ; 5 × (-2) = -10 (fold semantics preserved)
+    expect(calcRun(["2", "+", "3", "±", "="])).toBe("-1");
+    expect(calcRun(["5", "×", "2", "±", "="])).toBe("-10");
+  });
+
+  test("± on the result of = re-signs it and still starts a fresh entry", () => {
+    let s = calcInit();
+    for (const k of ["2", "+", "3", "=", "±"]) s = calcPress(s, k);
+    expect(calcDisplay(s)).toBe("-5"); // re-signed result
+    s = calcPress(s, "7");
+    expect(calcDisplay(s)).toBe("7"); // typing after that starts fresh
+  });
+
+  test("calcClearLabel flips between AC and C like iOS", () => {
+    let s = calcInit();
+    expect(calcClearLabel(s)).toBe("AC"); // fresh → full reset
+    for (const k of ["5"]) s = calcPress(s, k);
+    expect(calcClearLabel(s)).toBe("C"); // an entry is underway
+    for (const k of ["+", "3", "="]) s = calcPress(s, k);
+    expect(calcClearLabel(s)).toBe("AC"); // completed = → everything clearable
+  });
+
+  test("calcClearLabel reads AC while ERR (the only escape is a full clear)", () => {
+    let s = calcInit();
+    for (const k of ["5", "÷", "0", "="]) s = calcPress(s, k);
+    expect(calcDisplay(s)).toBe(ERR);
+    expect(calcClearLabel(s)).toBe("AC");
+    s = calcPress(s, "C");
+    expect(calcClearLabel(s)).toBe("AC"); // reset → still reads AC
+  });
+
+  test("calcFontPx steps the big display down as numbers grow (never up)", () => {
+    expect(calcFontPx("0")).toBe(64);
+    expect(calcFontPx("123456")).toBe(64);
+    expect(calcFontPx("1234567")).toBe(54);
+    expect(calcFontPx("1234567890")).toBe(46);
+    const long = "9".repeat(30);
+    expect(calcFontPx(long)).toBe(23);
   });
 });

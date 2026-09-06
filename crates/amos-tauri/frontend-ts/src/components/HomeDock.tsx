@@ -1,4 +1,4 @@
-import { useRef, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type TouchEvent as ReactTouchEvent } from "react";
 import type { HomeLayout } from "../lib/amosStore";
 import { appIcon, appTitleKey } from "../apps";
 import { AppIconTile } from "./AppIcon";
@@ -8,6 +8,15 @@ import { NOTIF_KEY, SETTINGS_KEY, countForApp, dndActive, normalizeQuick, type N
 import { useStoreValue } from "../lib/useStoreValue";
 import { HomeWidgets } from "./HomeWidgets";
 import type { StoreTile } from "../lib/storeApps";
+import { amosLog, amosWarn } from "../lib/debugLog";
+
+/** Fine-pointer (mouse/trackpad) → allow HTML5 drag-to-reorder. Coarse/touch →
+ *  disable native drag so a horizontal swipe pages the dock instead of dragging.
+ *  Falls back to draggable when matchMedia is unavailable (SSR / happy-dom tests). */
+function finePointerEnabled(): boolean {
+  if (typeof window === "undefined" || !window.matchMedia) return true;
+  return window.matchMedia("(pointer: fine)").matches;
+}
 
 function IconTile({
   id,
@@ -15,6 +24,7 @@ function IconTile({
   label,
   unread,
   pulse,
+  reorderable,
   onClick,
   onDragStart,
   onDragOver,
@@ -26,6 +36,10 @@ function IconTile({
   unread: number;
   /** Brief "launch" highlight when the user picks this app from search. */
   pulse?: boolean;
+  /** HTML5 drag-to-reorder is a fine-pointer (mouse) affordance; touch devices
+   *  keep icons non-draggable so a horizontal swipe pages the dock instead of
+   *  starting a native drag that swallows the touch. */
+  reorderable: boolean;
   onClick: () => void;
   onDragStart: (id: string) => void;
   onDragOver: (e: DragEvent) => void;
@@ -35,12 +49,12 @@ function IconTile({
     <button
       aria-label={label}
       title={label}
-      draggable
+      draggable={reorderable}
       onClick={onClick}
-      onDragStart={(e) => {
+      onDragStart={reorderable ? (e) => {
         onDragStart(id);
         e.dataTransfer?.setData("text/plain", id);
-      }}
+      } : undefined}
       onDragOver={(e) => onDragOver(e)}
       onDrop={(e) => {
         e.preventDefault();
@@ -64,7 +78,7 @@ function IconTile({
           </span>
         )}
       </span>
-      <span className="max-w-full truncate text-[11px] text-neutral-800 transition-colors group-hover:text-accent dark:text-neutral-200">{label}</span>
+      <span className="max-w-full truncate text-xs font-medium text-neutral-800 transition-colors group-hover:text-accent dark:text-neutral-200">{label}</span>
     </button>
   );
 }
@@ -73,6 +87,7 @@ export default function HomeDock({
   layout,
   onOpen,
   onMove,
+  onSearch,
   pulseId,
   ext = [],
 }: {
@@ -80,6 +95,8 @@ export default function HomeDock({
   onOpen: (id: string) => void;
   /** (dragId, overId) after a drop — parent persists with saveLayout. */
   onMove: (dragId: string, overId: string) => void;
+  /** Open Spotlight search (shown as a discreet search pill at the bottom of the grid). */
+  onSearch?: () => void;
   /** Icon to briefly highlight (id) after a soft-launch from search. */
   pulseId?: string | null;
   /** Store-installed (third-party) tiles to render alongside built-ins. */
@@ -91,6 +108,7 @@ export default function HomeDock({
   const notifs = useStoreValue<Notif[]>(NOTIF_KEY, []);
   const quiet = dndActive(normalizeQuick(useStoreValue<unknown>(SETTINGS_KEY, {})));
   const dragId = useRef<string | null>(null);
+  const reorderable = useRef(finePointerEnabled()).current;
 
   const extById = new Map(ext.map((e) => [e.id, e]));
   const extName = (id: string): string | undefined => extById.get(id)?.name;
@@ -132,6 +150,7 @@ export default function HomeDock({
       label={labelOf(id)}
       unread={unreadOf(id)}
       pulse={pulseId === id}
+      reorderable={reorderable}
       onClick={() => openTap(id)}
       onDragStart={handleStart}
       onDragOver={handleDragOver}
@@ -142,12 +161,135 @@ export default function HomeDock({
   const pageIds = layout.page.filter(known);
   const dockIds = layout.dock.filter(known);
 
+  // ---- Main icon grid: horizontal multi-page ----
+  // The home's app icons live on horizontal pages (swipe left/right to page).
+  // HomeWidgets stay fixed above; the bottom dock bar stays a single row below.
+  const GRID_COLS = 4;
+  const GRID_ROWS = 3;
+  const GRID_PER_PAGE = GRID_COLS * GRID_ROWS; // 12 icons per page
+  const gridPages: string[][] = [];
+  for (let i = 0; i < pageIds.length; i += GRID_PER_PAGE) {
+    gridPages.push(pageIds.slice(i, i + GRID_PER_PAGE));
+  }
+  const [gridPage, setGridPage] = useState(0);
+  useEffect(() => {
+    if (gridPage > Math.max(0, gridPages.length - 1)) {
+      setGridPage(Math.max(0, gridPages.length - 1));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gridPages.length]);
+  const shownGrid = gridPages.length ? (gridPages[Math.min(gridPage, gridPages.length - 1)] ?? []) : [];
+  const gridPanX = useRef<number | null>(null);
+  const gridPanned = useRef(false);
+  const onGridStart = (e: ReactTouchEvent<HTMLDivElement>) => {
+    const x = e.touches[0]?.clientX;
+    gridPanX.current = x == null ? null : x;
+    gridPanned.current = false;
+  };
+  const onGridMove = (e: ReactTouchEvent<HTMLDivElement>) => {
+    const x0 = gridPanX.current;
+    if (x0 == null || gridPanned.current || gridPages.length <= 1) return;
+    const x = e.touches[0]?.clientX;
+    if (x == null) return;
+    const dx = x - x0;
+    if (Math.abs(dx) < 48) return;
+    gridPanned.current = true;
+    gridPanX.current = null;
+    dragId.current = "__grid_pan__";
+    window.setTimeout(() => {
+      if (dragId.current === "__grid_pan__") dragId.current = null;
+    }, 300);
+    if (dx < 0) setGridPage((p) => Math.min(p + 1, gridPages.length - 1));
+    else setGridPage((p) => Math.max(p - 1, 0));
+  };
+  const onGridEnd = () => {
+    gridPanX.current = null;
+  };
+
+  // ---- on-device diagnosis for "dock not rendering" ----
+  const reported = useRef(false);
+  const lastEmpty = useRef<boolean | null>(null);
+  useEffect(() => {
+    reported.current = false;
+    lastEmpty.current = null;
+  }, [layout]);
+  if (!reported.current) {
+    reported.current = true;
+    amosLog("dock", "mounted", { gridPages: gridPages.length, pageIds, dockIds });
+  }
+  const emptyNow = dockIds.length === 0;
+  if (emptyNow !== lastEmpty.current) {
+    lastEmpty.current = emptyNow;
+    if (emptyNow) {
+      const dropped = layout.dock.filter((id) => !known(id));
+      amosWarn("dock", "dock icon list is empty", { persistedDock: layout.dock, droppedUnknown: dropped });
+    }
+  }
+
   return (
     <div className="flex h-full flex-col px-4 pb-3">
-      <div className="min-h-0 flex-1 overflow-y-auto py-3">
-        <HomeWidgets onOpen={onOpen} />
-        <div className="mt-4 grid grid-cols-4 gap-y-6">{pageIds.map(renderIcon)}</div>
+      {/* main paged region: a horizontal swipe ANYWHERE in this column (incl. over
+          the clock/weather widgets) pages the icon grid, iOS-home style. */}
+      <div
+        className="flex min-h-0 flex-1 flex-col overflow-hidden"
+        style={{ touchAction: "pan-y" }}
+        onTouchStart={onGridStart}
+        onTouchMove={onGridMove}
+        onTouchEnd={onGridEnd}
+        onTouchCancel={onGridEnd}
+      >
+        {/* fixed widgets header — generous breathing room below the status bar */}
+        <div className="shrink-0 px-1 pt-[48px]">
+          <HomeWidgets onOpen={onOpen} />
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col justify-center">
+          <div className="grid grid-cols-4 place-content-center gap-y-5" data-testid="home-grid">
+            {shownGrid.map(renderIcon)}
+          </div>
+        </div>
+        {gridPages.length > 1 && (
+          <div data-testid="home-dots" className="mt-1 flex items-center justify-center gap-0.5">
+            {gridPages.map((_, i) => {
+              const active = i === Math.min(gridPage, gridPages.length - 1);
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  data-testid="home-dot"
+                  aria-label={`page ${i + 1} of ${gridPages.length}`}
+                  aria-current={active ? "true" : undefined}
+                  onClick={() => setGridPage(Math.min(i, gridPages.length - 1))}
+                  className="grid h-5 min-w-5 cursor-pointer place-items-center transition active:scale-90"
+                >
+                  <span
+                    aria-hidden
+                    className={
+                      "block rounded-full transition-all " +
+                      (active
+                        ? "h-1.5 w-3.5 bg-neutral-500/80 dark:bg-neutral-300/80"
+                        : "h-1.5 w-1.5 bg-neutral-400/40 dark:bg-neutral-600/60")
+                    }
+                  />
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
+
+      {onSearch && (
+        <button
+          type="button"
+          aria-label="search"
+          onClick={onSearch}
+          className="mx-auto mb-1.5 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-white/45 text-sm shadow-sm ring-1 ring-black/5 transition active:scale-90 dark:bg-white/10 dark:ring-white/10"
+        >
+          🔍
+        </button>
+      )}
+
+      {/* bottom dock bar: single fixed row (no paging) */}
       <div className="dock-mag flex items-end justify-around rounded-3xl bg-white/30 px-2 py-3 shadow-inner ring-1 ring-black/5 backdrop-blur-md dark:bg-neutral-900/40 dark:ring-white/10">
         {dockIds.map(renderIcon)}
       </div>

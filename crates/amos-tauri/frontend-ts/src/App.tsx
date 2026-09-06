@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode, type TouchEvent as ReactTouchEvent } from "react";
 import { ThemeProvider } from "./theme";
 import { I18nProvider, useI18n } from "./i18n";
-import { APPS, appTitleKey, AppComponent } from "./apps";
+import { APPS, appTitleKey, AppComponent, svelteEnabled } from "./apps";
 import HomeDock from "./components/HomeDock";
+import SveltePropsHost from "./components/SveltePropsHost";
+import SvelteAppHost from "./components/SvelteAppHost";
+import { amosLog } from "./lib/debugLog";
+import { edgeAtY, pastEdgeThreshold, type Edge } from "./lib/edgeSwipe";
 import { LockScreen, RecentsPanel, SpotlightPanel } from "./components/SystemPanels";
 import NotificationCenter from "./components/NotificationCenter";
 import NotificationBanner from "./components/NotificationBanner";
@@ -11,12 +15,12 @@ import { Backdrop } from "./components/Wallpaper";
 import EditHome from "./components/EditHome";
 import StatusBar from "./components/StatusBar";
 import { getLayout, hydrateFromSystemStore, moveBefore, pushRecent, saveLayout, readStoreValue, writeStoreValue, type HomeLayout } from "./lib/amosStore";
-import { NOTIF_KEY, removeAppNotifs, dndActive, normalizeQuick, SETTINGS_KEY, type Notif } from "./lib/settings";
+import { NOTIF_KEY, removeAppNotifs, type Notif } from "./lib/settings";
 import { zh, type MessageKey } from "./i18n/locales/zh";
 import { isExtId, loadStoreTiles, subscribeStoreTiles, tileById, type StoreTile } from "./lib/storeApps";
 import { useStoreValue } from "./lib/useStoreValue";
 import { bridged, subscribe } from "./lib/backend";
-import { clampAutoOffSec, dueForAutoSleep, setScreenState, AUTOOFF_STORE_KEY } from "./lib/display";
+import { clampAutoOffSec, dueForAutoSleep, setScreenState, AUTOOFF_STORE_KEY, WAKE_HOME_KEY, wakeHomeDue, wakeHomeEnabled } from "./lib/display";
 import { useCallKeepAwake, useScreenHold } from "./lib/keepAwake";
 import { useNotificationAlert } from "./lib/useNotificationAlert";
 import { startLmkSurfaceWatcher, startPeriodicReconcile } from "./lib/lmk";
@@ -26,6 +30,56 @@ import {
   keyActionOf,
   type HardwareAction,
 } from "./lib/systemButtons";
+
+// Dynamic loader for the Svelte home screen (consumed by SveltePropsHost). Kept
+// module-stable so the host mounts it exactly once per identity.
+const loadHomeDock = () => import("./svelte/HomeDock.svelte");
+// The home layout editor is also a controlled screen (shell owns the layout).
+const loadEditHome = () => import("./svelte/EditHome.svelte");
+// Shell-chrome island: StatusBar needs no props — read the same stores as React.
+const loadStatusBar = () => import("./svelte/StatusBar.svelte");
+function StatusBarEntry() {
+  return svelteEnabled() ? (
+    <SvelteAppHost load={loadStatusBar} className="" />
+  ) : (
+    <StatusBar />
+  );
+}
+// Global "notification arrived" toast chrome island (reads NOTIF + DND stores).
+const loadNotificationBanner = () => import("./svelte/NotificationBanner.svelte");
+function NotificationBannerEntry() {
+  return svelteEnabled() ? (
+    <SvelteAppHost load={loadNotificationBanner} className="" />
+  ) : (
+    <NotificationBanner />
+  );
+}
+// Wallpaper backdrop chrome island (pure presentational; reads theme + settings).
+const loadBackdrop = () => import("./svelte/Backdrop.svelte");
+function BackdropEntry() {
+  return svelteEnabled() ? (
+    <SvelteAppHost load={loadBackdrop} className="" />
+  ) : (
+    <Backdrop />
+  );
+}
+// Recents overlay is a CONTROLLED chrome panel (shell owns `open`).
+const loadRecents = () => import("./svelte/RecentsPanel.svelte");
+// Spotlight overlay is CONTROLLED too (shell owns `open`; result = soft-launch).
+const loadSpotlight = () => import("./svelte/SpotlightPanel.svelte");
+// LockScreen is the whole-screen locked surface (emits 'unlock' to the shell).
+const loadLockScreen = () => import("./svelte/LockScreen.svelte");
+// NotificationCenter (control center) is a CONTROLLED overlay.
+const loadNotificationCenter = () => import("./svelte/NotificationCenter.svelte");
+// Incoming call surface is an always-mounted ISLAND driven by telephony events.
+const loadIncomingCall = () => import("./svelte/IncomingCall.svelte");
+function IncomingCallEntry() {
+  return svelteEnabled() ? (
+    <SvelteAppHost load={loadIncomingCall} className="" />
+  ) : (
+    <IncomingCall />
+  );
+}
 
 function HomeIndicator({ onHome }: { onHome: () => void }) {
   const startY = useRef<number | null>(null);
@@ -71,34 +125,59 @@ function HomeIndicator({ onHome }: { onHome: () => void }) {
   );
 }
 
-function AppShell({ title, onBack, children }: { title: string; onBack: () => void; children: ReactNode }) {
-  // Pull down from the top edge of an app to close it and return home (iPhone-like).
-  const closeY = useRef<number | null>(null);
-  const closeStart = (e: ReactTouchEvent<HTMLDivElement>) => {
+function AppShell({
+  title,
+  onBack,
+  onNotify,
+  children,
+}: {
+  title: string;
+  onBack: () => void;
+  /** Pull DOWN from the top of an app → open quick settings (notification center). */
+  onNotify?: () => void;
+  children: ReactNode;
+}) {
+  // Edge gestures: pull UP from the bottom edge → return to the home/dock screen;
+  // pull DOWN from the top edge → open quick settings (handled by [onNotify]). Only
+  // a drag that starts in the thin top/bottom edge zone counts (lib/edgeSwipe.ts),
+  // so it doesn't fight scrolling inside the app content. The bottom edge is the
+  // whole home-indicator strip (not just the small pill) so a bottom-up reliably
+  // gets you back to the dock.
+  const grabRef = useRef<{ edge: Edge; y: number } | null>(null);
+  const firedRef = useRef(false);
+  const grabStart = (e: ReactTouchEvent<HTMLDivElement>) => {
     const y = e.touches[0]?.clientY;
-    if (y != null && y <= 120) closeY.current = y;
+    if (y == null) return;
+    const h = e.currentTarget.clientHeight || window.innerHeight;
+    const edge = edgeAtY(y, h);
+    if (!edge) return;
+    grabRef.current = { edge, y };
+    firedRef.current = false;
   };
-  const closeMove = (e: ReactTouchEvent<HTMLDivElement>) => {
-    const sy = closeY.current;
-    if (sy == null) return;
+  const grabMove = (e: ReactTouchEvent<HTMLDivElement>) => {
+    const g = grabRef.current;
+    if (!g || firedRef.current) return;
     const y = e.touches[0]?.clientY;
-    if (y != null && y - sy > 70) {
-      closeY.current = null;
-      onBack();
+    if (y == null) return;
+    if (pastEdgeThreshold(g.edge, g.y, y)) {
+      firedRef.current = true;
+      grabRef.current = null;
+      if (g.edge === "top") onNotify?.();
+      else onBack();
     }
   };
-  const closeEnd = () => {
-    closeY.current = null;
+  const grabEnd = () => {
+    grabRef.current = null;
   };
   return (
     <div
       className="app-enter flex h-full flex-col bg-neutral-100 dark:bg-neutral-950"
-      onTouchStart={closeStart}
-      onTouchMove={closeMove}
-      onTouchEnd={closeEnd}
-      onTouchCancel={closeEnd}
+      onTouchStart={grabStart}
+      onTouchMove={grabMove}
+      onTouchEnd={grabEnd}
+      onTouchCancel={grabEnd}
     >
-      <StatusBar />
+      <StatusBarEntry />
       <header className="flex items-center gap-2 border-b border-neutral-200/70 bg-white/50 px-3 py-2 backdrop-blur-md dark:border-neutral-800 dark:bg-white/5">
         <button onClick={onBack} aria-label="back" className="w-6 text-accent text-sm font-semibold hover:underline">
           ‹
@@ -108,59 +187,6 @@ function AppShell({ title, onBack, children }: { title: string; onBack: () => vo
       </header>
       <main className="min-h-0 flex-1 overflow-auto">{children}</main>
       <HomeIndicator onHome={onBack} />
-    </div>
-  );
-}
-function TopBar({
-  onLock,
-  onRecents,
-  onSearch,
-  onNotify,
-  onEdit,
-}: {
-  onLock: () => void;
-  onRecents: () => void;
-  onSearch: () => void;
-  onNotify: () => void;
-  onEdit: () => void;
-}) {
-  const btn =
-    "grid h-9 w-9 place-items-center rounded-full bg-white/45 text-sm shadow-sm ring-1 ring-black/5 backdrop-blur-md transition active:scale-90 dark:bg-white/10 dark:ring-white/10";
-  // Unread notification count on the bell (hidden while Do-Not-Disturb is on),
-  // reactive so it updates live as notifications change.
-  const notifs = useStoreValue<Notif[]>(NOTIF_KEY, []);
-  const unread = dndActive(normalizeQuick(useStoreValue<unknown>(SETTINGS_KEY, {})))
-    ? 0
-    : notifs.length;
-  const badge = unread > 0 ? (unread > 99 ? "99+" : String(unread)) : null;
-  return (
-    <div className="flex items-center justify-between px-4 pt-2">
-      <div className="flex gap-2">
-        <button onClick={onNotify} aria-label="notifications" className={btn} title="notifications">
-          <span className="relative">
-            🔔
-            {badge && (
-              <span className="absolute -right-2.5 -top-1.5 grid min-w-[16px] place-items-center rounded-full bg-danger px-1 text-[10px] font-bold text-white ring-2 ring-white dark:ring-neutral-900">
-                {badge}
-              </span>
-            )}
-          </span>
-        </button>
-        <button onClick={onRecents} aria-label="recents" className={btn} title="recents">
-          ⇤
-        </button>
-        <button onClick={onSearch} aria-label="search" className={btn} title="search">
-          🔍
-        </button>
-      </div>
-      <div className="flex gap-2">
-        <button onClick={onEdit} aria-label="edit home" className={btn} title="edit home">
-          ✎
-        </button>
-        <button onClick={onLock} aria-label="lock" className={btn} title="lock">
-          🔒
-        </button>
-      </div>
     </div>
   );
 }
@@ -244,7 +270,47 @@ function Shell() {
     closeAll();
     setActive(null);
   };
+  // Keep a fresh handle so the resume listener below always calls the latest goHome.
+  const goHomeRef = useRef(goHome);
+  goHomeRef.current = goHome;
+  // Latest "wake → home" policy for the (mount-once) resume listener.
+  const wakeHomeRef = useRef(true);
   const back = () => goHome("app-back");
+
+  // Physical screen-on / app-resume policy: when the app returns from a *real*
+  // background (power-button wake, screen on) → show the dock home page, mirroring
+  // the in-app unlock→home behavior. Only an absence of at least WAKE_HOME_MIN_MS
+  // counts as a wake — transient focus losses (a system permission dialog, a quick
+  // notification-shade peek, an in-app blur) are ignored so the user isn't yanked
+  // back to the dock. Gated by the wakeHome setting and never bypasses our own
+  // LockScreen (that path goes through handleUnlock).
+  useEffect(() => {
+    let leaveAt: number | null = null;
+    const leaving = () => {
+      if (leaveAt == null) leaveAt = Date.now();
+    };
+    const arriving = () => {
+      const start = leaveAt;
+      leaveAt = null;
+      // Only a *real* wake (away >= WAKE_HOME_MIN_MS) returns to the dock.
+      if (!wakeHomeDue(start, Date.now())) return;
+      if (wakeHomeRef.current) goHomeRef.current("resume");
+    };
+    const onVis = () => {
+      if (document.visibilityState === "hidden") leaving();
+      else arriving();
+    };
+    const onBlur = () => leaving();
+    const onFocus = () => arriving();
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
 
   // Clean up the pulse timer if the shell unmounts.
   useEffect(() => {
@@ -253,6 +319,15 @@ function Shell() {
       if (t) window.clearTimeout(t);
     };
   }, []);
+
+  // Log which visible surface the shell is showing whenever it changes. The home
+  // screen (HomeDock, incl. the dock pill) only renders when NOT locked / NOT in
+  // an app / NOT in edit mode — so this pinpoints an on-device "dock missing"
+  // (stuck on lock/app/edit) in adb logcat.
+  useEffect(() => {
+    const where = locked ? "lock" : active ? `app:${active}` : editMode ? "edit" : "home";
+    amosLog("shell", `surface=${where}`, { locked, active, editMode });
+  }, [locked, active, editMode]);
 
   // Global notification-arrival alert (vibrate + ring per effective sound policy),
   // mounted once so it fires on every screen — home, inside an app, even locked.
@@ -276,19 +351,34 @@ function Shell() {
     pulseTimer.current = window.setTimeout(() => setLaunchPulse(null), 1200);
   };
 
-  // Pull down from the top of the home screen to open the notification center.
-  const pullRef = useRef<{ y: number } | null>(null);
+  // Edge gestures on the home screen: pull DOWN from the top edge → notification
+  // center / quick settings (flashlight, airplane mode, …). Pulling UP from the
+  // bottom on the home screen intentionally does nothing — the dock/home is
+  // already in view and must never be covered by an overlay (Recents stays
+  // reachable from the ⇤ TopBar / app surface). Pure logic in lib/edgeSwipe.ts.
+  const pullRef = useRef<{ edge: Edge; y: number } | null>(null);
+  const edgeFired = useRef(false);
   const pullStart = (e: ReactTouchEvent<HTMLDivElement>) => {
-    if (locked || active || editMode || ncOpen || recentsOpen || spotOpen) return;
+    if (locked || active || editMode || ncOpen || recentsOpen || spotOpen) {
+      pullRef.current = null;
+      return;
+    }
     const y = e.touches[0]?.clientY;
-    if (y != null && y <= 110) pullRef.current = { y };
+    if (y == null) return;
+    const edge = edgeAtY(y, window.innerHeight);
+    if (!edge) return;
+    pullRef.current = { edge, y };
+    edgeFired.current = false;
   };
   const pullMove = (e: ReactTouchEvent<HTMLDivElement>) => {
     const s = pullRef.current;
-    if (!s) return;
+    if (!s || edgeFired.current || s.edge !== "top") return;
     const y = e.touches[0]?.clientY;
-    if (y != null && y - s.y > 70) {
+    if (y == null) return;
+    if (pastEdgeThreshold(s.edge, s.y, y)) {
+      edgeFired.current = true;
       pullRef.current = null;
+      closeAll();
       setNcOpen(true);
     }
   };
@@ -321,6 +411,13 @@ function Shell() {
   // watcher without a remount — not a one-shot read.
   const autoOffRaw = useStoreValue<unknown>(AUTOOFF_STORE_KEY, 0);
   const autoOffSec = clampAutoOffSec(autoOffRaw);
+  // Reactive "wake → home" preference (Settings → General). When ON, unlocking or
+  // returning to the foreground lands on the dock home page. Live so a Settings
+  // toggle takes effect without remounting.
+  const wakeHomeRaw = useStoreValue<unknown>(WAKE_HOME_KEY, true);
+  const wakeHomeOn = wakeHomeEnabled(wakeHomeRaw);
+  wakeHomeRef.current = wakeHomeOn;
+
   // Single screen-off entry used by the TopBar lock button AND the idle watcher,
   // so both paths report one consistent state to the daemon.
   const lockScreen = () => {
@@ -330,6 +427,11 @@ function Shell() {
   const handleUnlock = () => {
     setLocked(false);
     void setScreenState(true);
+    // "Screen on" policy: whenever the display comes back on (manual 🔒 unlock or
+    // waking from auto screen-off), return to the home/dock page — don't resume a
+    // background app or leave an overlay up. goHome clears active + closes sheets.
+    // Gated by the wakeHome setting (default ON).
+    if (wakeHomeOn) goHome("unlock");
   };
   const lastActivityRef = useRef(Date.now());
   // Keep-awake reasons: an active call (today) or a future nav/video session
@@ -433,20 +535,140 @@ function Shell() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  if (locked) return <LockScreen onUnlock={handleUnlock} />;
+  // Actions from the Svelte Recents overlay (channel "recents"): opening an app
+  // reuses the shell's `open` (which also clears overlays); 'close' closes it.
+  const handleRecentsEvent = (event: string, detail: unknown): void => {
+    if (event === "open" && typeof detail === "string") open(detail);
+    else if (event === "close") setRecentsOpen(false);
+  };
+  // Spotlight choosing an app = soft-launch (pulse its icon on home, stay home).
+  const handleSpotlightEvent = (event: string, detail: unknown): void => {
+    if (event === "open" && typeof detail === "string") softLaunch(detail);
+    else if (event === "close") setSpotOpen(false);
+  };
+  // Control-center actions + close from the Svelte NotificationCenter.
+  const handleNcEvent = (event: string, _detail: unknown): void => {
+    if (event === "close") setNcOpen(false);
+    else if (event === "search") setSpotOpen(true);
+    else if (event === "recents") setRecentsOpen(true);
+    else if (event === "edit") setEditMode(true);
+    else if (event === "lock") lockScreen();
+  };
+
+  // System sheets (quick settings / recents / spotlight) render above BOTH the home
+  // screen and an open app, so pull-down (quick settings) works from any surface.
+  const sheets = (
+    <>
+      {svelteEnabled() ? (
+        <SveltePropsHost
+          name="nc"
+          load={loadNotificationCenter}
+          props={{ open: ncOpen }}
+          onEvent={handleNcEvent}
+          className=""
+        />
+      ) : (
+        <NotificationCenter
+          open={ncOpen}
+          onClose={() => setNcOpen(false)}
+          onSearch={() => setSpotOpen(true)}
+          onRecents={() => setRecentsOpen(true)}
+          onEdit={() => setEditMode(true)}
+          onLock={lockScreen}
+        />
+      )}
+      {svelteEnabled() ? (
+        <SveltePropsHost
+          name="recents"
+          load={loadRecents}
+          props={{ open: recentsOpen }}
+          onEvent={handleRecentsEvent}
+          className=""
+        />
+      ) : (
+        <RecentsPanel open={recentsOpen} onClose={() => setRecentsOpen(false)} onOpen={open} />
+      )}
+      {svelteEnabled() ? (
+        <SveltePropsHost
+          name="spotlight"
+          load={loadSpotlight}
+          props={{ open: spotOpen }}
+          onEvent={handleSpotlightEvent}
+          className=""
+        />
+      ) : (
+        <SpotlightPanel open={spotOpen} onClose={() => setSpotOpen(false)} onOpen={softLaunch} />
+      )}
+    </>
+  );
+
+  // Actions emitted by the Svelte home screen (bridged over the "home" propsBus
+  // channel by SveltePropsHost). The React shell stays the single owner of
+  // navigation + the home layout, exactly as it is for the React HomeDock.
+  const handleHomeEvent = (event: string, detail: unknown): void => {
+    if (event === "open") {
+      if (typeof detail === "string") open(detail);
+    } else if (event === "move") {
+      const d = detail as { drag: string; over: string };
+      setLayout((prev) => {
+        const next = moveBefore(prev, d.drag, d.over);
+        saveLayout(next);
+        return next;
+      });
+    } else if (event === "search") {
+      setSpotOpen(true);
+    }
+  };
+
+  // Actions from the Svelte EditHome (controlled over the "editHome" channel):
+  // it reports the NEXT layout it computed (via hideFromHome/restoreToHome) and
+  // the shell persists it; "done" leaves edit mode. Same ownership split as home.
+  const handleEditHomeEvent = (event: string, detail: unknown): void => {
+    if (event === "change") {
+      const l = detail as HomeLayout;
+      setLayout(l);
+      saveLayout(l);
+    } else if (event === "done") {
+      setEditMode(false);
+    }
+  };
+
+  if (locked)
+    return svelteEnabled() ? (
+      <SveltePropsHost
+        name="lock"
+        load={loadLockScreen}
+        props={{}}
+        onEvent={(event) => {
+          if (event === "unlock") handleUnlock();
+        }}
+      />
+    ) : (
+      <LockScreen onUnlock={handleUnlock} />
+    );
 
   if (active) {
     const key = appTitleKey(active);
     const title = key ? t(key) : ext.find((x) => x.id === active)?.name ?? active;
     return (
-      <AppShell key={active} title={title} onBack={back}>
-        <AppComponent id={active} />
-      </AppShell>
+      <>
+        <AppShell key={active} title={title} onBack={back} onNotify={() => setNcOpen(true)}>
+          <AppComponent id={active} />
+        </AppShell>
+        {sheets}
+      </>
     );
   }
 
   if (editMode)
-    return (
+    return svelteEnabled() ? (
+      <SveltePropsHost
+        name="editHome"
+        load={loadEditHome}
+        props={{ layout }}
+        onEvent={handleEditHomeEvent}
+      />
+    ) : (
       <EditHome
         layout={layout}
         onChange={(l) => {
@@ -465,32 +687,33 @@ function Shell() {
       onTouchEnd={pullEnd}
       onTouchCancel={pullEnd}
     >
-      <StatusBar />
-      <TopBar
-        onLock={lockScreen}
-        onRecents={() => setRecentsOpen(true)}
-        onSearch={() => setSpotOpen(true)}
-        onNotify={() => setNcOpen(true)}
-        onEdit={() => setEditMode(true)}
-      />
+      <StatusBarEntry />
       <div className="min-h-0 flex-1">
-        <HomeDock
-          layout={layout}
-          ext={ext}
-          onOpen={open}
-          pulseId={launchPulse}
-          onMove={(drag, over) =>
-            setLayout((prev) => {
-              const next = moveBefore(prev, drag, over);
-              saveLayout(next);
-              return next;
-            })
-          }
-        />
+        {svelteEnabled() ? (
+          <SveltePropsHost
+            name="home"
+            load={loadHomeDock}
+            props={{ layout, ext, pulseId: launchPulse }}
+            onEvent={handleHomeEvent}
+          />
+        ) : (
+          <HomeDock
+            layout={layout}
+            ext={ext}
+            onOpen={open}
+            onSearch={() => setSpotOpen(true)}
+            pulseId={launchPulse}
+            onMove={(drag, over) =>
+              setLayout((prev) => {
+                const next = moveBefore(prev, drag, over);
+                saveLayout(next);
+                return next;
+              })
+            }
+          />
+        )}
       </div>
-      <NotificationCenter open={ncOpen} onClose={() => setNcOpen(false)} />
-      <RecentsPanel open={recentsOpen} onClose={() => setRecentsOpen(false)} onOpen={open} />
-      <SpotlightPanel open={spotOpen} onClose={() => setSpotOpen(false)} onOpen={softLaunch} />
+      {sheets}
     </div>
   );
 }
@@ -501,14 +724,14 @@ export default function App() {
       <I18nProvider>
         <div className="flex h-full w-full items-center justify-center overflow-hidden bg-neutral-300/60 sm:py-5 dark:bg-neutral-950">
           <div className="relative h-full w-full max-w-[400px] overflow-hidden bg-neutral-100 shadow-2xl ring-1 ring-black/10 sm:h-[min(93vh,860px)] sm:rounded-[46px] dark:bg-black dark:ring-white/10">
-            <Backdrop />
+            <BackdropEntry />
             <div className="relative z-10 h-full">
               <Shell />
             </div>
             {/* Global arrival toast, layered above every screen (home/app/lock). */}
-            <NotificationBanner />
+            <NotificationBannerEntry />
             {/* Incoming-call surface: Ringing → Answer/Decline; Active → record + hang up. */}
-            <IncomingCall />
+            <IncomingCallEntry />
           </div>
         </div>
       </I18nProvider>

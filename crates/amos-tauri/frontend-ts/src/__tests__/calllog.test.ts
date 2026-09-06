@@ -103,3 +103,19 @@ describe("calllog", () => {
     expect(frequentNumbers(list, 1)).toHaveLength(1); // counted once as a group
   });
 });
+
+  test("logNameFor resolves +CC and bare local forms of the same number to one name", () => {
+    const mk = (number: string, name?: string, ts = 0): CallRecord => ({ number, name, ts });
+    const list = [
+      mk("13800000001", "Alice", 3),
+      mk("+86 13800000001", undefined, 2),
+      mk("13900000002", "Bob", 1),
+    ];
+    // bare lookup finds the name stored on the +CC form (and vice-versa)
+    expect(logNameFor(list, "+86 13800000001")).toBe("Alice");
+    expect(logNameFor(list, "13800000001")).toBe("Alice");
+    expect(logNameFor(list, "13900000002")).toBe("Bob");
+    expect(logNameFor(list, "999")).toBeUndefined();
+    expect(logNameFor(list, "")).toBeUndefined();
+  });
+

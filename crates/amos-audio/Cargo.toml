@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+build = "build.rs"
 description = "Amos hardware audio: AOSP-near audio-HAL abstraction (capture/playback traits + 16 kHz PCM wire spec), sample-rate resampling, deterministic mocks for tests/dev, and target_os-gated direct TinyALSA / AAudio FFI seams for the on-device pipeline (mic -> local ASR, call-audio interception)."
 
 [lib]

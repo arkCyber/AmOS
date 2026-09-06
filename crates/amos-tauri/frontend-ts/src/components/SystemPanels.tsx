@@ -8,12 +8,25 @@ import { useFocusTrap } from "../lib/useFocusTrap";
 import { APPS, appIcon, appTitleKey } from "../apps";
 import { AppIconTile } from "./AppIcon";
 import { fmtClock } from "../lib/time";
+import { isCustomWallpaper, WALLPAPER_FILES } from "../lib/wallpaper";
 
 /* ---- Lock screen ---- */
 export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
   const { t, locale } = useI18n();
+  const dark =
+    typeof document !== "undefined" && !!document.documentElement?.classList?.contains("dark");
   const cfg = readStoreValue<{ enabled?: boolean; pin?: string }>("amos.lock", {});
   const needPin = !!cfg.enabled && !!cfg.pin;
+  // Optional lock-screen background image, configured in Settings ("后台").
+  const prefs = readStoreValue<{ lockWallpaper?: string }>("amos.settings", {});
+  const lockWall = prefs.lockWallpaper;
+  let lockBgUrl: string | null = null;
+  if (lockWall) {
+    const f = isCustomWallpaper(lockWall)
+      ? lockWall
+      : (WALLPAPER_FILES[lockWall] ?? (dark ? "dark" : "light"));
+    lockBgUrl = isCustomWallpaper(f) ? f : `wallpapers/${f}`;
+  }
   const [pin, setPin] = useState("");
   const [bad, setBad] = useState(false);
   const [emergency, setEmergency] = useState(false);
@@ -69,8 +82,18 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
       aria-modal="true"
       aria-label={t("shell.lockTitle")}
       ref={rootRef}
-      className="fade-in absolute inset-0 z-50 flex flex-col items-center justify-center bg-neutral-900/75 px-6 text-neutral-50 backdrop-blur-2xl"
+      className={
+        "fade-in absolute inset-0 z-50 flex flex-col items-center justify-center overflow-hidden px-6 text-neutral-50 " +
+        (lockBgUrl ? "" : "bg-neutral-900/75 backdrop-blur-2xl")
+      }
     >
+      {lockBgUrl && (
+        <>
+          <div aria-hidden className="absolute inset-0 bg-cover bg-center" style={{ backgroundImage: `url(${lockBgUrl})` }} />
+          <div aria-hidden className="absolute inset-0 bg-black/35" />
+        </>
+      )}
+      <div className="relative z-10 flex w-full flex-col items-center">
       <div className="text-center leading-none">
         <div className="text-7xl font-thin tabular-nums tracking-tight">{fmtClock(now)}</div>
         <div className="mt-2.5 text-lg text-neutral-200">{date}</div>
@@ -132,6 +155,7 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
           {t("shell.emergencyUnreachable")}
         </p>
       )}
+      </div>
     </div>
   );
 }
@@ -192,7 +216,16 @@ export function SpotlightPanel({ open, onClose, onOpen }: { open: boolean; onClo
   const { t } = useI18n();
   const [q, setQ] = useState("");
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
   useFocusTrap(open, rootRef, onClose);
+  // Ensure the search field actually has focus (summons the on-screen keyboard on
+  // device). A plain `autoFocus` is not enough here because the opening tap keeps
+  // focus on the tapped button, so we focus once the sheet is mounted.
+  useEffect(() => {
+    if (!open) return;
+    const id = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(id);
+  }, [open]);
   if (!open) return null;
   const needle = q.trim().toLowerCase();
   const hits = needle
@@ -213,6 +246,7 @@ export function SpotlightPanel({ open, onClose, onOpen }: { open: boolean; onClo
         </button>
       </div>
       <input
+        ref={inputRef}
         autoFocus
         value={q}
         onChange={(e) => setQ(e.target.value)}

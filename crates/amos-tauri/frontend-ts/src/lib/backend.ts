@@ -647,3 +647,19 @@ export async function storeBundleUri(uri: string): Promise<BundleResource | null
 }
 
 
+
+/* ---- Notes export: write a .txt via the Rust core ---- */
+
+export interface ExportedTxtFile {
+  name: string;
+  path: string;
+  bytes: number;
+}
+
+/** Ask the Rust core to write `text` to a `<name>.txt` file in its export dir and
+ *  return the on-disk path. Outside Tauri (or when the command is unavailable)
+ *  this returns null so the UI can fall back to copying to the AmOS clipboard. */
+export async function exportTxtFile(name: string, text: string): Promise<ExportedTxtFile | null> {
+  return invoke<ExportedTxtFile>("notes_export_txt", { name, text });
+}
+

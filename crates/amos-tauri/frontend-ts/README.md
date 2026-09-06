@@ -45,6 +45,39 @@ npm test             # vitest run
 npm run build        # vite build → dist/
 ```
 
+## Svelte 5 pilot (React → Svelte migration scaffold)
+
+The calculator and the weather app are piloted in Svelte 5 (runes) to validate a
+compiled, no-virtual-DOM UI inside the existing React shell — aimed at leaner
+bundles and better frame budgets on low-end/WebView targets. See
+**`SVELTE5_PILOT.md`** for the full write-up (architecture, gates, and how the
+swap is turned on/off), and **`SVELTE_MIGRATION_DATA.md`** for measured
+bundle-size data (`npm run bundle:report`) + the on-device frame-rate A/B runbook.
+
+TL;DR of the seam:
+- `src/svelte/CalculatorApp.svelte` + `WeatherApp.svelte` + `ContactsApp.svelte` +
+  `PermissionsApp.svelte` — React-free Svelte 5 ports reusing the SAME pure libs
+  (`lib/calculator.ts`, `lib/weather.ts`, `lib/contacts.ts`, `lib/permissions.ts`).
+- `src/svelte/` infra — reactive i18n singleton (`locale.svelte.ts`), reactive
+  theme (`theme.svelte.ts`), persisted store (`store.ts`, used by Calculator +
+  Contacts for history/call-log).
+- `src/components/SvelteAppHost.tsx` — generic React host that `mount()`s a
+  Svelte app (dynamic import) and keeps Svelte i18n in sync with the shell.
+- `src/apps.tsx` → `CalculatorEntry`/`WeatherEntry`/`ContactsEntry` route
+  **production builds to Svelte** and keep the React versions for `vite dev` +
+  the bun suite (which has no `.svelte` loader). Dev can preview Svelte via
+  `localStorage.setItem("amos.ui.svelteCalc","1")`.
+
+New commands (Svelte-specific; the rest of the repo still tests under bun):
+
+```bash
+npm run typecheck:svelte  # svelte-check --tsconfig ./tsconfig.json
+npm run test:svelte       # vitest run (DOM tests for .svelte, in svelte-tests/)
+bun run smoke:ui          # local UI smoke (bun): build + vite preview + headless Chrome asserts the Svelte home renders (exit 0/1; scripts/smoke-ui.mjs)
+bun run smoke:ui --skip-build   # reuse an existing build
+UI_SMOKE_STRICT=1 bun run smoke:ui # also require bespoke <svg> tile art
+```
+
 ## Wires to Tauri (do AFTER feature parity)
 
 In `crates/amos-tauri/tauri.conf.json` point the shell at this package and add

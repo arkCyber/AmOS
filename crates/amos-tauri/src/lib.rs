@@ -28,6 +28,7 @@ pub mod flashlight;
 pub mod incall;
 pub mod interpret;
 pub mod mail;
+pub mod note_export;
 pub mod privacy_client;
 pub mod radio;
 pub mod real_dial;
@@ -135,6 +136,7 @@ pub fn run() {
             store::store_set,
             store::store_remove,
             store::store_snapshot,
+            note_export::notes_export_txt,
             translate::transcribe_audio,
             translate::translate_text,
             interpret::interpret_start,

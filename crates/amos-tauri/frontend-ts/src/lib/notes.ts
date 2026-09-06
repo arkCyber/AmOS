@@ -148,6 +148,42 @@ export function editNote(list: Note[], id: string, text: string, now: number): N
   return list.map((n) => (n.id === id ? { ...n, text: v, ts: now } : n));
 }
 
+/* ---- Batch operations (multi-select: archive / restore / trash / delete / pin) ---- */
+
+/** Move many notes to a lifecycle bucket: \"archived\", \"trash\", or back to active
+ *  (`undefined`). Only notes whose id is in `ids` are touched; others unchanged. */
+export function setManyState(
+  list: Note[],
+  ids: readonly string[],
+  state: "archived" | "trash" | undefined,
+): Note[] {
+  const set = new Set(ids);
+  if (set.size === 0) return list;
+  return list.map((n) =>
+    set.has(n.id) ? { ...n, ...(state ? { state } : { state: undefined }) } : n,
+  );
+}
+
+/** Pin (move to top) or unpin every note in `ids`. Pinning reorders so the pinned
+ *  group floats above the rest (stable within each group). Unpinning just clears
+ *  the star and keeps positions. */
+export function setPinned(list: Note[], ids: readonly string[], on: boolean): Note[] {
+  const set = new Set(ids);
+  if (set.size === 0) return list;
+  const changed = list.map((n) =>
+    set.has(n.id) ? { ...n, pinned: on ? true : undefined } : n,
+  );
+  return on ? orderPinned(changed) : changed;
+}
+
+/** Remove every note whose id is in `ids` (hard delete, e.g. from the trash). */
+export function removeMany(list: Note[], ids: readonly string[]): Note[] {
+  const set = new Set(ids);
+  if (set.size === 0) return list;
+  return list.filter((n) => !set.has(n.id));
+}
+
+
 export function fmtTime(ts: number): string {
   return new Date(ts).toLocaleString();
 }
@@ -253,7 +289,49 @@ export function noteListProgress(list: Note[]): { notes: number; total: number; 
   return { notes, total, done };
 }
 
-/* ---- Light inline rich text: **bold**, ==highlight==, ~~strike~~, [link](url) ---- */
+/* ---- Hashtags: collect / match / filter ---- */
+// A tag token: `#` followed by a word char, then word chars / `-`. A word char is
+// any letter/number/underscore incl. CJK. Negative lookbehind avoids matching
+// `abc#tag` mid-word (and a second `#`); end excludes `-` so `#work-day` stays one.
+const TAG_RE = /(?<![\p{L}\p{N}_])#([\p{L}\p{N}_][\p{L}\p{N}_-]*)/gu;
+const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Unique tags (without the leading `#`) in order of first appearance. Matching
+ *  is case-insensitive so `#Work` and `#work` count as one; the first written
+ *  form is kept for display. */
+export function tagsOf(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  TAG_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TAG_RE.exec(text)) !== null) {
+    const key = m[1]!.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(m[1]!);
+    }
+  }
+  return out;
+}
+
+/** True when `text` contains the tag `tag` as a real token (case-insensitive,
+ *  not a substring of another word). */
+export function hasTag(text: string, tag: string): boolean {
+  const want = tag.replace(/^#/, "").trim().toLowerCase();
+  if (!want) return false;
+  const re = new RegExp(
+    `(?<![\\p{L}\\p{N}_])#${escRe(want)}(?![\\p{L}\\p{N}_-])`,
+    "iu",
+  );
+  return re.test(text);
+}
+
+/** Keep only notes that carry the given tag. */
+export function filterByTag(list: Note[], tag: string): Note[] {
+  return list.filter((n) => hasTag(n.text, tag));
+}
+
+/* ---- Light inline rich text: **bold**, ==highlight==, ~~strike~~, [link](url), #tag ---- */
 export interface RichSeg {
   text: string;
   bold: boolean;
@@ -262,13 +340,30 @@ export interface RichSeg {
   /** Present only for a `[text](url)` segment. */
   url?: string;
   link?: boolean;
+  /** Present only for a `#tag` segment (text includes the leading `#`). */
+  tag?: boolean;
 }
 
 const PLAIN_SEG = (text: string): RichSeg => ({ text, bold: false, hl: false, strike: false });
 
-/** Split a note body into plain / bold / highlighted / struck / link segments.
- * Text not wrapped in markers stays plain; the original text is kept verbatim
- * (newlines included). Pure + headless-testable. */
+/** Split plain text into plain + `#tag` segments (tags render in accent color). */
+function splitTagged(text: string): RichSeg[] {
+  const out: RichSeg[] = [];
+  const re = /(?<![\p{L}\p{N}_])#[\p{L}\p{N}_][\p{L}\p{N}_-]*/gu;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(PLAIN_SEG(text.slice(last, m.index)));
+    out.push({ text: m[0], bold: false, hl: false, strike: false, tag: true });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(PLAIN_SEG(text.slice(last)));
+  return out;
+}
+
+/** Split a note body into plain / bold / highlighted / struck / link / hashtag
+ * segments. Text not wrapped in markers stays plain; the original text is kept
+ * verbatim (newlines included). Pure + headless-testable. */
 export function fmtInline(text: string): RichSeg[] {
   const out: RichSeg[] = [];
   const re =
@@ -298,5 +393,37 @@ export function fmtInline(text: string): RichSeg[] {
     last = m.index + raw.length;
   }
   if (last < text.length) out.push(PLAIN_SEG(text.slice(last)));
-  return out;
+  // Second pass: split tags out of any plain segment (never inside bold/highlight/
+  // strike/link spans, so nesting is preserved).
+  const final: RichSeg[] = [];
+  for (const s of out) {
+    if (!s.bold && !s.hl && !s.strike && !s.link) final.push(...splitTagged(s.text));
+    else final.push(s);
+  }
+  return final;
 }
+/* ---- Export / share to .txt ---- */
+
+const pad2 = (x: number) => String(x).padStart(2, "0");
+
+/** A human-friendly `备忘录-<yyyyMMdd-HHmm>.txt` basename (no extension) safe for
+ *  filesystems. Pure + testable. */
+export function exportBaseName(now: Date): string {
+  const d = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+  const t = `${pad2(now.getHours())}${pad2(now.getMinutes())}`;
+  return `备忘录-${d}-${t}`;
+}
+
+/** Plain-text rendering of one or more notes for a `.txt` export: each note gets
+ *  a `标题\n时间\n\n正文` block, blocks separated by a horizontal rule. Keeps the
+ *  raw body verbatim (markers/checklists/#tags left as written). */
+export function noteExportText(list: Note[]): string {
+  return list
+    .map((n) => {
+      const stamp = new Date(n.ts).toLocaleString();
+      const title = noteTitle(n.text) || "(无标题)";
+      return `${title}\n${stamp}\n\n${n.text}`;
+    })
+    .join("\n\n----\n\n");
+}
+

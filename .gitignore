@@ -86,3 +86,8 @@ target/
 
 # rustc internal-compiler-error dumps (do not commit)
 rustc-ice-*.txt
+
+# local render-check preview artifacts (regenerated via vite build; never commit)
+crates/amos-tauri/frontend-ts/amos_*_preview.html
+crates/amos-tauri/frontend-ts/amos_*_preview.png
+crates/amos-tauri/frontend-ts/preview6.js

@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { AMOS_THEME_CHANGED_EVENT } from "../svelte/ui-events";
 
 export type ThemeMode = "light" | "dark" | "auto";
 export const THEME_KEY = "amos-ui.theme";
@@ -85,6 +86,17 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const onChange = (e: MediaQueryListEvent) => setOsDark(e.matches);
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  // A Svelte screen (e.g. the Svelte Settings screen) can switch the theme by
+  // writing amos-ui.theme; re-sync this context live so React screens follow.
+  useEffect(() => {
+    const onChanged = (e: Event) => {
+      const m = (e as CustomEvent<string>).detail;
+      if (isThemeMode(m)) setModeState(m);
+    };
+    window.addEventListener(AMOS_THEME_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(AMOS_THEME_CHANGED_EVENT, onChanged);
   }, []);
 
   const dark = resolveDark(mode, new Date().getHours(), osDark);

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { batteryPercent, fmtClock, zoneClock, stopwatchReducer, stopwatchInit, fmtStopwatch, timerReducer, timerInit, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, alarmKey, dayAllowed, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, WORLD_CITY_MAX, defaultWorldCities, lapDeltas, fastestLap, type Alarm } from "../lib/time";
-
 describe("time / status bar", () => {
   test("fmtClock pads hours/minutes", () => {
     expect(fmtClock(new Date(2024, 0, 1, 9, 5))).toBe("09:05");
@@ -269,3 +268,37 @@ describe("time / status bar", () => {
     expect(fastestLap([7000])).toBe(0); // single lap is trivially fastest
   });
 });
+
+describe("alarmsReducer add — repeat sanitization (bug: invalid day numbers leaked in-session)", () => {
+  test("drops non-integer / out-of-range repeat days, matching normalizeAlarms", () => {
+    let s = alarmInit();
+    s = alarmsReducer(s, {
+      type: "add",
+      hour: 8,
+      min: 0,
+      label: "",
+      repeat: [2.5, -1, 8, 3, 0, 3],
+    });
+    const al = s.list[0]!;
+    expect(al.repeat).toEqual([0, 3]); // deduped, sorted, only integer 0..6
+  });
+
+  test("an all-invalid repeat list falls back to 'every day' (no repeat field)", () => {
+    let s = alarmInit();
+    s = alarmsReducer(s, { type: "add", hour: 8, min: 0, label: "", repeat: [-5, 9, 1.7] });
+    expect(s.list[0]!.repeat).toBeUndefined();
+    expect(dayAllowed(s.list[0]!, new Date(2024, 0, 1))).toBe(true);
+  });
+
+  test("valid repeats stay usable by dayAllowed (getDay: 0=Sun..6=Sat)", () => {
+    let s = alarmInit();
+    s = alarmsReducer(s, { type: "add", hour: 8, min: 0, label: "", repeat: [6, 6, 1] });
+    const al = s.list[0]!;
+    expect(al.repeat).toEqual([1, 6]);
+    expect(dayAllowed(al, new Date(2024, 0, 1))).toBe(true); // 2024-01-01 Mon = 1
+    expect(dayAllowed(al, new Date(2024, 0, 6))).toBe(true); // 2024-01-06 Sat = 6
+    expect(dayAllowed(al, new Date(2024, 0, 7))).toBe(false); // 2024-01-07 Sun = 0
+    expect(dayAllowed(al, new Date(2024, 0, 2))).toBe(false); // Tue = 2
+  });
+});
+

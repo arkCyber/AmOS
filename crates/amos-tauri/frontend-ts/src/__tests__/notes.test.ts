@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf } from "../lib/notes";
+import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText } from "../lib/notes";
 
 describe("notes store helpers", () => {
   test("prependNote adds newest first, each with a unique id", () => {
@@ -282,6 +282,155 @@ describe("notes store helpers", () => {
     ]);
     // non-http link (e.g. mailto) is left as plain text, not a link
     expect(fmtInline("[m](mailto:a@b.c)").every((s) => !s.link)).toBe(true);
+  });
+});
+describe("hashtags (#tag)", () => {
+  test("tagsOf collects unique tags in order, case-insensitively deduped", () => {
+    expect(tagsOf("买 #牛奶 和 #Work 再 #work")).toEqual(["牛奶", "Work"]);
+    expect(tagsOf("无标签文本 #_u #x-y")).toEqual(["_u", "x-y"]);
+    expect(tagsOf("中文 #标签也支持 ok")).toEqual(["标签也支持"]);
+    expect(tagsOf("没有")).toEqual([]);
+  });
+
+  test("tagsOf ignores mid-word # (abc#tag); repeated ## still yields the word", () => {
+    // `abc#notatag`: the # is preceded by a word char -> not a tag.
+    // `##y`: the 2nd # is preceded by a # (not a word char) -> #y is a tag.
+    expect(tagsOf("abc#notatag #x ##y")).toEqual(["x", "y"]);
+  });
+
+  test("hasTag matches a real token, not a substring, case-insensitively", () => {
+    expect(hasTag("见 #Work 一下", "work")).toBe(true);
+    expect(hasTag("加班 #working 中", "work")).toBe(false); // substring
+    expect(hasTag("加班 #working 中", "working")).toBe(true);
+    expect(hasTag("abc#x 里", "x")).toBe(false); // mid-word
+    expect(hasTag("文本", "")).toBe(false);
+  });
+
+  test("filterByTag keeps only notes carrying the tag", () => {
+    const list = [
+      { id: "1", text: "买菜 #food", ts: 1 },
+      { id: "2", text: "健身", ts: 2 },
+      { id: "3", text: "外卖 #FOOD", ts: 3 },
+      { id: "4", text: "食材 #food 详单", ts: 4 },
+    ];
+    expect(filterByTag(list, "food").map((n) => n.id)).toEqual(["1", "3", "4"]);
+    expect(filterByTag(list, "nope")).toEqual([]);
+  });
+
+  test("fmtInline colors #tags as tag segments and preserves text on round-trip", () => {
+    expect(fmtInline("记得 #todo 明天")).toEqual([
+      { text: "记得 ", bold: false, hl: false, strike: false },
+      { text: "#todo", bold: false, hl: false, strike: false, tag: true },
+      { text: " 明天", bold: false, hl: false, strike: false },
+    ]);
+    // tags inside **bold** stay inside the bold span (no double tagging)
+    const bold = fmtInline("**#inside** plain #outside");
+    expect(bold[0]).toEqual({ text: "#inside", bold: true, hl: false, strike: false });
+    expect(bold[bold.length - 1]).toMatchObject({ text: "#outside", tag: true });
+    // verbatim round-trip of plain text (marker syntax like ** is consumed by design)
+    const src = "a #b 中文#标签 ## x #y-z";
+    expect(fmtInline(src).map((s) => s.text).join("")).toBe(src);
+  });
+
+
+  test("tags near punctuation and a numeric tag are recognized; empty text yields []", () => {
+    // `#x#y`: the 2nd # is preceded by a word char -> only #x is a tag (mid-word rule).
+    expect(tagsOf("(#work) #工作，#会议。 #x#y #123")).toEqual(["work", "工作", "会议", "x", "123"]);
+    expect(tagsOf("")).toEqual([]);
+  });
+
+  test("hasTag accepts a leading '#' and never matches inside a bare URL fragment", () => {
+    expect(hasTag("提 #work 吧", "#work")).toBe(true);
+    // `x.com/a#frag`: the # is preceded by a word char -> not a tag.
+    expect(hasTag("看 https://x.com/a#frag 了", "frag")).toBe(false);
+  });
+
+  test("filterByTag keeps input order and composes with plain subset rules", () => {
+    const list = [
+      { id: "1", text: "a #keep", ts: 1 },
+      { id: "2", text: "b #KEEP 再 #other", ts: 2 },
+      { id: "3", text: "c", ts: 3 },
+      { id: "4", text: "d #keep-extra", ts: 4 }, // #keep-extra != #keep
+    ];
+    expect(filterByTag(list, "keep").map((n) => n.id)).toEqual(["1", "2"]);
+  });
+
+  test("fmtInline does not tag inside link/label text nor split a #-word at hyphen end", () => {
+    // The visible label "[click me #x]" has no url marker -> its #x is still a tag,
+    // but the real link "[go](https://e.com/p#frag)" label "go" has none.
+    const linked = fmtInline("见 [go](https://e.com/p#frag) 好了");
+    expect(linked.some((s) => s.link && s.text === "go")).toBe(true);
+    expect(linked.some((s) => s.tag && s.text === "#frag")).toBe(false); // in the url, skipped
+  });
+});
+
+describe("batch operations (multi-select)", () => {
+  const base = [
+    { id: "1", text: "a", ts: 1 },
+    { id: "2", text: "b", ts: 2, pinned: true },
+    { id: "3", text: "c", ts: 3, state: "archived" as const },
+    { id: "4", text: "d", ts: 4, state: "trash" as const },
+  ];
+
+  test("setManyState moves many notes into a bucket and can restore them", () => {
+    expect(setManyState(base, ["1", "2"], "archived").map((n) => n.state ?? null)).toEqual([
+      "archived",
+      "archived",
+      "archived",
+      "trash",
+    ]);
+    // restore out of trash
+    expect(setManyState(base, ["4"], undefined).map((n) => n.state ?? null)).toEqual([
+      null,
+      null,
+      "archived",
+      null,
+    ]);
+    // untouched when no ids given
+    expect(setManyState(base, [], "trash")).toBe(base);
+  });
+
+  test("setPinned(true) floats all selected to the top; (false) just clears the star", () => {
+    const pinned = setPinned(base, ["1", "4"], true);
+    expect(pinned.filter((n) => n.pinned).map((n) => n.id)).toEqual(["1", "2", "4"]);
+    // every selected is pinned
+    expect(pinned.every((n) => !["1", "4"].includes(n.id) || n.pinned)).toBe(true);
+    const unpinned = setPinned(pinned, ["2"], false);
+    expect(unpinned.find((n) => n.id === "2")!.pinned).toBeUndefined();
+    expect(unpinned.length).toBe(pinned.length);
+  });
+
+  test("removeMany hard-deletes exactly the given ids", () => {
+    expect(removeMany(base, ["1", "3", "nope"]).map((n) => n.id)).toEqual(["2", "4"]);
+    expect(removeMany(base, [])).toBe(base);
+  });
+});
+
+describe("export / share (.txt)", () => {
+  test("exportBaseName stamps a filesystem-safe, padded date-time name", () => {
+    const n = new Date(2026, 8, 6, 9, 5); // month is 0-based → Sep
+    expect(exportBaseName(n)).toBe("备忘录-2026-09-06-0905");
+    expect(exportBaseName(new Date(2026, 0, 3, 23, 59))).toBe("备忘录-2026-01-03-2359");
+    // Only digits + `-` + the literal title prefix (safe for filesystems).
+    expect(/[^备忘录0-9-]/.test(exportBaseName(n))).toBe(false);
+  });
+
+  test("noteExportText renders each note with title, timestamp, body, and a separator", () => {
+    const list = [
+      { id: "1", text: "买牛奶\n- [ ] 牛奶", ts: Date.UTC(2026, 8, 6) },
+      { id: "2", text: "想法\n#idea 好点子", ts: Date.UTC(2026, 8, 6, 12) },
+    ];
+    const out = noteExportText(list);
+    expect(out).toContain("买牛奶");
+    expect(out).toContain("- [ ] 牛奶"); // body kept verbatim
+    expect(out).toContain("#idea 好点子"); // rich markers kept as-is
+    expect(out.split("\n\n----\n\n")).toHaveLength(2); // one separator between two notes
+    expect(out.startsWith("买牛奶\n")).toBe(true); // title line first
+  });
+
+  test("noteExportText falls back to a placeholder title when the body has no text", () => {
+    const out = noteExportText([{ id: "x", text: "   ", ts: 0 }]);
+    expect(out).toContain("(无标题)");
   });
 });
 

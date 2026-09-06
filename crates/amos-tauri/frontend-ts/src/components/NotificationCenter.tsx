@@ -44,7 +44,23 @@ const QUICK: { key: QuickKey; label: "q.wifi" | "q.bluetooth" | "q.airplane" | "
   { key: "location", label: "q.location", icon: "📍" },
 ];
 
-export default function NotificationCenter({ open, onClose }: { open: boolean; onClose: () => void }) {
+export default function NotificationCenter({
+  open,
+  onClose,
+  onSearch,
+  onRecents,
+  onEdit,
+  onLock,
+}: {
+  open: boolean;
+  onClose: () => void;
+  /** Optional "control-center" actions (formerly the home top bar): reachable via
+   *  this pull-down shade instead of a cluttered bar on the home page. */
+  onSearch?: () => void;
+  onRecents?: () => void;
+  onEdit?: () => void;
+  onLock?: () => void;
+}) {
   const { t } = useI18n();
   // The "dark mode" quick tile drives the real theme (not just a cosmetic bit).
   const { dark, toggle: themeToggle } = useTheme();
@@ -207,6 +223,36 @@ export default function NotificationCenter({ open, onClose }: { open: boolean; o
           {t("common.done")}
         </button>
       </div>
+
+      {/* Control-center system actions (moved off the home top bar): each closes
+          this shade and opens the target surface. */}
+      {(() => {
+        const acts: { icon: string; label: string; fn?: () => void }[] = [
+          { icon: "🔍", label: "search", fn: onSearch },
+          { icon: "⇤", label: "recents", fn: onRecents },
+          { icon: "✎", label: "edit home", fn: onEdit },
+          { icon: "🔒", label: "lock", fn: onLock },
+        ].filter((a) => a.fn);
+        if (!acts.length) return null;
+        return (
+          <div className="mt-2 flex items-center justify-end gap-2">
+            {acts.map((a) => (
+              <button
+                key={a.label}
+                aria-label={a.label}
+                title={a.label}
+                onClick={() => {
+                  a.fn!();
+                  onClose();
+                }}
+                className="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"
+              >
+                {a.icon}
+              </button>
+            ))}
+          </div>
+        );
+      })()}
 
       {/* Torch / flashlight — illumination control (ephemeral hardware state).
           A dedicated full-width tile above the preference quick-settings. */}

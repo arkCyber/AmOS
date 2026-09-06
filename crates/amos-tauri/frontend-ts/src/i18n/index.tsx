@@ -11,6 +11,7 @@ import type { Locale } from "./types";
 import { isLocale } from "./types";
 import { zh, type MessageKey, type ZhDict } from "./locales/zh";
 import { en } from "./locales/en";
+import { AMOS_LOCALE_CHANGED_EVENT } from "../svelte/ui-events";
 
 export const LOCALE_KEY = "amos-ui.locale";
 
@@ -56,6 +57,17 @@ export function I18nProvider({ children }: { children: ReactNode }) {
       /* ignore */
     }
   }, [locale]);
+
+  // A Svelte screen (e.g. the Svelte Settings screen) can switch the language by
+  // writing amos-ui.locale; re-sync this context live so the React shell follows.
+  useEffect(() => {
+    const onChanged = (e: Event) => {
+      const l = (e as CustomEvent<string>).detail;
+      if (isLocale(l)) setLocaleState(l);
+    };
+    window.addEventListener(AMOS_LOCALE_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(AMOS_LOCALE_CHANGED_EVENT, onChanged);
+  }, []);
 
   const t = useCallback<I18nValue["t"]>(
     (key, params) => translate(dict, key, params),

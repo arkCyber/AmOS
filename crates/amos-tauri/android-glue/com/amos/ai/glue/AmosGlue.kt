@@ -3,6 +3,7 @@ package com.amos.ai.glue
 import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
@@ -41,18 +42,30 @@ object AmosGlue {
 
     /**
      * Start the producers. Call after permissions are granted (see
-     * [ensurePermissions]); this is a skeleton — wire it to the Activity's
-     * `onStart`/post-permission callback at device bring-up.
+     * [ensurePermissions]). Each hardware producer is isolated so an unavailable
+     * peripheral (camera disabled by device policy, missing sensor, no torch…)
+     * can never crash the System UI on boot.
      */
     fun onStart(context: Context) {
         // GNSS/radios already bound on the Rust side (SensorHost::bind_android).
-        SensorGlue.attach(context.applicationContext)
-        CameraGlue.attach(context.applicationContext)
+        startQuietly("sensor") { SensorGlue.attach(context.applicationContext) }
+        startQuietly("camera") { CameraGlue.attach(context.applicationContext) }
         ClipboardGlue.bind(context.applicationContext)
         // Bind the real torch (rear camera flash) so FlashlightBridge boots with
         // the AndroidFlashlightProvider instead of the desktop Mock.
-        FlashlightGlue.bind(context.applicationContext)
+        startQuietly("flashlight") { FlashlightGlue.bind(context.applicationContext) }
     }
+
+    /** Run [block], logging (never throwing) if a producer can't start. */
+    private fun startQuietly(name: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Throwable) {
+            Log.w(TAG, "$name producer start skipped: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private const val TAG = "AmosGlue"
 
     /** Stop the producers and release the camera/sensor hardware. */
     fun onStop(context: Context) {

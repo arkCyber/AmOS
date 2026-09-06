@@ -56,20 +56,22 @@ fn read_string(env: &mut JNIEnv<'_>, s: jstring) -> String {
         .unwrap_or_default()
 }
 
-/// `AmosInCallService.nativeState(state)` — the Kotlin in-call service pushes every
-/// real Telecom call-state change here; we forward it to the WebView as
+/// `AmosInCallService.nativeState(direction, state, peer)` — the Kotlin in-call service
+/// pushes every real Telecom call-state change here; we forward it to the WebView as
 /// `telephony-event` (same payload the daemon Watch emits, so the existing IncomingCall
 /// / in-call UI just works for real calls).
 ///
 /// # Safety
-/// `env`/`this` are the standard JNI instance-method args; `state` is a live local ref
-/// valid for the duration of the call.
+/// `env`/`this` are the standard JNI instance-method args; the `jstring`s are live
+/// local refs valid for the duration of the call.
 #[cfg(feature = "android")]
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_amos_ai_glue_AmosInCallService_nativeState(
     env: *mut jni::sys::JNIEnv,
     _this: jobject,
+    direction: jstring,
     state: jstring,
+    peer: jstring,
 ) {
     let Ok(mut env) = (unsafe { jni::JNIEnv::from_raw(env) }) else {
         return;
@@ -77,15 +79,15 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_AmosInCallService_nativeStat
     if let Ok(vm) = env.get_java_vm() {
         let _ = VM.set(vm);
     }
+    let direction = read_string(&mut env, direction);
     let state = read_string(&mut env, state);
+    let peer = read_string(&mut env, peer);
     if let Some(app) = APP.get() {
-        // "Ringing" surfaces as an incoming call in the WebView overlay.
-        let direction = if state == "Ringing" { "Incoming" } else { "Outgoing" };
         let payload = TelephonyCallPayload {
             id: "real".to_string(),
-            peer: String::new(),
+            peer,
             state,
-            direction: direction.to_string(),
+            direction,
             emergency: false,
             recording: "Off".to_string(),
         };

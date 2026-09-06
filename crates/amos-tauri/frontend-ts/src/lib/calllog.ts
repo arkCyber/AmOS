@@ -92,11 +92,14 @@ export function recentNumbers(list: CallRecord[], n: number): string[] {
   return out;
 }
 
-/** Name hint for a number from the log (best known), if any. */
+/** Name hint for a number from the log (best known), if any. Uses the SAME
+ * `sameCallNumber` equality as `recentNumbers`/`frequentNumbers`, so `+CC…` and a
+ * bare local form of the same number resolve to one name. */
 export function logNameFor(list: CallRecord[], number: string): string | undefined {
   const d = callDigits(number);
   if (d === "") return undefined;
-  return normalizeCallLog(list).find((r) => callDigits(r.number) === d)?.name;
+  const rec = normalizeCallLog(list).find((r) => sameCallNumber(r.number, number));
+  return rec?.name;
 }
 
 /** Top `n` most frequently-dialed numbers ("常用联系人"), newest-first on ties,

@@ -70,7 +70,11 @@ describe("Reminders — iOS-style lists + compose (DOM)", () => {
     expect(appIcon("reminders")).toBe("✅"); // registry glyph (still distinct from 📝 / 🕐)
     // It opts into the bespoke iOS-style face: white card + coloured checklist.
     expect(isBespokeTile("reminders")).toBe(true);
-    expect(isBespokeTile("clock")).toBe(false); // other apps keep the uniform tone
+    // Only the hand-tuned first-party tiles are bespoke; the rest keep the
+    // uniform tonal wash (weather is still generic), and Clock now opts in too.
+    expect(isBespokeTile("weather")).toBe(false); // generic tile stays uniform
+    expect(isBespokeTile("clock")).toBe(true); // black night tile
+
     const host = document.createElement("span");
     const root = createRoot(host);
     act(() => {

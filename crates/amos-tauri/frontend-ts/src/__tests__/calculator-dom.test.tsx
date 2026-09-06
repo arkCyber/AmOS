@@ -62,3 +62,55 @@ describe("calculator physical-keyboard input", () => {
     expect(host.textContent).toContain("5");
   });
 });
+
+describe("calculator on-screen keypad (DOM)", () => {
+  const display = (host: HTMLElement) =>
+    host.querySelector('[role="status"]')?.textContent ?? "";
+  const clearBtn = (host: HTMLElement) =>
+    host.querySelector(
+      'button[aria-label="AC"], button[aria-label="C"]',
+    ) as HTMLButtonElement | null;
+
+  async function tap(host: HTMLElement, aria: string) {
+    const el = host.querySelector(`button[aria-label="${aria}"]`) as
+      | HTMLButtonElement
+      | null;
+    expect(el, `missing key "${aria}"`).toBeTruthy();
+    await act(async () => el!.click());
+  }
+
+  test("tapping digits/operators/= computes and shows the result", async () => {
+    const host = mountCalc();
+    await act(async () => {});
+    await tap(host, "9");
+    await tap(host, "+");
+    await tap(host, "3");
+    await tap(host, "=");
+    expect(display(host)).toBe("12");
+  });
+
+  test("± toggles the sign of the shown entry and 0 is a no-op", async () => {
+    const host = mountCalc();
+    await act(async () => {});
+    await tap(host, "5");
+    await tap(host, "±");
+    expect(display(host)).toBe("-5");
+    await tap(host, "±");
+    expect(display(host)).toBe("5");
+    // a fresh 0 followed by ± must not produce "-0"
+    await tap(host, "C");
+    await tap(host, "±");
+    expect(display(host)).toBe("0");
+  });
+
+  test("clear key reads AC fresh, flips to C while typing, and resets", async () => {
+    const host = mountCalc();
+    await act(async () => {});
+    expect(clearBtn(host)?.getAttribute("aria-label")).toBe("AC");
+    await tap(host, "7");
+    expect(clearBtn(host)?.getAttribute("aria-label")).toBe("C");
+    await act(async () => clearBtn(host)!.click());
+    expect(display(host)).toBe("0");
+    expect(clearBtn(host)?.getAttribute("aria-label")).toBe("AC");
+  });
+});

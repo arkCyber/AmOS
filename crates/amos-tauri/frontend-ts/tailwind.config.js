@@ -3,7 +3,7 @@ export default {
   // class strategy so a single `dark` class on <html> drives both our manual
   // toggle and prefers-color-scheme ("auto") without duplicating rules.
   darkMode: "class",
-  content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  content: ["./index.html", "./src/**/*.{ts,tsx,svelte}"],
   theme: {
     extend: {
       colors: {

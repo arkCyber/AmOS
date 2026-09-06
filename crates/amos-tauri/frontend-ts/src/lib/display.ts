@@ -25,6 +25,42 @@ export type ScreenState = "on" | "off";
  */
 export const AUTOOFF_STORE_KEY = "amos.displayAutoOffSec";
 
+/** Durable-store key: return to the home/dock page when the display wakes. */
+export const WAKE_HOME_KEY = "amos.wakeHome";
+
+/**
+ * Whether waking/unlocking should drop you back on the home/dock page. Absent or
+ * unparseable defaults to `true` (the requested behavior); explicit false disables it.
+ */
+export function wakeHomeEnabled(raw: unknown): boolean {
+  if (raw === true || raw === 1 || raw === "1" || raw === "true") return true;
+  if (raw === false || raw === 0 || raw === "0" || raw === "false") return false;
+  return true;
+}
+
+/**
+ * Minimum time (ms) the app must have been backgrounded / lost focus before a
+ * resume is treated as a real "wake" (physical power key / screen on) that returns
+ * to the dock. Shorter absences (a permission dialog, a notification-shade peek,
+ * a transient focus steal) are ignored so the user isn't yanked back to home.
+ */
+export const WAKE_HOME_MIN_MS = 1000;
+
+/**
+ * Pure "is this a real wake that should return to the dock?" decision. A resume
+ * counts only if the app was genuinely away for at least `minMs` (default
+ * [WAKE_HOME_MIN_MS]); a null/no-away or too-brief absence is not a wake.
+ */
+export function wakeHomeDue(
+  leaveAtMs: number | null | undefined,
+  nowMs: number,
+  minMs: number = WAKE_HOME_MIN_MS,
+): boolean {
+  if (leaveAtMs == null) return false;
+  return nowMs - leaveAtMs >= minMs;
+}
+
+
 
 export function isOn(s: ScreenState): boolean {
   return s === "on";

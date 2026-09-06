@@ -7,7 +7,53 @@ import {
   idleElapsedSec,
   isOn,
   AUTOOFF_STORE_KEY,
+  WAKE_HOME_KEY,
+  WAKE_HOME_MIN_MS,
+  wakeHomeDue,
+  wakeHomeEnabled,
 } from "../lib/display";
+
+describe("wakeHomeDue (real-wake decision)", () => {
+  const now = 1_000_000;
+  it("never counts as a wake if it wasn't away", () => {
+    expect(wakeHomeDue(null, now)).toBe(false);
+    expect(wakeHomeDue(undefined, now)).toBe(false);
+  });
+  it("ignores brief absences shorter than the minimum", () => {
+    expect(wakeHomeDue(now - 300, now)).toBe(false);
+    expect(wakeHomeDue(now - (WAKE_HOME_MIN_MS - 1), now)).toBe(false);
+  });
+  it("counts a wake once the absence reaches the minimum", () => {
+    expect(wakeHomeDue(now - WAKE_HOME_MIN_MS, now)).toBe(true);
+    expect(wakeHomeDue(now - 60_000, now)).toBe(true);
+  });
+  it("honors a custom minimum", () => {
+    expect(wakeHomeDue(now - 500, now, 1000)).toBe(false);
+    expect(wakeHomeDue(now - 1500, now, 1000)).toBe(true);
+  });
+});
+
+describe("wakeHomeEnabled (wake → dock policy)", () => {
+  it("defaults ON for absent/unknown values", () => {
+    expect(wakeHomeEnabled(undefined)).toBe(true);
+    expect(wakeHomeEnabled(null)).toBe(true);
+    expect(wakeHomeEnabled("")).toBe(true);
+    expect(wakeHomeEnabled({})).toBe(true);
+  });
+  it("true-like values → on, false-like → off", () => {
+    expect(wakeHomeEnabled(true)).toBe(true);
+    expect(wakeHomeEnabled(1)).toBe(true);
+    expect(wakeHomeEnabled("true")).toBe(true);
+    expect(wakeHomeEnabled("1")).toBe(true);
+    expect(wakeHomeEnabled(false)).toBe(false);
+    expect(wakeHomeEnabled(0)).toBe(false);
+    expect(wakeHomeEnabled("false")).toBe(false);
+    expect(wakeHomeEnabled("0")).toBe(false);
+  });
+  it("exposes the durable store key", () => {
+    expect(WAKE_HOME_KEY).toBe("amos.wakeHome");
+  });
+});
 
 describe("display screen-state helpers", () => {
   it("isOn / asScreenState round-trip the canonical on/off", () => {

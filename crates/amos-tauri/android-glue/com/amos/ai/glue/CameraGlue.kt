@@ -12,6 +12,7 @@ import android.hardware.camera2.CaptureRequest
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import android.view.Surface
 
 /**
@@ -68,10 +69,18 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
 
         try {
             cm.openCamera(id, stateCallback, handler)
-        } catch (_: SecurityException) {
-            // No CAMERA grant at open time; retry after the permission flow.
+        } catch (e: Exception) {
+            // The camera can be unavailable for many reasons — disabled by a device
+            // policy (ServiceSpecificException "disabled by policy"), in use by
+            // another client, or no grant at open time. A peripheral video producer
+            // must never crash the System UI on boot, so we release any half-built
+            // capture resources, report the camera off, and move on.
+            detach()
+            Log.w(TAG, "camera attach skipped: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
+
+    private const val TAG = "AmosGlue"
 
     /** Close the capture session, reader, and camera (frees the sensor). */
     fun detach() {

@@ -10,7 +10,7 @@ import {
   telephonyStartRecording,
   telephonyStopRecording,
 } from "../lib/backend";
-import { KEYS, backspace, clearDial, pushKey, MAX_DIAL_LEN, fmtCallDuration } from "../lib/phone";
+import { KEYS, backspace, clearDial, pushKey, fmtCallDuration } from "../lib/phone";
 import { EMERGENCY_NUMBERS, EMERGENCY_QUICK_NUMBER } from "../lib/emergency";
 import {
   CONTACTS_KEY,
@@ -184,25 +184,36 @@ export function PhoneApp() {
 
   const keypad = (
     <div className="flex w-full flex-col items-center">
-      <div className="py-5 text-center">
-        <div className="text-3xl tabular-nums tracking-widest">{num || "—"}</div>
-        <div className="mt-1 text-[10px] tabular-nums opacity-40">
-          {num.length}/{MAX_DIAL_LEN}
-        </div>
+      {/* iOS-style dial number: light, centred, auto-shrinks so long numbers fit */}
+      <div className="flex w-full max-w-xs items-center justify-center px-3 pb-1 pt-2">
+        <span
+          className={
+            "block max-w-full truncate font-light tabular-nums leading-none " +
+            (num.length > 9
+              ? "text-[26px] tracking-[0.02em]"
+              : num.length > 5
+                ? "text-[32px] tracking-[0.04em]"
+                : "text-[40px] tracking-[0.05em]")
+          }
+        >
+          {num}
+        </span>
       </div>
-      <div className="grid w-full max-w-xs grid-cols-3 gap-3">
+      {/* iPhone-style keypad: three modest round keys per row (no full-width giants) */}
+      <div className="grid w-full max-w-xs grid-cols-3 justify-items-center gap-x-1 gap-y-3">
         {KEYS.map((k) => {
           const letters = SUB[k as keyof typeof SUB];
           return (
             <button
               key={k}
               onClick={() => tap(k)}
-              className="grid aspect-square place-items-center rounded-full bg-neutral-300/90 text-neutral-900 transition active:scale-90 dark:bg-white/10 dark:text-white"
+              aria-label={k}
+              className="grid h-[76px] w-[76px] place-items-center rounded-full bg-neutral-300/90 text-neutral-900 transition hover:bg-neutral-300/80 active:scale-95 dark:bg-white/10 dark:text-white"
             >
               <span className="flex flex-col items-center leading-none">
-                <span className="text-[22px]">{k}</span>
+                <span className="text-[26px] font-light leading-none">{k}</span>
                 {letters && (
-                  <span className="mt-0.5 text-[9px] tracking-[0.18em] opacity-60">
+                  <span className="mt-1 text-[10px] tracking-[0.22em] opacity-55">
                     {letters}
                   </span>
                 )}
@@ -211,13 +222,14 @@ export function PhoneApp() {
           );
         })}
       </div>
-      <div className="mt-4 flex items-center justify-center gap-6">
-        <div className="flex flex-col items-center gap-3">
+      {/* Compact, iPhone-like action row: delete + clear on the left, call centre */}
+      <div className="mt-3 flex items-start justify-center gap-12">
+        <div className="flex flex-col items-center gap-2">
           <button
             onClick={() => setNum(backspace(num))}
             disabled={!num}
             aria-label="backspace"
-            className="grid h-11 w-11 place-items-center rounded-full bg-neutral-300/90 text-lg text-neutral-700 transition active:scale-90 disabled:opacity-30 dark:bg-white/10 dark:text-white"
+            className="grid h-11 w-11 place-items-center rounded-full bg-neutral-300/90 text-lg text-neutral-700 transition active:scale-90 disabled:opacity-25 dark:bg-white/10 dark:text-white"
           >
             ⌫
           </button>
@@ -225,7 +237,7 @@ export function PhoneApp() {
             onClick={() => setNum(clearDial(num))}
             disabled={!num}
             aria-label="clear"
-            className="text-[11px] text-accent disabled:opacity-30"
+            className="text-[11px] text-accent disabled:opacity-25"
           >
             {t("phone.clear")}
           </button>
@@ -233,11 +245,12 @@ export function PhoneApp() {
         <button
           onClick={() => void startCall()}
           disabled={!num}
-          className="grid h-[72px] w-[72px] place-items-center rounded-full bg-green-500 text-white shadow-[0_8px_20px_rgba(52,199,89,0.4)] transition active:scale-90 disabled:opacity-40"
           aria-label="call"
+          className="grid h-[60px] w-[60px] place-items-center rounded-full bg-green-500 text-white shadow-[0_6px_16px_rgba(52,199,89,0.45)] transition active:scale-90 disabled:opacity-40"
         >
-          <span className="text-3xl leading-none">📞</span>
+          <span className="text-2xl leading-none">📞</span>
         </button>
+        <div className="w-11" aria-hidden />
       </div>
       {/* Demo-only: have the mock daemon ring an incoming call for a manual test. */}
       <button

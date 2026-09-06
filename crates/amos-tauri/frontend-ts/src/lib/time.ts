@@ -252,10 +252,21 @@ function normalizeAlarm(hour: number, min: number) {
   return { h, m };
 }
 
+/** Sanitize a repeat-day list to integer weekday indices 0..6 (dedup + sorted).
+ * Returns `undefined` when none are valid — matching normalizeAlarms, so an
+ * in-session add can never hold day numbers that dayAllowed() would silently
+ * never match (a real bug when the UI/legacy data supplied e.g. 2.5 / -1 / 8). */
+function cleanRepeat(r: readonly number[] | undefined): number[] | undefined {
+  if (!r || r.length === 0) return undefined;
+  const days = [...new Set(r.filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))].sort();
+  return days.length ? days : undefined;
+}
+
 export function alarmsReducer(s: AlarmState, a: AlarmAction): AlarmState {
   switch (a.type) {
     case "add": {
       const { h, m } = normalizeAlarm(a.hour, a.min);
+      const repeat = cleanRepeat(a.repeat);
       alarmSeq += 1;
       const alarm: Alarm = {
         id: `${Date.now().toString(36)}-${alarmSeq}`,
@@ -265,7 +276,7 @@ export function alarmsReducer(s: AlarmState, a: AlarmAction): AlarmState {
         enabled: true,
         ringing: false,
         tone: ALARM_TONES.includes(a.tone as (typeof ALARM_TONES)[number]) ? a.tone! : ALARM_TONES[0],
-        ...(a.repeat && a.repeat.length > 0 ? { repeat: [...new Set(a.repeat)].sort() } : {}),
+        ...(repeat ? { repeat } : {}),
       };
       return { ...s, list: [...s.list, alarm] };
     }

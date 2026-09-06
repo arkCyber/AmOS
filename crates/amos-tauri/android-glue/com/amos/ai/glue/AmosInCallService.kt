@@ -73,12 +73,17 @@ class AmosInCallService : InCallService() {
             Call.STATE_DISCONNECTED -> "Ended"
             else -> "Unknown"
         }
-        Log.i(TAG, "real call state -> $state")
-        nativeState(state)
+        val details = c?.details
+        // This SDK exposes no readable `Call.Details.direction`; infer it from the
+        // state (a ringing call we did not originate is incoming).
+        val direction = if (state == "Ringing") "Incoming" else "Outgoing"
+        val peer = details?.handle?.schemeSpecificPart ?: ""
+        Log.i(TAG, "real call -> state=$state dir=$direction peer=$peer")
+        nativeState(direction, state, peer)
     }
 
     /** JNI upcall: real call-state change → Rust `incall` (see amos-tauri/src/incall.rs). */
-    private external fun nativeState(state: String)
+    private external fun nativeState(direction: String, state: String, peer: String)
 
     // ---- real call control (callable by the app while we are default dialer) ----
 

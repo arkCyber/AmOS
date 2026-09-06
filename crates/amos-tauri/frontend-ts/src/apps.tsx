@@ -20,7 +20,7 @@ import { useTheme, type ThemeMode } from "./theme";
 import Segmented from "./components/Segmented";
 import { ClipboardTray } from "./components/ClipboardTray";
 import { GROUP, ROW, LABEL, SUB, FIELD, Switch, chip, btn } from "./components/ui";
-import { WallpaperCard } from "./components/Wallpaper";
+import { LockWallpaperCard, WallpaperCard } from "./components/Wallpaper";
 import LockSettings from "./components/LockSettings";
 import SensorPanel from "./components/SensorPanel";
 import SystemPanel from "./components/SystemPanel";
@@ -30,13 +30,13 @@ import { SETTINGS_KEY, BACKUP_KEY, SYNC_STORES, readCloud, setCloudPrefs, snapsh
 import { readAiConfig, setAiConfig, DEEPSEEK_MODEL, DEEPSEEK_ENDPOINT, type AiProviderId } from "./lib/providers";
 import { describeEngine, type EngineView } from "./lib/aiEngine";
 import type { Locale } from "./i18n/types";
-import { addHistory, calcDisplay, calcEntry, calcFromKey, calcInit, calcPress, ERR } from "./lib/calculator";
+import { addHistory, calcClearLabel, calcEntry, calcFontPx, calcFromKey, calcInit, calcPress, ERR } from "./lib/calculator";
 import { zoneClock, stopwatchInit, stopwatchReducer, fmtStopwatch, timerInit, timerReducer, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, defaultWorldCities, lapDeltas, fastestLap, type WorldCity } from "./lib/time";
 import { readStoreValue, writeStoreValue } from "./lib/amosStore";
-import { AUTOOFF_STORE_KEY, clampAutoOffSec } from "./lib/display";
-import { bridged, getAiStatus, switchAiBackend } from "./lib/backend";
+import { AUTOOFF_STORE_KEY, clampAutoOffSec, WAKE_HOME_KEY, wakeHomeEnabled } from "./lib/display";
+import { bridged, getAiStatus, switchAiBackend, exportTxtFile } from "./lib/backend";
 import { clipboardRead, clipboardWrite, entryText } from "./lib/clipboard";
-import { NOTES_KEY, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, fmtTime, normalizeNotes, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeAllTasks, noteListProgress, fmtInline, type Note } from "./lib/notes";
+import { NOTES_KEY, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, fmtTime, normalizeNotes, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeAllTasks, noteListProgress, fmtInline, hasTag, tagsOf, setManyState, setPinned, removeMany, exportBaseName, noteExportText, type Note } from "./lib/notes";
 import { noteTitle, notePreview, noteDayOf } from "./lib/notes";
 import { forecast, dayLabel, displayTemp, convertRange, adjustForecast, WEATHER_CITIES, normalizeWeatherCities, removeWeatherCity, addWeatherCity, type TempUnit, type WCity } from "./lib/weather";
 import {
@@ -53,48 +53,19 @@ import {
   normalizePhotos,
   type Photo,
 } from "./lib/photos";
+import {
+  listCaptures,
+  captureBlob,
+  removeVideoCapture,
+  toggleCaptureFav,
+  resLabelOf,
+  type VideoCapture,
+} from "./lib/cameraCapture";
+import VideoThumb from "./components/VideoThumb";
+import SvelteAppHost from "./components/SvelteAppHost";
 
-export interface AppMeta {
-  id: string;
-  /** i18n key for the app's display name (also used as its title bar). */
-  titleKey: MessageKey;
-  icon: string;
-}
-
-/** The set of apps currently ported to React/TS. Grows as each app migrates. */
-export const APPS: AppMeta[] = [
-  { id: "clock", titleKey: "app.clock", icon: "🕐" },
-  { id: "settings", titleKey: "app.settings", icon: "⚙️" },
-  { id: "calculator", titleKey: "app.calculator", icon: "🧮" },
-  { id: "weather", titleKey: "app.weather", icon: "🌤️" },
-  { id: "notes", titleKey: "app.notes", icon: "📝" },
-  { id: "reminders", titleKey: "app.reminders", icon: "✅" },
-  { id: "vmemos", titleKey: "app.vmemos", icon: "🎙️" },
-  { id: "photos", titleKey: "app.photos", icon: "🖼️" },
-  { id: "files", titleKey: "app.files", icon: "📁" },
-  { id: "android", titleKey: "app.android", icon: "🤖" },
-  { id: "messages", titleKey: "app.messages", icon: "💬" },
-  { id: "phone", titleKey: "app.phone", icon: "📞" },
-  { id: "music", titleKey: "app.music", icon: "🎵" },
-  { id: "maps", titleKey: "app.maps", icon: "🗺️" },
-  { id: "camera", titleKey: "app.camera", icon: "📷" },
-  { id: "ai", titleKey: "app.ai", icon: "🤖" },
-  { id: "interpreter", titleKey: "app.interpreter", icon: "🌐" },
-  { id: "mail", titleKey: "app.mail", icon: "✉️" },
-  { id: "store", titleKey: "app.store", icon: "🛍️" },
-  { id: "privacy", titleKey: "app.privacy", icon: "🛡️" },
-  { id: "contacts", titleKey: "app.contacts", icon: "👥" },
-  { id: "magnifier", titleKey: "app.magnifier", icon: "🔍" },
-];
-
-export function appTitleKey(id: string): MessageKey | null {
-  return APPS.find((a) => a.id === id)?.titleKey ?? null;
-}
-
-/** Single source of truth for an app's tile icon (emoji). */
-export function appIcon(id: string): string {
-  return APPS.find((a) => a.id === id)?.icon ?? "🧩";
-}
+export { APP_META as APPS, appIcon, appTitleKey } from "./lib/appMeta";
+export type { AppMeta } from "./lib/appMeta";
 
 /* ---- Clock (world clock + live now) ---- */
 const StopwatchCard: FC = () => {
@@ -250,228 +221,228 @@ const Clock: FC = () => {
         <Segmented value={tab} options={TABS} onChange={setTab} ariaLabel="clock-tabs" />
       </div>
       <div className={tab === "world" ? "" : "hidden"}>
-      <div className="text-center">
-        <div className="text-5xl font-thin tabular-nums">{fmt(now)}</div>
-        <div className="mt-1 text-sm opacity-60">{fmtDate(now)}</div>
-        <div className="mt-1 text-xs uppercase tracking-wide opacity-50">{t("clock.now")}</div>
-      </div>
-      <div className="mt-6 flex items-center justify-between">
-        <span className="text-xs uppercase tracking-wide opacity-50">{t("clock.world")}</span>
-        <div className="flex items-center gap-2">
-          {wcMissing && (
+        <div className="text-center">
+          <div className="text-5xl font-thin tabular-nums">{fmt(now)}</div>
+          <div className="mt-1 text-sm opacity-60">{fmtDate(now)}</div>
+          <div className="mt-1 text-xs uppercase tracking-wide opacity-50">{t("clock.now")}</div>
+        </div>
+        <div className="mt-6 flex items-center justify-between">
+          <span className="text-xs uppercase tracking-wide opacity-50">{t("clock.world")}</span>
+          <div className="flex items-center gap-2">
+            {wcMissing && (
+              <button
+                onClick={() => setWc(addWorldCity(wc, wcMissing))}
+                className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
+              >
+                + {t("clock.addCity")}
+              </button>
+            )}
             <button
-              onClick={() => setWc(addWorldCity(wc, wcMissing))}
+              onClick={() => setWcEdit((e) => !e)}
               className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
             >
-              + {t("clock.addCity")}
+              {wcEdit ? t("common.done") : t("clock.edit")}
             </button>
-          )}
-          <button
-            onClick={() => setWcEdit((e) => !e)}
-            className="rounded-full bg-neutral-200 px-2 py-0.5 text-[11px] dark:bg-neutral-700"
-          >
-            {wcEdit ? t("common.done") : t("clock.edit")}
-          </button>
-        </div>
-      </div>
-      <div className="mt-2 space-y-2">
-        {world.map((c) => (
-          <div
-            key={c.labelKey}
-            className="flex items-center justify-between rounded-xl bg-neutral-200/50 px-3 py-2 text-sm dark:bg-neutral-800/50"
-          >
-            <span className="opacity-70">{t(c.labelKey)}</span>
-            <div className="flex items-center gap-2">
-              {wcEdit && (
-                <button
-                  onClick={() => setWc(removeWorldCity(wc, c.zone))}
-                  className="rounded-full bg-neutral-300 px-2 text-xs text-danger dark:bg-neutral-700"
-                >
-                  ✕
-                </button>
-              )}
-              <span className="tabular-nums">{zoneClock(now, c.zone)}</span>
-            </div>
           </div>
-        ))}
-      </div>
-      </div>
-      <div className={tab === "timer" ? "" : "hidden"}>
-      <div className="mt-6 rounded-xl bg-neutral-200/50 p-4 text-center dark:bg-neutral-800/50">
-        <div className="text-xs uppercase tracking-wide opacity-50">{t("clock.timer")}</div>
-        <div
-          className={
-            "mt-1 text-4xl font-thin tabular-nums " + (timerDone ? "text-danger" : "")
-          }
-        >
-          {fmtCountdown(tm.remainingMs)}
         </div>
-        {timerDone && <div className="mt-1 text-xs text-danger">{t("clock.timerDone")}</div>}
-        <div className="mt-2 flex items-center justify-center gap-2">
-          {[1, 3, 5].map((m) => (
-            <button
-              key={m}
-              onClick={() => tmDispatch({ type: "set", totalMs: m * 60000 })}
-              disabled={tm.running}
-              className={btn("neutral", "sm")}
-            >
-              {m} {t("clock.min")}
-            </button>
-          ))}
-        </div>
-        <div className="mt-3 flex items-center justify-center gap-4">
-          <button
-            onClick={() => tmDispatch({ type: tm.running ? "pause" : "start", now: Date.now() })}
-            disabled={tm.totalMs === 0 && !tm.running}
-            className={
-              "h-12 w-12 rounded-full text-lg text-white " +
-              (tm.running ? "bg-danger" : "bg-green-500")
-            }
-            aria-label={t("clock.timer")}
-          >
-            {tm.running ? "⏸" : "▶"}
-          </button>
-          <button
-            onClick={() => tmDispatch({ type: "reset" })}
-            disabled={tm.totalMs === 0}
-            className="h-12 w-12 rounded-full bg-neutral-300 text-lg disabled:opacity-30 dark:bg-neutral-700"
-            aria-label="reset"
-          >
-            ↺
-          </button>
-        </div>
-      </div>
-      </div>
-      <div className={tab === "alarm" ? "" : "hidden"}>
-      {ringAlarms.length > 0 && (
-        <div className="mt-4 space-y-2">
-          {ringAlarms.map((ra) => (
+        <div className="mt-2 space-y-2">
+          {world.map((c) => (
             <div
-              key={ra.id}
-              className="flex items-center justify-between gap-2 rounded-xl bg-danger/15 px-3 py-2 text-sm"
+              key={c.labelKey}
+              className="flex items-center justify-between rounded-xl bg-neutral-200/50 px-3 py-2 text-sm dark:bg-neutral-800/50"
             >
-              <span>
-                {(ra.tone ?? "🔔")} {fmtHm(ra.hour, ra.min)}
-                {ra.label ? ` · ${ra.label}` : ""}
-              </span>
-              <div className="flex shrink-0 gap-1.5">
-                <button
-                  onClick={() => alDispatch({ type: "snooze", id: ra.id, now })}
-                  className={btn("neutral", "sm")}
-                >
-                  {t("clock.snooze")}
-                </button>
-                <button
-                  onClick={() => alDispatch({ type: "dismiss", id: ra.id })}
-                  className={btn("danger", "sm")}
-                >
-                  {t("clock.dismissAlarm")}
-                </button>
+              <span className="opacity-70">{t(c.labelKey)}</span>
+              <div className="flex items-center gap-2">
+                {wcEdit && (
+                  <button
+                    onClick={() => setWc(removeWorldCity(wc, c.zone))}
+                    className="rounded-full bg-neutral-300 px-2 text-xs text-danger dark:bg-neutral-700"
+                  >
+                    ✕
+                  </button>
+                )}
+                <span className="tabular-nums">{zoneClock(now, c.zone)}</span>
               </div>
             </div>
           ))}
         </div>
-      )}
-      <div className="mt-6 rounded-xl bg-neutral-200/50 p-4 dark:bg-neutral-800/50">
-        <div className="flex items-center justify-between">
-          <span className="text-xs uppercase tracking-wide opacity-50">{t("clock.alarm")}</span>
-          <span className="text-[11px] opacity-50">{t("clock.alarmCount", { n: al.list.length })}</span>
+      </div>
+      <div className={tab === "timer" ? "" : "hidden"}>
+        <div className="mt-6 rounded-xl bg-neutral-200/50 p-4 text-center dark:bg-neutral-800/50">
+          <div className="text-xs uppercase tracking-wide opacity-50">{t("clock.timer")}</div>
+          <div
+            className={
+              "mt-1 text-4xl font-thin tabular-nums " + (timerDone ? "text-danger" : "")
+            }
+          >
+            {fmtCountdown(tm.remainingMs)}
+          </div>
+          {timerDone && <div className="mt-1 text-xs text-danger">{t("clock.timerDone")}</div>}
+          <div className="mt-2 flex items-center justify-center gap-2">
+            {[1, 3, 5].map((m) => (
+              <button
+                key={m}
+                onClick={() => tmDispatch({ type: "set", totalMs: m * 60000 })}
+                disabled={tm.running}
+                className={btn("neutral", "sm")}
+              >
+                {m} {t("clock.min")}
+              </button>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center justify-center gap-4">
+            <button
+              onClick={() => tmDispatch({ type: tm.running ? "pause" : "start", now: Date.now() })}
+              disabled={tm.totalMs === 0 && !tm.running}
+              className={
+                "h-12 w-12 rounded-full text-lg text-white " +
+                (tm.running ? "bg-danger" : "bg-green-500")
+              }
+              aria-label={t("clock.timer")}
+            >
+              {tm.running ? "⏸" : "▶"}
+            </button>
+            <button
+              onClick={() => tmDispatch({ type: "reset" })}
+              disabled={tm.totalMs === 0}
+              className="h-12 w-12 rounded-full bg-neutral-300 text-lg disabled:opacity-30 dark:bg-neutral-700"
+              aria-label="reset"
+            >
+              ↺
+            </button>
+          </div>
         </div>
-        {al.list.length === 0 ? (
-          <p className="py-2 text-center text-xs opacity-50">{t("clock.alarmEmpty")}</p>
-        ) : (
-          <div className="mt-2 space-y-1.5">
-            {al.list.map((a) => (
-              <div key={a.id} className="flex items-center justify-between gap-2 text-sm">
-                <div className="min-w-0">
-                  <span className={"tabular-nums font-semibold " + (!a.enabled ? "opacity-40" : "")}>
-                    {fmtHm(a.hour, a.min)}
-                  </span>
-                  {a.label && (
-                    <span className={"ml-2 text-xs " + (!a.enabled ? "opacity-40" : "opacity-60")}>
-                      {a.label}
-                    </span>
-                  )}
-                  {a.repeat && a.repeat.length > 0 && (
-                    <span className={"block text-[10px] " + (!a.enabled ? "opacity-40" : "opacity-50")}>
-                      {t("clock.repeat")}: {a.repeat.map((d) => DOW[d] ?? "").join(" · ")}
-                    </span>
-                  )}
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
+      </div>
+      <div className={tab === "alarm" ? "" : "hidden"}>
+        {ringAlarms.length > 0 && (
+          <div className="mt-4 space-y-2">
+            {ringAlarms.map((ra) => (
+              <div
+                key={ra.id}
+                className="flex items-center justify-between gap-2 rounded-xl bg-danger/15 px-3 py-2 text-sm"
+              >
+                <span>
+                  {(ra.tone ?? "🔔")} {fmtHm(ra.hour, ra.min)}
+                  {ra.label ? ` · ${ra.label}` : ""}
+                </span>
+                <div className="flex shrink-0 gap-1.5">
                   <button
-                    onClick={() => alDispatch({ type: "tone", id: a.id })}
-                    aria-label={t("clock.tone")}
-                    title={t("clock.tone")}
-                    className="rounded-full px-1 text-base leading-none"
+                    onClick={() => alDispatch({ type: "snooze", id: ra.id, now })}
+                    className={btn("neutral", "sm")}
                   >
-                    {a.tone ?? "🔔"}
+                    {t("clock.snooze")}
                   </button>
-                  <Switch
-                    on={a.enabled}
-                    onToggle={() => alDispatch({ type: "toggle", id: a.id })}
-                    label={t("clock.alarmToggle")}
-                  />
                   <button
-                    onClick={() => alDispatch({ type: "remove", id: a.id })}
-                    aria-label={t("clock.alarmRemove")}
-                    className="text-danger"
+                    onClick={() => alDispatch({ type: "dismiss", id: ra.id })}
+                    className={btn("danger", "sm")}
                   >
-                    ✕
+                    {t("clock.dismissAlarm")}
                   </button>
                 </div>
               </div>
             ))}
           </div>
         )}
-        <div className="mt-3 flex items-center gap-1">
-          <span className="mr-1 text-[10px] opacity-50">{t("clock.repeat")}</span>
-          {DOW.map((d, day) => (
+        <div className="mt-6 rounded-xl bg-neutral-200/50 p-4 dark:bg-neutral-800/50">
+          <div className="flex items-center justify-between">
+            <span className="text-xs uppercase tracking-wide opacity-50">{t("clock.alarm")}</span>
+            <span className="text-[11px] opacity-50">{t("clock.alarmCount", { n: al.list.length })}</span>
+          </div>
+          {al.list.length === 0 ? (
+            <p className="py-2 text-center text-xs opacity-50">{t("clock.alarmEmpty")}</p>
+          ) : (
+            <div className="mt-2 space-y-1.5">
+              {al.list.map((a) => (
+                <div key={a.id} className="flex items-center justify-between gap-2 text-sm">
+                  <div className="min-w-0">
+                    <span className={"tabular-nums font-semibold " + (!a.enabled ? "opacity-40" : "")}>
+                      {fmtHm(a.hour, a.min)}
+                    </span>
+                    {a.label && (
+                      <span className={"ml-2 text-xs " + (!a.enabled ? "opacity-40" : "opacity-60")}>
+                        {a.label}
+                      </span>
+                    )}
+                    {a.repeat && a.repeat.length > 0 && (
+                      <span className={"block text-[10px] " + (!a.enabled ? "opacity-40" : "opacity-50")}>
+                        {t("clock.repeat")}: {a.repeat.map((d) => DOW[d] ?? "").join(" · ")}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      onClick={() => alDispatch({ type: "tone", id: a.id })}
+                      aria-label={t("clock.tone")}
+                      title={t("clock.tone")}
+                      className="rounded-full px-1 text-base leading-none"
+                    >
+                      {a.tone ?? "🔔"}
+                    </button>
+                    <Switch
+                      on={a.enabled}
+                      onToggle={() => alDispatch({ type: "toggle", id: a.id })}
+                      label={t("clock.alarmToggle")}
+                    />
+                    <button
+                      onClick={() => alDispatch({ type: "remove", id: a.id })}
+                      aria-label={t("clock.alarmRemove")}
+                      className="text-danger"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="mt-3 flex items-center gap-1">
+            <span className="mr-1 text-[10px] opacity-50">{t("clock.repeat")}</span>
+            {DOW.map((d, day) => (
+              <button
+                key={day}
+                onClick={() => toggleDay(day)}
+                aria-pressed={alRepeat.includes(day)}
+                className={
+                  "h-6 w-6 rounded-full text-[10px] " +
+                  (alRepeat.includes(day)
+                    ? "bg-accent text-white"
+                    : "bg-neutral-300 dark:bg-neutral-700")
+                }
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+          <div className="mt-3 flex items-end gap-1.5">
+            <input
+              value={alH}
+              onChange={(e) => setAlH(e.target.value.replace(/[^0-9]/g, "").slice(0, 2))}
+              inputMode="numeric"
+              aria-label={t("clock.hour")}
+              className="w-12 rounded-lg bg-white/70 px-2 py-1 text-center text-sm outline-none dark:bg-neutral-900/70"
+            />
+            <span className="pb-1 text-sm">:</span>
+            <input
+              value={alM}
+              onChange={(e) => setAlM(e.target.value.replace(/[^0-9]/g, "").slice(0, 2))}
+              inputMode="numeric"
+              aria-label={t("clock.minute")}
+              className="w-12 rounded-lg bg-white/70 px-2 py-1 text-center text-sm outline-none dark:bg-neutral-900/70"
+            />
+            <input
+              value={alLabel}
+              onChange={(e) => setAlLabel(e.target.value)}
+              placeholder={t("clock.alarmLabel")}
+              className="min-w-0 flex-1 rounded-lg bg-white/70 px-2 py-1 text-sm outline-none dark:bg-neutral-900/70"
+            />
             <button
-              key={day}
-              onClick={() => toggleDay(day)}
-              aria-pressed={alRepeat.includes(day)}
-              className={
-                "h-6 w-6 rounded-full text-[10px] " +
-                (alRepeat.includes(day)
-                  ? "bg-accent text-white"
-                  : "bg-neutral-300 dark:bg-neutral-700")
-              }
+              onClick={addAlarm}
+              className="shrink-0 rounded-full bg-accent px-3 py-1.5 text-sm text-white active:scale-95"
             >
-              {d}
+              {t("clock.addAlarm")}
             </button>
-          ))}
+          </div>
         </div>
-        <div className="mt-3 flex items-end gap-1.5">
-          <input
-            value={alH}
-            onChange={(e) => setAlH(e.target.value.replace(/[^0-9]/g, "").slice(0, 2))}
-            inputMode="numeric"
-            aria-label={t("clock.hour")}
-            className="w-12 rounded-lg bg-white/70 px-2 py-1 text-center text-sm outline-none dark:bg-neutral-900/70"
-          />
-          <span className="pb-1 text-sm">:</span>
-          <input
-            value={alM}
-            onChange={(e) => setAlM(e.target.value.replace(/[^0-9]/g, "").slice(0, 2))}
-            inputMode="numeric"
-            aria-label={t("clock.minute")}
-            className="w-12 rounded-lg bg-white/70 px-2 py-1 text-center text-sm outline-none dark:bg-neutral-900/70"
-          />
-          <input
-            value={alLabel}
-            onChange={(e) => setAlLabel(e.target.value)}
-            placeholder={t("clock.alarmLabel")}
-            className="min-w-0 flex-1 rounded-lg bg-white/70 px-2 py-1 text-sm outline-none dark:bg-neutral-900/70"
-          />
-          <button
-            onClick={addAlarm}
-            className="shrink-0 rounded-full bg-accent px-3 py-1.5 text-sm text-white active:scale-95"
-          >
-            {t("clock.addAlarm")}
-          </button>
-        </div>
-      </div>
       </div>
       <div className={tab === "stopwatch" ? "" : "hidden"}>
         <StopwatchCard />
@@ -530,6 +501,16 @@ const Settings: FC = () => {
   const pickAutoOff = (v: string) => {
     writeStoreValue(AUTOOFF_STORE_KEY, Number(v));
     setAutoOffStr(v);
+  };
+  // Return to the dock home page when the display wakes (default ON). Reactive-ish:
+  // written to the shared store so the Shell's wake policy picks it up live.
+  const [wakeHome, setWakeHome] = useState(() =>
+    wakeHomeEnabled(readStoreValue<unknown>(WAKE_HOME_KEY, true)),
+  );
+  const toggleWakeHome = () => {
+    const next = !wakeHome;
+    setWakeHome(next);
+    writeStoreValue(WAKE_HOME_KEY, next);
   };
   // Truthful engine/ASR snapshot from get_status (engine + degraded + asr).
   const [aiView, setAiView] = useState<EngineView>({
@@ -597,6 +578,11 @@ const Settings: FC = () => {
             onChange={pickAutoOff}
             ariaLabel="auto-screen-off"
           />
+        </div>
+        <div className={SUB} />
+        <div className={ROW}>
+          <span className={LABEL}>{t("settings.wakeHome")}</span>
+          <Switch on={wakeHome} onToggle={toggleWakeHome} label={t("settings.wakeHome")} />
         </div>
       </section>
 
@@ -732,6 +718,7 @@ const Settings: FC = () => {
       <TaskManager />
       <LmkDebugPanel />
       <WallpaperCard />
+      <LockWallpaperCard />
       <LockSettings />
       <p className="px-1 text-xs opacity-50">mode={mode} · dark={String(dark)} · locale={locale}</p>
     </div>
@@ -754,18 +741,37 @@ const Calculator: FC = () => {
       setSt((s) => calcPress(s, k));
     }
   };
-  const shown = calcDisplay(st).split(ERR).join(t("calc.error"));
-  const ROWS: string[][] = [
-    ["C", "⌫", "%", "÷"],
+  // iOS layout: the operator column (incl. =) is orange, the top function row
+  // (C / ± / %) is a light grey, digits sit on the dark grey body.
+  // NOTE: like the real iOS Calculator there is no on-screen backspace in the
+  // 4×5 grid (Apple exposes AC/±/%/÷ up top). The reducer still supports "⌫"
+  // and it stays reachable via a physical Delete/Backspace (see calcFromKey),
+  // which this OS shell passes through on desktop.
+  const LAYOUT: string[][] = [
+    ["C", "±", "%", "÷"],
     ["7", "8", "9", "×"],
     ["4", "5", "6", "−"],
     ["1", "2", "3", "+"],
-    ["0", ".", "=", ""],
+    ["0", ".", "="],
   ];
-  // iOS-style key roles: the right operator column (incl. =) is orange,
-  // the top function row (C / ⌫ / %) is a light grey, everything else a digit key.
   const OPER = new Set(["÷", "×", "−", "+", "="]);
-  const FN = new Set(["C", "⌫", "%"]);
+  const FUNC = new Set(["C", "±", "%"]);
+  const keyCls = (k: string) =>
+    OPER.has(k)
+      ? "bg-[#ff9f0a] text-white" // iOS orange
+      : FUNC.has(k)
+        ? "bg-[#a5a5a5] text-black" // iOS light-grey functions
+        : "bg-[#333] text-white"; // iOS dark-grey digits
+
+  // Display layers: a dim "current operation" line above the big, thin, right-
+  // aligned result that auto-shrinks as it grows (iOS behaviour) so nothing is
+  // truncated. The keypad is a fixed-height bottom block sized purely by its
+  // column width — it never stretches with the window height.
+  const big = st.cur === ERR ? t("calc.error") : st.cur;
+  const operand = st.acc ? st.acc.trimEnd() : "";
+  const isErr = st.cur === ERR;
+  const clearGlyph = calcClearLabel(st);
+
   // Physical keyboard support: Enter/Backspace/Delete/Escape, digits, +−×÷% …
   // Keep the latest `press` in a ref so the window listener is registered only
   // once (no unbind/rebind churn on every keystroke).
@@ -781,83 +787,166 @@ const Calculator: FC = () => {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
   return (
-    <div className="flex h-full flex-col px-2 pb-2 pt-1">
-      <div className="flex items-start justify-between px-2">
+    // The Calculator is always a dark surface (like the real iOS app) regardless
+    // of the surrounding shell theme. min-h-full (not h-full) lets the page
+    // scroll on extremely short viewports so the keypad is never clipped.
+    <div className="flex min-h-full flex-col bg-black text-white">
+      <div className="flex justify-end px-4 pt-2">
         <button
           onClick={() => setShowHist((v) => !v)}
           className={
-            "rounded-full px-3 py-1 text-xs transition active:scale-90 " +
-            (showHist ? "bg-accent text-white" : "opacity-60")
+            "rounded-full px-3 py-1 text-[13px] leading-none transition active:scale-95 " +
+            (showHist
+              ? "bg-[#ff9f0a] text-white"
+              : "bg-white/10 text-white/70 hover:bg-white/20")
           }
         >
           {t("calc.history")}
           {history.length > 0 ? ` (${history.length})` : ""}
         </button>
-        <div
-          role="status"
-          className="flex-1 truncate px-1 pb-1 text-right text-[52px] font-thin leading-none tabular-nums"
-          style={{ color: st.cur === ERR ? "var(--color-danger, #ef4444)" : undefined }}
-        >
-          {shown}
+      </div>
+
+      {/* Big iOS-style display region (fills all space above the keypad). */}
+      <div className="relative min-h-0 flex-1 px-5">
+        {showHist &&
+          (history.length > 0 ? (
+            <div className="fade-in absolute inset-x-4 top-1 max-h-[70%] overflow-auto rounded-xl bg-white/10 p-2 text-sm backdrop-blur-md">
+              {history.map((h, i) => (
+                <div
+                  key={`${i}-${h.expr}`}
+                  className="flex items-baseline justify-end gap-2 py-0.5"
+                >
+                  <span className="text-white/60">{h.expr} =</span>
+                  <span className="tabular-nums font-medium text-white">{h.result}</span>
+                </div>
+              ))}
+              <button
+                onClick={() => setHistory([])}
+                className="mt-1 w-full rounded-md py-0.5 text-xs text-white/60 hover:text-white"
+              >
+                {t("calc.clear")}
+              </button>
+            </div>
+          ) : (
+            <div className="fade-in absolute inset-x-4 top-1 rounded-xl bg-white/10 p-2 text-center text-xs text-white/70 backdrop-blur-md">
+              {t("calc.empty")}
+            </div>
+          ))}
+        <div className="flex h-full flex-col justify-end pb-2">
+          {operand && (
+            <div
+              aria-hidden="true"
+              className="truncate pb-1 text-right text-2xl font-light tabular-nums text-white/45"
+            >
+              {operand}
+            </div>
+          )}
+          <div
+            role="status"
+            className="truncate text-right font-thin leading-none tabular-nums"
+            style={{
+              // Errors get a fixed, moderate size (the localized word shouldn't
+              // blow up to the full display height); numbers auto-shrink by length.
+              fontSize: isErr ? 40 : calcFontPx(big),
+              color: isErr ? "rgb(var(--danger))" : undefined,
+            }}
+          >
+            {big}
+          </div>
         </div>
       </div>
-      {showHist &&
-        (history.length > 0 ? (
-          <div className="mx-2 mb-1 max-h-24 overflow-auto rounded-xl bg-neutral-100/80 p-2 text-sm dark:bg-neutral-800/80">
-            {history.map((h, i) => (
-              <div
-                key={`${i}-${h.expr}`}
-                className="flex items-baseline justify-end gap-2 py-0.5"
-              >
-                <span className="opacity-50">{h.expr} =</span>
-                <span className="tabular-nums font-medium">{h.result}</span>
-              </div>
-            ))}
-            <button
-              onClick={() => setHistory([])}
-              className="mt-1 w-full rounded-md py-0.5 text-xs opacity-50 hover:opacity-100"
-            >
-              {t("calc.clear")}
-            </button>
-          </div>
-        ) : (
-          <p className="mb-1 text-center text-xs opacity-40">{t("calc.empty")}</p>
-        ))}
-      <div className="flex min-h-0 flex-1 flex-col justify-end">
-        <div className="grid grid-cols-4 gap-x-[11px] gap-y-[11px]">
-          {ROWS.map((row) =>
-            row
-              .filter(Boolean)
-              .map((k) => {
-                const isOp = OPER.has(k);
-                const isFn = FN.has(k);
-                const wide = k === "0";
+
+      {/* Keypad pinned to the bottom, square keys sized by column width. */}
+      <div className="px-2 pb-3">
+        <div className="grid grid-cols-4 gap-x-3 gap-y-3">
+          {LAYOUT.map((row, ri) => (
+            <Fragment key={ri}>
+              {row.map((k) => {
+                const wide = k === "0" && ri === LAYOUT.length - 1;
+                const glyph = k === "C" ? clearGlyph : k;
                 return (
                   <button
                     key={k}
                     onClick={() => press(k)}
-                    aria-label={k}
+                    aria-label={glyph}
                     className={
-                      "flex select-none items-center justify-center rounded-full text-[26px] leading-none transition active:scale-95 " +
-                      (isOp
-                        ? "bg-orange-500 text-white"
-                        : isFn
-                          ? "bg-neutral-200 text-neutral-900 dark:bg-neutral-300 dark:text-neutral-900"
-                          : "bg-neutral-300 text-neutral-900 dark:bg-neutral-600 dark:text-white") +
-                      (wide ? " col-span-2 justify-start pl-7" : " aspect-square")
+                      "flex select-none items-center rounded-full text-[26px] leading-none transition active:brightness-150 active:scale-95 " +
+                      (wide
+                        ? "col-span-2 justify-start pl-8 text-left"
+                        : "aspect-square justify-center") +
+                      " " +
+                      keyCls(k)
                     }
                   >
-                    {k}
+                    {glyph}
                   </button>
                 );
-              }),
-          )}
+              })}
+            </Fragment>
+          ))}
         </div>
       </div>
     </div>
   );
 };
+
+/* ---- Svelte migration seam (React → Svelte) ----
+ * Each migrated screen keeps its long-standing React implementation as the
+ * reference + bun-test path (the happy-dom suite has no .svelte loader) and is
+ * A/B-validated on-device through `SvelteAppHost`, which mounts the .svelte app
+ * inside the React shell. Routing:
+ *   • production build (`vite build`, what Tauri ships to a device) → Svelte;
+ *   • `vite dev` + the bun test suite → React, unless opted in below, so CI and
+ *     fast local iteration stay on the loader-free path.
+ * This lets each Svelte port be validated before the React body is deleted. */
+export function svelteEnabled(): boolean {
+  try {
+    // `import.meta.env.PROD` is only defined by Vite; absent under bun (→ React).
+    const env = (import.meta as { env?: { PROD?: boolean } }).env;
+    if (env?.PROD) return true;
+  } catch {
+    /* non-Vite runtime */
+  }
+  try {
+    // dev opt-in: localStorage.setItem("amos.ui.svelteCalc", "1")
+    return (
+      typeof localStorage !== "undefined" &&
+      localStorage.getItem("amos.ui.svelteCalc") === "1"
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Stable module-level loaders (identity must not change per render — the host
+// mounts once per loader identity).
+const loadCalculator = () => import("./svelte/CalculatorApp.svelte");
+const loadWeather = () => import("./svelte/WeatherApp.svelte");
+const loadContacts = () => import("./svelte/ContactsApp.svelte");
+const loadPermissions = () => import("./svelte/PermissionsApp.svelte");
+const loadClock = () => import("./svelte/ClockApp.svelte");
+const loadMessages = () => import("./svelte/MessagesApp.svelte");
+const loadMusic = () => import("./svelte/MusicApp.svelte");
+const loadNotes = () => import("./svelte/NotesApp.svelte");
+const loadFiles = () => import("./svelte/FilesApp.svelte");
+const loadPhotos = () => import("./svelte/PhotosApp.svelte");
+const loadPhone = () => import("./svelte/PhoneApp.svelte");
+const loadReminders = () => import("./svelte/RemindersApp.svelte");
+const loadMail = () => import("./svelte/MailApp.svelte");
+const loadSettings = () => import("./svelte/SettingsApp.svelte");
+const loadMaps = () => import("./svelte/MapsApp.svelte");
+const loadVmem = () => import("./svelte/VoiceMemosApp.svelte");
+const loadMagnifier = () => import("./svelte/MagnifierApp.svelte");
+const loadAndroid = () => import("./svelte/AndroidApp.svelte");
+const loadStore = () => import("./svelte/StoreApp.svelte");
+const loadCamera = () => import("./svelte/CameraApp.svelte");
+const loadInterp = () => import("./svelte/InterpApp.svelte");
+const loadAi = () => import("./svelte/AiApp.svelte");
+
+const CalculatorEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadCalculator} /> : <Calculator />;
 
 /* ---- Weather (localized 5-day forecast; data in lib/weather.ts) ---- */
 const Weather: FC = () => {
@@ -966,6 +1055,69 @@ const Weather: FC = () => {
   );
 };
 
+const WeatherEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadWeather} /> : <Weather />;
+
+const ContactsEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadContacts} /> : <ContactsApp />;
+
+const PermissionsEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadPermissions} /> : <PermissionsApp />;
+
+const ClockEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadClock} /> : <Clock />;
+
+const MessagesEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadMessages} /> : <MessagesApp />;
+
+const MusicEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadMusic} /> : <MusicApp />;
+
+const NotesEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadNotes} /> : <Notes />;
+
+const FilesEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadFiles} /> : <FilesApp />;
+
+const PhotosEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadPhotos} /> : <Photos />;
+
+const PhoneEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadPhone} /> : <PhoneApp />;
+
+const RemindersEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadReminders} /> : <RemindersApp />;
+
+const MailEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadMail} /> : <MailApp />;
+
+const SettingsEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadSettings} /> : <Settings />;
+
+const MapsEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadMaps} /> : <MapsApp />;
+
+const VmemosEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadVmem} /> : <VoiceMemosApp />;
+
+const MagnifierEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadMagnifier} /> : <MagnifierApp />;
+
+const AndroidEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadAndroid} /> : <AndroidApp />;
+
+const StoreEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadStore} /> : <StoreApp />;
+
+const CameraEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadCamera} /> : <CameraApp />;
+
+const InterpEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadInterp} /> : <InterpApp />;
+
+const AiEntry: FC = () =>
+  svelteEnabled() ? <SvelteAppHost load={loadAi} /> : <AiApp />;
+
 /* ---- Notes (persisted via the shared amos.notes store) ---- */
 const Notes: FC = () => {
   const { t } = useI18n();
@@ -1020,22 +1172,119 @@ const Notes: FC = () => {
   const editTasks = tasksOf(editVal);
   const [mode, setMode] = useState<"all" | "archived" | "trash">("all");
   const [searchQ, setSearchQ] = useState("");
+  const [exportMsg, setExportMsg] = useState("");
+  const doExportOne = async (n: Note) => {
+    const name = exportBaseName(new Date());
+    const text = noteExportText([n]);
+    const res = await exportTxtFile(name, text);
+    if (res?.path) {
+      setExportMsg(`${t("note.exportedTo")} ${res.name}`);
+    } else {
+      try {
+        await clipboardWrite({ kind: "text", text });
+      } catch {
+        /* clipboard unavailable — message still informs */
+      }
+      setExportMsg(t("note.exportCopied"));
+    }
+  };
   // Which note is expanded (its full body/editor is shown). Task lists & the
   // note being edited stay expanded so checklists are always actionable.
   const [openId, setOpenId] = useState<string | null>(null);
-  const active = orderPinned(searchNotes(notesOf(notes, undefined), mode === "all" ? searchQ : ""));
+  // Active #tag filter (lowercased name, no '#') — chips below the list filters.
+  const [selTag, setSelTag] = useState<string | null>(null);
+  const activeAll = orderPinned(searchNotes(notesOf(notes, undefined), mode === "all" ? searchQ : ""));
+  // Tags present in the current "all" list, with counts + first-written display name.
+  const tagRow = (() => {
+    const map = new Map<string, { name: string; count: number }>();
+    for (const n of activeAll)
+      for (const tg of tagsOf(n.text)) {
+        const k = tg.toLowerCase();
+        const e = map.get(k);
+        if (e) e.count += 1;
+        else map.set(k, { name: tg, count: 1 });
+      }
+    return [...map.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  })();
+  const active = selTag ? activeAll.filter((n) => hasTag(n.text, selTag)) : activeAll;
   const archived = notesOf(notes, "archived");
   const trashed = notesOf(notes, "trash");
   const agg = noteListProgress(notesOf(notes, undefined));
   const view = mode === "all" ? active : mode === "archived" ? archived : trashed;
   const setState = (id: string, st: "archived" | "trash" | undefined) =>
     persist(setNoteState(notes, id, st));
+  // Multi-select batch mode (archive / trash / restore / delete / pin).
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const selectedInView = new Set([...selected].filter((id) => view.some((n) => n.id === id)));
+  const toggleSel = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const exitSelect = () => {
+    setSelecting(false);
+    setSelected(new Set());
+  };
+  const selectAllInView = () => {
+    const ids = view.map((n) => n.id);
+    setSelected((prev) =>
+      ids.length > 0 && ids.every((id) => prev.has(id)) ? new Set() : new Set(ids),
+    );
+  };
+  const runBatch = (next: Note[]) => {
+    persist(next);
+    exitSelect();
+  };
+  const selIds = [...selectedInView];
+  const batchArch = () => runBatch(setManyState(notes, selIds, "archived"));
+  const batchTrash = () => runBatch(setManyState(notes, selIds, "trash"));
+  const batchRestore = () => runBatch(setManyState(notes, selIds, undefined));
+  const batchDelete = () => runBatch(removeMany(notes, selIds));
+  const batchPin = () => runBatch(setPinned(notes, selIds, true));
+  const selectRow = (n: Note) => {
+    const on = selected.has(n.id);
+    return (
+      <button
+        key={n.id}
+        onClick={() => toggleSel(n.id)}
+        aria-pressed={on}
+        className={
+          "block w-full rounded-2xl p-3 text-left shadow-sm ring-1 transition active:scale-[0.99] " +
+          (on
+            ? "bg-accent/15 ring-accent dark:bg-accent/20"
+            : "bg-white/60 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10")
+        }
+      >
+        <div className="flex items-center gap-2">
+          <span
+            aria-hidden
+            className={
+              "grid h-5 w-5 shrink-0 place-items-center rounded-full text-[12px] " +
+              (on ? "bg-accent text-white" : "border border-black/20 text-transparent dark:border-white/40")
+            }
+          >
+            ✓
+          </span>
+          <span className="truncate text-[15px] font-medium">{noteTitle(n.text) || t("note.untitled")}</span>
+        </div>
+      </button>
+    );
+  };
   const composeStats = noteStats(text);
   const statsOf = (n: Note) => noteStats(n.text);
   const chip = (m: "all" | "archived" | "trash", label: string, count: number) => (
     <button
       key={m}
-      onClick={() => setMode(m)}
+      onClick={() => {
+        setMode(m);
+        if (m !== "all") setSelTag(null);
+        // Multi-select is scoped to one tab: leave select mode when switching views.
+        setSelecting(false);
+        setSelected(new Set());
+      }}
       aria-pressed={mode === m}
       className={
         "rounded-full px-3 py-1 text-xs " +
@@ -1094,6 +1343,11 @@ const Notes: FC = () => {
   };
   return (
     <div className="p-4">
+      {exportMsg && (
+        <p role="status" className="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-xs text-accent dark:bg-white/10">
+          {exportMsg}
+        </p>
+      )}
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
@@ -1122,6 +1376,38 @@ const Notes: FC = () => {
         {chip("archived", t("note.tabArchived"), archived.length)}
         {chip("trash", t("note.tabTrash"), trashed.length)}
       </div>
+      {mode === "all" && (tagRow.length > 0 || selTag) && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {selTag && (
+            <button
+              onClick={() => setSelTag(null)}
+              className="rounded-full px-2.5 py-0.5 text-[11px] text-accent ring-1 ring-accent/50"
+              aria-pressed
+              title={t("note.clearTag")}
+            >
+              #{selTag} ✕
+            </button>
+          )}
+          {tagRow.map((tg) => {
+            const activeChip = selTag === tg.name.toLowerCase();
+            return (
+              <button
+                key={tg.name.toLowerCase()}
+                onClick={() => setSelTag(activeChip ? null : tg.name.toLowerCase())}
+                aria-pressed={activeChip}
+                className={
+                  "rounded-full px-2.5 py-0.5 text-[11px] " +
+                  (activeChip
+                    ? "bg-accent text-white"
+                    : "bg-black/5 text-accent ring-1 ring-accent/40 dark:bg-white/10")
+                }
+              >
+                #{tg.name} ({tg.count})
+              </button>
+            );
+          })}
+        </div>
+      )}
       {mode === "all" && agg.notes > 0 && (
         <p className="mt-2 text-[11px] text-accent">
           {t("note.progressAgg", {
@@ -1131,11 +1417,98 @@ const Notes: FC = () => {
           })}
         </p>
       )}
+      {(selecting || view.length > 0) && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {selecting ? (
+            <>
+              <span className="mr-1 text-xs opacity-70">已选 {selectedInView.size}</span>
+              <button
+                onClick={selectAllInView}
+                className="rounded-full bg-black/5 px-3 py-1 text-xs dark:bg-white/10"
+              >
+                {t("note.selectAll")}
+              </button>
+              {mode === "all" && (
+                <>
+                  <button
+                    disabled={selectedInView.size === 0}
+                    onClick={batchPin}
+                    className="rounded-full bg-black/5 px-3 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
+                  >
+                    ★ {t("note.pin")}
+                  </button>
+                  <button
+                    disabled={selectedInView.size === 0}
+                    onClick={batchArch}
+                    className="rounded-full bg-black/5 px-3 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
+                  >
+                    {t("note.archive")}
+                  </button>
+                  <button
+                    disabled={selectedInView.size === 0}
+                    onClick={batchTrash}
+                    className="rounded-full bg-black/5 px-3 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
+                  >
+                    {t("note.delete")}
+                  </button>
+                </>
+              )}
+              {mode === "archived" && (
+                <>
+                  <button
+                    disabled={selectedInView.size === 0}
+                    onClick={batchRestore}
+                    className="rounded-full bg-black/5 px-3 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
+                  >
+                    {t("note.restore")}
+                  </button>
+                  <button
+                    disabled={selectedInView.size === 0}
+                    onClick={batchTrash}
+                    className="rounded-full bg-black/5 px-3 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
+                  >
+                    {t("note.delete")}
+                  </button>
+                </>
+              )}
+              {mode === "trash" && (
+                <>
+                  <button
+                    disabled={selectedInView.size === 0}
+                    onClick={batchRestore}
+                    className="rounded-full bg-black/5 px-3 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
+                  >
+                    {t("note.restore")}
+                  </button>
+                  <button
+                    disabled={selectedInView.size === 0}
+                    onClick={batchDelete}
+                    className="rounded-full bg-red-500/15 px-3 py-1 text-xs text-danger disabled:opacity-30"
+                  >
+                    {t("note.deleteForever")}
+                  </button>
+                </>
+              )}
+              <button onClick={exitSelect} className="ml-auto text-xs text-accent">
+                {t("note.done")}
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => setSelecting(true)}
+              className="ml-auto rounded-full bg-black/5 px-3 py-1 text-xs dark:bg-white/10"
+            >
+              {t("note.select")}
+            </button>
+          )}
+        </div>
+      )}
       <div className="mt-3 space-y-2">
         {view.length === 0 ? (
           <p className="py-6 text-center text-sm opacity-60">{t("note.empty")}</p>
         ) : (
           view.map((n) => {
+            if (selecting) return selectRow(n);
             if (collapsed(n)) return noteRow(n);
             return (
             <div key={n.id} className="rounded-2xl bg-white/60 p-3 shadow-sm ring-1 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10">
@@ -1234,7 +1607,19 @@ const Notes: FC = () => {
                 <>
                   <p className="whitespace-pre-wrap text-sm">
                     {fmtInline(n.text).map((seg, i) =>
-                      seg.bold ? (
+                      seg.tag ? (
+                        <button
+                          type="button"
+                          key={i}
+                          onClick={() => {
+                            setMode("all");
+                            setSelTag(seg.text.slice(1).toLowerCase());
+                          }}
+                          className="text-accent font-medium underline decoration-accent/40 underline-offset-2"
+                        >
+                          {seg.text}
+                        </button>
+                      ) : seg.bold ? (
                         <strong key={i} className="font-semibold">
                           {seg.text}
                         </strong>
@@ -1306,6 +1691,13 @@ const Notes: FC = () => {
                       </span>
                     </span>
                     <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => void doExportOne(n)}
+                        title={t("note.export")}
+                        className="hover:underline"
+                      >
+                        ↧ {t("note.export")}
+                      </button>
                       {mode === "all" && (
                         <button
                           onClick={() => persist(togglePin(notes, n.id))}
@@ -1372,6 +1764,15 @@ const Photos: FC = () => {
   const [wallMsg, setWallMsg] = useState("");
   const [slide, setSlide] = useState(false);
   const [favOnly, setFavOnly] = useState(false);
+  // Video captures (from the camera) live in amos.captures + the binary MediaStore;
+  // they join this gallery as playable tiles alongside stills.
+  const [vids, setVids] = useState<VideoCapture[]>(() => listCaptures());
+  const [playId, setPlayId] = useState<string | null>(null);
+  const [playUrl, setPlayUrl] = useState("");
+  const fmtLen = (ms: number) => {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  };
   const persist = (l: Photo[]) => {
     writeStoreValue(PHOTOS_KEY, l);
     setList(l);
@@ -1425,6 +1826,35 @@ const Photos: FC = () => {
     }, 2500);
     return () => clearInterval(id);
   }, [slide, sel, list]);
+
+  const openVideo = async (id: string) => {
+    setPlayId(id);
+    const blob = await captureBlob(id);
+    if (blob) {
+      try {
+        if (typeof URL !== "undefined" && URL.createObjectURL) setPlayUrl(URL.createObjectURL(blob));
+      } catch {
+        /* object URLs unavailable (headless) — show a spinner */
+      }
+    }
+  };
+  const closeVideo = () => {
+    if (playUrl) URL.revokeObjectURL(playUrl);
+    setPlayUrl("");
+    setPlayId(null);
+  };
+  const deleteVideo = async (id: string) => {
+    await removeVideoCapture(id);
+    setVids(listCaptures());
+    closeVideo();
+  };
+  // Videos appear in the gallery only outside multi-select and the favourites filter.
+  const showVideos = vids.length > 0 && !selecting && !favOnly;
+  // Interleave stills + camera videos newest-first.
+  const gallery: ({ kind: "photo"; p: Photo } | { kind: "video"; v: VideoCapture })[] = [];
+  for (const p of shown) gallery.push({ kind: "photo", p });
+  if (showVideos) for (const v of vids) gallery.push({ kind: "video", v });
+  gallery.sort((a, b) => (b.kind === "photo" ? b.p.ts : b.v.ts) - (a.kind === "photo" ? a.p.ts : a.v.ts));
 
   if (sel) {
     const prev = neighborOf(list, sel.id, -1);
@@ -1583,7 +2013,38 @@ const Photos: FC = () => {
         <p className="py-10 text-center text-sm opacity-60">{t("photo.favEmpty")}</p>
       ) : (
         <div className="grid grid-cols-3 gap-1">
-          {shown.map((p) => {
+          {gallery.map((it) => {
+            if (it.kind === "video") {
+              const v = it.v;
+              return (
+                <div key={`v-${v.id}`} className="relative aspect-square overflow-hidden bg-black text-4xl">
+                  <button
+                    aria-label="video"
+                    onClick={() => void openVideo(v.id)}
+                    className="absolute inset-0 grid h-full w-full place-items-center"
+                  >
+                    <span className="opacity-90">🎬</span>
+                    <VideoThumb id={v.id} />
+                    <span className="absolute bottom-1 right-1 rounded bg-black/60 px-1 text-[10px] tabular-nums text-white">
+                      {fmtLen(v.durationMs)}
+                    </span>
+                    {resLabelOf(v) && (
+                      <span className="absolute bottom-1 left-1 rounded bg-black/60 px-1 text-[9px] font-medium text-white">
+                        {resLabelOf(v)}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    aria-label="favourite video"
+                    onClick={() => setVids(toggleCaptureFav(v.id))}
+                    className="absolute right-1 top-1 z-10 grid h-6 w-6 place-items-center rounded-full bg-black/45 text-xs text-white"
+                  >
+                    {v.fav ? "♥" : "♡"}
+                  </button>
+                </div>
+              );
+            }
+            const p = it.p;
             const isSel = selecting && selected.has(p.id);
             return (
               <button
@@ -1619,34 +2080,88 @@ const Photos: FC = () => {
           })}
         </div>
       )}
+      {/* video playback overlay (camera captures shown in the gallery) */}
+      {playId && (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-black/85 px-4">
+          <div className="w-full max-w-lg">
+            {playUrl ? (
+              <video src={playUrl} controls autoPlay playsInline className="max-h-[70vh] w-full rounded-xl" />
+            ) : (
+              <div className="grid h-40 w-full place-items-center text-white/50">…</div>
+            )}
+            <div className="mt-2 text-center text-xs text-white/80">
+              {(() => {
+                const cap = vids.find((x) => x.id === playId);
+                if (!cap) return null;
+                const res = resLabelOf(cap);
+                return `${fmtLen(cap.durationMs)}${res ? ` · ${res}` : ""}`;
+              })()}
+            </div>
+            <div className="mt-3 flex flex-col items-center gap-2">
+              {wallMsg && <p role="status" className="text-xs text-white/80">{wallMsg}</p>}
+              <div className="flex items-center justify-between gap-3 self-stretch">
+                <button
+                  onClick={closeVideo}
+                  className="rounded-full bg-white/15 px-5 py-1.5 text-sm text-white ring-1 ring-white/25"
+                >
+                  ✕
+                </button>
+                <button
+                  onClick={() => {
+                    const cap = vids.find((x) => x.id === playId);
+                    if (!cap) return;
+                    try {
+                      navigator.clipboard?.writeText(
+                        `🎬 ${fmtLen(cap.durationMs)} · ${new Date(cap.ts).toLocaleString()}`,
+                      );
+                    } catch {
+                      /* clipboard unavailable */
+                    }
+                    setWallMsg(t("photo.shared"));
+                  }}
+                  className="rounded-full bg-white/15 px-4 py-1.5 text-sm text-white ring-1 ring-white/25"
+                >
+                  {t("photo.share")}
+                </button>
+                <button
+                  onClick={() => void deleteVideo(playId!)}
+                  className="rounded-full bg-danger/90 px-4 py-1.5 text-sm text-white"
+                >
+                  {t("photo.delete")}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
 
 /** Map of ported app id → React component. Unported ids fall back to a stub. */
 const COMPONENTS: Record<string, FC> = {
-  clock: Clock,
-  settings: Settings,
-  calculator: Calculator,
-  weather: Weather,
-  notes: Notes,
-  reminders: RemindersApp,
-  vmemos: VoiceMemosApp,
-  photos: Photos,
-  files: FilesApp,
-  android: AndroidApp,
-  messages: MessagesApp,
-  phone: PhoneApp,
-  music: MusicApp,
-  maps: MapsApp,
-  camera: CameraApp,
-  ai: AiApp,
-  interpreter: InterpApp,
-  mail: MailApp,
-  store: StoreApp,
-  privacy: PermissionsApp,
-  contacts: ContactsApp,
-  magnifier: MagnifierApp,
+  clock: ClockEntry,
+  settings: SettingsEntry,
+  calculator: CalculatorEntry,
+  weather: WeatherEntry,
+  notes: NotesEntry,
+  reminders: RemindersEntry,
+  vmemos: VmemosEntry,
+  photos: PhotosEntry,
+  files: FilesEntry,
+  android: AndroidEntry,
+  messages: MessagesEntry,
+  phone: PhoneEntry,
+  music: MusicEntry,
+  maps: MapsEntry,
+  camera: CameraEntry,
+  ai: AiEntry,
+  interpreter: InterpEntry,
+  mail: MailEntry,
+  store: StoreEntry,
+  privacy: PermissionsEntry,
+  contacts: ContactsEntry,
+  magnifier: MagnifierEntry,
 };
 
 /** Get the component for an app id, or a "not ported yet" placeholder. */
