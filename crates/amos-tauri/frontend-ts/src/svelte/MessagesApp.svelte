@@ -1,7 +1,7 @@
 <script lang="ts">
-  // MessagesApp.svelte — Svelte 5 (runes) port of the React MessagesApp in
-  // src/components/CommsApps.tsx. All message logic reuses pure lib/messages.ts;
-  // unread → notification sync mirrors the React effect via $effect; swipe-to-
+  // MessagesApp.svelte — Svelte 5 (runes) single-source implementation of the
+  // messages screen. All message logic reuses pure lib/messages.ts;
+  // unread → notification sync happens via $effect; swipe-to-
   // delete uses the same threshold. Store key: amos.messages.
   import {
     MSG_KEY,
@@ -20,6 +20,7 @@
   import type { Msg } from "../lib/messages";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { NOTIF_KEY, removeAppNotifs } from "../lib/settings";
+  import { iconSvg } from "../lib/sysIcons";
   import type { Notif } from "../lib/settings";
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
@@ -104,11 +105,11 @@
       <span class="text-sm font-semibold">{CONTACT}</span>
       {#if unreadCount(msgs) > 0}
         <button onclick={() => persist(markAllRead(msgs))} title={t("message.markRead")}
-          class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-xs text-accent">● {unreadCount(msgs)} {t("message.unread")}</button>
+          class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-xs text-accent"><span class="inline-block h-1.5 w-1.5 rounded-full bg-accent align-[-1px]"></span> {unreadCount(msgs)} {t("message.unread")}</button>
       {/if}
     </div>
     <button onclick={clear} disabled={msgs.length === 0} aria-label={t("message.clear")}
-      class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700">🗑 {t("message.clear")}</button>
+      class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700"><span data-icon="trash" class="inline-flex align-[-1px]">{@html iconSvg("trash", "h-3 w-3")}</span> {t("message.clear")}</button>
   </div>
 
   <div class="flex-1 space-y-2 overflow-auto">
@@ -131,16 +132,16 @@
             class={"rounded-2xl px-3 py-2 text-sm " +
               (m.from === "me" ? "bg-accent text-white" : "bg-neutral-300 text-neutral-900 dark:bg-neutral-700 dark:text-white")}>
             {#if m.quote}
-              <div class={"mb-1 rounded-md px-1.5 py-0.5 text-xs leading-snug opacity-70 " +
-                (m.from === "me" ? "bg-white/20" : "bg-black/5 dark:bg-white/10")}>↩ {m.quote}</div>
+              <div class={"mb-1 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs leading-snug opacity-70 " +
+                (m.from === "me" ? "bg-white/20" : "bg-black/5 dark:bg-white/10")}><span class="inline-flex shrink-0">{@html iconSvg("reply", "h-3 w-3")}</span> {m.quote}</div>
             {/if}
             <div class="whitespace-pre-wrap">{m.text}</div>
             <div class="mt-0.5 text-right text-xs tabular-nums opacity-60">{fmtBubbleTime(m.ts)}</div>
           </div>
-          <button onclick={() => (replyTo = m.text)} aria-label={t("message.reply")} title={t("message.reply")}
-            class="mt-1 shrink-0 rounded-full px-1 text-xs leading-none opacity-0 transition-opacity group-hover:opacity-60">↩</button>
-          <button onclick={() => persist(removeMessageAt(msgs, i))} aria-label={t("message.remove")} title={t("message.remove")}
-            class="mt-1 shrink-0 rounded-full px-1 text-xs leading-none opacity-0 transition-opacity group-hover:opacity-60">✕</button>
+          <button onclick={() => (replyTo = m.text)} aria-label={t("message.reply")} title={t("message.reply")} data-icon="reply"
+            class="mt-1 shrink-0 rounded-full px-1 text-xs leading-none opacity-0 transition-opacity group-hover:opacity-60">{@html iconSvg("reply", "h-4 w-4")}</button>
+          <button onclick={() => persist(removeMessageAt(msgs, i))} aria-label={t("message.remove")} title={t("message.remove")} data-icon="x"
+            class="mt-1 shrink-0 rounded-full px-1 text-xs leading-none opacity-0 transition-opacity group-hover:opacity-60">{@html iconSvg("x", "h-3 w-3")}</button>
         </div>
       {/each}
     {/if}
@@ -148,8 +149,8 @@
 
   {#if replyTo}
     <div class="mt-1 flex items-center justify-between gap-2 rounded-lg bg-accent/10 px-2 py-1 text-xs">
-      <span class="min-w-0 truncate text-accent">↩ {t("message.replying")}: {replyTo}</span>
-      <button onclick={() => (replyTo = null)} aria-label={t("message.replyClear")} class="shrink-0 px-1 text-accent">✕</button>
+      <span class="flex min-w-0 items-center gap-1 truncate text-accent"><span data-icon="reply" class="inline-flex shrink-0">{@html iconSvg("reply", "h-3 w-3")}</span> {t("message.replying")}: {replyTo}</span>
+      <button onclick={() => (replyTo = null)} aria-label={t("message.replyClear")} data-icon="x" class="shrink-0 px-1 text-accent">{@html iconSvg("x", "h-3 w-3")}</button>
     </div>
   {/if}
 
@@ -163,8 +164,8 @@
         class="min-w-0 flex-1 bg-transparent text-sm text-neutral-900 outline-none placeholder:text-black/30 dark:text-white dark:placeholder:text-white/30"
       />
     </div>
-    <button onclick={send} title={t("message.placeholder", { name: CONTACT })} aria-label="send"
-      class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white shadow-[0_4px_12px_rgba(0,122,255,0.35)] transition active:scale-90">➤</button>
+    <button onclick={send} title={t("message.placeholder", { name: CONTACT })} aria-label="send" data-icon="send"
+      class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white shadow-[0_4px_12px_rgba(0,122,255,0.35)] transition active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
   </div>
 </div>
 

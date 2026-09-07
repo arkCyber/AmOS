@@ -34,7 +34,10 @@ export type SysIconName =
   | "repeat"
   | "messageCircle"
   | "musicNote"
-  | "headphones";
+  | "headphones"
+  | "trash"
+  | "send"
+  | "reply";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -135,6 +138,13 @@ const INNER: Record<SysIconName, string> = {
     '<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5Z"/>' +
     '<path d="M21 14h-3a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-5Z"/>' +
     '<path d="M3 14v-3a9 9 0 0 1 18 0v3"/>',
+  trash:
+    '<path d="M3 6h18"/>' +
+    '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>' +
+    '<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>' +
+    '<path d="M10 11v6M14 11v6"/>',
+  send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+  reply: '<path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>',
 };
 
 /** Render a named icon as an SVG markup string. */
