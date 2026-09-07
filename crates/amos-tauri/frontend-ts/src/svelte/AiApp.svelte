@@ -1,7 +1,6 @@
 <script lang="ts">
-  // AiApp.svelte — Svelte 5 (runes) port of the React `AiApp`
-  // (components/BackendApps.tsx) + its two voice subcomponents rendered inline via
-  // <VoiceMicButton/> and <StreamVoiceButton/>. No React. chat_agent streaming
+  // AiApp.svelte — Svelte 5 (runes) single-source implementation of the AI
+  // screen, rendering <VoiceMicButton/> and <StreamVoiceButton/>. chat_agent streaming
   // (tokens + semantic UiCards) + sessions/history reuses lib/backend + lib/stream
   // pure parsers. Outside Tauri every RPC degrades to null so the shell shows a
   // localized banner; live chat/voice need a real amos-ai daemon + mic.
@@ -24,6 +23,7 @@
   import { capTail } from "../lib/bounded";
   import VoiceMicButton from "./VoiceMicButton.svelte";
   import StreamVoiceButton from "./StreamVoiceButton.svelte";
+  import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
   /* Bounds for long-lived in-session lists (deterministic-memory guard). */
@@ -323,8 +323,9 @@
             <button
               onclick={() => void delSess(s.session_id)}
               title={t("ai.removeSession")}
-              class="rounded-full bg-neutral-300 px-1.5 text-xs text-danger dark:bg-neutral-700"
-            >✕</button>
+              data-icon="x"
+              class="grid h-5 w-5 place-items-center rounded-full bg-neutral-300 text-danger dark:bg-neutral-700"
+            >{@html iconSvg("x", "h-3 w-3")}</button>
           </div>
         {/each}
       {:else}
@@ -428,8 +429,9 @@
       disabled={busy}
       aria-label="send"
       title="send"
-      class="rounded-full bg-accent px-4 text-white disabled:opacity-40"
-    >➤</button>
+      data-icon="send"
+      class="grid h-8 w-9 place-items-center rounded-full bg-accent px-2 text-white disabled:opacity-40"
+    >{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
   </div>
 </div>
 

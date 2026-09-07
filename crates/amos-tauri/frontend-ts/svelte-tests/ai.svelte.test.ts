@@ -19,6 +19,10 @@ const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const btnText = (h: { container: HTMLElement }, s: string) =>
   [...h.container.querySelectorAll("button")].find((b) => (b.textContent ?? "").includes(s)) as
     HTMLButtonElement | undefined;
+const btnByAria = (h: { container: HTMLElement }, label: string) =>
+  [...h.container.querySelectorAll("button")].find(
+    (b) => b.getAttribute("aria-label") === label,
+  ) as HTMLButtonElement | undefined;
 const textareaByPlaceholder = (h: { container: HTMLElement }, p: string) =>
   [...h.container.querySelectorAll("textarea")].find((t) =>
     (t.getAttribute("placeholder") ?? "").includes(p),
@@ -43,7 +47,7 @@ describe("AiApp.svelte (offline shell)", () => {
     await settle();
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "你好" } });
-    await fireEvent.click(btnText(host, "➤") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
     await settle();
     expect(input?.value).toBe(""); // echoed, not a silent no-op
     expect(txt(host)).toContain("你好");
@@ -57,7 +61,7 @@ describe("AiApp.svelte (offline shell)", () => {
     // Seed a conversation by sending offline.
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "hi" } });
-    await fireEvent.click(btnText(host, "➤") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
     await settle();
     expect(txt(host)).not.toContain("与 AI 对话"); // no longer empty
     // First tap arms...
@@ -76,7 +80,7 @@ describe("AiApp.svelte (offline shell)", () => {
     await settle();
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "hi" } });
-    await fireEvent.click(btnText(host, "➤") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
     await settle();
     // Arm the two-step clear...
     await fireEvent.click(btnText(host, "清空") as HTMLButtonElement);
@@ -96,7 +100,7 @@ describe("AiApp.svelte (offline shell)", () => {
     expect(btnText(host, "复制回答")).toBeFalsy();
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "hello" } });
-    await fireEvent.click(btnText(host, "➤") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
     await settle();
     expect(btnText(host, "复制回答")).toBeTruthy(); // last agent bubble has text
   });
