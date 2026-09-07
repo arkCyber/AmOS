@@ -110,17 +110,14 @@ describe("HomeDock.svelte — actions back to the shell (UP direction)", () => {
     await tick();
   });
 
-  test("the search pill emits 'search'", async () => {
+  test("home shows no floating search pill (search = downward swipe)", async () => {
     channel().set({ layout: layout([], ["phone"]), ext: [], pulseId: null });
     const { container } = render(HomeDock);
-    const searched: unknown[] = [];
-    const off = channel().on((event, detail) => {
-      if (event === "search") searched.push(detail);
-    });
-    await fireEvent.click(container.querySelector('button[aria-label="search"]') as HTMLButtonElement);
-    expect(searched).toEqual([undefined]);
-    off();
     await tick();
+    // The P2 change removed the dock-parallel pill; Spotlight is instead opened
+    // by a downward swipe on the home body (pure decision in lib/edgeSwipe.ts,
+    // covered by that module's unit tests — happy-dom cannot synthesize touches).
+    expect(container.querySelector('button[aria-label="search"]')).toBeNull();
   });
 });
 

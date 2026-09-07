@@ -12,7 +12,7 @@
   // i18n from locale.svelte.ts, notifications/DND reactively via createStoreValue
   // (svelte/store) — the twin of React's useStoreValue.
   import { t, locale } from "./locale.svelte";
-  import { iconSvg } from "../lib/sysIcons";
+  import { homeDownToSpotlight } from "../lib/edgeSwipe";
   import { onMount } from "svelte";
   import { appIcon, appTitleKey } from "../lib/appMeta";
   import type { HomeLayout } from "../lib/amosStore";
@@ -178,6 +178,25 @@
     panX = null;
   }
 
+  // ---- Home-body downward swipe → Spotlight (iPhone "swipe down on Home to
+  // search"). The top status edge is reserved for the Notification Center, and
+  // the bottom zone for the dock / Recents — see lib/edgeSwipe.ts. We only
+  // detect the vertical travel on the root; horizontal page-swipes are handled
+  // by the grid above and never have enough downward travel to trigger here.
+  let swipeY: number | null = null;
+  function onHomeTouchStart(e: TouchEvent): void {
+    const y = e.touches[0]?.clientY;
+    swipeY = y == null ? null : y;
+  }
+  function onHomeTouchEnd(e: TouchEvent): void {
+    const y0 = swipeY;
+    swipeY = null;
+    if (y0 == null) return;
+    const y = e.changedTouches[0]?.clientY;
+    if (y == null) return;
+    if (homeDownToSpotlight(y0, y, window.innerHeight)) home.emit("search");
+  }
+
   // ---- on-device diagnosis for "dock not rendering" (parity with React) ----
   onMount(() => {
     amosLog("dock", "mounted", { gridPages: gridPages.length, pageIds, dockIds });
@@ -208,7 +227,15 @@
 </script>
 
 
-<div class="flex h-full flex-col px-4 pb-3">
+<div
+  class="flex h-full flex-col px-4 pb-3"
+  role="group"
+  aria-label="home screen"
+  style="touch-action: none"
+  ontouchstart={onHomeTouchStart}
+  ontouchend={onHomeTouchEnd}
+  ontouchcancel={onHomeTouchEnd}
+>
   <!-- main paged region: a horizontal swipe ANYWHERE in this column pages the
        icon grid; widgets stay fixed above, bottom dock stays a single row below -->
   <div
@@ -297,14 +324,6 @@
       </button>
     </div>
   </div>
-
-  <!-- search pill (the React shell always supplies onSearch on the home screen) -->
-  <button
-    type="button"
-    aria-label="search"
-    onclick={() => home.emit("search")}
-    class="mx-auto mb-1.5 flex h-8 cursor-pointer items-center justify-center gap-1 rounded-full bg-white/45 px-3 text-xs font-medium text-neutral-700 shadow-sm ring-1 ring-black/5 transition active:scale-90 dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
-  ><span data-icon="search" class="grid h-3.5 w-3.5 place-items-center">{@html iconSvg("search", "h-3.5 w-3.5")}</span> <span>{t("home.search")}</span></button>
 
   <!-- bottom dock bar: single fixed row (no paging) -->
   <div
