@@ -22,6 +22,7 @@
   } from "../lib/contacts";
   import type { Contact } from "../lib/contacts";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { iconSvg } from "../lib/sysIcons";
   import { bridged, telephonyDial } from "../lib/backend";
   import {
     CALLLOG_KEY,
@@ -257,16 +258,17 @@
                 {/if}
               </span>
               <button onclick={() => openEdit(c)} aria-label={t("contacts.edit")} title={t("contacts.edit")}
-                class="grid h-8 w-8 place-items-center rounded-full text-sm text-neutral-500 opacity-80 active:scale-90 dark:text-neutral-300">✏️</button>
+                class="grid h-8 w-8 place-items-center rounded-full text-neutral-500 opacity-80 active:scale-90 dark:text-neutral-300">{@html iconSvg("pencil", "h-4 w-4")}</button>
               <button onclick={() => persist(setContactFav(contacts, c.id, !c.fav))} aria-label={t("contacts.fav")} title={t("contacts.fav")}
                 class="text-base opacity-70 active:scale-90">{c.fav ? "⭐" : "☆"}</button>
               <button onclick={() => void call(c)} aria-label={t("contacts.call")} title={t("contacts.call")}
-                class="grid h-8 w-8 place-items-center rounded-full bg-green-600/90 text-white active:scale-90">📞</button>
+                class="grid h-8 w-8 place-items-center rounded-full bg-green-600/90 text-white active:scale-90">{@html iconSvg("phone", "h-4 w-4")}</button>
               <button
                 onclick={() => (confirmId === c.id ? persist(removeContact(contacts, c.id)) : (confirmId = c.id))}
                 aria-label={t("contacts.delete")}
                 title={t("contacts.delete")}
-                class="h-8 w-8 text-danger/80 active:scale-90">{confirmId === c.id ? "✓" : "🗑"}</button>
+                data-icon={confirmId === c.id ? "check" : "trash"}
+                class="grid h-8 w-8 place-items-center text-danger/80 active:scale-90">{@html iconSvg(confirmId === c.id ? "check" : "trash", "h-4 w-4")}</button>
             </div>
           {/each}
         </div>

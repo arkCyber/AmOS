@@ -21,6 +21,7 @@
   import { captureBlob, listCaptures, removeVideoCapture, resLabelOf, toggleCaptureFav } from "../lib/cameraCapture";
   import type { VideoCapture } from "../lib/cameraCapture";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { iconSvg } from "../lib/sysIcons";
   import { fmtTime } from "../lib/notes";
   import { t } from "./locale.svelte";
 
@@ -316,7 +317,7 @@
               <p role="status" class="text-xs text-white/80">{wallMsg}</p>
             {/if}
             <div class="flex items-center justify-between gap-3 self-stretch">
-              <button onclick={closeVideo} class="rounded-full bg-white/15 px-5 py-1.5 text-sm text-white ring-1 ring-white/25">✕</button>
+              <button onclick={closeVideo} aria-label="close video" data-icon="x" class="grid h-8 w-8 place-items-center rounded-full bg-white/15 text-white ring-1 ring-white/25">{@html iconSvg("x", "h-4 w-4")}</button>
               <button onclick={() => playId && shareVideo(playId)} class="rounded-full bg-white/15 px-4 py-1.5 text-sm text-white ring-1 ring-white/25">{t("photo.share")}</button>
               <button onclick={() => playId && void deleteVideo(playId)} class="rounded-full bg-danger/90 px-4 py-1.5 text-sm text-white">{t("photo.delete")}</button>
             </div>

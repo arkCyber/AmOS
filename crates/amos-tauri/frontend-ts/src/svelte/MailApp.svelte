@@ -1,10 +1,9 @@
 <script lang="ts">
-  // MailApp.svelte — Svelte 5 (runes) port of the React MailApp
-  // (src/components/MailApp.tsx). Reads + acts on the amos-mail daemon purely
-  // through lib/backend.ts (same bridge the React UI uses); offline (no bridge)
-  // shows a localized banner + empty list, exactly like React. Unread INBOX mail
-  // is mirrored into the shared notif store for the dock badge (zh label, as the
-  // React UI does).
+  // MailApp.svelte — Svelte 5 (runes) single-source implementation of the mail
+  // screen. Reads + acts on the amos-mail daemon purely
+  // through lib/backend.ts; offline (no bridge)
+  // shows a localized banner + empty list. Unread INBOX mail
+  // is mirrored into the shared notif store for the dock badge.
   import {
     bridged,
     mailDelete,
@@ -21,6 +20,7 @@
     type MailSummary,
   } from "../lib/backend";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { iconSvg } from "../lib/sysIcons";
   import { NOTIF_KEY, removeAppNotifs, type Notif } from "../lib/settings";
   import { zh } from "../i18n/locales/zh";
   import { t, locale } from "./locale.svelte";
@@ -284,13 +284,13 @@
         </button>
       {/if}
       {#if opened.summary.mailbox !== "Archive"}
-        <button onclick={() => void moveOut("Archive")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">
-          🗂 {t("mail.archive")}
+        <button onclick={() => void moveOut("Archive")} class="inline-flex items-center gap-1 rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">
+          <span data-icon="archive">{@html iconSvg("archive", "h-3 w-3")}</span> {t("mail.archive")}
         </button>
       {/if}
       {#if opened.summary.mailbox !== "Trash"}
-        <button onclick={() => void moveOut("Trash")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">
-          🗑 {t("mail.trash")}
+        <button onclick={() => void moveOut("Trash")} class="inline-flex items-center gap-1 rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">
+          <span data-icon="trash">{@html iconSvg("trash", "h-3 w-3")}</span> {t("mail.trash")}
         </button>
       {/if}
       {#if opened.summary.mailbox === "Trash"}
@@ -360,9 +360,9 @@
           sentId = null;
           error = null;
         }}
-        class="rounded-full bg-accent px-3 py-1 text-xs text-white"
+        class="inline-flex items-center gap-1 rounded-full bg-accent px-3 py-1 text-xs text-white"
       >
-        ✏️ {t("mail.compose")}
+        <span data-icon="pencil">{@html iconSvg("pencil", "h-3 w-3")}</span> {t("mail.compose")}
       </button>
     </div>
 
