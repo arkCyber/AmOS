@@ -107,3 +107,41 @@ iOS 的真相是：**应用全屏、edge-to-edge、分层堆叠**；系统不会
 - [ ] 成组卡片 `rounded-[11px]` 与图标 `rounded-[19px]` 视觉是否过度“棱角”。
 - [ ] 各 App 打开时顶部固定标题栏与内容是否出现“双层标题”感。
 - [ ] 控制中心磁贴 on/off 两态的图标明暗 / 反色是否清晰。
+
+---
+
+## 8. P0 实施状态（2026-09-07 追加）
+
+本报告的 P0-1（统一矢量图标、替换 emoji/文本 glyph）已**分步落地**，新增
+`frontend-ts/src/lib/sysIcons.ts`（SF 风格 `currentColor` SVG，Svelte `{@html}` / React
+`dangerouslySetInnerHTML` 共用）。下列界面已改为矢量图标，且每步 `vitest`/`svelte-check`/`tsc`
+验证通过、独立提交：
+
+| 界面 / 文件 | 已替换 | 提交 |
+| --- | --- | --- |
+| 状态栏 `StatusBar`（Svelte + React） | 📶🅱✈️🔦🌒🔕 与 `▮▮▮ 87%` 电池 → `wifi/bluetooth/airplane/flashlight/moon/mutedBell` + 电池 glyph | `084c416` |
+| 控制中心 / 通知 `NotificationCenter`（双端） | quick tiles、手电、动作钮 🔍⇤✎🔒、DND 行、`✕` | `a67b2bf` |
+| 音乐 `MusicApp` | 传输 ⏮▶⏸⏭、循环 🔁🔂、歌词 💬、行指示 ♪/▶、删除 ✕、🎧 | `1f4dbaa` |
+| 信息 `MessagesApp` | 🗑 ➤ ↩ ✕、● 未读点 | `81c6fcd` |
+| 来电 `IncomingCall`（双端） | 📞 🎙️🔇 ✕ ●⏹ | `83558ef` |
+| 锁屏 `LockScreen`（双端） | 🔒、⌫✓（保留 aria-label） | `b7da1ab` |
+| Notes 标签 chip ✕ | `e1f0d6c` | |
+| Reminders 搜索工具栏 | 🔍✕ | `d960a16` |
+| Clock 计时/秒表/闹钟钮 | ⏸▶↺✕ | `ba38271` |
+| Weather/Permissions/Privacy 授权 chip ✕ | `d3a7272` | |
+| AiApp 发送/删会话 | ➤✕ | `8e38483` |
+| VoiceMemos 录制/播放/编辑/删除 | ●❚❚▶✎🗑 | `c836631` |
+| PhoneApp 通话/拨号控件 | 📞🎙️🔇⏹●⌨️✕⌫ | `32d4beb` |
+| HomeDock 搜索胶囊 🔍（双端） | `55e65f9` | |
+
+**刻意保留的 emoji（数据 / 内容，非按钮 chrome，不在 P0-A 范围）**：
+App 分组/用户可选的图标（App Library 组图标、联系人头像占位、闹钟铃声 `🔔`、收藏 ★/♥、
+置顶 📌、旗标 ⚑/⚑、完成 ✓ 状态、机器人 🤖/用户 👤 头像、通知 `n.icon` 数据字段、附件 ✉️📎 等）。
+它们需要“数据→图标”映射层决策，属于后续专项，不应盲改。
+
+**待办 / 注意**：
+- 还有零星 App 按钮 emoji（Mail/Contacts/Files/Photos 等）及若干搜索框前缀 `🔍` 未清；
+- 其中一部分位于**当前未跟踪的进行中文件**（例：`AppLibrary.svelte`、`PrivacyPage.svelte`、
+  `settings-pages.svelte.test.ts` 曾为未跟踪），为避免把进行中的工作卷入提交，涉及这类文件时
+  要么跳过、要么先由归属人提交后再继续。
+- 图标为 best-effort 的 `currentColor` 矢量，**需按第 7 节清单肉眼复核**造型/线宽与 SF Symbols 的差距。
