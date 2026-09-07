@@ -26,26 +26,26 @@ async function renderOpen() {
   return container;
 }
 
-const tileByIcon = (c: HTMLElement, icon: string) =>
+const tileByIcon = (c: HTMLElement, dataIcon: string) =>
   [...c.querySelectorAll("button[aria-pressed]")].find((b) =>
-    (b.textContent ?? "").includes(icon),
+    b.querySelector(`[data-icon="${dataIcon}"]`),
   ) as HTMLButtonElement | undefined;
 
 describe("NotificationCenter.svelte (controlled via propsBus 'nc')", () => {
   test("renders quick tiles and the flashlight tile when open", async () => {
     const c = await renderOpen();
     expect(c.querySelectorAll('button[aria-pressed]').length).toBeGreaterThanOrEqual(6);
-    expect(tileByIcon(c, "📶")).toBeTruthy(); // wifi
-    expect(tileByIcon(c, "🔦") || tileByIcon(c, "🔆")).toBeTruthy(); // torch tile
+    expect(tileByIcon(c, "wifi")).toBeTruthy(); // wifi
+    expect(tileByIcon(c, "flashlight")).toBeTruthy(); // torch tile
   });
 
   test("toggling Do-Not-Disturb flips its tile and persists", async () => {
     const c = await renderOpen();
-    const dnd = tileByIcon(c, "🌒") as HTMLButtonElement;
+    const dnd = tileByIcon(c, "dnd") as HTMLButtonElement;
     expect(dnd.getAttribute("aria-pressed")).toBe("false");
     await fireEvent.click(dnd);
     await tick();
-    const next = tileByIcon(c, "🌒") as HTMLButtonElement;
+    const next = tileByIcon(c, "dnd") as HTMLButtonElement;
     expect(next.getAttribute("aria-pressed")).toBe("true");
     expect(readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {}).dnd).toBe(true);
   });
@@ -68,11 +68,11 @@ describe("NotificationCenter.svelte (controlled via propsBus 'nc')", () => {
 
   test("location starts ON and a tap flips it off", async () => {
     const c = await renderOpen();
-    const loc = tileByIcon(c, "📍") as HTMLButtonElement;
+    const loc = tileByIcon(c, "location") as HTMLButtonElement;
     expect(loc.getAttribute("aria-pressed")).toBe("true"); // default ON
     await fireEvent.click(loc);
     await tick();
-    const after = tileByIcon(c, "📍") as HTMLButtonElement;
+    const after = tileByIcon(c, "location") as HTMLButtonElement;
     expect(after.getAttribute("aria-pressed")).toBe("false");
   });
 

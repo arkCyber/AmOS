@@ -20,12 +20,13 @@ const byAria = (container: HTMLElement, aria: string) =>
   container.querySelector(`[aria-label="${aria}"]`);
 
 describe("StatusBar.svelte", () => {
-  test("renders the clock (digits) and battery", async () => {
+  test("renders the clock (digits) and a battery glyph + %", async () => {
     const { container } = render(StatusBar);
     await tick();
     expect(container.textContent ?? "").toMatch(/\d{1,2}:\d{2}/); // fmtClock
-    expect(container.textContent ?? "").toContain("▮▮▮");
-    expect(container.textContent ?? "").toMatch(/%/);
+    const batt = container.querySelector('[aria-label="battery level"]');
+    expect(batt?.querySelector("svg")).toBeTruthy(); // vector battery glyph
+    expect(batt?.textContent ?? "").toMatch(/%/);
   });
 
   test("shows the flashlight glyph when the torch store is on", async () => {
