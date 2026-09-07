@@ -38,6 +38,7 @@
   import type { Note } from "../lib/notes";
   import { clipboardHistory, clipboardRead, clipboardWrite, entryText } from "../lib/clipboard";
   import type { ClipboardEntry } from "../lib/clipboard";
+  import { iconSvg } from "../lib/sysIcons";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { exportTxtFile } from "../lib/backend";
   import { t } from "./locale.svelte";
@@ -240,7 +241,7 @@
   {#if mode === "all" && (tagRow.length > 0 || selTag)}
     <div class="mt-2 flex flex-wrap items-center gap-1.5">
       {#if selTag}
-        <button onclick={() => (selTag = null)} aria-pressed="true" class="rounded-full px-2.5 py-0.5 text-[11px] text-accent ring-1 ring-accent/50" title={t("note.clearTag")}>#{selTag} ✕</button>
+        <button onclick={() => (selTag = null)} aria-pressed="true" title={t("note.clearTag")} class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] text-accent ring-1 ring-accent/50">#{selTag}<span data-icon="x" class="grid h-3 w-3 place-items-center">{@html iconSvg("x", "h-3 w-3")}</span></button>
       {/if}
       {#each tagRow as tg (tg.name.toLowerCase())}
         {@const k = tg.name.toLowerCase()}

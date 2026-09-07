@@ -74,8 +74,9 @@ describe("NotesApp.svelte", () => {
     expect(txt(host)).not.toContain("买菜清单");
 
     const clear = [...host.container.querySelectorAll("button")].find((b) =>
-      (b.textContent ?? "").includes("✕"),
+      b.querySelector('[data-icon="x"]'),
     );
+    expect(clear).toBeTruthy();
     await fireEvent.click(clear as HTMLButtonElement);
     expect(txt(host)).toContain("买菜清单");
   });
