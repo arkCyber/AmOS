@@ -59,7 +59,7 @@ describe("WeatherApp.svelte", () => {
     expect(edit).toBeTruthy();
     await fireEvent.click(edit as HTMLButtonElement);
     const removeBeijing = buttons(host).find(
-      (b) => (b.textContent ?? "").includes("北京") && (b.textContent ?? "").includes("✕"),
+      (b) => (b.textContent ?? "").includes("北京") && !!b.querySelector('[data-icon="x"]'),
     );
     expect(removeBeijing).toBeTruthy();
     await fireEvent.click(removeBeijing as HTMLButtonElement);

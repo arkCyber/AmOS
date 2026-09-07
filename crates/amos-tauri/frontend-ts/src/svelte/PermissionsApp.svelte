@@ -25,6 +25,7 @@
   } from "../lib/privacyBackend";
   import type { AuditView } from "../lib/privacyBackend";
   import { isExtId, tileById } from "../lib/storeApps";
+  import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
   /** Built-in apps that actually request each sensitive capability (a showcase). */
@@ -142,9 +143,9 @@
             <button
               onclick={() => toggle(app, cap)}
               title={t("perm.revoke")}
-              class="rounded-full bg-green-500/15 px-2.5 py-1 text-xs text-green-600 dark:text-green-400"
+              class="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2.5 py-1 text-xs text-green-600 dark:text-green-400"
             >
-              {labelOf(app)} ✕
+              {labelOf(app)}<span data-icon="x" class="grid h-3 w-3 place-items-center">{@html iconSvg("x", "h-3 w-3")}</span>
             </button>
           {/each}
         </div>

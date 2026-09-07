@@ -21,6 +21,7 @@
   } from "../lib/weather";
   import type { TempUnit, WCity } from "../lib/weather";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { iconSvg } from "../lib/sysIcons";
   import { locale, t } from "./locale.svelte";
 
   const CITIES_KEY = "amos.weather.cities";
@@ -109,9 +110,9 @@
       {#each cities as c (c.id)}
         <button
           onclick={() => removeAt(c.id)}
-          class="rounded-full bg-neutral-200 px-2 py-0.5 text-xs text-danger dark:bg-neutral-700"
+          class="inline-flex items-center gap-1 rounded-full bg-neutral-200 px-2 py-0.5 text-xs text-danger dark:bg-neutral-700"
         >
-          {t(`weather.city.${c.id}`)} ✕
+          {t(`weather.city.${c.id}`)}<span data-icon="x" class="grid h-3 w-3 place-items-center">{@html iconSvg("x", "h-3 w-3")}</span>
         </button>
       {/each}
     </div>

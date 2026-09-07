@@ -44,8 +44,8 @@ describe("PermissionsApp.svelte (offline ledger)", () => {
     expect(cameraCandidate(host)!.getAttribute("aria-pressed")).toBe("true");
 
     // The granted holder appears as a green chip "相机 ✕"; click to revoke.
-    const holder = [...host.container.querySelectorAll("button")].find((b) =>
-      (b.textContent ?? "").includes("相机") && (b.textContent ?? "").includes("✕"),
+    const holder = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").includes("相机") && !!b.querySelector('[data-icon="x"]'),
     );
     expect(holder).toBeTruthy();
     await fireEvent.click(holder as HTMLButtonElement);
