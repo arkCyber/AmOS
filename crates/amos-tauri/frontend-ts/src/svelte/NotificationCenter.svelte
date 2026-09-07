@@ -18,6 +18,7 @@
     type RadioPayload,
   } from "../lib/backend";
   import { attachFocusTrap } from "../lib/focusTrap";
+  import { iconSvg, quickIcon } from "../lib/sysIcons";
   import { propsChannel } from "./propsBus";
   import { createStoreValue } from "./store";
   import {
@@ -42,13 +43,13 @@
     type RadioKey,
   } from "../lib/settings";
 
-  const QUICK: { key: QuickKey; label: string; icon: string }[] = [
-    { key: "wifi", label: "q.wifi", icon: "📶" },
-    { key: "bluetooth", label: "q.bluetooth", icon: "🅱" },
-    { key: "airplane", label: "q.airplane", icon: "✈️" },
-    { key: "darkmode", label: "q.dark", icon: "🌙" },
-    { key: "dnd", label: "q.dnd", icon: "🌒" },
-    { key: "location", label: "q.location", icon: "📍" },
+  const QUICK: { key: QuickKey; label: string }[] = [
+    { key: "wifi", label: "q.wifi" },
+    { key: "bluetooth", label: "q.bluetooth" },
+    { key: "airplane", label: "q.airplane" },
+    { key: "darkmode", label: "q.dark" },
+    { key: "dnd", label: "q.dnd" },
+    { key: "location", label: "q.location" },
   ];
 
   interface NcProps {
@@ -192,10 +193,10 @@
 
     <!-- Control-center system actions (formerly the home top bar). -->
     <div class="mt-2 flex items-center justify-end gap-2">
-      <button aria-label="search" title="search" onclick={() => act("search")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10">🔍</button>
-      <button aria-label="recents" title="recents" onclick={() => act("recents")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10">⇤</button>
-      <button aria-label="edit home" title="edit home" onclick={() => act("edit")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10">✎</button>
-      <button aria-label="lock" title="lock" onclick={() => act("lock")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10">🔒</button>
+      <button aria-label="search" title="search" onclick={() => act("search")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="search">{@html iconSvg("search", "h-[17px] w-[17px]")}</span></button>
+      <button aria-label="recents" title="recents" onclick={() => act("recents")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="recents">{@html iconSvg("recents", "h-[17px] w-[17px]")}</span></button>
+      <button aria-label="edit home" title="edit home" onclick={() => act("edit")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="pencil">{@html iconSvg("pencil", "h-[17px] w-[17px]")}</span></button>
+      <button aria-label="lock" title="lock" onclick={() => act("lock")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="lock">{@html iconSvg("lock", "h-[17px] w-[17px]")}</span></button>
     </div>
 
     <!-- Torch / flashlight tile. -->
@@ -211,7 +212,7 @@
       }
     >
       <span class="flex items-center gap-2.5">
-        <span class="text-xl leading-none">{flash.on ? "🔦" : "🔆"}</span>
+        <span data-icon="flashlight" class="text-xl leading-none">{@html iconSvg("flashlight", "h-[22px] w-[22px]")}</span>
         {t("q.flashlight")}
       </span>
       {#if !flash.torch_present}
@@ -237,7 +238,7 @@
               : "bg-white/55 text-neutral-800 ring-1 ring-white/50 shadow-sm dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10")
           }
         >
-          <span class="text-xl leading-none">{q.icon}</span>
+          <span data-icon={q.key} class="text-xl leading-none">{@html iconSvg(quickIcon(q.key), "h-[22px] w-[22px]")}</span>
           {t(q.label)}
         </button>
       {/each}
@@ -246,7 +247,10 @@
     <div class="mt-3 flex items-center justify-between px-1">
       <span class="text-xs font-semibold uppercase tracking-widest opacity-50">
         {#if quiet}
-          <span class="normal-case tracking-normal text-accent">🌒 {t("nc.dnd")}</span>
+          <span class="inline-flex items-center gap-1 normal-case tracking-normal text-accent">
+            <span data-icon="moon" class="grid h-4 w-4 place-items-center">{@html iconSvg("moon", "h-4 w-4")}</span>
+            {t("nc.dnd")}
+          </span>
         {:else}
           {notifs.length} ·
         {/if}
@@ -270,8 +274,9 @@
               <button
                 onclick={() => dismiss(n.id)}
                 aria-label="dismiss"
+                data-icon="x"
                 class="grid h-6 w-6 place-items-center rounded-full opacity-60 transition hover:opacity-100"
-              >✕</button>
+              >{@html iconSvg("x", "h-3 w-3")}</button>
             </div>
             {#if n.title}<div class="mt-1 text-sm font-medium">{n.title}</div>{/if}
             {#if n.body}<div class="text-xs opacity-70">{n.body}</div>{/if}

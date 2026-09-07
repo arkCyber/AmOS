@@ -34,14 +34,15 @@ import {
   type QuickSettings,
   type RadioKey,
 } from "../lib/settings";
+import { iconSvg, quickIcon } from "../lib/sysIcons";
 
-const QUICK: { key: QuickKey; label: "q.wifi" | "q.bluetooth" | "q.airplane" | "q.dark" | "q.dnd" | "q.location"; icon: string }[] = [
-  { key: "wifi", label: "q.wifi", icon: "📶" },
-  { key: "bluetooth", label: "q.bluetooth", icon: "🅱" },
-  { key: "airplane", label: "q.airplane", icon: "✈️" },
-  { key: "darkmode", label: "q.dark", icon: "🌙" },
-  { key: "dnd", label: "q.dnd", icon: "🌒" },
-  { key: "location", label: "q.location", icon: "📍" },
+const QUICK: { key: QuickKey; label: "q.wifi" | "q.bluetooth" | "q.airplane" | "q.dark" | "q.dnd" | "q.location" }[] = [
+  { key: "wifi", label: "q.wifi" },
+  { key: "bluetooth", label: "q.bluetooth" },
+  { key: "airplane", label: "q.airplane" },
+  { key: "darkmode", label: "q.dark" },
+  { key: "dnd", label: "q.dnd" },
+  { key: "location", label: "q.location" },
 ];
 
 export default function NotificationCenter({
@@ -227,12 +228,15 @@ export default function NotificationCenter({
       {/* Control-center system actions (moved off the home top bar): each closes
           this shade and opens the target surface. */}
       {(() => {
-        const acts: { icon: string; label: string; fn?: () => void }[] = [
-          { icon: "🔍", label: "search", fn: onSearch },
-          { icon: "⇤", label: "recents", fn: onRecents },
-          { icon: "✎", label: "edit home", fn: onEdit },
-          { icon: "🔒", label: "lock", fn: onLock },
-        ].filter((a) => a.fn);
+        type Act = { icon: "search" | "recents" | "pencil" | "lock"; label: string; fn?: () => void };
+        const acts: Act[] = (
+          [
+            { icon: "search", label: "search", fn: onSearch },
+            { icon: "recents", label: "recents", fn: onRecents },
+            { icon: "pencil", label: "edit home", fn: onEdit },
+            { icon: "lock", label: "lock", fn: onLock },
+          ] as Act[]
+        ).filter((a) => a.fn);
         if (!acts.length) return null;
         return (
           <div className="mt-2 flex items-center justify-end gap-2">
@@ -247,7 +251,7 @@ export default function NotificationCenter({
                 }}
                 className="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"
               >
-                {a.icon}
+                <span data-icon={a.icon} dangerouslySetInnerHTML={{ __html: iconSvg(a.icon, "h-[17px] w-[17px]") }} />
               </button>
             ))}
           </div>
@@ -268,7 +272,7 @@ export default function NotificationCenter({
         }
       >
         <span className="flex items-center gap-2.5">
-          <span className="text-xl leading-none">{flash.on ? "🔦" : "🔆"}</span>
+          <span data-icon="flashlight" className="text-xl leading-none" dangerouslySetInnerHTML={{ __html: iconSvg("flashlight", "h-[22px] w-[22px]") }} />
           {t("q.flashlight")}
         </span>
         {!flash.torch_present ? (
@@ -301,7 +305,7 @@ export default function NotificationCenter({
                   : "bg-white/55 text-neutral-800 ring-1 ring-white/50 shadow-sm dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10")
               }
             >
-              <span className="text-xl leading-none">{q.icon}</span>
+              <span data-icon={q.key} className="text-xl leading-none" dangerouslySetInnerHTML={{ __html: iconSvg(quickIcon(q.key), "h-[22px] w-[22px]") }} />
               {t(q.label)}
             </button>
           );
@@ -311,8 +315,9 @@ export default function NotificationCenter({
       <div className="mt-3 flex items-center justify-between px-1">
         <span className="text-xs font-semibold uppercase tracking-widest opacity-50">
           {quiet ? (
-            <span className="normal-case tracking-normal text-accent">
-              🌒 {t("nc.dnd")}
+            <span className="inline-flex items-center gap-1 normal-case tracking-normal text-accent">
+              <span data-icon="moon" className="grid h-4 w-4 place-items-center" dangerouslySetInnerHTML={{ __html: iconSvg("moon", "h-4 w-4") }} />
+              {t("nc.dnd")}
             </span>
           ) : (
             `${notifs.length} ·`
@@ -344,10 +349,10 @@ export default function NotificationCenter({
                 <button
                   onClick={() => dismiss(n.id)}
                   aria-label="dismiss"
+                  data-icon="x"
                   className="grid h-6 w-6 place-items-center rounded-full opacity-60 transition hover:opacity-100"
-                >
-                  ✕
-                </button>
+                  dangerouslySetInnerHTML={{ __html: iconSvg("x", "h-3 w-3") }}
+                />
               </div>
               {n.title && <div className="mt-1 text-sm font-medium">{n.title}</div>}
               {n.body && <div className="text-xs opacity-70">{n.body}</div>}

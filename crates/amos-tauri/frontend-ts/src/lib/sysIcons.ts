@@ -19,7 +19,14 @@ export type SysIconName =
   | "airplane"
   | "moon"
   | "mutedBell"
-  | "flashlight";
+  | "flashlight"
+  | "location"
+  | "appearance"
+  | "search"
+  | "pencil"
+  | "lock"
+  | "recents"
+  | "x";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -31,6 +38,29 @@ const RADIO_TO_ICON: Record<string, SysIconName> = {
 /** Map a radio kind from `radioIcons()` to its vector glyph name. */
 export function radioIcon(kind: string): SysIconName {
   return RADIO_TO_ICON[kind] ?? "wifi";
+}
+
+/**
+ * Map a quick-settings key (`lib/settings` QuickKey) to its Control-Center icon.
+ * `darkmode` (appearance half-disc) is kept visually distinct from `dnd` (moon).
+ */
+export function quickIcon(key: string): SysIconName {
+  switch (key) {
+    case "airplane":
+      return "airplane";
+    case "wifi":
+      return "wifi";
+    case "bluetooth":
+      return "bluetooth";
+    case "darkmode":
+      return "appearance";
+    case "dnd":
+      return "moon";
+    case "location":
+      return "location";
+    default:
+      return "wifi";
+  }
 }
 
 /** Common stroke attributes tuned for a 24-viewBox, ~1em inline glyph. */
@@ -63,6 +93,19 @@ const INNER: Record<SysIconName, string> = {
     '<rect x="4" y="10" width="11" height="4" rx="2"/>' +
     '<circle cx="18" cy="12" r="2.2" fill="currentColor" stroke="none"/>' +
     "</g>",
+  location:
+    '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/>' +
+    '<circle cx="12" cy="10" r="3"/>',
+  appearance:
+    '<circle cx="12" cy="12" r="9"/>' +
+    '<path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none"/>',
+  search: '<circle cx="11" cy="11" r="7.5"/><path d="m20.5 20.5-4.3-4.3"/>',
+  pencil: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
+  lock: '<rect x="3.5" y="11" width="17" height="10" rx="2.5"/><path d="M7.5 11V7a4.5 4.5 0 0 1 9 0v4"/>',
+  recents:
+    '<rect x="8.5" y="8.5" width="13" height="13" rx="2.2"/>' +
+    '<path d="M5.5 15H4.2A2.2 2.2 0 0 1 2 12.8V4.2A2.2 2.2 0 0 1 4.2 2h8.6A2.2 2.2 0 0 1 15 4.2v1.3"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
 };
 
 /** Render a named icon as an SVG markup string. */
