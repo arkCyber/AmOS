@@ -10,6 +10,7 @@
   import { createStoreValue } from "./store";
   import { propsChannel } from "./propsBus";
   import { isCustomWallpaper, WALLPAPER_FILES } from "../lib/wallpaper";
+  import { iconSvg } from "../lib/sysIcons";
 
   const bus = propsChannel<{ ready?: boolean }>("lock");
 
@@ -101,7 +102,7 @@
       <div class="text-7xl font-thin tabular-nums tracking-tight">{fmtClock(now)}</div>
       <div class="mt-2.5 text-lg text-neutral-200">{dateStr}</div>
       <div class="mt-7 flex items-center justify-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.2em] text-neutral-400">
-        <span aria-hidden="true">🔒</span> {t("shell.lockTitle")}
+        <span aria-hidden="true" data-icon="lock" class="grid h-3.5 w-3.5 place-items-center">{@html iconSvg("lock", "h-3.5 w-3.5")}</span> {t("shell.lockTitle")}
       </div>
     </div>
 
@@ -120,13 +121,22 @@
           <button
             onclick={confirm ? submit : back ? backspace : () => tap(k)}
             aria-label={k}
+            data-icon={confirm ? "check" : back ? "delete" : undefined}
             class={
               "grid h-[72px] w-[72px] place-items-center rounded-full text-2xl ring-1 transition active:scale-90 " +
               (confirm
                 ? "bg-green-500 text-white ring-green-400 active:bg-green-400"
                 : "bg-white/10 text-white ring-white/25 backdrop-blur active:bg-white/25")
             }
-          >{k}</button>
+          >
+            {#if confirm}
+              {@html iconSvg("check", "h-8 w-8")}
+            {:else if back}
+              {@html iconSvg("delete", "h-7 w-7")}
+            {:else}
+              {k}
+            {/if}
+          </button>
         {/each}
       </div>
     {:else}

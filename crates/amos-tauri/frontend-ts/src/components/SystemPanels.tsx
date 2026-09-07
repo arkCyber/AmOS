@@ -9,6 +9,7 @@ import { APPS, appIcon, appTitleKey } from "../apps";
 import { AppIconTile } from "./AppIcon";
 import { fmtClock } from "../lib/time";
 import { isCustomWallpaper, WALLPAPER_FILES } from "../lib/wallpaper";
+import { iconSvg } from "../lib/sysIcons";
 
 /* ---- Lock screen ---- */
 export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
@@ -98,7 +99,7 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
         <div className="text-7xl font-thin tabular-nums tracking-tight">{fmtClock(now)}</div>
         <div className="mt-2.5 text-lg text-neutral-200">{date}</div>
         <div className="mt-7 flex items-center justify-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.2em] text-neutral-400">
-          <span aria-hidden>🔒</span> {t("shell.lockTitle")}
+          <span aria-hidden data-icon="lock" dangerouslySetInnerHTML={{ __html: iconSvg("lock", "h-3 w-3") }} /> {t("shell.lockTitle")}
         </div>
       </div>
       {needPin ? (
@@ -126,7 +127,13 @@ export function LockScreen({ onUnlock }: { onUnlock: () => void }) {
                       : "bg-white/10 text-white ring-white/25 backdrop-blur active:bg-white/25")
                   }
                 >
-                  {k}
+                  {confirm ? (
+                    <span data-icon="check" dangerouslySetInnerHTML={{ __html: iconSvg("check", "h-8 w-8") }} />
+                  ) : back ? (
+                    <span data-icon="delete" dangerouslySetInnerHTML={{ __html: iconSvg("delete", "h-7 w-7") }} />
+                  ) : (
+                    k
+                  )}
                 </button>
               );
             })}

@@ -14,7 +14,7 @@ const wrap = (el: ReactNode) => (
 
 describe("system panels SSR mount", () => {
   test("lock screen renders", () => {
-    expect(renderToString(wrap(<LockScreen onUnlock={() => {}} />))).toContain("🔒");
+    expect(renderToString(wrap(<LockScreen onUnlock={() => {}} />))).toContain('data-icon="lock"');
   });
   test("recents panel renders when open (empty state)", () => {
     const html = renderToString(wrap(<RecentsPanel open onClose={() => {}} onOpen={() => {}} />));

@@ -42,7 +42,9 @@ export type SysIconName =
   | "mic"
   | "micOff"
   | "record"
-  | "stop";
+  | "stop"
+  | "delete"
+  | "check";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -163,6 +165,10 @@ const INNER: Record<SysIconName, string> = {
     '<path d="M12 19v3"/>',
   record: '<circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="1.6" fill="currentColor" stroke="none"/>',
+  delete:
+    '<path d="M20 5H9l-7 7 7 7h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Z"/>' +
+    '<path d="m18 9-6 6M12 9l6 6"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
 };
 
 /** Render a named icon as an SVG markup string. */
