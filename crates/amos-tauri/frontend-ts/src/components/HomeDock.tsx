@@ -6,7 +6,7 @@ import { useI18n } from "../i18n";
 import { zh, type MessageKey } from "../i18n/locales/zh";
 import { NOTIF_KEY, SETTINGS_KEY, countForApp, dndActive, normalizeQuick, type Notif } from "../lib/settings";
 import { useStoreValue } from "../lib/useStoreValue";
-import { iconSvg } from "../lib/sysIcons";
+import { homeDownToSpotlight } from "../lib/edgeSwipe";
 import { HomeWidgets } from "./HomeWidgets";
 import type { StoreTile } from "../lib/storeApps";
 import { amosLog, amosWarn } from "../lib/debugLog";
@@ -220,6 +220,29 @@ export default function HomeDock({
     gridPanX.current = null;
   };
 
+  // ---- Home-body downward swipe → Spotlight (dev parity with the Svelte home).
+  // Vertically-dominant downward swipe starting in the home body (below the
+  // reserved top status edge, above the bottom zone) opens search. See
+  // lib/edgeSwipe.ts.
+  const homeSwipeStart = useRef<{ x: number; y: number } | null>(null);
+  const onHomeTouchStart = (e: ReactTouchEvent<HTMLDivElement>) => {
+    const t = e.touches[0];
+    homeSwipeStart.current = t ? { x: t.clientX, y: t.clientY } : null;
+  };
+  const onHomeTouchEnd = (e: ReactTouchEvent<HTMLDivElement>) => {
+    const s = homeSwipeStart.current;
+    homeSwipeStart.current = null;
+    if (!s) return;
+    const t = e.changedTouches[0];
+    if (!t) return;
+    const dy = t.clientY - s.y;
+    const dx = Math.abs(t.clientX - s.x);
+    if (dy > dx && homeDownToSpotlight(s.y, t.clientY, window.innerHeight)) onSearch?.();
+  };
+  const onHomeTouchCancel = () => {
+    homeSwipeStart.current = null;
+  };
+
   // ---- on-device diagnosis for "dock not rendering" ----
   const reported = useRef(false);
   const lastEmpty = useRef<boolean | null>(null);
@@ -241,7 +264,15 @@ export default function HomeDock({
   }
 
   return (
-    <div className="flex h-full flex-col px-4 pb-3">
+    <div
+      className="flex h-full flex-col px-4 pb-3"
+      role="group"
+      aria-label="home screen"
+      style={{ touchAction: "none" }}
+      onTouchStart={onHomeTouchStart}
+      onTouchEnd={onHomeTouchEnd}
+      onTouchCancel={onHomeTouchCancel}
+    >
       {/* main paged region: a horizontal swipe ANYWHERE in this column (incl. over
           the clock/weather widgets) pages the icon grid, iOS-home style. */}
       <div
@@ -313,17 +344,6 @@ export default function HomeDock({
           </button>
         </div>
       </div>
-
-      {onSearch && (
-        <button
-          type="button"
-          aria-label="search"
-          onClick={onSearch}
-          className="mx-auto mb-1.5 flex h-8 cursor-pointer items-center justify-center gap-1 rounded-full bg-white/45 px-3 text-xs font-medium text-neutral-700 shadow-sm ring-1 ring-black/5 transition active:scale-90 dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
-        >
-          <span data-icon="search" dangerouslySetInnerHTML={{ __html: iconSvg("search", "h-3.5 w-3.5") }} /> <span>{t("home.search")}</span>
-        </button>
-      )}
 
       {/* bottom dock bar: single fixed row (no paging) */}
       <div className="dock-mag flex items-end justify-around rounded-3xl bg-white/30 px-2 py-3 shadow-inner ring-1 ring-black/5 backdrop-blur-md dark:bg-neutral-900/40 dark:ring-white/10">

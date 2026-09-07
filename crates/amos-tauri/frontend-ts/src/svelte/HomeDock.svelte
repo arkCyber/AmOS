@@ -180,21 +180,33 @@
 
   // ---- Home-body downward swipe → Spotlight (iPhone "swipe down on Home to
   // search"). The top status edge is reserved for the Notification Center, and
-  // the bottom zone for the dock / Recents — see lib/edgeSwipe.ts. We only
-  // detect the vertical travel on the root; horizontal page-swipes are handled
-  // by the grid above and never have enough downward travel to trigger here.
+  // the bottom zone for the dock / Recents — see lib/edgeSwipe.ts. The gesture is
+  // *vertically dominant* (down travel > |horizontal travel|) so an intentional
+  // left/right page-swipe on the icon grid never also opens Spotlight.
+  let swipeX: number | null = null;
   let swipeY: number | null = null;
   function onHomeTouchStart(e: TouchEvent): void {
-    const y = e.touches[0]?.clientY;
-    swipeY = y == null ? null : y;
+    const t = e.touches[0];
+    swipeX = t == null ? null : t.clientX;
+    swipeY = t == null ? null : t.clientY;
   }
   function onHomeTouchEnd(e: TouchEvent): void {
+    const x0 = swipeX;
     const y0 = swipeY;
+    swipeX = null;
     swipeY = null;
-    if (y0 == null) return;
-    const y = e.changedTouches[0]?.clientY;
-    if (y == null) return;
-    if (homeDownToSpotlight(y0, y, window.innerHeight)) home.emit("search");
+    if (x0 == null || y0 == null) return;
+    const t = e.changedTouches[0];
+    if (t == null) return;
+    const dy = t.clientY - y0;
+    const dx = Math.abs(t.clientX - x0);
+    // Vertically dominant downward swipe within the home body → Spotlight.
+    if (dy > dx && homeDownToSpotlight(y0, t.clientY, window.innerHeight)) home.emit("search");
+  }
+  // A system/touch-cancel interrupts the gesture → never open Spotlight, just reset.
+  function onHomeTouchCancel(): void {
+    swipeX = null;
+    swipeY = null;
   }
 
   // ---- on-device diagnosis for "dock not rendering" (parity with React) ----
@@ -234,7 +246,7 @@
   style="touch-action: none"
   ontouchstart={onHomeTouchStart}
   ontouchend={onHomeTouchEnd}
-  ontouchcancel={onHomeTouchEnd}
+  ontouchcancel={onHomeTouchCancel}
 >
   <!-- main paged region: a horizontal swipe ANYWHERE in this column pages the
        icon grid; widgets stay fixed above, bottom dock stays a single row below -->
