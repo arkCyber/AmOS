@@ -16,12 +16,7 @@
   } from "../lib/settings";
   import { SOUND_KEY, normalizeSound, effectiveAlert } from "../lib/sound";
   import { createStoreValue } from "./store";
-
-  const GLYPH: Record<string, string> = {
-    airplane: "✈️",
-    wifi: "📶",
-    bluetooth: "🅱",
-  };
+  import { batterySvg, iconSvg, radioIcon } from "../lib/sysIcons";
 
   const settingsStore = createStoreValue<unknown>(SETTINGS_KEY, {});
   const flashStore = createStoreValue<unknown>(FLASHLIGHT_KEY, {});
@@ -65,10 +60,10 @@
   const icons = $derived(applyConnectivity(radioIcons(quick), online));
   const dnd = $derived(!!quick.dnd);
   const effective = $derived(effectiveAlert(normalizeSound(soundRaw), dnd));
-  // Persistent alert indicators: 🌒 during DND; else 🔕 when the ring/vibrate
-  // policy mutes alerts. Nothing extra in the default state.
-  const alertGlyph = $derived(
-    dnd ? "🌒" : effective.ring || effective.vibrate ? null : "🔕",
+  // Persistent alert indicators: moon while Do-Not-Disturb; else a muted bell
+  // when the ring/vibrate policy mutes alerts. Nothing extra in the default state.
+  const alertIcon = $derived(
+    dnd ? ("moon" as const) : effective.ring || effective.vibrate ? null : ("mutedBell" as const),
   );
 </script>
 
@@ -80,21 +75,26 @@
     class="pointer-events-none absolute left-1/2 top-[9px] h-[22px] w-[112px] -translate-x-1/2 rounded-full bg-black shadow-sm"
   ></span>
   <span class="flex items-center gap-1 text-[10px] opacity-80" aria-label="network status">
-    {#if alertGlyph}
+    {#if alertIcon}
       <span
+        data-icon={alertIcon}
         aria-label={dnd ? "do not disturb" : "alerts muted"}
         title={dnd ? "Do Not Disturb" : "alerts muted"}
-      >{alertGlyph}</span>
+      >{@html iconSvg(alertIcon)}</span>
     {/if}
     {#if flashOn}
-      <span aria-label="flashlight on" title="Flashlight">🔦</span>
+      <span data-icon="flashlight" aria-label="flashlight on" title="Flashlight">{@html iconSvg("flashlight")}</span>
     {/if}
     {#each icons as ic (ic.kind)}
       <span
+        data-icon={ic.kind}
         class={ic.on ? "" : "opacity-40"}
         title={ic.kind === "wifi" && !online ? "wifi: no connection" : undefined}
-      >{GLYPH[ic.kind] ?? ic.kind}</span>
+      >{@html iconSvg(radioIcon(ic.kind))}</span>
     {/each}
-    <span class="tabular-nums" aria-hidden="true">▮▮▮ {batteryPercent(now)}%</span>
+    <span class="flex items-center gap-1 tabular-nums" aria-label="battery level">
+      {@html batterySvg(batteryPercent(now))}
+      <span aria-hidden="true">{batteryPercent(now)}%</span>
+    </span>
   </span>
 </div>
