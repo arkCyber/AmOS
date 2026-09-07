@@ -12,6 +12,7 @@
   // i18n from locale.svelte.ts, notifications/DND reactively via createStoreValue
   // (svelte/store) — the twin of React's useStoreValue.
   import { t, locale } from "./locale.svelte";
+  import { iconSvg } from "../lib/sysIcons";
   import { onMount } from "svelte";
   import { appIcon, appTitleKey } from "../lib/appMeta";
   import type { HomeLayout } from "../lib/amosStore";
@@ -149,7 +150,7 @@
   }
   function onGridMove(e: TouchEvent): void {
     const x0 = panX;
-    if (x0 == null || panned || gridPages.length <= 1) return;
+    if (x0 == null || panned) return;
     const x = e.touches[0]?.clientX;
     if (x == null) return;
     const dx = x - x0;
@@ -160,8 +161,18 @@
     window.setTimeout(() => {
       if (dragId === "__grid_pan__") dragId = null;
     }, 300);
-    if (dx < 0) gridPage = Math.min(gridPage + 1, gridPages.length - 1);
-    else gridPage = Math.max(gridPage - 1, 0);
+    if (gridPages.length <= 1) {
+      // A single page has nowhere to page to — a swipe to the left is the iOS
+      // "keep going past the last page" gesture that opens the App Library.
+      if (dx < 0) home.emit("library");
+    } else if (gridPage >= gridPages.length - 1 && dx < 0) {
+      // Past the last icon page → the trailing "App Library" page.
+      home.emit("library");
+    } else if (dx < 0) {
+      gridPage = Math.min(gridPage + 1, gridPages.length - 1);
+    } else {
+      gridPage = Math.max(gridPage - 1, 0);
+    }
   }
   function onGridEnd(): void {
     panX = null;
@@ -242,30 +253,49 @@
         {/each}
       </div>
     </div>
-    {#if gridPages.length > 1}
-      <div data-testid="home-dots" class="mt-1 flex items-center justify-center gap-0.5">
-        {#each gridPages as _, i (i)}
-          <button
-            type="button"
-            data-testid="home-dot"
-            aria-label={`page ${i + 1} of ${gridPages.length}`}
-            aria-current={i === safePage ? "true" : undefined}
-            onclick={() => (gridPage = Math.min(i, lastIndex))}
-            class="grid h-5 min-w-5 cursor-pointer place-items-center transition active:scale-90"
-          >
-            <span
-              aria-hidden="true"
-              class={
-                "block rounded-full transition-all " +
-                (i === safePage
-                  ? "h-1.5 w-3.5 bg-neutral-500/80 dark:bg-neutral-300/80"
-                  : "h-1.5 w-1.5 bg-neutral-400/40 dark:bg-neutral-600/60")
-              }
-            ></span>
-          </button>
-        {/each}
-      </div>
-    {/if}
+    <div class="mt-1 flex items-center justify-center gap-1">
+      {#if gridPages.length > 1}
+        <div data-testid="home-dots" class="flex items-center justify-center gap-0.5">
+          {#each gridPages as _, i (i)}
+            <button
+              type="button"
+              data-testid="home-dot"
+              aria-label={`page ${i + 1} of ${gridPages.length}`}
+              aria-current={i === safePage ? "true" : undefined}
+              onclick={() => (gridPage = Math.min(i, lastIndex))}
+              class="grid h-5 min-w-5 cursor-pointer place-items-center transition active:scale-90"
+            >
+              <span
+                aria-hidden="true"
+                class={
+                  "block rounded-full transition-all " +
+                  (i === safePage
+                    ? "h-1.5 w-3.5 bg-neutral-500/80 dark:bg-neutral-300/80"
+                    : "h-1.5 w-1.5 bg-neutral-400/40 dark:bg-neutral-600/60")
+                }
+              ></span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+      <!-- iOS-style "App Library" trailing-page entry (always present, even with a
+           single icon page). A bigger 4×4 mini-app-grid icon, like the iOS App
+           Library indicator. Left-swipe past the last page reaches the same place. -->
+      <button
+        type="button"
+        data-testid="app-library-entry"
+        aria-label={t("appLibrary.title")}
+        title={t("appLibrary.title")}
+        onclick={() => home.emit("library")}
+        class="ml-1 grid h-6 w-6 cursor-pointer place-items-center rounded-[7px] bg-white/45 shadow-sm ring-1 ring-black/5 transition hover:scale-105 active:scale-90 dark:bg-white/10 dark:ring-white/10"
+      >
+        <span aria-hidden="true" class="grid w-4 grid-cols-4 gap-px">
+          {#each Array(16) as _, i (i)}
+            <span class="h-[3px] w-[3px] rounded-[0.5px] bg-neutral-600/70 dark:bg-neutral-300/70"></span>
+          {/each}
+        </span>
+      </button>
+    </div>
   </div>
 
   <!-- search pill (the React shell always supplies onSearch on the home screen) -->
@@ -273,8 +303,8 @@
     type="button"
     aria-label="search"
     onclick={() => home.emit("search")}
-    class="mx-auto mb-1.5 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-white/45 text-sm shadow-sm ring-1 ring-black/5 transition active:scale-90 dark:bg-white/10 dark:ring-white/10"
-  >🔍</button>
+    class="mx-auto mb-1.5 flex h-8 cursor-pointer items-center justify-center gap-1 rounded-full bg-white/45 px-3 text-xs font-medium text-neutral-700 shadow-sm ring-1 ring-black/5 transition active:scale-90 dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
+  ><span data-icon="search" class="grid h-3.5 w-3.5 place-items-center">{@html iconSvg("search", "h-3.5 w-3.5")}</span> <span>{t("home.search")}</span></button>
 
   <!-- bottom dock bar: single fixed row (no paging) -->
   <div

@@ -6,6 +6,7 @@ import { useI18n } from "../i18n";
 import { zh, type MessageKey } from "../i18n/locales/zh";
 import { NOTIF_KEY, SETTINGS_KEY, countForApp, dndActive, normalizeQuick, type Notif } from "../lib/settings";
 import { useStoreValue } from "../lib/useStoreValue";
+import { iconSvg } from "../lib/sysIcons";
 import { HomeWidgets } from "./HomeWidgets";
 import type { StoreTile } from "../lib/storeApps";
 import { amosLog, amosWarn } from "../lib/debugLog";
@@ -88,6 +89,7 @@ export default function HomeDock({
   onOpen,
   onMove,
   onSearch,
+  onLibrary,
   pulseId,
   ext = [],
 }: {
@@ -97,6 +99,8 @@ export default function HomeDock({
   onMove: (dragId: string, overId: string) => void;
   /** Open Spotlight search (shown as a discreet search pill at the bottom of the grid). */
   onSearch?: () => void;
+  /** Enter the iOS-style "App Library" page (trailing page / pager dot). */
+  onLibrary?: () => void;
   /** Icon to briefly highlight (id) after a soft-launch from search. */
   pulseId?: string | null;
   /** Store-installed (third-party) tiles to render alongside built-ins. */
@@ -188,7 +192,7 @@ export default function HomeDock({
   };
   const onGridMove = (e: ReactTouchEvent<HTMLDivElement>) => {
     const x0 = gridPanX.current;
-    if (x0 == null || gridPanned.current || gridPages.length <= 1) return;
+    if (x0 == null || gridPanned.current) return;
     const x = e.touches[0]?.clientX;
     if (x == null) return;
     const dx = x - x0;
@@ -199,8 +203,18 @@ export default function HomeDock({
     window.setTimeout(() => {
       if (dragId.current === "__grid_pan__") dragId.current = null;
     }, 300);
-    if (dx < 0) setGridPage((p) => Math.min(p + 1, gridPages.length - 1));
-    else setGridPage((p) => Math.max(p - 1, 0));
+    if (gridPages.length <= 1) {
+      // A single page has nowhere to page to — a swipe to the left is the iOS
+      // "keep going past the last page" gesture that opens the App Library.
+      if (dx < 0) onLibrary?.();
+    } else if (gridPage >= gridPages.length - 1 && dx < 0) {
+      // Past the last icon page → the trailing "App Library" page.
+      onLibrary?.();
+    } else if (dx < 0) {
+      setGridPage((p) => Math.min(p + 1, gridPages.length - 1));
+    } else {
+      setGridPage((p) => Math.max(p - 1, 0));
+    }
   };
   const onGridEnd = () => {
     gridPanX.current = null;
@@ -248,34 +262,56 @@ export default function HomeDock({
             {shownGrid.map(renderIcon)}
           </div>
         </div>
-        {gridPages.length > 1 && (
-          <div data-testid="home-dots" className="mt-1 flex items-center justify-center gap-0.5">
-            {gridPages.map((_, i) => {
-              const active = i === Math.min(gridPage, gridPages.length - 1);
-              return (
-                <button
+        <div className="mt-1 flex items-center justify-center gap-1">
+          {gridPages.length > 1 && (
+            <div data-testid="home-dots" className="flex items-center justify-center gap-0.5">
+              {gridPages.map((_, i) => {
+                const active = i === Math.min(gridPage, gridPages.length - 1);
+                return (
+                  <button
+                    key={i}
+                    type="button"
+                    data-testid="home-dot"
+                    aria-label={`page ${i + 1} of ${gridPages.length}`}
+                    aria-current={active ? "true" : undefined}
+                    onClick={() => setGridPage(Math.min(i, gridPages.length - 1))}
+                    className="grid h-5 min-w-5 cursor-pointer place-items-center transition active:scale-90"
+                  >
+                    <span
+                      aria-hidden
+                      className={
+                        "block rounded-full transition-all " +
+                        (active
+                          ? "h-1.5 w-3.5 bg-neutral-500/80 dark:bg-neutral-300/80"
+                          : "h-1.5 w-1.5 bg-neutral-400/40 dark:bg-neutral-600/60")
+                      }
+                    />
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {/* iOS-style "App Library" trailing-page entry (always present, even with a
+              single icon page). A bigger 4×4 mini-app-grid icon, like the iOS App
+              Library indicator. Left-swipe past the last page reaches the same place. */}
+          <button
+            type="button"
+            data-testid="app-library-entry"
+            aria-label={t("appLibrary.title")}
+            title={t("appLibrary.title")}
+            onClick={onLibrary}
+            className="ml-1 grid h-6 w-6 cursor-pointer place-items-center rounded-[7px] bg-white/45 shadow-sm ring-1 ring-black/5 transition hover:scale-105 active:scale-90 dark:bg-white/10 dark:ring-white/10"
+          >
+            <span aria-hidden className="grid w-4 grid-cols-4 gap-px">
+              {Array.from({ length: 16 }).map((_, i) => (
+                <span
                   key={i}
-                  type="button"
-                  data-testid="home-dot"
-                  aria-label={`page ${i + 1} of ${gridPages.length}`}
-                  aria-current={active ? "true" : undefined}
-                  onClick={() => setGridPage(Math.min(i, gridPages.length - 1))}
-                  className="grid h-5 min-w-5 cursor-pointer place-items-center transition active:scale-90"
-                >
-                  <span
-                    aria-hidden
-                    className={
-                      "block rounded-full transition-all " +
-                      (active
-                        ? "h-1.5 w-3.5 bg-neutral-500/80 dark:bg-neutral-300/80"
-                        : "h-1.5 w-1.5 bg-neutral-400/40 dark:bg-neutral-600/60")
-                    }
-                  />
-                </button>
-              );
-            })}
-          </div>
-        )}
+                  className="h-[3px] w-[3px] rounded-[0.5px] bg-neutral-600/70 dark:bg-neutral-300/70"
+                />
+              ))}
+            </span>
+          </button>
+        </div>
       </div>
 
       {onSearch && (
@@ -283,9 +319,9 @@ export default function HomeDock({
           type="button"
           aria-label="search"
           onClick={onSearch}
-          className="mx-auto mb-1.5 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-white/45 text-sm shadow-sm ring-1 ring-black/5 transition active:scale-90 dark:bg-white/10 dark:ring-white/10"
+          className="mx-auto mb-1.5 flex h-8 cursor-pointer items-center justify-center gap-1 rounded-full bg-white/45 px-3 text-xs font-medium text-neutral-700 shadow-sm ring-1 ring-black/5 transition active:scale-90 dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
         >
-          🔍
+          <span data-icon="search" dangerouslySetInnerHTML={{ __html: iconSvg("search", "h-3.5 w-3.5") }} /> <span>{t("home.search")}</span>
         </button>
       )}
 
