@@ -37,7 +37,12 @@ export type SysIconName =
   | "headphones"
   | "trash"
   | "send"
-  | "reply";
+  | "reply"
+  | "phone"
+  | "mic"
+  | "micOff"
+  | "record"
+  | "stop";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -145,6 +150,19 @@ const INNER: Record<SysIconName, string> = {
     '<path d="M10 11v6M14 11v6"/>',
   send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
   reply: '<path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>',
+  phone:
+    '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/>',
+  mic:
+    '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>' +
+    '<path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/>',
+  micOff:
+    '<path d="m1 1 22 22"/>' +
+    '<path d="M9 9v3a3 3 0 0 0 5.12 2.12"/>' +
+    '<path d="M15 9.34V5a3 3 0 0 0-5.94-.6"/>' +
+    '<path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/>' +
+    '<path d="M12 19v3"/>',
+  record: '<circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="1.6" fill="currentColor" stroke="none"/>',
 };
 
 /** Render a named icon as an SVG markup string. */

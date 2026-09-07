@@ -14,6 +14,7 @@
     type TelephonyCall,
   } from "../lib/backend";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { iconSvg } from "../lib/sysIcons";
   import { CALLLOG_KEY, normalizeCallLog, recordCall } from "../lib/calllog";
   import { CONTACTS_KEY, contactNameFor, normalizeContacts, type Contact } from "../lib/contacts";
 
@@ -135,10 +136,10 @@
       <div
         aria-hidden="true"
         class={
-          "grid h-36 w-36 place-items-center rounded-full bg-white/10 text-7xl shadow-2xl ring-1 ring-white/20 " +
+          "grid h-36 w-36 place-items-center rounded-full bg-white/10 text-white/80 shadow-2xl ring-1 ring-white/20 " +
           (ringing ? "animate-pulse" : "")
         }
-      >📞</div>
+      >{@html iconSvg("phone", "h-16 w-16")}</div>
       <div class="mt-8 max-w-full text-3xl font-semibold leading-tight break-words">{label}</div>
       <div class="mt-2 text-sm tracking-widest text-white/50 tabular-nums">{call.peer}</div>
       {#if recording === "On"}
@@ -155,16 +156,18 @@
           <button
             onclick={() => void leave()}
             aria-label={t("phone.decline")}
+            data-icon="x"
             class="grid h-24 w-24 place-items-center rounded-full bg-red-500 text-3xl text-white shadow-[0_12px_30px_rgba(239,68,68,0.45)] transition active:scale-90"
-          >✕</button>
+          >{@html iconSvg("x", "h-9 w-9")}</button>
           <span class="text-sm font-medium text-white/80">{t("phone.decline")}</span>
         </div>
         <div class="flex flex-col items-center gap-2">
           <button
             onclick={() => void answer()}
             aria-label={t("phone.answer")}
+            data-icon="phone"
             class="grid h-24 w-24 place-items-center rounded-full bg-emerald-500 text-4xl text-white shadow-[0_12px_30px_rgba(16,185,129,0.5)] transition active:scale-90"
-          >📞</button>
+          >{@html iconSvg("phone", "h-12 w-12")}</button>
           <span class="text-sm font-medium text-white/80">{t("phone.answer")}</span>
         </div>
       </div>
@@ -174,22 +177,24 @@
           <button
             onclick={() => (muted = !muted)}
             aria-label={muted ? t("phone.unmute") : t("phone.mute")}
+            data-icon={muted ? "micOff" : "mic"}
             class={
               "grid h-16 w-16 place-items-center rounded-full text-2xl transition active:scale-90 " +
               (muted ? "bg-red-500 text-white" : "bg-white/10 text-white ring-1 ring-white/20")
             }
-          >{muted ? "🔇" : "🎙️"}</button>
+          >{@html iconSvg(muted ? "micOff" : "mic", "h-7 w-7")}</button>
           <span class="text-xs text-white/70">{muted ? t("phone.unmute") : t("phone.mute")}</span>
         </div>
         <div class="flex flex-col items-center gap-1.5">
           <button
             onclick={() => void toggleRecord()}
             aria-label={recording === "On" ? t("phone.recordStop") : t("phone.recordStart")}
+            data-icon={recording === "On" ? "stop" : "record"}
             class={
               "grid h-16 w-16 place-items-center rounded-full text-2xl transition active:scale-90 " +
               (recording === "On" ? "bg-red-500 text-white" : "bg-white/10 text-white ring-1 ring-white/20")
             }
-          >{recording === "On" ? "⏹" : "●"}</button>
+          >{@html iconSvg(recording === "On" ? "stop" : "record", "h-7 w-7")}</button>
           <span class="text-xs text-white/70">
             {recording === "On" ? t("phone.recordStop") : t("phone.recordStart")}
           </span>
@@ -198,8 +203,9 @@
           <button
             onclick={() => void leave()}
             aria-label={t("phone.hangup")}
+            data-icon="x"
             class="grid h-16 w-16 place-items-center rounded-full bg-red-500 text-2xl text-white transition active:scale-90"
-          >✕</button>
+          >{@html iconSvg("x", "h-7 w-7")}</button>
           <span class="text-xs text-white/70">{t("phone.hangup")}</span>
         </div>
       </div>

@@ -10,6 +10,7 @@ import {
 } from "../lib/backend";
 import { readStoreValue, writeStoreValue } from "../lib/amosStore";
 import { CALLLOG_KEY, normalizeCallLog, recordCall } from "../lib/calllog";
+import { iconSvg } from "../lib/sysIcons";
 import {
   CONTACTS_KEY,
   contactNameFor,
@@ -154,11 +155,11 @@ export default function IncomingCall() {
         <div
           aria-hidden
           className={
-            "grid h-36 w-36 place-items-center rounded-full bg-white/10 text-7xl shadow-2xl ring-1 ring-white/20 " +
+            "grid h-36 w-36 place-items-center rounded-full bg-white/10 text-white/80 shadow-2xl ring-1 ring-white/20 " +
             (ringing ? "animate-pulse" : "")
           }
         >
-          📞
+          <span dangerouslySetInnerHTML={{ __html: iconSvg("phone", "h-16 w-16") }} />
         </div>
         <div className="mt-8 max-w-full text-3xl font-semibold leading-tight break-words">{label}</div>
         <div className="mt-2 text-sm tracking-widest text-white/50 tabular-nums">{call.peer}</div>
@@ -179,7 +180,7 @@ export default function IncomingCall() {
               aria-label={t("phone.decline")}
               className="grid h-24 w-24 place-items-center rounded-full bg-red-500 text-3xl text-white shadow-[0_12px_30px_rgba(239,68,68,0.45)] transition active:scale-90"
             >
-              ✕
+              <span data-icon="x" dangerouslySetInnerHTML={{ __html: iconSvg("x", "h-9 w-9") }} />
             </button>
             <span className="text-sm font-medium text-white/80">{t("phone.decline")}</span>
           </div>
@@ -189,7 +190,7 @@ export default function IncomingCall() {
               aria-label={t("phone.answer")}
               className="grid h-24 w-24 place-items-center rounded-full bg-emerald-500 text-4xl text-white shadow-[0_12px_30px_rgba(16,185,129,0.5)] transition active:scale-90"
             >
-              📞
+              <span data-icon="phone" dangerouslySetInnerHTML={{ __html: iconSvg("phone", "h-12 w-12") }} />
             </button>
             <span className="text-sm font-medium text-white/80">{t("phone.answer")}</span>
           </div>
@@ -207,7 +208,7 @@ export default function IncomingCall() {
                   : "bg-white/10 text-white ring-1 ring-white/20")
               }
             >
-              {muted ? "🔇" : "🎙️"}
+              <span data-icon={muted ? "micOff" : "mic"} dangerouslySetInnerHTML={{ __html: iconSvg(muted ? "micOff" : "mic", "h-7 w-7") }} />
             </button>
             <span className="text-xs text-white/70">{muted ? t("phone.unmute") : t("phone.mute")}</span>
           </div>
@@ -222,7 +223,7 @@ export default function IncomingCall() {
                   : "bg-white/10 text-white ring-1 ring-white/20")
               }
             >
-              {recording === "On" ? "⏹" : "●"}
+              <span data-icon={recording === "On" ? "stop" : "record"} dangerouslySetInnerHTML={{ __html: iconSvg(recording === "On" ? "stop" : "record", "h-7 w-7") }} />
             </button>
             <span className="text-xs text-white/70">
               {recording === "On" ? t("phone.recordStop") : t("phone.recordStart")}
@@ -234,7 +235,7 @@ export default function IncomingCall() {
               aria-label={t("phone.hangup")}
               className="grid h-16 w-16 place-items-center rounded-full bg-red-500 text-2xl text-white transition active:scale-90"
             >
-              ✕
+              <span data-icon="x" dangerouslySetInnerHTML={{ __html: iconSvg("x", "h-7 w-7") }} />
             </button>
             <span className="text-xs text-white/70">{t("phone.hangup")}</span>
           </div>
