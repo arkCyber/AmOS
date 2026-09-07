@@ -1,9 +1,9 @@
 <script lang="ts">
-  // VoiceMemosApp.svelte — Svelte 5 (runes) port of the React VoiceMemosApp
-  // (src/components/VoiceMemosApp.tsx). iOS-style recorder persisted to the shared
+  // VoiceMemosApp.svelte — Svelte 5 (runes) single-source implementation of the
+  // voice-memos screen. iOS-style recorder persisted to the shared
   // amos.vmemos store; demo clips (synthesized WAV) make the list playable without
-  // a mic. Recording/playback reuse the SAME lib/voiceRecorder + lib/mediaStore the
-  // React UI uses; real capture needs a microphone (device acceptance), while the
+  // a mic. Recording/playback reuse lib/voiceRecorder + lib/mediaStore;
+  // real capture needs a microphone (device acceptance), while the
   // list CRUD / seed rows are fully browser-testable.
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { defaultMediaStore } from "../lib/mediaStore";
@@ -25,6 +25,7 @@
     type VoiceMemo,
   } from "../lib/voiceMemos";
   import { startVoiceRecording, type ActiveRecording } from "../lib/voiceRecorder";
+  import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
   const GROUP =
@@ -185,9 +186,10 @@
       <button
         onclick={() => void start()}
         aria-label={t("vm.record")}
+        data-icon="record"
         class="grid h-20 w-20 place-items-center rounded-full bg-danger text-4xl text-white shadow-lg ring-4 ring-danger/25 active:scale-95"
       >
-        ●
+        {@html iconSvg("record", "h-10 w-10")}
       </button>
     {:else}
       <button
@@ -219,9 +221,10 @@
               <button
                 onclick={() => togglePlay(m)}
                 aria-label={playingId === m.id ? t("vm.pause") : t("vm.play")}
+                data-icon={playingId === m.id ? "pause" : "play"}
                 class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90"
               >
-                {playingId === m.id ? "❚❚" : "▶"}
+                {@html iconSvg(playingId === m.id ? "pause" : "play", "h-[18px] w-[18px]")}
               </button>
               <div class="min-w-0 flex-1">
                 {#if editingId === m.id}
@@ -244,11 +247,11 @@
                 </p>
               </div>
               <div class="flex shrink-0 items-center gap-1.5">
-                <button onclick={() => beginRename(m)} aria-label={t("vm.rename")} class="text-base text-accent active:scale-90">
-                  ✎
+                <button onclick={() => beginRename(m)} aria-label={t("vm.rename")} data-icon="pencil" class="grid h-6 w-6 place-items-center text-accent active:scale-90">
+                  {@html iconSvg("pencil", "h-4 w-4")}
                 </button>
-                <button onclick={() => deleteMemo(m)} aria-label={t("vm.delete")} class="text-base text-danger active:scale-90">
-                  🗑
+                <button onclick={() => deleteMemo(m)} aria-label={t("vm.delete")} data-icon="trash" class="grid h-6 w-6 place-items-center text-danger active:scale-90">
+                  {@html iconSvg("trash", "h-4 w-4")}
                 </button>
               </div>
             </div>
