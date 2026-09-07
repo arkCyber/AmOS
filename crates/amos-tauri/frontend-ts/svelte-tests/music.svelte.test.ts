@@ -17,17 +17,17 @@ const playBtn = (h: { container: HTMLElement }) =>
   [...h.container.querySelectorAll("button")].find((b) =>
     b.getAttribute("aria-label") === "play" || b.getAttribute("aria-label") === "pause",
   ) as HTMLButtonElement | undefined;
-const btnText = (h: { container: HTMLElement }, s: string) =>
-  [...h.container.querySelectorAll("button")].find((b) => (b.textContent ?? "").includes(s));
+const btnByIcon = (h: { container: HTMLElement }, name: string) =>
+  [...h.container.querySelectorAll("button")].find((b) => b.getAttribute("data-icon") === name);
 
 describe("MusicApp.svelte", () => {
   test("seeded playlist shows a current track + rows", () => {
     const host = render(MusicApp);
     expect(bigTitle(host).length).toBeGreaterThan(0);
-    // several playlist rows exist
-    const rows = [...host.container.querySelectorAll("button")].filter((b) =>
-      (b.textContent ?? "").includes("♪") || (b.textContent ?? "").includes("▶"),
-    );
+    // several playlist rows exist (each row carries a play/music-note indicator)
+    const rows = [
+      ...host.container.querySelectorAll('span[data-icon="musicNote"], span[data-icon="play"]'),
+    ];
     expect(rows.length).toBeGreaterThan(1);
   });
 
@@ -41,7 +41,7 @@ describe("MusicApp.svelte", () => {
   test("next changes the current track", async () => {
     const host = render(MusicApp);
     const t0 = bigTitle(host);
-    const next = btnText(host, "⏭");
+    const next = btnByIcon(host, "skipForward");
     expect(next).toBeTruthy();
     await fireEvent.click(next as HTMLButtonElement);
     expect(bigTitle(host)).not.toBe(t0);

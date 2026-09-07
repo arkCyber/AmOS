@@ -26,7 +26,15 @@ export type SysIconName =
   | "pencil"
   | "lock"
   | "recents"
-  | "x";
+  | "x"
+  | "play"
+  | "pause"
+  | "skipBack"
+  | "skipForward"
+  | "repeat"
+  | "messageCircle"
+  | "musicNote"
+  | "headphones";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -106,6 +114,27 @@ const INNER: Record<SysIconName, string> = {
     '<rect x="8.5" y="8.5" width="13" height="13" rx="2.2"/>' +
     '<path d="M5.5 15H4.2A2.2 2.2 0 0 1 2 12.8V4.2A2.2 2.2 0 0 1 4.2 2h8.6A2.2 2.2 0 0 1 15 4.2v1.3"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  play:
+    '<path d="M8 5.7v12.6a.6.6 0 0 0 .92.5l10-6.3a.6.6 0 0 0 0-1L8.92 5.2a.6.6 0 0 0-.92.5Z" fill="currentColor" stroke="none"/>',
+  pause:
+    '<path d="M7 5.4h3.4v13.2H7zM13.6 5.4H17v13.2h-3.4z" fill="currentColor" stroke="none"/>',
+  skipBack:
+    '<path d="M6 5.4h2.3v13.2H6z" fill="currentColor" stroke="none"/>' +
+    '<path d="M18 5.6v12.8a.55.55 0 0 1-.87.46L9.4 12.5a.6.6 0 0 1 0-.97l7.73-6.38a.55.55 0 0 1 .87.46Z" fill="currentColor" stroke="none"/>',
+  skipForward:
+    '<path d="M15.7 5.4H18v13.2h-2.3z" fill="currentColor" stroke="none"/>' +
+    '<path d="M6 5.6v12.8a.55.55 0 0 0 .87.46l7.73-6.38a.6.6 0 0 0 0-.97L6.87 5.14A.55.55 0 0 0 6 5.6Z" fill="currentColor" stroke="none"/>',
+  repeat:
+    '<path d="m17 2 4 4-4 4"/>' +
+    '<path d="M3 11v-1a4 4 0 0 1 4-4h14"/>' +
+    '<path d="m7 22-4-4 4-4"/>' +
+    '<path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  messageCircle: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+  musicNote: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  headphones:
+    '<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5Z"/>' +
+    '<path d="M21 14h-3a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-5Z"/>' +
+    '<path d="M3 14v-3a9 9 0 0 1 18 0v3"/>',
 };
 
 /** Render a named icon as an SVG markup string. */
