@@ -44,7 +44,8 @@ export type SysIconName =
   | "record"
   | "stop"
   | "delete"
-  | "check";
+  | "check"
+  | "rotateCcw";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -169,6 +170,9 @@ const INNER: Record<SysIconName, string> = {
     '<path d="M20 5H9l-7 7 7 7h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Z"/>' +
     '<path d="m18 9-6 6M12 9l6 6"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
+  rotateCcw:
+    '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>' +
+    '<path d="M3 3v5h5"/>',
 };
 
 /** Render a named icon as an SVG markup string. */
