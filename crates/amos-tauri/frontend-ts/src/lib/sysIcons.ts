@@ -45,7 +45,8 @@ export type SysIconName =
   | "stop"
   | "delete"
   | "check"
-  | "rotateCcw";
+  | "rotateCcw"
+  | "dialpad";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -173,6 +174,16 @@ const INNER: Record<SysIconName, string> = {
   rotateCcw:
     '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>' +
     '<path d="M3 3v5h5"/>',
+  dialpad:
+    '<circle cx="6.6" cy="5.4" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="12" cy="5.4" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="17.4" cy="5.4" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="6.6" cy="12" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="17.4" cy="12" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="6.6" cy="18.6" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="12" cy="18.6" r="1.3" fill="currentColor" stroke="none"/>' +
+    '<circle cx="17.4" cy="18.6" r="1.3" fill="currentColor" stroke="none"/>',
 };
 
 /** Render a named icon as an SVG markup string. */

@@ -1,5 +1,6 @@
 <script lang="ts">
-  // PhoneApp.svelte — Svelte 5 (runes) port of React PhoneDialer. Keypad/dial
+  // PhoneApp.svelte — Svelte 5 (runes) single-source implementation of the phone
+  // screen. Keypad/dial
   // logic reuses lib/phone + lib/emergency; dialing/events/record go through
   // lib/backend telephony; recent/frequent derive from the call log via
   // createStoreValue (mirrors useOutgoingCalls). Real dial/record verified on-device.
@@ -17,6 +18,7 @@
   import type { Notif } from "../lib/settings";
   import { zh } from "../i18n/locales/zh";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
 
@@ -274,20 +276,22 @@
         <div class="mt-2 flex items-center gap-5">
           {#if activeId}
             <button onclick={() => void toggleRecord()} aria-label={recording === "On" ? t("phone.recordStop") : t("phone.recordStart")}
-              class={"grid h-14 w-14 place-items-center rounded-full text-lg transition active:scale-90 " + (recording === "On" ? "bg-danger text-white" : "bg-neutral-200 text-danger dark:bg-white/10")}>
-              {recording === "On" ? "⏹" : "●"}
+              data-icon={recording === "On" ? "stop" : "record"}
+              class={"grid h-14 w-14 place-items-center rounded-full transition active:scale-90 " + (recording === "On" ? "bg-danger text-white" : "bg-neutral-200 text-danger dark:bg-white/10")}>
+              {@html iconSvg(recording === "On" ? "stop" : "record", "h-7 w-7")}
             </button>
           {/if}
           <button onclick={() => (muted = !muted)} aria-label={muted ? t("phone.unmute") : t("phone.mute")}
-            class={"grid h-14 w-14 place-items-center rounded-full text-lg transition active:scale-90 " + (muted ? "bg-danger text-white" : "bg-neutral-200 text-neutral-700 dark:bg-white/10 dark:text-white")}>
-            {muted ? "🔇" : "🎙️"}
+            data-icon={muted ? "micOff" : "mic"}
+            class={"grid h-14 w-14 place-items-center rounded-full transition active:scale-90 " + (muted ? "bg-danger text-white" : "bg-neutral-200 text-neutral-700 dark:bg-white/10 dark:text-white")}>
+            {@html iconSvg(muted ? "micOff" : "mic", "h-7 w-7")}
           </button>
-          <button onclick={() => { padOpen = !padOpen; dtmf = ""; }} aria-label={t("phone.dtmf")}
-            class="grid h-14 w-14 place-items-center rounded-full bg-neutral-200 text-lg text-neutral-700 transition active:scale-90 dark:bg-white/10 dark:text-white">⌨️</button>
+          <button onclick={() => { padOpen = !padOpen; dtmf = ""; }} aria-label={t("phone.dtmf")} data-icon="dialpad"
+            class="grid h-14 w-14 place-items-center rounded-full bg-neutral-200 text-neutral-700 transition active:scale-90 dark:bg-white/10 dark:text-white">{@html iconSvg("dialpad", "h-7 w-7")}</button>
         </div>
       {/if}
       <div class="mt-6">
-        <button onclick={() => void endCall()} aria-label="end" class="grid h-16 w-16 place-items-center rounded-full bg-danger text-2xl text-white transition active:scale-90">✕</button>
+        <button onclick={() => void endCall()} aria-label="end" data-icon="end" class="grid h-16 w-16 place-items-center rounded-full bg-danger text-white transition active:scale-90">{@html iconSvg("x", "h-7 w-7")}</button>
       </div>
     </div>
 
@@ -314,13 +318,13 @@
 
       <div class="mt-3 flex items-start justify-center gap-12">
         <div class="flex flex-col items-center gap-2">
-          <button onclick={() => (num = backspace(num))} disabled={!num} aria-label="backspace"
-            class="grid h-11 w-11 place-items-center rounded-full bg-neutral-300/90 text-lg text-neutral-700 transition active:scale-90 disabled:opacity-25 dark:bg-white/10 dark:text-white">⌫</button>
+          <button onclick={() => (num = backspace(num))} disabled={!num} aria-label="backspace" data-icon="delete"
+            class="grid h-11 w-11 place-items-center rounded-full bg-neutral-300/90 text-neutral-700 transition active:scale-90 disabled:opacity-25 dark:bg-white/10 dark:text-white">{@html iconSvg("delete", "h-5 w-5")}</button>
           <button onclick={() => (num = clearDial(num))} disabled={!num} aria-label="clear" class="text-xs text-accent disabled:opacity-25">{t("phone.clear")}</button>
         </div>
-        <button onclick={() => void startCall()} disabled={!num} aria-label="call"
+        <button onclick={() => void startCall()} disabled={!num} aria-label="call" data-icon="phone"
           class="grid h-[60px] w-[60px] place-items-center rounded-full bg-green-500 text-white shadow-[0_6px_16px_rgba(52,199,89,0.45)] transition active:scale-90 disabled:opacity-40">
-          <span class="text-2xl leading-none">📞</span>
+          {@html iconSvg("phone", "h-7 w-7")}
         </button>
         <div class="w-11" aria-hidden="true"></div>
       </div>
