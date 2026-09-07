@@ -1,8 +1,8 @@
 <script lang="ts">
-  // RemindersApp.svelte — Svelte 5 (runes) port of the React RemindersApp
-  // (src/components/RemindersApp.tsx). All domain logic reuses pure lib/reminders.ts;
+  // RemindersApp.svelte — Svelte 5 (runes) single-source implementation of the
+  // reminders screen. All domain logic reuses pure lib/reminders.ts;
   // data is persisted through the shared amos.* store under amos.reminders /
-  // amos.reminderLists, exactly like the React screen, so the shell-mounted
+  // amos.reminderLists, exactly like the retired React screen, so the shell-mounted
   // OS notifier (lib/reminderNotify.ts) keeps firing on the same markers.
   import {
     COLOR_NAMES,
@@ -35,6 +35,7 @@
     type SmartView,
   } from "../lib/reminders";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
   /* iOS-like palette for colored list dots (literal Tailwind classes). */
@@ -408,8 +409,9 @@
       aria-label={t("reminder.search")}
       title={t("reminder.search")}
       class="ml-auto grid h-7 w-7 shrink-0 place-items-center rounded-full bg-neutral-200/70 text-sm dark:bg-neutral-700/70"
+      data-icon={searchOpen ? "x" : "search"}
     >
-      {searchOpen ? "✕" : "🔍"}
+      {@html iconSvg(searchOpen ? "x" : "search", "h-[15px] w-[15px]")}
     </button>
   </div>
 
@@ -417,7 +419,7 @@
   {#if searchOpen}
     <div class="flex shrink-0 items-center gap-2 px-3 pb-1.5">
       <div class="flex min-w-0 flex-1 items-center gap-1.5 rounded-xl bg-black/5 px-2.5 py-1 ring-1 ring-black/5 dark:bg-white/10 dark:ring-white/10">
-        <span class="opacity-50">🔍</span>
+        <span class="shrink-0 opacity-50" data-icon="search">{@html iconSvg("search", "h-3.5 w-3.5")}</span>
         <input
           bind:value={query}
           placeholder={t("reminder.search")}
@@ -430,8 +432,8 @@
           </span>
         {/if}
         {#if query}
-          <button onclick={() => (query = "")} aria-label={t("reminder.clear")} class="shrink-0 text-neutral-400">
-            ✕
+          <button onclick={() => (query = "")} aria-label={t("reminder.clear")} data-icon="x" class="grid h-5 w-5 shrink-0 place-items-center rounded-full text-neutral-400">
+            {@html iconSvg("x", "h-3 w-3")}
           </button>
         {/if}
       </div>
