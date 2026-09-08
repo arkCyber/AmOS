@@ -48,6 +48,16 @@ describe("decodeOutput (interactive PTY stream)", () => {
     expect(decodeOutput("abc\x7f").lines).toEqual(["ab"]);
   });
 
+  test("a lone CR overwrites the line (progress bars), CRLF is a newline", () => {
+    expect(decodeOutput("10%\r20%\r100%\n").lines).toEqual(["100%"]);
+    expect(decodeOutput("abc\r\nb\n").lines).toEqual(["abc", "b"]);
+  });
+
+  test("ESC[K erases to end of the current line", () => {
+    expect(decodeOutput("hello\x1b[K").lines.join("")).toBe("hello");
+    expect(decodeOutput("one\x1b[K").lines).toEqual(["one"]);
+  });
+
   test("ESC[2J requests a full clear", () => {
     const d = decodeOutput("junk\x1b[2Jnew");
     expect(d.clear).toBe(true);

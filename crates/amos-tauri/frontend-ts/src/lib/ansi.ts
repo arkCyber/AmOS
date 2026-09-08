@@ -103,7 +103,6 @@ export function decodeOutput(raw: string): DecodedOutput {
   const lines: string[] = [];
   let cur = "";
   let clear = false;
-  let crPending = false;
 
   const flush = () => {
     lines.push(cur);
@@ -115,23 +114,20 @@ export function decodeOutput(raw: string): DecodedOutput {
   while (i < n) {
     const c = raw[i]!;
     if (c === "\r") {
-      if (crPending) crPending = false; // a stray second \r — ignore
-      flush();
-      crPending = true;
-      i += 1;
+      if (raw[i + 1] === "\n") {
+        flush(); // CRLF = a real newline
+        i += 2;
+      } else {
+        cur = ""; // lone CR = carriage return overwrites the line so far
+        i += 1;
+      }
       continue;
     }
     if (c === "\n") {
-      if (crPending) {
-        crPending = false; // part of CRLF — line already flushed by \r
-      } else {
-        flush();
-      }
+      flush();
       i += 1;
       continue;
     }
-    if (crPending) crPending = false; // a non-\n follows the \r
-
     if (c === "\b" || c === "\u007f") {
       cur = cur.slice(0, -1);
       i += 1;
@@ -154,7 +150,8 @@ export function decodeOutput(raw: string): DecodedOutput {
         cur = "";
         clear = true;
       } else if (!code.endsWith("m")) {
-        // cursor / erase-line CSI — dropped (no visible effect for a line buffer)
+        // cursor / erase-line (EL/ED) CSI — dropped: our line buffer renders
+        // whole lines, and a lone EL at end-of-line is already a no-op.
       } else {
         cur += `\u001b[${code}`; // keep SGR for the colour pass
       }
@@ -163,9 +160,7 @@ export function decodeOutput(raw: string): DecodedOutput {
     cur += c;
     i += 1;
   }
-  if (cur !== "" || (crPending && cur === "")) {
-    if (cur !== "") flush();
-  }
+  if (cur !== "") flush();
   return { lines, clear };
 }
 
