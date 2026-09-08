@@ -22,6 +22,7 @@ function installTermBridge(): { reads: string[][] } {
         const running = reads.length > 0;
         return { id: (args?.session as number) ?? 0, output: out, error: "", running };
       }
+      if (cmd === "term_kill") return { id: (args?.session as number) ?? 0, output: null, error: "", running: false };
       return null;
     },
   };
@@ -97,5 +98,24 @@ describe("TerminalApp.svelte (offline demo shell)", () => {
     const green = host.container.querySelector('span[style*="color: rgb(34, 197, 94)"]') ??
       host.container.querySelector('span[style*="#22c55e"]');
     expect(green).toBeTruthy();
+  });
+
+  test("live mode cleans up the PTY session on unmount (no orphan)", async () => {
+    installTermBridge();
+    let killed = 0;
+    const inv = (window as AnyWin).__TAURI_INTERNALS__ as {
+      invoke: (c: string, a?: Record<string, unknown>) => Promise<unknown>;
+    };
+    const original = inv.invoke;
+    inv.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "term_kill") killed += 1;
+      return original(cmd, args);
+    };
+    const host = render(TerminalApp);
+    await new Promise<void>((r) => setTimeout(r, 60));
+    // unmount while a live session is attached
+    cleanup();
+    await tick();
+    expect(killed).toBeGreaterThan(0);
   });
 });

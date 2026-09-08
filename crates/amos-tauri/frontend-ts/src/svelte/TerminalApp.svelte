@@ -17,8 +17,9 @@
     type TermLine,
   } from "../lib/terminal";
   import { parseAnsi, decodeOutput } from "../lib/ansi";
-  import { termSpawn, termWrite, termRead } from "../lib/backend";
+  import { termSpawn, termWrite, termRead, termKill } from "../lib/backend";
   import { t } from "./locale.svelte";
+  import { onDestroy } from "svelte";
 
   let lines = $state<TermLine[]>(termBanner(t("terminal.demo")));
   let draft = $state("");
@@ -48,6 +49,13 @@
       .catch(() => {
         /* stay in the offline demo */
       });
+  });
+
+  // Leave cleanly: kill the PTY session when the app unmounts (no orphan child).
+  onDestroy(() => {
+    if (live && sess > 0) {
+      void termKill(sess).catch(() => {});
+    }
   });
 
   // Live poller: pull output, decode it (CR/LF / backspace / clear / SGR).
