@@ -1,0 +1,31 @@
+[package]
+name = "amos-telemetry-spy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AmOS passive egress telemetry-spy domain core: a no-block payload-audit NIC that watches one data interface (e.g. rmnet_data0) for device-bound identifiers (hardware serial / IMEI / serving cell ID) leaking in outbound payloads and emits high-severity audit events for a daemon -> System UI gRPC warning path. Pure std by default; live pnet capture is the feature-gated `audit` path (compile != device-validated)."
+
+[lib]
+name = "amos_telemetry_spy"
+path = "src/lib.rs"
+
+# Deliberately no default deps: the identifier model, payload scanner heuristic,
+# minimal header parser and identity seam are pure std and host-testable, so
+# `make test` / `make lint` never pull a native lib. Live packet capture (pnet)
+# and the async Tokio bridge are behind `audit` — the AOSP/rooted real-device
+# path, mirroring amos-network-guard / amos-telephony.
+[dependencies]
+pnet = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+# Live capture on a data interface via libpnet (needs a rooted / AmOS-AOSP slot
+# with raw-socket privilege). `cargo check --features audit` validates it
+# compiles; running it is a device bring-up step.
+audit = ["dep:pnet", "dep:tokio"]
+
+[[example]]
+name = "live_spy"
+required-features = ["audit"]

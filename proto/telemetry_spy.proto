@@ -1,0 +1,89 @@
+// AmOS telemetry-spy gRPC contract: lets the System UI subscribe to a live
+// stream of high-severity egress audit hits produced by the passive
+// amos-telemetry-spy capture layer, over the same shared Unix Domain Socket as
+// privacy / governor / netguard / sensor.
+//
+// Honest boundaries (mirrors docs/anti-telemetry-egress-guard.md and
+// crates/amos-telemetry-spy):
+//   * A hit means a device-bound identifier (hardware serial / IMEI / serving
+//     cell ID) was found as a **plaintext substring** in an outbound payload.
+//     This is a brittle, low-confidence heuristic — encrypted flows hide it and
+//     naive scanning over-reports — so every hit carries an evidence
+//     `confidence` grade and is NOT claimed to be a confirmed leak.
+//   * The spy sees the AP / app data plane only (e.g. rmnet_data0); it cannot
+//     observe the modem/baseband's own backhaul (a separate trust domain).
+//   * `Watch` only yields events when a real capture backend (rooted /
+//     AmOS-AOSP pnet slot) is actually running. On the default host build the
+//     stream is empty or the Arm errors — never a fabricated hit.
+syntax = "proto3";
+
+package amos_telemetry_spy;
+
+// Subscribe to live high-severity audit hits from the telemetry-spy capture.
+message Empty {}
+
+// One evidence grade carried on an EgressHit.
+enum Confidence {
+  CONFIDENCE_UNSPECIFIED = 0;
+  CONFIDENCE_LOW = 1;
+  CONFIDENCE_MEDIUM = 2;
+  CONFIDENCE_HIGH = 3;
+}
+
+// Which device-bound identifier leaked.
+enum IdentifierKind {
+  KIND_UNSPECIFIED = 0;
+  KIND_SERIAL = 1;
+  KIND_IMEI = 2;
+  KIND_CELL_ID = 3;
+}
+
+// The transport the hit was observed on.
+enum Protocol {
+  PROTOCOL_UNSPECIFIED = 0;
+  PROTOCOL_TCP = 1;
+  PROTOCOL_UDP = 2;
+  PROTOCOL_ICMP = 3;
+  PROTOCOL_OTHER = 4;
+}
+
+// One graded identifier hit folded into the audit event.
+message IdentifierHit {
+  IdentifierKind kind = 1;
+  uint32 occurrences = 2;
+  Confidence confidence = 3;
+}
+
+// A single high-severity audit event produced by the spy.
+message EgressHit {
+  // Wall-clock milliseconds (UTC) when the frame was observed.
+  uint64 ts_ms = 1;
+  // The interface the frame was captured on (e.g. rmnet_data0).
+  string iface = 2;
+  // Source IP text form.
+  string src_ip = 3;
+  // Source port, when the transport carried one.
+  optional uint32 src_port = 4;
+  // Destination IP text form.
+  string dst_ip = 5;
+  // Destination port, when the transport carried one.
+  optional uint32 dst_port = 6;
+  Protocol protocol = 7;
+  // The graded identifier hits.
+  repeated IdentifierHit hits = 8;
+  // Payload window size that was scanned.
+  uint64 payload_bytes = 9;
+  // Severity (always HIGH for a hit) and strongest evidence grade.
+  string severity = 10;
+  Confidence confidence = 11;
+}
+
+service TelemetrySpyService {
+  // Live server-streaming of high-severity audit hits.
+  rpc Watch(Empty) returns (stream EgressHit);
+  // Test/demo injection: publish one hit onto the Watch fan-out so a real UDS
+  // e2e can drive the chain (subscribe -> SimulateHit -> receive). Honest &
+  // safe by default: the daemon rejects this with PermissionDenied unless the
+  // `AMOS_SPY_ALLOW_INJECT` env var is set (off on every production boot).
+  rpc SimulateHit(EgressHit) returns (Empty);
+}
