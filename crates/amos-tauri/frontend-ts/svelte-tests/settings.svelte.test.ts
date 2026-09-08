@@ -138,6 +138,8 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     expect(txt(host)).toContain("名称");
     expect(txt(host)).toContain("可被发现");
     expect(txt(host)).toContain("AirPods Pro");
+    // the Wi‑Fi-only "current network" row is NOT shown on the Bluetooth page
+    expect(txt(host)).not.toContain("当前网络");
     // default discoverable = on; toggle persists it off
     const disc = host.container.querySelector('[role="switch"][aria-label="可被发现"]') as HTMLButtonElement | null;
     expect(disc).toBeTruthy();

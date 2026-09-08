@@ -110,11 +110,13 @@
         <p class={HINT}>{t("settings.airplaneBlocks")}</p>
       </div>
     {:else}
-      <div class={SUB}></div>
-      <div class="flex items-center justify-between gap-3 px-4 py-3">
-        <span class={LABEL}>{t("settings.currentNetwork")}</span>
-        <span class="truncate text-[15px] opacity-60">{which === "wifi" && on && cfg.current ? cfg.current : on ? t("settings.on") : t("settings.off")}</span>
-      </div>
+      {#if which === "wifi"}
+        <div class={SUB}></div>
+        <div class="flex items-center justify-between gap-3 px-4 py-3">
+          <span class={LABEL}>{t("settings.currentNetwork")}</span>
+          <span class="truncate text-[15px] opacity-60">{which === "wifi" && on && cfg.current ? cfg.current : on ? t("settings.on") : t("settings.off")}</span>
+        </div>
+      {/if}
     {/if}
   </section>
 
