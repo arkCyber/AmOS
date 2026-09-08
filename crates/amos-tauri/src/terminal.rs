@@ -48,6 +48,7 @@ fn err(e: impl Into<String>) -> TermOut {
 }
 
 /// A live terminal session (fields filled when `terminal-pty` is enabled).
+#[allow(dead_code)] // read only under the `terminal-pty` feature
 struct Session {
     cwd: String,
     /// Per-session allowlist; None = unrestricted (still a device-only choice).
@@ -65,6 +66,7 @@ fn registry() -> &'static Mutex<HashMap<u64, Session>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(dead_code)] // used only when spawning a real PTY under `terminal-pty`
 fn next_id() -> u64 {
     static NEXT: OnceLock<Mutex<u64>> = OnceLock::new();
     let mut n = NEXT.get_or_init(|| Mutex::new(1)).lock().unwrap();
@@ -186,6 +188,40 @@ pub fn allowed(allowlist: Option<&[String]>, bin: &str) -> bool {
     match allowlist {
         None => true,
         Some(list) => list.iter().any(|a| a == bin),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_policy_is_fail_open_only_when_unrestricted() {
+        let list = ["ls".to_string(), "pwd".to_string()];
+        assert!(allowed(Some(&list), "ls"));
+        assert!(allowed(Some(&list), "pwd"));
+        assert!(!allowed(Some(&list), "rm"));
+        assert!(!allowed(Some(&list), "su"));
+        // No allowlist = unrestricted (only reachable after an explicit opt-in
+        // at spawn time in the real backend).
+        assert!(allowed(None, "anything"));
+    }
+
+    #[tokio::test]
+    async fn spawn_is_refused_when_pty_feature_is_off() {
+        // Default posture: no execution surface.
+        let r = term_spawn(None, Some(vec!["ls".to_string()])).await;
+        assert_eq!(r.id, 0);
+        assert!(!r.error.is_empty());
+        assert!(r.error.contains("not enabled"));
+    }
+
+    #[tokio::test]
+    async fn unknown_session_ops_fail_cleanly() {
+        let r = term_kill(999_999).await;
+        assert_eq!(r.id, 0);
+        assert!(r.error.contains("unknown or ended session"));
     }
 }
 

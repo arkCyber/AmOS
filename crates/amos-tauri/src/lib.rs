@@ -40,6 +40,7 @@ pub mod store;
 pub mod system;
 pub mod taskmgr;
 pub mod telephony;
+pub mod terminal;
 pub mod translate;
 pub mod tts;
 pub mod wm;

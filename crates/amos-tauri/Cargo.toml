@@ -50,6 +50,8 @@ hyper-util.workspace = true
 serde.workspace = true
 serde_json = "1.0"
 base64 = "0.21"
+# PTY for the terminal backend; enabled only by the `terminal-pty` feature.
+portable-pty = { version = "0.8", optional = true }
 tracing.workspace = true
 
 # Opt-in local streaming ASR: compiles + links the native sherpa-onnx lib.
@@ -90,6 +92,9 @@ appstore-live = ["amos-appstore/live"]
 # SELinux but can bind loopback TCP (see crates/amos-ai/src/server.rs
 # `resolve_tcp_addr`). Desktop host builds omit it (UDS), unless AMOS_TCP_ADDR is set.
 tcp = []
+# PTY-backed terminal shell (device): off by default — the safe posture is a
+# non-executing build. Enable on-device (System UI APK) with the real pty crate.
+terminal-pty = ["dep:portable-pty"]
 
 # Integration tests spawn the real amos-ai tonic server in-process so the AI
 # bridge command core can be exercised headlessly over UDS (no Tauri/GUI).
