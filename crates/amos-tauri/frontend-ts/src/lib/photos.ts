@@ -111,6 +111,20 @@ export function toggleFav(list: Photo[], id: string): Photo[] {
   return list.map((p) => (p.id === id ? { ...p, fav: !p.fav } : p));
 }
 
+/** Batch-set the favourite flag on every photo whose id is in `ids` (like the
+ * iOS "Favourite" action in multi-select). New array; returns the input when the
+ * set is empty. */
+export function setFavs(list: Photo[], ids: ReadonlySet<string>, on: boolean): Photo[] {
+  if (ids.size === 0) return list;
+  return list.map((p) => {
+    if (!ids.has(p.id)) return p;
+    const next: Photo = { ...p };
+    if (on) next.fav = true;
+    else delete next.fav; // clearing → drop the key (invariant: absent = not fav)
+    return next;
+  });
+}
+
 /** Only the favourited photos. */
 export function favsOf(list: Photo[]): Photo[] {
   return list.filter((p) => p.fav);

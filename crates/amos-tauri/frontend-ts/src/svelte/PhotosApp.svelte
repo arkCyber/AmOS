@@ -15,6 +15,7 @@
     removePhoto,
     removePhotos,
     seedPhotos,
+    setFavs,
     shareCaption,
     toggleFav,
   } from "../lib/photos";
@@ -104,6 +105,22 @@
     persist(removePhotos(list, selected));
     selected = new Set();
     selecting = false;
+  };
+  // iOS multi-select "Favourite": mark every selected photo favourited, exit.
+  const batchFav = (on: boolean) => {
+    if (selected.size === 0) return;
+    persist(setFavs(list, selected, on));
+    selected = new Set();
+    selecting = false;
+  };
+  // Select All / Deselect All over the currently-shown photos (respects the
+  // active ♥ filter), mirroring iOS's in-selection "Select All".
+  const allShownSelected = $derived(
+    selecting && shown.length > 0 && selected.size === shown.length,
+  );
+  const toggleSelectAll = () => {
+    if (!selecting || shown.length === 0) return;
+    selected = allShownSelected ? new Set() : new Set(shown.map((p) => p.id));
   };
 
   // Interleave stills + camera videos newest-first.
@@ -305,7 +322,11 @@
           <button onclick={() => (favOnly = true)} aria-pressed={favOnly} class={chip(favOnly, "md")}>♥ ({favsOf(list).length})</button>
         </div>
       {/if}
+      {#if selecting && list.length > 0}
+        <button onclick={toggleSelectAll} class={chip(allShownSelected, "md")}>{allShownSelected ? t("photo.selectNone") : t("photo.selectAll")}</button>
+      {/if}
       {#if selecting && selected.size > 0}
+        <button onclick={() => batchFav(true)} class={btn("accent", "lg")}>{t("photo.favSelected", { n: selected.size })}</button>
         <button onclick={deleteSelected} class={btn("danger", "lg")}>{t("photo.deleteSelected", { n: selected.size })}</button>
       {/if}
     </div>

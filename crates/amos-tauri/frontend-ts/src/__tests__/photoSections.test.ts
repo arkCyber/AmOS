@@ -4,7 +4,7 @@
  * timestamps from whole-day offsets, so no timezone/DST ambiguity can leak in.
  */
 import { describe, expect, test } from "bun:test";
-import { dayIndex, dayKey, groupDays, type DaySectionText } from "../lib/photos";
+import { dayIndex, dayKey, groupDays, setFavs, type DaySectionText } from "../lib/photos";
 
 const now = new Date(2026, 8, 8, 12, 0, 0).getTime(); // 2026-09-08 12:00 local
 const DAY = 86_400_000;
@@ -49,5 +49,34 @@ describe("photo day grouping", () => {
     const one = groupDays([D(now)], now, tx);
     expect(one).toHaveLength(1);
     expect(one[0]?.items).toHaveLength(1);
+  });
+});
+
+// setFavs lives in lib/photos.ts alongside toggleFav.
+describe("photo setFavs", () => {
+  const mk = () => [
+    { id: "a", ts: 1 },
+    { id: "b", ts: 2, fav: true },
+    { id: "c", ts: 3 },
+  ];
+  test("sets fav=true on the chosen subset, leaving others untouched", () => {
+    const out = setFavs(mk(), new Set(["a", "c"]), true);
+    expect(out.map((p) => [p.id, p.fav])).toEqual([
+      ["a", true],
+      ["b", true],
+      ["c", true],
+    ]);
+  });
+  test("can clear fav on a subset", () => {
+    const out = setFavs(mk(), new Set(["b"]), false);
+    expect(out.find((p) => p.id === "b")?.fav).toBeUndefined();
+    expect(out.find((p) => p.id === "a")?.fav).toBeUndefined();
+  });
+  test("returns the input unchanged for an empty selection", () => {
+    const list = mk();
+    expect(setFavs(list, new Set(), true)).toBe(list);
+    // unknown ids are ignored but the array is still rebuilt
+    const out = setFavs(list, new Set(["nope"]), true);
+    expect(out).toEqual(list);
   });
 });

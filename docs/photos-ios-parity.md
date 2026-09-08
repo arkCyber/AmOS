@@ -28,8 +28,8 @@
 | iOS | AmOS | 状态 | 验收 |
 |---|---|---|---|
 | 点选、计数、批量删除 | `selecting` + `removePhotos` + 计数按钮 | ✅ | photos.svelte 1 例 |
-| 批量**收藏** | — | 🟡 | 待加 `selected`→fav |
-| 「全选」+ 反选 | — | ❌ | 待加 |
+| 批量**收藏**（选择态） | `setFavs` 纯函数 + `photo.favSelected` 按钮 | ✅ | pure setFavs 3 例 + photos.svelte 1 例 |
+| **全选 / 取消全选**（尊重 ♥ 过滤） | `allShownSelected` + `toggleSelectAll` + `photo.selectAll/None` | ✅ | photos.svelte 1 例（含计数断言） |
 
 ## 媒体源
 | iOS | AmOS | 状态 | 验收 |

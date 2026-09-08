@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **相册 iOS 选择态 Phase-2（批量收藏 + 全选，2026-09-08）**：在 iOS 对齐 Phase-1（Days 分组）基础上补齐选择操作。纯 `lib/photos.ts: setFavs(list, ids, on)`（批量设收藏；清除时删除键，保持「非收藏则 fav 缺席」不变量）。`PhotosApp.svelte` 加选择态「收藏所选 ({n})」按钮与「全选/取消全选」切换（尊重当前 ♥ 过滤，`allShownSelected` 判定），操作后退出选择态。i18n 加 `photo.favSelected/photo.selectAll/photo.selectNone`（en/zh 各 +3 奇偶一致）。验证：纯 setFavs 3 例（子集置真/清除/空集合引用不变）、photos.svelte 7 例（+批量收藏→♥(1)、+全选→删除计数=全部→取消清空）、i18n 6、全量 vitest **54 文件 / 293 例全绿**（+2）、tsc/svelte-check clean。文档 `photos-ios-parity.md` 更新对应行 ✅。
 - **相册 iOS Days 分组对齐（Phase-1，2026-09-08）**：对照 iOS「照片」审计并产出差距清单 `docs/photos-ios-parity.md`（每条带验收语义/纯测或真机标记）。实现第一个可验证对齐项：图库按本地日 **Days 分组**并显示相对日期头（`今天/昨天/具体日期`）。纯逻辑单源在 `lib/photos.ts`：新增 `dayKey`/`dayIndex`/`dayLabel`/`groupDays`（本地午夜取日、DST 安全、新→旧、同日内保序）；`PhotosApp.svelte` 用派生 `sections` 把网格包成逐节 + 段头（含计数、`role="heading"`），段头经 `t()` 对语言热切。i18n 加 `photo.today/photo.yesterday`（en/zh 奇偶一致）。验证：纯 `photoSections.test.ts` 3 例（key/index/分组/计数/顺序）、photos.svelte 5 例（+段头 + i18n 热切 Today）、全量 vitest **54 文件 / 291 例全绿**（+1）、tsc clean、svelte-check 0/0。
 
 ### Fixed

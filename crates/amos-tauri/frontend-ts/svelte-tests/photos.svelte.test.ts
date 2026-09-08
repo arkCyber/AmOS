@@ -81,6 +81,44 @@ describe("PhotosApp.svelte", () => {
     expect(firstTile(host)).toBeTruthy();
   });
 
+  test("select-mode batch favourite marks the chosen photos and exits", async () => {
+    const host = render(PhotosApp);
+    // enter select mode
+    const selBtn = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").trim() === "选择",
+    );
+    await fireEvent.click(selBtn as HTMLButtonElement);
+    await fireEvent.click(firstTile(host)!); // pick one photo
+    const favBtn = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").includes("收藏所选 (1)"),
+    );
+    expect(favBtn).toBeTruthy();
+    await fireEvent.click(favBtn as HTMLButtonElement);
+    // select mode exited; the ♥ filter chip now reports one favourite
+    expect(txt(host)).toContain("♥ (1)");
+    expect(txt(host)).not.toContain("收藏所选");
+  });
+
+  test("Select All selects every shown photo (delete count), Deselect All clears", async () => {
+    const host = render(PhotosApp);
+    await fireEvent.click([...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").trim() === "选择",
+    ) as HTMLButtonElement);
+    // Select All → all shown photos selected → delete-count equals the full list
+    await fireEvent.click([...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").trim() === "全选",
+    ) as HTMLButtonElement);
+    const seedCount = host.container.querySelectorAll('button[class*="aspect-square"]').length;
+    expect(seedCount).toBeGreaterThan(0);
+    expect(txt(host)).toContain("取消全选"); // now fully selected
+    expect(txt(host)).toContain(`删除所选 (${seedCount})`);
+    // Deselect All clears the selection (actions disappear)
+    await fireEvent.click([...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").trim() === "取消全选",
+    ) as HTMLButtonElement);
+    expect(txt(host)).not.toContain("删除所选");
+  });
+
   test("shows a read-only native strip when a media bridge serves stills", async () => {
     // Offline (no bridge) the strip stays hidden; with a stubbed bridge the
     // camera collection returns one native still → a read-only native tile.
