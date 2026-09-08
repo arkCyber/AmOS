@@ -242,4 +242,27 @@ describe("CameraApp.svelte (video library)", () => {
     expect(stored.length).toBe(1);
     expect(btnAria(host, "媒体库")).toBeTruthy();
   });
+
+  test("a still can be captured while recording video, without stopping it", async () => {
+    (globalThis as { MediaRecorder?: unknown }).MediaRecorder = FakeMediaRecorder;
+    const host = await renderLive();
+    await fireEvent.click(btnAria(host, "视频") as HTMLButtonElement);
+    await settle();
+    // start recording
+    await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+    await settle();
+    expect(txt(host)).toContain("录制中…");
+    // grab a photo mid-recording → it lands in Photos
+    const photosBefore = (JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]") as unknown[]).length;
+    expect(btnAria(host, "录像中拍照")).toBeTruthy();
+    await fireEvent.click(btnAria(host, "录像中拍照") as HTMLButtonElement);
+    await settle();
+    const photos = JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]") as unknown[];
+    expect(photos.length).toBe(photosBefore + 1);
+    // the recording is NOT interrupted by the grab
+    expect(txt(host)).toContain("录制中…");
+    await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+    await settle();
+    expect(txt(host)).not.toContain("录制中…");
+  });
 });

@@ -316,6 +316,7 @@ export const en: Record<MessageKey, string> = {
   "camera.photo": "Photo",
   "camera.video": "Video",
   "camera.recording": "Recording…",
+  "camera.photoWhileRec": "Photo while recording",
   "camera.library": "Library",
   "camera.delete": "Delete",
   "camera.recSaved": "Saved to library 🎬",

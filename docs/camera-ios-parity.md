@@ -22,6 +22,7 @@
 |---|---|---|---|
 | 拍照/录像 滑切 | `mode` photo/video | ✅ | — |
 | 录像→app 内媒体库回放/删除 | `MediaRecorder` + `amos.captures` + overlay | ✅ | svelte 录像→library 1 例 |
+| **录像中拍照（不中断录制）** | 录制态「📷」按钮 → `doCapture` 抓帧写 Photos | ✅ | svelte「录像中拍照→Photos+1 且仍在录」1 例 |
 | 真实感 HDR 开关 + 诚实降级说明 | `hdr` 占位 + `camera.hdrNote` | 🟡(占位) | svelte HDR note 1 例 |
 
 ## 系统/高级（多数需真机）

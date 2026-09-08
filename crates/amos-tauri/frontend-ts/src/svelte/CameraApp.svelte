@@ -609,6 +609,15 @@
   const controlCls = (active: boolean) =>
     "grid h-9 min-w-9 place-items-center rounded-full px-1.5 text-[13px] leading-none transition active:scale-90 disabled:opacity-25 " +
     (active ? "bg-white text-neutral-900 shadow" : "bg-black/30 text-white ring-1 ring-white/30");
+
+  // iOS "capture a photo while recording video": a still-frame grab that does
+  // NOT interrupt the running recording. Reuses the normal frame-capture path
+  // (canvas from the live <video> when pixels exist, else the demo tile) and
+  // writes straight into Photos.
+  const grabStill = () => {
+    if (mode !== "video" || recState !== "recording" || !live) return;
+    doCapture();
+  };
 </script>
 
 <div class="flex h-full flex-col bg-black text-white">
@@ -688,6 +697,17 @@
           {fmtClockSec(elapsed)} · {t("camera.recording")}
         </div>
       </div>
+    {/if}
+
+    <!-- iOS: capture a still photo while the video is recording (doesn't stop it) -->
+    {#if mode === "video" && recState === "recording"}
+      <button
+        onclick={grabStill}
+        disabled={!live}
+        aria-label={t("camera.photoWhileRec")}
+        title={t("camera.photoWhileRec")}
+        class="absolute right-3 top-14 z-10 grid h-11 w-11 place-items-center rounded-full bg-white/90 text-[#111] text-lg shadow ring-1 ring-white/50 transition active:scale-90 disabled:opacity-40"
+      >📷</button>
     {/if}
 
     <!-- burst-in-progress counter -->

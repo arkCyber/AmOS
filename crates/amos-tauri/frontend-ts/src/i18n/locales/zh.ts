@@ -314,6 +314,7 @@ export const zh = {
   "camera.photo": "拍照",
   "camera.video": "视频",
   "camera.recording": "录制中…",
+  "camera.photoWhileRec": "录像中拍照",
   "camera.library": "媒体库",
   "camera.delete": "删除",
   "camera.recSaved": "已保存到媒体库 🎬",
