@@ -44,6 +44,7 @@
   let wallMsg = $state("");
   let slide = $state(false);
   let favOnly = $state(false);
+  let vidsOnly = $state(false);
   let vids = $state<VideoCapture[]>(listCaptures());
   let playId = $state<string | null>(null);
   let playUrl = $state("");
@@ -52,7 +53,7 @@
   // Native (real external-storage) stills from the media_* bridge, shown as a
   // read-only strip above the local grid (only when a bridge is present).
   let native = $state<NativePhoto[]>([]);
-  const nativeShown = $derived(!favOnly && !selecting && native.length > 0);
+  const nativeShown = $derived(!favOnly && !vidsOnly && !selecting && native.length > 0);
 
   // Load real stills from the bridge once (camera + screenshots). Offline (no
   // bridge) or on a denied/absent backend this stays empty → the strip is hidden
@@ -97,9 +98,21 @@
     selected = next;
   };
   const toggleSelectMode = () => {
+    if (vidsOnly) return; // video tiles aren't multi-selectable (their own fav)
     selected = new Set();
     selecting = !selecting;
   };
+  // iOS-like Library filter: All / Favourites / Videos (smart "albums").
+  const setFilter = (v: "all" | "fav" | "videos") => {
+    favOnly = v === "fav";
+    vidsOnly = v === "videos";
+    if (selecting) {
+      selected = new Set();
+      selecting = false;
+    }
+  };
+  const viewIs = (v: "all" | "fav" | "videos"): boolean =>
+    v === "fav" ? favOnly : v === "videos" ? vidsOnly : !favOnly && !vidsOnly;
   const deleteSelected = () => {
     if (selected.size === 0) return;
     persist(removePhotos(list, selected));
@@ -127,7 +140,11 @@
   const gallery = $derived(
     (() => {
       const out: ({ kind: "photo"; p: Photo } | { kind: "video"; v: VideoCapture })[] = [];
-      for (const p of shown) out.push({ kind: "photo", p });
+      // "Videos" shows only camera videos; every other view shows (filtered) stills.
+      if (!vidsOnly) {
+        for (const p of shown) out.push({ kind: "photo", p });
+      }
+      // Favourites keeps stills only; All and Videos mix in the camera library.
       const showVideos = vids.length > 0 && !selecting && !favOnly;
       if (showVideos) for (const v of vids) out.push({ kind: "video", v });
       out.sort(
@@ -316,12 +333,15 @@
       {#if list.length > 0}
         <button onclick={toggleSelectMode} class={chip(selecting, "lg")}>{selecting ? t("photo.cancel") : t("photo.select")}</button>
       {/if}
-      {#if favsOf(list).length > 0}
-        <div class="ml-auto flex gap-1">
-          <button onclick={() => (favOnly = false)} aria-pressed={!favOnly} class={chip(!favOnly, "md")}>{t("photo.all")} ({list.length})</button>
-          <button onclick={() => (favOnly = true)} aria-pressed={favOnly} class={chip(favOnly, "md")}>♥ ({favsOf(list).length})</button>
-        </div>
-      {/if}
+      <div class="ml-auto flex gap-1">
+        <button onclick={() => setFilter("all")} aria-pressed={viewIs("all")} class={chip(viewIs("all"), "md")}>{t("photo.all")} ({list.length})</button>
+        {#if favsOf(list).length > 0}
+          <button onclick={() => setFilter("fav")} aria-pressed={viewIs("fav")} class={chip(viewIs("fav"), "md")}>♥ ({favsOf(list).length})</button>
+        {/if}
+        {#if vids.length > 0}
+          <button onclick={() => setFilter("videos")} aria-pressed={viewIs("videos")} class={chip(viewIs("videos"), "md")}>🎬 ({vids.length})</button>
+        {/if}
+      </div>
       {#if selecting && list.length > 0}
         <button onclick={toggleSelectAll} class={chip(allShownSelected, "md")}>{allShownSelected ? t("photo.selectNone") : t("photo.selectAll")}</button>
       {/if}
@@ -331,9 +351,9 @@
       {/if}
     </div>
 
-    {#if list.length === 0}
+    {#if list.length === 0 && !vidsOnly}
       <p class="py-10 text-center text-sm opacity-60">{t("photo.empty")}</p>
-    {:else if shown.length === 0}
+    {:else if shown.length === 0 && !vidsOnly}
       <p class="py-10 text-center text-sm opacity-60">{t("photo.favEmpty")}</p>
     {:else}
       {#if nativeShown}

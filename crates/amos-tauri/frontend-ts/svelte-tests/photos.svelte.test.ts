@@ -12,6 +12,7 @@ import PhotosApp from "../src/svelte/PhotosApp.svelte";
 import { setLocale } from "../src/svelte/locale.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import { PHOTOS_KEY } from "../src/lib/photos";
+import { CAPTURES_KEY } from "../src/lib/cameraCapture";
 
 afterEach(() => {
   cleanup();
@@ -31,6 +32,34 @@ describe("PhotosApp.svelte", () => {
     const host = render(PhotosApp);
     expect(txt(host)).not.toContain("暂无照片");
     expect(firstTile(host)).toBeTruthy();
+  });
+
+  test("Videos smart-filter shows only camera videos; All restores stills", async () => {
+    // Seed one camera video capture → the 🎬 chip appears.
+    writeStoreValue(CAPTURES_KEY, [
+      { id: "v1", ts: Date.now() - 1000, mime: "video/webm", durationMs: 3000, w: 1280, h: 720 },
+    ]);
+    const host = render(PhotosApp);
+    await tick();
+    const vidChip = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").includes("🎬 (1)"),
+    );
+    expect(vidChip).toBeTruthy();
+    const photoCount = () =>
+      host.container.querySelectorAll('button[class*="aspect-square"]').length;
+    expect(photoCount()).toBeGreaterThan(0); // stills present in All view
+    // switch to Videos → only the video tile remains, stills hidden
+    await fireEvent.click(vidChip as HTMLButtonElement);
+    await tick();
+    expect(host.container.querySelector('button[aria-label="video"]')).toBeTruthy();
+    expect(photoCount()).toBe(0);
+    // back to All → stills return
+    const allChip = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").includes("全部"),
+    );
+    await fireEvent.click(allChip as HTMLButtonElement);
+    await tick();
+    expect(photoCount()).toBeGreaterThan(0);
   });
 
   test("grid is grouped into iOS-style day sections; headers relabel on locale switch", async () => {
