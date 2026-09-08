@@ -10,10 +10,13 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import PhotosApp from "../src/svelte/PhotosApp.svelte";
 import { setLocale } from "../src/svelte/locale.svelte";
+import { writeStoreValue } from "../src/lib/amosStore";
+import { PHOTOS_KEY } from "../src/lib/photos";
 
 afterEach(() => {
   cleanup();
   setLocale("zh");
+  window.localStorage.clear();
 });
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
@@ -117,6 +120,25 @@ describe("PhotosApp.svelte", () => {
       (b) => (b.textContent ?? "").trim() === "取消全选",
     ) as HTMLButtonElement);
     expect(txt(host)).not.toContain("删除所选");
+  });
+
+  test("viewer navigation stays inside the active ♥ filter (no jump to unfavourited)", async () => {
+    // Seed two photos: one favourited (newer), one not (older).
+    writeStoreValue(PHOTOS_KEY, [
+      { id: "p-fav", ts: Date.now() - 1000, fav: true, emoji: "💙", a: "#f00", b: "#00f" },
+      { id: "p-old", ts: Date.now() - 2 * 86_400_000, emoji: "💛", a: "#0f0", b: "#0ff" },
+    ]);
+    const host = render(PhotosApp);
+    // switch to Favourites → only the favourited tile is shown
+    await fireEvent.click([...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").includes("♥ (1)"),
+    ) as HTMLButtonElement);
+    expect(txt(host)).not.toContain("💛"); // non-favourite hidden
+    // open the favourited photo
+    await fireEvent.click(host.container.querySelector('button[class*="aspect-square"]') as HTMLButtonElement);
+    // prev/next disabled: the only other item is outside the filter
+    expect(btnAria(host, "下一张")?.disabled).toBe(true);
+    expect(btnAria(host, "上一张")?.disabled).toBe(true);
   });
 
   test("shows a read-only native strip when a media bridge serves stills", async () => {

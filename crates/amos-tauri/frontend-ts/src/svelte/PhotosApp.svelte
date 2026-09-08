@@ -171,10 +171,10 @@
     const cur = sel;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "ArrowLeft") {
-        const p = neighborOf(list, cur.id, -1);
+        const p = neighborOf(shown, cur.id, -1);
         if (p) sel = p;
       } else if (e.key === "ArrowRight") {
-        const n = neighborOf(list, cur.id, 1);
+        const n = neighborOf(shown, cur.id, 1);
         if (n) sel = n;
       }
     };
@@ -186,7 +186,7 @@
   $effect(() => {
     if (!slide || !sel) return;
     const id = setInterval(() => {
-      sel = neighborOf(list, sel?.id ?? "", 1) ?? sel;
+      sel = neighborOf(shown, sel?.id ?? "", 1) ?? sel;
     }, 2500);
     return () => clearInterval(id);
   });
@@ -270,9 +270,9 @@
 </script>
 
 {#if sel}
-  {@const prevP = neighborOf(list, sel?.id ?? "", -1)}
-  {@const nextP = neighborOf(list, sel?.id ?? "", 1)}
-  {@const idx = list.findIndex((p) => p.id === sel?.id) + 1}
+  {@const prevP = neighborOf(shown, sel?.id ?? "", -1)}
+  {@const nextP = neighborOf(shown, sel?.id ?? "", 1)}
+  {@const idx = shown.findIndex((p) => p.id === sel?.id) + 1}
   <div class="flex h-full flex-col items-center justify-center gap-3 p-4">
     <div class="grid h-40 w-40 place-items-center overflow-hidden rounded-3xl text-7xl" style:background={grad(sel) ?? "#14161d"}>
       {#if sel.data}

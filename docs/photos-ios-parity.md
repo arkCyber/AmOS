@@ -17,7 +17,7 @@
 ## 查看器（全屏）
 | iOS | AmOS | 状态 | 验收 |
 |---|---|---|---|
-| 左右翻页 + 键盘/箭头 | viewer + `neighborOf` + ArrowLeft/Right | ✅ | svelte 测试 / 手动 |
+| 左右翻页 + 键盘/箭头 | viewer + `neighborOf` + ArrowLeft/Right（**基于当前 `shown`**，♥ 过滤内翻页不越界） | ✅ | svelte 1 例（♥ 视图内 prev/next 禁用） |
 | 收藏、删除、分享 | fav/share(剪贴板)/delete | ✅ | — |
 | 分享**系统分享单** | 剪贴板文本（离线占位） | 🟡 | 真机需分享面板 📱 |
 | 缩放（捏合/双击）、滑动关闭过渡 | — | ❌ | 📱 |
