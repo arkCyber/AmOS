@@ -91,3 +91,9 @@ export function pushHistory(history: string[], input: string, cap = 100): string
   const next = history[history.length - 1] === s ? history : [...history, s];
   return next.length > cap ? next.slice(next.length - cap) : next;
 }
+
+/** Cap a transcript to the newest `cap` lines (scrollback buffer). Pure. */
+export function capLines(lines: readonly TermLine[], cap = 1000): TermLine[] {
+  if (lines.length <= cap) return lines as TermLine[];
+  return lines.slice(lines.length - cap);
+}

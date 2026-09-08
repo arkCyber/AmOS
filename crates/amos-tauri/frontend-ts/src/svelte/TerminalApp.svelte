@@ -13,6 +13,7 @@
     termBanner,
     runTermLine,
     pushHistory,
+    capLines,
     PROMPT,
     type TermLine,
   } from "../lib/terminal";
@@ -27,6 +28,15 @@
   let histIdx = $state(-1);
   let scroller: HTMLDivElement | null = $state(null);
   let cmdInput: HTMLInputElement | null = $state(null);
+
+  // Every transcript write goes through the scrollback cap so a long-running
+  // (live) session never grows the DOM without bound.
+  const setLines = (next: TermLine[]) => {
+    lines = capLines(next);
+  };
+  const appendLines = (add: TermLine[]) => {
+    lines = capLines([...lines, ...add]);
+  };
 
   // Live (real-PTY) session state.
   let live = $state(false);
@@ -43,7 +53,7 @@
         if (r && r.id > 0) {
           live = true;
           sess = r.id;
-          lines = [...lines, { text: "(real PTY shell attached)", kind: "muted" }];
+          appendLines([{ text: "(real PTY shell attached)", kind: "muted" }]);
         }
       })
       .catch(() => {
@@ -66,9 +76,9 @@
         const r = await termRead(sess, 4096).catch(() => null);
         if (!r || r.output == null) return;
         const d = decodeOutput(r.output);
-        if (d.clear) lines = [];
+        if (d.clear) setLines([]);
         if (d.lines.length > 0) {
-          lines = [...lines, ...d.lines.map((text) => ({ text, kind: "out" as const }))];
+          appendLines(d.lines.map((text) => ({ text, kind: "out" as const })));
         }
         if (!r.running) clearInterval(id);
       })();
@@ -88,9 +98,9 @@
       const trimmed = draft.trim();
       if (trimmed !== "") {
         void termWrite(sess, `${trimmed}\n`).catch(() => {});
-        lines = [...lines, { text: `${PROMPT} ${draft}`, kind: "cmd" as const }];
+        appendLines([{ text: `${PROMPT} ${draft}`, kind: "cmd" as const }]);
       } else {
-        lines = [...lines, { text: PROMPT, kind: "cmd" as const }];
+        appendLines([{ text: PROMPT, kind: "cmd" as const }]);
       }
       pushDraftHistoryOnly();
       draft = "";
@@ -100,7 +110,7 @@
     const r = runTermLine(draft, "AmOS Terminal (offline demo)");
     const base = r.clear ? [] : lines;
     const prompt = draft.trim() === "" ? [{ text: PROMPT, kind: "cmd" as const }] : [];
-    lines = [...base, ...prompt, ...r.lines];
+    setLines([...base, ...prompt, ...r.lines]);
     hist = pushHistory(hist, draft);
     histIdx = -1;
     draft = "";

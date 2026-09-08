@@ -2,7 +2,7 @@
  * Pure unit tests for the offline-safe AmOS terminal line model (lib/terminal.ts).
  */
 import { describe, expect, test } from "bun:test";
-import { runTermLine, pushHistory, termBanner } from "../lib/terminal";
+import { runTermLine, pushHistory, capLines, termBanner } from "../lib/terminal";
 
 const last = (ls: unknown[]): unknown => ls[ls.length - 1];
 const lastText = (ls: readonly { text: string }[]): string | undefined =>
@@ -66,5 +66,17 @@ describe("terminal history", () => {
     const capped = pushHistory(big, "last", 100);
     expect(capped.length).toBe(100);
     expect(capped[capped.length - 1]).toBe("last");
+  });
+});
+
+describe("terminal scrollback", () => {
+  test("capLines keeps the newest lines within the buffer", () => {
+    const mk = (n: number) => Array.from({ length: n }, (_, i) => ({ text: `L${i}`, kind: "out" as const }));
+    expect(capLines(mk(5), 10)).toHaveLength(5); // under cap → unchanged length
+    const capped = capLines(mk(20), 10);
+    expect(capped).toHaveLength(10);
+    expect(capped[0]).toEqual({ text: "L10", kind: "out" });
+    expect(capped[9]).toEqual({ text: "L19", kind: "out" });
+    expect(capLines([], 5)).toEqual([]);
   });
 });
