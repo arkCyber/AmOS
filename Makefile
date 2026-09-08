@@ -77,6 +77,7 @@ gated-check:
 	cargo check -p amos-radio --features android
 	cargo check -p amos-telephony --features android
 	cargo check -p amos-sensor --features android
+	cargo check -p amos-media --features android
 	cargo check -p amos-profiling --features android
 	# Battery/thermal telemetry seam feeding the energy governor (amos-power).
 	cargo check -p amos-power --features android

@@ -1,0 +1,32 @@
+[package]
+name = "amos-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos media / external-storage domain core: spec types for the standard Android file collections (DCIM/Camera, Pictures, Download, Recordings…), a pluggable MediaProvider seam (deterministic Mock today; Android MediaStore via Kotlin glue + optional HostFs for root/Waydroid later), and a permission-policy MediaManager. Design & gap list: docs/android-storage-unify.md, docs/media.md."
+
+[lib]
+name = "amos_media"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+serde.workspace = true
+serde_json = "1"
+base64 = "0.21"
+# Real Android MediaStore backend (`src/android.rs`, feature `android`): talks to
+# the Kotlin `MediaStoreGlue` in the System UI APK over JNI (String↔String JSON).
+# Optional so desktop/CI stay light.
+jni = { version = "0.21", optional = true }
+
+[dev-dependencies]
+
+[features]
+default = []
+# Real Android MediaStore backend (`src/android.rs`) behind the provider seam.
+# Needs the Kotlin MediaStoreGlue in the generated System UI app + a runtime
+# permission grant, so `cargo check --features android` only proves it compiles;
+# real behavior is exercised at device time (docs/android-storage-unify.md §6 C).
+android = ["dep:jni"]
+

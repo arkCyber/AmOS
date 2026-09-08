@@ -10,12 +10,12 @@
 //! mappers (unit-tested). Absent daemon → descriptive error (UI shows a
 //! "daemon not connected" state).
 
+use crate::ai_bridge::with_client_id;
 use amos_proto::amos_governor::governor_client::GovernorClient;
 use amos_proto::amos_governor::{
     AppRef as ProtoAppRef, Empty as GovernorEmpty, JobRef as ProtoJobRef, MoveAppRequest,
 };
 use serde::Serialize;
-use crate::ai_bridge::with_client_id;
 
 async fn build_channel() -> Result<tonic::transport::Channel, String> {
     crate::daemon::channel().await

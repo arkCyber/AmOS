@@ -29,10 +29,7 @@ pub struct ExportOutcome {
 
 /// Directory for exports: `$AMOS_EXPORT_DIR`, else `<tmp>/amos-exports`.
 fn export_dir() -> PathBuf {
-    if let Some(p) = env::var("AMOS_EXPORT_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(p) = env::var("AMOS_EXPORT_DIR").ok().filter(|s| !s.is_empty()) {
         return PathBuf::from(p);
     }
     env::temp_dir().join("amos-exports")
@@ -114,7 +111,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("amos-note-export-{tag}-{}-{nonce}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "amos-note-export-{tag}-{}-{nonce}",
+            std::process::id()
+        ))
     }
 
     #[test]

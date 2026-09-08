@@ -97,7 +97,10 @@ pub fn scheduler_alarm_register(
 
 /// Cancel a pending alarm. Returns whether it was registered.
 #[tauri::command]
-pub fn scheduler_alarm_cancel(state: State<'_, AlarmSchedState>, id: String) -> Result<bool, String> {
+pub fn scheduler_alarm_cancel(
+    state: State<'_, AlarmSchedState>,
+    id: String,
+) -> Result<bool, String> {
     Ok(state.cancel(&id))
 }
 

@@ -91,4 +91,18 @@ describe("IncomingCall.svelte (fake telephony bridge)", () => {
     await tick();
     expect(container.querySelector('[role="dialog"]')).toBeNull();
   });
+
+  test("blank/hidden caller id shows the localized unknown label", async () => {
+    const emit = installBridge();
+    const { container } = render(IncomingCall);
+    await settle();
+
+    emit({ id: "c3", direction: "Incoming", state: "Ringing", peer: "" });
+    await tick();
+    await settle();
+    const dialog = container.querySelector('[role="dialog"]');
+    expect(dialog).toBeTruthy();
+    // headline falls back to the localized "unknown" text, no number sub-row
+    expect((dialog?.textContent ?? "")).toContain(zh["phone.unknown"]);
+  });
 });

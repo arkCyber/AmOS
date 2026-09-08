@@ -69,9 +69,11 @@
   });
   const quiet = $derived(dndActive(normalizeQuick(quick)));
 
-  // iOS-aligned: NO always-on drag-to-reorder on the home (reordering happens in
-  // the Edit-Home surface). A mouse drag therefore pages the icon grid left/right
-  // exactly like a touch swipe. State shared by the mouse + touch paging handlers.
+  // iOS-aligned: the icon *grid* has NO always-on drag-to-reorder (reordering there
+  // happens in the Edit-Home surface); a mouse drag pages the grid left/right like
+  // a touch swipe. The bottom **dock bar** is the exception: dragging one dock icon
+  // onto another emits `move` so the shell can reorder the dock. State below is
+  // shared by the mouse + touch paging handlers.
   let mousePanX: number | null = null;
   let mousePanned = false;
 
@@ -126,6 +128,31 @@
       return;
     }
     home.emit("open", id);
+  }
+  // Dock drag-to-reorder on the home: dragging a dock icon onto another asks the
+  // shell to move it there (the shell owns the layout). Only the bottom dock bar
+  // is draggable — the icon grid keeps iOS-style page-turn drag, and a plain click
+  // (no drag) still opens the app via handleTap.
+  let dockDrag: string | null = null;
+  function dockDragStart(e: DragEvent, id: string): void {
+    dockDrag = id;
+    try {
+      e.dataTransfer?.setData("text/plain", id);
+    } catch {
+      /* dataTransfer may be absent in headless tests — drag source is tracked anyway */
+    }
+  }
+  function dockDragEnd(): void {
+    dockDrag = null;
+  }
+  function dockAllowDrop(e: DragEvent): void {
+    e.preventDefault();
+  }
+  function dockDrop(e: DragEvent, over: string): void {
+    e.preventDefault();
+    const drag = dockDrag;
+    dockDrag = null;
+    if (drag && drag !== over) home.emit("move", { drag, over });
   }
   function pageBy(dx: number): void {
     // Reset the click-suppression flag for the gesture that just happened.
@@ -395,6 +422,11 @@
     aria-label={labelOf(id)}
     title={labelOf(id)}
     onclick={() => handleTap(id)}
+    draggable={inDock || undefined}
+    ondragstart={inDock ? (e) => dockDragStart(e, id) : undefined}
+    ondragend={inDock ? dockDragEnd : undefined}
+    ondragover={inDock ? dockAllowDrop : undefined}
+    ondrop={inDock ? (e) => dockDrop(e, id) : undefined}
     class="group flex flex-col items-center gap-1 outline-none {inDock ? 'w-20' : 'w-16'}"
   >
     <span class="relative">

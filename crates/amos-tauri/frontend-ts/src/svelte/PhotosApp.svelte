@@ -23,6 +23,10 @@
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { iconSvg } from "../lib/sysIcons";
   import { fmtTime } from "../lib/notes";
+  import { hasMediaBridge, mediaList } from "../lib/media";
+  import type { MediaItem } from "../lib/media";
+  import { nativePhotoFromItem } from "../lib/photoLibrary";
+  import type { NativePhoto } from "../lib/photoLibrary";
   import { t } from "./locale.svelte";
 
   const seed = ((): Photo[] => {
@@ -43,6 +47,39 @@
   let playUrl = $state("");
   let selecting = $state(false);
   let selected = $state<ReadonlySet<string>>(new Set());
+  // Native (real external-storage) stills from the media_* bridge, shown as a
+  // read-only strip above the local grid (only when a bridge is present).
+  let native = $state<NativePhoto[]>([]);
+  const nativeShown = $derived(!favOnly && !selecting && native.length > 0);
+
+  // Load real stills from the bridge once (camera + screenshots). Offline (no
+  // bridge) or on a denied/absent backend this stays empty → the strip is hidden
+  // and behaviour is byte-identical to before. Native tiles are read-only.
+  let nativeLoaded = false;
+  $effect(() => {
+    if (nativeLoaded) return;
+    nativeLoaded = true;
+    if (!hasMediaBridge()) return;
+    void (async () => {
+      const settled = await Promise.allSettled([
+        mediaList("camera"),
+        mediaList("screenshots"),
+      ]);
+      const items: MediaItem[] = [];
+      for (const r of settled) {
+        if (r.status === "fulfilled" && Array.isArray(r.value)) items.push(...r.value);
+      }
+      const seen = new Set<string>();
+      const tiles: NativePhoto[] = [];
+      for (const it of items) {
+        if (seen.has(it.uri)) continue;
+        seen.add(it.uri);
+        tiles.push(nativePhotoFromItem(it));
+      }
+      tiles.sort((a, b) => b.ts - a.ts);
+      native = tiles;
+    })();
+  });
 
   const persist = (l: Photo[]) => {
     writeStoreValue(PHOTOS_KEY, l);
@@ -257,6 +294,20 @@
     {:else if shown.length === 0}
       <p class="py-10 text-center text-sm opacity-60">{t("photo.favEmpty")}</p>
     {:else}
+      {#if nativeShown}
+        <div class="mb-2" role="region" aria-label="native photos">
+          <div class="flex gap-1 overflow-x-auto px-1">
+            {#each native as n (n.id)}
+              <div
+                class="relative grid aspect-square w-16 shrink-0 place-items-center overflow-hidden rounded-lg bg-black/20 text-2xl ring-1 ring-white/10"
+                title={n.name}
+              >
+                <span aria-hidden="true">{n.emoji ?? "🗂"}</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
       <div class="grid grid-cols-3 gap-1">
         {#each gallery as it (it.kind === "photo" ? it.p.id : it.v.id)}
           {#if it.kind === "video"}

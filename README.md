@@ -56,6 +56,7 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-scheduler/           # background-task scheduler + wakeup-alignment domain core: AlarmExact vs Deferred jobs, Doze/charging/maintenance-window gating + coalesced due-batching + next-wake (docs/scheduler.md)
     ├── amos-monitor/             # system working-status (health) domain core: folds SystemSampler load (CPU/mem) + amos-profiling battery/power + amos-applife process counts into one honest SystemHealth (real /proc `linux` sampler, `android` skeleton) (docs/system-monitor.md)
     ├── amos-display/             # display-protection / auto screen-off domain core: deterministic ScreenState + IdlePolicy (battery vs charging timeouts, hold-while-call) + the AMOS_SCREEN_STATE_PATH file contract the daemon energy beat and the System UI host share (docs/display-idle.md)
+    ├── amos-media/               # media / external-storage domain core: spec types for the standard Android collections (DCIM/Camera, Pictures, Download, Recordings…), a pluggable MediaProvider seam (deterministic Mock today; Android MediaStore via Kotlin glue + optional HostFsProvider raw read_dir for root/Waydroid later) + a permission-policy MediaManager (nothing readable/writable until granted) + a cross-compilable `scan_dir` DCIM-scan example (docs/media.md · docs/android-storage-unify.md)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 

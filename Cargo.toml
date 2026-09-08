@@ -28,6 +28,7 @@ members = [
     "crates/amos-applife",
     "crates/amos-scheduler",
     "crates/amos-monitor",
+    "crates/amos-media",
     "crates/amos-display",
     "crates/amos-web3",
     "crates/amos-identity",
@@ -72,6 +73,7 @@ amos-applife = { path = "crates/amos-applife" }
 amos-scheduler = { path = "crates/amos-scheduler" }
 amos-monitor = { path = "crates/amos-monitor" }
 amos-display = { path = "crates/amos-display" }
+amos-media = { path = "crates/amos-media" }
 amos-web3 = { path = "crates/amos-web3" }
 amos-identity = { path = "crates/amos-identity" }
 

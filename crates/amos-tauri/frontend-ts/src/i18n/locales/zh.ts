@@ -245,6 +245,7 @@ export const zh = {
   "phone.incoming": "来电",
   "phone.answer": "接听",
   "phone.decline": "拒绝",
+  "phone.unknown": "未知号码",
   "phone.hangup": "挂断",
   "phone.simIncoming": "模拟来电",
   "phone.clear": "清空",

@@ -34,10 +34,10 @@ fn digits_only(number: &str) -> String {
 
 #[cfg(feature = "android")]
 mod android_impl {
-    use std::sync::OnceLock;
     use super::*;
     use jni::objects::{GlobalRef, JObject, JValue};
     use jni::{JNIEnv, JavaVM};
+    use std::sync::OnceLock;
 
     /// Process-wide handle to the Java app `Context` used to fire dial intents.
     /// A JNI *global* ref is VM-global; each use re-attaches the thread first (the
@@ -66,18 +66,14 @@ mod android_impl {
 
     /// Fire `ACTION_CALL` for `number` (already stripped to digits) from the context.
     pub fn dial(number: &str) -> Result<(), String> {
-        let (vm, ctx) = CTX
-            .get()
-            .ok_or_else(|| {
-                "real dial context not bound — call TelephonyGlue.nativeAttach at boot".to_string()
-            })?;
+        let (vm, ctx) = CTX.get().ok_or_else(|| {
+            "real dial context not bound — call TelephonyGlue.nativeAttach at boot".to_string()
+        })?;
         let mut env = vm
             .attach_current_thread()
             .map_err(|e| format!("failed to attach to JVM: {e}"))?;
 
-        let action = env
-            .new_string(ACTION_CALL)
-            .map_err(|e| e.to_string())?;
+        let action = env.new_string(ACTION_CALL).map_err(|e| e.to_string())?;
         let intent = env
             .new_object(
                 "android/content/Intent",
@@ -184,7 +180,6 @@ pub async fn real_dial(number: String) -> Result<String, String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::digits_only;
@@ -214,4 +209,3 @@ mod tests {
         assert_eq!(digits_only("+"), "+");
     }
 }
-

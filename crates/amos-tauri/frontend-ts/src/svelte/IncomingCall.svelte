@@ -18,6 +18,7 @@
   import { iconSvg } from "../lib/sysIcons";
   import { CALLLOG_KEY, normalizeCallLog, recordCall } from "../lib/calllog";
   import { CONTACTS_KEY, contactNameFor, normalizeContacts, type Contact } from "../lib/contacts";
+  import { callerDisplayLabel, hasPeerNumber } from "../lib/callDisplay";
 
   let call = $state<TelephonyCall | null>(null);
   let phase = $state<"ringing" | "talking">("ringing");
@@ -45,7 +46,8 @@
         recording = c.recording as "Off" | "On" | "Failed";
       } else if (c.state === "Ended") {
         // Persist the finished incoming call into the shared log so the Phone
-        // screen's Recent/Frequent list reflects it too.
+        // screen's Recent/Frequent list reflects it too. The log is number-keyed,
+        // so calls with no (empty/hidden) caller id are intentionally not recorded.
         if (surfacedId === c.id && c.peer) {
           const prev = normalizeCallLog(readStoreValue<unknown>(CALLLOG_KEY, []));
           const label = contactNameFor(contacts, c.peer) ?? c.peer;
@@ -88,7 +90,8 @@
 </script>
 
 {#if call}
-  {@const label = contactNameFor(contacts, call.peer) ?? call.peer}
+  {@const name = contactNameFor(contacts, call.peer)}
+  {@const label = callerDisplayLabel(call.peer, name, t("phone.unknown"))}
   {@const ringing = phase === "ringing"}
   <div
     role="dialog"
@@ -119,7 +122,9 @@
         }
       >{@html iconSvg("phone", "h-16 w-16")}</div>
       <div class="mt-8 max-w-full text-3xl font-semibold leading-tight break-words">{label}</div>
-      <div class="mt-2 text-sm tracking-widest text-white/50 tabular-nums">{call.peer}</div>
+      {#if hasPeerNumber(call.peer)}
+        <div class="mt-2 text-sm tracking-widest text-white/50 tabular-nums">{call.peer}</div>
+      {/if}
       {#if recording === "On"}
         <div class="mt-4 flex items-center gap-2 text-sm font-medium text-red-300">
           <span aria-hidden="true" class="h-2 w-2 animate-pulse rounded-full bg-red-400"></span>

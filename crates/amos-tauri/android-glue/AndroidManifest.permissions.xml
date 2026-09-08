@@ -32,4 +32,19 @@
          Android Telecom (needs runtime CALL_PHONE grant; see docs/telephony.md). -->
     <uses-permission android:name="android.permission.CALL_PHONE" />
 
+    <!-- External-storage / media access (docs/android-storage-unify.md §7 and
+         crates/amos-media/src/mapping.rs encode the per-API split; this declares
+         the union so any installed build has what it needs):
+           * API 33+ (Android 13+): granular READ_MEDIA_* per collection.
+           * API <=32: legacy READ_EXTERNAL_STORAGE (auto-picked at runtime).
+           * MediaStore.insert of our own contributions needs no write permission
+             on API 29+; the legacy WRITE is only for API <=28.
+         The System UI must request the right subset at runtime (the WebView's
+         MainActivity.Wiring.kt REQ_MEDIA branch). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+
 </manifest>

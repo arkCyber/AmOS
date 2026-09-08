@@ -247,6 +247,7 @@ export const en: Record<MessageKey, string> = {
   "phone.incoming": "Incoming call",
   "phone.answer": "Answer",
   "phone.decline": "Decline",
+  "phone.unknown": "Unknown",
   "phone.hangup": "Hang up",
   "phone.simIncoming": "Simulate incoming",
   "phone.clear": "Clear",

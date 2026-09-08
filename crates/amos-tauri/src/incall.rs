@@ -51,9 +51,7 @@ fn read_string(env: &mut JNIEnv<'_>, s: jstring) -> String {
     }
     // SAFETY: `s` is a live java.lang.String local ref for the duration of the call.
     let j = unsafe { JString::from_raw(s) };
-    env.get_string(&j)
-        .map(|x| x.into())
-        .unwrap_or_default()
+    env.get_string(&j).map(|x| x.into()).unwrap_or_default()
 }
 
 /// `AmosInCallService.nativeState(direction, state, peer)` — the Kotlin in-call service

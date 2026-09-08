@@ -5,7 +5,7 @@
  * React + Svelte UIs). Here we verify the Svelte UI wiring: the seeded grid,
  * opening the single-photo viewer, and multi-select batch delete.
  */
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import PhotosApp from "../src/svelte/PhotosApp.svelte";
 
@@ -54,5 +54,40 @@ describe("PhotosApp.svelte", () => {
     // still a gallery (list shrunk by one); select mode exited
     expect(txt(host)).not.toContain("删除所选");
     expect(firstTile(host)).toBeTruthy();
+  });
+
+  test("shows a read-only native strip when a media bridge serves stills", async () => {
+    // Offline (no bridge) the strip stays hidden; with a stubbed bridge the
+    // camera collection returns one native still → a read-only native tile.
+    const stub = (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: { collection?: string }) => {
+        if (cmd === "media_list" && args?.collection === "camera") {
+          return [
+            {
+              id: "content://cam/1",
+              kind: "image",
+              collection: "camera",
+              name: "IMG_native.jpg",
+              uri: "content://cam/1",
+              mime: "image/jpeg",
+              size_bytes: 10,
+              ts: 200,
+            },
+          ];
+        }
+        return [];
+      },
+    };
+    try {
+      const host = render(PhotosApp);
+      await vi.waitFor(() => {
+        expect(host.container.querySelector('[aria-label="native photos"]')).toBeTruthy();
+      });
+      expect(host.container.querySelector('[title="IMG_native.jpg"]')).toBeTruthy();
+    } finally {
+      if (stub === undefined) delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+      else (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = stub;
+    }
   });
 });

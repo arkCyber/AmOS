@@ -110,7 +110,10 @@ impl HardwareButtons {
 
     /// Take (and clear) the pending action if any — one press = one pull.
     pub fn take_pending(&self) -> Option<HardwareButton> {
-        self.pending.lock().unwrap_or_else(|p| p.into_inner()).take()
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 }
 
@@ -120,9 +123,7 @@ impl HardwareButtons {
 /// shell does not depend on the Rust→JS event system / `eval` reaching the webview
 /// on mobile. The shell polls this on a short interval (see `osInputBridge`).
 #[tauri::command]
-pub fn take_pending_hardware_button(
-    state: State<'_, HardwareButtons>,
-) -> Option<String> {
+pub fn take_pending_hardware_button(state: State<'_, HardwareButtons>) -> Option<String> {
     state.take_pending().map(hardware_name)
 }
 
@@ -278,7 +279,10 @@ mod tests {
         // plain lowercase rename turned `AiAssistant` into "aiassistant" (unmapped),
         // so the camera-key → AI path silently did nothing.
         assert_eq!(serde_json::to_value(HardwareButton::Home).unwrap(), "home");
-        assert_eq!(serde_json::to_value(HardwareButton::Voice).unwrap(), "voice");
+        assert_eq!(
+            serde_json::to_value(HardwareButton::Voice).unwrap(),
+            "voice"
+        );
         assert_eq!(
             serde_json::to_value(HardwareButton::AiAssistant).unwrap(),
             "ai_assistant"

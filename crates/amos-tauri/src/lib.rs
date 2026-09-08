@@ -29,6 +29,7 @@ pub mod flashlight;
 pub mod incall;
 pub mod interpret;
 pub mod mail;
+pub mod media;
 pub mod note_export;
 pub mod privacy_client;
 pub mod radio;
@@ -82,6 +83,7 @@ pub fn run() {
         .manage(shared_store)
         .manage(radio_bridge)
         .manage(flashlight_bridge)
+        .manage(media::MediaBridge::boot())
         .manage(display::DisplayPowerBridge::file_default())
         .manage(buttons::HardwareButtons::new())
         .manage(interpret::InterpretationBridge::new())
@@ -140,6 +142,15 @@ pub fn run() {
             store::store_remove,
             store::store_snapshot,
             note_export::notes_export_txt,
+            media::media_provider_name,
+            media::media_available_collections,
+            media::media_grants,
+            media::media_grant_read,
+            media::media_grant_write,
+            media::media_revoke,
+            media::media_list,
+            media::media_save,
+            media::media_load,
             translate::transcribe_audio,
             translate::translate_text,
             interpret::interpret_start,

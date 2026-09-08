@@ -29,6 +29,10 @@ amos-audio = { path = "../amos-audio" }
 amos-radio = { path = "../amos-radio" }
 amos-flashlight.workspace = true
 amos-display.workspace = true
+# amos-media: external-storage/media domain core — its MediaManager + MediaProvider
+# seam backs the local `media_*` commands (Mock on host; Android MediaStore on-device
+# later). See docs/android-storage-unify.md + docs/media.md.
+amos-media = { path = "../amos-media" }
 async-trait = "0.1"
 # amos-sensor: device-sensor domain core — the System UI's own sensor read side
 # (LiveSensorProvider stream bus + SensorManager energy policy) backs the local
@@ -71,6 +75,8 @@ android = [
     "amos-flashlight/android",
     "amos-sensor/android",
     "amos-audio/aaudio",
+    # Media backend over the Kotlin MediaStoreGlue (crates/amos-media android).
+    "amos-media/android",
 ]
 sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]
 piper-tts = ["amos-tts/piper"]

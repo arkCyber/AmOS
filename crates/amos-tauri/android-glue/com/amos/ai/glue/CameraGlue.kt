@@ -108,7 +108,17 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
     override fun onImageAvailable(reader: ImageReader) {
         val image = reader.acquireLatestImage() ?: return
         try {
-            val nv21 = Nv21.packYuv420ToNv21(image) ?: return
+            // A peripheral video producer must never crash the System UI: some
+            // HAL/configs deliver plane buffers that are not Java-accessible
+            // ("buffer is inaccessible") or transiently invalid — drop the frame
+            // instead of throwing. image is always closed in finally.
+            val nv21 = try {
+                Nv21.packYuv420ToNv21(image)
+            } catch (t: Throwable) {
+                Log.w(TAG, "frame encode dropped: ${t.javaClass.simpleName}: ${t.message}")
+                null
+            }
+            if (nv21 == null) return
             recordFrame(
                 cameraNumber,
                 image.width,
@@ -142,7 +152,7 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
 
     private fun startCapture(camera: CameraDevice) {
         val r = reader ?: return
-        val target = Surface(r.surface)
+        val target: Surface = r.surface
         val request = camera
             .createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             .apply { addTarget(target) }
@@ -176,13 +186,19 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
         return try {
             val ch: CameraCharacteristics = cm.getCameraCharacteristics(id)
             val configs = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                ?: return null
-            val sizes = configs.getOutputSizes(ImageFormat.YUV_420_888) ?: return null
-            sizes
-                .filter { it.width <= targetW && it.height <= targetH }
-                .maxByOrNull { it.width * it.height }
-                ?: sizes.maxByOrNull { it.width * it.height }
-                ?.let { Pair(it.width, it.height) }
+            if (configs == null) {
+                null
+            } else {
+                val sizes = configs.getOutputSizes(ImageFormat.YUV_420_888)
+                if (sizes == null) {
+                    null
+                } else {
+                    val fit = sizes.filter { it.width <= targetW && it.height <= targetH }
+                    val chosen = fit.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                        ?: sizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                    if (chosen != null) Pair(chosen.width, chosen.height) else null
+                }
+            }
         } catch (_: Exception) {
             null
         }

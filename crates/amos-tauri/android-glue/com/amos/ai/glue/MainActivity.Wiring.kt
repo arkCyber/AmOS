@@ -10,6 +10,7 @@ import android.webkit.WebChromeClient
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import org.json.JSONArray
 
 /**
  * AmOS System UI — **wiring template** for the generated Tauri-Android Activity.
@@ -36,6 +37,8 @@ import androidx.core.content.ContextCompat
 object PermissionWire {
 
     private const val REQ_CAMERA = 9001
+    private const val REQ_MEDIA = 9003
+    private const val TAG = "AmosMediaWire"
 
     /** Request CAMERA (and RECORD_AUDIO) if not already granted. Idempotent. */
     fun requestNeeded(activity: Activity) {
@@ -46,15 +49,51 @@ object PermissionWire {
         ActivityCompat.requestPermissions(activity, want.toTypedArray(), REQ_CAMERA)
     }
 
+    /** Request the media read permission(s) (per API level) if not granted. */
+    fun requestMedia(activity: Activity) {
+        MediaPermissions.request(activity, REQ_MEDIA)
+    }
+
+    /** If read access is already held (e.g. pre-granted), attach MediaStore now —
+     * a dialog-less path so a granted app picks up the real backend without waiting
+     * for a grant callback. Logs (never throws) on native attach failure. */
+    fun ensureAttached(activity: Activity) {
+        if (!MediaPermissions.hasReadAccess(activity)) return
+        runCatching {
+            val glue = MediaStoreGlue(activity.applicationContext)
+            glue.attach()
+            Log.i(TAG, "media backend attached (MediaStore)")
+            // Self-check (no UI needed): list DCIM/Camera through the SAME query
+            // media_list uses and log the count, so a device log confirms the path.
+            val arr = JSONArray(glue.listCollection("camera"))
+            Log.i(TAG, "self-check media_list(camera) => ${arr.length()} items")
+        }.onFailure { Log.w(TAG, "media attach failed: ${it.message}") }
+    }
+
     /** Forward the OS result into [AmosGlue] + the WebView media grant readiness. */
     fun onResult(activity: Activity, requestCode: Int, grantResults: IntArray) {
-        if (requestCode != REQ_CAMERA) return
-        val cameraGranted = grantResults.isNotEmpty() &&
-            grantResults[0] == PackageManager.PERMISSION_GRANTED
-        if (cameraGranted) {
-            AmosGlue.onCameraPermissionGranted(activity.applicationContext)
-        } else {
-            Toast.makeText(activity, "Camera denied — Magnifier runs in demo mode", Toast.LENGTH_LONG).show()
+        when (requestCode) {
+            REQ_CAMERA -> {
+                val cameraGranted = grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+                if (cameraGranted) {
+                    AmosGlue.onCameraPermissionGranted(activity.applicationContext)
+                } else {
+                    Toast.makeText(activity, "Camera denied — Magnifier runs in demo mode", Toast.LENGTH_LONG).show()
+                }
+            }
+            REQ_MEDIA -> {
+                val granted = grantResults.isNotEmpty() &&
+                    grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                if (granted) {
+                    // Hand this MediaStoreGlue instance to the native media backend
+                    // (JNI attach) so media_* commands read the real external storage.
+                    runCatching { MediaStoreGlue(activity.applicationContext).attach() }
+                        .onFailure { Log.w(TAG, "media attach failed: ${it.message}") }
+                } else {
+                    Toast.makeText(activity, "Media access denied — external collections unavailable", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -89,7 +128,7 @@ object NativeBootGuard {
     private const val TAG = "NativeBootGuard"
 
     /** Run [block], logging (never throwing) if a native symbol is unavailable. */
-    inline fun quiet(name: String, block: () -> Unit) {
+    fun quiet(name: String, block: () -> Unit) {
         try {
             block()
         } catch (t: Throwable) {
