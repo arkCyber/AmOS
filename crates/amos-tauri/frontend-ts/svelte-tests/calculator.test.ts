@@ -47,6 +47,18 @@ describe("CalculatorApp.svelte — keypad (DOM)", () => {
     expect(status(host)).toBe("12");
   });
 
+  test("% inside a pending + is a percentage of the left operand (50 + 10 % = 55)", async () => {
+    const host = renderCalc();
+    await tap(host, "5");
+    await tap(host, "0");
+    await tap(host, "+");
+    await tap(host, "1");
+    await tap(host, "0");
+    await tap(host, "%");
+    await tap(host, "=");
+    expect(status(host)).toBe("55");
+  });
+
   test("AC clears an entry back to 0", async () => {
     const host = renderCalc();
     await tap(host, "9");

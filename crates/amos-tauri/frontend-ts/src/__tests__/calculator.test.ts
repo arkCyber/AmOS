@@ -40,8 +40,21 @@ describe("calculator", () => {
     expect(calcRun(["2", "+", "3", "=", "7"])).toBe("7");
   });
 
-  test("percent divides the current entry by 100", () => {
+  test("standalone percent divides the current entry by 100", () => {
     expect(calcRun(["5", "0", "%"])).toBe("0.5");
+    // after "=" (no pending op) it is also a plain /100 of the shown result
+    expect(calcRun(["1", "0", "0", "%"])).toBe("1");
+  });
+
+  test("percent inside a pending op means a percentage of the left operand (iOS)", () => {
+    // 50 + (10 % of 50 = 5) = 55
+    expect(calcRun(["5", "0", "+", "1", "0", "%", "="])).toBe("55");
+    // 50 × (10 % of 50 = 5) = 250
+    expect(calcRun(["5", "0", "×", "1", "0", "%", "="])).toBe("250");
+    // 100 ÷ (4 % of 100 = 4) = 25
+    expect(calcRun(["1", "0", "0", "÷", "4", "%", "="])).toBe("25");
+    // 200 − (10 % of 200 = 20) = 180
+    expect(calcRun(["2", "0", "0", "−", "1", "0", "%", "="])).toBe("180");
   });
 
   test("chained operators fold left to right", () => {

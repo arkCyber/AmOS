@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **计算器 `%` 键语义修复（2026-09-08）**：审计+实证定位 `calcPress` 的 `%` 实现错误——原逻辑总是把当前输入 `/100`，在**挂起运算**上下文给出错误结果（如 `50 + 10 % =` 应为 `55` 实为 `5.1`；`50 × 10 % =` 应为 `250` 实为 `5`；`100 ÷ 4 % =` 应为 `25` 实为 `2500`）。修复为 iOS 语义：有挂起二元运算时，把右操作数变成**左操作数的百分比**（`left × cur / 100`，经 `normalize`+`evalExpr` 解析负/小数），无挂起（独立或 `=` 后）仍为 `/100`。`±` 实证正常未改。测试：纯层拆分为 2 例（独立 `/100` 含 `=` 后；iOS 挂起四则：`+`→55、`×`→250、`÷`→25、`−`→180），Svelte DOM 补 1 例（`50 + 10 % =`→55）。验证：纯 25、Svelte calculator 10/10、全量 vitest **54 文件 / 290 例全绿**（+1）、tsc clean。
+
 ### Added
 - **电话外拨审计 + Svelte 层外拨补测（2026-09-08）**：审计 `PhoneApp.svelte` 去电链路（`startCall→telephonyDial→回铃→onTelephonyEvent(Active/Ended)→recordOutgoing 去电写日志/通知`）——逻辑完整且已有纯层镜像 `useOutgoingCalls`（20 例）+ calllog/callTone/duration + `phone.svelte.test.ts`（3 例离线 UI，含"无 daemon 拨号→本地化报错"）。补一个此前缺失的 **Svelte 外拨 happy-path**：`svelte-tests/phone-outgoing.svelte.test.ts`（假 telephony 桥）覆盖 拨号→in-call UI(挂断钮)+去电写共享日志 → `Active`⇒"通话中"(时长) → `Ended`⇒复位、日志保留。全量 Svelte vitest **54 文件 / 289 例全绿**（+1）；tsc clean。手机外拨审计结论：功能完整、覆盖充分（剩余 ACTION_CALL/CALL_PHONE 真机路径在 device-bringup 验收）。
 - **来电显示完善：未知号码兜底 + 纯逻辑测试（2026-09-08）**：`IncomingCall.svelte` 空/隐藏号码（blocked/unknown）来电不再显示空标题——新增纯逻辑 `lib/callDisplay.ts`：`callerDisplayLabel(peer, contactName, unknownText)`（联系人名 > 号码 > 本地化"未知号码"）、`hasPeerNumber`（非空号码才显示副标题行）；组件用 `contactNameFor` 预解析联系人名 + `callerDisplayLabel`/`hasPeerNumber`。i18n 加 `phone.unknown`（en "Unknown"/zh "未知号码"，en/zh 奇偶一致）。新增 `callDisplay.test.ts` 4 例（联系人优先/号码兜底/纯空白→未知/空白联系人名回退/hasPeerNumber）。验证：svelte-check 0/0、tsc ✓、i18n 6 + callDisplay 4 全绿、bun 全量 OK、incoming-call svelte 4/4、全量 Svelte 288。

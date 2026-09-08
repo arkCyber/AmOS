@@ -138,8 +138,18 @@ export function calcPress(st: CalcState, label: string): CalcState {
   } else if (label === "⌫") {
     cur = cur.length > 1 ? cur.slice(0, -1) : "0";
   } else if (label === "%") {
+    // iOS semantics: with a pending binary op (left <op> …) the typed right
+    // entry becomes a percentage *of the left operand* — "50 + 10 % =" → 55
+    // (10 % of 50 = 5), "50 × 10 % =" → 250, "100 ÷ 4 % =" → 25. With no pending
+    // op (standalone or right after "=") it is simply the current entry / 100,
+    // so "5 % =" → 0.05. evalExpr is reused so negatives/decimals parse too.
     try {
-      cur = fmt(evalNum(cur) / 100);
+      if (acc) {
+        const leftExpr = normalize(acc).replace(/\s*[+\-*/]\s*$/, ""); // strip trailing op
+        cur = fmt((evalNum(leftExpr) * evalNum(cur)) / 100);
+      } else {
+        cur = fmt(evalNum(cur) / 100);
+      }
     } catch {
       cur = ERR;
     }
