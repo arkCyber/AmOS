@@ -8,14 +8,21 @@ import {
   sortNetworks,
   findBySsid,
   connectOpenOrSaved,
+  connectWithPassword,
+  autoRejoin,
   forgetNetwork,
+  hasPassword,
   isSaved,
   normalizeWifi,
   NEIGHBORHOOD,
   type WifiCfg,
 } from "../lib/wifi";
 
-const cfg = (current: string | null = null, saved: string[] = []): WifiCfg => ({ current, saved });
+const cfg = (
+  current: string | null = null,
+  saved: string[] = [],
+  passwords: Record<string, string> = {},
+): WifiCfg => ({ current, saved, passwords });
 
 describe("wifi signal", () => {
   test("clampSignal bounds + rounds into 0..4", () => {
@@ -69,7 +76,7 @@ describe("wifi connect (honest, no fake passworded join)", () => {
     expect(isSaved(out, "Library_Guest")).toBe(true);
   });
 
-  test("a secure network that isn't current is NOT connectable offline", () => {
+  test("a secure network without a stored password is NOT connectable", () => {
     const out = connectOpenOrSaved(cfg(), NEIGHBORHOOD, "AmOS-5G");
     expect(out.current).toBeNull();
     expect(isSaved(out, "AmOS-5G")).toBe(false);
@@ -82,6 +89,50 @@ describe("wifi connect (honest, no fake passworded join)", () => {
   test("findBySsid resolves present networks only", () => {
     expect(findBySsid(NEIGHBORHOOD, "Home-2.4G")?.ssid).toBe("Home-2.4G");
     expect(findBySsid(NEIGHBORHOOD, "nope")).toBeNull();
+  });
+});
+
+describe("wifi remembered password (auto-join next time)", () => {
+  test("entering a password connects AND remembers it for reuse", () => {
+    const out = connectWithPassword(cfg(), NEIGHBORHOOD, "AmOS-5G", "hunter2");
+    expect(out.current).toBe("AmOS-5G");
+    expect(hasPassword(out, "AmOS-5G")).toBe(true);
+    expect(out.passwords["AmOS-5G"]).toBe("hunter2");
+  });
+
+  test("a remembered secure network joins again without re-entering", () => {
+    const have = cfg(null, [], { "Home-2.4G": "pw" });
+    const out = connectOpenOrSaved(have, NEIGHBORHOOD, "Home-2.4G");
+    expect(out.current).toBe("Home-2.4G");
+  });
+
+  test("autoRejoin reconnects the strongest remembered (passworded) network when idle", () => {
+    // remembered Home-2.4G (signal 3) + iPhone-Mini (signal 2), both have pw.
+    const idle = cfg(null, ["Home-2.4G", "iPhone-Mini"], {
+      "Home-2.4G": "a",
+      "iPhone-Mini": "b",
+    });
+    const out = autoRejoin(idle, NEIGHBORHOOD);
+    expect(out.current).toBe("Home-2.4G"); // strongest remembered
+  });
+
+  test("autoRejoin ignores a remembered secure network with no stored password", () => {
+    const idle = cfg(null, ["Neighbor_AX"], {});
+    expect(autoRejoin(idle, NEIGHBORHOOD).current).toBeNull();
+    // but re-joins an open remembered one
+    const open = autoRejoin(cfg(null, ["Cafe_Free"], {}), NEIGHBORHOOD);
+    expect(open.current).toBe("Cafe_Free");
+  });
+
+  test("autoRejoin is a no-op when already connected", () => {
+    const c = cfg("Cafe_Free", ["Cafe_Free"], {});
+    expect(autoRejoin(c, NEIGHBORHOOD).current).toBe("Cafe_Free");
+  });
+
+  test("forgetNetwork also forgets the stored password", () => {
+    const out = forgetNetwork(cfg("AmOS-5G", ["AmOS-5G"], { "AmOS-5G": "pw" }), "AmOS-5G");
+    expect(out.current).toBeNull();
+    expect(hasPassword(out, "AmOS-5G")).toBe(false);
   });
 });
 
@@ -104,11 +155,16 @@ describe("wifi forget / remembered", () => {
 
 describe("wifi persistence guard", () => {
   test("normalizeWifi keeps a valid current + saved and coerces junk", () => {
-    const g = normalizeWifi({ current: "Home-2.4G", saved: ["Home-2.4G", "x", "", 5] });
+    const g = normalizeWifi({
+      current: "Home-2.4G",
+      saved: ["Home-2.4G", "x", "", 5],
+      passwords: { "Home-2.4G": "pw", junk: "" },
+    });
     expect(g.current).toBe("Home-2.4G");
     expect(g.saved).toEqual(["Home-2.4G", "x"]);
-    expect(normalizeWifi(null)).toEqual({ current: null, saved: [] });
-    expect(normalizeWifi("x")).toEqual({ current: null, saved: [] });
+    expect(g.passwords).toEqual({ "Home-2.4G": "pw" });
+    expect(normalizeWifi(null)).toEqual({ current: null, saved: [], passwords: {} });
+    expect(normalizeWifi("x")).toEqual({ current: null, saved: [], passwords: {} });
     expect(normalizeWifi({ current: "" }).saved).toEqual([]);
     expect(normalizeWifi({ current: 5 }).current).toBeNull();
   });

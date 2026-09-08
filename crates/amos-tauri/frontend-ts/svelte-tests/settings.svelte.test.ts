@@ -139,23 +139,43 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     expect(txt(host)).toContain("演示列表");
     const cafe = host.container.querySelector('button[aria-label="Cafe_Free"]') as HTMLButtonElement | null;
     expect(cafe).toBeTruthy();
-    expect(cafe?.disabled).toBe(false); // open → joinable offline
+    // a secure, not-current AP shows "需密码" and opens a password sheet on tap
     const secure = host.container.querySelector('button[aria-label="AmOS-5G"]') as HTMLButtonElement | null;
     expect(secure).toBeTruthy();
-    expect(secure?.disabled).toBe(true); // secure + not-current → disabled (honest)
+    expect(secure?.disabled).toBe(false);
+    expect(txt(host)).toContain("需密码");
+    await fireEvent.click(secure as HTMLButtonElement);
+    await flush();
+    const pw = host.container.querySelector('input[aria-label="Wi-Fi 密码"]') as HTMLInputElement | null;
+    expect(pw).toBeTruthy();
+    await fireEvent.input(pw, { target: { value: "secret5g" } });
+    await fireEvent.click(host.container.querySelector('button[aria-label="连接"]') as HTMLButtonElement);
+    await flush();
+    // joined + password remembered for next time
+    expect(readStoreValue<Record<string, unknown>>(WIFI_KEY, {}).current).toBe("AmOS-5G");
+    expect((readStoreValue<Record<string, unknown>>(WIFI_KEY, {}).passwords as Record<string, string>)["AmOS-5G"]).toBe("secret5g");
     // joining the open network makes it the current one and shows 已连接
     await fireEvent.click(cafe as HTMLButtonElement);
     await flush();
     expect(txt(host)).toContain("已连接");
     expect(readStoreValue<{ current?: string; saved?: string[] }>(WIFI_KEY, {}).current).toBe("Cafe_Free");
-    // joining remembered it → the Forget row is available; forgetting disconnects
+    // forgetting it auto-rejoins to the strongest remembered+passworded net (AmOS-5G)
     const forget = host.container.querySelector('button[aria-label="忘记此网络"]') as HTMLButtonElement | null;
     expect(forget).toBeTruthy();
     await fireEvent.click(forget as HTMLButtonElement);
     await flush();
-    const after = readStoreValue<{ current?: string | null; saved?: string[] }>(WIFI_KEY, {});
+    expect(readStoreValue<{ current?: string }>(WIFI_KEY, {}).current).toBe("AmOS-5G"); // auto-rejoin
+    // now forget AmOS-5G too → nothing remembered/passworded remains → disconnected
+    await fireEvent.click(host.container.querySelector('button[aria-label="忘记此网络"]') as HTMLButtonElement);
+    await flush();
+    const after = readStoreValue<{
+      current?: string | null;
+      saved?: string[];
+      passwords?: Record<string, string>;
+    }>(WIFI_KEY, {});
     expect(after.current).toBeNull();
     expect(after.saved ?? []).toEqual([]);
+    expect(after.passwords ?? {}).not.toHaveProperty("AmOS-5G");
     expect(txt(host)).not.toContain("已连接");
   });
 

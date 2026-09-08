@@ -20,10 +20,13 @@ export interface WifiNet {
 
 /** Persisted Wi‑Fi preference (which network is current / remembered). */
 export interface WifiCfg {
-  /** SSID of the current connection (open or already-remembered). */
+  /** SSID of the current connection (open or one we have the password for). */
   current: string | null;
   /** SSIDs AmOS has joined before (remembered; iOS re-joins these automatically). */
   saved: string[];
+  /** Remembered passwords (emulated Keychain), keyed by SSID, so a secure
+   * network can re-join automatically on the next visit without re-entry. */
+  passwords: Record<string, string>;
 }
 
 export const WIFI_KEY = "amos.wifi";
@@ -74,11 +77,23 @@ export function findBySsid(nets: readonly WifiNet[], ssid: string): WifiNet | nu
   return nets.find((n) => n.ssid === ssid) ?? null;
 }
 
+/** True when we hold a remembered password for `ssid` (auto-join available). */
+export function hasPassword(cfg: WifiCfg, ssid: string): boolean {
+  return typeof cfg.passwords[ssid] === "string" && cfg.passwords[ssid]!.length > 0;
+}
+
+/** Remember a password for a network (emulated Keychain). Pure. */
+export function rememberPassword(cfg: WifiCfg, ssid: string, pw: string): WifiCfg {
+  const p = pw.trim();
+  if (p === "") return cfg;
+  return { ...cfg, passwords: { ...cfg.passwords, [ssid]: p } };
+}
+
 /**
- * Join an AP that needs no password (open) or is already the current network;
- * secure networks a device hasn't joined are NOT connectable offline → returns
- * the config unchanged. Honest: we never fake a passworded join. Joining an open
- * network remembers it (so iOS-like it can re-join automatically later).
+ * Join an AP: an open network (or one we already hold a remembered password for)
+ * can be connected right away and is remembered. A secure network we have no
+ * password for can't join → returns the config unchanged (the caller should ask
+ * for a password via `connectWithPassword`). Never fakes a credential-less join.
  */
 export function connectOpenOrSaved(
   cfg: WifiCfg,
@@ -87,17 +102,52 @@ export function connectOpenOrSaved(
 ): WifiCfg {
   const net = findBySsid(nets, ssid);
   if (!net) return cfg;
-  if (net.secure && net.ssid !== cfg.current) return cfg; // would need a password / real radio
-  const saved = cfg.saved.includes(ssid) ? cfg.saved : [...cfg.saved, ssid];
-  return { current: ssid, saved };
+  if (net.secure && !hasPassword(cfg, ssid)) return cfg; // would need a password
+  return join(cfg, ssid);
 }
 
-/** Forget a network: drops it from current and from the remembered list
- * (iOS "Forget This Network"). Pure. */
+/** Join with an explicitly-entered password (remembered for next time). */
+export function connectWithPassword(
+  cfg: WifiCfg,
+  nets: readonly WifiNet[],
+  ssid: string,
+  pw: string,
+): WifiCfg {
+  const net = findBySsid(nets, ssid);
+  if (!net || pw.trim() === "") return cfg;
+  return rememberPassword(join(cfg, ssid), ssid, pw);
+}
+
+/** Mark `ssid` as current and add it to the remembered list (pure core). */
+function join(cfg: WifiCfg, ssid: string): WifiCfg {
+  const saved = cfg.saved.includes(ssid) ? cfg.saved : [...cfg.saved, ssid];
+  return { ...cfg, current: ssid, saved };
+}
+
+/**
+ * Auto-rejoin: when nothing is current but a *remembered* network is in range and
+ * joinable (open, or we hold its password), pick the strongest such one — the
+ * iOS behaviour of reconnecting to a remembered network. Pure.
+ */
+export function autoRejoin(cfg: WifiCfg, nets: readonly WifiNet[]): WifiCfg {
+  if (cfg.current) return cfg; // already connected
+  const candidates = nets
+    .filter(
+      (n) => cfg.saved.includes(n.ssid) && (!n.secure || hasPassword(cfg, n.ssid)),
+    )
+    .sort((a, b) => clampSignal(b.signal) - clampSignal(a.signal));
+  const top = candidates[0];
+  return top ? { ...cfg, current: top.ssid } : cfg;
+}
+
+/** Forget a network: drops it from current, from remembered, and forgets the
+ * password (iOS "Forget This Network"). Pure. */
 export function forgetNetwork(cfg: WifiCfg, ssid: string): WifiCfg {
+  const { [ssid]: _drop, ...passwords } = cfg.passwords;
   return {
     current: cfg.current === ssid ? null : cfg.current,
     saved: cfg.saved.filter((s) => s !== ssid),
+    passwords,
   };
 }
 
@@ -115,9 +165,15 @@ export function normalizeWifi(v: unknown): WifiCfg {
     const saved = Array.isArray(o.saved)
       ? o.saved.filter((s): s is string => typeof s === "string" && s !== "")
       : [];
-    return { current, saved: [...new Set(saved)] };
+    const passwords: Record<string, string> = {};
+    if (o.passwords && typeof o.passwords === "object") {
+      for (const [k, val] of Object.entries(o.passwords as Record<string, unknown>)) {
+        if (typeof val === "string" && val !== "") passwords[k] = val;
+      }
+    }
+    return { current, saved: [...new Set(saved)], passwords };
   }
-  return { current: null, saved: [] };
+  return { current: null, saved: [], passwords: {} };
 }
 
-export const wifiInit = (): WifiCfg => ({ current: null, saved: [] });
+export const wifiInit = (): WifiCfg => ({ current: null, saved: [], passwords: {} });

@@ -8,8 +8,11 @@
   import {
     WIFI_KEY,
     NEIGHBORHOOD,
+    autoRejoin,
     connectOpenOrSaved,
+    connectWithPassword,
     forgetNetwork,
+    hasPassword,
     normalizeWifi,
     signalBars,
     sortNetworks,
@@ -46,6 +49,38 @@
   const sorted = $derived.by(() =>
     sortNetworks(NEIGHBORHOOD, cfg.current, cfg.saved),
   );
+
+  // ---- remembered-password / auto-rejoin ----
+  // Auto-reconnect the strongest remembered (open or passworded) network when the
+  // page opens with Wi‑Fi on and nothing connected yet — iOS behaviour.
+  $effect(() => {
+    if (which === "wifi" && on && !qs.airplane) {
+      const next = autoRejoin(cfg, NEIGHBORHOOD);
+      if (next.current !== cfg.current) saveCfg(next);
+    }
+  });
+
+  // Password entry for a secure network we haven't joined before.
+  let pwFor = $state<string | null>(null);
+  let pwVal = $state("");
+  const joinNet = (net: { ssid: string; secure: boolean }) => {
+    if (net.ssid === cfg.current) return;
+    if (net.secure) {
+      if (hasPassword(cfg, net.ssid)) {
+        saveCfg(connectOpenOrSaved(cfg, NEIGHBORHOOD, net.ssid));
+      } else {
+        pwFor = net.ssid;
+        pwVal = "";
+      }
+    } else {
+      saveCfg(connectOpenOrSaved(cfg, NEIGHBORHOOD, net.ssid));
+    }
+  };
+  const submitPassword = () => {
+    if (pwFor) saveCfg(connectWithPassword(cfg, NEIGHBORHOOD, pwFor, pwVal));
+    pwFor = null;
+    pwVal = "";
+  };
 </script>
 
 <div class="space-y-5">
@@ -99,20 +134,18 @@
         {#if net.ssid !== cfg.current}
           <div class={SUB}></div>
           <button
-            onclick={() => {
-              // Only an open network (or the already-current one) joins here; a
-              // secure new AP is disabled because it would need a password + real
-              // radio (never silently faked).
-              if (!net.secure || net.ssid === cfg.current)
-                saveCfg(connectOpenOrSaved(cfg, NEIGHBORHOOD, net.ssid));
-            }}
-            disabled={net.secure && net.ssid !== cfg.current}
+            onclick={() => joinNet(net)}
             aria-label={net.ssid}
             class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left disabled:opacity-40"
           >
             <span class="flex min-w-0 items-center gap-2">
               <span class="truncate text-[15px] text-neutral-800 dark:text-neutral-100">{net.ssid}</span>
-              {#if net.secure}<span class="text-xs" aria-hidden="true">🔒</span>{/if}
+              {#if net.secure}
+                <span class="shrink-0 text-xs" aria-hidden="true">🔒</span>
+              {/if}
+              {#if net.secure && !hasPassword(cfg, net.ssid)}
+                <span class="shrink-0 text-[11px] opacity-50">{t("settings.wifiNeedsPw")}</span>
+              {/if}
             </span>
             <span class="flex shrink-0 items-end gap-0.5" aria-hidden="true">
               {#each [1, 2, 3] as i (i)}
@@ -125,6 +158,28 @@
           </button>
         {/if}
       {/each}
+      {#if pwFor}
+        <div class={SUB}></div>
+        <div class="space-y-2 px-4 py-3">
+          <p class="text-sm font-medium text-neutral-800 dark:text-neutral-100">
+            {t("settings.wifiPwFor", { net: pwFor })}
+          </p>
+          <input
+            type="password"
+            bind:value={pwVal}
+            onkeydown={(e) => {
+              if (e.key === "Enter") submitPassword();
+            }}
+            placeholder={t("settings.wifiPassword")}
+            aria-label={t("settings.wifiPassword")}
+            class="w-full rounded-lg bg-black/5 px-2.5 py-1.5 text-sm outline-none dark:bg-white/10"
+          />
+          <div class="flex gap-2">
+            <button onclick={() => { pwFor = null; pwVal = ""; }} aria-label={t("settings.wifiCancel")} class="flex-1 rounded-lg bg-black/5 px-3 py-1.5 text-sm text-neutral-700 dark:bg-white/10 dark:text-neutral-200">{t("settings.wifiCancel")}</button>
+            <button onclick={submitPassword} aria-label={t("settings.wifiConnect")} class="flex-1 rounded-lg bg-accent px-3 py-1.5 text-sm text-white">{t("settings.wifiConnect")}</button>
+          </div>
+        </div>
+      {/if}
       <div class={SUB}></div>
       <div class="px-4 py-2">
         <p class={HINT}>{t("settings.wifiSimNote")}</p>
