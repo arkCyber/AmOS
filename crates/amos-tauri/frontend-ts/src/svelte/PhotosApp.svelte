@@ -7,6 +7,7 @@
   import {
     PHOTOS_KEY,
     favsOf,
+    groupDays,
     isRealPhoto,
     neighborOf,
     newPhoto,
@@ -119,6 +120,26 @@
       return out;
     })(),
   );
+
+  // iOS "Days" grouping: the grid is split into local-day sections with relative
+  // headers (今天/昨天/日期). Pure via lib/photos groupDays; `t` keeps the labels
+  // reactive to a mid-session locale switch.
+  const dateLabel = (ts: number): string => {
+    const d = new Date(ts);
+    return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+  };
+  const sections = $derived.by(() => {
+    const now = Date.now();
+    return groupDays(
+      gallery.map((it) => ({ ts: it.kind === "photo" ? it.p.ts : it.v.ts, it })),
+      now,
+      {
+        today: t("photo.today"),
+        yesterday: t("photo.yesterday"),
+        date: dateLabel,
+      },
+    ).map((s) => ({ key: s.key, label: s.label, items: s.items.map((x) => x.it) }));
+  });
 
   const grad = (p: Photo): string | undefined =>
     p.a && p.b ? `linear-gradient(135deg, ${p.a}, ${p.b})` : undefined;
@@ -308,8 +329,16 @@
           </div>
         </div>
       {/if}
-      <div class="grid grid-cols-3 gap-1">
-        {#each gallery as it (it.kind === "photo" ? it.p.id : it.v.id)}
+      {#each sections as sec (sec.key)}
+        <p role="heading" aria-level="2"
+          class="mb-1 mt-2 flex items-baseline gap-2 px-1 text-[13px] font-semibold text-white/90">
+          <span>{sec.label}</span>
+          {#if sec.items.length > 1}
+            <span class="text-xs font-normal text-white/50">{sec.items.length}</span>
+          {/if}
+        </p>
+        <div class="grid grid-cols-3 gap-1">
+          {#each sec.items as it (it.kind === "photo" ? it.p.id : it.v.id)}
           {#if it.kind === "video"}
             {@const v = it.v}
             <div class="relative aspect-square overflow-hidden bg-black text-4xl">
@@ -347,8 +376,9 @@
               {/if}
             </button>
           {/if}
-        {/each}
-      </div>
+          {/each}
+        </div>
+      {/each}
     {/if}
 
     {#if playId}

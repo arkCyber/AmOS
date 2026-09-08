@@ -197,6 +197,8 @@ export const en: Record<MessageKey, string> = {
   "photo.close": "Back",
   "photo.delete": "Delete",
   "photo.empty": "No photos yet",
+  "photo.today": "Today",
+  "photo.yesterday": "Yesterday",
   "files.root": "Root",
   "files.addFolder": "＋ Folder",
   "files.addFile": "＋ Text",

@@ -140,3 +140,79 @@ export function neighborOf(list: Photo[], id: string, delta: 1 | -1): Photo | nu
   const n = list.length;
   return list[(((i + delta) % n) + n) % n] ?? null;
 }
+
+/* ---- iOS "Days" library grouping ------------------------------------------
+ * iOS Photos organises the Library as a set of "Days"; the wall is a newest-first
+ * list of photos interrupted by section headers that read "Today", "Yesterday",
+ * or a concrete date. These helpers compute that grouping in the *viewer's local
+ * calendar timezone* — pure + headlessly testable (single source of truth the
+ * screen renders). ------------------------------------------------------------------ */
+
+/** Local calendar key (YYYY-MM-DD) for a timestamp, in the current timezone. */
+export function dayKey(ts: number): string {
+  const d = new Date(ts);
+  const m = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+/** Whole-day distance from the local day of `now` to the local day of `ts`:
+ * 0 = today, 1 = yesterday, 2+ = earlier (negative for the future). Determined
+ * from local midnights so a DST shift cannot push "today" off by one. */
+export function dayIndex(ts: number, now: number): number {
+  const a = new Date(now);
+  a.setHours(0, 0, 0, 0);
+  const b = new Date(ts);
+  b.setHours(0, 0, 0, 0);
+  return Math.round((a.getTime() - b.getTime()) / 86_400_000);
+}
+
+/** Injectable strings/formatting for a section header, so the pure code never
+ * touches `Intl`/`t()` directly (test-friendly and locale-driven by the caller). */
+export interface DaySectionText {
+  today: string;
+  yesterday: string;
+  /** Format a concrete older date, e.g. `(ts) => new Date(ts).toLocaleDateString()`. */
+  date(ts: number): string;
+}
+
+export interface DaySection<I> {
+  /** Calendar key (YYYY-MM-DD), stable for reactivity keys. */
+  key: string;
+  /** `dayIndex` of this section (0 today …). */
+  day: number;
+  /** Header text: Today / Yesterday / concrete date. */
+  label: string;
+  items: I[];
+}
+
+/** One day's header label from its index. */
+export function dayLabel(day: number, ts: number, tx: DaySectionText): string {
+  if (day === 0) return tx.today;
+  if (day === 1) return tx.yesterday;
+  return tx.date(ts);
+}
+
+/**
+ * Bucket newest-first `items` (each carrying a `ts`) into local-day sections,
+ * ordered newest day first (today first, then older). Order within a day is the
+ * input order (the caller is responsible for it already being newest-first, so
+ * the wall stays visually chronological). Pure.
+ */
+export function groupDays<I extends { ts: number }>(
+  items: readonly I[],
+  now: number,
+  tx: DaySectionText,
+): DaySection<I>[] {
+  const map = new Map<string, DaySection<I>>();
+  for (const it of items) {
+    const key = dayKey(it.ts);
+    const e = map.get(key);
+    if (e) e.items.push(it);
+    else {
+      const day = dayIndex(it.ts, now);
+      map.set(key, { key, day, label: dayLabel(day, it.ts, tx), items: [it] });
+    }
+  }
+  return [...map.values()].sort((a, b) => a.day - b.day);
+}

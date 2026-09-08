@@ -195,6 +195,8 @@ export const zh = {
   "photo.close": "返回",
   "photo.delete": "删除",
   "photo.empty": "暂无照片",
+  "photo.today": "今天",
+  "photo.yesterday": "昨天",
   "files.root": "根目录",
   "files.addFolder": "＋ 文件夹",
   "files.addFile": "＋ 文本",

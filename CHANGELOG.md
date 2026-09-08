@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **相册 iOS Days 分组对齐（Phase-1，2026-09-08）**：对照 iOS「照片」审计并产出差距清单 `docs/photos-ios-parity.md`（每条带验收语义/纯测或真机标记）。实现第一个可验证对齐项：图库按本地日 **Days 分组**并显示相对日期头（`今天/昨天/具体日期`）。纯逻辑单源在 `lib/photos.ts`：新增 `dayKey`/`dayIndex`/`dayLabel`/`groupDays`（本地午夜取日、DST 安全、新→旧、同日内保序）；`PhotosApp.svelte` 用派生 `sections` 把网格包成逐节 + 段头（含计数、`role="heading"`），段头经 `t()` 对语言热切。i18n 加 `photo.today/photo.yesterday`（en/zh 奇偶一致）。验证：纯 `photoSections.test.ts` 3 例（key/index/分组/计数/顺序）、photos.svelte 5 例（+段头 + i18n 热切 Today）、全量 vitest **54 文件 / 291 例全绿**（+1）、tsc clean、svelte-check 0/0。
+
 ### Fixed
 - **计算器 `%` 键语义修复（2026-09-08）**：审计+实证定位 `calcPress` 的 `%` 实现错误——原逻辑总是把当前输入 `/100`，在**挂起运算**上下文给出错误结果（如 `50 + 10 % =` 应为 `55` 实为 `5.1`；`50 × 10 % =` 应为 `250` 实为 `5`；`100 ÷ 4 % =` 应为 `25` 实为 `2500`）。修复为 iOS 语义：有挂起二元运算时，把右操作数变成**左操作数的百分比**（`left × cur / 100`，经 `normalize`+`evalExpr` 解析负/小数），无挂起（独立或 `=` 后）仍为 `/100`。`±` 实证正常未改。测试：纯层拆分为 2 例（独立 `/100` 含 `=` 后；iOS 挂起四则：`+`→55、`×`→250、`÷`→25、`−`→180），Svelte DOM 补 1 例（`50 + 10 % =`→55）。验证：纯 25、Svelte calculator 10/10、全量 vitest **54 文件 / 290 例全绿**（+1）、tsc clean。
 

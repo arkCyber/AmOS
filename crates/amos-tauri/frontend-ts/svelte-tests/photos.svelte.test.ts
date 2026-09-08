@@ -7,9 +7,14 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
+import { tick } from "svelte";
 import PhotosApp from "../src/svelte/PhotosApp.svelte";
+import { setLocale } from "../src/svelte/locale.svelte";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  setLocale("zh");
+});
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const btnAria = (h: { container: HTMLElement }, aria: string) =>
@@ -23,6 +28,26 @@ describe("PhotosApp.svelte", () => {
     const host = render(PhotosApp);
     expect(txt(host)).not.toContain("暂无照片");
     expect(firstTile(host)).toBeTruthy();
+  });
+
+  test("grid is grouped into iOS-style day sections; headers relabel on locale switch", async () => {
+    const host = render(PhotosApp);
+    // the newest seeded photo is "today" → a Today section header exists
+    const headings = [...host.container.querySelectorAll('p[role="heading"]')].map(
+      (h) => h.textContent ?? "",
+    );
+    expect(headings.length).toBeGreaterThan(0);
+    expect(headings.some((h) => h.includes("今天"))).toBe(true);
+    // still renders photo tiles under the sections
+    expect(firstTile(host)).toBeTruthy();
+
+    // reactive i18n: switch to en → the same header reads "Today" without remount
+    setLocale("en");
+    await tick();
+    const enHeadings = [...host.container.querySelectorAll('p[role="heading"]')].map(
+      (h) => h.textContent ?? "",
+    );
+    expect(enHeadings.some((h) => h.includes("Today"))).toBe(true);
   });
 
   test("opening a photo shows the viewer; deleting returns to the gallery", async () => {
