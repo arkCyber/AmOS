@@ -8,12 +8,14 @@ import {
   sortNetworks,
   findBySsid,
   connectOpenOrSaved,
+  forgetNetwork,
+  isSaved,
   normalizeWifi,
   NEIGHBORHOOD,
   type WifiCfg,
 } from "../lib/wifi";
 
-const cfg = (current: string | null = null): WifiCfg => ({ current });
+const cfg = (current: string | null = null, saved: string[] = []): WifiCfg => ({ current, saved });
 
 describe("wifi signal", () => {
   test("clampSignal bounds + rounds into 0..4", () => {
@@ -52,14 +54,16 @@ describe("wifi scan ordering", () => {
 });
 
 describe("wifi connect (honest, no fake passworded join)", () => {
-  test("an open network can be joined", () => {
+  test("an open network can be joined and is remembered", () => {
     const out = connectOpenOrSaved(cfg(), NEIGHBORHOOD, "Library_Guest");
     expect(out.current).toBe("Library_Guest");
+    expect(isSaved(out, "Library_Guest")).toBe(true);
   });
 
   test("a secure network that isn't current is NOT connectable offline", () => {
     const out = connectOpenOrSaved(cfg(), NEIGHBORHOOD, "AmOS-5G");
     expect(out.current).toBeNull();
+    expect(isSaved(out, "AmOS-5G")).toBe(false);
   });
 
   test("unknown ssid is a no-op", () => {
@@ -72,12 +76,31 @@ describe("wifi connect (honest, no fake passworded join)", () => {
   });
 });
 
+describe("wifi forget / remembered", () => {
+  test("forgetNetwork clears current and drops it from saved", () => {
+    const joined = connectOpenOrSaved(cfg(), NEIGHBORHOOD, "Cafe_Free");
+    expect(joined.current).toBe("Cafe_Free");
+    const out = forgetNetwork(joined, "Cafe_Free");
+    expect(out.current).toBeNull();
+    expect(isSaved(out, "Cafe_Free")).toBe(false);
+  });
+
+  test("forgetting a non-current saved network keeps current", () => {
+    const c = cfg("Cafe_Free", ["Cafe_Free", "Home-2.4G"]);
+    const out = forgetNetwork(c, "Home-2.4G");
+    expect(out.current).toBe("Cafe_Free");
+    expect(out.saved).toEqual(["Cafe_Free"]);
+  });
+});
+
 describe("wifi persistence guard", () => {
-  test("normalizeWifi keeps a valid current and coerces junk", () => {
-    expect(normalizeWifi({ current: "Home-2.4G" }).current).toBe("Home-2.4G");
-    expect(normalizeWifi(null).current).toBeNull();
-    expect(normalizeWifi("x").current).toBeNull();
-    expect(normalizeWifi({ current: "" }).current).toBeNull();
+  test("normalizeWifi keeps a valid current + saved and coerces junk", () => {
+    const g = normalizeWifi({ current: "Home-2.4G", saved: ["Home-2.4G", "x", "", 5] });
+    expect(g.current).toBe("Home-2.4G");
+    expect(g.saved).toEqual(["Home-2.4G", "x"]);
+    expect(normalizeWifi(null)).toEqual({ current: null, saved: [] });
+    expect(normalizeWifi("x")).toEqual({ current: null, saved: [] });
+    expect(normalizeWifi({ current: "" }).saved).toEqual([]);
     expect(normalizeWifi({ current: 5 }).current).toBeNull();
   });
 });

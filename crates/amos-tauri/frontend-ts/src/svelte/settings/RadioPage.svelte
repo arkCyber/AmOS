@@ -9,6 +9,7 @@
     WIFI_KEY,
     NEIGHBORHOOD,
     connectOpenOrSaved,
+    forgetNetwork,
     normalizeWifi,
     signalBars,
     sortNetworks,
@@ -87,6 +88,12 @@
           </span>
           <span aria-hidden="true" class="shrink-0 text-accent">✓</span>
         </div>
+        <div class={SUB}></div>
+        <button
+          onclick={() => cfg.current && saveCfg(forgetNetwork(cfg, cfg.current))}
+          aria-label={t("settings.wifiForget")}
+          class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-[15px] text-danger"
+        >{t("settings.wifiForget")}</button>
       {/if}
       {#each sorted as net (net.ssid)}
         {#if net.ssid !== cfg.current}

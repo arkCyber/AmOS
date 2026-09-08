@@ -696,6 +696,7 @@ export const zh = {
   "settings.wifiScan": "扫描",
   "settings.wifiSimNote": "演示列表——真机扫描需系统无线能力。",
   "settings.wifiConnected": "已连接",
+  "settings.wifiForget": "忘记此网络",
   "settings.radioOnDesc": "已开启。接入真实网络控制器后，此处将列出可用网络。",
   "settings.radioOffDesc": "已关闭。开启后即可连接附近网络。",
   "settings.notifications": "通知",

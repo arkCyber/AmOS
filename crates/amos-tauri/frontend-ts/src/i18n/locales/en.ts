@@ -698,6 +698,7 @@ export const en: Record<MessageKey, string> = {
   "settings.wifiScan": "Scan",
   "settings.wifiSimNote": "Demo list — a real scan needs the device Wi-Fi radio.",
   "settings.wifiConnected": "Connected",
+  "settings.wifiForget": "Forget Network",
   "settings.radioOnDesc": "On. Available networks will appear here once a real network controller is attached.",
   "settings.radioOffDesc": "Off. Turn it on to connect to nearby networks.",
   "settings.notifications": "Notifications",

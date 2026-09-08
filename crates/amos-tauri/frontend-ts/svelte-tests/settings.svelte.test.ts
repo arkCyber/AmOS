@@ -147,7 +147,16 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     await fireEvent.click(cafe as HTMLButtonElement);
     await flush();
     expect(txt(host)).toContain("已连接");
-    expect(readStoreValue<{ current?: string }>(WIFI_KEY, {}).current).toBe("Cafe_Free");
+    expect(readStoreValue<{ current?: string; saved?: string[] }>(WIFI_KEY, {}).current).toBe("Cafe_Free");
+    // joining remembered it → the Forget row is available; forgetting disconnects
+    const forget = host.container.querySelector('button[aria-label="忘记此网络"]') as HTMLButtonElement | null;
+    expect(forget).toBeTruthy();
+    await fireEvent.click(forget as HTMLButtonElement);
+    await flush();
+    const after = readStoreValue<{ current?: string | null; saved?: string[] }>(WIFI_KEY, {});
+    expect(after.current).toBeNull();
+    expect(after.saved ?? []).toEqual([]);
+    expect(txt(host)).not.toContain("已连接");
   });
 
   test("now-real sub pages render their real controls", async () => {

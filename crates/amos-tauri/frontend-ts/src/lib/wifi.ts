@@ -22,6 +22,8 @@ export interface WifiNet {
 export interface WifiCfg {
   /** SSID of the current connection (open or already-remembered). */
   current: string | null;
+  /** SSIDs AmOS has joined before (remembered; iOS re-joins these automatically). */
+  saved: string[];
 }
 
 export const WIFI_KEY = "amos.wifi";
@@ -70,7 +72,8 @@ export function findBySsid(nets: readonly WifiNet[], ssid: string): WifiNet | nu
 /**
  * Join an AP that needs no password (open) or is already the current network;
  * secure networks a device hasn't joined are NOT connectable offline → returns
- * the config unchanged. Honest: we never fake a passworded join.
+ * the config unchanged. Honest: we never fake a passworded join. Joining an open
+ * network remembers it (so iOS-like it can re-join automatically later).
  */
 export function connectOpenOrSaved(
   cfg: WifiCfg,
@@ -80,16 +83,36 @@ export function connectOpenOrSaved(
   const net = findBySsid(nets, ssid);
   if (!net) return cfg;
   if (net.secure && net.ssid !== cfg.current) return cfg; // would need a password / real radio
-  return { ...cfg, current: ssid };
+  const saved = cfg.saved.includes(ssid) ? cfg.saved : [...cfg.saved, ssid];
+  return { current: ssid, saved };
+}
+
+/** Forget a network: drops it from current and from the remembered list
+ * (iOS "Forget This Network"). Pure. */
+export function forgetNetwork(cfg: WifiCfg, ssid: string): WifiCfg {
+  return {
+    current: cfg.current === ssid ? null : cfg.current,
+    saved: cfg.saved.filter((s) => s !== ssid),
+  };
+}
+
+/** Whether a network is in the remembered list. */
+export function isSaved(cfg: WifiCfg, ssid: string): boolean {
+  return cfg.saved.includes(ssid);
 }
 
 /** Coerce any stored value into a valid WifiCfg (corruption guard). */
 export function normalizeWifi(v: unknown): WifiCfg {
   if (v && typeof v === "object") {
     const o = v as Record<string, unknown>;
-    if (typeof o.current === "string" && o.current !== "") return { current: o.current };
+    const current =
+      typeof o.current === "string" && o.current !== "" ? o.current : null;
+    const saved = Array.isArray(o.saved)
+      ? o.saved.filter((s): s is string => typeof s === "string" && s !== "")
+      : [];
+    return { current, saved: [...new Set(saved)] };
   }
-  return { current: null };
+  return { current: null, saved: [] };
 }
 
-export const wifiInit = (): WifiCfg => ({ current: null });
+export const wifiInit = (): WifiCfg => ({ current: null, saved: [] });
