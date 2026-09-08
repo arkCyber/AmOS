@@ -45,6 +45,7 @@ const ASSIGN: Record<string, CategoryId> = {
   privacy: "system",
   android: "system",
   store: "system",
+  terminal: "utilities",
 };
 
 export function categoryOf(id: string): CategoryId {

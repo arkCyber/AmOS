@@ -39,6 +39,7 @@ export const APP_META: AppMeta[] = [
   { id: "contacts", titleKey: "app.contacts", icon: "👥" },
   { id: "magnifier", titleKey: "app.magnifier", icon: "🔍" },
   { id: "monitor", titleKey: "app.monitor", icon: "📈" },
+  { id: "terminal", titleKey: "app.terminal", icon: "🖥️" },
 ];
 
 export function appMetaById(id: string): AppMeta | undefined {

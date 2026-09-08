@@ -28,6 +28,7 @@ export const SVELTE_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   music: () => import("./MusicApp.svelte"),
   maps: () => import("./MapsApp.svelte"),
   camera: () => import("./CameraApp.svelte"),
+  terminal: () => import("./TerminalApp.svelte"),
   ai: () => import("./AiApp.svelte"),
   interpreter: () => import("./InterpApp.svelte"),
   mail: () => import("./MailApp.svelte"),

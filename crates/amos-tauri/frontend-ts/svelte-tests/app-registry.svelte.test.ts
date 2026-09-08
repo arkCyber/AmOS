@@ -12,11 +12,11 @@ const EXPECTED: string[] = [
   "clock", "settings", "calculator", "weather", "notes", "reminders",
   "vmemos", "photos", "files", "android", "messages", "phone",
   "music", "maps", "camera", "ai", "interpreter", "mail",
-  "store", "privacy", "contacts", "magnifier", "monitor",
+  "store", "privacy", "contacts", "magnifier", "monitor", "terminal",
 ];
 
 describe("svelte/appRegistry.ts", () => {
-  test("covers exactly the 23 built-in app ids", () => {
+  test("covers exactly the 24 built-in app ids", () => {
     expect(svelteAppIds().sort()).toEqual([...EXPECTED].sort());
   });
 
