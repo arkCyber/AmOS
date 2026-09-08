@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **相机 iOS 对齐审计 + 控制环不变量测试（Phase-1，2026-09-08）**：审计确认相机已接近 iOS 满配（镜头翻转+镜像、实时取景、比例/变焦/网格/闪光/自拍计时/连拍、拍照存 Photos、照片/视频滑切、录像→库回放、画质档、HDR 诚实占位），且 `camera.svelte.test.ts`(9)+`camera-lib.test.ts` 已覆盖离线路/实时/录像全链路。产出差距矩阵 `docs/camera-ios-parity.md`（每项验收语义 + `📱` 设备级归属）。补强：把 UI 依赖的 **iOS 控制环不变量**用真实顺序纯测钉死（此前只测了泛型 `cycleAfter`）——闪光 auto→on→off、镜头 back↔front、比例 4:3→方→16:9、自拍计时 0→3→10、变焦步进/界限；防将来误改顺序静默改环。camera-lib **17/17**（+5）；全量 pure OK、vitest **54 文件 / 294 例全绿**、tsc/svelte-check clean。剩余真缺口(夜间/人像/ProRAW/光学变焦/点按对焦 AE-AF)均标 `📱`。
+
 ### Fixed
 - **相册查看器过滤语境修复（2026-09-08）**：审计最新代码发现——查看器翻页/键盘箭头/幻灯片用 `neighborOf(list,…)`（全量 list），♥ 收藏过滤激活时浏览会**跳到非收藏照片**，破坏过滤器语境。改为基于当前集合 `shown`（含查看器计数 `idx` 同步用 `shown`）。非过滤时 `shown===list`，行为不变（无回归）。补 Svelte 用例：预置 1 收藏+1 非收藏，进 ♥ 视图打开收藏断言 prev/next 禁用。photos.svelte **8/8**；全量 vitest **54 文件 / 294 例全绿**（+1）、tsc/svelte-check clean。
 

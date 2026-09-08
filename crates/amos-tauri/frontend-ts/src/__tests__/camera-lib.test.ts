@@ -11,6 +11,14 @@ import {
   resOf,
   nextRes,
   cycleAfter,
+  FLASH_ORDER,
+  FACING_ORDER,
+  RATIO_ORDER,
+  TIMER_PRESETS,
+  ZOOM_STEPS,
+  ZOOM_MIN,
+  ZOOM_MAX,
+  type CamFlash,
 } from "../lib/camera";
 
 describe("camera capture geometry", () => {
@@ -81,6 +89,47 @@ describe("camera cycle helpers", () => {
     expect(cycleAfter(["a", "b", "c"], "a")).toBe("b");
     expect(cycleAfter(["a", "b", "c"], "c")).toBe("a");
     expect(cycleAfter(["a", "b"], "unknown" as never)).toBe("a");
+  });
+});
+
+// iOS-style control cycles the UI drives — pinned here so a future reorder of
+// the "orders" in lib/camera can never silently change the on-screen cycle.
+describe("camera iPhone control cycles", () => {
+  test("flash cycles auto → on → off → auto", () => {
+    const cycle = (f: CamFlash) => cycleAfter(FLASH_ORDER, f);
+    expect(FLASH_ORDER).toEqual(["auto", "on", "off"]);
+    expect(cycle("auto")).toBe("on");
+    expect(cycle("on")).toBe("off");
+    expect(cycle("off")).toBe("auto");
+  });
+
+  test("lens flip alternates back ↔ front", () => {
+    expect(FACING_ORDER).toEqual(["back", "front"]);
+    expect(cycleAfter(FACING_ORDER, "back")).toBe("front");
+    expect(cycleAfter(FACING_ORDER, "front")).toBe("back");
+  });
+
+  test("aspect ratio cycles 4:3 → square → 16:9 → 4:3", () => {
+    expect(RATIO_ORDER).toEqual(["4:3", "square", "16:9"]);
+    expect(cycleAfter(RATIO_ORDER, "4:3")).toBe("square");
+    expect(cycleAfter(RATIO_ORDER, "square")).toBe("16:9");
+    expect(cycleAfter(RATIO_ORDER, "16:9")).toBe("4:3");
+  });
+
+  test("self-timer presets cycle 0 → 3 → 10 → 0", () => {
+    expect(TIMER_PRESETS).toEqual([0, 3, 10]);
+    expect(cycleAfter(TIMER_PRESETS, 0)).toBe(3);
+    expect(cycleAfter(TIMER_PRESETS, 3)).toBe(10);
+    expect(cycleAfter(TIMER_PRESETS, 10)).toBe(0);
+  });
+
+  test("zoom steps / bounds invariants stay iOS-like", () => {
+    expect(ZOOM_STEPS).toEqual([1, 2, 3]);
+    expect(ZOOM_MIN).toBe(1);
+    expect(ZOOM_MAX).toBe(5);
+    expect(nextZoom(1)).toBe(2);
+    expect(nextZoom(2)).toBe(3);
+    expect(nextZoom(3)).toBe(1);
   });
 });
 
