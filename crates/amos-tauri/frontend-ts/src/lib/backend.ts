@@ -353,6 +353,37 @@ export async function telephonyEnd(callId: string): Promise<void | null> {
   return invoke<void>("telephony_end", { callId });
 }
 
+/* ---- Terminal (PTY shell bridge; real only when the backend `terminal-pty`
+ *       feature is built in — otherwise every call returns id 0 + an error). -- */
+export type TermOut = {
+  id: number;
+  output: string | null;
+  error: string;
+  running: boolean;
+};
+
+export async function termSpawn(
+  cwd?: string | null,
+  allowlist?: string[] | null,
+): Promise<TermOut | null> {
+  return invoke<TermOut>("term_spawn", { cwd: cwd ?? null, allowlist: allowlist ?? null });
+}
+export async function termWrite(session: number, data: string): Promise<TermOut | null> {
+  return invoke<TermOut>("term_write", { session, data });
+}
+export async function termRead(
+  session: number,
+  max?: number | null,
+): Promise<TermOut | null> {
+  return invoke<TermOut>("term_read", { session, max: max ?? null });
+}
+export async function termKill(session: number): Promise<TermOut | null> {
+  return invoke<TermOut>("term_kill", { session });
+}
+export async function termResize(session: number, cols: number, rows: number): Promise<TermOut | null> {
+  return invoke<TermOut>("term_resize", { session, cols, rows });
+}
+
 /** Answer an incoming (ringing) call by id. */
 export async function telephonyAnswer(callId: string): Promise<void | null> {
   return invoke<void>("telephony_answer", { callId });

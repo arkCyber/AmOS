@@ -2,7 +2,7 @@
  * Pure unit tests for the ANSI -> colour-span parser (lib/ansi.ts).
  */
 import { describe, expect, test } from "bun:test";
-import { parseAnsi, hasEscape } from "../lib/ansi";
+import { parseAnsi, hasEscape, decodeOutput } from "../lib/ansi";
 
 const esc = (code: number | string) => `\u001b[${code}m`;
 
@@ -34,5 +34,31 @@ describe("parseAnsi", () => {
   test("hasEscape reports raw control sequences", () => {
     expect(hasEscape(`x${esc(31)}y`)).toBe(true);
     expect(hasEscape("plain")).toBe(false);
+  });
+});
+
+describe("decodeOutput (interactive PTY stream)", () => {
+  test("splits CR/LF/CRLF into lines without doubles", () => {
+    expect(decodeOutput("a\r\nb\nc").lines).toEqual(["a", "b", "c"]);
+    expect(decodeOutput("a\r\nb\nc").clear).toBe(false);
+  });
+
+  test("backspace removes the previous character", () => {
+    expect(decodeOutput("hello\b\b\b\b\b").lines.join("")).toBe("");
+    expect(decodeOutput("abc\x7f").lines).toEqual(["ab"]);
+  });
+
+  test("ESC[2J requests a full clear", () => {
+    const d = decodeOutput("junk\x1b[2Jnew");
+    expect(d.clear).toBe(true);
+    // everything before the clear is discarded; text after it is a fresh line
+    expect(d.lines.join("")).toBe("new");
+  });
+
+  test("SGR colour codes survive for the later parseAnsi pass; cursor CSI is dropped", () => {
+    const d = decodeOutput(`\x1b[32mgreen\x1b[0m\x1b[2K end`);
+    const joined = d.lines.join("");
+    expect(joined.includes("\x1b[32m")).toBe(true); // colour kept
+    expect(joined.includes("\x1b[2K")).toBe(false); // erase-line dropped
   });
 });

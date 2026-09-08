@@ -105,6 +105,7 @@ fn pty_enabled() -> bool {
 /// # Arguments
 /// * `cwd` — working directory the shell starts in (defaults to a safe value).
 /// * `allowlist` — if `Some`, only these command binaries may run (fail closed).
+#[tauri::command]
 pub async fn term_spawn(
     cwd: Option<String>,
     allowlist: Option<Vec<String>>,
@@ -178,6 +179,7 @@ pub async fn term_spawn(
     }
 }
 /// Write bytes to a live session's stdin.
+#[tauri::command]
 pub async fn term_write(session: u64, data: String) -> TermOut {
     #[cfg(feature = "terminal-pty")]
     {
@@ -203,6 +205,7 @@ pub async fn term_write(session: u64, data: String) -> TermOut {
 }
 
 /// Read available output from a live session (cap `max` bytes if given).
+#[tauri::command]
 pub async fn term_read(session: u64, max: Option<usize>) -> TermOut {
     #[cfg(feature = "terminal-pty")]
     {
@@ -231,6 +234,7 @@ pub async fn term_read(session: u64, max: Option<usize>) -> TermOut {
 }
 
 /// Terminate a session and reap its child (no orphans).
+#[tauri::command]
 pub async fn term_kill(session: u64) -> TermOut {
     let mut guard = registry().lock().unwrap();
     let removed = guard.remove(&session);
@@ -251,6 +255,7 @@ pub async fn term_kill(session: u64) -> TermOut {
 }
 
 /// Resize a session's PTY window (TIOCSWINSZ).
+#[tauri::command]
 pub async fn term_resize(session: u64, cols: u16, rows: u16) -> TermOut {
     if cols == 0 || rows == 0 {
         return err("terminal: invalid resize (cols/rows must be > 0)");
