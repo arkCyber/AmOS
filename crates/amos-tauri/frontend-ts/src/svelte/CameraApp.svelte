@@ -112,6 +112,7 @@
   let burstSeqId: number | null = null;
 
   // ---- dynamic / pinch zoom + tap-to-focus ----
+  let lastTapMs = 0; // last single-tap time, to tell a slow (focus) tap from a fast double (zoom)
   let pinch: {
     ids: Map<number, { x: number; y: number }>;
     d0: number;
@@ -449,12 +450,17 @@
   }
   function onPinchEnd(e: PointerEvent): void {
     pinch.ids.delete(e.pointerId);
-    // a quick, still single tap = tap-to-focus (first tap aims; again locks)
+    // a quick, still single tap = tap-to-focus. A *rapid* repeat of it (a
+    // double-tap, <300 ms apart) is the zoom gesture on iOS, so skip focusing —
+    // the container's ondblclick drives the zoom instead.
     const t = pinch.tap;
     if (t && t.id === e.pointerId) {
       pinch.tap = null;
-      if (performance.now() - t.t < 500) {
-        tapToFocus(t.x, t.y, e.currentTarget as HTMLElement);
+      const now = performance.now();
+      if (now - t.t < 500) {
+        const doubleTap = now - lastTapMs < 300;
+        lastTapMs = now;
+        if (!doubleTap) tapToFocus(t.x, t.y, e.currentTarget as HTMLElement);
       }
     }
     if (pinch.ids.size < 2) pinch.d0 = 0;

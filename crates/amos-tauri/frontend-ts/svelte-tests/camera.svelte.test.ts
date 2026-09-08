@@ -174,12 +174,31 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     await settle();
     expect(hasAfBox()).toBe(true);
     expect(txt(host)).not.toContain("AE/AF LOCKED");
-    // second tap on ~the same point → AE/AF LOCKED caption + amber border
+    // two slow taps on ~the same point lock AE/AF (must exceed the 300 ms
+    // double-tap window so the second tap is a focus/lock tap, not a zoom)
+    await new Promise<void>((r) => setTimeout(r, 350));
     await fireEvent.pointerDown(app, { clientX: 51, clientY: 51, pointerId: 2 });
     await fireEvent.pointerUp(app, { clientX: 51, clientY: 51, pointerId: 2 });
     await settle();
     expect(txt(host)).toContain("AE/AF LOCKED");
     expect(host.container.querySelector('.border-amber-300')).toBeTruthy();
+  });
+
+  test("a rapid double-tap does not lock focus (it is the zoom gesture)", async () => {
+    const host = await renderLive();
+    const app = host.container.querySelector('[role="application"]') as HTMLElement;
+    Object.defineProperty(app, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ x: 0, y: 0, width: 100, height: 100, top: 0, left: 0, right: 100, bottom: 100 }),
+    });
+    // two taps in quick succession (<300 ms): the first aims, the second is a
+    // double-tap → focus is NOT applied a second time, so it never locks.
+    await fireEvent.pointerDown(app, { clientX: 50, clientY: 50, pointerId: 1 });
+    await fireEvent.pointerUp(app, { clientX: 50, clientY: 50, pointerId: 1 });
+    await fireEvent.pointerDown(app, { clientX: 50, clientY: 50, pointerId: 2 });
+    await fireEvent.pointerUp(app, { clientX: 50, clientY: 50, pointerId: 2 });
+    await settle();
+    expect(txt(host)).not.toContain("AE/AF LOCKED");
   });
 });
 
