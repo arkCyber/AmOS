@@ -27,7 +27,7 @@
 ## 系统/高级（多数需真机）
 | iOS | AmOS | 状态 |
 |---|---|---|
-| 点按对焦 / AE-AF 锁定(黄框+AE/AF LOCK) | — | `❌` 📱(需 `applyConstraints` focus/pointsOfInterest) |
+| 点按对焦 / AE-AF 锁定(黄框+AE/AF LOCK) | `focusFromRect`+`afTap`/`afInit`/`afCaption` + pointer 单击对焦、同点二次锁定；真机 `pointsOfInterest` 尽力 | 🟡 | camera-lib 纯 4 例 + camera.svelte 1 例；硬件对焦 `📱` |
 | 夜景模式 / 人像景深 / ProRAW / 实况照片 | — | `❌` 📱 |
 | 光学镜头群(0.5×/1×/2×/3× 原生) | 仅数码变焦 | `🟡` 📱 |
 | 拍摄中拍照(录像时抓帧) | — | `🟡` 📱 |

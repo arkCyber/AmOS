@@ -133,3 +133,59 @@ export function cycleAfter<T>(order: readonly T[], current: T): T {
 export function nextZoom(current: number): number {
   return cycleAfter(ZOOM_STEPS, clampZoom(current));
 }
+
+/* ---- Tap-to-focus / AE-AF lock (pure model; hardware focus via track
+ *       applyConstraints pointsOfInterest is best-effort and device-gated).
+ *       iOS behaviour: tap sets an AF point; a second tap on the same point
+ *       locks exposure+focus ("AE/AF LOCK"); tapping elsewhere re-aims. ---- */
+export interface FocusPoint {
+  /** Normalised 0..1 within the viewfinder (0,0 = top-left). */
+  x: number;
+  y: number;
+}
+export interface AfState {
+  x: number | null;
+  y: number | null;
+  locked: boolean;
+}
+
+/** Clamp a coordinate to the 0..1 unit viewfinder. */
+export function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(1, Math.max(0, v));
+}
+
+/** Convert a pointer position (relative to the viewfinder element) into a
+ * normalised focus point. Returns null when the element has no area yet. */
+export function focusFromRect(
+  cx: number,
+  cy: number,
+  rect: { x: number; y: number; width: number; height: number },
+): FocusPoint | null {
+  if (!(rect.width > 0) || !(rect.height > 0)) return null;
+  return { x: clamp01((cx - rect.x) / rect.width), y: clamp01((cy - rect.y) / rect.height) };
+}
+
+export function afInit(): AfState {
+  return { x: null, y: null, locked: false };
+}
+
+/** First tap aims (unlocked) at the point; a second tap within `tol` locks
+ * (AE/AF LOCK); a tap elsewhere re-aims and unlocks. Pure. */
+export function afTap(s: AfState, p: FocusPoint, tol = 0.04): AfState {
+  if (
+    s.x !== null &&
+    s.y !== null &&
+    !s.locked &&
+    Math.abs(s.x - p.x) <= tol &&
+    Math.abs(s.y - p.y) <= tol
+  ) {
+    return { ...s, locked: true };
+  }
+  return { x: p.x, y: p.y, locked: false };
+}
+
+/** The iOS "AE/AF LOCK" caption when a locked point is shown. */
+export function afCaption(state: AfState): string {
+  return state.locked ? "AE/AF LOCKED" : "AF";
+}

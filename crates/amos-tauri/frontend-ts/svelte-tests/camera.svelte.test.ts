@@ -155,6 +155,32 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     expect(btnAria(host, "画质")?.textContent?.trim()).toBe("FHD");
     expect(gumCalls).toBe(before + 1); // re-requested at the new resolution
   });
+
+  test("tap-to-focus aims an AF box; a second tap locks AE/AF (live)", async () => {
+    const host = await renderLive();
+    const app = host.container.querySelector('[role="application"]') as HTMLElement;
+    expect(app).toBeTruthy();
+    // stub a real viewfinder rect so the pure coordinate mapping runs in jsdom
+    Object.defineProperty(app, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ x: 0, y: 0, width: 100, height: 100, top: 0, left: 0, right: 100, bottom: 100 }),
+    });
+    const hasAfBox = () =>
+      host.container.querySelector('.border-yellow-400, .border-amber-300') !== null;
+    expect(hasAfBox()).toBe(false);
+    // a quick, still single tap → unlocked AF box
+    await fireEvent.pointerDown(app, { clientX: 50, clientY: 50, pointerId: 1 });
+    await fireEvent.pointerUp(app, { clientX: 50, clientY: 50, pointerId: 1 });
+    await settle();
+    expect(hasAfBox()).toBe(true);
+    expect(txt(host)).not.toContain("AE/AF LOCKED");
+    // second tap on ~the same point → AE/AF LOCKED caption + amber border
+    await fireEvent.pointerDown(app, { clientX: 51, clientY: 51, pointerId: 2 });
+    await fireEvent.pointerUp(app, { clientX: 51, clientY: 51, pointerId: 2 });
+    await settle();
+    expect(txt(host)).toContain("AE/AF LOCKED");
+    expect(host.container.querySelector('.border-amber-300')).toBeTruthy();
+  });
 });
 
 /** Minimal MediaRecorder stand-in so video recording works headless. */

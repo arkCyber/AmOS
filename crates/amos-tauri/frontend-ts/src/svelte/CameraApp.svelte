@@ -32,6 +32,11 @@
     fitCrop,
     zoomCrop,
     captureDims,
+    focusFromRect,
+    afInit,
+    afTap,
+    afCaption,
+    type AfState,
     type CamFacing,
     type CamFlash,
     type CamRatio,
@@ -75,6 +80,8 @@
   let grid = $state(false);
   let timer = $state<number>(0);
   let countdown = $state<number | null>(null);
+  // Tap-to-focus / AE-AF lock state (pure model in lib/camera).
+  let af = $state<AfState>(afInit());
   let flashFx = $state(false);
   let last = $state<Photo | null>(
     latestPhoto(readStoreValue<Photo[]>(PHOTOS_KEY, [])) ?? null,
@@ -104,11 +111,17 @@
   let burstSeq = $state<{ taken: number; total: number } | null>(null);
   let burstSeqId: number | null = null;
 
-  // ---- dynamic / pinch zoom ----
-  let pinch: { ids: Map<number, { x: number; y: number }>; d0: number; z0: number } = {
+  // ---- dynamic / pinch zoom + tap-to-focus ----
+  let pinch: {
+    ids: Map<number, { x: number; y: number }>;
+    d0: number;
+    z0: number;
+    tap: { id: number; x: number; y: number; t: number } | null;
+  } = {
     ids: new Map(),
     d0: 0,
     z0: 1,
+    tap: null,
   };
 
   const supported =
@@ -413,6 +426,9 @@
     if (pinch.ids.size === 2) {
       pinch.d0 = pinchDistance();
       pinch.z0 = zoom;
+      pinch.tap = null; // a second finger means zoom, not a tap
+    } else if (pinch.ids.size === 1) {
+      pinch.tap = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() };
     }
   }
   function onPinchMove(e: PointerEvent): void {
@@ -421,6 +437,11 @@
       p.x = e.clientX;
       p.y = e.clientY;
     }
+    // a real drag (not a tap) invalidates the tap candidate
+    const t = pinch.tap;
+    if (t && t.id === e.pointerId) {
+      if (Math.hypot(e.clientX - t.x, e.clientY - t.y) > 12) pinch.tap = null;
+    }
     if (pinch.ids.size >= 2 && pinch.d0 > 0) {
       const d = pinchDistance();
       zoom = clampZoom((pinch.z0 * d) / pinch.d0 || zoom);
@@ -428,6 +449,14 @@
   }
   function onPinchEnd(e: PointerEvent): void {
     pinch.ids.delete(e.pointerId);
+    // a quick, still single tap = tap-to-focus (first tap aims; again locks)
+    const t = pinch.tap;
+    if (t && t.id === e.pointerId) {
+      pinch.tap = null;
+      if (performance.now() - t.t < 500) {
+        tapToFocus(t.x, t.y, e.currentTarget as HTMLElement);
+      }
+    }
     if (pinch.ids.size < 2) pinch.d0 = 0;
   }
   const onZoomDoubleTap = () => {
@@ -527,7 +556,31 @@
     if (recState === "recording") return; // re-acquiring would cancel the take
     facing = facing === "back" ? "front" : "back";
     flash = "auto"; // iOS resets flash when flipping lenses
+    af = afInit(); // focus/point no longer applies to the other lens
     void acquire();
+  };
+  // iOS tap-to-focus: a quick single tap aims the AF point; tapping the same
+  // point again locks AE/AF; tapping elsewhere (or while locked) unlocks +
+  // re-aims. Hardware focus is best-effort via track pointsOfInterest;
+  // unsupported → the on-screen AF/AE-AF indicator still reflects the model.
+  const tapToFocus = (x: number, y: number, el: HTMLElement) => {
+    if (!live) return;
+    const rect = el.getBoundingClientRect();
+    const p = focusFromRect(x, y, rect);
+    if (!p) return;
+    aimAt(p);
+  };
+  const aimAt = (p: { x: number; y: number }) => {
+    af = afTap(af, p);
+    const track = stream?.getVideoTracks()[0];
+    try {
+      if (track?.applyConstraints)
+        void track.applyConstraints({
+          advanced: [{ pointsOfInterest: [{ x: p.x, y: p.y }] }],
+        } as unknown as MediaTrackConstraints);
+    } catch {
+      /* focus point unsupported — the UI indicator still reflects the model */
+    }
   };
   const toggleHdr = () => {
     hdr = !hdr;
@@ -553,6 +606,8 @@
 </script>
 
 <div class="flex h-full flex-col bg-black text-white">
+  <!-- The viewfinder handles gestures (tap-to-focus + pinch zoom) via pointer
+       events; live feed, AF/AE-AF overlay etc. follow. -->
   <div
     class="relative min-h-0 flex-1 touch-none overflow-hidden bg-neutral-950"
     role="application"
@@ -580,6 +635,21 @@
     <!-- demo viewfinder fallback (no camera / headless) -->
     {#if !live}
       <div class="grid h-full place-items-center text-6xl">🏔️</div>
+    {/if}
+
+    <!-- tap-to-focus AF / AE-AF-lock indicator (iOS-style yellow square) -->
+    {#if live && af.x != null && af.y != null}
+      <div
+        aria-hidden="true"
+        class="pointer-events-none absolute z-10"
+        style="left: {af.x * 100}%; top: {af.y * 100}%; transform: translate(-50%, -50%);"
+      >
+        <div class="relative grid h-16 w-16 place-items-center rounded-[3px] border-2 {af.locked ? 'border-amber-300' : 'border-yellow-400'}">
+          {#if af.locked}
+            <span class="absolute top-0 translate-y-[-110%] rounded bg-black/55 px-1 text-[9px] font-semibold tracking-wide text-amber-200">{afCaption(af)}</span>
+          {/if}
+        </div>
+      </div>
     {/if}
 
     <!-- rule-of-thirds grid -->

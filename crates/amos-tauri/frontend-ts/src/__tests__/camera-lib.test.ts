@@ -18,6 +18,11 @@ import {
   ZOOM_STEPS,
   ZOOM_MIN,
   ZOOM_MAX,
+  clamp01,
+  focusFromRect,
+  afInit,
+  afTap,
+  afCaption,
   type CamFlash,
 } from "../lib/camera";
 
@@ -145,5 +150,42 @@ describe("camera resolution presets", () => {
     expect(nextRes("sd")).toBe("hd");
     expect(nextRes("hd")).toBe("fhd");
     expect(nextRes("fhd")).toBe("sd");
+  });
+});
+
+describe("camera tap-to-focus / AE-AF lock", () => {
+  test("clamp01 bounds coordinates and guards non-finite", () => {
+    expect(clamp01(0.5)).toBe(0.5);
+    expect(clamp01(-1)).toBe(0);
+    expect(clamp01(2)).toBe(1);
+    expect(clamp01(NaN)).toBe(0);
+  });
+
+  test("focusFromRect maps a tap into normalised viewfinder coords", () => {
+    const rect = { x: 0, y: 0, width: 1000, height: 500 };
+    expect(focusFromRect(250, 250, rect)).toEqual({ x: 0.25, y: 0.5 });
+    // clamps taps outside the frame
+    expect(focusFromRect(-50, 9999, rect)).toEqual({ x: 0, y: 1 });
+    // no area → null
+    expect(focusFromRect(10, 10, { x: 0, y: 0, width: 0, height: 0 })).toBeNull();
+  });
+
+  test("first tap aims (unlocked), a second near tap locks (AE/AF LOCK)", () => {
+    const first = afTap(afInit(), { x: 0.4, y: 0.5 });
+    expect(first).toEqual({ x: 0.4, y: 0.5, locked: false });
+    expect(afCaption(first)).toBe("AF");
+    const locked = afTap(first, { x: 0.402, y: 0.501 });
+    expect(locked.locked).toBe(true);
+    expect(afCaption(locked)).toBe("AE/AF LOCKED");
+  });
+
+  test("a far tap re-aims and unlocks; tapping while locked unlocks (iOS gesture)", () => {
+    const locked = afTap(afTap(afInit(), { x: 0.5, y: 0.5 }), { x: 0.5, y: 0.5 });
+    expect(locked.locked).toBe(true);
+    // tapping again (even the same spot) while locked is the unlock gesture
+    expect(afTap(locked, { x: 0.51, y: 0.5 }).locked).toBe(false);
+    // tapping elsewhere re-aims & unlocks
+    const reaimed = afTap(locked, { x: 0.1, y: 0.9 });
+    expect(reaimed).toEqual({ x: 0.1, y: 0.9, locked: false });
   });
 });
