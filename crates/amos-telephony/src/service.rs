@@ -163,7 +163,9 @@ impl TelephonyService {
 fn into_status(e: TelephonyError) -> Status {
     use TelephonyError::*;
     match e {
-        InvalidNumber(_) | NotEmergency(_) => Status::invalid_argument(e.to_string()),
+        InvalidNumber(_) | NotEmergency(_) | MustUseEmergencyPath(_) => {
+            Status::invalid_argument(e.to_string())
+        }
         UnknownCall(_) => Status::not_found(e.to_string()),
         IllegalState { .. } | RecordingForbidden(_) => Status::failed_precondition(e.to_string()),
         NoCarrier => Status::unavailable(e.to_string()),

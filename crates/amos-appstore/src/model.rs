@@ -267,6 +267,11 @@ pub enum PackageFormat {
     #[default]
     TarGz,
     Zip,
+    /// A Play-style Android APK. The engine downloads + verifies its bytes like
+    /// any other package, but *installing* it is routed to the device's
+    /// PackageInstaller through the [`crate::android`] bridge (see
+    /// [`crate::client::AppStore::install_apk`]) — never unpacked to disk.
+    Apk,
 }
 
 impl PackageFormat {
@@ -274,6 +279,7 @@ impl PackageFormat {
         match self {
             PackageFormat::TarGz => "tar.gz",
             PackageFormat::Zip => "zip",
+            PackageFormat::Apk => "apk",
         }
     }
 }

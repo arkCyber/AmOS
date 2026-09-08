@@ -27,6 +27,14 @@ amos-scheduler.workspace = true
 # get_status.system. The `linux` feature only adds std::fs reads of /proc (absent
 # at runtime on macOS/dev → honest "unknown", never fabricated).
 amos-monitor = { workspace = true, features = ["linux"] }
+# Egress data-plane firewall domain core (policy + seam + Mock). Default build is
+# pure std; the daemon mounts a Mock-backed NetGuardService (docs/anti-telemetry-egress-guard.md).
+amos-network-guard.workspace = true
+# Passive egress telemetry-spy domain core (pure std). Only pulled in by the
+# `telemetry-spy` feature, which adds the EgressMatch -> EgressHit mapping +
+# `TelemetrySpySvc::ingest_match` feed seam (host-testable). Live pnet capture
+# is a device/AOSP step (amos-telemetry-spy `audit` feature).
+amos-telemetry-spy = { workspace = true, optional = true }
 amos-display.workspace = true
 amos-asr = { path = "../amos-asr" }
 tokio.workspace = true
@@ -56,6 +64,16 @@ ureq = "2"
 asr-sherpa = ["amos-asr/sherpa"]
 qnn = []
 neuropilot = []
+# Pulls the amos-telemetry-spy domain core and the EgressMatch -> proto EgressHit
+# mapping / `TelemetrySpySvc::ingest_match` feed seam. Pure std (no pnet): the
+# seam is host-testable, so a capture producer only needs to open the NIC
+# (amos-telemetry-spy `audit` + a rooted/AmOS-AOSP slot) to start feeding.
+telemetry-spy = ["dep:amos-telemetry-spy"]
+# Pulls the live pnet capture producer (amos-telemetry-spy `audit`): the daemon
+# opens a data interface named by AMOS_SPY_IFACE and feeds every decoded+scanned
+# match into the SAME TelemetrySpySvc Watch stream serve() mounts. Device/AOSP
+# path — needs raw-socket privilege; default build never compiles it (quiet).
+telemetry-spy-audit = ["telemetry-spy", "amos-telemetry-spy/audit"]
 
 [dev-dependencies]
 tower.workspace = true

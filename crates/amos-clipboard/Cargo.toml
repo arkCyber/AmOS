@@ -1,0 +1,27 @@
+[package]
+name = "amos-clipboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos clipboard domain core shared by the host System UI and the guest Android container: the host<->guest clipboard-sync wire protocol (framed JSON messages + streaming decoder + echo guard), a pluggable ClipboardProvider seam (deterministic Mock today; Android ClipboardManager via JNI behind `android`), and a headless-testable GuestClipboardAgent. Design & two-topology decision: docs/clipboard-container-sync.md."
+
+[lib]
+name = "amos_clipboard"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = "1.0"
+# Real Android backend (the container's ClipboardManager via JNI, hosted in a
+# guest process that owns a Context). Optional: only pulled in when the `android`
+# feature is enabled so desktop/CI stays light.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enables `src/android.rs` (AndroidClipboardProvider). Intended for on-device guest
+# builds; deliberately excluded from desktop/CI. Runtime still requires a real
+# Android VM + a Context; `cargo check --features android` validates that it
+# *compiles*.
+android = ["dep:jni"]

@@ -17,6 +17,15 @@
 //! than touching disk — but when given a web-install dir
 //! ([`with_web_install_dir`](AppStore::with_web_install_dir)) a `tar.gz`
 //! web-bundle is also unpacked to `<dir>/<id>/` so the app is runnable on disk.
+//!
+//! Real Android apps (`PackageFormat::Apk`) take a separate, honest device
+//! path: once a [`with_android_bridge`](AppStore::with_android_bridge) is
+//! configured, [`install_apk`](AppStore::install_apk) /
+//! [`upgrade_apk`](AppStore::upgrade_apk) download + verify the APK and then
+//! silently commit it through the platform's `PackageInstaller` — refusing up
+//! front when the device posture cannot commit silently (see
+//! [`crate::android`]), instead of pretending an APK is installed when the
+//! platform would demand a confirmation dialog.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::android::{CommitOutcome, InstallMode, InstallRequest, PackageInstallerBridge};
 use crate::error::{Result, StoreError};
 use crate::model::{AppManifest, AppStatus, Checksum, InstalledApp, PackageFormat};
 use crate::StoreProvider;
@@ -45,6 +55,9 @@ pub struct AppStore<P: StoreProvider> {
     /// When set, installing a `tar.gz` web-bundle also unpacks it under this
     /// directory (`<dir>/<id>/`), so an installed app is runnable on disk.
     web_install: Option<PathBuf>,
+    /// When set, `install_apk`/`upgrade_apk` drive the device's
+    /// PackageInstaller through this bridge (see [`crate::android`]).
+    pms_bridge: Option<Arc<dyn PackageInstallerBridge>>,
 }
 
 /// Current unix-epoch seconds (used to stamp installs).
@@ -62,6 +75,7 @@ impl<P: StoreProvider> AppStore<P> {
             provider,
             installed: Arc::new(Mutex::new(Registry::default())),
             web_install: None,
+            pms_bridge: None,
         }
     }
 
@@ -81,6 +95,7 @@ impl<P: StoreProvider> AppStore<P> {
             provider,
             installed: Arc::new(Mutex::new(registry)),
             web_install: None,
+            pms_bridge: None,
         })
     }
 
@@ -94,6 +109,20 @@ impl<P: StoreProvider> AppStore<P> {
     /// The configured web-bundle install root, if any.
     pub fn web_install_dir(&self) -> Option<&Path> {
         self.web_install.as_deref()
+    }
+
+    /// Attach the device-side [`PackageInstallerBridge`] that lets real Android
+    /// APKs be installed/upgraded (see [`install_apk`](Self::install_apk)). This
+    /// is the seam a Tauri/JNI priv-app plugin populates on-device; leave unset
+    /// for pure web-bundle / headless use. Returns `self` for chaining.
+    pub fn with_android_bridge(mut self, bridge: Arc<dyn PackageInstallerBridge>) -> Self {
+        self.pms_bridge = Some(bridge);
+        self
+    }
+
+    /// The configured PackageInstaller bridge, if any.
+    pub fn android_bridge(&self) -> Option<&dyn PackageInstallerBridge> {
+        self.pms_bridge.as_deref()
     }
 
     /// When a web-install dir is set and the package is a `tar.gz` web-bundle,
@@ -223,18 +252,14 @@ impl<P: StoreProvider> AppStore<P> {
     /// a newer release.
     pub async fn install(&self, id: &str) -> Result<InstalledApp> {
         let manifest = self.resolve_catalog(id).await?;
+        manifest.validate()?;
+        self.ensure_not_apk(&manifest)?;
         check_publisher(&manifest)?;
         if self.is_installed(id)? {
+            let version = self.installed_version(id)?.unwrap_or_default();
             return Err(StoreError::AlreadyInstalled {
                 id: id.to_string(),
-                version: self
-                    .installed
-                    .lock()
-                    .map_err(|_| StoreError::Provider("registry poisoned".into()))?
-                    .apps
-                    .get(id)
-                    .map(|a| a.version().to_string())
-                    .unwrap_or_default(),
+                version,
             });
         }
         let bytes = self.provider.fetch_package(&manifest).await?;
@@ -254,6 +279,8 @@ impl<P: StoreProvider> AppStore<P> {
             .cloned()
             .ok_or_else(|| StoreError::NotInstalled { id: id.to_string() })?;
         let latest = self.resolve_catalog(id).await?;
+        latest.validate()?;
+        self.ensure_not_apk(&latest)?;
         check_publisher(&latest)?;
         if latest.version <= *current.version() {
             return Err(StoreError::NoUpdate {
@@ -264,6 +291,67 @@ impl<P: StoreProvider> AppStore<P> {
         let bytes = self.provider.fetch_package(&latest).await?;
         verify_bytes(id, &latest, &bytes)?;
         self.install_bundle(&latest, &bytes)?;
+        self.record(latest)
+    }
+
+    /// Install `id`'s current release as a real Android APK, driving the device's
+    /// PackageInstaller through the configured [`PackageInstallerBridge`] (the
+    /// silent "无感" OEM path).
+    ///
+    /// This is the *device* half of an APK store app: like
+    /// [`install`](Self::install) it downloads and sha256-verifies the package,
+    /// but instead of unpacking to disk it stages + commits the APK via the
+    /// bridge. It is **honest about capability**: it refuses up front (before any
+    /// download) when no bridge is configured or when the device posture cannot
+    /// commit silently (see [`crate::android::Posture`]), and it treats a
+    /// `PendingUserAction` result as a failure — the silent engine never records
+    /// an APK as installed when the platform demanded a confirmation dialog.
+    pub async fn install_apk(&self, id: &str) -> Result<InstalledApp> {
+        let manifest = self.resolve_catalog(id).await?;
+        manifest.validate()?;
+        self.ensure_apk(&manifest)?;
+        check_publisher(&manifest)?;
+        if self.is_installed(id)? {
+            let version = self.installed_version(id)?.unwrap_or_default();
+            return Err(StoreError::AlreadyInstalled {
+                id: id.to_string(),
+                version,
+            });
+        }
+        // Fail fast: don't download an APK we can't silently install.
+        self.silent_bridge()?;
+        let bytes = self.provider.fetch_package(&manifest).await?;
+        verify_bytes(id, &manifest, &bytes)?;
+        self.commit_apk(&manifest, InstallMode::Full, &bytes)?;
+        self.record(manifest)
+    }
+
+    /// Upgrade `id` to the catalog's newest APK release via the bridge
+    /// (in-place install inheriting the previous package's data). No-op when
+    /// already current; refused on a non-silent device.
+    pub async fn upgrade_apk(&self, id: &str) -> Result<InstalledApp> {
+        let current = self
+            .installed
+            .lock()
+            .map_err(|_| StoreError::Provider("registry poisoned".into()))?
+            .apps
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotInstalled { id: id.to_string() })?;
+        let latest = self.resolve_catalog(id).await?;
+        latest.validate()?;
+        self.ensure_apk(&latest)?;
+        check_publisher(&latest)?;
+        if latest.version <= *current.version() {
+            return Err(StoreError::NoUpdate {
+                id: id.to_string(),
+                version: current.version().to_string(),
+            });
+        }
+        self.silent_bridge()?;
+        let bytes = self.provider.fetch_package(&latest).await?;
+        verify_bytes(id, &latest, &bytes)?;
+        self.commit_apk(&latest, InstallMode::InheritExisting, &bytes)?;
         self.record(latest)
     }
 
@@ -319,6 +407,101 @@ impl<P: StoreProvider> AppStore<P> {
             .ok_or_else(|| StoreError::UnknownApp { id: id.to_string() })
     }
 
+    /// The version string of `id`, if it is currently recorded as installed.
+    fn installed_version(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .installed
+            .lock()
+            .map_err(|_| StoreError::Provider("registry poisoned".into()))?
+            .apps
+            .get(id)
+            .map(|a| a.version().to_string()))
+    }
+
+    /// Refuse to run an *APK* engine path against a non-APK catalog entry.
+    fn ensure_apk(&self, manifest: &AppManifest) -> Result<()> {
+        if manifest.package.format == PackageFormat::Apk {
+            Ok(())
+        } else {
+            Err(StoreError::Provider(format!(
+                "{} publishes a {} package, not an APK — use install() for web bundles",
+                manifest.id,
+                manifest.package.format.as_str()
+            )))
+        }
+    }
+
+    /// Refuse the *web-bundle* path (`install`/`upgrade`) for an APK entry: an
+    /// APK must go through the PackageInstaller bridge
+    /// (`install_apk`/`upgrade_apk`) — the engine never silently *records* an
+    /// APK as installed when the platform wasn't asked to install it.
+    fn ensure_not_apk(&self, manifest: &AppManifest) -> Result<()> {
+        if manifest.package.format == PackageFormat::Apk {
+            Err(StoreError::Provider(format!(
+                "{} is an APK package — use install_apk()/upgrade_apk(), not install()/upgrade()",
+                manifest.id
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The configured bridge when (and only when) it can commit silently. This
+    /// is the guard that makes the APK engine honest: a store without a bridge,
+    /// or on a sideloaded (non-privileged) device, gets a clear refusal instead
+    /// of pretending an APK will install without a user prompt.
+    fn silent_bridge(&self) -> Result<&dyn PackageInstallerBridge> {
+        let bridge = self.pms_bridge.as_deref().ok_or_else(|| {
+            StoreError::Provider(
+                "no Android PackageInstaller bridge configured (set with_android_bridge)".into(),
+            )
+        })?;
+        let posture = bridge.posture();
+        if !posture.can_silent_commit() {
+            let gap = posture
+                .silent_gap()
+                .unwrap_or("no silent capability on this device");
+            return Err(StoreError::Provider(format!(
+                "silent APK install unavailable on this device: {gap}"
+            )));
+        }
+        Ok(bridge)
+    }
+
+    /// Stage + silently commit an already-verified APK through the bridge.
+    fn commit_apk(
+        &self,
+        manifest: &AppManifest,
+        mode: InstallMode,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let bridge = self.silent_bridge()?;
+        let req = InstallRequest {
+            // The catalog id doubles as the Android package name for APK apps; a
+            // real (JNI) bridge may parse the actual packageName out of the APK.
+            package: manifest.id.clone(),
+            apk_name: "base.apk".into(),
+            mode,
+            version_code: 0, // versionCode isn't part of the catalog model today
+            expect_silent: true,
+            label: Some(manifest.name.clone()),
+        };
+        let mut session = bridge.open_session(&req)?;
+        bridge.write_apk(&mut session, bytes)?;
+        match bridge.commit(session)? {
+            CommitOutcome::Installed | CommitOutcome::Updated => Ok(()),
+            CommitOutcome::PendingUserAction => Err(StoreError::Provider(format!(
+                "PMS surfaced a confirmation dialog for {} — this device is not silent-privileged",
+                manifest.id
+            ))),
+            CommitOutcome::Failed { code, message } => Err(StoreError::Provider(format!(
+                "APK commit for {} failed ({}): {message}",
+                manifest.id,
+                crate::android::status_name(code)
+            ))),
+        }
+    }
+
     /// Record a verified manifest as installed (replacing any previous entry,
     /// which is how an upgrade lands). Stamps the install time.
     fn record(&self, manifest: AppManifest) -> Result<InstalledApp> {
@@ -368,6 +551,8 @@ fn check_publisher(manifest: &AppManifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use crate::android::{Posture, SideloadOnlyBridge};
     use crate::model::{AppCategory, AppStatus, PackageFormat, PackageRef};
     use crate::provider::MockStoreProvider;
 
@@ -385,6 +570,29 @@ mod tests {
             package: PackageRef {
                 format: PackageFormat::TarGz,
                 url: format!("https://cdn.example.com/{id}.tgz"),
+                sha256: None,
+                size_bytes: None,
+            },
+            publisher: None,
+        }
+    }
+
+    /// A catalog entry that ships as a Play-style APK (routes through the
+    /// PackageInstaller bridge, not web-bundle unpacking).
+    fn apk_app(id: &str, name: &str, ver: &str) -> AppManifest {
+        AppManifest {
+            id: id.into(),
+            name: name.into(),
+            summary: "demo apk app".into(),
+            description: String::new(),
+            author: "Amos Team".into(),
+            version: crate::model::Version::parse(ver).unwrap(),
+            category: AppCategory::Communication,
+            homepage: String::new(),
+            icon_url: String::new(),
+            package: PackageRef {
+                format: PackageFormat::Apk,
+                url: format!("https://cdn.example.com/{id}.apk"),
                 sha256: None,
                 size_bytes: None,
             },
@@ -748,5 +956,149 @@ mod tests {
         // Failed install must not leave a partial bundle behind.
         assert!(!root.join("org.amos.broken").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn install_apk_refuses_without_a_configured_bridge() {
+        let p = MockStoreProvider::new();
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "1.0.0"),
+            b"PK\x03\x04v1".to_vec(),
+        )
+        .unwrap();
+        // No bridge configured → honest refusal before any download happens.
+        let store = AppStore::new(p);
+        let err = store.install_apk("com.amos.mail").await.unwrap_err();
+        assert!(matches!(err, StoreError::Provider(_)), "{err}");
+        assert!(err.to_string().contains("bridge"), "{err}");
+        assert!(!store.is_installed("com.amos.mail").unwrap());
+    }
+
+    #[tokio::test]
+    async fn install_apk_refuses_on_a_sideloaded_device() {
+        let p = MockStoreProvider::new();
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "1.0.0"),
+            b"PK\x03\x04v1".to_vec(),
+        )
+        .unwrap();
+        // A sideloaded store can never commit silently → the engine must refuse.
+        let store = AppStore::new(p)
+            .with_android_bridge(Arc::new(SideloadOnlyBridge::new(Posture::sideload())));
+        let err = store.install_apk("com.amos.mail").await.unwrap_err();
+        assert!(matches!(err, StoreError::Provider(_)), "{err}");
+        assert!(err.to_string().contains("silent"), "{err}");
+        assert!(!store.is_installed("com.amos.mail").unwrap());
+    }
+
+    #[tokio::test]
+    async fn install_apk_commits_silently_and_records_on_oem_platform() {
+        let p = MockStoreProvider::new();
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "1.0.0"),
+            b"PK\x03\x04v1".to_vec(),
+        )
+        .unwrap();
+        let store = AppStore::new(p)
+            .with_android_bridge(Arc::new(SideloadOnlyBridge::new(Posture::oem_platform())));
+        let installed = store.install_apk("com.amos.mail").await.unwrap();
+        assert_eq!(installed.version().to_string(), "1.0.0");
+        assert!(store.is_installed("com.amos.mail").unwrap());
+        assert_eq!(store.installed().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_apk_refuses_a_web_bundle_catalog_entry() {
+        let p = MockStoreProvider::new();
+        p.add(app("org.amos.web", "Web", "1.0.0"), b"tgz".to_vec()).unwrap();
+        let store = AppStore::new(p)
+            .with_android_bridge(Arc::new(SideloadOnlyBridge::new(Posture::oem_platform())));
+        let err = store.install_apk("org.amos.web").await.unwrap_err();
+        assert!(matches!(err, StoreError::Provider(_)), "{err}");
+        assert!(err.to_string().contains("not an APK"), "{err}");
+        assert!(!store.is_installed("org.amos.web").unwrap());
+    }
+
+    #[tokio::test]
+    async fn upgrade_apk_moves_to_the_newer_release_only() {
+        let p = MockStoreProvider::new();
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "1.0.0"),
+            b"PK\x03\x04v1".to_vec(),
+        )
+        .unwrap();
+        // store shares the mock's Arc<State>, so a later add() is visible to it.
+        let store = AppStore::new(p.clone())
+            .with_android_bridge(Arc::new(SideloadOnlyBridge::new(Posture::oem_platform())));
+        store.install_apk("com.amos.mail").await.unwrap();
+
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "2.0.0"),
+            b"PK\x03\x04v2".to_vec(),
+        )
+        .unwrap();
+        let upgraded = store.upgrade_apk("com.amos.mail").await.unwrap();
+        assert_eq!(upgraded.version().to_string(), "2.0.0");
+
+        // Re-upgrading when already current is a clean no-op, not a reinstall.
+        let noop = store.upgrade_apk("com.amos.mail").await.unwrap_err();
+        assert!(matches!(noop, StoreError::NoUpdate { .. }), "{noop}");
+    }
+
+    /// A provider that hands the engine an *unvalidated* manifest — unlike
+    /// [`MockStoreProvider`], it does not validate on `add`. Proves the engine
+    /// validates provider input itself before trusting it.
+    struct RawProvider {
+        mf: AppManifest,
+    }
+
+    #[async_trait]
+    impl crate::StoreProvider for RawProvider {
+        fn name(&self) -> &'static str {
+            "raw-provider"
+        }
+        async fn catalog(&self) -> crate::Result<Vec<AppManifest>> {
+            Ok(vec![self.mf.clone()])
+        }
+        async fn fetch_package(&self, _m: &AppManifest) -> crate::Result<Vec<u8>> {
+            Ok(b"payload".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_validates_provider_manifests_before_trusting_them() {
+        // MockStoreProvider would refuse this; a raw/untrusted provider won't.
+        let mut mf = app("org.amos.ok", "Ok", "1.0.0");
+        mf.id = "has space".into(); // not a valid slug
+        let store = AppStore::new(RawProvider { mf });
+
+        let err = store.install("has space").await.unwrap_err();
+        assert!(matches!(err, StoreError::InvalidAppId(_)), "{err}");
+        assert!(!store.is_installed("has space").unwrap());
+
+        // The APK path validates provider input too.
+        let mut mf2 = apk_app("com.amos.ok", "Ok", "1.0.0");
+        mf2.package.sha256 = None;
+        mf2.id = "bad id".into();
+        let store2 = AppStore::new(RawProvider { mf: mf2 });
+        let err2 = store2.install_apk("bad id").await.unwrap_err();
+        assert!(matches!(err2, StoreError::InvalidAppId(_)), "{err2}");
+    }
+
+    #[tokio::test]
+    async fn install_web_path_refuses_apk_catalog_entries() {
+        let p = MockStoreProvider::new();
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "1.0.0"),
+            b"PK\x03\x04".to_vec(),
+        )
+        .unwrap();
+        // The web `install()` must never *record* an APK without asking the
+        // device's PackageInstaller — it must direct the caller to install_apk.
+        let store = AppStore::new(p);
+        let err = store.install("com.amos.mail").await.unwrap_err();
+        assert!(matches!(err, StoreError::Provider(_)), "{err}");
+        assert!(err.to_string().contains("install_apk"), "{err}");
+        assert!(!store.is_installed("com.amos.mail").unwrap());
     }
 }

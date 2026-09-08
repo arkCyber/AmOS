@@ -1459,6 +1459,26 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         }
     });
 
+    // LMK self-protection (base A): re-verify + self-heal `oom_score_adj` on the
+    // same cadence as the other beats, so the "never reclaim this daemon by OOM
+    // tier" property is *continuously assured* rather than assumed at boot. The
+    // first tick fires immediately (boot-time verification); a drift is healed
+    // and logged when privileged; a host with no oom control (desktop dev) is a
+    // quiet trace-level no-op. See `life_guard` module + `docs/life-guard.md`.
+    // Aborted on shutdown below.
+    let life_guard = Arc::new(crate::life_guard::LifeGuard::new(
+        crate::life_guard::PlatformProcFs::new(),
+    ));
+    let life_beat = life_guard.spawn_periodic(interval);
+
+    // Shared telemetry-spy hit bus. The System UI's `Watch` subscribers consume
+    // it; on a device (`telemetry-spy-audit`) the pnet capture producer feeds the
+    // SAME instance (clone shares the broadcast), so a real NIC hit reaches Watch.
+    // The test/demo injection RPC is off unless AMOS_SPY_ALLOW_INJECT is set.
+    let telemetry_svc = crate::telemetry_spy_service::TelemetrySpySvc::new_with_inject(
+        crate::telemetry_spy_service::injection_env_allowed(),
+    );
+
     let server = tonic::transport::Server::builder()
         .add_service(AiAgentServer::with_interceptor(
             ai_service,
@@ -1506,7 +1526,35 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
             let (privacy, persist) = crate::privacy_service::bootstrap();
             crate::privacy_service::server(privacy, persist)
         })
-        ;
+        // Egress network-guard service (amos-network-guard + proto netguard.proto):
+        // lets the System UI arm/disarm the userspace data-plane egress gate and read
+        // a status + audit summary over the same UDS. P1 is policy intent on the
+        // in-process Mock; real enforcement (VpnService / nftables) is a device/AOSP
+        // step (docs/anti-telemetry-egress-guard.md §3.1/§3.4).
+        .add_service(crate::netguard_service::server())
+        // Passive telemetry-spy audit stream (crates/amos-telemetry-spy + proto
+        // telemetry_spy.proto): lets the System UI subscribe (server-streaming Watch)
+        // to high-severity egress hits. On this default host build no capture producer
+        // feeds the service, so Watch yields nothing (never a fabricated hit); a real
+        // pnet capture feed is started below under `telemetry-spy-audit`
+        // (docs/telemetry-spy.md). The mounted instance is the SHARED bus the producer
+        // feeds, so subscribers and producer see the same hits.
+        .add_service(crate::telemetry_spy_service::server_for(
+            telemetry_svc.clone(),
+        ));
+
+    // (feature `telemetry-spy-audit`) Real-device capture producer: opens the data
+    // interface named by AMOS_SPY_IFACE and feeds every decoded+scanned match into
+    // the SAME TelemetrySpySvc mounted above, so a NIC hit reaches Watch -> System
+    // UI. Quiet by default: the producer only starts when BOTH an interface and at
+    // least one watch identifier (AMOS_SPY_IDS) are configured; a refused start is
+    // logged, never a fabricated success. Needs raw-socket privilege (device/AOSP).
+    #[cfg(feature = "telemetry-spy-audit")]
+    let (spy_stop, spy_pump) = {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump = crate::telemetry_spy_capture::spawn_configured(telemetry_svc, Arc::clone(&stop));
+        (stop, pump)
+    };
 
     // The transport decides how the fully-built tonic server consumes its connection
     // source: TCP (`.serve`) when `AMOS_TCP_ADDR` was set, else the Unix stream bound
@@ -1536,6 +1584,16 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     energy_beat.abort();
     governor_beat.abort();
     system_beat.abort();
+    life_beat.abort();
+    // Halt the on-device telemetry-spy capture: request the pnet loop stop and
+    // abort the pump task (feature `telemetry-spy-audit` only).
+    #[cfg(feature = "telemetry-spy-audit")]
+    {
+        crate::telemetry_spy_capture::stop_request(&spy_stop);
+        if let Some(handle) = spy_pump {
+            handle.abort();
+        }
+    }
 
     // Persist sessions (if `AMOS_SESSIONS_PATH` is set) before exiting.
     if let Some(p) = &sessions_path {

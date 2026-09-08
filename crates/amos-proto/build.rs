@@ -13,6 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/sensor.proto",
                 "../../proto/governor.proto",
                 "../../proto/privacy.proto",
+                "../../proto/netguard.proto",
+                "../../proto/telemetry_spy.proto",
             ],
             &["../../proto"],
         )?;
@@ -23,5 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../../proto/sensor.proto");
     println!("cargo:rerun-if-changed=../../proto/governor.proto");
     println!("cargo:rerun-if-changed=../../proto/privacy.proto");
+    println!("cargo:rerun-if-changed=../../proto/netguard.proto");
+    println!("cargo:rerun-if-changed=../../proto/telemetry_spy.proto");
     Ok(())
 }

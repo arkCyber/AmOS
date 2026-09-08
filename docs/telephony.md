@@ -229,7 +229,7 @@ service Telephony {
 1. **P0**：`crates/amos-telephony` 领域内核（`model`/`error`/`provider`/`CallSession` 状态机 + `EmergencyMap`）+ `MockTelephonyProvider` + 全单测。→ **✅ 已完成（2026-09-03）**：`number.rs`/`session.rs`/`error.rs`/`provider.rs`，17 单测通过，可在无真机时完成并进 CI。
 2. **P1**：`proto/telephony.proto` + `amos-proto` 代码生成 + `TelephonyService` 挂进 `amos-ai` UDS + 无头 gRPC 测试。→ **✅ 已完成（2026-09-03）**：`service.rs`（`mock_server()`）、`amos-ai/src/server.rs` 经 `add_service` 挂载、`tests/telephony_rpc_e2e.rs` 真 UDS 往返（Dial/Status/End、112 自动紧急路由）。
 3. **P2**：前端接线 + 来电 surface。→ **✅ 完成（2026-09-03/04）**：`PhoneApp` 拨号接线、锁屏紧急入口 110、**`Watch` 真实持续事件流**（`ProviderEvent` 增 `Incoming/Connected{id,peer}`，Mock 上报；`service.inject_incoming()` 供无头注入）；**2026-09-04 闭环**：Tauri `Watch` 事件桥（`spawn_telephony_watch` 长连 `telephony-event`，带退避重连）+ 前端**来电浮层 `IncomingCall`**（Ringing→接听/拒接；接通 Active→含录音开关的通话条 + 挂断）+ `telephony_answer` + 拨号出局 **demo 自动接通**（`demo_server()`：出局普通号短响铃后到 Active，桌面拨号→通话→录音→挂断真实可操作；`mock_server()` 仍确定性供无头 e2e）＋ `SimulateIncoming` RPC（mock 专用，真 provider 返回 `Unavailable`）+ `telephony_simulate_incoming` + PhoneApp「模拟来电」demo 入口，**来电浮层也可桌面手测**（生产来电仍走真机注入/Binder）。
-4. **P3（需真机/OEM；宿主进程已在 §12 定稿）**：宿主于 **System UI（`amos-tauri` APK）进程**的 `AndroidTelephonyProvider`/`AndroidEmergencyTelephonyProvider`（feature `android` + 可选 `jni`）。→ **编译骨架已落地（2026-09-04，见 §12 #8）**：`crates/amos-telephony/src/android.rs` 以 `ACTION_CALL` 真实起呼（System UI `Context` 直呼），`cargo check --features android` + `clippy` 通过；**仍 ⏳ 待真机/OEM 验收**：接 `InCallService`/`TelephonyCallback` 的接听/挂断/来电/录音、`ACTION_CALL`→`TelecomManager#placeCall` 迁移、锁屏无 UI 紧急拨号验证（按 §5 硬性保证，需 OEM/root + 交叉窗）。紧急号分类复用 §3 `EmergencyMap`。
+4. **P3（需真机/OEM；宿主进程已在 §12 定稿）**：宿主于 **System UI（`amos-tauri` APK）进程**的 `AndroidTelephonyProvider`/`AndroidEmergencyTelephonyProvider`（feature `android` + 可选 `jni`）。→ **编译骨架已落地（2026-09-04，见 §12 #8）**：`crates/amos-telephony/src/android.rs` 以 `TelecomManager#placeCall` 真实起呼（Binder 化 + 紧急路由统一层，见 §12 #9），`cargo check --features android` + `clippy` 通过；**仍 ⏳ 待真机/OEM 验收**：接 `InCallService`/`TelephonyCallback` 的接听/挂断/来电/录音、锁屏无 UI 紧急拨号验证（按 §5 硬性保证，需 OEM/root + 交叉窗）。紧急号分类复用 §3 `EmergencyMap`、强制路由复用 §12 #9 `crate::route`。
 
 ---
 
@@ -285,8 +285,14 @@ service Telephony {
 - 验证：`cargo check --features android`、`cargo clippy --features android -D warnings` 均通过；默认(desktop/CI) 构建不含 JNI 栈、不受影响。
 - 真机仍需：System UI(ROLE_DIALER) APK 交叉编译、真实起呼/接听/来电注入与锁屏无 UI 紧急拨号按 §5 验收。
 
+### #9 Binder 化 `TelecomManager#placeCall` + 紧急路由统一层（2026-09-08，编译门控、真机待验）
+- 把 §12 #8 里 `android.rs` 的 `ACTION_CALL` intent 起呼**替换为 `TelecomManager#placeCall(Uri, Bundle)`**（System UI `Context` 经 `getSystemService("telecom")` 直取，即 Binder `ITelecomService` 事务的 JNI 等价物），不再走广播 intent。仍诚实划线：`answer`/`end`/录音/实时 `status` 保持 `Provider(P3 device-validated)`，接听/挂断/来电/录音需 `InCallService`/`TelephonyCallback` 桥（P3，真机验收）。
+- **新增 `crate::route` 紧急路由统一层**（VM-free，主机可测）：`DialRoute{Emergency,Regular}` + `route()` + `guard_regular()`/`guard_emergency()`。`MockTelephonyProvider`（`provider.rs`）与 Android 两个 provider **共用同一决策**：普通 provider 拒绝紧急号（新错误变体 `TelephonyError::MustUseEmergencyPath`，措辞区别于紧急路径拒绝普通号的 `NotEmergency`），紧急 provider 拒绝普通号 → 110/112 永不落入 SIM 路径、普通号永不被特权路径静默放行。`AndroidTelephonyProvider`/`AndroidEmergencyTelephonyProvider::new` 现需携带 `EmergencyMap` 以便在 Binder 事务前强制分离。
+- 工程边界（与 §1 硬性红线一致）：`placeCall` 宿主于 `system_server` 的 `ITelecomService`，**`/dev/binder` 手写 ioctl 只是重新实现这一调用且毫无崩溃免疫**——"无 SIM/锁屏/无 UI 也能通 110/112"由 modem/RIL 在网络层路由保证；OS 完全卡死属 OEM 硬件（独立供电域）。见 `android.rs` 模块头文档。
+- 验证：`cargo test -p amos-telephony --lib` **68 通过** + `tests/telephony_rpc_e2e.rs` **2 通过**；`cargo clippy -p amos-telephony --all-targets -- -D warnings` 干净；`cargo check --features android` + `cargo clippy --features android -D warnings` 通过；`cargo check -p amos-ai` 通过。
+
 ### 验收
-- `cargo test -p amos-telephony --lib`：**51 通过**；`cargo clippy -p amos-telephony --all-targets -D warnings`：干净。
+- `cargo test -p amos-telephony --lib`：**68 通过**；`cargo test -p amos-telephony`（含 `telephony_rpc_e2e.rs`）：**2 e2e 通过**；`cargo clippy -p amos-telephony --all-targets -D warnings`：干净；`cargo check --features android` + `cargo clippy --features android -D warnings`：通过。
 - 前端：`bun test` 目标文件通过、`tsc --noEmit` 通过（全量 `bun test` 在本机环境存在个别文件空转，非本轮改动引入）。
 
 

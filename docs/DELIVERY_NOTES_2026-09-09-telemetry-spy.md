@@ -91,11 +91,48 @@ clippy -D warnings / fmt clean on the touched crates.
 
 ## 4. 已知限制 / 遗留（诚实）
 
-1. **真实 pnet 抓网卡 producer**（rooted/AmOS-AOSP + `audit` feature）打开 `rmnet_data0` 并
-   对每帧命中调 `TelemetrySpySvc::ingest_match` —— 是唯一“设备才能验证”的动作；接线草图在
-   `docs/telemetry-spy.md`，逐字段映射已 host 单测。
+1. ~~**真实 pnet 抓网卡 producer** 仅剩设备/AOSP 接线~~ → **已补全（2026-09-09）**：daemon 侧
+   producer 已落地为 `amos-ai::telemetry_spy_capture`（feature `telemetry-spy-audit`），
+   `serve()` 持共享 `TelemetrySpySvc` 并在编译期启用该 feature 时按环境变量启动；见下方 §5。
+   仍需真机验收的只剩「打开 raw datalink 的 root/AmOS-AOSP 通道」本身。
 2. 默认 host 构建无 producer → `Watch` 静默，**绝不产生伪造 hit**（no-fake-success）。
 3. `SimulateHit` 注入 RPC 需进程显式设 `AMOS_SPY_ALLOW_INJECT=1`，生产 boot 默认只读。
-4. 前端 `spyNotif` 用中性英文文案（未补 en/zh i18n key / 专门设置页入口），纯可选打磨。
+4. ~~前端 `spyNotif` 中性英文 / 无设置页入口~~ → **已补（2026-09-09）**：en/zh i18n key +
+   「设置 → 隐私与安全性 → 外发泄漏审计」入口页；命中通知文案随当前语言本地化。
 5. 抓包只见 AP/App 数据面、明文启发式低置信、per-frame 无 TCP 重组 / IP 分片重组——
    均为文档声明的边界。
+
+---
+
+## 5. 跟进增量（2026-09-09，工作树内，尚未提交）
+
+### A. daemon 侧真实 capture producer（打通 NIC → Watch）
+- `crates/amos-ai/src/telemetry_spy_capture.rs`（feature `telemetry-spy-audit` = `telemetry-spy`
+  + `amos-telemetry-spy/audit`）：解析环境（`AMOS_SPY_IFACE` / `AMOS_SPY_LAYER3` /
+  `AMOS_SPY_IDS`，`kind=value` 逗号分隔），`spawn_stream` 开网卡并 `tokio::spawn` 逐帧调
+  `ingest_match`。诚实门：接口未设或标识为空**拒绝启动并记录日志**（绝不空扫/伪造）。
+- `server.rs` `serve()`：预先构造**共享** `TelemetrySpySvc`（`#[derive(Clone)]` 共用 broadcast），
+  用 `telemetry_spy_service::server_for` 挂载；feature 下经 `spawn_configured` 启动 producer，
+  关停时 `stop_request` + abort。
+- 验证：默认 + `--features telemetry-spy-audit` 的 `cargo check`/`clippy -D warnings`/`fmt --check`
+  干净；`cargo test -p amos-ai --features telemetry-spy-audit --lib telemetry_spy_` → **11 passed**
+  （含 5 个 producer 解析/拒绝单测 + 既有 ingest_match e2e seam）。`cargo check -p
+  amos-telemetry-spy --features audit` 干净。
+
+### B. 前端本地化 + 设置入口（顺带补全，见上一步交付）
+- `frontend-ts/lib/telemetrySpy.ts`：`spyNotif`/`recordSpyHit` 增可选 `fmt` 翻译器，命中通知随
+  语言本地化且仍**不回显标识明文**；新增 `kindKey`/`confidenceKey`。
+- `App.tsx`：向 `recordSpyHit(hit, t)` 传入实时 `t`。
+- i18n `zh.ts`/`en.ts`：新增 `settings.spy` + `spy.*` 键（MessageKey 强制 en 全量对齐）。
+- 新增 `svelte/settings/TelemetrySpyPage.svelte` + `SettingsApp.svelte` 注册
+  「外发泄漏审计 / Outbound Leak Audit」子页（隐私与安全性组，含 Quiet/Watching 状态行与诚实边界）。
+- 验证：`telemetrySpy.test.ts` 9 pass；`tsc --noEmit` / `svelte-check` / `bun-iso test` 全绿。
+
+### 建议提交（按仓库风格）
+```text
+feat(telemetry-spy): daemon capture producer (feature telemetry-spy-audit) + frontend i18n/settings entry
+```
+涉及文件：`crates/amos-ai/{Cargo.toml,src/lib.rs,src/server.rs,src/telemetry_spy_service.rs,
+src/telemetry_spy_capture.rs}`、`frontend-ts/…{telemetrySpy.ts,App.tsx,i18n/locales/{zh,en}.ts,
+SettingsApp.svelte,settings/TelemetrySpyPage.svelte,telemetrySpy.test.ts}`、`docs/telemetry-spy.md`、
+`docs/DELIVERY_NOTES_2026-09-09-telemetry-spy.md`。

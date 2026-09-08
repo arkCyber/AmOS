@@ -22,6 +22,11 @@ pub mod buttons;
 pub mod clipboard;
 #[cfg(feature = "android")]
 pub mod clipboard_glue;
+/// Host-side guest-container clipboard transport (Waydroid / no-UI base). Host
+/// half of the global-clipboard sync seam: framed protocol + a `ClipboardNative`
+/// sink + an ingest loop, transport-agnostic over an injectable byte channel.
+/// Inert (not auto-wired) until a real guest channel is attached on-device.
+pub mod clipboard_guest;
 pub mod daemon;
 pub mod display;
 pub mod flashlight;
@@ -39,6 +44,7 @@ pub mod sensors;
 pub mod store;
 pub mod system;
 pub mod taskmgr;
+pub mod telemetry_spy;
 pub mod telephony;
 pub mod terminal;
 pub mod translate;
@@ -254,6 +260,11 @@ pub fn run() {
             // so the shell can tear down / refresh a `legacy` surface when its
             // Android app is reclaimed/destroyed (reconnects if the daemon starts).
             android_lmk::spawn_lmk_watch(app.handle().clone());
+            // Forward the daemon `TelemetrySpyService.Watch` stream (high-severity
+            // egress audit hits) to the WebView as `telemetry-spy-hit` so the shell
+            // can surface an exfiltration warning live (reconnects if the daemon
+            // starts; quiet until a real `audit`-feature capture producer is wired).
+            telemetry_spy::spawn_telemetry_spy_watch(app.handle().clone());
             // On device, arm the torch device-seam UI pusher so OS-driven torch
             // changes (TorchCallback) reach the System UI live via the shared
             // store's `store-updated` event (status bar + open control-center).

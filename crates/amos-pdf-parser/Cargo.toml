@@ -1,0 +1,30 @@
+[package]
+name = "amos-pdf-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AmOS offline RAG data-extraction pipeline: squeezes the text (and best-effort layout/table structure) out of a PDF so a local 7B model can read it. Pure-Rust on lopdf (compiles for host + Android); a domain core (extract -> lines -> chunks) with honest, documented limits. Design: docs/offline-rag-pdf.md."
+
+[lib]
+name = "amos_pdf_parser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amos-pdf-parser"
+path = "src/main.rs"
+
+[dependencies]
+# PDF structure + content-stream decode. `nom_parser` is what gates lopdf's
+# `Document::extract_text`/`Content::decode` (its own high-level text layer that
+# honours per-font encodings, incl. ToUnicode). We drop the default `rayon`/
+# `chrono_time` extras so the crate stays lean and Android-cross-compilable; the
+# text path needs none of them.
+lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
+serde.workspace = true
+serde_json = "1.0"
+
+[dev-dependencies]
+# Integration tests build a real (in-memory) PDF through lopdf's writer, so they
+# need the same crate plus the (lean) features the library enables.
+lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }

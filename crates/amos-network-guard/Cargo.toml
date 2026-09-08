@@ -1,0 +1,27 @@
+[package]
+name = "amos-network-guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos egress data-plane firewall domain core: pure policy model + NetworkGuard seam + deterministic Mock, with feature-gated rootless (vpn) and AOSP/rooted (nftables) placeholders. Default build is pure std so host/CI gates stay green. Design: docs/anti-telemetry-egress-guard.md."
+
+[lib]
+name = "amos_network_guard"
+path = "src/lib.rs"
+
+# Deliberately no default dependencies: the domain core, seam and Mock are pure
+# std and host-testable. Real backends (VpnService on rootless devices,
+# nftables in an AOSP/rooted build) are feature-gated so `make test`/`make lint`
+# never pull native system deps — mirroring amos-monitor / amos-telephony.
+[dependencies]
+
+[features]
+default = []
+# Rootless Android path (Android VpnService) — reserved; wiring lands on-device
+# with a real Context (see src/vpn.rs). `cargo check --features vpn` validates
+# it compiles; it is NOT proof the device gate works.
+vpn = []
+# AOSP / rooted path — reserved for the system-component build (see src/nftables.rs).
+# Same rule: compiling != device-validated.
+nftables = []

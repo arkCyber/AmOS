@@ -31,6 +31,12 @@ use tonic::{Request, Response, Status};
 const CHANNEL_CAP: usize = 256;
 
 /// The tonic `TelemetrySpyService` implementation wrapping the broadcast fan-out.
+///
+/// `Clone` shares the same hit bus: the System UI's `Watch` subscribers and (on a
+/// device, `telemetry-spy-audit`) the pnet capture producer each hold a clone of
+/// the same service, so a real NIC hit reaches every `Watch` stream. Cloning is
+/// cheap — it only clones the `broadcast::Sender` and an `Arc` counter.
+#[derive(Clone)]
 pub struct TelemetrySpySvc {
     tx: broadcast::Sender<EgressHit>,
     /// Total hits emitted since start (for observability / tests).
@@ -110,7 +116,7 @@ impl TelemetrySpyService for TelemetrySpySvc {
 
 /// Parse an opt-in injection env flag (`AMOS_SPY_ALLOW_INJECT`). Only `"1"` or
 /// `"true"` enables it; anything else (including unset) keeps the bus read-only.
-fn injection_env_allowed() -> bool {
+pub(crate) fn injection_env_allowed() -> bool {
     matches!(
         std::env::var("AMOS_SPY_ALLOW_INJECT").as_deref(),
         Ok("1") | Ok("true")
@@ -121,6 +127,13 @@ fn injection_env_allowed() -> bool {
 /// test/demo injection RPC is off unless `AMOS_SPY_ALLOW_INJECT` is set.
 pub fn server() -> TelemetrySpyServiceServer<TelemetrySpySvc> {
     TelemetrySpyServiceServer::new(TelemetrySpySvc::new_with_inject(injection_env_allowed()))
+}
+
+/// Wrap a **caller-owned** shared service. The daemon's `serve()` uses this so it
+/// keeps a handle on the same bus it mounts — letting a capture producer feed
+/// `ingest_match` while `Watch` subscribers consume the identical broadcast.
+pub fn server_for(svc: TelemetrySpySvc) -> TelemetrySpyServiceServer<TelemetrySpySvc> {
+    TelemetrySpyServiceServer::new(svc)
 }
 
 // ---- Domain feed seam (`telemetry-spy` feature) ----------------------------

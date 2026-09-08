@@ -86,7 +86,42 @@ export function toSpyHit(raw: unknown): SpyHitPayload | null {
   return { ts_ms, iface, src_ip, src_port, dst_ip, dst_port, protocol, hits, payload_bytes, severity, confidence };
 }
 
-/** Human label for an identifier kind (English-safe; i18n may translate later). */
+/**
+ * Shape of the app i18n `t(key, params)` used to localize notification copy at
+ * write-time. The React shell (`useI18n`) and the Svelte `t` both agree on this
+ * `{param}` interpolation contract.
+ */
+export type SpyTranslate = (key: string, params?: Record<string, string | number>) => string;
+
+/** i18n key for an identifier kind (missing from the default English fallback). */
+export function kindKey(kind: string): string {
+  switch (kind) {
+    case "serial":
+      return "spy.kind.serial";
+    case "imei":
+      return "spy.kind.imei";
+    case "cell_id":
+      return "spy.kind.cellId";
+    default:
+      return "spy.kind.unknown";
+  }
+}
+
+/** i18n key for an evidence-confidence grade. */
+export function confidenceKey(level: string): string {
+  switch (level) {
+    case "high":
+      return "spy.conf.high";
+    case "medium":
+      return "spy.conf.medium";
+    case "low":
+      return "spy.conf.low";
+    default:
+      return "spy.conf.unknown";
+  }
+}
+
+/** Human label for an identifier kind (neutral English; used without a translator). */
 export function kindLabel(kind: string): string {
   switch (kind) {
     case "serial":
@@ -108,12 +143,33 @@ export function isHigh(hit: SpyHitPayload): boolean {
 /**
  * Build a durable, **non-sensitive** notification for a hit. Never echoes the
  * actual serial/IMEI/cell-id value — only kind + transport metadata.
+ *
+ * When a `fmt` translator is supplied the copy is localized through the i18n
+ * dictionaries at write-time (matching the shell's current language); without
+ * one the helper falls back to neutral English so pure callers/tests stay
+ * deterministic.
  */
-export function spyNotif(hit: SpyHitPayload, now = Date.now()): Notif {
-  const kinds = hit.hits.map((h) => kindLabel(h.kind)).join(", ");
+export function spyNotif(hit: SpyHitPayload, now = Date.now(), fmt?: SpyTranslate): Notif {
+  const kinds = hit.hits.map((h) => (fmt ? fmt(kindKey(h.kind)) : kindLabel(h.kind))).join(", ");
   const dst = hit.dst_port != null ? `${hit.dst_ip}:${hit.dst_port}` : hit.dst_ip;
+  const id = `spy:${hit.ts_ms}:${hit.iface}:${hit.hits.map((h) => h.kind).join("+")}`;
+  if (fmt) {
+    return {
+      id,
+      app: fmt("spy.app"),
+      icon: "🛰️",
+      title: fmt("spy.notif.title", { kinds }),
+      body: fmt("spy.notif.body", {
+        protocol: hit.protocol,
+        dst,
+        iface: hit.iface,
+        confidence: fmt(confidenceKey(hit.confidence)),
+      }),
+      time: now,
+    };
+  }
   return {
-    id: `spy:${hit.ts_ms}:${hit.iface}:${hit.hits.map((h) => h.kind).join("+")}`,
+    id,
     app: "Telemetry spy",
     icon: "🛰️",
     title: `Outbound leak risk: ${kinds}`,
@@ -126,9 +182,9 @@ export function spyNotif(hit: SpyHitPayload, now = Date.now()): Notif {
  * Persist a hit into the shared notification store so the Notification Center /
  * banner can show it (newest-first, capped). Best-effort: never throws.
  */
-export function recordSpyHit(hit: SpyHitPayload): void {
+export function recordSpyHit(hit: SpyHitPayload, fmt?: SpyTranslate): void {
   const list = readStoreValue<Notif[]>(NOTIF_KEY, []);
-  writeStoreValue(NOTIF_KEY, addNotif(list, spyNotif(hit)));
+  writeStoreValue(NOTIF_KEY, addNotif(list, spyNotif(hit, Date.now(), fmt)));
 }
 
 /**

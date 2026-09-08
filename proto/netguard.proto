@@ -1,0 +1,55 @@
+// AmOS egress "network guard" gRPC contract: lets the System UI arm / disarm the
+// userspace data-plane egress gate and read a small status + audit summary, over
+// the same shared Unix Domain Socket as privacy / governor / ai_agent / sensor.
+//
+// Honest boundaries (docs/anti-telemetry-egress-guard.md):
+//   * This gates and audits the Android **userspace / app data plane** only. It
+//     cannot reach the modem/baseband (a separate processor/trust domain), so
+//     "arm the guard" never claims to block the SoC's own backhaul.
+//   * `StatusReply.enforced` is true ONLY when a real backend (Android VpnService
+//     on a non-rooted device, or nftables in an AOSP/rooted build) is actually
+//     enforcing. On the default host build the backend is the in-process Mock and
+//     `enforced` is false — arming records intent, never a fabricated "blocked".
+syntax = "proto3";
+
+package amos_netguard;
+
+// Arm / disarm the guard (records user intent in the daemon).
+message ToggleRequest {
+  bool enabled = 1;
+}
+
+message ToggleReply {
+  // The post-toggle armed state.
+  bool enabled = 1;
+  // Human-readable confirmation / caveat ("armed; mock backend, not enforced").
+  string message = 2;
+}
+
+message StatusRequest {}
+
+// One top egress domain (by bytes) from the daemon's rolling counter.
+message EgressSample {
+  string domain = 1;
+  uint64 bytes = 2;
+}
+
+message StatusReply {
+  // User intent: is the guard armed?
+  bool enabled = 1;
+  // The enforcement backend in use: "mock" (default host) | "vpn" | "nftables".
+  string backend = 2;
+  // True ONLY when a real backend is actually enforcing on this device.
+  bool enforced = 3;
+  // Number of egress policy rules the guard holds.
+  uint64 policy_rules = 4;
+  // Top domains by bytes in the current audit window (empty when no data).
+  repeated EgressSample top_egress = 5;
+}
+
+service NetGuardService {
+  // Arm or disarm the egress guard.
+  rpc Toggle(ToggleRequest) returns (ToggleReply);
+  // Current armed state + backend + small audit summary.
+  rpc Status(StatusRequest) returns (StatusReply);
+}

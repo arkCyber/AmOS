@@ -48,6 +48,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod android;
 pub mod client;
 pub mod error;
 pub mod host;
@@ -60,6 +61,11 @@ pub mod webinstall;
 #[cfg(feature = "live")]
 pub mod http;
 
+pub use android::{
+    ffi, ApiLevel, CommitOutcome, InstallMode, InstallRequest, INSTALL_PACKAGES_PERMISSION,
+    PackageInstallerBridge, Posture, Precondition, Privilege, SideloadOnlyBridge, Session,
+    STATUS_PENDING_USER_ACTION,
+};
 pub use client::AppStore;
 pub use error::{Result, StoreError};
 pub use host::{is_valid_app_id, parse_bundle_uri, serve_bundle, ServedBundle, SCHEME};

@@ -1,7 +1,8 @@
 # amos-telemetry-spy · 无感异步审计网卡（passive egress telemetry-spy）
 
 **状态**: 2026-09-09 · host 可测 domain core（纯 `std`，默认零 native 依赖）+ feature 门控
-`audit` 实时抓包 seam。**compiling ≠ 真机已验收**。
+`audit` 实时抓包 seam；daemon 侧真实 producer 已接线（`amos-ai` `telemetry-spy-audit`，见
+下方 §真机 capture producer）。**compiling ≠ 真机已验收**。
 
 ## 它做什么（范围诚实）
 
@@ -90,16 +91,27 @@ cargo run    -p amos-telemetry-spy --example live_spy --features audit -- [iface
 ### daemon 侧 feed seam（`amos-ai` `telemetry-spy` feature，纯 std 可测）
 `amos-ai` 的 `--features telemetry-spy` 会把 `amos-telemetry-spy` 域核心拉进来，并启用
 `EgressMatch → proto EgressHit` 的映射 + `TelemetrySpySvc::ingest_match(&EgressMatch)`。
-单测证明：一个域 `EgressMatch`（含 IMEI 命中）经 `ingest_match` 即出现在 `Watch` 流。因此
-**真机上只剩一步**：一个 pnet capture 任务每解码+扫描一帧命中就调用 `ingest_match`：
+单测证明：一个域 `EgressMatch`（含 IMEI 命中）经 `ingest_match` 即出现在 `Watch` 流。
 
-```rust,ignore
-// on-device producer sketch (needs amos-telemetry-spy `audit` + rooted/AmOS-AOSP):
-let cfg = amos_telemetry_spy::capture::CaptureCfg::new("rmnet_data0")?.layer3_ipv4();
-let ids = device_identity.identifiers();           // serial / IMEI / cell ID
-let mut rx = amos_telemetry_spy::capture::spawn_stream(cfg, stop, ids)?;
-while let Some(m) = rx.recv().await { spy_svc.ingest_match(&m); } // -> Watch -> Tauri -> UI
+### 真机 capture producer 已接线（`amos-ai` `telemetry-spy-audit` feature，2026-09-09）
+`serve()` 现在持有一个**共享** `TelemetrySpySvc`（mount 与 producer 各持一个 clone，共用同一
+broadcast），并在编译期启用 `--features telemetry-spy-audit` 时，按环境变量启动真实 pnet
+producer（`amos-ai::telemetry_spy_capture`）：
+
+```bash
+# device/AOSP build（需要 raw-socket 特权；missing iface / 无特权会显式失败）
+cargo run -p amos-ai --features telemetry-spy-audit
+# env（运行时配置，全部只读审计）:
+#   AMOS_SPY_IFACE=rmnet_data0      # 必须：要监听的接口
+#   AMOS_SPY_IDS=imei=<IMEI>,serial=<SN>,cell_id=<cellid>   # 必须非空：观察的标识
+#   AMOS_SPY_LAYER3=1               # 可选：rmnet 类 L3 接口用 IPv4 网络层抓包
+#   AMOS_SPY_ALLOW_INJECT=1         # 可选：仅测试/demo 注入用
 ```
+
+producer 每解码+扫描一帧命中即调 `ingest_match` → `Watch` → Tauri → UI。**诚实门**：
+接口未设、或 `AMOS_SPY_IDS` 为空都**拒绝启动并记录日志**（绝不空扫/伪造命中）；默认构建不编
+译该模块（pnet/原生依赖不进 `make test`/CI）。打开 raw datalink 仍是 rooted/AmOS-AOSP
+bring-up 步骤 —— **compiling ≠ 真机已验收**。
 
 ### 测试注入门控（`AMOS_SPY_ALLOW_INJECT`）
 `proto/telemetry_spy.proto` 的 `SimulateHit` 是 test/demo RPC：daemon 仅当进程显式设

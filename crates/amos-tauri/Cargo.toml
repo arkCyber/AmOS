@@ -33,6 +33,10 @@ amos-display.workspace = true
 # seam backs the local `media_*` commands (Mock on host; Android MediaStore on-device
 # later). See docs/android-storage-unify.md + docs/media.md.
 amos-media = { path = "../amos-media" }
+# Shared host<->guest clipboard-sync protocol + ClipboardProvider seam + guest
+# agent core (single source of truth for the wire contract). The host transport
+# (src/clipboard_guest.rs) re-exports crate::amos_clipboard::proto from here.
+amos-clipboard = { path = "../amos-clipboard" }
 async-trait = "0.1"
 # amos-sensor: device-sensor domain core — the System UI's own sensor read side
 # (LiveSensorProvider stream bus + SensorManager energy policy) backs the local

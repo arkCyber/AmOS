@@ -11,15 +11,17 @@
 //!     Some, only those command binaries may run (fail-closed default).
 //!
 //! WIRING (bring-up, with the `terminal-pty` feature on a device):
-//!   1. crates/amos-tauri/Cargo.toml
-//!        [features]
-//!        terminal-pty = ["dep:portable-pty"]
-//!        [dependencies]
-//!        portable-pty = { version = "0.8", optional = true }
-//!   2. crates/amos-tauri/src/lib.rs:  #[cfg(feature = "terminal-pty")]
-//!                                    pub mod terminal;
-//!   3. In generate_handler![] add: term_spawn, term_write, term_read,
-//!      term_kill, term_resize.
+//! ```text
+//! 1. crates/amos-tauri/Cargo.toml
+//!      [features]
+//!      terminal-pty = ["dep:portable-pty"]
+//!      [dependencies]
+//!      portable-pty = { version = "0.8", optional = true }
+//! 2. crates/amos-tauri/src/lib.rs:  #[cfg(feature = "terminal-pty")]
+//!                                  pub mod terminal;
+//! 3. In generate_handler![] add: term_spawn, term_write, term_read,
+//!    term_kill, term_resize.
+//! ```
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -27,13 +29,13 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 
 #[cfg(feature = "terminal-pty")]
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+#[cfg(feature = "terminal-pty")]
 use std::io::{Read, Write};
 #[cfg(feature = "terminal-pty")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "terminal-pty")]
 use std::sync::Arc;
-#[cfg(feature = "terminal-pty")]
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 /// Uniform result envelope for every terminal bridge call.
 #[derive(Debug, Clone, Serialize)]
@@ -49,11 +51,21 @@ pub struct TermOut {
 }
 
 fn ok(id: u64, output: Option<String>, running: bool) -> TermOut {
-    TermOut { id, output, error: String::new(), running }
+    TermOut {
+        id,
+        output,
+        error: String::new(),
+        running,
+    }
 }
 
 fn err(e: impl Into<String>) -> TermOut {
-    TermOut { id: 0, output: None, error: e.into(), running: false }
+    TermOut {
+        id: 0,
+        output: None,
+        error: e.into(),
+        running: false,
+    }
 }
 
 /// A live terminal session.
@@ -85,10 +97,25 @@ fn registry() -> &'static Mutex<HashMap<u64, Session>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the session registry without panicking on a poisoned mutex (P0-1).
+///
+/// Poisoning is unreachable in practice — no code panics while holding the lock —
+/// but `unwrap` is forbidden in production. Recovery via `into_inner` keeps the
+/// registry usable (and, because this crate never panics under the lock, the
+/// recovered state is always consistent).
+fn registry_guard() -> std::sync::MutexGuard<'static, HashMap<u64, Session>> {
+    registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[allow(dead_code)] // used only when spawning a real PTY under `terminal-pty`
 fn next_id() -> u64 {
     static NEXT: OnceLock<Mutex<u64>> = OnceLock::new();
-    let mut n = NEXT.get_or_init(|| Mutex::new(1)).lock().unwrap();
+    let mut n = NEXT
+        .get_or_init(|| Mutex::new(1))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let id = *n;
     *n += 1;
     id
@@ -106,10 +133,7 @@ fn pty_enabled() -> bool {
 /// * `cwd` — working directory the shell starts in (defaults to a safe value).
 /// * `allowlist` — if `Some`, only these command binaries may run (fail closed).
 #[tauri::command]
-pub async fn term_spawn(
-    cwd: Option<String>,
-    allowlist: Option<Vec<String>>,
-) -> TermOut {
+pub async fn term_spawn(cwd: Option<String>, allowlist: Option<Vec<String>>) -> TermOut {
     if !pty_enabled() {
         return err("terminal: PTY shell is not enabled in this build (feature `terminal-pty`)");
     }
@@ -123,7 +147,12 @@ pub async fn term_spawn(
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut cmd = CommandBuilder::new(shell);
         cmd.cwd(&dir);
-        let size = PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 };
+        let size = PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
         let pair = match native_pty_system().openpty(size) {
             Ok(p) => p,
             Err(e) => return err(format!("terminal: openpty: {e}")),
@@ -151,7 +180,10 @@ pub async fn term_spawn(
             loop {
                 match reader.read(&mut tmp) {
                     Ok(0) => break,
-                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                    Ok(n) => {
+                        let mut buf = buf2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
                     Err(_) => break,
                 }
             }
@@ -166,11 +198,15 @@ pub async fn term_spawn(
             alive,
             reader_thread,
         };
-        registry()
-            .lock()
-            .unwrap()
-            .insert(id, Session { cwd: dir, allowlist, pty: Some(live) });
-        return ok(id, None, true);
+        registry_guard().insert(
+            id,
+            Session {
+                cwd: dir,
+                allowlist,
+                pty: Some(live),
+            },
+        );
+        ok(id, None, true)
     }
     #[cfg(not(feature = "terminal-pty"))]
     {
@@ -183,7 +219,7 @@ pub async fn term_spawn(
 pub async fn term_write(session: u64, data: String) -> TermOut {
     #[cfg(feature = "terminal-pty")]
     {
-        let mut guard = registry().lock().unwrap();
+        let mut guard = registry_guard();
         let live = guard.get_mut(&session).and_then(|s| s.pty.as_mut());
         let Some(live) = live else {
             drop(guard);
@@ -192,10 +228,10 @@ pub async fn term_write(session: u64, data: String) -> TermOut {
         // echo is handled by the pty itself, so we only forward the raw bytes.
         let res = live.writer.write_all(data.as_bytes());
         drop(guard);
-        return match res {
+        match res {
             Ok(_) => ok(session, None, true),
             Err(e) => err(format!("terminal: write: {e}")),
-        };
+        }
     }
     #[cfg(not(feature = "terminal-pty"))]
     {
@@ -209,13 +245,13 @@ pub async fn term_write(session: u64, data: String) -> TermOut {
 pub async fn term_read(session: u64, max: Option<usize>) -> TermOut {
     #[cfg(feature = "terminal-pty")]
     {
-        let mut guard = registry().lock().unwrap();
+        let mut guard = registry_guard();
         let live = guard.get_mut(&session).and_then(|s| s.pty.as_mut());
         let Some(live) = live else {
             drop(guard);
             return err("terminal: unknown or ended session");
         };
-        let mut bytes = std::mem::take(&mut *live.buf.lock().unwrap());
+        let mut bytes = std::mem::take(&mut *live.buf.lock().unwrap_or_else(|p| p.into_inner()));
         if let Some(cap) = max {
             if bytes.len() > cap {
                 bytes.truncate(cap);
@@ -224,7 +260,11 @@ pub async fn term_read(session: u64, max: Option<usize>) -> TermOut {
         let running = live.alive.load(Ordering::Relaxed);
         drop(guard);
         let out = String::from_utf8_lossy(&bytes).to_string();
-        return ok(session, if out.is_empty() { None } else { Some(out) }, running);
+        ok(
+            session,
+            if out.is_empty() { None } else { Some(out) },
+            running,
+        )
     }
     #[cfg(not(feature = "terminal-pty"))]
     {
@@ -236,7 +276,7 @@ pub async fn term_read(session: u64, max: Option<usize>) -> TermOut {
 /// Terminate a session and reap its child (no orphans).
 #[tauri::command]
 pub async fn term_kill(session: u64) -> TermOut {
-    let mut guard = registry().lock().unwrap();
+    let mut guard = registry_guard();
     let removed = guard.remove(&session);
     drop(guard);
     match removed {
@@ -262,13 +302,18 @@ pub async fn term_resize(session: u64, cols: u16, rows: u16) -> TermOut {
     }
     #[cfg(feature = "terminal-pty")]
     {
-        let mut guard = registry().lock().unwrap();
+        let mut guard = registry_guard();
         let live = guard.get_mut(&session).and_then(|s| s.pty.as_mut());
         let Some(live) = live else {
             drop(guard);
             return err("terminal: unknown or ended session");
         };
-        let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
         let res = live.master.resize(size);
         drop(guard);
         match res {
@@ -292,7 +337,6 @@ pub fn allowed(allowlist: Option<&[String]>, bin: &str) -> bool {
         Some(list) => list.iter().any(|a| a == bin),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -352,4 +396,3 @@ mod tests {
         assert!(got.contains("PTY_OK"), "echo never returned: {got:?}");
     }
 }
-

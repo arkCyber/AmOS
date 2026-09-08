@@ -28,10 +28,14 @@ members = [
     "crates/amos-applife",
     "crates/amos-scheduler",
     "crates/amos-monitor",
+    "crates/amos-network-guard",
+    "crates/amos-telemetry-spy",
     "crates/amos-media",
+    "crates/amos-clipboard",
     "crates/amos-display",
     "crates/amos-web3",
     "crates/amos-identity",
+    "crates/amos-pdf-parser",
 ]
 
 [workspace.package]
@@ -57,6 +61,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tauri = "2"
 tauri-build = "2"
+pnet = "0.35"
 
 # ---- local workspace crates ----
 amos-proto = { path = "crates/amos-proto" }
@@ -72,8 +77,11 @@ amos-power = { path = "crates/amos-power" }
 amos-applife = { path = "crates/amos-applife" }
 amos-scheduler = { path = "crates/amos-scheduler" }
 amos-monitor = { path = "crates/amos-monitor" }
+amos-network-guard = { path = "crates/amos-network-guard" }
+amos-telemetry-spy = { path = "crates/amos-telemetry-spy" }
 amos-display = { path = "crates/amos-display" }
 amos-media = { path = "crates/amos-media" }
+amos-clipboard = { path = "crates/amos-clipboard" }
 amos-web3 = { path = "crates/amos-web3" }
 amos-identity = { path = "crates/amos-identity" }
 

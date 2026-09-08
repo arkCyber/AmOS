@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
+  confidenceKey,
   isHigh,
+  kindKey,
   kindLabel,
   SPY_HIT_EVENT,
   spyNotif,
   toSpyHit,
   type SpyHitPayload,
 } from "../lib/telemetrySpy";
+import { translate } from "../i18n";
+import { zh } from "../i18n/locales/zh";
+import { en } from "../i18n/locales/en";
 
 const HIT: SpyHitPayload = {
   ts_ms: 123,
@@ -75,5 +80,30 @@ describe("telemetry-spy egress audit bridge (pure helpers)", () => {
     const a = spyNotif({ ...HIT, ts_ms: 1 }, 1);
     const b = spyNotif({ ...HIT, ts_ms: 2 }, 2);
     expect(a.id).not.toBe(b.id);
+  });
+
+  test("kindKey/confidenceKey map to the i18n key surface", () => {
+    expect(kindKey("imei")).toBe("spy.kind.imei");
+    expect(kindKey("cell_id")).toBe("spy.kind.cellId");
+    expect(kindKey("serial")).toBe("spy.kind.serial");
+    expect(kindKey("bogus")).toBe("spy.kind.unknown");
+    expect(confidenceKey("high")).toBe("spy.conf.high");
+    expect(confidenceKey("bogus")).toBe("spy.conf.unknown");
+  });
+
+  test("spyNotif localizes copy via a translator without echoing the value", () => {
+    const tOf = (dict: typeof zh) => (k: string, p?: Record<string, string | number>) =>
+      translate(dict, k, p);
+    const nZh = spyNotif(HIT, 999, tOf(zh));
+    expect(nZh.app).toBe("外发泄漏审计");
+    expect(nZh.title).toContain("外发泄漏风险");
+    expect(nZh.title).toContain("IMEI");
+    const nEn = spyNotif(HIT, 999, tOf(en));
+    expect(nEn.app).toBe("Telemetry Spy");
+    expect(nEn.title).toBe("Outbound leak risk: IMEI");
+    expect(nEn.body).toContain("evidence confidence: high");
+    // Even localized, the notification never carries the identifier's numeric value.
+    expect(JSON.stringify(nZh)).not.toContain("490154203237518");
+    expect(JSON.stringify(nEn)).not.toContain("490154203237518");
   });
 });

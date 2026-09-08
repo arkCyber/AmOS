@@ -4,25 +4,45 @@
 //! process holding the app `Context` + **`ROLE_DIALER`** — i.e. the **System UI
 //! (Tauri core) APK**, not the headless `amos-ai` daemon (see `docs/telephony.md`
 //! §2 host-process note & §12 #1). This module is that host: it takes a `JavaVM`
-//! plus a global ref to the app `Context` and dials via the well-trodden
-//! `Intent(ACTION_CALL, tel:…)` path — the documented fallback in `docs/telephony.md
-//! §5`.
+//! plus a global ref to the app `Context` and drives the call through
+//! **`TelecomManager#placeCall`** — the privileged Binder transaction to the
+//! framework's `ITelecomService` (which `TelecomManager` is a thin Java wrapper
+//! over).
 //!
-//! Status — **honest on-device skeleton**, mirroring `amos-radio`'s `android.rs`:
-//! * `dial`/`emergency_call` place a real call intent and return a provider call id.
-//!   On-device this should migrate to `TelecomManager#placeCall` (the modern
-//!   `ROLE_DIALER` path); `ACTION_CALL` is the conservative fallback that also works
-//!   for emergency numbers.
+//! # Why `placeCall`, not a hand-rolled `/dev/binder` client
+//!
+//! `TelecomManager#placeCall` **is** the Binder path to Telecom: its counterpart
+//! `com.android.internal.telecom.ITelecomService` runs inside **`system_server`**.
+//! A raw Rust `ioctl` on `/dev/binder` would only re-implement the exact
+//! marshalling this one JNI call already does — and would gain **no** crash
+//! immunity, because a dead `system_server` means a dead Telecom service either
+//! way. The real "110/112 even with no SIM / locked / UI dead" guarantee comes from
+//! the **modem / RIL** routing emergency numbers at the network layer, not from
+//! which process talks to Telecom; a fully-wedged OS is OEM hardware (separate
+//! power domain), out of scope for an app crate. `placeCall` is chosen over an
+//! `ACTION_CALL` broadcast because it is the modern *`ROLE_DIALER`* entry point
+//! that yields explicit in-call state and lets a future `InCallService` bridge
+//! drive answer/end/recording through Telecom.
+//!
+//! # Status — **honest on-device skeleton** (mirrors `amos-radio`'s `android.rs`)
+//!
+//! * `dial`/`emergency_call` place a real call and return a provider call id.
+//! * Every dial is routed through [`crate::route`] against an [`EmergencyMap`]: the
+//!   ordinary provider **refuses** a recognized emergency code and the emergency
+//!   provider **refuses** an ordinary number — the same hard separation the
+//!   domain/`Mock` enforces — so 110/112 can never fall onto the SIM path.
 //! * `answer`/`end`/recording and live `status` are **not** wired yet: real in-call
-//!   control requires an `InCallService`/`TelephonyCallback` bridge and a call-state
-//!   broadcast, which is device-validated P3 work (they return an explicit
-//!   `Provider` error rather than pretending).
+//!   control requires an `InCallService`/`TelephonyCallback` bridge + a call-state
+//!   broadcast (device-validated P3; they return an explicit `Provider` error).
 //! * `subscribe` returns a live receiver wired to an in-call event registry (empty
 //!   until the device callback lands).
 //!
 //! Runtime requires a real Android VM (`jni::JavaVM`) + a `GlobalRef` to the app
-//! `Context`. Not runnable on the desktop host; `cargo check --features android`
-//! keeps it compiling.
+//! `Context`, and the caller package must be the default dialer (or hold
+//! `CALL_PRIVILEGED` / a platform signature) or Telecom rejects the transaction.
+//! Not runnable on the desktop host; `cargo check --features android` keeps it
+//! compiling, and the pure routing/enforcement logic is unit-tested headlessly in
+//! `crate::route`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,17 +53,16 @@ use jni::{JNIEnv, JavaVM};
 use tokio::sync::mpsc;
 
 use crate::error::{Result, TelephonyError};
-use crate::number::Number;
+use crate::number::{EmergencyMap, Number};
 use crate::provider::{EmergencyTelephonyProvider, ProviderEvent, TelephonyProvider};
+use crate::route::{guard_emergency, guard_regular};
 use crate::session::{Call, CallId};
 
-/// `android.content.Intent.ACTION_CALL` (dial fallback; also reaches emergency codes).
-const ACTION_CALL: &str = "android.intent.action.CALL";
-/// `Intent.FLAG_ACTIVITY_NEW_TASK` (no Activity here to host the call dialog).
-const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+/// `Context.getSystemService` key for the Telecom manager.
+const TELECOM_SERVICE: &str = "telecom";
 const TEL_SCHEME: &str = "tel:";
 
-/// `Send + Sync` handle to the Java app `Context` used to fire dial intents.
+/// `Send + Sync` handle to the Java app `Context` used to reach system services.
 ///
 /// A JNI **global** reference is process-wide and safe to use from any thread as long
 /// as each use attaches that thread to the VM first — same pattern as `amos-radio`.
@@ -82,71 +101,69 @@ impl EventBus {
     }
 }
 
-/// Fire an `ACTION_CALL` intent for `number` from the app `Context`.
+/// `context.getSystemService(Context.TELECOM_SERVICE)` → the `TelecomManager`.
 ///
-/// TODO(on-device, P3): migrate to `TelecomManager#placeCall` so the System UI, as
-/// `ROLE_DIALER`, drives the call through Telecom (better in-call control + explicit
-/// emergency marking) rather than a broadcast intent.
-fn place(env: &mut JNIEnv<'_>, ctx: &JObject<'_>, number: &Number) -> Result<()> {
-    let action = env.new_string(ACTION_CALL).map_err(jerr)?;
-    let intent = env
-        .new_object(
-            "android/content/Intent",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&action)],
-        )
-        .map_err(jerr)?;
-    let tel = env
-        .new_string(format!("{TEL_SCHEME}{}", number.digits()))
-        .map_err(jerr)?;
-    let uri = env
-        .call_static_method(
-            "android/net/Uri",
-            "parse",
-            "(Ljava/lang/String;)Landroid/net/Uri;",
-            &[JValue::Object(&tel)],
+/// The returned object is used by runtime (dynamic) dispatch, so no Java cast is
+/// needed: `TelecomManager#placeCall` resolves on the instance's actual class.
+fn telecom_manager<'e>(env: &mut JNIEnv<'e>, ctx: &JObject<'e>) -> Result<JObject<'e>> {
+    let name = env.new_string(TELECOM_SERVICE).map_err(jerr)?;
+    let svc = env
+        .call_method(
+            ctx,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[JValue::Object(&name)],
         )
         .and_then(|v| v.l())
         .map_err(jerr)?;
-    env.call_method(
-        &intent,
-        "setData",
-        "(Landroid/net/Uri;)Landroid/content/Intent;",
-        &[JValue::Object(&uri)],
+    if svc.is_null() {
+        return Err(TelephonyError::Provider(
+            "TelecomManager unavailable: no telephony service on this device".into(),
+        ));
+    }
+    Ok(svc)
+}
+
+/// `Uri.parse("tel:<digits>")` — the dial address both `placeCall` paths use.
+fn dial_uri<'e>(env: &mut JNIEnv<'e>, number: &Number) -> Result<JObject<'e>> {
+    let tel = env
+        .new_string(format!("{TEL_SCHEME}{}", number.digits()))
+        .map_err(jerr)?;
+    env.call_static_method(
+        "android/net/Uri",
+        "parse",
+        "(Ljava/lang/String;)Landroid/net/Uri;",
+        &[JValue::Object(&tel)],
     )
-    .map_err(jerr)?;
-    env.call_method(
-        &intent,
-        "addFlags",
-        "(I)Landroid/content/Intent;",
-        &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
-    )
-    .map_err(jerr)?;
-    env.call_method(
-        ctx,
-        "startActivity",
-        "(Landroid/content/Intent;)V",
-        &[JValue::Object(&intent)],
-    )
-    .map_err(jerr)?;
-    Ok(())
+    .and_then(|v| v.l())
+    .map_err(jerr)
 }
 
 /// Ordinary (SIM/telecom) call backend. Lives in the System UI process.
 pub struct AndroidTelephonyProvider {
     vm: JavaVM,
     context: AndroidContext,
+    /// Jurisdiction emergency set — held so this backend enforces the same hard
+    /// emergency/regular separation as the domain/`Mock` (see `crate::route`).
+    emergency: EmergencyMap,
     events: Arc<EventBus>,
     seq: AtomicU64,
 }
 
 impl AndroidTelephonyProvider {
-    /// Construct from a `JavaVM` + a global ref to the app `Context`. `env` is only
+    /// Construct from a `JavaVM` + a global ref to the app `Context`, plus the
+    /// [`EmergencyMap`] this backend routes emergency numbers against. `env` is only
     /// used to create the global ref.
-    pub fn new(vm: JavaVM, env: &JNIEnv<'_>, context: JObject<'_>) -> Result<Self> {
+    pub fn new(
+        vm: JavaVM,
+        env: &JNIEnv<'_>,
+        context: JObject<'_>,
+        emergency: EmergencyMap,
+    ) -> Result<Self> {
         Ok(Self {
             vm,
             context: AndroidContext(env.new_global_ref(context).map_err(jerr)?),
+            emergency,
             events: Arc::new(EventBus::new()),
             seq: AtomicU64::new(0),
         })
@@ -165,8 +182,27 @@ impl AndroidTelephonyProvider {
 
     fn dial_impl(&self, number: &Number) -> Result<CallId> {
         let mut env = self.attach()?;
+        // `ctx` and `env` are both borrowed from `&self` here (radio's proven
+        // pattern), so `telecom_manager` can tie them to one lifetime.
         let ctx: &JObject<'_> = self.context.0.as_obj();
-        place(&mut env, ctx, number)?;
+        let tm = telecom_manager(&mut env, ctx)?;
+        let uri = dial_uri(&mut env, number)?;
+        // placeCall(Uri, Bundle) needs an (empty is fine) extras bundle since API 23.
+        let bundle = env
+            .new_object("android/os/Bundle", "()V", &[])
+            .map_err(jerr)?;
+        env.call_method(
+            &tm,
+            "placeCall",
+            "(Landroid/net/Uri;Landroid/os/Bundle;)V",
+            &[JValue::Object(&uri), JValue::Object(&bundle)],
+        )
+        .map_err(|e| {
+            TelephonyError::Provider(format!(
+                "TelecomManager#placeCall rejected the call ({e}); \
+                 is this process the default dialer (ROLE_DIALER)?"
+            ))
+        })?;
         Ok(self.next_id())
     }
 }
@@ -174,6 +210,10 @@ impl AndroidTelephonyProvider {
 #[async_trait]
 impl TelephonyProvider for AndroidTelephonyProvider {
     async fn dial(&self, number: &Number) -> Result<CallId> {
+        // Hard separation: a recognized emergency number can never ride the ordinary
+        // SIM/telecom path (mirrors the domain/`Mock`, enforced before any Binder
+        // transaction). A caller must use the emergency provider for 110/112.
+        guard_regular(&self.emergency, number)?;
         self.dial_impl(number)
     }
 
@@ -221,9 +261,14 @@ pub struct AndroidEmergencyTelephonyProvider {
 }
 
 impl AndroidEmergencyTelephonyProvider {
-    pub fn new(vm: JavaVM, env: &JNIEnv<'_>, context: JObject<'_>) -> Result<Self> {
+    pub fn new(
+        vm: JavaVM,
+        env: &JNIEnv<'_>,
+        context: JObject<'_>,
+        emergency: EmergencyMap,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: AndroidTelephonyProvider::new(vm, env, context)?,
+            inner: AndroidTelephonyProvider::new(vm, env, context, emergency)?,
         })
     }
 }
@@ -231,9 +276,10 @@ impl AndroidEmergencyTelephonyProvider {
 #[async_trait]
 impl EmergencyTelephonyProvider for AndroidEmergencyTelephonyProvider {
     async fn emergency_call(&self, number: Number) -> Result<CallId> {
-        // Intent-dial the emergency code. The platform guarantees the network lets it
-        // through (no SIM / locked / no-UI) — that guarantee is the framework's, not
-        // ours (see docs/telephony.md §12 #2).
+        // Only a recognized emergency code may use the privileged path — an ordinary
+        // number is refused rather than silently placed where ordinary safeguards
+        // (rate-limiting, recording policy) are bypassed.
+        guard_emergency(&self.inner.emergency, &number)?;
         self.inner.dial_impl(&number)
     }
 }

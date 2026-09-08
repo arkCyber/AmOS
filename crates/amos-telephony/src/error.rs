@@ -15,6 +15,13 @@ pub enum TelephonyError {
     #[error("{0:?} is not a recognized emergency number")]
     NotEmergency(String),
 
+    /// A recognized emergency number was dialed through the ordinary (SIM/telecom)
+    /// path. It must be forced onto the privileged emergency path instead — the
+    /// domain-level manifestation of the "emergency never shares the ordinary dial
+    /// path" contract (see `docs/telephony.md` §5).
+    #[error("{0:?} is a recognized emergency number and must use the emergency path")]
+    MustUseEmergencyPath(String),
+
     /// No carrier / SIM is available to place this (regular) call.
     #[error("no carrier/SIM available for this call")]
     NoCarrier,

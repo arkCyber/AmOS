@@ -19,7 +19,9 @@ pub mod energy;
 pub mod governor;
 pub mod governor_service;
 pub mod inference;
+pub mod life_guard;
 pub mod monitoring;
+pub mod netguard_service;
 pub mod privacy;
 pub mod privacy_service;
 pub mod profiler;
@@ -27,6 +29,11 @@ pub mod security;
 pub mod semantic;
 pub mod server;
 pub mod session;
+pub mod telemetry_spy_service;
+// Daemon-side pnet capture producer feeding TelemetrySpySvc::ingest_match. Only
+// compiled under `telemetry-spy-audit` (amos-telemetry-spy `audit` = pnet).
+#[cfg(feature = "telemetry-spy-audit")]
+pub mod telemetry_spy_capture;
 
 use std::path::PathBuf;
 

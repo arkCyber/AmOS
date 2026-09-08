@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-audio-check android-ai-sherpa-check clean honesty-smoke
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-audio-check android-ai-sherpa-check pdf-android-check ci-local clean honesty-smoke deploy doctor
 
 all: build
 
@@ -167,6 +167,31 @@ android-audio-check:
 # protoc + network. No device needed.
 android-ai-sherpa-check:
 	bash scripts/android-ai-sherpa-check.sh
+
+# Cross-compile gate for the offline-RAG PDF data-extraction crate on Android.
+# The crate is pure Rust on lopdf (no C), so this only needs the rustup android
+# target (no NDK linker for a `check`). Run `rustup target add aarch64-linux-android`
+# first if missing. No device needed.
+pdf-android-check:
+	cargo check -p amos-pdf-parser --target aarch64-linux-android
+	cargo test -p amos-pdf-parser
+
+# Local CI-parity gate: shell-syntax + workflow YAML + native-toolchain pin
+# parity + (optional) container build. No push / no CI needed. See
+# scripts/ci-local-gate.sh. Pass --docker to also build the container image.
+ci-local:
+	bash scripts/ci-local-gate.sh
+
+# Unified local deploy/gate entrypoint (deploy.sh). Keeps the local M-series Mac
+# NDK/env/clippy in lockstep with the Ubuntu CI runner and regenerates
+# .cargo/config.toml from the DISCOVERED NDK (no stale hard-coded paths).
+#   make deploy        -> ./deploy.sh help
+#   ./deploy.sh lint / test / android / android-build / docker / ci-local / doctor
+deploy:
+	./deploy.sh
+
+doctor:
+	./deploy.sh doctor
 
 clean:
 	cargo clean

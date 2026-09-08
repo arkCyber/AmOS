@@ -1,0 +1,70 @@
+name: Publish native CI container
+
+# Builds .github/docker/ci-android and pushes the pinned toolchain image to GHCR.
+# Once pushed, opt the native gated jobs in ci.yml into container mode by setting
+# the repository Variable CI_ANDROID_IMAGE (Settings > Secrets and variables >
+# Actions) to the pushed tag, e.g. ghcr.io/<owner>/amos-ci-android:26.1.10909125.
+#
+# Trigger: manual (workflow_dispatch, choose a tag) or on push to main that
+# touches the Dockerfile. PRs cannot push to GHCR (the GITHUB_TOKEN is read-only),
+# so builds from feature branches must be dispatched manually.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (keep aligned with the NDK pin, e.g. 26.1.10909125).'
+        required: false
+        default: 'latest'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/docker/ci-android/**'
+      - '.github/workflows/container-image.yml'
+
+concurrency:
+  group: ci-native-image
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/amos-ci-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ inputs.tag || 'latest' }}
+            type=sha,prefix=sha-
+
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .github/docker/ci-android
+          file: .github/docker/ci-android/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

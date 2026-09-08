@@ -315,6 +315,24 @@ make check         # fast React/TS check (bun test + typecheck)
   drag/jiggle editing, layout persistence, i18n/theme, streaming/ASR/interpret
   reducers and per-app logic, plus graceful degradation outside Tauri.
 
+### CI parity & environment drift (Android NDK / clippy)
+
+To keep a local machine in lockstep with the Ubuntu x86 CI runner (the source of
+the recurring `gated-native-backends` / `android-audio-seams` / `lint-and-test`
+regressions), run the unified local gate instead of ad-hoc `cargo`:
+
+```bash
+make ci-local            # local parity gate: shell + workflow YAML + NDK/cargo-ndk pins
+./deploy.sh lint         # fmt --check + clippy --workspace --all-targets -- -D warnings (== CI)
+./deploy.sh android      # discover NDK, regenerate .cargo/config.toml, run the android seams
+./deploy.sh docker       # build the pinned native-toolchain container image
+```
+
+`deploy.sh` never hard-codes an NDK path — it discovers it and regenerates the
+git-ignored `.cargo/config.toml`, so a stale machine path can't leak into CI.
+Native-gated CI jobs can opt into running inside that pinned container by setting
+the repository Variable `CI_ANDROID_IMAGE`. See `docs/ci-engineering.md`.
+
 ## Recent additions (2026-09-04)
 
 - **Call recording — first-class, contractual (`crates/amos-telephony` + `proto/telephony.proto` + `amos-tauri` + `frontend-ts`)**: per-call `RecordingState{Off,On,Failed}` domain state machine; `TelephonyProvider::start/stop_recording` allow/deny consent seam with a **hard no-record rule for emergency (110/112/911…) lines**; wire `StartRecording`/`StopRecording` RPCs, `CallSnapshot.recording`, Tauri `telephony_start/stop_recording`, and a record toggle + live "正在录音" indicator in `PhoneApp`. `Call`-state recording is broadcast on `Watch`, so every surface stays consistent.
@@ -361,6 +379,8 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) — Community guidelines
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
+- [docs/clipboard-container-sync.md](./docs/clipboard-container-sync.md) — Cross-boundary global-clipboard sync (host↔Waydroid/Android container): two-topology decision + shared framed protocol + host transport + guest-side agent crate + offline link/backoff supervisor (`amos-clipboard`, all implemented/tested); device channel bridge planned
+- [docs/clipboard-device-runbook.md](./docs/clipboard-device-runbook.md) — Connected-phone runbook: detect retail / no-UI-base / Waydroid, `adb push` + run the `amos-clipboard` on-device self-check, and which clipboard layers are really testable per device shape
 - [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility (dev/prototype; product = no-UI Android base)
 - [docs/microg.md](./docs/microg.md) — MicroG in AmOS: self-built AOSP guest + signature spoofing fixed preinstall layer (decision + Phase 0–3 plan; planned, not yet implemented)
 - [docs/microg-implementation-review.md](./docs/microg-implementation-review.md) — MicroG proposal vs review side-by-side (claims → AmOS reality / recommended correction)

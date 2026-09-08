@@ -68,16 +68,17 @@ fn main() {
     let mut best: Option<(u32, PathBuf)> = None;
     if let Ok(hosts) = fs::read_dir(&prebuilt) {
         for h in hosts.filter_map(|e| e.ok()) {
-            let base = h
-                .path()
-                .join("sysroot/usr/lib")
-                .join(platform_dir);
-            let Ok(apis) = fs::read_dir(&base) else { continue };
+            let base = h.path().join("sysroot/usr/lib").join(platform_dir);
+            let Ok(apis) = fs::read_dir(&base) else {
+                continue;
+            };
             for a in apis.filter_map(|e| e.ok()) {
                 let api_dir = a.path();
                 let name = a.file_name();
                 let Some(name) = name.to_str() else { continue };
-                let Ok(api) = name.parse::<u32>() else { continue };
+                let Ok(api) = name.parse::<u32>() else {
+                    continue;
+                };
                 if api >= 26
                     && api_dir.join("libaaudio.so").exists()
                     && best.as_ref().map_or(true, |(b, _)| api > *b)

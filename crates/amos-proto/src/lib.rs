@@ -54,6 +54,25 @@ pub mod amos_privacy {
     tonic::include_proto!("amos_privacy");
 }
 
+pub mod amos_netguard {
+    //! Generated types for the egress network-guard service:
+    //! `net_guard_service_client` (client), `net_guard_service_server` (server),
+    //! and messages (`ToggleRequest`, `StatusReply`, `EgressSample`, ...). Honest
+    //! enforcement caveats live in `proto/netguard.proto` and
+    //! `docs/anti-telemetry-egress-guard.md`.
+    tonic::include_proto!("amos_netguard");
+}
+
+pub mod amos_telemetry_spy {
+    //! Generated types for the passive telemetry-spy service:
+    //! `telemetry_spy_service_client` (client),
+    //! `telemetry_spy_service_server` (server), and messages (`EgressHit`,
+    //! `IdentifierHit`, enums `Confidence`/`IdentifierKind`/`Protocol`). A hit
+    //! is a **low-confidence heuristic** (plaintext substring), never a claimed
+    //! confirmed leak — see `proto/telemetry_spy.proto`.
+    tonic::include_proto!("amos_telemetry_spy");
+}
+
 /// gRPC metadata header carrying the caller's client id.
 ///
 /// The System UI (Tauri core) sends this on every RPC so the daemon's security

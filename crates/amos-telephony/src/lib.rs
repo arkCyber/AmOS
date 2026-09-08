@@ -29,6 +29,7 @@ pub mod error;
 pub mod number;
 pub mod provider;
 pub mod rate;
+pub mod route;
 pub mod session;
 
 pub use audit::{AuditEntry, AuditLog, AuditOutcome};
@@ -37,6 +38,7 @@ pub use number::{EmergencyMap, Number, NumberKind};
 pub use provider::{
     EmergencyTelephonyProvider, MockTelephonyProvider, ProviderEvent, TelephonyProvider,
 };
+pub use route::{guard_emergency, guard_regular, route, DialRoute};
 pub use session::{Call, CallDirection, CallId, CallSession, CallState, EndReason, RecordingState};
 
 // The gRPC `TelephonyService` (see docs/telephony.md §6) exposed over the shared

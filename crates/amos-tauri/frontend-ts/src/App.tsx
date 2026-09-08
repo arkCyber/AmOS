@@ -24,6 +24,7 @@ import { clampAutoOffSec, dueForAutoSleep, setScreenState, AUTOOFF_STORE_KEY, WA
 import { useCallKeepAwake, useScreenHold } from "./lib/keepAwake";
 import { useNotificationAlert } from "./lib/useNotificationAlert";
 import { startLmkSurfaceWatcher, startPeriodicReconcile } from "./lib/lmk";
+import { recordSpyHit, startTelemetrySpyWatcher } from "./lib/telemetrySpy";
 import { startAlarmWatcher } from "./svelte/osAlarmWatcher";
 import { startReminderWatcher } from "./svelte/osReminderWatcher";
 import { startTimerWatcher } from "./svelte/osTimerWatcher";
@@ -553,6 +554,29 @@ function Shell() {
       stopPeriodic();
     };
   }, []);
+
+  // Forward daemon telemetry-spy `Watch` hits (Rust `telemetry-spy-hit` event)
+  // into the shared notification store so the shell surfaces an outbound-leak
+  // risk banner / notification-center entry (daemon → Tauri → store → UI).
+  useEffect(() => {
+    if (!bridged()) return;
+    let alive = true;
+    let unsub: (() => void) | null = null;
+    void (async () => {
+      const stop = await startTelemetrySpyWatcher((hit) => {
+        recordSpyHit(hit, t);
+      });
+      if (!alive) {
+        stop();
+        return;
+      }
+      unsub = stop;
+    })();
+    return () => {
+      alive = false;
+      unsub?.();
+    };
+  }, [t]);
 
   // Desktop dev convenience: H = home, V = voice (AI), A = AI — same actions.
   useEffect(() => {

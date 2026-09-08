@@ -23,8 +23,51 @@ import {
   interpretText,
   invoke,
   launchAndroidApp,
+  mailDelete,
+  mailInbox,
+  mailList,
+  mailMailboxes,
+  mailMove,
+  mailRead,
+  mailSearch,
+  mailSend,
+  mailSetFlagged,
+  mailSetSeen,
+  cancelNativeAlarm,
+  exportTxtFile,
+  pollNativeAlarms,
+  registerNativeAlarm,
   sendChat,
+  storeBundleResource,
+  storeBundleUri,
+  storeCatalog,
+  storeFind,
+  storeInstall,
+  storeInstalled,
+  storeSearch,
+  storeStatus,
+  storeUninstall,
+  storeUpdatable,
+  storeUpgrade,
   subscribe,
+  systemStoreSnapshot,
+  flashlightSet,
+  flashlightStatus,
+  radioSet,
+  radioStatus,
+  realDial,
+  telephonyAnswer,
+  telephonyDial,
+  telephonyEnd,
+  telephonySimulateIncoming,
+  telephonyStartRecording,
+  telephonyStatus,
+  telephonyStopRecording,
+  termKill,
+  termRead,
+  termResize,
+  termSpawn,
+  termWrite,
   transcribeAudio,
   translateText,
   ttsSynthesize,
@@ -184,6 +227,94 @@ describe("backend bridge", () => {
       "get_android_apps",
       "launch_android_app",
       "get_android_app_icon",
+    ]) {
+      expect(calls, `expected ${cmd} to be routed`).toContain(cmd);
+    }
+  });
+
+  test("mail / appstore / native-alarm thin wrappers route to their daemon commands", async () => {
+    const calls: string[] = [];
+    const fake = {
+      invoke: async (cmd: string) => {
+        calls.push(cmd);
+        return null;
+      },
+      listen: async () => async () => {},
+    };
+    const store = new Map<string, string>();
+    setWindow({
+      __TAURI_INTERNALS__: fake,
+      localStorage: { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) },
+    });
+    expect(bridged()).toBe(true);
+
+    // Mail RPC wrappers (both cc-present and cc-absent shapes of mailSend).
+    await mailMailboxes();
+    await mailList("INBOX", 10);
+    await mailSearch("INBOX", "hello");
+    await mailInbox();
+    await mailRead("INBOX", "m1");
+    await mailSend({ to: ["a@x.com"], subject: "s", body: "b" });
+    await mailSend({ to: ["a@x.com"], subject: "s", body: "b", cc: ["c@x.com"] });
+    await mailSetFlagged("INBOX", "m1", true);
+    await mailSetSeen("INBOX", "m1", false);
+    await mailDelete("INBOX", "m1");
+    await mailMove("INBOX", "m1", "Archive");
+
+    // App Store wrappers.
+    await storeCatalog();
+    await storeSearch("notes");
+    await storeFind("app.amos.notes");
+    await storeInstalled();
+    await storeUpdatable();
+    await storeStatus("app.amos.notes");
+    await storeInstall("app.amos.notes");
+    await storeUpgrade("app.amos.notes");
+    await storeUninstall("app.amos.notes");
+    await storeBundleResource("app.amos.notes", "index.html");
+    await storeBundleUri("amos-app://app.amos.notes/index.html");
+
+    // System store hydration + notes export + native-alarm bridge.
+    await systemStoreSnapshot();
+    await exportTxtFile("note", "hi");
+    await registerNativeAlarm("a1", 1_000_000);
+    await cancelNativeAlarm("a1");
+    await pollNativeAlarms();
+
+    // Telephony / radio / flashlight / terminal RPC wrappers.
+    await telephonyDial("10086");
+    await telephonyDial("110", true); // emergency path
+    await realDial("10086"); // returns bool: invoke->null => false
+    await telephonyEnd("c1");
+    await telephonyAnswer("c1");
+    await telephonySimulateIncoming("18812345678");
+    await telephonyStatus();
+    await telephonyStartRecording("c1");
+    await telephonyStopRecording("c1");
+    await radioStatus();
+    await radioSet("airplane", true);
+    await radioSet("wifi", false);
+    await flashlightStatus();
+    await flashlightSet(true);
+    await termSpawn("/tmp", ["ls"]);
+    await termWrite(1, "echo hi\n");
+    await termRead(1);
+    await termKill(1);
+    await termResize(1, 120, 24);
+
+    for (const cmd of [
+      "mail_mailboxes", "mail_list", "mail_search", "mail_inbox", "mail_read",
+      "mail_send", "mail_set_flagged", "mail_set_seen", "mail_delete", "mail_move",
+      "appstore_catalog", "appstore_search", "appstore_find", "appstore_installed",
+      "appstore_updatable", "appstore_status", "appstore_install", "appstore_upgrade",
+      "appstore_uninstall", "appstore_bundle_resource", "appstore_bundle_uri",
+      "store_snapshot", "notes_export_txt",
+      "scheduler_alarm_register", "scheduler_alarm_cancel", "scheduler_alarm_poll",
+      "telephony_dial", "real_dial", "telephony_end", "telephony_answer",
+      "telephony_simulate_incoming", "telephony_status", "telephony_start_recording",
+      "telephony_stop_recording",
+      "radio_status", "radio_set", "flashlight_status", "flashlight_set",
+      "term_spawn", "term_write", "term_read", "term_kill", "term_resize",
     ]) {
       expect(calls, `expected ${cmd} to be routed`).toContain(cmd);
     }

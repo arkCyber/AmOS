@@ -43,6 +43,7 @@
   import DiagnosticsPage from "./settings/DiagnosticsPage.svelte";
   import RadioPage from "./settings/RadioPage.svelte";
   import PrivacyPage from "./settings/PrivacyPage.svelte";
+  import TelemetrySpyPage from "./settings/TelemetrySpyPage.svelte";
   import NotificationsPage from "./settings/NotificationsPage.svelte";
   import SoundPage from "./settings/SoundPage.svelte";
   import AboutPage from "./settings/AboutPage.svelte";
@@ -63,6 +64,7 @@
     | "lock"
     | "ai"
     | "privacy"
+    | "spy"
     | "about"
     | "diagnostics";
   type Page = "index" | Sub;
@@ -81,6 +83,7 @@
     lock: "settings.passcode",
     ai: "settings.ai",
     privacy: "settings.privacy",
+    spy: "settings.spy",
     about: "settings.about",
     diagnostics: "settings.diagnostics",
   };
@@ -105,6 +108,7 @@
     ai: ["model", "deepseek", "推理", "inference", "模型"],
     account: ["sync", "backup", "同步", "备份", "iCloud"],
     privacy: ["permission", "grant", "授权", "权限", "敏感"],
+    spy: ["egress", "leak", "audit", "telemetry", "serial", "imei", "cell", "回传", "外发", "泄漏", "审计", "序列号"],
     about: ["version", "battery", "device", "版本", "电量", "设备", "storage"],
     diagnostics: ["monitor", "debug", "lmk", "监控", "进程", "开发者", "developer"],
   };
@@ -236,6 +240,7 @@
       { kind: "nav", page: "account", key: "settings.icloudRow", sub: () => icloudSub },
       { kind: "nav", page: "ai", key: "settings.ai" },
       { kind: "nav", page: "privacy", key: "settings.privacy" },
+      { kind: "nav", page: "spy", key: "settings.spy" },
     ],
     // 系统：关于本机 / 系统监控与开发者
     [
@@ -392,6 +397,8 @@
         <DiagnosticsPage />
       {:else if page === "privacy"}
         <PrivacyPage />
+      {:else if page === "spy"}
+        <TelemetrySpyPage />
       {:else if page === "notifications"}
         <NotificationsPage />
       {:else if page === "sound"}

@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::{Result, TelephonyError};
-use crate::number::{EmergencyMap, Number, NumberKind};
+use crate::number::{EmergencyMap, Number};
+use crate::route::{guard_emergency, guard_regular};
 use crate::session::{
     Call, CallDirection, CallId, CallSession, CallState, EndReason, RecordingState,
 };
@@ -236,10 +237,10 @@ impl MockTelephonyProvider {
 #[async_trait]
 impl TelephonyProvider for MockTelephonyProvider {
     async fn dial(&self, number: &Number) -> Result<CallId> {
-        if number.kind(&self.emergency) == NumberKind::Emergency {
-            // Enforce the separation: emergency numbers must use the emergency path.
-            return Err(TelephonyError::NotEmergency(number.digits()));
-        }
+        // Enforce the hard separation (shared with the on-device Android provider):
+        // a recognized emergency number must use the emergency path, never the
+        // ordinary SIM/telecom dial.
+        guard_regular(&self.emergency, number)?;
         let mut st = self.inner.lock().await;
         let id = Self::next_id(&mut st);
         let sess = CallSession::start_outgoing(id.clone(), number.clone(), false);
@@ -340,9 +341,8 @@ impl TelephonyProvider for MockTelephonyProvider {
 #[async_trait]
 impl EmergencyTelephonyProvider for MockTelephonyProvider {
     async fn emergency_call(&self, number: Number) -> Result<CallId> {
-        if number.kind(&self.emergency) != NumberKind::Emergency {
-            return Err(TelephonyError::NotEmergency(number.digits()));
-        }
+        // Only a recognized emergency code may use the privileged path.
+        guard_emergency(&self.emergency, &number)?;
         let mut st = self.inner.lock().await;
         let id = Self::next_id(&mut st);
         let sess = CallSession::start_outgoing(id.clone(), number, true);
@@ -387,7 +387,7 @@ mod tests {
         // Ordinary dial refuses an emergency number (separation enforced).
         assert!(matches!(
             p.dial(&e).await,
-            Err(TelephonyError::NotEmergency(_))
+            Err(TelephonyError::MustUseEmergencyPath(_))
         ));
 
         // The emergency path places it and marks it emergency.
