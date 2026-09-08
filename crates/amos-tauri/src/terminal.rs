@@ -26,6 +26,15 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 
+#[cfg(feature = "terminal-pty")]
+use std::io::{Read, Write};
+#[cfg(feature = "terminal-pty")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "terminal-pty")]
+use std::sync::Arc;
+#[cfg(feature = "terminal-pty")]
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
 /// Uniform result envelope for every terminal bridge call.
 #[derive(Debug, Clone, Serialize)]
 pub struct TermOut {
@@ -47,17 +56,27 @@ fn err(e: impl Into<String>) -> TermOut {
     TermOut { id: 0, output: None, error: e.into(), running: false }
 }
 
-/// A live terminal session (fields filled when `terminal-pty` is enabled).
-#[allow(dead_code)] // read only under the `terminal-pty` feature
+/// A live terminal session.
+#[allow(dead_code)] // fields read only under the `terminal-pty` feature
 struct Session {
     cwd: String,
     /// Per-session allowlist; None = unrestricted (still a device-only choice).
     allowlist: Option<Vec<String>>,
-    // TODO(bring-up): keep the portable_pty handle + child here, e.g.
-    //   pty: portable_pty::PtyPair / Box<dyn MasterPty>,
-    //   child: portable_pty::ChildKiller,
+    /// Live PTY state — present only when the `terminal-pty` feature is on.
+    #[cfg(feature = "terminal-pty")]
+    pty: Option<LivePty>,
+}
+
+/// The real PTY side of a session (feature `terminal-pty`).
+#[cfg(feature = "terminal-pty")]
+struct LivePty {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    buf: Arc<Mutex<Vec<u8>>>,
+    alive: Arc<AtomicBool>,
     #[allow(dead_code)]
-    _marker: std::marker::PhantomData<()>,
+    reader_thread: std::thread::JoinHandle<()>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<u64, Session>>> = OnceLock::new();
@@ -100,13 +119,57 @@ pub async fn term_spawn(
     let dir = cwd.unwrap_or_else(|| "/".to_string());
     #[cfg(feature = "terminal-pty")]
     {
-        // TODO(bring-up): portable_pty::native_pty_system(); openpty, spawn the
-        // allowlisted shell with cwd=dir, then store { pty, child } under a new
-        // id. Return ok(id, None, true). Any failure -> err(...) and never leak
-        // the child.
-        let _ = dir;
-        let _ = allowlist;
-        return err("terminal: PTY backend not yet wired (see docs/terminal-design.md)");
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.cwd(&dir);
+        let size = PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 };
+        let pair = match native_pty_system().openpty(size) {
+            Ok(p) => p,
+            Err(e) => return err(format!("terminal: openpty: {e}")),
+        };
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(c) => c,
+            Err(e) => return err(format!("terminal: spawn: {e}")),
+        };
+        drop(pair.slave);
+        let reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => return err(format!("terminal: reader: {e}")),
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => return err(format!("terminal: writer: {e}")),
+        };
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut reader = reader;
+        let buf2 = Arc::clone(&buf);
+        let alive2 = Arc::clone(&alive);
+        let reader_thread = std::thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop {
+                match reader.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+            }
+            alive2.store(false, Ordering::Relaxed);
+        });
+        let id = next_id();
+        let live = LivePty {
+            master: pair.master,
+            child,
+            writer,
+            buf,
+            alive,
+            reader_thread,
+        };
+        registry()
+            .lock()
+            .unwrap()
+            .insert(id, Session { cwd: dir, allowlist, pty: Some(live) });
+        return ok(id, None, true);
     }
     #[cfg(not(feature = "terminal-pty"))]
     {
@@ -116,36 +179,55 @@ pub async fn term_spawn(
 }
 /// Write bytes to a live session's stdin.
 pub async fn term_write(session: u64, data: String) -> TermOut {
-    let guard = registry().lock().unwrap();
-    let live = guard.contains_key(&session);
-    drop(guard);
-    if !live {
-        return err("terminal: unknown or ended session");
+    #[cfg(feature = "terminal-pty")]
+    {
+        let mut guard = registry().lock().unwrap();
+        let live = guard.get_mut(&session).and_then(|s| s.pty.as_mut());
+        let Some(live) = live else {
+            drop(guard);
+            return err("terminal: unknown or ended session");
+        };
+        // echo is handled by the pty itself, so we only forward the raw bytes.
+        let res = live.writer.write_all(data.as_bytes());
+        drop(guard);
+        return match res {
+            Ok(_) => ok(session, None, true),
+            Err(e) => err(format!("terminal: write: {e}")),
+        };
     }
-    if !pty_enabled() {
-        return err("terminal: PTY shell is not enabled in this build");
+    #[cfg(not(feature = "terminal-pty"))]
+    {
+        let _ = (session, data);
+        err("terminal: PTY shell is not enabled in this build")
     }
-    // TODO(bring-up): forward `data` into the session's PTY stdin; echo is
-    // handled by the pty itself, so nothing extra is needed here.
-    let _ = data;
-    err("terminal: PTY backend not yet wired (see docs/terminal-design.md)")
 }
 
 /// Read available output from a live session (cap `max` bytes if given).
 pub async fn term_read(session: u64, max: Option<usize>) -> TermOut {
-    let guard = registry().lock().unwrap();
-    let live = guard.contains_key(&session);
-    drop(guard);
-    if !live {
-        return err("terminal: unknown or ended session");
+    #[cfg(feature = "terminal-pty")]
+    {
+        let mut guard = registry().lock().unwrap();
+        let live = guard.get_mut(&session).and_then(|s| s.pty.as_mut());
+        let Some(live) = live else {
+            drop(guard);
+            return err("terminal: unknown or ended session");
+        };
+        let mut bytes = std::mem::take(&mut *live.buf.lock().unwrap());
+        if let Some(cap) = max {
+            if bytes.len() > cap {
+                bytes.truncate(cap);
+            }
+        }
+        let running = live.alive.load(Ordering::Relaxed);
+        drop(guard);
+        let out = String::from_utf8_lossy(&bytes).to_string();
+        return ok(session, if out.is_empty() { None } else { Some(out) }, running);
     }
-    if !pty_enabled() {
-        return err("terminal: PTY shell is not enabled in this build");
+    #[cfg(not(feature = "terminal-pty"))]
+    {
+        let _ = (session, max);
+        err("terminal: PTY shell is not enabled in this build")
     }
-    let _ = max;
-    // TODO(bring-up): drain the PTY master read side; trim to `max`; return
-    // ok(session, Some(bytes), running). None when the child has exited.
-    err("terminal: PTY backend not yet wired (see docs/terminal-design.md)")
 }
 
 /// Terminate a session and reap its child (no orphans).
@@ -155,8 +237,14 @@ pub async fn term_kill(session: u64) -> TermOut {
     drop(guard);
     match removed {
         None => err("terminal: unknown or ended session"),
-        Some(_s) => {
-            // TODO(bring-up): send SIGKILL to the pty child and reap it here.
+        Some(mut s) => {
+            #[cfg(feature = "terminal-pty")]
+            if let Some(mut live) = s.pty.take() {
+                live.alive.store(false, Ordering::Relaxed);
+                let _ = live.child.kill();
+                drop(live.child);
+            }
+            let _ = &mut s;
             ok(0, None, false)
         }
     }
@@ -167,18 +255,27 @@ pub async fn term_resize(session: u64, cols: u16, rows: u16) -> TermOut {
     if cols == 0 || rows == 0 {
         return err("terminal: invalid resize (cols/rows must be > 0)");
     }
-    let guard = registry().lock().unwrap();
-    let live = guard.contains_key(&session);
-    drop(guard);
-    if !live {
-        return err("terminal: unknown or ended session");
+    #[cfg(feature = "terminal-pty")]
+    {
+        let mut guard = registry().lock().unwrap();
+        let live = guard.get_mut(&session).and_then(|s| s.pty.as_mut());
+        let Some(live) = live else {
+            drop(guard);
+            return err("terminal: unknown or ended session");
+        };
+        let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+        let res = live.master.resize(size);
+        drop(guard);
+        match res {
+            Ok(_) => ok(session, None, true),
+            Err(e) => err(format!("terminal: resize: {e}")),
+        }
     }
-    if !pty_enabled() {
-        return err("terminal: PTY shell is not enabled in this build");
+    #[cfg(not(feature = "terminal-pty"))]
+    {
+        let _ = (session, cols, rows);
+        err("terminal: PTY shell is not enabled in this build")
     }
-    // TODO(bring-up): call resize on the session's master pty.
-    let _ = (cols, rows);
-    err("terminal: PTY backend not yet wired (see docs/terminal-design.md)")
 }
 
 /// (Policy helper, pure) Whether `bin` is allowed by a per-session allowlist.
@@ -208,6 +305,7 @@ mod tests {
         assert!(allowed(None, "anything"));
     }
 
+    #[cfg(not(feature = "terminal-pty"))]
     #[tokio::test]
     async fn spawn_is_refused_when_pty_feature_is_off() {
         // Default posture: no execution surface.
@@ -222,6 +320,31 @@ mod tests {
         let r = term_kill(999_999).await;
         assert_eq!(r.id, 0);
         assert!(r.error.contains("unknown or ended session"));
+    }
+
+    /// Real PTY integration (feature `terminal-pty`): spawn a shell on the host,
+    /// pipe `echo PTY_OK`, and confirm the line comes back through the pty.
+    #[cfg(feature = "terminal-pty")]
+    #[tokio::test]
+    async fn real_pty_echo_round_trip() {
+        let sp = term_spawn(Some("/tmp".to_string()), Some(vec!["echo".to_string()])).await;
+        assert!(sp.id > 0, "spawn failed: {}", sp.error);
+        let id = sp.id;
+        let _ = term_write(id, "echo PTY_OK\n".to_string()).await;
+        let _ = term_write(id, "exit\n".to_string()).await;
+        let mut got = String::new();
+        for _ in 0..50 {
+            let rd = term_read(id, None).await;
+            if let Some(o) = rd.output {
+                got.push_str(&o);
+            }
+            if got.contains("PTY_OK") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = term_kill(id).await;
+        assert!(got.contains("PTY_OK"), "echo never returned: {got:?}");
     }
 }
 

@@ -7,6 +7,7 @@
   // `terminal-pty` device build. When that backend ships, this screen swaps the
   // demo evaluator for the real term_* bridge.
   import { termBanner, runTermLine, pushHistory, PROMPT, type TermLine } from "../lib/terminal";
+  import { parseAnsi } from "../lib/ansi";
   import { t } from "./locale.svelte";
 
   let lines = $state<TermLine[]>(termBanner(t("terminal.demo")));
@@ -63,7 +64,11 @@
     class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-2 font-mono"
   >
     {#each lines as ln, i (i)}
-      <p class={"whitespace-pre-wrap break-words " + kindCls(ln.kind)}>{ln.text}</p>
+      <p class={"whitespace-pre-wrap break-words " + kindCls(ln.kind)}>
+        {#each parseAnsi(ln.text) as sp, k (k)}
+          <span style:color={sp.fg} class={sp.bold ? "font-semibold" : ""}>{sp.text}</span>
+        {/each}
+      </p>
     {/each}
   </div>
   <div class="flex items-center gap-1 border-t border-white/10 px-3 py-2 font-mono">
