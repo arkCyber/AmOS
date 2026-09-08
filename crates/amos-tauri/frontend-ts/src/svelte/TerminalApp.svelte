@@ -1,13 +1,23 @@
 <script lang="ts">
-  // TerminalApp.svelte — AmOS Terminal (offline-safe demo shell).
+  // TerminalApp.svelte — AmOS Terminal.
   //
-  // HONESTY: AmOS has no real PTY by default (docs/terminal-design.md). This
-  // screen runs a small built-in command set via the pure lib/terminal.ts (no
-  // process is ever spawned) and clearly states that a real shell needs the
-  // `terminal-pty` device build. When that backend ships, this screen swaps the
-  // demo evaluator for the real term_* bridge.
-  import { termBanner, runTermLine, pushHistory, PROMPT, type TermLine } from "../lib/terminal";
-  import { parseAnsi } from "../lib/ansi";
+  // Two modes:
+  //   1. OFFLINE DEMO (default): runs the safe built-in command set via the pure
+  //      lib/terminal.ts — nothing is ever spawned.
+  //   2. LIVE (device): if the backend `terminal-pty` feature is built in and
+  //      `term_spawn` returns a session id, this screen drives the real shell:
+  //      Enter sends lines to `term_write`, and a poller pulls `term_read` output
+  //      through `decodeOutput` (CR/LF, backspace, ESC[2J clear, SGR kept for
+  //      colour). The live path is testable headlessly with a fake term_* bridge.
+  import {
+    termBanner,
+    runTermLine,
+    pushHistory,
+    PROMPT,
+    type TermLine,
+  } from "../lib/terminal";
+  import { parseAnsi, decodeOutput } from "../lib/ansi";
+  import { termSpawn, termWrite, termRead } from "../lib/backend";
   import { t } from "./locale.svelte";
 
   let lines = $state<TermLine[]>(termBanner(t("terminal.demo")));
@@ -17,6 +27,47 @@
   let scroller: HTMLDivElement | null = $state(null);
   let cmdInput: HTMLInputElement | null = $state(null);
 
+  // Live (real-PTY) session state.
+  let live = $state(false);
+  let sess = $state(0);
+
+  // Try to open a real PTY session once. Offline (no backend / feature off)
+  // term_spawn rejects or returns id 0 → we stay in the offline demo.
+  let probed = false;
+  $effect(() => {
+    if (probed) return;
+    probed = true;
+    void termSpawn(undefined, ["help"])
+      .then((r) => {
+        if (r && r.id > 0) {
+          live = true;
+          sess = r.id;
+          lines = [...lines, { text: "(real PTY shell attached)", kind: "muted" }];
+        }
+      })
+      .catch(() => {
+        /* stay in the offline demo */
+      });
+  });
+
+  // Live poller: pull output, decode it (CR/LF / backspace / clear / SGR).
+  $effect(() => {
+    if (!live) return;
+    const id = setInterval(() => {
+      void (async () => {
+        const r = await termRead(sess, 4096).catch(() => null);
+        if (!r || r.output == null) return;
+        const d = decodeOutput(r.output);
+        if (d.clear) lines = [];
+        if (d.lines.length > 0) {
+          lines = [...lines, ...d.lines.map((text) => ({ text, kind: "out" as const }))];
+        }
+        if (!r.running) clearInterval(id);
+      })();
+    }, 100);
+    return () => clearInterval(id);
+  });
+
   // Auto-scroll to the newest line and keep the input focused — a terminal stays
   // pinned to the bottom and ready to type after every command.
   $effect(() => {
@@ -25,14 +76,31 @@
   });
 
   const submit = () => {
+    if (live) {
+      const trimmed = draft.trim();
+      if (trimmed !== "") {
+        void termWrite(sess, `${trimmed}\n`).catch(() => {});
+        lines = [...lines, { text: `${PROMPT} ${draft}`, kind: "cmd" as const }];
+      } else {
+        lines = [...lines, { text: PROMPT, kind: "cmd" as const }];
+      }
+      pushDraftHistoryOnly();
+      draft = "";
+      return;
+    }
+    // offline demo path
     const r = runTermLine(draft, "AmOS Terminal (offline demo)");
     const base = r.clear ? [] : lines;
-    // A blank Enter still advances the transcript (a fresh prompt line).
     const prompt = draft.trim() === "" ? [{ text: PROMPT, kind: "cmd" as const }] : [];
     lines = [...base, ...prompt, ...r.lines];
     hist = pushHistory(hist, draft);
     histIdx = -1;
     draft = "";
+  };
+  // In live mode history is recorded without re-emitting a prompt (already added).
+  const pushDraftHistoryOnly = () => {
+    const s = draft.trim();
+    if (s !== "" && hist[hist.length - 1] !== s) hist = [...hist, s];
   };
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "ArrowUp") {

@@ -6,7 +6,32 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import TerminalApp from "../src/svelte/TerminalApp.svelte";
 
-afterEach(cleanup);
+type AnyWin = Record<string, unknown>;
+const cleanBridge = () => delete (window as AnyWin).__TAURI_INTERNALS__;
+/** Fake term_* bridge: spawn yields a session; term_write collects lines;
+ *  term_read returns scripted chunks (here one echo + an ANSI clear + colour). */
+function installTermBridge(): { reads: string[][] } {
+  const reads: string[][] = [["PTY_OK\r\n"], ["\u001b[2J\u001b[32mGREEN\u001b[0m\r\n"]];
+  (window as AnyWin).__TAURI_INTERNALS__ = {
+    invoke: async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "term_spawn") return { id: 7, output: null, error: "", running: true };
+      if (cmd === "term_write") return { id: (args?.session as number) ?? 0, output: null, error: "", running: true };
+      if (cmd === "term_read") {
+        const chunk = reads.shift() ?? [];
+        const out = chunk.length ? chunk.join("") : null;
+        const running = reads.length > 0;
+        return { id: (args?.session as number) ?? 0, output: out, error: "", running };
+      }
+      return null;
+    },
+  };
+  return { reads };
+}
+
+afterEach(() => {
+  cleanup();
+  cleanBridge();
+});
 
 const inputOf = (h: { container: HTMLElement }) =>
   h.container.querySelector('input[aria-label="命令"]') as HTMLInputElement | null;
@@ -58,5 +83,19 @@ describe("TerminalApp.svelte (offline demo shell)", () => {
     await run(host, "echo x");
     expect(txt(host)).toContain("x");
     expect(document.activeElement).toBe(inputOf(host));
+  });
+
+  test("live mode: a real-PTY bridge is polled, decoded, cleared and coloured", async () => {
+    installTermBridge();
+    const host = render(TerminalApp);
+    // let the spawn probe + a few poll ticks run
+    await new Promise<void>((r) => setTimeout(r, 450));
+    await tick();
+    // the stream cleared the screen (junk/echo gone) then printed GREEN (ANSI kept)
+    expect(txt(host)).toContain("GREEN");
+    expect(txt(host)).not.toContain("PTY_OK"); // cleared by ESC[2J
+    const green = host.container.querySelector('span[style*="color: rgb(34, 197, 94)"]') ??
+      host.container.querySelector('span[style*="#22c55e"]');
+    expect(green).toBeTruthy();
   });
 });
