@@ -19,6 +19,7 @@ import { AMOS_LOCALE_CHANGED_EVENT } from "../src/svelte/ui-events";
 import { AUTOOFF_STORE_KEY } from "../src/lib/display";
 import { LOCK_KEY, type LockCfg } from "../src/lib/lock";
 import { SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
+import { WIFI_KEY } from "../src/lib/wifi";
 import { FOCUS_KEY } from "../src/lib/focusPrefs";
 
 beforeEach(() => {
@@ -124,6 +125,29 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     await navigate(host, "蜂窝网络");
     expect(txt(host)).toContain("蜂窝数据");
     expect(txt(host)).toContain("数据漫游");
+  });
+
+  test("Wi-Fi page lists a demo neighbourhood; open joins, secure is disabled", async () => {
+    // Turn Wi‑Fi ON (radio) so the networks list renders.
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    const host = render(SettingsApp);
+    await navigate(host, "无线局域网");
+    const flush = () => new Promise<void>((r) => setTimeout(r, 10));
+    await flush();
+    // nearby-networks header + honest demo note + scan button are present
+    expect(txt(host)).toContain("附近网络");
+    expect(txt(host)).toContain("演示列表");
+    const cafe = host.container.querySelector('button[aria-label="Cafe_Free"]') as HTMLButtonElement | null;
+    expect(cafe).toBeTruthy();
+    expect(cafe?.disabled).toBe(false); // open → joinable offline
+    const secure = host.container.querySelector('button[aria-label="AmOS-5G"]') as HTMLButtonElement | null;
+    expect(secure).toBeTruthy();
+    expect(secure?.disabled).toBe(true); // secure + not-current → disabled (honest)
+    // joining the open network makes it the current one and shows 已连接
+    await fireEvent.click(cafe as HTMLButtonElement);
+    await flush();
+    expect(txt(host)).toContain("已连接");
+    expect(readStoreValue<{ current?: string }>(WIFI_KEY, {}).current).toBe("Cafe_Free");
   });
 
   test("now-real sub pages render their real controls", async () => {

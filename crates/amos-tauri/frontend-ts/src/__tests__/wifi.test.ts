@@ -1,0 +1,83 @@
+/**
+ * Pure unit tests for the Wi-Fi view model (lib/wifi.ts).
+ */
+import { describe, expect, test } from "bun:test";
+import {
+  clampSignal,
+  signalBars,
+  sortNetworks,
+  findBySsid,
+  connectOpenOrSaved,
+  normalizeWifi,
+  NEIGHBORHOOD,
+  type WifiCfg,
+} from "../lib/wifi";
+
+const cfg = (current: string | null = null): WifiCfg => ({ current });
+
+describe("wifi signal", () => {
+  test("clampSignal bounds + rounds into 0..4", () => {
+    expect(clampSignal(4)).toBe(4);
+    expect(clampSignal(3.4)).toBe(3);
+    expect(clampSignal(99)).toBe(4);
+    expect(clampSignal(-2)).toBe(0);
+    expect(clampSignal(NaN)).toBe(0);
+  });
+
+  test("signalBars maps to iOS-like 0..3 bars", () => {
+    expect(signalBars(0)).toBe(0);
+    expect(signalBars(1)).toBe(1);
+    expect(signalBars(2)).toBe(2);
+    expect(signalBars(3)).toBe(3);
+    expect(signalBars(4)).toBe(3);
+  });
+});
+
+describe("wifi scan ordering", () => {
+  test("current network pins to the top, then strongest first (stable)", () => {
+    const sorted = sortNetworks(NEIGHBORHOOD, "Cafe_Free");
+    expect(sorted[0]?.ssid).toBe("Cafe_Free"); // current first
+    const rest = sorted.slice(1).map((n) => n.ssid);
+    expect(rest[0]).toBe("AmOS-5G"); // signal 4
+    expect(rest).toContain("Neighbor_AX");
+  });
+
+  test("without a current network it is purely signal-desc, stable", () => {
+    const sorted = sortNetworks(NEIGHBORHOOD, null);
+    const sig = sorted.map((n) => clampSignal(n.signal));
+    for (let i = 1; i < sig.length; i++) {
+      expect(sig[i - 1]!).toBeGreaterThanOrEqual(sig[i]!);
+    }
+  });
+});
+
+describe("wifi connect (honest, no fake passworded join)", () => {
+  test("an open network can be joined", () => {
+    const out = connectOpenOrSaved(cfg(), NEIGHBORHOOD, "Library_Guest");
+    expect(out.current).toBe("Library_Guest");
+  });
+
+  test("a secure network that isn't current is NOT connectable offline", () => {
+    const out = connectOpenOrSaved(cfg(), NEIGHBORHOOD, "AmOS-5G");
+    expect(out.current).toBeNull();
+  });
+
+  test("unknown ssid is a no-op", () => {
+    expect(connectOpenOrSaved(cfg(), NEIGHBORHOOD, "nope")).toEqual(cfg());
+  });
+
+  test("findBySsid resolves present networks only", () => {
+    expect(findBySsid(NEIGHBORHOOD, "Home-2.4G")?.ssid).toBe("Home-2.4G");
+    expect(findBySsid(NEIGHBORHOOD, "nope")).toBeNull();
+  });
+});
+
+describe("wifi persistence guard", () => {
+  test("normalizeWifi keeps a valid current and coerces junk", () => {
+    expect(normalizeWifi({ current: "Home-2.4G" }).current).toBe("Home-2.4G");
+    expect(normalizeWifi(null).current).toBeNull();
+    expect(normalizeWifi("x").current).toBeNull();
+    expect(normalizeWifi({ current: "" }).current).toBeNull();
+    expect(normalizeWifi({ current: 5 }).current).toBeNull();
+  });
+});
