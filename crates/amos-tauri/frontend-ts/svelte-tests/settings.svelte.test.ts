@@ -20,6 +20,7 @@ import { AUTOOFF_STORE_KEY } from "../src/lib/display";
 import { LOCK_KEY, type LockCfg } from "../src/lib/lock";
 import { SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
 import { WIFI_KEY } from "../src/lib/wifi";
+import { BT_KEY } from "../src/lib/bluetooth";
 import { FOCUS_KEY } from "../src/lib/focusPrefs";
 
 beforeEach(() => {
@@ -125,6 +126,25 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     await navigate(host, "蜂窝网络");
     expect(txt(host)).toContain("蜂窝数据");
     expect(txt(host)).toContain("数据漫游");
+  });
+
+  test("Bluetooth page shows this-device + discoverable toggle + nearby (demo)", async () => {
+    writeStoreValue(SETTINGS_KEY, { bluetooth: true, airplane: false });
+    const host = render(SettingsApp);
+    await navigate(host, "蓝牙");
+    const flush = () => new Promise<void>((r) => setTimeout(r, 10));
+    await flush();
+    // this-device name + discoverable switch + demo device list
+    expect(txt(host)).toContain("名称");
+    expect(txt(host)).toContain("可被发现");
+    expect(txt(host)).toContain("AirPods Pro");
+    // default discoverable = on; toggle persists it off
+    const disc = host.container.querySelector('[role="switch"][aria-label="可被发现"]') as HTMLButtonElement | null;
+    expect(disc).toBeTruthy();
+    expect(disc?.getAttribute("aria-checked")).toBe("true");
+    await fireEvent.click(disc as HTMLButtonElement);
+    await flush();
+    expect(readStoreValue<{ discoverable?: boolean }>(BT_KEY, {}).discoverable).toBe(false);
   });
 
   test("Wi-Fi page lists a demo neighbourhood; open joins, secure is disabled", async () => {

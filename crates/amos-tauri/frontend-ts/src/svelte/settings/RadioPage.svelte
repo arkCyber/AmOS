@@ -18,6 +18,14 @@
     sortNetworks,
     type WifiCfg,
   } from "../../lib/wifi";
+  import {
+    BT_KEY,
+    DEMO_DEVICES,
+    btGlyph,
+    normalizeBt,
+    setDiscoverable,
+    type BtCfg,
+  } from "../../lib/bluetooth";
   import { GROUP, ROW, LABEL, SUB, HINT } from "./kit";
   import Switch from "./Switch.svelte";
 
@@ -80,6 +88,13 @@
     if (pwFor) saveCfg(connectWithPassword(cfg, NEIGHBORHOOD, pwFor, pwVal));
     pwFor = null;
     pwVal = "";
+  };
+
+  // ---- Bluetooth "this device + discoverable" config (same RadioPage) ----
+  let btCfg = $state<BtCfg>(normalizeBt(readStoreValue<unknown>(BT_KEY, undefined)));
+  const saveBt = (next: BtCfg) => {
+    btCfg = next;
+    writeStoreValue(BT_KEY, next);
   };
 </script>
 
@@ -184,6 +199,47 @@
       <div class="px-4 py-2">
         <p class={HINT}>{t("settings.wifiSimNote")}</p>
       </div>
+    </section>
+  {/if}
+
+  {#if which === "bluetooth" && on && !qs.airplane}
+    <section class={GROUP}>
+      <div class="flex items-center justify-between gap-3 px-4 py-3">
+        <span class={LABEL}>{t("settings.btDeviceName")}</span>
+        <span class="truncate text-[15px] opacity-60">{btCfg.name}</span>
+      </div>
+      <div class={SUB}></div>
+      <div class={ROW}>
+        <span class={LABEL}>{t("settings.btDiscoverable")}</span>
+        <Switch
+          on={btCfg.discoverable}
+          aria={t("settings.btDiscoverable")}
+          ontoggle={() => saveBt(setDiscoverable(btCfg, !btCfg.discoverable))}
+        />
+      </div>
+      <div class={SUB}></div>
+      <div class="px-4 py-2">
+        <p class={HINT}>{t("settings.btSimNote")}</p>
+      </div>
+    </section>
+
+    <section class={GROUP}>
+      <div class="px-4 py-2">
+        <span class="text-[13px] font-semibold text-neutral-800 dark:text-neutral-100">{t("settings.btNearby")}</span>
+      </div>
+      <div class={SUB}></div>
+      {#each DEMO_DEVICES as dev (dev.id)}
+        <div class="flex items-center justify-between gap-3 px-4 py-3">
+          <span class="flex items-center gap-2">
+            <span aria-hidden="true" class="text-base">{btGlyph(dev.kind)}</span>
+            <span class="truncate text-[15px] text-neutral-800 dark:text-neutral-100">{dev.name}</span>
+          </span>
+          <span class="shrink-0 text-xs opacity-50">{t("settings.btNotPaired")}</span>
+        </div>
+        {#if dev.id !== DEMO_DEVICES[DEMO_DEVICES.length - 1]?.id}
+          <div class={SUB}></div>
+        {/if}
+      {/each}
     </section>
   {/if}
 
