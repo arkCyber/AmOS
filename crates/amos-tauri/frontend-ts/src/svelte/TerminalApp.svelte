@@ -13,11 +13,22 @@
   let draft = $state("");
   let hist = $state<string[]>([]);
   let histIdx = $state(-1);
+  let scroller: HTMLDivElement | null = $state(null);
+  let cmdInput: HTMLInputElement | null = $state(null);
+
+  // Auto-scroll to the newest line and keep the input focused — a terminal stays
+  // pinned to the bottom and ready to type after every command.
+  $effect(() => {
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    cmdInput?.focus();
+  });
 
   const submit = () => {
     const r = runTermLine(draft, "AmOS Terminal (offline demo)");
     const base = r.clear ? [] : lines;
-    lines = [...base, ...r.lines];
+    // A blank Enter still advances the transcript (a fresh prompt line).
+    const prompt = draft.trim() === "" ? [{ text: PROMPT, kind: "cmd" as const }] : [];
+    lines = [...base, ...prompt, ...r.lines];
     hist = pushHistory(hist, draft);
     histIdx = -1;
     draft = "";
@@ -47,14 +58,18 @@
 </script>
 
 <div class="flex h-full flex-col bg-[#0c0c0e] text-[13px] leading-snug">
-  <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-2 font-mono">
-    {#each lines as ln (ln)}
+  <div
+    bind:this={scroller}
+    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-2 font-mono"
+  >
+    {#each lines as ln, i (i)}
       <p class={"whitespace-pre-wrap break-words " + kindCls(ln.kind)}>{ln.text}</p>
     {/each}
   </div>
   <div class="flex items-center gap-1 border-t border-white/10 px-3 py-2 font-mono">
     <span class="shrink-0 text-emerald-300">{PROMPT}</span>
     <input
+      bind:this={cmdInput}
       bind:value={draft}
       onkeydown={(e) => {
         onKey(e);
@@ -69,3 +84,4 @@
     />
   </div>
 </div>
+

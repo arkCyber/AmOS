@@ -50,4 +50,13 @@ describe("TerminalApp.svelte (offline demo shell)", () => {
     await tick();
     expect(inp.value).toBe("whoami");
   });
+
+  test("the command input is focused on open and refocused after each command", async () => {
+    const host = render(TerminalApp);
+    await tick();
+    expect(document.activeElement).toBe(inputOf(host));
+    await run(host, "echo x");
+    expect(txt(host)).toContain("x");
+    expect(document.activeElement).toBe(inputOf(host));
+  });
 });
