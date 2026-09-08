@@ -111,14 +111,26 @@
 
   let page = $state<Page>("index");
   let q = $state("");
+  /** Jump the (shell-provided) scroll container back to the top on navigation,
+   *  so a tall sub page doesn't open mid-list. Falls back to window scrolling. */
+  const resetTop = () => {
+    const host =
+      typeof document !== "undefined"
+        ? (document.querySelector('[data-testid="app-surface"] .overflow-y-auto') as HTMLElement | null)
+        : null;
+    if (host) host.scrollTop = 0;
+    else {
+      try {
+        window.scrollTo({ top: 0 });
+      } catch {
+        /* ignore */
+      }
+    }
+  };
   const nav = (p: Page) => {
     q = ""; // leaving the index clears the search
     page = p;
-    try {
-      window.scrollTo({ top: 0 });
-    } catch {
-      /* ignore */
-    }
+    resetTop();
   };
   const goHome = () => {
     syncLock();

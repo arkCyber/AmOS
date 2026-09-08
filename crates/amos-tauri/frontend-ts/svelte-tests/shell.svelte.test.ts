@@ -74,6 +74,20 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
   });
 
+  test("app surface hosts a scrollable region so tall content-flow apps can be paged", async () => {
+    open("settings");
+    const { container } = render(Shell);
+    await tick();
+    const surface = container.querySelector('[data-testid="app-surface"]');
+    expect(surface).toBeTruthy();
+    // the app host is the ScrollView → an overflow-y-auto region exists under the
+    // surface chrome (this is what lets a Settings/Phone list scroll on device)
+    const host = surface?.querySelector(".overflow-y-auto");
+    expect(host).toBeTruthy();
+    // and it is bounded (min-h-0 flex-1) so it fills the space under the header
+    expect(host?.className ?? "").toContain("min-h-0");
+  });
+
   test("Spotlight overlay opens from shellState and closes on setSpot(false)", async () => {
     setSpot(true);
     const { container } = render(Shell);

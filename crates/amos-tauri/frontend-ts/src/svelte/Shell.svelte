@@ -251,7 +251,10 @@
             <span class="flex-1 truncate text-center text-[17px] font-semibold tracking-tight">{appTitle(s.id)}</span>
             <span class="w-10"></span>
           </div>
-          <div class="min-h-0 flex-1">
+          <!-- The app host is the ScrollView: content-flow apps (Settings, Phone,
+               Photos, Clock…) grow past the viewport and scroll here. Without
+               overflow-y-auto they'd clip on device (content below unreachable). -->
+          <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {#key s.id}
               {#if AppComp}
                 <AppComp />
