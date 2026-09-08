@@ -1,6 +1,6 @@
 <script lang="ts">
-  // AndroidApp.svelte — Svelte 5 (runes) port of the React AndroidApp
-  // (src/components/AndroidApp.tsx). Lists legacy Android apps over the shared
+  // AndroidApp.svelte — Svelte 5 (runes) single-source implementation of the
+  // Android-apps screen. Lists legacy Android apps over the shared
   // bridge (get_android_apps) + launches on tap; recents persisted in the shared
   // store. Offline (not inside Tauri / no daemon) degrades to a localized
   // "not connected" state (fully testable here); live listing/launch/icon fetch

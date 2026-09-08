@@ -4,16 +4,17 @@
   // controlled channels the Svelte screens read (HomeDock "home", EditHome
   // "editHome", LockScreen "lock"). ③b adds real app mounting; ③c adds overlays
   // (Recents/Spotlight/NC) + hardware/edge policies. React-free import graph.
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { propsChannel } from "./propsBus";
   import { svelteAppLoader } from "./appRegistry";
   import { appTitleKey } from "../lib/appMeta";
   import { t } from "./locale.svelte";
   import type { HomeLayout } from "../lib/amosStore";
-  import { moveBefore } from "../lib/amosStore";
+  import { moveBefore, addAppsToDock } from "../lib/amosStore";
   import {
     applyLayout,
     enterEdit,
+    enterLibrary,
     exitEdit,
     goHome,
     layout,
@@ -31,8 +32,14 @@
     unlock,
   } from "./shellState.svelte";
   import LockScreen from "./LockScreen.svelte";
+  import { startTimerWatcher } from "./osTimerWatcher";
+  import { startAlarmWatcher } from "./osAlarmWatcher";
+  import { startReminderWatcher } from "./osReminderWatcher";
+  import { startOsAutoOff } from "./osAutoOff";
+  import { startOsInputBridge, startOsHardwarePoll } from "./osInputBridge";
   import HomeDock from "./HomeDock.svelte";
   import EditHome from "./EditHome.svelte";
+  import AppLibrary from "./AppLibrary.svelte";
   import StatusBar from "./StatusBar.svelte";
   import Backdrop from "./Backdrop.svelte";
   import NotificationBanner from "./NotificationBanner.svelte";
@@ -55,6 +62,16 @@
         layout: layout(),
         ext: [],
         pulseId: pulseId(),
+      });
+    }
+  });
+  // Feed the App Library screen (layout + any store-installed tiles) whenever that
+  // surface is shown. The standalone Svelte shell hosts no store apps yet.
+  $effect(() => {
+    if (surface().kind === "library") {
+      propsChannel<{ layout: HomeLayout; ext: never[] }>("appLibrary").set({
+        layout: layout(),
+        ext: [],
       });
     }
   });
@@ -87,12 +104,22 @@
         const m = d as { drag: string; over: string };
         applyLayout(moveBefore(layout(), m.drag, m.over));
       } else if (e === "search") setSpot(true);
+      else if (e === "library") enterLibrary();
     });
   });
   $effect(() => {
     return propsChannel<{ layout: HomeLayout }>("editHome").on((e, d) => {
       if (e === "change") applyLayout(d as HomeLayout);
       else if (e === "done") exitEdit();
+    });
+  });
+  $effect(() => {
+    return propsChannel<{ layout: HomeLayout; ext: never[] }>("appLibrary").on((e, d) => {
+      if (e === "open" && typeof d === "string") open(d);
+      else if (e === "back") goHome();
+      else if (e === "dockAdd" && Array.isArray(d)) {
+        applyLayout(addAppsToDock(layout(), d.filter((x) => typeof x === "string")));
+      }
     });
   });
   $effect(() => {
@@ -124,8 +151,30 @@
   });
 
   let ready = $state(false);
+  let stopWatchers: Array<() => void> = [];
   onMount(() => {
     ready = true;
+    // Pure-Svelte host: surface a running countdown's "time's up" and a due alarm
+    // even when the Clock app isn't the focused surface (suppressed while focused).
+    const getActive = () => {
+      const s = surface();
+      return s.kind === "app" ? s.id : null;
+    };
+    stopWatchers = [
+      startTimerWatcher(getActive),
+      startAlarmWatcher(getActive),
+      startReminderWatcher(getActive),
+      startOsAutoOff({ onSleep: lock }),
+      startOsHardwarePoll({
+        onNav: (a) => (a === "home" ? goHome() : open("ai")),
+      }),
+      startOsInputBridge({
+        onNav: (a) => (a === "home" ? goHome() : open("ai")),
+      }),
+    ];
+  });
+  onDestroy(() => {
+    stopWatchers.forEach((stop) => stop());
   });
 
   const s = $derived(surface());
@@ -177,13 +226,30 @@
     {:else}
       {#if s.kind === "edit"}
         <EditHome />
+      {:else if s.kind === "library"}
+        <div class="flex h-full flex-col">
+          <Backdrop />
+          <div class="relative z-10 flex h-full flex-col">
+            <StatusBar />
+            <div class="min-h-0 flex-1">
+              <AppLibrary />
+            </div>
+          </div>
+        </div>
       {:else if s.kind === "app"}
-        <div class="flex h-full flex-col" data-testid="app-surface">
+        <div
+          class="flex h-full flex-col text-neutral-900 dark:text-neutral-100"
+          data-testid="app-surface"
+        >
           <StatusBar />
-          <div class="flex items-center justify-between border-b border-neutral-200/70 bg-white/50 px-3 py-2 backdrop-blur-md dark:border-neutral-800 dark:bg-white/5">
-            <button onclick={goHome} aria-label="back" class="w-6 text-accent text-sm font-semibold">‹</button>
-            <span class="flex-1 truncate text-center text-sm font-semibold">{appTitle(s.id)}</span>
-            <span class="w-6"></span>
+          <div class="flex items-center justify-between border-b border-neutral-200/70 bg-white/50 px-3 py-3 backdrop-blur-md dark:border-neutral-800 dark:bg-white/5">
+            <button
+              onclick={goHome}
+              aria-label="back"
+              class="-ml-1 grid h-10 w-10 cursor-pointer place-items-center rounded-full text-accent text-[17px] font-semibold transition active:bg-black/5 dark:active:bg-white/10"
+            >‹</button>
+            <span class="flex-1 truncate text-center text-[17px] font-semibold tracking-tight">{appTitle(s.id)}</span>
+            <span class="w-10"></span>
           </div>
           <div class="min-h-0 flex-1">
             {#key s.id}
@@ -192,14 +258,18 @@
               {/if}
             {/key}
           </div>
-          <!-- Home indicator (matches the OS home gesture; returns to the shell home) -->
-          <div class="flex justify-center pb-1 pt-1">
+          <!-- Home indicator: a horizontal bar (iOS-style); tapping returns to the
+               shell home. The whole strip is the touch target (44px tall for touch). -->
+          <div class="flex justify-center pb-2 pt-1">
             <button
               aria-label="home"
               data-testid="home-indicator"
+              title="Home"
               onclick={goHome}
-              class="grid h-6 w-6 place-items-center rounded-full bg-neutral-800/80 ring-1 ring-white/20"
-            >⌂</button>
+              class="grid w-40 cursor-pointer place-items-center py-2"
+            >
+              <span class="block h-1.5 w-16 rounded-full bg-neutral-800/80 ring-1 ring-white/10 dark:bg-neutral-200/90 dark:ring-black/10"></span>
+            </button>
           </div>
         </div>
       {:else}

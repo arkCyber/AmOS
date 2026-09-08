@@ -1,12 +1,18 @@
 <!doctype html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN" class="h-full">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
     <title>Amos System UI</title>
   </head>
-  <body class="bg-neutral-100 text-neutral-900 antialiased dark:bg-neutral-950 dark:text-neutral-100">
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+  <body class="h-full bg-neutral-900">
+    <!-- Root / index.html IS the pure-Svelte System UI shell (Shell.svelte).
+         The legacy React host (main.tsx/App.tsx) is retired by the React→Svelte
+         migration; keep this page loading the same entry as shell.html so the
+         Tauri main window (which serves frontendDist root "/") mounts the
+         Svelte shell instead of a blank React root. -->
+    <div id="root" class="h-full"></div>
+    <script type="module" src="/src/shell-entry.ts"></script>
   </body>
 </html>
+

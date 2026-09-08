@@ -69,20 +69,11 @@
   });
   const quiet = $derived(dndActive(normalizeQuick(quick)));
 
-  // Fine-pointer (mouse) → allow drag-to-reorder; coarse/touch disables native
-  // drag so a horizontal swipe pages the grid instead. Fall back to draggable
-  // when matchMedia is absent (SSR / happy-dom).
-  const reorderable = (() => {
-    try {
-      return (
-        typeof window === "undefined" ||
-        !window.matchMedia ||
-        window.matchMedia("(pointer: fine)").matches
-      );
-    } catch {
-      return true;
-    }
-  })();
+  // iOS-aligned: NO always-on drag-to-reorder on the home (reordering happens in
+  // the Edit-Home surface). A mouse drag therefore pages the icon grid left/right
+  // exactly like a touch swipe. State shared by the mouse + touch paging handlers.
+  let mousePanX: number | null = null;
+  let mousePanned = false;
 
   // ---- label / badge / icon resolution (pure lib reuse) ----
   const extById = $derived(new Map(ext.map((e) => [e.id, e])));
@@ -128,35 +119,16 @@
   let panX: number | null = null;
   let panned = false;
 
-  function handleDragStart(id: string): void {
-    dragId = id;
-  }
-  function handleDrop(id: string): void {
-    const src = dragId;
-    dragId = null;
-    if (src && src !== id) home.emit("move", { drag: src, over: id });
-  }
+  // ---- Icon grid paging (shared page-turn logic) ----
   function handleTap(id: string): void {
     if (dragId) {
-      dragId = null; // a tap right after a drag shouldn't open the app
+      dragId = null; // a click right after a page-swipe shouldn't open the app
       return;
     }
     home.emit("open", id);
   }
-  function onGridStart(e: TouchEvent): void {
-    const x = e.touches[0]?.clientX;
-    panX = x == null ? null : x;
-    panned = false;
-  }
-  function onGridMove(e: TouchEvent): void {
-    const x0 = panX;
-    if (x0 == null || panned) return;
-    const x = e.touches[0]?.clientX;
-    if (x == null) return;
-    const dx = x - x0;
-    if (Math.abs(dx) < 48) return;
-    panned = true;
-    panX = null;
+  function pageBy(dx: number): void {
+    // Reset the click-suppression flag for the gesture that just happened.
     dragId = "__grid_pan__";
     window.setTimeout(() => {
       if (dragId === "__grid_pan__") dragId = null;
@@ -174,8 +146,59 @@
       gridPage = Math.max(gridPage - 1, 0);
     }
   }
+
+  function onGridStart(e: TouchEvent): void {
+    const x = e.touches[0]?.clientX;
+    panX = x == null ? null : x;
+    panned = false;
+  }
+  function onGridMove(e: TouchEvent): void {
+    const x0 = panX;
+    if (x0 == null || panned) return;
+    const x = e.touches[0]?.clientX;
+    if (x == null) return;
+    const dx = x - x0;
+    if (Math.abs(dx) < 48) return;
+    panned = true;
+    panX = null;
+    pageBy(dx);
+  }
   function onGridEnd(): void {
     panX = null;
+  }
+
+  // ---- Mouse paging: drag anywhere on the home column with the mouse to page
+  // (mouse/pen). Touch keeps its existing handlers; we only react to mouse here
+  // so a mouse drag = page, aligned with iOS page swipes. Native HTML5
+  // drag-reorder is disabled on the home (reorder lives in Edit-Home). -->
+  function onMouseDown(e: PointerEvent): void {
+    if (e.pointerType !== "mouse") return;
+    mousePanX = e.clientX;
+    mousePanned = false;
+    // NOTE: deliberately NO setPointerCapture here — capturing the pointer onto
+    // this container would redirect the synthesized `click` to the container too,
+    // so tapping an app icon would stop opening the app. Mouse drags stay within
+    // the full-width home column, so move events continue to bubble to us anyway.
+    // A click (no >48px move) still opens the app; a big horizontal drag pages.
+  }
+  function onMouseMove(e: PointerEvent): void {
+    if (e.pointerType !== "mouse") return;
+    const x0 = mousePanX;
+    if (x0 == null || mousePanned) return;
+    const dx = e.clientX - x0;
+    if (Math.abs(dx) < 48) return;
+    mousePanned = true;
+    mousePanX = null;
+    pageBy(dx);
+  }
+  function onMouseUp(e: PointerEvent): void {
+    if (e.pointerType !== "mouse") return;
+    mousePanX = null;
+    mousePanned = false;
+  }
+  function onMouseCancel(): void {
+    mousePanX = null;
+    mousePanned = false;
   }
 
   // ---- Home-body downward swipe → Spotlight (iPhone "swipe down on Home to
@@ -247,6 +270,10 @@
   ontouchstart={onHomeTouchStart}
   ontouchend={onHomeTouchEnd}
   ontouchcancel={onHomeTouchCancel}
+  onpointerdown={onMouseDown}
+  onpointermove={onMouseMove}
+  onpointerup={onMouseUp}
+  onpointercancel={onMouseCancel}
 >
   <!-- main paged region: a horizontal swipe ANYWHERE in this column pages the
        icon grid; widgets stay fixed above, bottom dock stays a single row below -->
@@ -267,8 +294,8 @@
           class="flex flex-col justify-center rounded-3xl bg-white/40 p-4 text-left shadow-sm ring-1 ring-black/5 backdrop-blur-md transition active:scale-95 dark:bg-white/10 dark:ring-white/10"
           onclick={() => home.emit("open", "clock")}
         >
-          <div class="text-4xl font-thin leading-none tabular-nums">{fmtClock(now)}</div>
-          <div class="mt-2 text-xs opacity-70">{dateStr}</div>
+          <div class="text-4xl font-medium leading-none tabular-nums text-neutral-900 dark:text-white">{fmtClock(now)}</div>
+          <div class="mt-2 text-xs text-neutral-600/90 dark:text-neutral-300/90">{dateStr}</div>
         </button>
 {#if today}
           <button
@@ -277,16 +304,17 @@
             onclick={() => home.emit("open", "weather")}
           >
             <div class="text-2xl">{today.icon}</div>
-            <div class="text-xl font-thin tabular-nums">{today.temp}°</div>
-            <div class="text-[10px] opacity-70">{t("weather.today")}</div>
+            <div class="text-xl font-medium tabular-nums text-neutral-900 dark:text-white">{today.temp}°</div>
+            <div class="text-[10px] text-neutral-500 dark:text-neutral-300">{t("weather.today")}</div>
           </button>
         {/if}
       </div>
     </div>
 
-    <!-- paged icon grid -->
+    <!-- paged icon grid: vertically centered in the space above the paging/search
+         rows (dock is pinned at the bottom of the column). -->
     <div class="flex min-h-0 flex-1 flex-col justify-center">
-      <div class="grid grid-cols-4 place-content-center gap-y-5" data-testid="home-grid">
+      <div class="grid grid-cols-4 place-content-center place-items-center gap-y-6" data-testid="home-grid">
         {#each shownGrid as id (id)}
           {@render tile(id)}
         {/each}
@@ -317,16 +345,15 @@
           {/each}
         </div>
       {/if}
-      <!-- iOS-style "App Library" trailing-page entry (always present, even with a
-           single icon page). A bigger 4×4 mini-app-grid icon, like the iOS App
-           Library indicator. Left-swipe past the last page reaches the same place. -->
+      <!-- iOS-style "App Library" (分组图标) stays on the SAME line as the paging
+           dots — the trailing-page group indicator of the home pager. -->
       <button
         type="button"
         data-testid="app-library-entry"
         aria-label={t("appLibrary.title")}
         title={t("appLibrary.title")}
         onclick={() => home.emit("library")}
-        class="ml-1 grid h-6 w-6 cursor-pointer place-items-center rounded-[7px] bg-white/45 shadow-sm ring-1 ring-black/5 transition hover:scale-105 active:scale-90 dark:bg-white/10 dark:ring-white/10"
+        class="grid h-6 w-6 cursor-pointer place-items-center rounded-[7px] bg-white/45 shadow-sm ring-1 ring-black/5 transition hover:scale-105 active:scale-90 dark:bg-white/10 dark:ring-white/10"
       >
         <span aria-hidden="true" class="grid w-4 grid-cols-4 gap-px">
           {#each Array(16) as _, i (i)}
@@ -335,45 +362,53 @@
         </span>
       </button>
     </div>
+    <!-- Spotlight search pill (🔍 + label) alone on its own line (below the pager row);
+         mb keeps a comfortable gap above the dock bar. -->
+    <div class="mb-[30px] mt-1 flex items-center justify-center">
+      <button
+        type="button"
+        data-testid="home-search-entry"
+        aria-label={t("shell.search")}
+        title={t("shell.search")}
+        onclick={() => home.emit("search")}
+        class="flex h-6 cursor-pointer items-center gap-1 rounded-full bg-white/45 px-2 text-[11px] font-medium text-neutral-700 shadow-sm ring-1 ring-black/5 transition hover:scale-105 active:scale-90 dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
+      >
+        <span aria-hidden="true" class="text-[10px] leading-none">🔍</span>
+        <span>{t("shell.search")}</span>
+      </button>
+    </div>
   </div>
 
   <!-- bottom dock bar: single fixed row (no paging) -->
   <div
-    class="dock-mag flex items-end justify-around rounded-3xl bg-white/30 px-2 py-3 shadow-inner ring-1 ring-black/5 backdrop-blur-md dark:bg-neutral-900/40 dark:ring-white/10"
+    class="dock-mag flex items-end justify-around rounded-3xl bg-white/30 px-3 py-3.5 shadow-inner ring-1 ring-black/5 backdrop-blur-md dark:bg-neutral-900/40 dark:ring-white/10"
   >
     {#each dockIds as id (id)}
-      {@render tile(id)}
+      {@render tile(id, true)}
     {/each}
   </div>
 </div>
 
 
-{#snippet tile(id: string)}
+{#snippet tile(id: string, inDock = false)}
   <button
     aria-label={labelOf(id)}
     title={labelOf(id)}
-    draggable={reorderable}
     onclick={() => handleTap(id)}
-    ondragstart={(e) => {
-      handleDragStart(id);
-      e.dataTransfer?.setData("text/plain", id);
-    }}
-    ondragover={(e) => e.preventDefault()}
-    ondrop={(e) => {
-      e.preventDefault();
-      handleDrop(id);
-    }}
-    class="group flex w-16 flex-col items-center gap-1 outline-none"
+    class="group flex flex-col items-center gap-1 outline-none {inDock ? 'w-20' : 'w-16'}"
   >
     <span class="relative">
       <AppIcon
         id={id}
         icon={iconOf(id)}
         tileClassName={
-          "h-14 w-14 rounded-[19px] group-hover:-translate-y-0.5 group-active:scale-90" +
+          (inDock
+            ? "h-[60px] w-[60px] rounded-[21px]"
+            : "h-14 w-14 rounded-[19px]") +
+          " group-hover:-translate-y-0.5 group-active:scale-90" +
           (pulseId === id ? " animate-pulse ring-2 ring-accent" : "")
         }
-        glyphClassName="text-[2.5rem]"
+        glyphClassName={inDock ? "text-[2.7rem]" : "text-[2.5rem]"}
       />
       {#if unreadOf(id) > 0}
         <span
@@ -381,9 +416,11 @@
         >{unreadOf(id) > 99 ? "99+" : unreadOf(id)}</span>
       {/if}
     </span>
-    <span
-      class="max-w-full truncate text-xs font-medium text-neutral-800 transition-colors group-hover:text-accent dark:text-neutral-200"
-    >{labelOf(id)}</span>
+    {#if !inDock}
+      <span
+        class="max-w-full truncate text-xs font-medium text-neutral-800 transition-colors group-hover:text-accent dark:text-neutral-200"
+      >{labelOf(id)}</span>
+    {/if}
   </button>
 {/snippet}
 

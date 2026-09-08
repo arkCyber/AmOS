@@ -39,9 +39,11 @@
 )]
 
 pub mod error;
+pub mod exact;
 pub mod scheduler;
 pub mod spec;
 
 pub use error::SchedulerError;
+pub use exact::ExactAlarmClock;
 pub use scheduler::{ScheduledJob, Scheduler};
 pub use spec::{JobId, JobType, PowerState};

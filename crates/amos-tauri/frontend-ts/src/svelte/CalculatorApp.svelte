@@ -120,8 +120,10 @@
     </button>
   </div>
 
-  <!-- Big iOS-style display region (fills all space above the keypad). -->
-  <div class="relative min-h-0 flex-1 px-5">
+  <!-- Big iOS-style display region (a fixed band above the keypad, so the number
+       sits higher and the whole keypad moves up — not bottom-docked with a huge
+       empty gap above the digits). -->
+  <div class="relative h-[38%] shrink-0 px-5">
     {#if showHist}
       {#if history.length > 0}
         <div class="fade-in absolute inset-x-4 top-1 max-h-[70%] overflow-auto rounded-xl bg-white/10 p-2 text-sm backdrop-blur-md">
@@ -147,18 +149,18 @@
         </div>
       {/if}
     {/if}
-    <div class="flex h-full flex-col justify-end pb-2">
+    <div class="flex h-full flex-col justify-end pb-4">
       {#if operand}
         <div
           aria-hidden="true"
-          class="truncate pb-1 text-right text-2xl font-light tabular-nums text-white/45"
+          class="truncate pb-1 text-right text-2xl font-medium tabular-nums text-white/45"
         >
           {operand}
         </div>
       {/if}
       <div
         role="status"
-        class="truncate text-right font-thin leading-none tabular-nums"
+        class="truncate text-right font-medium leading-none tabular-nums"
         style:font-size={isErr ? "40px" : `${calcFontPx(big)}px`}
         style:color={isErr ? "rgb(var(--danger))" : ""}
       >
@@ -167,9 +169,11 @@
     </div>
   </div>
 
-  <!-- Keypad pinned to the bottom, square keys sized by column width. -->
+  <!-- Keypad pinned to the bottom, square keys sized by column width; the keypad
+       is width-capped + centered so keys keep iPhone-like proportions even on a
+       wider canvas, and gaps/glyphs match the compact iOS layout. -->
   <div class="px-2 pb-3">
-    <div class="grid grid-cols-4 gap-x-3 gap-y-3">
+    <div class="mx-auto grid w-full max-w-[400px] grid-cols-4 gap-2">
       {#each LAYOUT as row, ri}
         {#each row as k}
           {@const wide = k === "0" && ri === LAYOUT.length - 1}
@@ -177,8 +181,8 @@
           <button
             onclick={() => press(k)}
             aria-label={glyph}
-            class="flex select-none items-center rounded-full text-[26px] leading-none transition active:brightness-150 active:scale-95 {wide
-              ? 'col-span-2 justify-start pl-8 text-left'
+            class="flex select-none items-center rounded-full text-[22px] leading-none transition active:brightness-150 active:scale-95 {wide
+              ? 'col-span-2 justify-start pl-7 text-left'
               : 'aspect-square justify-center'} {keyCls(k)}"
           >
             {glyph}

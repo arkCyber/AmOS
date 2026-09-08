@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { batteryPercent, fmtClock, zoneClock, stopwatchReducer, stopwatchInit, fmtStopwatch, timerReducer, timerInit, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, alarmKey, dayAllowed, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, WORLD_CITY_MAX, defaultWorldCities, lapDeltas, fastestLap, type Alarm } from "../lib/time";
+import { batteryPercent, fmtClock, zoneClock, stopwatchReducer, stopwatchInit, fmtStopwatch, timerReducer, timerInit, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, alarmKey, dayAllowed, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, WORLD_CITY_MAX, defaultWorldCities, lapDeltas, fastestLap, slowestLap, moveWorldCity, alarmsByTime, nextAlarmAtMs, risingEdge, type Alarm } from "../lib/time";
 describe("time / status bar", () => {
   test("fmtClock pads hours/minutes", () => {
     expect(fmtClock(new Date(2024, 0, 1, 9, 5))).toBe("09:05");
@@ -237,18 +237,25 @@ describe("time / status bar", () => {
       "Europe/London",
       "America/New_York",
     ]);
-    // add a new city
+    // a much bigger catalog is now offered than the default four
+    expect(WORLD_CITY_PRESETS.length).toBeGreaterThan(6);
+    // add a specific (newer) preset city
     const sydney = WORLD_CITY_PRESETS.find((c) => c.zone === "Australia/Sydney")!;
     const five = addWorldCity(def, sydney);
     expect(five.length).toBe(5);
     expect(five[4]!.zone).toBe("Australia/Sydney");
     // add existing -> same list (no-op)
     expect(addWorldCity(five, sydney)).toBe(five);
-    // push past cap drops the oldest
-    const other = { zone: "X", labelKey: "x" };
-    const capped = addWorldCity(five, other); // 6
-    expect(capped.length).toBe(WORLD_CITY_MAX);
-    expect(addWorldCity(capped, other)).toBe(capped); // dup at cap -> no-op
+    // fill up to the cap then one more evicts the oldest (LIFO by age)
+    let list = def; // starts with the default four
+    for (let i = 0; i < WORLD_CITY_MAX; i++) {
+      list = addWorldCity(list, { zone: `Zone/${i}`, labelKey: "x" });
+    }
+    expect(list.length).toBe(WORLD_CITY_MAX);
+    const capped = addWorldCity(list, { zone: "Zone/extra", labelKey: "x" });
+    expect(capped.length).toBe(WORLD_CITY_MAX); // never exceeds the cap
+    expect(capped.some((c) => c.zone === "Asia/Shanghai")).toBe(false); // oldest evicted
+    expect(addWorldCity(capped, capped[0]!)).toBe(capped); // dup at cap -> no-op
     // remove
     expect(removeWorldCity(five, "Asia/Tokyo").map((c) => c.zone)).not.toContain("Asia/Tokyo");
     // sanitize persisted garbage
@@ -299,6 +306,236 @@ describe("alarmsReducer add — repeat sanitization (bug: invalid day numbers le
     expect(dayAllowed(al, new Date(2024, 0, 6))).toBe(true); // 2024-01-06 Sat = 6
     expect(dayAllowed(al, new Date(2024, 0, 7))).toBe(false); // 2024-01-07 Sun = 0
     expect(dayAllowed(al, new Date(2024, 0, 2))).toBe(false); // Tue = 2
+  });
+});
+
+describe("alarmsReducer update — edit an existing alarm (iOS parity)", () => {
+  const at = (h: number, m: number) => new Date(2024, 0, 1, h, m, 0);
+  const seed = () => {
+    let s = alarmInit();
+    s = alarmsReducer(s, { type: "add", hour: 8, min: 30, label: "起床", repeat: [1, 2, 3, 4, 5] });
+    return { s, id: s.list[0]!.id };
+  };
+
+  test("rewrites hour/min/label/repeat and preserves id/enabled/tone", () => {
+    const { s, id } = seed();
+    const before = s.list[0]!;
+    const next = alarmsReducer(s, {
+      type: "update", id, hour: 7, min: 5, label: "晨跑", repeat: [1, 3, 5],
+    });
+    expect(next.list).toHaveLength(1);
+    const al = next.list[0]!;
+    expect(al.id).toBe(id); // same identity — an edit, not an add/remove
+    expect(al).toMatchObject({ hour: 7, min: 5, label: "晨跑", repeat: [1, 3, 5] });
+    expect(al.enabled).toBe(before.enabled);
+    expect(al.tone).toBe(before.tone);
+  });
+
+  test("clamps out-of-range times like add does", () => {
+    const { s, id } = seed();
+    const next = alarmsReducer(s, {
+      type: "update", id, hour: 99, min: -3, label: "", repeat: [],
+    });
+    expect(next.list[0]).toMatchObject({ hour: 23, min: 0, label: "" });
+  });
+
+  test("clearing every repeat day falls back to 'every day' (no repeat field)", () => {
+    const { s, id } = seed();
+    expect(s.list[0]!.repeat).toEqual([1, 2, 3, 4, 5]);
+    const next = alarmsReducer(s, { type: "update", id, hour: 8, min: 30, label: "", repeat: [] });
+    const al = next.list[0]!;
+    expect(al.repeat).toBeUndefined();
+    expect(dayAllowed(al, at(7, 0))).toBe(true); // Sunday now allowed
+  });
+
+  test("a ringing alarm is silenced when edited to a new time", () => {
+    let s = seed().s;
+    const id = s.list[0]!.id;
+    s = alarmsReducer(s, { type: "tick", now: at(8, 29) });
+    s = alarmsReducer(s, { type: "tick", now: at(8, 30) }); // rings at 08:30
+    expect(ringingAlarms(s).length).toBe(1);
+    // User edits it to 06:45 → stops ringing, and 08:30 won't re-fire that minute.
+    s = alarmsReducer(s, { type: "update", id, hour: 6, min: 45, label: "更早", repeat: [] });
+    expect(ringingAlarms(s)).toEqual([]);
+    expect(s.list[0]).toMatchObject({ hour: 6, min: 45, label: "更早" });
+    s = alarmsReducer(s, { type: "tick", now: at(8, 30) });
+    expect(ringingAlarms(s)).toEqual([]);
+    // And it fires at the NEW minute instead.
+    s = alarmsReducer(s, { type: "tick", now: at(6, 44) });
+    s = alarmsReducer(s, { type: "tick", now: at(6, 45) });
+    expect(ringingAlarms(s).length).toBe(1);
+  });
+});
+
+describe("alarmsReducer — ringtone tone on add/edit", () => {
+  const seed = () => {
+    let s = alarmInit();
+    s = alarmsReducer(s, { type: "add", hour: 8, min: 30, label: "", tone: "🔔" });
+    return { s, id: s.list[0]!.id };
+  };
+
+  test("add stores the chosen tone", () => {
+    let s = alarmInit();
+    s = alarmsReducer(s, { type: "add", hour: 7, min: 0, label: "", tone: "⏰" });
+    expect(s.list[0]!.tone).toBe("⏰");
+  });
+
+  test("update with a tone token replaces it; absent keeps the existing one", () => {
+    const { s, id } = seed();
+    expect(s.list[0]!.tone).toBe("🔔");
+    const changed = alarmsReducer(s, {
+      type: "update", id, hour: 9, min: 0, label: "", repeat: [], tone: "🎶",
+    });
+    expect(changed.list[0]!.tone).toBe("🎶");
+    // No tone in the action → tone is left untouched.
+    const kept = alarmsReducer(changed, {
+      type: "update", id, hour: 10, min: 0, label: "", repeat: [],
+    });
+    expect(kept.list[0]!.tone).toBe("🎶");
+    // An invalid tone token is ignored (keeps the current one).
+    const invalid = alarmsReducer(kept, {
+      type: "update", id, hour: 11, min: 0, label: "", repeat: [], tone: "nope",
+    });
+    expect(invalid.list[0]!.tone).toBe("🎶");
+  });
+});
+
+describe("slowestLap + moveWorldCity", () => {
+  test("slowestLap returns the index of the largest lap delta (-1 when none)", () => {
+    // Cumulative lap snapshots → deltas [3000, 2000, 4000, 3000].
+    const snaps = [3000, 5000, 9000, 12000];
+    expect(fastestLap(snaps)).toBe(1); // 2000ms lap is the fastest
+    expect(slowestLap(snaps)).toBe(2); // 4000ms lap is the slowest
+    expect(slowestLap([])).toBe(-1);
+  });
+
+  test("moveWorldCity reorders, clamps and no-ops on no-change", () => {
+    const mk = () =>
+      ["A", "B", "C", "D"].map((z) => ({ zone: `T/${z}`, labelKey: `clock.city.${z.toLowerCase()}` }));
+    expect(moveWorldCity(mk(), 0, 2).map((c) => c.zone)).toEqual([
+      "T/B", "T/C", "T/A", "T/D",
+    ]);
+    expect(moveWorldCity(mk(), 3, 0).map((c) => c.zone)).toEqual([
+      "T/D", "T/A", "T/B", "T/C",
+    ]);
+    // Same index / NaN are no-ops returning the same array.
+    const l = mk();
+    expect(moveWorldCity(l, 0, 0)).toBe(l);
+    expect(moveWorldCity(l, 1, Number.NaN)).toBe(l);
+    // Out-of-range indices are clamped to [0, n-1], so -5→99 == 0→3 reorder.
+    const clamped = moveWorldCity(mk(), -5, 99);
+    expect(clamped).not.toBe(mk());
+    expect(clamped.map((c) => c.zone)).toEqual(["T/B", "T/C", "T/D", "T/A"]);
+  });
+
+  test("alarmsByTime returns a stable earliest-first copy without mutating input", () => {
+    const mk = (id: string, hour: number, min: number): Alarm => ({
+      id, hour, min, label: "", enabled: true, ringing: false, tone: "🔔",
+    });
+    const list = [mk("late", 8, 30), mk("early", 6, 0), mk("same", 8, 30)];
+    const sorted = alarmsByTime(list);
+    expect(sorted.map((a) => a.id)).toEqual(["early", "late", "same"]);
+    expect(list.map((a) => a.id)).toEqual(["late", "early", "same"]); // input untouched
+    expect(sorted[1]).toBe(list[0]); // ties keep identity
+  });
+
+  test("nextAlarmAtMs returns the next allowed occurrence strictly after now", () => {
+    // 2026-09-07 is a Monday.
+    const monday8am = new Date(2026, 8, 7, 8, 0).getTime();
+    const daily: Alarm = { id: "d", hour: 8, min: 30, label: "", enabled: true, ringing: false };
+    // Still later today → same day 08:30.
+    expect(nextAlarmAtMs(daily, monday8am)).toBe(new Date(2026, 8, 7, 8, 30).getTime());
+    // After today's time already passed → tomorrow 08:30.
+    const monday9am = new Date(2026, 8, 7, 9, 0).getTime();
+    expect(nextAlarmAtMs(daily, monday9am)).toBe(new Date(2026, 8, 8, 8, 30).getTime());
+    // Weekday-only alarm on a Sunday evening → next Monday 08:30.
+    const weekday: Alarm = { ...daily, repeat: [1, 2, 3, 4, 5] };
+    const sunday10pm = new Date(2026, 8, 6, 22, 0).getTime(); // 2026-09-06 is a Sunday
+    expect(nextAlarmAtMs(weekday, sunday10pm)).toBe(new Date(2026, 8, 7, 8, 30).getTime());
+  });
+});
+
+describe("risingEdge (one-shot transient cues)", () => {
+  test("is true only on the false→true transition", () => {
+    expect(risingEdge(false, true)).toBe(true); // the cue fires here
+    expect(risingEdge(true, true)).toBe(false); // already done — no re-fire
+    expect(risingEdge(true, false)).toBe(false); // falling edge
+    expect(risingEdge(false, false)).toBe(false); // steady
+  });
+});
+
+describe("alarm snoozeMin — per-alarm snooze length", () => {
+  const at = (h: number, m: number) => new Date(2024, 0, 1, h, m, 0);
+
+  test("snooze uses the alarm's snoozeMin; absent falls back to 5", () => {
+    // Default (no snoozeMin) → +5 minutes (8:05).
+    let s = alarmInit();
+    s = alarmsReducer(s, { type: "add", hour: 8, min: 0, label: "" });
+    const id = s.list[0]!.id;
+    s = alarmsReducer(s, { type: "tick", now: at(7, 59) });
+    s = alarmsReducer(s, { type: "tick", now: at(8, 0) });
+    s = alarmsReducer(s, { type: "snooze", id, now: at(8, 0) });
+    expect(s.list[0]).toMatchObject({ hour: 8, min: 5 });
+
+    // snoozeMin 9 → +9 minutes (8:09).
+    let s2 = alarmInit();
+    s2 = alarmsReducer(s2, { type: "add", hour: 8, min: 0, label: "", snoozeMin: 9 });
+    const id2 = s2.list[0]!.id;
+    s2 = alarmsReducer(s2, { type: "tick", now: at(7, 59) });
+    s2 = alarmsReducer(s2, { type: "tick", now: at(8, 0) });
+    s2 = alarmsReducer(s2, { type: "snooze", id: id2, now: at(8, 0) });
+    expect(s2.list[0]).toMatchObject({ hour: 8, min: 9 });
+    expect(s2.list[0]!.snoozeMin).toBe(9);
+  });
+
+  test("add/update store snoozeMin; normalize keeps a valid one", () => {
+    let s = alarmInit();
+    s = alarmsReducer(s, { type: "add", hour: 7, min: 0, label: "", snoozeMin: 15 });
+    expect(s.list[0]!.snoozeMin).toBe(15);
+    s = alarmsReducer(s, { type: "update", id: s.list[0]!.id, hour: 8, min: 0, label: "", snoozeMin: 9 });
+    expect(s.list[0]!.snoozeMin).toBe(9);
+    // Invalid values are dropped (falls back to default at snooze time).
+    s = alarmsReducer(s, { type: "update", id: s.list[0]!.id, hour: 8, min: 0, label: "", snoozeMin: 999 });
+    expect(s.list[0]!.snoozeMin).toBe(9); // unchanged (invalid ignored)
+    // normalize keeps a valid persisted snoozeMin.
+    const kept = normalizeAlarms([{ id: "x", hour: 6, min: 0, label: "", enabled: true, ringing: false, snoozeMin: 9 }]);
+    expect(kept[0]!.snoozeMin).toBe(9);
+  });
+});
+
+describe("world-clock extra (name) cities", () => {
+  const HK = { zone: "Asia/Hong_Kong", labelKey: "", name: { zh: "香港", en: "Hong Kong" } };
+
+  test("normalize keeps preset zones and valid-name extra cities, drops garbage", () => {
+    const def = defaultWorldCities();
+    const got = normalizeWorldCities(
+      [
+        HK, // non-preset, has a bilingual name → kept
+        { zone: "Asia/Tokyo" }, // preset → kept (normalized)
+        { zone: "Mars/Olympus" }, // unknown + no name → garbage
+        3,
+        null,
+      ],
+      def,
+    );
+    const zones = got.map((c) => c.zone);
+    expect(zones).toContain("Asia/Hong_Kong");
+    expect(zones).toContain("Asia/Tokyo");
+    expect(zones).not.toContain("Mars/Olympus");
+    expect(got.find((c) => c.zone === "Asia/Hong_Kong")?.name).toEqual({ zh: "香港", en: "Hong Kong" });
+  });
+
+  test("extra cities can be added and the cap stays bounded", () => {
+    let list = defaultWorldCities(); // 4
+    list = addWorldCity(list, HK);
+    expect(list.some((c) => c.zone === "Asia/Hong_Kong")).toBe(true);
+    // Fill to WORLD_CITY_MAX then add → oldest evicted, length stays bounded.
+    for (let i = 0; i < WORLD_CITY_MAX; i++) {
+      list = addWorldCity(list, { zone: `Extra/${i}`, labelKey: "", name: { zh: `城${i}`, en: `City ${i}` } });
+    }
+    expect(list.length).toBe(WORLD_CITY_MAX);
+    const extra = addWorldCity(list, { zone: "Extra/final", labelKey: "", name: { zh: "末", en: "Last" } });
+    expect(extra.length).toBe(WORLD_CITY_MAX);
   });
 });
 

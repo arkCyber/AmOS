@@ -7,16 +7,17 @@
  * the way the React shell does. Actions are pure state transitions with NO React
  * on the import graph.
  *
- * NOTE: opening an app also clears that app's notification badge + records a
- * recent — that needs a React-free APPS meta module (id→titleKey), a later
- * Phase-3 foundation. Until then this module owns only surface/overlay/layout.
+ * NOTE: `open()` already records a recent for built-in apps (drives the App
+ * Library "Frequently Used" group) using the React-free appMeta module. Clearing
+ * the opened app's notification badge is still a later Phase-3 foundation.
  */
-import { saveLayout, type HomeLayout } from "../lib/amosStore";
-import { readStoreValue } from "../lib/amosStore";
+import { saveLayout, pushRecent, getLayout, defaultLayout, type HomeLayout } from "../lib/amosStore";
+import { appTitleKey, appIds } from "../lib/appMeta";
 
 export type Surface =
   | { kind: "home" }
   | { kind: "app"; id: string }
+  | { kind: "library" }
   | { kind: "lock" }
   | { kind: "edit" };
 
@@ -28,13 +29,23 @@ let _recentsOpen = $state(false);
 let _spotOpen = $state(false);
 /** Id of the app icon currently pulsing (Spotlight soft-launch), if any. */
 let _pulseId = $state<string | null>(null);
-/** The persisted home layout (kept in sync when we reach the store). */
-const initialLayout: HomeLayout =
-  readStoreValue<HomeLayout | null>("amos.home.layout", null) ?? {
-    page: [],
-    dock: [],
-    hidden: [],
-  };
+/** The persisted home layout (kept in sync when we reach the store). On a fresh
+ * run (or a previously-persisted-but-empty home) with built-in apps available we
+ * seed a real default via getLayout(appIds()) — the built-in dock apps + the rest
+ * on a page. Without this, a first boot has NO persisted layout and the Svelte
+ * shell fell back to an all-empty {page:[],dock:[],hidden:[]}, leaving the home
+ * grid and dock blank ("页面内容不完整"). getLayout() already returns the default
+ * when nothing is persisted; we additionally treat a *persisted-but-empty* home
+ * as needing a default so a stale empty amos.home.layout can't blank the launcher. */
+function seededHome(): HomeLayout {
+  const available = appIds();
+  const l = getLayout(available);
+  if (l.page.length === 0 && l.dock.length === 0 && available.length > 0) {
+    return defaultLayout(available);
+  }
+  return l;
+}
+const initialLayout: HomeLayout = seededHome();
 let _layout = $state<HomeLayout>(initialLayout);
 
 // Svelte 5 forbids exporting reassigned $state from a module, so expose getters.
@@ -63,10 +74,20 @@ function clearOverlays() {
   _spotOpen = false;
 }
 
-/** Open an app screen (from dock/grid/recents). */
+/** Open an app screen (from dock/grid/recents/library). Records a recent (built-ins
+ * only — third-party ids don't pollute the frequently-used set) so the App Library
+ * "Frequently Used" group stays live, mirroring the React shell's `open`. */
 export function open(id: string): void {
+  if (appTitleKey(id) !== null) pushRecent(id);
   clearOverlays();
   _surface = { kind: "app", id };
+}
+
+/** Enter the iOS-style "App Library" page (grouped apps + frequently used). */
+export function enterLibrary(): void {
+  clearOverlays();
+  _pulseId = null;
+  _surface = { kind: "library" };
 }
 
 /** Spotlight "soft launch": pulse the icon on home, stay home. */
@@ -136,12 +157,9 @@ export function resetShellState(): void {
   _recentsOpen = false;
   _spotOpen = false;
   _pulseId = null;
-  _layout =
-    readStoreValue<HomeLayout | null>("amos.home.layout", null) ?? {
-      page: [],
-      dock: [],
-      hidden: [],
-    };
+  // Same non-empty seeding as module init (see seededHome): a fresh / empty
+  // persisted home must not blank the launcher grid + dock.
+  _layout = seededHome();
 }
 
 

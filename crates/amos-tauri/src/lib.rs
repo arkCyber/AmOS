@@ -12,6 +12,7 @@
 )]
 
 pub mod ai_bridge;
+pub mod alarm_sched;
 #[cfg(feature = "android")]
 pub mod android_glue;
 pub mod android_lmk;
@@ -76,6 +77,7 @@ pub fn run() {
         .manage(assistant_voice::DeviceMic::new())
         .manage(WmState::new())
         .manage(SystemContext::new())
+        .manage(alarm_sched::AlarmSchedState::new())
         .manage(clipboard.clone())
         .manage(shared_store)
         .manage(radio_bridge)
@@ -110,6 +112,7 @@ pub fn run() {
             ai_bridge::android_lmk_tasks,
             android_lmk::android_lmk_debug,
             buttons::simulate_button,
+            buttons::take_pending_hardware_button,
             wm::wm_open,
             wm::wm_focus,
             wm::wm_hide,
@@ -201,6 +204,9 @@ pub fn run() {
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
             taskmgr::taskmgr_job_action,
+            alarm_sched::scheduler_alarm_register,
+            alarm_sched::scheduler_alarm_cancel,
+            alarm_sched::scheduler_alarm_poll,
             real_dial::real_dial
         ])
         .setup(|app| {

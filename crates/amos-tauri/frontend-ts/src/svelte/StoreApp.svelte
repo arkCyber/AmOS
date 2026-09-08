@@ -1,6 +1,6 @@
 <script lang="ts">
-  // StoreApp.svelte — Svelte 5 (runes) port of the React StoreApp
-  // (src/components/StoreApp.tsx). App Store over the amos-appstore bridge:
+  // StoreApp.svelte — Svelte 5 (runes) single-source implementation of the app
+  // store screen. App Store over the amos-appstore bridge:
   // browse catalog + install/upgrade/uninstall; syncs home-screen tiles via
   // lib/storeApps. Offline (no bridge) shows a localized notice (testable here);
   // real catalog + lifecycle need the appstore daemon (device acceptance).

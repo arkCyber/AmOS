@@ -1,10 +1,10 @@
 <script lang="ts">
-  // MagnifierApp.svelte — Svelte 5 (runes) port of the React MagnifierApp
-  // (src/components/MagnifierApp.tsx). iPhone-style accessibility magnifier:
+  // MagnifierApp.svelte — Svelte 5 (runes) single-source implementation of the
+  // magnifier screen. iPhone-style accessibility magnifier:
   // a circular lens re-renders the content under it at higher magnification.
   //
-  // This ports the CONTROL surface (zoom/brightness/contrast + reset + persisted
-  // settings) and the lens/viewfinder canvas structure faithfully. Camera
+  // Provides the CONTROL surface (zoom/brightness/contrast + reset + persisted
+  // settings) and the lens/viewfinder canvas structure. Camera
   // acquisition (getUserMedia) + the actual 2D paint are guarded: where Canvas 2D
   // is unavailable (SSR / happy-dom) drawing no-ops so the UI still renders — the
   // control surface is mock-testable; real magnified view is device acceptance.

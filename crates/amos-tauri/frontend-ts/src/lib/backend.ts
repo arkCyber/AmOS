@@ -663,3 +663,23 @@ export async function exportTxtFile(name: string, text: string): Promise<Exporte
   return invoke<ExportedTxtFile>("notes_export_txt", { name, text });
 }
 
+/* ---- Native exact-alarm bridge (docs/native-alarm-bridge.md; §9 ③) ---- */
+
+/** Ask the Rust host to register a one-shot exact alarm at `atMs` (epoch ms).
+ *  Offline (no Tauri bridge) → no-op returning null, so the WebView still rings
+ *  via its own JS notifier. */
+export async function registerNativeAlarm(id: string, atMs: number): Promise<void> {
+  await invoke("scheduler_alarm_register", { id, atMs });
+}
+
+/** Ask the Rust host to cancel a pending exact alarm. Offline → null. */
+export async function cancelNativeAlarm(id: string): Promise<boolean | null> {
+  return invoke<boolean>("scheduler_alarm_cancel", { id });
+}
+
+/** Poll the Rust host for alarms due by `nowMs` (defaults to host wall clock).
+ *  Returns { due: string[] } on-device, or null offline. */
+export async function pollNativeAlarms(nowMs?: number): Promise<{ due: string[] } | null> {
+  return invoke<{ due: string[] }>("scheduler_alarm_poll", { nowMs });
+}
+

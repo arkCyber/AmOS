@@ -46,6 +46,22 @@ fn on_button(app: &tauri::AppHandle, buttons: &tauri::State<HardwareButtons>, na
 - **桌面开发/测试**：`simulate_button` 命令 +
   键盘快捷键（H/V/A）走完全相同的路径。
 
+### 真机实测（S5 · FreemeOS/MediaTek，2026-09-08）——相机键被 ROM 抢占
+
+AI 助手改为**双击音量+**：`MainActivity.onKeyDown` 在 450 ms 内**双击音量+
+(`VOLUME_UP`)** 时 `assistantQuiet()` → Rust `AiAssistant` → 前端 `open("ai")`；单击
+音量+ 仍正常调音量（不 consume）。相机键只被 consume、不再触发 AI（此前"相机键+音量+
+和弦"在真机不可靠，且相机键在 ROM 层被全局抢用）。实测按键仅在 AmOS 真正获焦时送达
+（`mCurrentFocus` 为 AmOS 窗口），这台 FreemeOS/MediaTek ROM 对相机键会**同时拉起系统
+相机 `com.freeme.camera` 并抢走前台**（`topResumedActivity` 变为相机），普通应用无法把
+相机键重映射成其它动作。
+
+- 会稳定送达 AmOS `onKeyDown` 的物理键：**音量键**（`KEYCODE_VOLUME_UP/DOWN`）。
+- **电源键不可被普通应用拦截**（系统电源管理保留）；AmOS 作为默认 HOME + 常亮
+  （`FLAG_KEEP_SCREEN_ON`）+ `wakeHome`，唤醒后即回主屏/显示 UI。
+- 若必须用"相机键 → AI"，需 ROM/系统层方案（root 后移除相机键全局快捷键、或以
+  kiosk 态禁系统相机），普通 APK 侧无法绕开。
+
 ## 测试
 
 - Rust 单测：`from_name` 解析、`ButtonAction::from` 映射、state 记录。

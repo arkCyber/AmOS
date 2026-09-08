@@ -42,7 +42,7 @@ describe("i18n", () => {
         if (ent.name === "node_modules" || ent.name === "__tests__" || ent.name === "locales") continue;
         const p = `${dir}/${ent.name}`;
         if (ent.isDirectory()) walk(p);
-        else if (/\.(ts|tsx)$/.test(ent.name)) files.push(p);
+        else if (/\.(ts|tsx|svelte)$/.test(ent.name)) files.push(p);
       }
     };
     walk(`${srcRoot}`);

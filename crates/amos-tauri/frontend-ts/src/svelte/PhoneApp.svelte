@@ -5,6 +5,7 @@
   // lib/backend telephony; recent/frequent derive from the call log via
   // createStoreValue (mirrors useOutgoingCalls). Real dial/record verified on-device.
   import { KEYS, backspace, clearDial, fmtCallDuration, pushKey } from "../lib/phone";
+  import { playRingback, stopCallTone } from "../lib/callTone";
   import { EMERGENCY_NUMBERS, EMERGENCY_QUICK_NUMBER } from "../lib/emergency";
   import {
     onTelephonyEvent, telephonyDial, telephonyEnd, telephonySimulateIncoming,
@@ -180,41 +181,12 @@
     return () => clearInterval(id);
   });
 
-  // Ringback tone (AmOS-managed call): beep while Dialing and not yet connected.
+  // Ringback tone (AmOS-managed call): play the real MP3 waiting tone while
+  // Dialing and not yet connected (stops when connected / call ends / unmount).
   $effect(() => {
     const ring = calling && !talking && !!activeId;
-    if (!ring) return;
-    let ctx: AudioContext | null = null;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    try {
-      const AC =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!AC) return;
-      ctx = new AC();
-      const burst = () => {
-        if (!ctx || ctx.state === "closed") return;
-        const o = ctx.createOscillator();
-        const g = ctx.createGain();
-        o.type = "sine";
-        o.frequency.value = 440;
-        g.gain.setValueAtTime(0.0001, ctx.currentTime);
-        g.gain.exponentialRampToValueAtTime(0.35, ctx.currentTime + 0.01);
-        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
-        o.connect(g);
-        g.connect(ctx.destination);
-        o.start();
-        o.stop(ctx.currentTime + 0.42);
-      };
-      burst();
-      timer = setInterval(burst, 800);
-    } catch {
-      /* audio unavailable */
-    }
-    return () => {
-      if (timer) clearInterval(timer);
-      if (ctx) void ctx.close();
-    };
+    if (ring) playRingback();
+    return () => stopCallTone();
   });
 </script>
 
@@ -299,7 +271,7 @@
   {:else if tab === "keys"}
     <div class="flex w-full flex-col items-center">
       <div class="flex w-full max-w-xs items-center justify-center px-3 pb-1 pt-2">
-        <span class="block max-w-full truncate font-light tabular-nums leading-none {num.length > 9 ? 'text-[26px] tracking-[0.02em]' : num.length > 5 ? 'text-[32px] tracking-[0.04em]' : 'text-[40px] tracking-[0.05em]'}">{num}</span>
+        <span class="block max-w-full truncate font-medium tabular-nums leading-none {num.length > 9 ? 'text-[26px] tracking-[0.02em]' : num.length > 5 ? 'text-[32px] tracking-[0.04em]' : 'text-[40px] tracking-[0.05em]'}">{num}</span>
       </div>
       <div class="grid w-full max-w-xs grid-cols-3 justify-items-center gap-x-1 gap-y-3">
         {#each KEYS as k (k)}

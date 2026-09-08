@@ -45,28 +45,25 @@ npm test             # vitest run
 npm run build        # vite build → dist/
 ```
 
-## Svelte 5 pilot (React → Svelte migration scaffold)
+## Svelte single-source (React → Svelte migration complete)
 
-The calculator and the weather app are piloted in Svelte 5 (runes) to validate a
-compiled, no-virtual-DOM UI inside the existing React shell — aimed at leaner
-bundles and better frame budgets on low-end/WebView targets. See
-**`SVELTE5_PILOT.md`** for the full write-up (architecture, gates, and how the
-swap is turned on/off), and **`SVELTE_MIGRATION_DATA.md`** for measured
-bundle-size data (`npm run bundle:report`) + the on-device frame-rate A/B runbook.
+Every built-in app screen is implemented **once in Svelte 5 (runes)** and mounted by
+a thin React host. The React reference bodies and the `*-parity.test.ts`
+dual-implementation suites have been removed, so `apps.tsx` is now only Svelte-host
+wiring (~149 lines) and `svelte-tests/` has no parity files left. `src/components`
+retains only the React shell-chrome leaves + hosts that `App.tsx` still uses on its
+`!svelteEnabled()` path. See **`SVELTE5_PILOT.md`** / **`DOCK_MIGRATION_ROADMAP.md`**
+(historical migration records) and **`SVELTE_MIGRATION_DATA.md`** for the measured
+bundle-size data.
 
 TL;DR of the seam:
-- `src/svelte/CalculatorApp.svelte` + `WeatherApp.svelte` + `ContactsApp.svelte` +
-  `PermissionsApp.svelte` — React-free Svelte 5 ports reusing the SAME pure libs
-  (`lib/calculator.ts`, `lib/weather.ts`, `lib/contacts.ts`, `lib/permissions.ts`).
-- `src/svelte/` infra — reactive i18n singleton (`locale.svelte.ts`), reactive
-  theme (`theme.svelte.ts`), persisted store (`store.ts`, used by Calculator +
-  Contacts for history/call-log).
-- `src/components/SvelteAppHost.tsx` — generic React host that `mount()`s a
-  Svelte app (dynamic import) and keeps Svelte i18n in sync with the shell.
-- `src/apps.tsx` → `CalculatorEntry`/`WeatherEntry`/`ContactsEntry` route
-  **production builds to Svelte** and keep the React versions for `vite dev` +
-  the bun suite (which has no `.svelte` loader). Dev can preview Svelte via
-  `localStorage.setItem("amos.ui.svelteCalc","1")`.
+- `src/svelte/<App>.svelte` — React-free Svelte 5 ports reusing the same pure libs
+  (`lib/*.ts`) and the shared persisted store (`store.ts`), plus reactive i18n
+  (`locale.svelte.ts`) and theme (`theme.svelte.ts`).
+- `src/components/SvelteAppHost.tsx` — generic React host that `mount()`s a Svelte
+  app (dynamic import) and keeps Svelte i18n in sync with the shell.
+- `src/apps.tsx` — every entry is `<XEntry = () => <SvelteAppHost load={loadX} />`
+  (`X` ∈ all built-in apps); no React app fallback remains.
 
 New commands (Svelte-specific; the rest of the repo still tests under bun):
 

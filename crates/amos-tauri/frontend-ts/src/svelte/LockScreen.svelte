@@ -32,10 +32,12 @@
     typeof document !== "undefined" && !!document.documentElement?.classList?.contains("dark");
   const lockWall = $derived(prefs.lockWallpaper);
   const lockBgUrl = $derived.by(() => {
-    if (!lockWall) return null;
-    const f = isCustomWallpaper(lockWall)
-      ? lockWall
-      : (WALLPAPER_FILES[lockWall] ?? (dark ? "dark" : "light"));
+    // Always resolve a wallpaper: use the user's lock wallpaper if chosen, else
+    // fall back to the theme default (dark/light) so the lock screen is never a
+    // bare gray panel.
+    const w = lockWall;
+    if (!w) return `wallpapers/${dark ? "dark" : "light"}`;
+    const f = isCustomWallpaper(w) ? w : WALLPAPER_FILES[w] ?? (dark ? "dark" : "light");
     return isCustomWallpaper(f) ? f : `wallpapers/${f}`;
   });
 
@@ -99,7 +101,7 @@
   {/if}
   <div class="relative z-10 flex w-full flex-col items-center">
     <div class="text-center leading-none">
-      <div class="text-7xl font-thin tabular-nums tracking-tight">{fmtClock(now)}</div>
+      <div class="text-7xl font-medium tabular-nums tracking-tight">{fmtClock(now)}</div>
       <div class="mt-2.5 text-lg text-neutral-200">{dateStr}</div>
       <div class="mt-7 flex items-center justify-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.2em] text-neutral-400">
         <span aria-hidden="true" data-icon="lock" class="grid h-3.5 w-3.5 place-items-center">{@html iconSvg("lock", "h-3.5 w-3.5")}</span> {t("shell.lockTitle")}

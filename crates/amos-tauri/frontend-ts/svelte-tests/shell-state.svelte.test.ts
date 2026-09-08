@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, test } from "vitest";
 import {
   applyLayout,
   enterEdit,
+  enterLibrary,
   exitEdit,
   goHome,
   layout,
@@ -26,6 +27,7 @@ import {
   surface,
   unlock,
 } from "../src/svelte/shellState.svelte";
+import { getRecents } from "../src/lib/amosStore";
 
 beforeEach(() => {
   window.localStorage.clear();
@@ -82,6 +84,24 @@ describe("shellState.svelte (Svelte shell navigation)", () => {
     const next = { page: ["notes"], dock: ["phone"], hidden: [] };
     applyLayout(next);
     expect(layout()).toEqual(next);
+  });
+
+  test("enterLibrary() opens the App Library surface and clears overlays + pulse", () => {
+    softLaunch("clock");
+    setNc(true);
+    enterLibrary();
+    expect(surface()).toEqual({ kind: "library" });
+    expect(pulseId()).toBeNull();
+    expect(ncOpen()).toBe(false);
+    goHome();
+    expect(surface()).toEqual({ kind: "home" });
+  });
+
+  test("open() records a recent for built-ins (drives the App Library Frequently Used)", () => {
+    open("phone");
+    expect(getRecents()[0]).toBe("phone");
+    open("phone");
+    expect(getRecents()).toEqual(["phone"]); // dedup: revisit doesn't double it
   });
 });
 

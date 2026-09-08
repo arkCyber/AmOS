@@ -27,6 +27,11 @@
 > 分发，并按 AmOS 的 per-APK 能力账本受控。guest 内运行的应用经 Wayland/DMA-BUF 合成
 > 进 AmOS 窗口；宿主始终是权限/审计权威。
 
+> 上游边界（勿混淆）：**LineageOS for microG 是独立的第三方上游项目**（基于 LineageOS
+> 的 de-Googled 发行）。AmOS **不是** LineageOS for microG，**不以它为基座、也不随它分发**；
+> 本文（§3）仅把它的 signature-spoofing 宏/受控 allowlist 当作**工程做法参考**，用于指导
+> AmOS **自建 AOSP guest** 的实现。
+
 ## 2. 组件选型（均为上游、可随镜像分发）
 
 | 组件 | 作用 | 说明/许可 |

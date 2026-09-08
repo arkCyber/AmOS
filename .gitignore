@@ -91,3 +91,4 @@ rustc-ice-*.txt
 crates/amos-tauri/frontend-ts/amos_*_preview.html
 crates/amos-tauri/frontend-ts/amos_*_preview.png
 crates/amos-tauri/frontend-ts/preview6.js
+.cargo/config.toml

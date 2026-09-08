@@ -120,7 +120,7 @@
 
   <div class="py-4 text-center">
     <div class="text-6xl">{days[0]?.icon ?? ""}</div>
-    <div class="text-5xl font-thin">{days[0] ? displayTemp(days[0].temp, unit) : ""}</div>
+    <div class="text-5xl font-medium">{days[0] ? displayTemp(days[0].temp, unit) : ""}</div>
     <div class="text-sm opacity-60">{days[0] ? convertRange(days[0].range, unit) : ""}</div>
     <div class="mt-1 text-xs opacity-60">
       {t("weather.humidity")} {days[0]?.humidity ?? "—"}% · {t("weather.wind")} {days[0]?.wind ?? "—"}

@@ -123,6 +123,49 @@ describe("MonitorApp.svelte — overview dashboard", () => {
     }
   });
 
+  test("bridged but daemon down (system_health rejects) → offline, not 'no data'; auto-recovers", async () => {
+    // A real Tauri WebView is always bridged, so the previous "no bridge ⇒ offline"
+    // gate could never express "daemon unreachable" — a dead daemon wrongly showed
+    // 📡「暂无系统数据」. Connected now means the daemon actually answered.
+    vi.useFakeTimers();
+    try {
+      let up = false;
+      const invoke = async (cmd: string) => {
+        if (cmd === "system_health") {
+          if (!up) throw new Error("daemon down");
+          return {
+            cpu_busy_pct: 44,
+            mem_total_bytes: 8_000_000_000,
+            mem_available_bytes: 4_000_000_000,
+            battery_level_pct: 70,
+            running: 1,
+            cached: 0,
+            stopped: 0,
+            apps: [],
+          };
+        }
+        return null;
+      };
+      (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+        invoke,
+        listen: async () => () => {},
+      };
+      const { container } = render(MonitorApp);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(byTest(container, "monitor-empty-offline")).toBeTruthy();
+      expect(byTest(container, "monitor-empty-nodata")).toBeNull();
+
+      // The daemon comes up; the next reconnect probe (5 s) recovers automatically.
+      up = true;
+      await vi.advanceTimersByTimeAsync(6000);
+      await vi.advanceTimersByTimeAsync(0); // flush the fetch promise
+      expect(byTest(container, "monitor-overview")).toBeTruthy();
+      expect(txt(container)).toContain("44%");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("offline → daemon comes up: pressing Retry recovers to the live overview", async () => {
     const { container } = render(MonitorApp);
     await settle();

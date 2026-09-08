@@ -11,7 +11,9 @@ export interface HomeLayout {
 export const LAYOUT_KEY = "amos.home.layout";
 export const RECENTS_KEY = "amos.recents";
 
-export const DEFAULT_DOCK = ["phone", "messages", "ai", "interpreter", "mail", "monitor"];
+// The three most important apps on the dock, first-run layout: 电话 Phone,
+// AI assistant, and 语音翻译/同传 Interpreter.
+export const DEFAULT_DOCK = ["phone", "ai", "interpreter"];
 
 declare global {
   interface Window {
@@ -164,6 +166,33 @@ export function moveBefore(layout: HomeLayout, dragId: string, targetId: string)
   if (tp >= 0) page.splice(tp, 0, dragId);
   else if (td >= 0) dock.splice(td, 0, dragId);
   else page.push(dragId);
+  return { page, dock, hidden };
+}
+
+/**
+ * Pin `ids` to the home DOCK (used when the user asks to send a custom group's
+ * apps to the main screen). An app is shown once: it is moved out of the page
+ * grid and out of `hidden` into the dock (dedup). Ids already docked are left in
+ * place; unknown ids are ignored.
+ */
+export function addAppsToDock(layout: HomeLayout, ids: readonly string[]): HomeLayout {
+  const page = [...layout.page];
+  const dock = [...layout.dock];
+  const hidden = [...layout.hidden];
+  for (const id of ids) {
+    if (!id) continue;
+    if (dock.includes(id)) {
+      // already pinned — just make sure it isn't hidden
+      const hi = hidden.indexOf(id);
+      if (hi >= 0) hidden.splice(hi, 1);
+      continue;
+    }
+    const pi = page.indexOf(id);
+    if (pi >= 0) page.splice(pi, 1);
+    const hi = hidden.indexOf(id);
+    if (hi >= 0) hidden.splice(hi, 1);
+    dock.push(id);
+  }
   return { page, dock, hidden };
 }
 

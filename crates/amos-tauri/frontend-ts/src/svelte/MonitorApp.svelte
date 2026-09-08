@@ -12,8 +12,9 @@
   // (‹ back / title「系统监控」/ home) so this screen is only the content area.
   //
   // Empty-state handling (the page is never a blank wall):
-  //  • not bridged → "系统服务未连接" + Retry (auto-recovers on the reconnect probe);
-  //  • bridged but no readings → "暂无系统数据" (host without /proc reports honestly).
+  //  • daemon not reachable — no Tauri bridge, OR the system_health round-trip failed
+  //    (amos-ai down) → "未连接系统服务" + Retry (auto-recovers on the reconnect probe);
+  //  • daemon answered but reported no readings → "暂无系统数据" (host without /proc).
   import SystemPanel from "./SystemPanel.svelte";
   import TaskManager from "./TaskManager.svelte";
   import {
@@ -52,18 +53,24 @@
 
   const refresh = () => {
     if (inflight || disposed) return;
-    const on = bridged();
-    online = on;
-    if (!on) return; // offline: cheap probe; the reconnect cadence wakes us later
     inflight = true;
     busy = true;
     systemHealth()
       .then((raw) => {
-        if (raw && !disposed) sys = normalizeSystemHealth(raw);
+        if (disposed) return;
+        // "Connected" means a daemon actually answered us (raw is non-null): the
+        // bridge exists AND the UDS round-trip succeeded. A null here is either no
+        // Tauri bridge or a failed command (daemon down) → offline; every poll is a
+        // reconnect probe that flips us back to live the moment the daemon returns.
+        online = raw !== null;
+        if (raw) sys = normalizeSystemHealth(raw);
       })
       .catch(() => {
-        /* daemon went away mid-flight → keep the previous reading */
-        amosWarn("monitor", "health read failed", { online });
+        /* daemon went away mid-flight → keep the previous reading, go offline */
+        if (!disposed) {
+          online = false;
+          amosWarn("monitor", "health read failed", { online });
+        }
       })
       .finally(() => {
         if (disposed) return;

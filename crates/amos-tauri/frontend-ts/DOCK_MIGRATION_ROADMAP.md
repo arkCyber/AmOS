@@ -4,6 +4,9 @@
 
 > 现实：一次性迁完全部不可靠（多数是大屏、部分依赖摄像头/音频/后端桥）。本文件是**逐屏清单 + 顺序 + 每屏 checklist**。每屏按 checklist 完成后勾掉，进度可追踪。
 
+> ✅ **最终态（2026-09）**：本清单所列**全部内置 App 均已 Svelte 单源完成**——各 React 实现体与 `*-parity.test.ts` 均已删除，`apps.tsx` 现仅剩 Svelte 宿主接线（约 149 行），`src/components` 仅保留壳层 chrome 所需的 React 叶与宿主。下表与 checklist 是**历史记录 / 迁移样板**，其中的“React 载体 / 留作 bun 回退”等表述不再代表当前状态。
+
+
 ## 迁移状态总览（前端 `src/`）
 
 ✅ = 已迁（Svelte 屏 + vitest + 一致性护栏 + PROD 路由）；⬜ = 待迁。

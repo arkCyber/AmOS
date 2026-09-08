@@ -389,6 +389,9 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/DELIVERY_NOTES_2026-09-05-display-protection.md](./docs/DELIVERY_NOTES_2026-09-05-display-protection.md) — Commit message + changeset + known limits for the display-protection / auto screen-off work (2026-09-05)
 - [docs/identity-web3.md](./docs/identity-web3.md) — Digital identity & Web3 signing domain core: `amos-identity` (`did:key`, key/keystore) + `amos-web3` (secp256k1, EVM address, EIP-191/EIP-712) — deterministic, no PRNG in the core, honest entropy/at-rest seams
 - [docs/DELIVERY_NOTES_2026-09-05-did-web3.md](./docs/DELIVERY_NOTES_2026-09-05-did-web3.md) — Commit message + changeset + known limits for the DID/Web3 signing domain-core work (2026-09-05)
+- [docs/hardware-buttons.md](./docs/hardware-buttons.md) — Hardware buttons (Home/Voice/AI): `buttons.rs` abstraction + `hardware-button` event + on-device wiring and the S5 FreemeOS camera-key/WebView findings
+- [docs/camera-key-system-remap.md](./docs/camera-key-system-remap.md) — Rooted system-layer steps to remap the camera key away from the OS camera on FreemeOS/MediaTek S5
+- [docs/os-shell-bridge-checklist.md](./docs/os-shell-bridge-checklist.md) — Real-device acceptance for the pure-Svelte OS-shell bridges (auto screen-off, incoming call, hardware Home, OS alarms)
 
 ## License
 

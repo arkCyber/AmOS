@@ -156,4 +156,20 @@ textarea {
   background: rgb(0 0 0 / 0.28);
 }
 
+/* iOS-parity type scale — scoped to APP surfaces only (the shared Shell wrapper
+ * renders every app inside [data-testid="app-surface"]). Apple uses larger type
+ * than the legacy defaults: body 17 / subhead 15 / footnote 13. These overrides
+ * nudge the inherited Tailwind sizes toward that scale without touching the home
+ * screen, dock, or App Library, and are deliberately small so nothing overflows.
+ * Remove this block to return to the previous 12/14/16 baseline. */
+[data-testid="app-surface"] .text-xs {
+  font-size: 0.8125rem; /* 12 -> 13 (iOS footnote) */
+}
+[data-testid="app-surface"] .text-sm {
+  font-size: 1rem; /* 14 -> 16 (toward iOS body 17) */
+}
+[data-testid="app-surface"] .text-base {
+  font-size: 1.0625rem; /* 16 -> 17 (iOS body) */
+}
+
 

@@ -14,7 +14,7 @@ import IncomingCall from "./components/IncomingCall";
 import { Backdrop } from "./components/Wallpaper";
 import EditHome from "./components/EditHome";
 import StatusBar from "./components/StatusBar";
-import { getLayout, hydrateFromSystemStore, moveBefore, pushRecent, saveLayout, readStoreValue, writeStoreValue, type HomeLayout } from "./lib/amosStore";
+import { getLayout, hydrateFromSystemStore, moveBefore, addAppsToDock, pushRecent, saveLayout, readStoreValue, writeStoreValue, type HomeLayout } from "./lib/amosStore";
 import { NOTIF_KEY, removeAppNotifs, type Notif } from "./lib/settings";
 import { zh, type MessageKey } from "./i18n/locales/zh";
 import { isExtId, loadStoreTiles, subscribeStoreTiles, tileById, type StoreTile } from "./lib/storeApps";
@@ -24,7 +24,9 @@ import { clampAutoOffSec, dueForAutoSleep, setScreenState, AUTOOFF_STORE_KEY, WA
 import { useCallKeepAwake, useScreenHold } from "./lib/keepAwake";
 import { useNotificationAlert } from "./lib/useNotificationAlert";
 import { startLmkSurfaceWatcher, startPeriodicReconcile } from "./lib/lmk";
-import { useDueReminderAlerts } from "./lib/reminderNotify";
+import { startAlarmWatcher } from "./svelte/osAlarmWatcher";
+import { startReminderWatcher } from "./svelte/osReminderWatcher";
+import { startTimerWatcher } from "./svelte/osTimerWatcher";
 import {
   buttonActionOf,
   keyActionOf,
@@ -36,6 +38,8 @@ import {
 const loadHomeDock = () => import("./svelte/HomeDock.svelte");
 // The home layout editor is also a controlled screen (shell owns the layout).
 const loadEditHome = () => import("./svelte/EditHome.svelte");
+// The iOS-style App Library is a controlled screen too (shell owns navigation).
+const loadAppLibrary = () => import("./svelte/AppLibrary.svelte");
 // Shell-chrome island: StatusBar needs no props — read the same stores as React.
 const loadStatusBar = () => import("./svelte/StatusBar.svelte");
 function StatusBarEntry() {
@@ -199,6 +203,7 @@ function Shell() {
   const [active, setActive] = useState<string | null>(null);
   const [locked, setLocked] = useState(false);
   const [editMode, setEditMode] = useState(false);
+  const [libOpen, setLibOpen] = useState(false);
   const [recentsOpen, setRecentsOpen] = useState(false);
   const [spotOpen, setSpotOpen] = useState(false);
   const [ncOpen, setNcOpen] = useState(false);
@@ -259,6 +264,7 @@ function Shell() {
     writeStoreValue(NOTIF_KEY, removeAppNotifs(list, name));
     if (!isExtId(id)) pushRecent(id); // third-party tiles don't pollute Recents yet
     closeAll();
+    setLibOpen(false);
     setActive(id);
   };
   // Single "return to AmOS home" entry used by the app's back arrow, the bottom home
@@ -267,6 +273,7 @@ function Shell() {
   const goHome = (src: string) => {
     console.info(`[shell] go-home from ${src}`);
     setEditMode(false);
+    setLibOpen(false);
     closeAll();
     setActive(null);
   };
@@ -325,17 +332,35 @@ function Shell() {
   // an app / NOT in edit mode — so this pinpoints an on-device "dock missing"
   // (stuck on lock/app/edit) in adb logcat.
   useEffect(() => {
-    const where = locked ? "lock" : active ? `app:${active}` : editMode ? "edit" : "home";
-    amosLog("shell", `surface=${where}`, { locked, active, editMode });
-  }, [locked, active, editMode]);
+    const where = locked
+      ? "lock"
+      : libOpen
+        ? "library"
+        : active
+          ? `app:${active}`
+          : editMode
+            ? "edit"
+            : "home";
+    amosLog("shell", `surface=${where}`, { locked, active, editMode, libOpen });
+  }, [locked, active, editMode, libOpen]);
 
   // Global notification-arrival alert (vibrate + ring per effective sound policy),
   // mounted once so it fires on every screen — home, inside an app, even locked.
   useNotificationAlert();
-  // OS-wide due-reminder scheduler: fires an app alert when a reminder's due
-  // time is reached, on any screen (see lib/reminderNotify.ts). Suppressed while
-  // the Reminders app itself is focused (its items are already on screen).
-  useDueReminderAlerts(active);
+  // OS-wide due reminders/alarms/countdown-timer: ONE React-free implementation
+  // each (os*Watcher), started here while React hosts — and by Shell.svelte once
+  // it becomes the host. No React hook duplicates remain for these.
+  const notifierActiveRef = useRef(active);
+  notifierActiveRef.current = active;
+  useEffect(() => {
+    const getActive = () => notifierActiveRef.current;
+    const stops = [
+      startReminderWatcher(getActive),
+      startAlarmWatcher(getActive),
+      startTimerWatcher(getActive),
+    ];
+    return () => stops.forEach((stop) => stop());
+  }, []);
   // Search-launch: clear the badge + record a recent, but stay on the home
   // screen and briefly highlight that app's icon (like picking it in Spotlight).
   const softLaunch = (id: string) => {
@@ -493,6 +518,18 @@ function Shell() {
     };
   }, []);
 
+  // DOM fallback: the Rust core ALSO dispatches `hardware-button` as a plain DOM
+  // CustomEvent (see buttons.rs `dispatch_dom`) so the shell reacts even when the
+  // Tauri `listen` bridge isn't available on-device. Works regardless of bridged().
+  useEffect(() => {
+    const onHardwareDom = (e: Event) => {
+      const detail = (e as CustomEvent<{ name?: string }>).detail;
+      if (detail?.name) runRef.current(buttonActionOf(detail.name));
+    };
+    window.addEventListener("hardware-button", onHardwareDom);
+    return () => window.removeEventListener("hardware-button", onHardwareDom);
+  }, []);
+
   // Tear down `legacy` Android surfaces whose container app was reclaimed or
   // destroyed (daemon `WatchLmk` → Rust `lmk-surface` event → wm_close). Also
   // reconcile the whole legacy set periodically against the authoritative LMK
@@ -602,6 +639,31 @@ function Shell() {
     </>
   );
 
+  // Open the iOS-style "App Library" (home → trailing page). Only meaningful under
+  // the Svelte-enabled production shell (which hosts AppLibrary.svelte); in the
+  // React dev/test fallback there is no library screen, so it's a no-op there.
+  const openLibrary = () => {
+    if (!svelteEnabled()) return;
+    closeAll();
+    setEditMode(false);
+    setActive(null);
+    setLibOpen(true);
+  };
+  // Actions from the Svelte App Library (controlled over the "appLibrary" channel):
+  // "open"(id) launches an app; "back" returns to the dock home.
+  const handleAppLibraryEvent = (event: string, detail: unknown): void => {
+    if (event === "open" && typeof detail === "string") open(detail);
+    else if (event === "back") goHome("library-back");
+    else if (event === "dockAdd" && Array.isArray(detail)) {
+      const ids = detail.filter((x): x is string => typeof x === "string");
+      setLayout((prev) => {
+        const next = addAppsToDock(prev, ids);
+        saveLayout(next);
+        return next;
+      });
+    }
+  };
+
   // Actions emitted by the Svelte home screen (bridged over the "home" propsBus
   // channel by SveltePropsHost). The React shell stays the single owner of
   // navigation + the home layout, exactly as it is for the React HomeDock.
@@ -617,6 +679,8 @@ function Shell() {
       });
     } else if (event === "search") {
       setSpotOpen(true);
+    } else if (event === "library") {
+      openLibrary();
     }
   };
 
@@ -659,6 +723,21 @@ function Shell() {
       </>
     );
   }
+
+  if (libOpen)
+    return (
+      <div className="flex h-full flex-col" data-testid="app-library">
+        <StatusBarEntry />
+        <div className="min-h-0 flex-1">
+          <SveltePropsHost
+            name="appLibrary"
+            load={loadAppLibrary}
+            props={{ layout, ext }}
+            onEvent={handleAppLibraryEvent}
+          />
+        </div>
+      </div>
+    );
 
   if (editMode)
     return svelteEnabled() ? (

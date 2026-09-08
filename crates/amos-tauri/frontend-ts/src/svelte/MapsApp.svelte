@@ -1,9 +1,9 @@
 <script lang="ts">
-  // MapsApp.svelte — Svelte 5 (runes) port of the React MapsApp
-  // (src/components/MapsApp.tsx). Offline-capable map over pure lib/maps.ts:
+  // MapsApp.svelte — Svelte 5 (runes) single-source implementation of the maps
+  // screen. Offline-capable map over pure lib/maps.ts:
   // slippy OSM tiles, city chips + search, drag/pan/zoom. "定位" (geolocation)
   // honours the system location master switch + per-app location grant; real
-  // device fix is the same browser `navigator.geolocation` the React app used
+  // device fix is the same browser `navigator.geolocation`
   // (device acceptance), while the master/grant/offline gating is fully testable.
   import { readStoreValue } from "../lib/amosStore";
   import { SETTINGS_KEY, locationEnabled, normalizeQuick } from "../lib/settings";

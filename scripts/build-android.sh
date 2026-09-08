@@ -56,6 +56,19 @@ _api=$(basename "$candidate"); _api=${_api#"$TARGET"}; _api=${_api%-clang}
 LINKER="$PREBUILT/bin/${TARGET}${_api}-clang"
 echo "linker: $LINKER (API $_api)"
 
+# Cargo's `linker` (set in .cargo/config.toml below) is only enough for pure-Rust
+# cdylibs. Any dependency with a C `cc` build (e.g. zstd-sys) ALSO needs the
+# target C compiler + archiver resolvable — otherwise cc's family detection fails
+# with `ToolNotFound: aarch64-linux-android-clang` and the build dies. Export the
+# cc/ar env for the target triple (underscore form only — a '-' is an invalid bash
+# identifier) and put the NDK tools on PATH so build scripts that invoke the
+# `-cc`/`-ar` by name find them.
+export PATH="$PREBUILT/bin:$PATH"
+export CC_aarch64_linux_android="$LINKER"
+export AR_aarch64_linux_android="$PREBUILT/bin/llvm-ar"
+export TARGET_CC="$LINKER"
+export TARGET_AR="$PREBUILT/bin/llvm-ar"
+
 # Generate the cross-compile config in the workspace's .cargo/config.toml.
 mkdir -p .cargo
 cat > .cargo/config.toml <<EOF
@@ -97,9 +110,10 @@ echo "Built binaries:"
 find "target/$TARGET/release" -maxdepth 1 -type f \
   -name 'amos-ai' -o -name 'amos-ai.exe' | sort
 echo
-echo "System UI: enable amos-tauri's 'android' feature so its RadioBridge is backed"
-echo "  by AndroidRadioProvider and its FlashlightBridge by AndroidFlashlightProvider"
-echo "  (CameraManager torch), then build the APK:"
+echo "System UI APK: use scripts/build-apk.sh (the ONLY supported APK entry) —"
+echo "  it hard-codes amos-tauri's 'android' feature so the on-device APK always"
+echo "  links the jni providers (radio/flashlight/sensor/aaudio). Building the"
+echo "  APK without 'android' crashes on launch with UnsatisfiedLinkError."
 echo "  cd crates/amos-tauri && cargo tauri android build --features android"
 echo
 echo "Stage to device (example):"

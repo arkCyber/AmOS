@@ -1,18 +1,25 @@
 /**
- * shell-entry.ts — OPTIONAL pure-Svelte top-level entry for local preview/acceptance
- * of `Shell.svelte` (Phase-3 ③). NOT wired into the production main (index.html still
- * mounts the React App, which hosts the Svelte screens). Open `shell.html` (dev or
- * the extra `shell` build input) to see the Svelte shell render standalone.
+ * shell-entry.ts — the **production** System UI entry: `index.html` mounts the
+ * pure-Svelte top-level `Shell.svelte` (the React host `App.tsx`/`main.tsx` is
+ * retired by the React→Svelte migration; only stale sources remain until the
+ * subtraction phase deletes them). `shell.html` is the same Svelte shell behind a
+ * second build input for headless/visual acceptance.
  */
 import "./index.css";
 import { mount } from "svelte";
 import Shell from "./svelte/Shell.svelte";
+import { bootOsChrome } from "./svelte/osBoot";
 import {
   enterEdit,
   lock,
   open,
   resetShellState,
 } from "./svelte/shellState.svelte";
+
+// Apply persisted theme/locale to the document before first paint (the React
+// host used to do this via ThemeProvider/I18nProvider; the Svelte host is the
+// one true host going forward).
+bootOsChrome();
 
 const root = document.getElementById("root") ?? (() => {
   const el = document.createElement("div");

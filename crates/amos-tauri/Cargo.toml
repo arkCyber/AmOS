@@ -18,6 +18,7 @@ tauri-build.workspace = true
 [dependencies]
 amos-proto.workspace = true
 amos-wm = { path = "../amos-wm" }
+amos-scheduler = { path = "../amos-scheduler" }
 amos-int.workspace = true
 amos-mail = { path = "../amos-mail" }
 amos-appstore = { path = "../amos-appstore" }

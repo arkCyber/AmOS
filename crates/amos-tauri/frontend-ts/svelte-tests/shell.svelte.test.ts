@@ -220,16 +220,43 @@ describe("Shell.svelte (surface decision tree)", () => {
     setSpot(true);
     const { container } = render(Shell);
     await tick();
-    // No layout → home has no dock tiles; spotlight default list includes "clock".
-    const clock = container.querySelector(
-      `button[aria-label="${zh["app.clock"]}"]`,
-    ) as HTMLButtonElement | null;
-    expect(clock).toBeTruthy();
-    await fireEvent.click(clock!);
+    // The home now ships a real default layout (seeded dock + page), so a "时钟"
+    // tile also lives on the home page. The Spotlight overlay is rendered AFTER
+    // the home content in the DOM, so pick the LAST "时钟" button = the Spotlight
+    // result, not the home tile (which would open the app).
+    const clocks = [
+      ...container.querySelectorAll(`button[aria-label="${zh["app.clock"]}"]`),
+    ];
+    const spotlightResult = clocks[clocks.length - 1];
+    expect(spotlightResult).toBeTruthy();
+    await fireEvent.click(spotlightResult!);
     await tick();
     expect(container.querySelector('[data-testid="app-surface"]')).toBeNull(); // stays home
     expect(pulseId()).toBe("clock"); // soft-launch pulse set
   });
+
+  test("App Library entry routes Shell into the library surface and back home", async () => {
+    const { container } = render(Shell);
+    await tick();
+    const entry = container.querySelector(
+      'button[data-testid="app-library-entry"]',
+    ) as HTMLButtonElement | null;
+    expect(entry).toBeTruthy();
+    await fireEvent.click(entry!);
+    await tick();
+    // The library surface (category folders) replaces the home grid.
+    expect(container.querySelector('[data-testid="home-grid"]')).toBeNull();
+    expect(container.querySelector('[data-testid="app-library"]')).toBeTruthy();
+    // Its home indicator returns to the dock home.
+    const home = container.querySelector(
+      'button[data-testid="library-home-indicator"]',
+    ) as HTMLButtonElement | null;
+    expect(home).toBeTruthy();
+    await fireEvent.click(home!);
+    await tick();
+    expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
+  });
+
 
 });
 

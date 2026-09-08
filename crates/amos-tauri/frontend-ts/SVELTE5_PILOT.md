@@ -7,6 +7,9 @@ chunk, and be tested. The calculator is the pilot screen.
 
 Status of this branch: **scaffold compiles, ships, and is fully tested.**
 
+> ✅ **Migration completed (2026-09)**: every built-in app is now **single-source Svelte**. The React reference bodies and the `*-parity.test.ts` dual-implementation suites were deleted; `apps.tsx` is only Svelte-host wiring and `svelte-tests/` has no parity files left. The pilot notes below are historical.
+
+
 ---
 
 ## Why this matters for the AmOS target

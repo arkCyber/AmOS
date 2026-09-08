@@ -86,7 +86,7 @@ describe("amos home layout & recents (pure logic)", () => {
   test("defaultLayout docks the dock-first apps and pages the rest", () => {
     const l = defaultLayout(available);
     expect(l.dock).toEqual(DEFAULT_DOCK); // all default-dock apps are available
-    expect(l.page).toEqual(["camera", "settings", "clock", "maps"]);
+    expect(l.page).toEqual(["messages", "camera", "settings", "mail", "clock", "maps", "monitor"]);
     expect(l.hidden).toEqual([]);
   });
 

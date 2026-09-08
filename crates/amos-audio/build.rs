@@ -52,28 +52,36 @@ fn main() {
         return;
     };
 
-    // Find the prebuilt toolchain dir under NDK and then the sysroot usr/lib.
+    // NDK names the armv7 ABI dir `arm-linux-androideabi` while the Rust target
+    // triple is `armv7-linux-androideabi`; every other ABI matches its triple
+    // verbatim. Map to the NDK platform dir for THIS target (we must only search
+    // the matching platform — picking another ABI's libaaudio.so yields an
+    // `incompatible with armelf_linux_eabi`-style link error).
+    let platform_dir = if target == "armv7-linux-androideabi" {
+        "arm-linux-androideabi"
+    } else {
+        target.as_str()
+    };
+
+    // Locate the NDK prebuilt sysroot and the matching platform dir.
     let prebuilt = ndk.join("toolchains/llvm/prebuilt");
-    let mut sysroots: Vec<PathBuf> = Vec::new();
+    let mut best: Option<(u32, PathBuf)> = None;
     if let Ok(hosts) = fs::read_dir(&prebuilt) {
         for h in hosts.filter_map(|e| e.ok()) {
-            let p = h.path().join("sysroot/usr/lib").join(&target);
-            if p.is_dir() {
-                sysroots.push(p);
-            }
-        }
-    }
-
-    // Pick the highest API dir (>= 26) that actually contains libaaudio.so.
-    let mut best: Option<(u32, PathBuf)> = None;
-    for base in sysroots {
-        if let Ok(apis) = fs::read_dir(&base) {
+            let base = h
+                .path()
+                .join("sysroot/usr/lib")
+                .join(platform_dir);
+            let Ok(apis) = fs::read_dir(&base) else { continue };
             for a in apis.filter_map(|e| e.ok()) {
                 let api_dir = a.path();
                 let name = a.file_name();
                 let Some(name) = name.to_str() else { continue };
                 let Ok(api) = name.parse::<u32>() else { continue };
-                if api >= 26 && api_dir.join("libaaudio.so").exists() && best.as_ref().map_or(true, |(b, _)| api > *b) {
+                if api >= 26
+                    && api_dir.join("libaaudio.so").exists()
+                    && best.as_ref().map_or(true, |(b, _)| api > *b)
+                {
                     best = Some((api, api_dir));
                 }
             }

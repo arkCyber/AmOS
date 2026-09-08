@@ -1,6 +1,6 @@
 <script lang="ts">
-  // InterpApp.svelte — Svelte 5 (runes) port of the React `InterpApp`
-  // (components/BackendApps.tsx). No React. All pure logic reuses lib/interp.ts
+  // InterpApp.svelte — Svelte 5 (runes) single-source implementation of the
+  // interpreter screen. All pure logic reuses lib/interp.ts
   // (language catalog + remembered prefs + persisted transcript in the shared
   // store) and lib/backend.ts RPC. Outside Tauri (no bridge) every call degrades
   // to null so the offline shell renders a localized banner and never crashes;

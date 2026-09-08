@@ -15,6 +15,10 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    // Bind all interfaces (0.0.0.0 + [::]). Tauri's desktop WKWebView resolves
+    // the devUrl "localhost" to 127.0.0.1 (IPv4); without this vite only listened
+    // on [::1] (IPv6) and the native window loaded nothing (blank).
+    host: true,
     watch: { ignored: ["**/src-tauri/**"] },
   },
   build: {

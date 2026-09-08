@@ -5,6 +5,7 @@
   // mute/record/hangup). Outgoing calls are the Phone screen's own UI. Offline (no
   // events) it renders nothing — same as React.
   import { t } from "./locale.svelte";
+  import { playIncomingRing, stopCallTone } from "../lib/callTone";
   import {
     onTelephonyEvent,
     telephonyAnswer,
@@ -77,35 +78,12 @@
     if (res) recording = res.recording as "Off" | "On" | "Failed";
   };
 
-  // Ring the phone while an incoming call is ringing (WebView tone until answer).
+  // Ring the phone with the real MP3 while an incoming call is ringing (stops on
+  // answer / decline / unmount — the WebView tone until the daemon confirms).
   $effect(() => {
     if (!call || phase !== "ringing") return;
-    const AC =
-      typeof window !== "undefined" &&
-      ((window as unknown as { AudioContext?: typeof AudioContext }).AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext);
-    if (!AC) return;
-    const ctx = new AC();
-    const beep = () => {
-      if (ctx.state === "closed") return;
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = "sine";
-      o.frequency.value = 620;
-      g.gain.setValueAtTime(0.0001, ctx.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.5);
-      o.connect(g);
-      g.connect(ctx.destination);
-      o.start();
-      o.stop(ctx.currentTime + 0.52);
-    };
-    beep();
-    const timer = setInterval(beep, 1000);
-    return () => {
-      clearInterval(timer);
-      void ctx.close();
-    };
+    playIncomingRing();
+    return () => stopCallTone();
   });
 </script>
 

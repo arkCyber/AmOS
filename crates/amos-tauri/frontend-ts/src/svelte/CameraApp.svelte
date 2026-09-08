@@ -1,6 +1,6 @@
 <script lang="ts">
-  // CameraApp.svelte — Svelte 5 (runes) port of the React `CameraApp`
-  // (src/components/CameraApp.tsx). No React. Pure control/capture math reuses
+  // CameraApp.svelte — Svelte 5 (runes) single-source implementation of the camera
+  // screen. Pure control/capture math reuses
   // lib/camera.ts + lib/cameraCapture.ts; photos land in lib/photos store; the
   // camera is default-allowed (no in-app gate) and granted to the shared ledger
   // on mount. The live feed path is gated on navigator.mediaDevices?.getUserMedia
@@ -595,7 +595,7 @@
     <!-- countdown + shutter-flash overlays -->
     {#if countdown != null}
       <div class="absolute inset-0 grid place-items-center">
-        <div class="grid h-20 w-20 place-items-center rounded-full bg-black/40 text-4xl font-thin text-white ring-2 ring-white">
+        <div class="grid h-20 w-20 place-items-center rounded-full bg-black/40 text-4xl font-medium text-white ring-2 ring-white">
           {countdown}
         </div>
       </div>

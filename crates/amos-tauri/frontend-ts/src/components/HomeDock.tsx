@@ -322,6 +322,18 @@ export default function HomeDock({
               })}
             </div>
           )}
+          {/* Spotlight search pill (🔍 + label) — must mirror svelte/HomeDock.svelte. */}
+          <button
+            type="button"
+            data-testid="home-search-entry"
+            aria-label={t("shell.search")}
+            title={t("shell.search")}
+            onClick={onSearch}
+            className="ml-1 flex h-6 cursor-pointer items-center gap-1 rounded-full bg-white/45 px-2 text-[11px] font-medium text-neutral-700 shadow-sm ring-1 ring-black/5 transition hover:scale-105 active:scale-90 dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
+          >
+            <span aria-hidden className="text-[10px] leading-none">🔍</span>
+            <span>{t("shell.search")}</span>
+          </button>
           {/* iOS-style "App Library" trailing-page entry (always present, even with a
               single icon page). A bigger 4×4 mini-app-grid icon, like the iOS App
               Library indicator. Left-swipe past the last page reaches the same place. */}
