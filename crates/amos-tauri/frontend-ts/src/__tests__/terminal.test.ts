@@ -29,6 +29,14 @@ describe("terminal demo shell", () => {
     expect(lastText(runTermLine("exit", "").lines)).toBe("session ended");
   });
 
+  test("date / uname / ver add safe built-ins (UTC iso + aliases)", () => {
+    const d = lastText(runTermLine("date", "", Date.UTC(2026, 8, 8, 12, 0, 0)).lines);
+    expect(d).toBe("2026-09-08T12:00:00.000Z");
+    expect(lastText(runTermLine("uname", "").lines)).toBe("amos");
+    expect(lastText(runTermLine("ver", "AmOS 0.1").lines)).toBe("AmOS 0.1");
+    expect(lastText(runTermLine("version", "AmOS 0.1").lines)).toBe("AmOS 0.1");
+  });
+
   test("clear returns the clear marker; blank input is a no-op", () => {
     expect(runTermLine("clear", "").clear).toBe(true);
     expect(runTermLine("   ", "")).toEqual({ lines: [], clear: false });

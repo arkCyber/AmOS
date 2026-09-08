@@ -36,6 +36,9 @@ const HELP: TermLine[] = [
   { text: "Available commands (offline-safe demo shell):", kind: "out" },
   { text: "  help            show this help", kind: "cmd" },
   { text: "  echo <text>     print <text> back", kind: "cmd" },
+  { text: "  date            print the current date/time (UTC)", kind: "cmd" },
+  { text: "  uname           print the OS name", kind: "cmd" },
+  { text: "  ver / version   alias of 'about'", kind: "cmd" },
   { text: "  clear           clear the screen", kind: "cmd" },
   { text: "  whoami          print the current user", kind: "cmd" },
   { text: "  about           show build info", kind: "cmd" },
@@ -44,7 +47,7 @@ const HELP: TermLine[] = [
 ];
 
 /** Run one (trimmed) input line against the safe demo command set. Pure. */
-export function runTermLine(input: string, about: string): TermResult {
+export function runTermLine(input: string, about: string, now = Date.now()): TermResult {
   const line = input.trim();
   if (line === "") return { lines: [], clear: false };
   const cmdLine: TermLine = { text: `${PROMPT} ${input}`, kind: "cmd" };
@@ -56,8 +59,14 @@ export function runTermLine(input: string, about: string): TermResult {
   switch (head) {
     case "echo":
       return { lines: [cmdLine, { text: rest.join(" "), kind: "out" }], clear: false };
+    case "date":
+      return { lines: [cmdLine, { text: new Date(now).toISOString(), kind: "out" }], clear: false };
+    case "uname":
+      return { lines: [cmdLine, { text: "amos", kind: "out" }], clear: false };
     case "whoami":
       return { lines: [cmdLine, { text: "amos", kind: "out" }], clear: false };
+    case "ver":
+    case "version":
     case "about":
       return { lines: [cmdLine, { text: about, kind: "out" }], clear: false };
     case "exit":
