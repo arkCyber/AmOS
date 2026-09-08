@@ -44,7 +44,7 @@
     }, 700);
   };
   const sorted = $derived.by(() =>
-    sortNetworks(NEIGHBORHOOD, cfg.current),
+    sortNetworks(NEIGHBORHOOD, cfg.current, cfg.saved),
   );
 </script>
 

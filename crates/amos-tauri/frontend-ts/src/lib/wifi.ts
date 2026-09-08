@@ -53,10 +53,15 @@ export const NEIGHBORHOOD: readonly WifiNet[] = [
   { ssid: "Neighbor_AX", signal: 1, secure: true },
 ];
 
-/** Sort a scan for display: the current network first, then by signal desc
- * (stable). Pure — used by the screen and by tests. */
-export function sortNetworks(nets: readonly WifiNet[], current: string | null): WifiNet[] {
-  const rank = (n: WifiNet) => (n.ssid === current ? 1 : 0);
+/** Sort a scan for display: current network first, then remembered ("my
+ * networks") by strength, then the rest by strength; ties by ssid. Stable. Pure. */
+export function sortNetworks(
+  nets: readonly WifiNet[],
+  current: string | null,
+  saved: readonly string[] = [],
+): WifiNet[] {
+  const rank = (n: WifiNet) =>
+    n.ssid === current ? 2 : saved.includes(n.ssid) ? 1 : 0;
   return [...nets].sort(
     (a, b) =>
       rank(b) - rank(a) || clampSignal(b.signal) - clampSignal(a.signal) ||

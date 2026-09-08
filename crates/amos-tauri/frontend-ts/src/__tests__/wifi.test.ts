@@ -51,6 +51,15 @@ describe("wifi scan ordering", () => {
       expect(sig[i - 1]!).toBeGreaterThanOrEqual(sig[i]!);
     }
   });
+
+  test("remembered networks sort above stronger unknown ones (iOS 'my networks')", () => {
+    // Cafe_Free (signal 3) remembered; AmOS-5G (signal 4) is not → remembered first.
+    const sorted = sortNetworks(NEIGHBORHOOD, null, ["Cafe_Free"]);
+    const ids = sorted.map((n) => n.ssid);
+    expect(ids[0]).toBe("Cafe_Free");
+    // and it still precedes the strongest unknown
+    expect(ids.indexOf("Cafe_Free")).toBeLessThan(ids.indexOf("AmOS-5G"));
+  });
 });
 
 describe("wifi connect (honest, no fake passworded join)", () => {
