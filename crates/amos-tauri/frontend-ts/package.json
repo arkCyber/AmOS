@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Amos System UI (bun + Vite + React + TypeScript + Tailwind) — light/dark theme + i18n first, consumes the amos.* shared store.",
+  "description": "Amos System UI (bun + Vite + Svelte 5 + TypeScript + Tailwind) — light/dark theme + i18n first, consumes the amos.* shared store.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
