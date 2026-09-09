@@ -23,7 +23,7 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable + fmt + clippy)
         uses: dtolnay/rust-toolchain@stable
@@ -58,7 +58,7 @@ jobs:
   smoke:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -94,7 +94,7 @@ jobs:
       CARGO_NET_RETRY: 3
       CARGO_HTTP_TIMEOUT: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run gated native backends in pinned container
         if: vars.CI_ANDROID_IMAGE != ''
@@ -142,7 +142,7 @@ jobs:
       CARGO_NET_RETRY: 3
       CARGO_HTTP_TIMEOUT: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run Android audio seams + sherpa in pinned container
         if: vars.CI_ANDROID_IMAGE != ''
