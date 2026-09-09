@@ -10,8 +10,10 @@
 //! Honest model (matches the workspace): the default host embedder is the
 //! deterministic `MockEmbedder` (offline, no model — retrieval is only *plumbing*,
 //! never claimed semantic). Setting `AMOS_RAG_EMBEDDER=ollama` selects the real
-//! local `/api/embeddings` adapter; an unreachable/broken model is a surfaced
-//! error, never a silent mock. Passages + vectors are in-memory unless
+//! local Ollama adapter (new `/api/embed`, falls back to old `/api/embeddings`);
+//! `AMOS_RAG_EMBEDDER=api` selects a cloud OpenAI-compatible `/v1/embeddings`.
+//! An unreachable/broken model is a surfaced error, never a silent mock.
+//! Passages + vectors are in-memory unless
 //! `AMOS_RAG_STATE` names a durable base path, in which case every Index/Remove
 //! atomically persists both and a restart re-hydrates them (see `docs/vector-db-rag.md`).
 //! "Retrieve-then-answer" is composed by the caller:
@@ -31,12 +33,19 @@ use amos_vector_db::{Embedder, MockEmbedder, VectorDbError};
 use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status};
 
-use crate::rag::{OllamaEmbedder, RagStore};
+use crate::rag::{ApiEmbedder, OllamaEmbedder, RagStore};
 
-/// Env var selecting the embedder backend: `mock` (default, offline) or `ollama`.
+/// Env var selecting the embedder backend: `mock` (default, offline), `ollama`
+/// (local Ollama) or `api` (cloud OpenAI-compatible `/v1/embeddings`).
 const EMBEDDER_ENV: &str = "AMOS_RAG_EMBEDDER";
-/// Env var naming the Ollama embedding model (used when embedder = `ollama`).
+/// Env var naming the embedding model (used by `ollama` and `api` embedders).
 const EMBED_MODEL_ENV: &str = "AMOS_RAG_EMBED_MODEL";
+/// Cloud embedder base URL (embedder = `api`; OpenAI-compatible `/embeddings`).
+const CLOUD_BASE_ENV: &str = "AMOS_RAG_EMBED_BASE";
+/// Cloud API key shared with the chat backends (bearer for the `api` embedder).
+const API_KEY_ENV: &str = "AMOS_API_KEY";
+/// Optional bearer for a token-gated local Ollama (embedder = `ollama`).
+const OLLAMA_KEY_ENV: &str = "AMOS_OLLAMA_API_KEY";
 /// Env var for the Mock embedder's fixed dimension (host/CI only).
 const MOCK_DIM_ENV: &str = "AMOS_RAG_DIM";
 /// Ollama host (shared with the chat backend). Default: `http://localhost:11434`.
@@ -287,7 +296,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Parse the embedder-choice env and build it. `mock` (default) → a fixed-dim
-/// `MockEmbedder`; `ollama` → the real local `/api/embeddings` adapter. An
+/// `MockEmbedder`; `ollama` → the real local Ollama adapter (old `/api/embeddings`
+/// or new `/api/embed`); `api` → a cloud OpenAI-compatible `/embeddings`. An
 /// invalid dimension / backend is an honest error (never a panic).
 fn embedder_from_env() -> Result<Box<dyn Embedder + Send>, String> {
     let which = std::env::var(EMBEDDER_ENV).unwrap_or_default();
@@ -296,7 +306,19 @@ fn embedder_from_env() -> Result<Box<dyn Embedder + Send>, String> {
             let host =
                 std::env::var(OLLAMA_HOST_ENV).unwrap_or_else(|_| "http://localhost:11434".into());
             let model = std::env::var(EMBED_MODEL_ENV).unwrap_or_else(|_| "bge-m3".into());
-            Ok(Box::new(OllamaEmbedder::new(host, model)) as Box<dyn Embedder + Send>)
+            let bearer = std::env::var(OLLAMA_KEY_ENV).ok().filter(|k| !k.is_empty());
+            Ok(
+                Box::new(OllamaEmbedder::new(host, model).with_bearer(bearer))
+                    as Box<dyn Embedder + Send>,
+            )
+        }
+        "api" => {
+            let base = std::env::var(CLOUD_BASE_ENV)
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+            let model =
+                std::env::var(EMBED_MODEL_ENV).unwrap_or_else(|_| "text-embedding-3-small".into());
+            let key = std::env::var(API_KEY_ENV).unwrap_or_default();
+            Ok(Box::new(ApiEmbedder::new(base, key, model)) as Box<dyn Embedder + Send>)
         }
         _ => {
             let dim = std::env::var(MOCK_DIM_ENV)
@@ -310,12 +332,12 @@ fn embedder_from_env() -> Result<Box<dyn Embedder + Send>, String> {
     }
 }
 
-/// The honest embedder label reported by `Status` (`"mock"` | `"ollama"`).
+/// The honest embedder label reported by `Status` (`"mock"` | `"ollama"` | `"api"`).
 fn label_from_env() -> &'static str {
-    if std::env::var(EMBEDDER_ENV).as_deref() == Ok("ollama") {
-        "ollama"
-    } else {
-        "mock"
+    match std::env::var(EMBEDDER_ENV).as_deref() {
+        Ok("ollama") => "ollama",
+        Ok("api") => "api",
+        _ => "mock",
     }
 }
 

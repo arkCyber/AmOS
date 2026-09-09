@@ -109,10 +109,10 @@ Landed (2026-09-09):
   transport-tested) + `RagStore` (embedder + `FlatIndex`).
 * `amos-ai/src/rag_service.rs` + proto `service Rag` — a gRPC `Rag` service
   mounted on the daemon's shared UDS: `Index` / `Remove` / `Query` / `Status`.
-  Embedder is mock (offline) by default, `AMOS_RAG_EMBEDDER=ollama` for a real
-  local model. "Retrieve-then-answer" is composed by the caller from `Rag.Query`
-  (returns nearest ids **+ their passage text** for citations) then
-  `AiAgent.StreamChat` with that context dropped into the prompt. Durable state:
+  Embedder is mock (offline) by default; `AMOS_RAG_EMBEDDER=ollama` for the real
+  local Ollama adapter (new `/api/embed`, falls back to `/api/embeddings`) and
+  `AMOS_RAG_EMBEDDER=api` for a cloud OpenAI-compatible `/v1/embeddings`
+  (`AMOS_RAG_EMBED_BASE` / `AMOS_RAG_EMBED_MODEL` / `AMOS_API_KEY`). Durable state:
   `AMOS_RAG_STATE` persists the vector snapshot + passages atomically and a
   restart re-hydrates them. UDS e2e: `rag_rpc_e2e.rs` + `rag_persist_e2e.rs`.
   `amos-ai` lib tests: **202**.

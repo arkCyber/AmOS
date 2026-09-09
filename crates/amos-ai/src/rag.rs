@@ -63,11 +63,92 @@ pub fn parse_embedding(payload: &str) -> amos_vector_db::Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Endpoint for the newer Ollama `/api/embed` RPC (plural vector response).
+pub fn embed_api_endpoint(host: &str) -> String {
+    format!("{}/api/embed", host.trim_end_matches('/'))
+}
+
+/// Parse an Ollama `/api/embed` response (`{"embeddings":[[…]]}`) into the first
+/// validated vector. Same honesty contract as [`parse_embedding`].
+pub fn parse_embed_api(payload: &str) -> amos_vector_db::Result<Vec<f32>> {
+    let v: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| VectorDbError::Embed(format!("unparseable /api/embed payload: {e}")))?;
+    let list = v
+        .get("embeddings")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| {
+            VectorDbError::Embed("no 'embeddings' array in /api/embed response".into())
+        })?;
+    let first = list
+        .first()
+        .ok_or_else(|| VectorDbError::Embed("empty embeddings list".into()))?;
+    let arr = first
+        .as_array()
+        .ok_or_else(|| VectorDbError::Embed("embeddings[0] is not an array".into()))?;
+    vec_from_json_numbers(arr)
+}
+
+/// Parse an OpenAI-compatible `/embeddings` response (`{"data":[{"embedding":[…]}]}`).
+pub fn parse_openai_embedding(payload: &str) -> amos_vector_db::Result<Vec<f32>> {
+    let v: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| VectorDbError::Embed(format!("unparseable embeddings payload: {e}")))?;
+    let data = v
+        .get("data")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| VectorDbError::Embed("no 'data' array in embeddings response".into()))?;
+    let first = data
+        .first()
+        .ok_or_else(|| VectorDbError::Embed("empty data list".into()))?;
+    let arr = first
+        .get("embedding")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| VectorDbError::Embed("data[0].embedding is not an array".into()))?;
+    vec_from_json_numbers(arr)
+}
+
+/// Validate a JSON number array into a finite, non-empty `Vec<f32>`.
+fn vec_from_json_numbers(arr: &[serde_json::Value]) -> amos_vector_db::Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(arr.len());
+    for el in arr {
+        let f = el
+            .as_f64()
+            .ok_or_else(|| VectorDbError::Embed("embedding element is not a number".into()))?
+            as f32;
+        if !f.is_finite() {
+            return Err(VectorDbError::Embed(
+                "embedding contains a non-finite value".into(),
+            ));
+        }
+        out.push(f);
+    }
+    if out.is_empty() {
+        return Err(VectorDbError::Embed("embedding is empty".into()));
+    }
+    Ok(out)
+}
+
 /// A real local embedder backed by an Ollama `/api/embeddings` model.
 ///
 /// Keyless by default; an optional bearer can be attached for token-gated
 /// gateways. The request is **blocking** (see module docs) and errors are
 /// surfaced as [`VectorDbError::Embed`] — never a fake vector.
+/// Small transport error from an Ollama POST: an HTTP status (kept so the caller
+/// can detect a missing route and fall back to an older API) or a transport msg.
+#[derive(Debug)]
+enum PostError {
+    Status(u16),
+    Transport(String),
+}
+
+impl PostError {
+    fn msg(&self) -> String {
+        match self {
+            PostError::Status(code) => format!("HTTP {code}"),
+            PostError::Transport(m) => m.clone(),
+        }
+    }
+}
+
 pub struct OllamaEmbedder {
     host: String,
     model: String,
@@ -91,28 +172,93 @@ impl OllamaEmbedder {
         self
     }
 
-    /// Blocking POST to `/api/embeddings`. Public so an async caller can run it
-    /// from `spawn_blocking` without holding the whole trait open.
-    pub fn embed_blocking(&self, text: &str) -> amos_vector_db::Result<Vec<f32>> {
-        let url = embeddings_endpoint(&self.host);
-        let body = serde_json::json!({ "model": self.model, "prompt": text });
-        let mut req = ureq::post(&url)
+    /// Blocking POST to an Ollama endpoint; returns the raw body or a small
+    /// transport error (HTTP status preserved so the caller can detect a missing
+    /// route and fall back to an older API).
+    fn post(&self, url: &str, body: serde_json::Value) -> Result<String, PostError> {
+        let mut req = ureq::post(url)
             .timeout(Duration::from_secs(30))
             .set("Content-Type", "application/json");
         if let Some(b) = &self.bearer {
             req = req.set("Authorization", &format!("Bearer {b}"));
         }
-        let resp = req
-            .send_string(&body.to_string())
-            .map_err(|e| VectorDbError::Embed(format!("Ollama /api/embeddings error: {e}")))?;
-        let payload = resp
-            .into_string()
-            .map_err(|e| VectorDbError::Embed(format!("read /api/embeddings body: {e}")))?;
-        parse_embedding(&payload)
+        let resp = req.send_string(&body.to_string()).map_err(|e| match e {
+            ureq::Error::Status(code, _) => PostError::Status(code),
+            other => PostError::Transport(format!("{other}")),
+        })?;
+        resp.into_string()
+            .map_err(|e| PostError::Transport(format!("{e}")))
+    }
+
+    /// Blocking embed. Public so an async caller can run it from `spawn_blocking`.
+    pub fn embed_blocking(&self, text: &str) -> amos_vector_db::Result<Vec<f32>> {
+        // Newer Ollama renamed the RPC to /api/embed (plural); older builds only
+        // expose /api/embeddings. Try the new one, fall back to the old on 404.
+        let new_body = serde_json::json!({ "model": self.model, "input": text });
+        match self.post(&embed_api_endpoint(&self.host), new_body) {
+            Ok(payload) => parse_embed_api(&payload),
+            Err(PostError::Status(404)) => {
+                let old_body = serde_json::json!({ "model": self.model, "prompt": text });
+                let url = embeddings_endpoint(&self.host);
+                let payload = self.post(&url, old_body).map_err(|e| {
+                    VectorDbError::Embed(format!("Ollama /api/embeddings error: {}", e.msg()))
+                })?;
+                parse_embedding(&payload)
+            }
+            Err(e) => Err(VectorDbError::Embed(format!(
+                "Ollama /api/embed error: {}",
+                e.msg()
+            ))),
+        }
     }
 }
 
 impl Embedder for OllamaEmbedder {
+    fn embed(&self, text: &str) -> amos_vector_db::Result<Vec<f32>> {
+        self.embed_blocking(text)
+    }
+}
+
+/// A cloud embedder talking to any OpenAI-compatible `/v1/embeddings` endpoint.
+///
+/// Keyed via `Authorization: Bearer`; blocking; errors are surfaced as
+/// [`VectorDbError::Embed`] and never fake a vector. This is the **full-cloud**
+/// RAG variant (note text goes to the configured provider).
+pub struct ApiEmbedder {
+    base: String,
+    model: String,
+    api_key: String,
+}
+
+impl ApiEmbedder {
+    /// `base` is the API base (e.g. `https://api.openai.com/v1`); `/embeddings`
+    /// is appended. `api_key` is sent as a bearer token.
+    pub fn new(base: String, api_key: String, model: String) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            model,
+            api_key,
+        }
+    }
+
+    /// Blocking POST to `${base}/embeddings`.
+    pub fn embed_blocking(&self, text: &str) -> amos_vector_db::Result<Vec<f32>> {
+        let url = format!("{}/embeddings", self.base);
+        let body = serde_json::json!({ "model": self.model, "input": text });
+        let resp = ureq::post(&url)
+            .timeout(Duration::from_secs(30))
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .send_string(&body.to_string())
+            .map_err(|e| VectorDbError::Embed(format!("cloud embeddings error: {e}")))?;
+        let payload = resp
+            .into_string()
+            .map_err(|e| VectorDbError::Embed(format!("read embeddings body: {e}")))?;
+        parse_openai_embedding(&payload)
+    }
+}
+
+impl Embedder for ApiEmbedder {
     fn embed(&self, text: &str) -> amos_vector_db::Result<Vec<f32>> {
         self.embed_blocking(text)
     }
@@ -298,6 +444,63 @@ mod tests {
         MockEmbedder::new(8).expect("mock dim")
     }
 
+    // ---- /api/embed (newer Ollama) + OpenAI /embeddings parsers ----
+
+    #[test]
+    fn parse_embed_api_valid_and_invalid() {
+        assert_eq!(
+            parse_embed_api(r#"{"embeddings":[[0.5,1.0]]}"#).unwrap(),
+            vec![0.5, 1.0]
+        );
+        assert!(parse_embed_api("{}").is_err());
+        assert!(parse_embed_api(r#"{"embeddings":[]}"#).is_err());
+        // Non-finite is rejected (never a poisoned index).
+        assert!(parse_embed_api(r#"{"embeddings":[[1e400]]}"#).is_err());
+    }
+
+    #[test]
+    fn parse_openai_embedding_valid_and_invalid() {
+        assert_eq!(
+            parse_openai_embedding(r#"{"data":[{"embedding":[0.25,-0.5]}]}"#).unwrap(),
+            vec![0.25, -0.5]
+        );
+        assert!(parse_openai_embedding(r#"{"data":[]}"#).is_err());
+        assert!(parse_openai_embedding(r#"{"data":[{}]}"#).is_err());
+        assert!(parse_openai_embedding(r#"{"data":[{"embedding":[]}]}"#).is_err());
+        assert!(parse_openai_embedding("not json").is_err());
+    }
+
+    #[test]
+    fn api_embedder_round_trip_over_mock_server() {
+        let (addr, _cap) = spawn_http_server(
+            "200 OK",
+            r#"{"data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}]}"#,
+        );
+        let emb = ApiEmbedder::new(
+            format!("http://{addr}/v1"),
+            "sk-test".into(),
+            "text-embedding-3-small".into(),
+        );
+        assert_eq!(emb.embed("hello").unwrap(), vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn api_embedder_sends_bearer() {
+        let (addr, cap) = spawn_http_server("200 OK", r#"{"data":[{"embedding":[1.0]}]}"#);
+        let emb = ApiEmbedder::new(format!("http://{addr}/v1"), "sk-secret".into(), "m".into());
+        let _ = emb.embed("hi");
+        let head = cap.lock().unwrap().to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-secret"), "{head}");
+    }
+
+    #[test]
+    fn ollama_embedder_reads_new_embed_api_shape() {
+        // Newer Ollama `/api/embed` returns the plural `{"embeddings":[[…]]}`.
+        let (addr, _) = spawn_http_server("200 OK", r#"{"embeddings":[[0.75,0.25]]}"#);
+        let emb = OllamaEmbedder::new(format!("http://{addr}"), "m".into());
+        assert_eq!(emb.embed("hello").unwrap(), vec![0.75, 0.25]);
+    }
+
     // ---- parse_embedding (pure, no network) ----
 
     #[test]
@@ -344,7 +547,7 @@ mod tests {
 
     #[test]
     fn ollama_embedder_round_trip() {
-        let (addr, _cap) = spawn_http_server("200 OK", r#"{"embedding":[0.1,0.2,0.3]}"#);
+        let (addr, _cap) = spawn_http_server("200 OK", r#"{"embeddings":[[0.1,0.2,0.3]]}"#);
         let emb = OllamaEmbedder::new(format!("http://{addr}"), "bge-m3".into());
         let v = emb.embed("hello").expect("embed ok");
         assert_eq!(v.len(), 3);
@@ -353,7 +556,7 @@ mod tests {
 
     #[test]
     fn ollama_embedder_sends_bearer_when_configured() {
-        let (addr, cap) = spawn_http_server("200 OK", r#"{"embedding":[0.5]}"#);
+        let (addr, cap) = spawn_http_server("200 OK", r#"{"embeddings":[[0.5]]}"#);
         let emb = OllamaEmbedder::new(format!("http://{addr}"), "bge-m3".into())
             .with_bearer(Some("sk-test".into()));
         emb.embed("hi").expect("embed ok");
@@ -363,7 +566,7 @@ mod tests {
 
     #[test]
     fn ollama_embedder_keyless_by_default() {
-        let (addr, cap) = spawn_http_server("200 OK", r#"{"embedding":[0.5]}"#);
+        let (addr, cap) = spawn_http_server("200 OK", r#"{"embeddings":[[0.5]]}"#);
         let emb = OllamaEmbedder::new(format!("http://{addr}"), "bge-m3".into());
         emb.embed("hi").expect("embed ok");
         let head = cap.lock().unwrap().clone();
