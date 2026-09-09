@@ -57,6 +57,16 @@ export function makeNote(text: string, now: number): Note {
   return { id: `${now.toString(36)}-${seq}`, text, ts: now, created: now };
 }
 
+/** Duplicate the note with `id`: a fresh copy (new id, same text, new created/ts,
+ *  kept pin state) is prepended at the top. No-op when `id` is missing. Immutable. */
+export function duplicateNote(list: Note[], id: string, now: number): Note[] {
+  const src = list.find((n) => n.id === id);
+  if (!src) return list;
+  const copy = makeNote(src.text, now);
+  if (src.pinned) copy.pinned = true;
+  return [copy, ...list];
+}
+
 /** Toggle the pin/star on a note: pinning floats it to the top; unpinning just
  * drops the star (keeps the note). Returns a new array (no-op if id missing). */
 export function togglePin(list: Note[], id: string): Note[] {

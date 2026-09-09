@@ -168,6 +168,7 @@ export const en: Record<MessageKey, string> = {
   "note.add": "Save",
   "note.edit": "Edit",
   "note.pin": "Pin",
+  "note.duplicate": "Duplicate",
   "note.archive": "Archive",
   "note.restore": "Restore",
   "note.deleteForever": "Delete forever",

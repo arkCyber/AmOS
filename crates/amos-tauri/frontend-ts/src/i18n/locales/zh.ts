@@ -166,6 +166,7 @@ export const zh = {
   "note.add": "保存",
   "note.edit": "编辑",
   "note.pin": "置顶",
+  "note.duplicate": "复制",
   "note.archive": "归档",
   "note.restore": "恢复",
   "note.deleteForever": "彻底删除",

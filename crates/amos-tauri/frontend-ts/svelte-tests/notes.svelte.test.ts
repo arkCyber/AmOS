@@ -465,3 +465,26 @@ describe("NotesApp.svelte — 折叠预览去内联标记", () => {
   });
 });
 
+
+describe("NotesApp.svelte — 复制便签", () => {
+  test("expanded note duplicate adds a copy at the top and persists two notes", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "d1", text: "被复制的内容", ts: 10, created: 10 }]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const row = host.container.querySelector(".mt-3.space-y-2 button") as HTMLButtonElement;
+    await fireEvent.click(row); // expand the note to reveal its action toolbar
+    const btn = host.container.querySelector(
+      'button[aria-label="note-duplicate"]',
+    ) as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    await fireEvent.click(btn);
+    const saved = JSON.parse(window.localStorage.getItem("amos.notes") ?? "[]");
+    expect(saved.length).toBe(2);
+    expect(saved[0].text).toBe("被复制的内容");
+    expect(saved[0].id).not.toBe("d1");
+  });
+});
+

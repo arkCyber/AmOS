@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf, stripInlineMarkers } from "../lib/notes";
+import { normalizeNotes, prependNote, removeNote, editNote, duplicateNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf, stripInlineMarkers } from "../lib/notes";
 import { orderByModified } from "../lib/notes";
 
 describe("notes store helpers", () => {
@@ -556,6 +556,32 @@ describe("stripInlineMarkers / notePreview clean preview", () => {
 
     orderByModified(list);
     expect(list.map((n) => n.id)).toEqual(before);
+  });
+});
+
+
+describe("duplicateNote", () => {
+  test("prepends a fresh copy with the same text, new id/ts and no created==ts gap", () => {
+    const base = [{ id: "a", text: "hello\nworld", ts: 100, created: 100 }];
+    const next = duplicateNote(base, "a", 5000);
+    expect(next.length).toBe(2);
+    expect(next[0]!.text).toBe("hello\nworld");
+    expect(next[0]!.ts).toBe(5000);
+    expect(next[0]!.created).toBe(5000);
+    expect(next[0]!.id).not.toBe("a");
+    expect(next[1]).toEqual(base[0]);
+    expect(base.length).toBe(1); // immutable
+  });
+
+  test("keeps the source pin state on the copy", () => {
+    const base = [{ id: "a", text: "x", ts: 1, created: 1, pinned: true }];
+    const next = duplicateNote(base, "a", 9);
+    expect(next[0]!.pinned).toBe(true);
+  });
+
+  test("no-op when the id is missing", () => {
+    const base = [{ id: "a", text: "x", ts: 1, created: 1 }];
+    expect(duplicateNote(base, "nope", 9)).toBe(base);
   });
 });
 

@@ -8,6 +8,7 @@
     NOTES_KEY,
     completeAllTasks,
     editNote,
+    duplicateNote,
     fmtInline,
     fmtTime,
     normalizeNotes,
@@ -281,6 +282,8 @@
 
   const setStateOf = (id: string, st: "archived" | "trash" | undefined) =>
     persist(setNoteState(notes, id, st));
+
+  const dupeOf = (id: string) => persist(duplicateNote(notes, id, Date.now()));
 
   // Fetch the inline clipboard-history tray only while open.
   $effect(() => {
@@ -577,6 +580,7 @@
                   {#if mode === "all"}
                     <button onclick={() => persist(togglePin(notes, n.id))} title={t("note.pin")} class={"hover:underline " + (n.pinned ? "text-amber-500" : "opacity-70")}>{n.pinned ? "★" : "☆"}</button>
                     <button onclick={() => setStateOf(n.id, "archived")} class="hover:underline">{t("note.archive")}</button>
+                    <button onclick={() => dupeOf(n.id)} aria-label="note-duplicate" title={t("note.duplicate")} class="hover:underline">⧉ {t("note.duplicate")}</button>
                     <button onclick={() => beginEdit(n)} class="text-accent hover:underline">{t("note.edit")}</button>
                     <button onclick={() => openEditor(n)} class="text-accent hover:underline">整页</button>
                   {/if}
