@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText } from "../lib/notes";
+import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf } from "../lib/notes";
 
 describe("notes store helpers", () => {
   test("prependNote adds newest first, each with a unique id", () => {
@@ -462,6 +462,46 @@ describe("iOS-style note row helpers", () => {
     expect(noteDayOf(now, now)).toBe(0); // today
     expect(noteDayOf(now - 86_400_000, now)).toBe(-1); // yesterday
     expect(noteDayOf(now + 86_400_000, now)).toBe(1); // tomorrow
+  });
+});
+
+
+describe("note created/modified storage", () => {
+  test("makeNote records created == ts", () => {
+    const n = makeNote("hi", 500);
+    expect(n.created).toBe(500);
+    expect(createdOf(n)).toBe(500);
+    expect(editedOf(n)).toBe(false); // not edited yet
+  });
+
+  test("editNote keeps created and bumps ts → editedOf true, createdOf stable", () => {
+    const first = makeNote("a", 100);
+    const after = editNote([first], first.id, "b", 999);
+    const n = after[0]!;
+    expect(n.created).toBe(100);
+    expect(n.ts).toBe(999);
+    expect(createdOf(n)).toBe(100);
+    expect(editedOf(n)).toBe(true);
+  });
+
+  test("normalizeNotes back-fills created from ts for legacy notes", () => {
+    const legacy = normalizeNotes([{ text: "legacy", ts: 42 }]);
+    expect(legacy[0]!.created).toBeUndefined(); // older source had no created
+    expect(createdOf(legacy[0]!)).toBe(42); // helper falls back to ts
+    expect(editedOf(legacy[0]!)).toBe(false); // legacy: not "known edited"
+  });
+
+  test("normalizeNotes preserves a sane stored created", () => {
+    const list = normalizeNotes([{ id: "x", text: "a", ts: 200, created: 100 }]);
+    expect(list[0]!.created).toBe(100);
+    expect(createdOf(list[0]!)).toBe(100);
+    expect(editedOf(list[0]!)).toBe(true);
+  });
+
+  test("normalizeNotes ignores a non-numeric created and falls back", () => {
+    const list = normalizeNotes([{ text: "a", ts: 5, created: "nope" }]);
+    expect(list[0]!.created).toBeUndefined();
+    expect(createdOf(list[0]!)).toBe(5);
   });
 });
 

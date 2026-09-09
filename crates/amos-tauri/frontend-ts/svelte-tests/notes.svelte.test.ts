@@ -124,3 +124,246 @@ describe("NotesApp.svelte", () => {
   });
 });
 
+describe("NotesApp.svelte — editor affordances", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  const addNote = async (host: { container: HTMLElement }, v: string) => {
+    const ta = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(ta, { target: { value: v } });
+    await fireEvent.click(btnTrim(host, "保存")!);
+    await tick();
+  };
+  const enterEdit = async (host: { container: HTMLElement }) => {
+    const editBtn = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").includes("编辑"),
+    ) as HTMLButtonElement;
+    expect(editBtn).toBeTruthy();
+    await fireEvent.click(editBtn);
+    await tick();
+  };
+  const noteEditTa = (host: { container: HTMLElement }) =>
+    host.container.querySelector('textarea[aria-label="note-edit"]') as HTMLTextAreaElement;
+
+  test("live rich-text preview shows while editing and renders markers", async () => {
+    const host = render(NotesApp);
+    await addNote(host, "**加粗** 与 #工作");
+    await enterEdit(host);
+    expect(noteEditTa(host)).toBeTruthy();
+
+    await fireEvent.click(host.container.querySelector('[aria-label="note-edit-preview"]')!);
+    await tick();
+
+    const prev = host.container.querySelector('[aria-label="note-preview"]');
+    expect(prev).toBeTruthy();
+    expect(prev?.querySelector("strong")).toBeTruthy(); // **加粗** rendered bold
+    expect(txt(host)).toContain("#工作");
+  });
+
+  test("☑ 勾选 toggles the task on the caret's line (line 0 by default)", async () => {
+    const host = render(NotesApp);
+    await addNote(host, "- [ ] 买牛奶");
+    await enterEdit(host);
+    const ta = noteEditTa(host);
+    expect(ta.value).toBe("- [ ] 买牛奶");
+
+    await fireEvent.click(host.container.querySelector('[aria-label="note-edit-toggle-task"]')!);
+    await tick();
+    expect(noteEditTa(host).value).toBe("- [x] 买牛奶");
+  });
+
+  test("＋ 任务 turns the caret's plain line into a checklist item", async () => {
+    const host = render(NotesApp);
+    await addNote(host, "写周报");
+    await enterEdit(host);
+    await fireEvent.click(host.container.querySelector('[aria-label="note-edit-prefix-task"]')!);
+    await tick();
+    expect(noteEditTa(host).value).toBe("- [ ] 写周报");
+  });
+});
+
+describe("NotesApp.svelte — created/modified indicator", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  test("an edited note (created < modified) shows the 已编辑 marker when opened", async () => {
+    // Seed localStorage with one edited note (created=1000, modified=2000).
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "edited1", text: "被修改过的正文", ts: 2000, created: 1000 }]),
+    );
+    const host = render(NotesApp);
+    await tick();
+
+    // The note is a collapsed row; open it to reveal the detail footer.
+    const row = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("被修改过的正文"),
+    ) as HTMLButtonElement;
+    expect(row).toBeTruthy();
+    await fireEvent.click(row);
+    await tick();
+
+    expect(txt(host)).toContain("已编辑");
+  });
+
+  test("a freshly-created note shows no 已编辑 marker", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "fresh", text: "新笔记", ts: 1000, created: 1000 }]),
+    );
+    const host = render(NotesApp);
+    const row = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("新笔记"),
+    ) as HTMLButtonElement;
+    await fireEvent.click(row);
+    await tick();
+    expect(txt(host)).not.toContain("已编辑");
+  });
+});
+
+
+
+
+describe("NotesApp.svelte — full-page editor wiring", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  test("opening 整页 swaps to NoteEditor; ‹ back flushes the autosave and returns", async () => {
+    const host = render(NotesApp);
+    const compose = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(compose, { target: { value: "第一版标题" } });
+    await fireEvent.click(btnTrim(host, "保存")!);
+    await tick();
+    expect(txt(host)).toContain("第一版标题");
+
+    // Open the full-page editor from the note's detail footer.
+    const full = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("整页"),
+    ) as HTMLButtonElement;
+    expect(full).toBeTruthy();
+    await fireEvent.click(full);
+    await tick();
+
+    const ed = host.container.querySelector(
+      'textarea[aria-label="note-editor-textarea"]',
+    ) as HTMLTextAreaElement;
+    expect(ed).toBeTruthy();
+    await fireEvent.input(ed, { target: { value: "第二版标题与正文" } });
+    await tick();
+
+    // ‹ back flushes the pending autosave and returns to the list.
+    await fireEvent.click(host.container.querySelector('[aria-label="note-editor-back"]')!);
+    await tick();
+
+    expect(host.container.querySelector('[aria-label="note-editor-textarea"]')).toBeNull();
+    expect(txt(host)).toContain("第二版标题与正文"); // list row reflects the save
+    const stored = readStoreValue<{ id: string; text: string; ts: number }[]>(
+      "amos.notes",
+      [],
+    );
+    expect(stored.some((n) => n.text === "第二版标题与正文")).toBe(true);
+  });
+});
+
+describe("NotesApp.svelte — Markdown-aware titles", () => {
+  test("a note starting with '# title' shows the heading (no '#') as its row title", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "md1", text: "# 阶段计划\n\n写正文与检查清单", ts: 1, created: 1 }]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    // Collapsed row title area: heading without the leading '#'.
+    expect(txt(host)).toContain("阶段计划");
+    expect(txt(host)).not.toContain("# 阶段计划");
+  });
+});
+
+
+describe("NotesApp.svelte — Markdown import / export", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  test("⇪ md imports the compose content as a front-matter-stripped note", async () => {
+    const host = render(NotesApp);
+    const compose = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(compose, {
+      target: { value: "---\ntitle: 周报\n---\n# 周报标题\n\n正文内容" },
+    });
+    await fireEvent.click(host.container.querySelector('[aria-label="note-import-md"]')!);
+    await tick();
+
+    const stored = readStoreValue<{ id: string; text: string }[]>("amos.notes", []);
+    expect(stored.some((n) => n.text === "# 周报标题\n\n正文内容")).toBe(true);
+    expect(compose.value).toBe(""); // compose cleared after import
+    expect(txt(host)).toContain("已导入");
+  });
+
+  test("⇩ .md export affordance is present and reports the clipboard fallback", async () => {
+    const host = render(NotesApp);
+    const compose = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(compose, { target: { value: "导出正文" } });
+    await fireEvent.click(btnTrim(host, "保存")!); // adds + opens the note
+    await tick();
+
+    const mdBtn = host.container.querySelector('[aria-label="note-export-md"]');
+    expect(mdBtn).toBeTruthy();
+    await fireEvent.click(mdBtn as HTMLButtonElement);
+    await tick();
+    expect(txt(host)).toContain("已复制 .md");
+  });
+});
+
+describe("NotesApp.svelte — open-in-editor preference", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  const seedNote = () =>
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "row1", text: "点按我", ts: 1, created: 1 }]),
+    );
+  const tapRow = async (host: { container: HTMLElement }) => {
+    const row = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("点按我"),
+    ) as HTMLButtonElement;
+    expect(row).toBeTruthy();
+    await fireEvent.click(row);
+    await tick();
+  };
+
+  test("default: tapping a row expands inline, not the full-page editor", async () => {
+    seedNote();
+    window.localStorage.removeItem("amos.notesPrefs");
+    const host = render(NotesApp);
+    await tapRow(host);
+    expect(host.container.querySelector('textarea[aria-label="note-editor-textarea"]')).toBeNull();
+    expect(txt(host)).toContain("点按我"); // expanded inline detail
+  });
+
+  test("pref on: tapping a row opens the full-page editor", async () => {
+    seedNote();
+    window.localStorage.setItem("amos.notesPrefs", JSON.stringify({ openInEditor: true }));
+    const host = render(NotesApp);
+    await tapRow(host);
+    expect(host.container.querySelector('textarea[aria-label="note-editor-textarea"]')).toBeTruthy();
+  });
+
+  test("the toggle persists openInEditor to amos.notesPrefs", async () => {
+    window.localStorage.removeItem("amos.notes");
+    window.localStorage.removeItem("amos.notesPrefs");
+    const host = render(NotesApp);
+    const cb = host.container.querySelector(
+      'input[aria-label="note-pref-open-in-editor"]',
+    ) as HTMLInputElement;
+    expect(cb).toBeTruthy();
+    await fireEvent.click(cb); // bind:checked flips to true
+    await tick();
+    const saved = JSON.parse(window.localStorage.getItem("amos.notesPrefs") ?? "{}");
+    expect(saved.openInEditor).toBe(true);
+  });
+});
+
+

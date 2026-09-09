@@ -17,6 +17,8 @@
     noteStats,
     noteTitle,
     notesOf,
+    createdOf,
+    editedOf,
     orderPinned,
     prependNote,
     removeNote,
@@ -36,17 +38,31 @@
     hasTag,
   } from "../lib/notes";
   import type { Note } from "../lib/notes";
+  import {
+    enterContinuesTask,
+    prefixTaskAtLine,
+    shiftLineIndent,
+    toggleTaskLineAt,
+  } from "../lib/noteEditing";
   import { clipboardHistory, clipboardRead, clipboardWrite, entryText } from "../lib/clipboard";
   import type { ClipboardEntry } from "../lib/clipboard";
   import { iconSvg } from "../lib/sysIcons";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { exportTxtFile } from "../lib/backend";
   import { t } from "./locale.svelte";
+  import NoteEditor from "./NoteEditor.svelte";
+  import { markdownTitleOf, parseMarkdownImport, toMarkdownFile } from "../lib/markdown";
+  import { loadNotesPrefs, saveNotesPrefs, type NotesPrefs } from "../lib/notePrefs";
+  // Display title: prefer a `# heading`, else the first line, else the untitled label.
+  const titleOf = (text: string) => markdownTitleOf(text) || noteTitle(text) || t("note.untitled");
 
   const seeded = normalizeNotes(readStoreValue<unknown>(NOTES_KEY, []));
   let notes = $state<Note[]>(seeded);
   let text = $state("");
   let editingId = $state<string | null>(null);
+  // Editor affordances: caret-based task ops + a live rich-text preview toggle.
+  let editEl = $state<HTMLTextAreaElement | null>(null);
+  let previewOn = $state(false);
   let editVal = $state("");
   let trayOpen = $state(false);
   let trayItems = $state<ClipboardEntry[]>([]);
@@ -55,11 +71,35 @@
   let openId = $state<string | null>(null);
   let selecting = $state(false); // multi-select batch mode
   let selected = $state<string[]>([]);
+  // Full-page editor (NoteEditor, docs/notes-editor.md): set to a note to swap the
+  // list view for that note's auto-saving editor; null shows the normal list.
+  let editor = $state<Note | null>(null);
+  // Notes preference: tap a collapsed row to open the full-page editor directly.
+  let prefs = $state<NotesPrefs>(loadNotesPrefs());
 
 
   const persist = (list: Note[]) => {
     writeStoreValue(NOTES_KEY, list);
     notes = list;
+  };
+
+  const openEditor = (n: Note) => {
+    if (n.state) return; // only active notes open in the editor
+    editor = n;
+  };
+  const closeEditor = () => {
+    editor = null;
+    // Re-read the store so auto-saves from the editor show up in the list rows.
+    notes = normalizeNotes(readStoreValue<unknown>(NOTES_KEY, []));
+  };
+  // Tapping a collapsed row: expand inline by default, or (pref on) open the
+  // full-page editor. Archived/trash rows always expand inline.
+  const rowTap = (n: Note) => {
+    if (prefs.openInEditor && mode === "all" && !n.state) {
+      openEditor(n);
+      return;
+    }
+    openId = n.id;
   };
 
   const add = () => {
@@ -78,6 +118,8 @@
   const cancelEdit = () => {
     editingId = null;
     editVal = "";
+    editEl = null;
+    previewOn = false;
   };
   const saveEdit = () => {
     if (!editingId) return;
@@ -103,6 +145,48 @@
 
   const editingThis = (id: string) => editingId === id;
   const editTasks = $derived(tasksOf(editVal));
+
+  // ---- Editor keybindings / caret-based task affordances (pure transforms) ----
+  const queueCaret = (ta: HTMLTextAreaElement, pos: number) => {
+    queueMicrotask(() => {
+      try {
+        ta.focus();
+        ta.setSelectionRange(pos, pos);
+      } catch {
+        /* caret restore is best-effort */
+      }
+    });
+  };
+  const onEditKey = (e: KeyboardEvent) => {
+    const ta = e.currentTarget as HTMLTextAreaElement;
+    const val = ta.value;
+    const off = ta.selectionStart ?? 0;
+    if (e.key === "Enter") {
+      const r = enterContinuesTask(val, off);
+      if (r && r.changed) {
+        e.preventDefault();
+        editVal = r.text;
+        queueCaret(ta, r.cursor);
+      }
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      const r = shiftLineIndent(val, off, 2, e.shiftKey);
+      if (r.changed) {
+        editVal = r.text;
+        queueCaret(ta, r.cursor);
+      }
+    }
+  };
+  const editCaret = () => editEl?.selectionStart ?? editVal.length;
+  const toggleAtCaret = () => {
+    const r = toggleTaskLineAt(editVal, editCaret());
+    if (r && r.changed) editVal = r.text;
+  };
+  const prefixAtCaret = () => {
+    const r = prefixTaskAtLine(editVal, editCaret());
+    if (r && r.changed) editVal = r.text;
+  };
+
   let selTag = $state<string | null>(null); // active #tag filter (lowercased)
   const activeAll = $derived(
     orderPinned(searchNotes(notesOf(notes, undefined), mode === "all" ? searchQ : "")),
@@ -160,6 +244,36 @@
   };
   const composeStats = $derived(noteStats(text));
   const statsOf = (n: Note) => noteStats(n.text);
+
+  // "Import Markdown": treat the compose box as a pasted Markdown doc → add a note
+  // with the front-matter-stripped, normalized body.
+  const importMd = () => {
+    const parsed = parseMarkdownImport(text);
+    if (!parsed) return;
+    const now = Date.now();
+    persist(prependNote(notes, parsed.body, now));
+    text = "";
+    exportMsg = `已导入「${parsed.title || "未命名"}」`;
+  };
+
+  // "Export .md": serialise one note as a Markdown file and copy to the AmOS
+  // clipboard (no on-device md writer yet — same honest fallback as the .txt path
+  // without a backend).
+  const doExportMd = async (n: Note) => {
+    const fileText = toMarkdownFile({
+      title: markdownTitleOf(n.text) || noteTitle(n.text) || "未命名",
+      text: n.text,
+      created: createdOf(n),
+      modified: n.ts,
+    });
+    try {
+      await clipboardWrite({ kind: "text", text: fileText });
+    } catch {
+      /* clipboard unavailable — message still informs */
+    }
+    exportMsg = "已复制 .md 到剪贴板（未连接后端）";
+  };
+
   const collapsed = (n: Note) =>
     !editingThis(n.id) && openId !== n.id && tasksOf(n.text).length === 0;
 
@@ -208,6 +322,9 @@
 </script>
 
 <div class="p-4">
+  {#if editor}
+    <NoteEditor note={editor} onClose={closeEditor} />
+  {:else}
   {#if exportMsg}
     <p role="status" class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-xs text-accent dark:bg-white/10">{exportMsg}</p>
   {/if}
@@ -219,9 +336,19 @@
     class="mb-2 w-full resize-none rounded-2xl bg-black/5 p-3 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:text-neutral-100 dark:ring-white/10 dark:placeholder:text-white/30"
   ></textarea>
   <div class="flex items-center justify-between">
-    <button onclick={add} class="rounded-full bg-accent px-4 py-1.5 text-sm text-white active:scale-95">{t("note.add")}</button>
+    <span class="flex items-center gap-2">
+      <button onclick={add} class="rounded-full bg-accent px-4 py-1.5 text-sm text-white active:scale-95">{t("note.add")}</button>
+      <button onclick={importMd} aria-label="note-import-md" title="把输入内容当作 Markdown 导入" class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">⇪ md</button>
+    </span>
     <span class="text-xs opacity-50">{t("note.stats", { chars: String(composeStats.chars), lines: String(composeStats.lines) })}</span>
   </div>
+
+  {#if mode === "all"}
+    <label class="mt-2 flex items-center gap-2 text-xs opacity-70">
+      <input type="checkbox" bind:checked={prefs.openInEditor} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-open-in-editor" />
+      点按笔记直接进入整页编辑
+    </label>
+  {/if}
 
   {#if mode === "all"}
     <input
@@ -289,13 +416,13 @@
           <button onclick={() => toggleSel(n.id)} aria-pressed={selected.includes(n.id)} class={"block w-full rounded-2xl p-3 text-left shadow-sm ring-1 transition " + (selected.includes(n.id) ? "bg-accent/15 ring-accent dark:bg-accent/20" : "bg-white/60 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10")}>
             <div class="flex items-center gap-2">
               <span aria-hidden="true" class={"grid h-5 w-5 shrink-0 place-items-center rounded-full text-[12px] " + (selected.includes(n.id) ? "bg-accent text-white" : "border border-black/20 text-transparent dark:border-white/40")}>✓</span>
-              <span class="truncate text-[15px] font-medium">{noteTitle(n.text) || t("note.untitled")}</span>
+              <span class="truncate text-[15px] font-medium">{titleOf(n.text)}</span>
             </div>
           </button>
         {:else if collapsed(n)}
-          <button onclick={() => (openId = n.id)} class="block w-full rounded-2xl bg-white/60 p-3 text-left shadow-sm ring-1 ring-black/5 transition active:bg-white/80 dark:bg-white/[0.06] dark:ring-white/10">
+          <button onclick={() => rowTap(n)} class="block w-full rounded-2xl bg-white/60 p-3 text-left shadow-sm ring-1 ring-black/5 transition active:bg-white/80 dark:bg-white/[0.06] dark:ring-white/10">
             <div class="flex items-start justify-between gap-2">
-              <span class="truncate text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">{noteTitle(n.text) || t("note.untitled")}</span>
+              <span class="truncate text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">{titleOf(n.text)}</span>
               <span class="shrink-0 pt-0.5 text-xs text-neutral-500">{stampOf(n)}</span>
             </div>
             {#if notePreview(n.text)}
@@ -321,7 +448,14 @@
 
             {#if editingThis(n.id)}
               <div>
-                <textarea bind:value={editVal} rows={3} aria-label="note-edit" class="w-full resize-none rounded-xl bg-white/70 p-2 text-sm outline-none dark:bg-neutral-900/70"></textarea>
+                <textarea
+                  bind:this={editEl}
+                  bind:value={editVal}
+                  onkeydown={onEditKey}
+                  rows={6}
+                  aria-label="note-edit"
+                  class="w-full resize-y rounded-xl bg-white/70 p-2 text-sm leading-relaxed outline-none dark:bg-neutral-900/70"
+                ></textarea>
                 {#if editTasks.length > 0}
                   <div class="mt-2 rounded-xl bg-white/50 p-2 dark:bg-neutral-900/50">
                     <div class="text-xs opacity-50">{t("note.tasks")} · {editTasks.filter((tk) => tk.done).length}/{editTasks.length}</div>
@@ -333,6 +467,41 @@
                     {/each}
                   </div>
                 {/if}
+                <div class="mt-2 flex items-center gap-1.5 text-xs">
+                  <button
+                    onclick={toggleAtCaret}
+                    title="勾选 / 取消光标所在任务行"
+                    aria-label="note-edit-toggle-task"
+                    class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
+                  >☑ 勾选</button>
+                  <button
+                    onclick={prefixAtCaret}
+                    title="把光标所在行变成任务"
+                    aria-label="note-edit-prefix-task"
+                    class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
+                  >＋ 任务</button>
+                  <button
+                    onclick={() => (previewOn = !previewOn)}
+                    aria-pressed={previewOn}
+                    aria-label="note-edit-preview"
+                    title="富文本预览"
+                    class={"rounded-full px-2.5 py-1 " + (previewOn ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
+                  >预览</button>
+                </div>
+
+                {#if previewOn && editVal.trim()}
+                  <div aria-label="note-preview" class="mt-2 whitespace-pre-wrap rounded-xl bg-white/40 p-2 text-sm leading-relaxed ring-1 ring-black/5 dark:bg-neutral-900/40 dark:ring-white/10">
+                    {#each fmtInline(editVal) as seg, i (i)}
+                      {#if seg.tag}<span class="font-medium text-accent underline decoration-accent/40 underline-offset-2">{seg.text}</span>
+                      {:else if seg.bold}<strong class="font-semibold">{seg.text}</strong>
+                      {:else if seg.hl}<mark class="rounded bg-amber-200 px-0.5 dark:bg-amber-500/40">{seg.text}</mark>
+                      {:else if seg.link && seg.url}<a href={seg.url} target="_blank" rel="noreferrer" class="break-all text-accent underline">{seg.text}</a>
+                      {:else if seg.strike}<s class="opacity-60">{seg.text}</s>
+                      {:else}{seg.text}{/if}
+                    {/each}
+                  </div>
+                {/if}
+
                 <div class="mt-2 flex items-center justify-between text-xs">
                   <span class="opacity-60">{fmtTime(n.ts)}</span>
                   <div class="flex gap-2">
@@ -388,15 +557,17 @@
               {/if}
               <div class="mt-2 flex items-center justify-between text-xs opacity-60">
                 <span class="flex gap-1.5">
-                  <span>{fmtTime(n.ts)}</span>
+                  <span title={editedOf(n) ? new Date(createdOf(n)).toLocaleString() : undefined}>{fmtTime(n.ts)}{editedOf(n) ? ` · ${t("note.edited")}` : ""}</span>
                   <span>· {statsOf(n).chars} {t("note.chars")}</span>
                 </span>
                 <div class="flex flex-wrap gap-2">
                   <button onclick={() => void doExportOne(n)} title={t("note.export")} class="hover:underline">↧ {t("note.export")}</button>
+                  <button onclick={() => void doExportMd(n)} aria-label="note-export-md" title="导出为 Markdown（复制到剪贴板）" class="hover:underline">⇩ .md</button>
                   {#if mode === "all"}
                     <button onclick={() => persist(togglePin(notes, n.id))} title={t("note.pin")} class={"hover:underline " + (n.pinned ? "text-amber-500" : "opacity-70")}>{n.pinned ? "★" : "☆"}</button>
                     <button onclick={() => setStateOf(n.id, "archived")} class="hover:underline">{t("note.archive")}</button>
                     <button onclick={() => beginEdit(n)} class="text-accent hover:underline">{t("note.edit")}</button>
+                    <button onclick={() => openEditor(n)} class="text-accent hover:underline">整页</button>
                   {/if}
                   {#if mode === "all" || mode === "archived"}
                     <button onclick={() => setStateOf(n.id, "trash")} class="text-danger hover:underline">{t("note.delete")}</button>
@@ -416,5 +587,6 @@
       {/each}
     {/if}
   </div>
+{/if}
 </div>
 

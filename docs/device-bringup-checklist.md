@@ -61,3 +61,7 @@ make gated-check                                   # 已含 amos-media --feature
 | A | root + ADB 二进制裸扫 DCIM | scan_dir 已 host 跑通(≈215µs 样本) | 交叉编译+ADB+10ms 实测 | ✅ 实测通过（S5 · 47 项 · 7.68ms · shell 非 root）|
 | B | 普通 App 走 MediaStore | AndroidMediaProvider 编译/契约 + attach 测试 | Kotlin 并入 gen + gradle 编译 + 授权 + attach | Kotlin 实装就绪（模板）· 待并入/编译/设备 |
 | C | Waydroid / 桌面 dev | `AMOS_MEDIA_ROOT`→HostFs 已 host 端到端测试 | 指向真实目录即用 | 已可跑 |
+
+## 离线 RAG（非媒体）真机状态 → 指针
+离线 Notes 向量检索的完整真机收尾（含 `amos-ai` 已带 `Rag` 服务、S5 真机 TCP-loopback mock `index/query/remove` round-trip 实测、ARM index bench 数字、`make android-rag-bringup` 一键驱动）记录在 **`docs/vector-db-rag.md`**：见其 `Recorded on-device measurement`、`On-device daemon bring-up` 与 `Status` 三节。
+

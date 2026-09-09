@@ -1,7 +1,11 @@
 export interface Note {
   id: string;
   text: string;
+  /** Last-modified timestamp (drives the row stamp / sort recency). */
   ts: number;
+  /** First-created timestamp. Optional for backward compatibility: notes written
+   *  before this field existed are back-filled to `ts` on normalize. */
+  created?: number;
   /** Optional star: pinned notes float to the top of the list. */
   pinned?: boolean;
   /** Optional lifecycle bucket: active notes omit this; others are archived or
@@ -43,10 +47,10 @@ export function noteDayOf(ts: number, now: number): number {
 // in the same millisecond (and deterministic within a process for tests).
 let seq = 0;
 
-/** Create a new note with a unique id. */
+/** Create a new note with a unique id. Creation time == last-modified time. */
 export function makeNote(text: string, now: number): Note {
   seq += 1;
-  return { id: `${now.toString(36)}-${seq}`, text, ts: now };
+  return { id: `${now.toString(36)}-${seq}`, text, ts: now, created: now };
 }
 
 /** Toggle the pin/star on a note: pinning floats it to the top; unpinning just
@@ -115,6 +119,11 @@ export function normalizeNotes(list: unknown): Note[] {
       id,
       text,
       ts,
+      // Backward-compatible created: accept a stored `created` if sane, else fold
+      // back to `ts` (older notes had only `ts`).
+      ...(typeof o.created === "number" && Number.isFinite(o.created)
+        ? { created: o.created as number }
+        : {}),
       ...(typeof o.pinned === "boolean" ? { pinned: o.pinned } : {}),
       ...(o.state === "archived" || o.state === "trash" ? { state: o.state } : {}),
     });
@@ -146,6 +155,23 @@ export function editNote(list: Note[], id: string, text: string, now: number): N
   if (!target) return list; // defensive: index in range by construction
   if (target.text === v) return list; // unchanged → same ref, no ts churn
   return list.map((n) => (n.id === id ? { ...n, text: v, ts: now } : n));
+}
+
+/** First-created timestamp; falls back to `ts` for legacy notes without `created`. */
+export function createdOf(note: Note): number {
+  return typeof note.created === "number" && Number.isFinite(note.created)
+    ? note.created
+    : note.ts;
+}
+
+/** True when a note was edited after it was created (modified > created). Legacy
+ *  notes without a `created` marker are treated as "not known edited". */
+export function editedOf(note: Note): boolean {
+  return (
+    typeof note.created === "number" &&
+    Number.isFinite(note.created) &&
+    note.ts > note.created
+  );
 }
 
 /* ---- Batch operations (multi-select: archive / restore / trash / delete / pin) ---- */
