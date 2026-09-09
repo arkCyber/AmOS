@@ -18,10 +18,10 @@ export const NOTES_KEY = "amos.notes";
 /** First meaningful (title) line of a note body — the bold row title (iOS Notes). */
 export function noteTitle(text: string): string {
   for (const line of text.split("\n")) {
-    const v = line.replace(/^\s*[-*]\s*/, "").trim();
-    if (v) return v;
+    const v = line.replace(/^\s*(?:[-*]\s+)/, "").trim();
+    if (v) return stripInlineMarkers(v);
   }
-  return text.trim();
+  return stripInlineMarkers(text.trim());
 }
 
 /** A whitespace-collapsed preview of the body *after* the title line, for the

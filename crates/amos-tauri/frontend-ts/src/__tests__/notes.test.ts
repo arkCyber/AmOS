@@ -560,6 +560,23 @@ describe("stripInlineMarkers / notePreview clean preview", () => {
 });
 
 
+describe("noteTitle strips inline markers (display/export titles stay clean)", () => {
+  test("a leading bold/highlight title has no marker syntax", () => {
+    expect(noteTitle("**加粗标题**\n正文")).toBe("加粗标题");
+    expect(noteTitle("==高亮备注==\n正文")).toBe("高亮备注");
+    expect(noteTitle("~~删~~标题\n正文")).toBe("删标题");
+  });
+
+  test("non-title whitespace still returns empty, plain stays unchanged", () => {
+    expect(noteTitle("  ")).toBe("");
+    expect(noteTitle("普通标题\n正文")).toBe("普通标题");
+    expect(noteTitle("含 #标签 标题")).toBe("含 #标签 标题");
+    // a real `* ` bullet still strips, but `**` bold is never half-eaten
+    expect(noteTitle(" * 列表行\n正文")).toBe("列表行");
+  });
+});
+
+
 describe("duplicateNote", () => {
   test("prepends a fresh copy with the same text, new id/ts and no created==ts gap", () => {
     const base = [{ id: "a", text: "hello\nworld", ts: 100, created: 100 }];

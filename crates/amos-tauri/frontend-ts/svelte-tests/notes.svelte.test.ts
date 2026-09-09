@@ -488,3 +488,18 @@ describe("NotesApp.svelte — 复制便签", () => {
   });
 });
 
+
+describe("NotesApp.svelte — 折叠行标题也去内联标记", () => {
+  test("collapsed title hides marker syntax from a marker-rich first line", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "t1", text: "**加粗标题**\n正文内容", ts: 10, created: 10 }]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const body = txt(host);
+    expect(body).toContain("加粗标题");
+    expect(body).not.toContain("**");
+  });
+});
+

@@ -36,6 +36,7 @@
     togglePin,
     toggleTaskInNote,
     toggleTaskInText,
+    stripInlineMarkers,
     tagsOf,
     hasTag,
   } from "../lib/notes";
@@ -56,7 +57,8 @@
   import { markdownTitleOf, parseMarkdownImport, toMarkdownFile } from "../lib/markdown";
   import { loadNotesPrefs, saveNotesPrefs, type NotesPrefs } from "../lib/notePrefs";
   // Display title: prefer a `# heading`, else the first line, else the untitled label.
-  const titleOf = (text: string) => markdownTitleOf(text) || noteTitle(text) || t("note.untitled");
+  const titleOf = (text: string) =>
+    stripInlineMarkers(markdownTitleOf(text) || noteTitle(text)) || t("note.untitled");
 
   const seeded = normalizeNotes(readStoreValue<unknown>(NOTES_KEY, []));
   let notes = $state<Note[]>(seeded);
