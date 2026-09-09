@@ -1,7 +1,8 @@
 /**
- * Pure audio helpers for the 同传 (interpret) pipeline: convert live PCM into
- * the byte chunks `interpret_audio` expects. Kept pure so they are unit-testable
- * with fake samples (no browser/AudioContext needed).
+ * Pure audio helpers for the 同传 (interpret) pipeline: convert live PCM into the
+ * raw mono 16 kHz f32 chunks `interpret_audio` expects (`Vec<f32>` on the Rust
+ * side). Kept pure so they are unit-testable with fake samples (no browser/
+ * AudioContext needed).
  */
 export const TARGET_RATE = 16000;
 
@@ -35,9 +36,14 @@ export function encodePcm16(samples: Float32Array): number[] {
   return bytes;
 }
 
-/** Whole mono frame -> 16k mono -> int16 bytes for interpret_audio. */
-export function frameToChunk(samples: Float32Array, fromRate: number): number[] {
-  return encodePcm16(downsample(samples, fromRate));
+/** Whole mono frame -> 16k mono -> **raw f32 sample values** for interpret_audio.
+ * Rust's `interpret_audio` (and `amos_int::Session`) consumes a `Vec<f32>` of
+ * mono 16 kHz f32 PCM — the same format sherpa's recognizer feeds on. So the
+ * chunk is the down-sampled sample VALUES, NOT a PCM16 byte encoding (feeding
+ * int16 bytes here would split every 16-bit sample into two f32 samples and
+ * corrupt the ASR). */
+export function frameToInterpChunk(samples: Float32Array, fromRate: number): number[] {
+  return Array.from(downsample(samples, fromRate));
 }
 
 /**

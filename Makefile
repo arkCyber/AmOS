@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-audio-check android-ai-sherpa-check pdf-android-check ci-local clean honesty-smoke deploy doctor
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor
 
 all: build
 
@@ -168,6 +168,20 @@ android-audio-check:
 android-ai-sherpa-check:
 	bash scripts/android-ai-sherpa-check.sh
 
+# One-shot DEVICE driver for the always-on native voice chain (AAudio → local
+# sherpa → assistant). Host-verifiable without a device: `bash -n` + `--dry-run`
+# print the exact plan; `--check-prereqs` only checks adb. `--apply` actually
+# touches an attached device (stage sherpa model, grant RECORD_AUDIO, run the
+# AAudio probe → C2/C3 evidence) and prints the honest C1–C7 verdict.
+android-voice-bringup:
+	bash scripts/android-voice-bringup.sh
+
+# One-shot device driver for the offline RAG chain (daemon `Rag` + rag_once +
+# bench_arm). Mirrors android-voice-bringup: --check-prereqs / --dry-run / --apply.
+# Pass extra args through ARGS (e.g. `make android-rag-bringup ARGS='--apply --device X'`).
+android-rag-bringup:
+	bash scripts/android-rag-bringup.sh $(ARGS)
+
 # Cross-compile gate for the offline-RAG PDF data-extraction crate on Android.
 # The crate is pure Rust on lopdf (no C), so this only needs the rustup android
 # target (no NDK linker for a `check`). Run `rustup target add aarch64-linux-android`
@@ -175,6 +189,17 @@ android-ai-sherpa-check:
 pdf-android-check:
 	cargo check -p amos-pdf-parser --target aarch64-linux-android
 	cargo test -p amos-pdf-parser
+
+# Host + Android-cross-compile gate for the offline vector-retrieval core
+# (amos-vector-db). Pure Rust on serde — the aarch64 `check` needs no NDK linker.
+# Also runs clippy + fmt (crate hygiene) and prints the honest host benchmark.
+vector-db-check:
+	cargo check -p amos-vector-db --target aarch64-linux-android
+	cargo test -p amos-vector-db
+	cargo clippy -p amos-vector-db --all-targets -- -D warnings
+	cargo fmt -p amos-vector-db -- --check
+	cargo run -p amos-vector-db --example bench_arm -- 2000 64
+
 
 # Local CI-parity gate: shell-syntax + workflow YAML + native-toolchain pin
 # parity + (optional) container build. No push / no CI needed. See

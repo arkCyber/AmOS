@@ -97,13 +97,25 @@ AMOS_AI_VOICE=1 bash scripts/build-android.sh
 ```
 运行时 env：`AMOS_ASR_BACKEND=sherpa` + `AMOS_SHERPA_MODEL_DIR=/data/amos/sherpa`。
 
-### 3.4 接线点（真机 worker 已泛型就绪，无需改逻辑）
-System UI 侧把真麦交进常驻 worker（代码 seam 已就位，device-bring-up 只需在这里调用）：
-```rust
-// 在设备端调用（System UI 持有 Context / 已授权 RECORD_AUDIO 后）：
-let mic = amos_audio::PlatformMic::open_device()?;   // Android+aaudio → AAudio, 16 kHz
-VoiceLink::spawn_resident(mic, ...)?;                 // 常驻采集 → Payload::Audio
+### 3.4 接线点 = 已注册的 Tauri 命令 `device_mic_start`（真实调用入口，勿手写）
+「真麦交进常驻 worker」已被封装成 **System UI 一条 Tauri 命令**，设备端 UI 只需
+`invoke("device_mic_start")`，无需（也不应）在别处再手写采集循环：
+```text
+[System UI]  invoke("device_mic_start")   ← 已注册：crates/amos-tauri/src/lib.rs:118
+   │  （进程需已获 RECORD_AUDIO 运行时授权）
+   ▼
+open_platform_mic()  → amos_audio::PlatformMic::open_device()
+   │                    Android+aaudio → AAudioCallbackCapture @16 kHz
+   ▼
+spawn_resident_capture::<PlatformMic>(link.feeder(), mic, 16000, 3, feed_silence=true)
+   │  16k 下采样 → Payload::Audio 帧 →(尾静音门) AudioEnd
+   ▼
+daemon bidi Chat → ChatAsr(sherpa) → 推理 token 回流 assistant-voice-event
 ```
+对应命令与实现位置：`device_mic_start` / `device_mic_stop` / `device_mic_status`
+（`crates/amos-tauri/src/assistant_voice.rs:418/465/476`）。
+> 诚实边界：普通 **host 构建**上这三条命令对麦返回「no native backend」错误
+> （绝无静默假麦）；只有带 `amos-audio/aaudio` 的 **Android 构建**才真开 AAudio 麦。
 
 ### 3.5 放模型
 ```bash
@@ -112,7 +124,10 @@ adb push models/sherpa-en-20m/ /data/amos/sherpa/     # encoder/decoder/joiner .
 （`models/sherpa-en-20m` 仓库已带 demo 模型，其 `test_wavs/0.wav` 是 UDS e2e 用的真实语音。）
 
 ### 3.6 跑 + 观察
-- 打开 AI 应用，开「常驻听麦」（`assistantVoiceStart/Feed/End`），对麦说话。
+- **两条语音输入路径别混淆**：现有 AI 应用的麦克风走的是 WebView `getUserMedia` →
+  JS PCM（浏览器采集，非 AAudio）；**本文要验的 AAudio 原生麦**走 `device_mic_start`
+  （见 3.4）——它才是「硬件采样回调 → 本地 sherpa」的真机闭环。开麦前先在 System UI
+  授权 `RECORD_AUDIO`。
 - 前端订阅 `assistant-voice-event`：先见灰色「正在识别…」transcript（interim），松麦后见模型 token 流出到回复气泡。
 - daemon `get_status` 应报 `asr = sherpa`（真后端，非 mock）。
 
@@ -143,4 +158,82 @@ adb push models/sherpa-en-20m/ /data/amos/sherpa/     # encoder/decoder/joiner .
 - `docs/device-poc.md` / `docs/mobile-targets.md` / `scripts/build-android.sh` — 交叉编译与设备 staging
 - `scripts/android-audio-check.sh` — host 侧 AAudio/TinyALSA seam 验收脚本
 - `scripts/android-ai-sherpa-check.sh` — host 侧 amos-ai(真 sherpa) Android 交叉编译/链接验收脚本
+
+## 7. 「真机接线」审计 —— 三大 wiring 的 done / remaining（2026-09-09 复核）
+
+> 本节的目的是回答「哪些代码面已闭环、哪些真缺口仍在」。凡标 ✅ 均可用 **host 门禁**
+> 证明（`cargo test -p amos-audio` 24 passed 已复核）；标 🔴 的是无法在 host 闭环、或
+> 仍未实现的真缺口。
+
+### 7.1 Wiring ①：麦克风 → ASR（AAudio 采集 → sherpa 输入缓冲）—— **代码面 ✅ 已完成**
+
+| 环节 | 状态 | 证据 |
+|---|---|---|
+| AAudio 手写 FFI（含 `setDataCallback` 真实 data-callback seam） | ✅ | `crates/amos-audio/src/android/aaudio.rs`（`AAudioCallbackCapture`，API 26 可链接） |
+| 硬件回调 → 宿主可测有界 ring（I16→f32，稳态零分配） | ✅ | `ring.rs`（6 例单测）+ `aaudio.rs` 回调 |
+| `PlatformMic::open_device()` 默认开回调采集（16 kHz） | ✅ | `source.rs:135-145` |
+| 常驻采集线程喂 `Payload::Audio` + 尾静音门 `AudioEnd` | ✅ | `assistant_voice.rs` `spawn_resident_capture`（多例单测） |
+| daemon bidi `Payload::Audio` → `ChatAsr`（真 sherpa）→ 收句作答 | ✅ | `amos-ai/src/server.rs:1038/1057`、`chat_asr.rs`；host e2e `bidi_sherpa_audio` |
+| 运行时真机采样验收（回调出声 / DSP / 权限 / 延迟） | 🔴 待设备 | 判据 C1–C7，host 无法伪造 |
+
+**前端可达路径（2026-09-09 补完）**：`device_mic_start/stop/status` 已由前端接通——
+`frontend-ts` 新增 `lib/backend.ts` 的 `deviceMicStart/Stop/Status` bridge 包装 +
+纯 `lib/deviceMic.ts`（`parseDeviceMicStatus` / `isNativeMicBackend`，host 单测 3 例）+ AI 应用
+composer 上的 `DeviceMicButton.svelte`「常驻原生听麦」开关（`AiApp.svelte` 挂载，`aria-label=
+"device voice input"`）。诚实行为：浏览器/离线禁用并提示需真机 AAudio；bridged 但无原生麦
+（host 构建）时 `deviceMicStart` 降级 null，按钮据 `bridgeDiag` 提示「无原生麦 / 未授权
+RECORD_AUDIO」，绝不伪造「正在听麦」；并**每秒轮询 `deviceMicStatus`**：实时显示已识别句数、
+并反映外部停止（采集是否活着一眼可见，供 bring-up 观察）。**回复显示已上收到 AiApp 单一
+`assistant-voice-event` `turn_done` sink**（`AiApp.svelte` 订阅 → 一个 agent 气泡）：
+`StreamVoiceButton`/`DeviceMicButton`
+都不再自订订阅，杜绝双气泡、且 DeviceMicButton 不再隐性依赖 StreamVoiceButton 被挂载；已用
+bridged svelte 测试锁定「一个 turn_done → 恰一个 agent 气泡」（`ai.svelte.test.ts`）。验证：
+`bun run typecheck` / `typecheck:svelte` 0/0、`bun run test`（src/__tests__）全绿、
+`bun run test:svelte` **59 文件 333 例全绿**（含新增 deviceMic 纯测 3 + backend 桥接 2 +
+voice-buttons 离线 1 + ai 单一 sink 锁 1）。
+
+**OS 级 `RECORD_AUDIO` 原生授权 seam（2026-09-09 结构到位，待设备/gradle 验收）**：
+新增 **JS-awaitable** 的 `mic_permission_state` / `mic_permission_request` Tauri 命令
+（`crates/amos-tauri/src/mic_permission.rs`：非 Android host 诚实回 `native:false`；
+Android 上经 Kotlin `MicPermissionGlue` 驱动 `isGranted()`/`request()`，OS 对话框结果经
+`onResult(granted)` JNI upcall 回填一个 oneshot，命令在对话框结束后返回）。Kotlin 侧
+`android-glue/com/amos/ai/glue/MicPermissionGlue.kt`（已同步 `gen/android`）在
+`PermissionWire.requestNeeded` 里于启动时 `ensureBound`，`onResult` 增加 `REQ_MIC` 分支回传
+原生结果（不经 `getUserMedia`）。前端 `DeviceMicButton` 开麦前先调 `micPermissionRequest()`，
+`native && granted` 才 `deviceMicStart`，否则诚实提示。Rust 验证：`cargo check`/`cargo clippy
+--features android --lib -D warnings` 两配置全绿、`mic_permission` host 单测 2 例过；前端
+`bun run check` 全绿。**待设备**：Kotlin 编译并入 `gen/android` 后跑 `./gradlew
+:app:compileDebugKotlin`，再真机授权 `REQ_MIC` 闭环。
+
+**🔴 仍未闭环（都需设备/OS，非 host 可验）**：
+- **设备 runtime C1–C7**：AAudio 实际出声/DSP/延迟 + 上面的 Kotlin 授权真实走通，只能真机判。
+  建议用一键驱动器：`make android-voice-bringup`（脚本 `scripts/android-voice-bringup.sh`，
+  dry-run 打印完整 plan；`--check-prereqs` 只查 adb；`--apply` 才真碰设备——stage sherpa 模型
+  → grant RECORD_AUDIO → 跑 AAudio probe 拿 C2/C3 证据，并诚实打印 C1/C4–C7 人工清单）。
+- **preview6.js 预览包**：为离线单文件预览的已提交产物，未在本改动重新生成（生产 System UI
+  走 Svelte 源；如需同步预览再跑前端 build）。
+
+### 7.2 Wiring ②：init.rc 托管运行（真机 daemon/采集的拉起）
+- `deploy/android/amos.rc` ✅ 已写好：`on property:sys.boot_completed=1` 拉起
+  `amos-ai`（`/system/bin/amos-ai --socket /data/amos/ai.sock`），已带
+  `AMOS_ASR_BACKEND=sherpa` + `AMOS_SHERPA_MODEL_DIR=/data/amos/sherpa`、
+  `oom_score_adj -1000`。
+- 🔴 真缺口：`amos.rc` 只拉起 **daemon**；「常驻麦采集」活在 System UI
+  （`device_mic_start`，见 7.1），而 System UI 是由 launcher 自动启动的 APK——
+  并非 init 服务。若产品要**无 UI 自启的常驻语音唤醒**，才需要新增一个带
+  `RECORD_AUDIO` 的系统级 native 采集服务（直接 `amos-audio` seam），这是独立设计决策。
+
+### 7.3 Wiring ③：加速器 / NPU 闭环（qcom/mtk）
+- 现状：`amos-ai/src/accelerator.rs` 走 **feature 门控**（`qnn`/`neuropilot`），
+  `compiled_in()` 未接入 SDK 时如实为假，不会把 NPU 当「已用」上报；`qcom-mtk-bringup.md`
+  记录 OEM 集成路径。此链路只做了「编译期 feature 声明」，**无真机/无 SDK 即不可闭环**。
+- 🔴 全部待设备/OEM SDK 验收；不属本 runbook 的 AAudio→sherpa 范围，另立工单。
+
+### 7.4 一句话
+**Wiring ① 的代码面（含硬件回调 seam + sherpa 输入缓冲）+ 前端可达路径已 100% 在 host 闭环并复核
+（`amos-audio` 24/24、前端 bun+svelte 全绿、svelte-check 0/0）。** 真正剩的只有：
+① 真机 OS 级 `RECORD_AUDIO` 原生授权（Kotlin 独立请求，见 7.1）；② 真机按 C1–C7 跑 runtime；
+③ 若要无 UI 自启语音唤醒则再加一个 init 采集服务。host 上没有任何「尚可安全补完的
+采集/sherpa/桥接 seam」——本 runbook 不为凑改动而强改已审计代码。
+
 

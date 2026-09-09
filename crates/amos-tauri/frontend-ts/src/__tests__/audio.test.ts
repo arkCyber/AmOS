@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { downsample, encodePcm16, frameToChunk, TARGET_RATE } from "../lib/audio";
+import { downsample, encodePcm16, frameToInterpChunk, TARGET_RATE } from "../lib/audio";
 
 describe("audio chunk helpers", () => {
   test("downsample halves length when rate halves", () => {
@@ -15,9 +15,21 @@ describe("audio chunk helpers", () => {
     expect(encodePcm16(new Float32Array([0]))).toEqual([0x00, 0x00]);
   });
 
-  test("frameToChunk routes through 16k + int16 (fake chunk → bytes)", () => {
-    const bytes = frameToChunk(new Float32Array([1, -1]), TARGET_RATE);
-    expect(bytes).toEqual([0xff, 0x7f, 0x00, 0x80]);
+  test("frameToInterpChunk routes through 16k and keeps raw f32 samples (Vec<f32> wire)", () => {
+    // Rust interpret_audio consumes `Vec<f32>` (the sherpa sample format), so the
+    // chunk must be the down-sampled sample VALUES — never a PCM16 byte encoding
+    // (which would split each 16-bit sample into two f32 samples and corrupt ASR).
+    // 48 kHz 3 samples → 1 sample @16 kHz (decimation step 3), value preserved.
+    const one = frameToInterpChunk(new Float32Array([0.5, -0.5, 0.25]), 48000);
+    expect(one.length).toBe(1);
+    expect(one[0]).toBeCloseTo(0.5);
+    // Already at 16 kHz → length unchanged, values kept as-is (raw f32, not bytes).
+    const same = frameToInterpChunk(new Float32Array([0.1, -0.2, 0.3]), TARGET_RATE);
+    expect(same.length).toBe(3);
+    expect(same[0]).toBeCloseTo(0.1);
+    expect(same[2]).toBeCloseTo(0.3);
+    // A byte encoding (PCM16) would double the length — this must never happen.
+    expect(one.length).not.toBe(2);
   });
 
   test("downsample guards invalid/equal/empty inputs (no NaN-length alloc)", () => {

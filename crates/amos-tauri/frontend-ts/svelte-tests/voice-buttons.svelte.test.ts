@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, render } from "@testing-library/svelte";
 import VoiceMicButton from "../src/svelte/VoiceMicButton.svelte";
 import StreamVoiceButton from "../src/svelte/StreamVoiceButton.svelte";
+import DeviceMicButton from "../src/svelte/DeviceMicButton.svelte";
 
 afterEach(cleanup);
 
@@ -25,10 +26,19 @@ describe("Ai voice buttons (offline)", () => {
 
   test("streaming voice button is disabled + offline title when not bridged", () => {
     const host = render(StreamVoiceButton, {
-      props: { online: false, session: () => "s", onReply: () => {} },
+      props: { online: false, session: () => "s" },
     });
     const b = buttonByAria(host, "streaming voice input");
     expect(b?.disabled).toBe(true);
     expect(b?.title).toContain("离线"); // ai.streamVoiceOffline
+  });
+
+  test("native always-on mic button is disabled + offline title when not bridged", () => {
+    const host = render(DeviceMicButton, {
+      props: { online: false, session: () => "s" },
+    });
+    const b = buttonByAria(host, "device voice input");
+    expect(b?.disabled).toBe(true);
+    expect(b?.title).toContain("离线"); // ai.deviceMicOffline
   });
 });

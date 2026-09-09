@@ -206,6 +206,71 @@ export async function assistantVoiceEnd(): Promise<unknown> {
   return invoke("assistant_voice_end");
 }
 
+/* ---- Device always-on native mic (AAudio seam) ---- */
+
+/**
+ * Status of the always-on **native** device-mic listen — the mirror of the Rust
+ * `DeviceMicStatus` (`crates/amos-tauri/src/assistant_voice.rs`). Unlike the
+ * WebView push-to-talk path above, the device mic runs a resident capture thread
+ * over `amos_audio::PlatformMic` (Android + aaudio → real AAudio); it streams
+ * `Payload::Audio` and auto-finalizes each utterance on trailing silence. Its
+ * replies arrive on the same `assistant-voice-event` channel the push-to-talk
+ * path uses.
+ */
+export interface DeviceMicStatus {
+  running: boolean;
+  /** Capture backend in effect: `aaudio` / `tinyalsa` / `mock` / `none`. */
+  backend: string;
+  /** Utterances submitted (`AudioEnd`) so far by the running worker. */
+  submitted: number;
+}
+
+/**
+ * Start the always-on native mic listen. Resolves to the backend label
+ * (`"aaudio"` / `"tinyalsa"`) on success; `null` when not bridged or when the
+ * platform mic is unavailable (host build / RECORD_AUDIO not granted) — read
+ * [`bridgeDiag`] to tell those apart, and never pretend a device mic exists.
+ */
+export async function deviceMicStart(sessionId?: string): Promise<string | null> {
+  return invoke<string>("device_mic_start", { sessionId });
+}
+
+/** Stop the always-on native mic listen (joins the resident capture thread). */
+export async function deviceMicStop(): Promise<null> {
+  return invoke<null>("device_mic_stop");
+}
+
+/** Poll the always-on native mic listen (`null` when not bridged). */
+export async function deviceMicStatus(): Promise<DeviceMicStatus | null> {
+  return invoke<DeviceMicStatus>("device_mic_status");
+}
+
+/* ---- OS RECORD_AUDIO grant (native AAudio needs it; not the WebView path) ---- */
+
+/**
+ * State of the OS `RECORD_AUDIO` grant for the native mic.
+ * `native` is true only inside the Android System UI where the Kotlin
+ * `MicPermissionGlue` is bound; `granted` is true only when the permission is held.
+ */
+export interface MicPermissionState {
+  native: boolean;
+  granted: boolean;
+}
+
+/** Dialog-free snapshot of the OS `RECORD_AUDIO` grant. Host → `native:false`. */
+export async function micPermissionState(): Promise<MicPermissionState | null> {
+  return invoke<MicPermissionState>("mic_permission_state");
+}
+
+/**
+ * JS-awaitable: ensure `RECORD_AUDIO` for the native AAudio mic, posting the OS
+ * dialog only when it is not already held. Host → `{ native:false, granted:false }`
+ * (no dialog, no fabricated grant).
+ */
+export async function micPermissionRequest(): Promise<MicPermissionState | null> {
+  return invoke<MicPermissionState>("mic_permission_request");
+}
+
 /* ---- 同传 / interpret RPC (degrade to null outside Tauri) ---- */
 export interface InterpOpts {
   source?: string;

@@ -113,3 +113,51 @@ describe("AiApp.svelte (offline shell)", () => {
     expect(txt(host)).toContain("暂无 daemon 会话"); // ai.sessionEmpty
   });
 });
+
+/**
+ * Bridged: a single `assistant-voice-event` sink lives in AiApp, so an utterance
+ * finalized by the ALWAYS-ON NATIVE device mic (DeviceMicButton) renders exactly
+ * one agent bubble — it must not rely on StreamVoiceButton's presence, and there
+ * must never be two subscribers double-pushing the same turn_done.
+ */
+describe("AiApp.svelte (bridged: single assistant-voice sink)", () => {
+  afterEach(() => {
+    cleanup();
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = undefined;
+  });
+
+  const waitUntil = async (cond: () => boolean, timeoutMs = 3000) => {
+    const t0 = Date.now();
+    while (!cond()) {
+      if (Date.now() - t0 > timeoutMs) throw new Error("timeout waiting for subscription");
+      await new Promise<void>((r) => setTimeout(r, 5));
+    }
+  };
+
+  test("one native-mic turn_done → exactly one agent bubble", async () => {
+    const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+    const fake = {
+      invoke: async () => null,
+      listen: async (ch: string, h: (e: { payload: unknown }) => void) => {
+        handlers[ch] = h;
+        return async () => {};
+      },
+    };
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = fake;
+    const host = render(AiApp);
+    await waitUntil(() => typeof handlers["assistant-voice-event"] === "function");
+
+    // A finalized utterance as the daemon pushes it for the native device mic.
+    handlers["assistant-voice-event"]!({
+      payload: { kind: "turn_done", session: "s", text: "原生语音答复-唯一" },
+    });
+    await settle();
+
+    const log = host.container.querySelector('[role="log"]');
+    const bubbles = [...(log?.querySelectorAll("div") ?? [])].filter((d) =>
+      (d.textContent ?? "").includes("原生语音答复-唯一"),
+    );
+    expect(bubbles.length).toBe(1);
+    expect(txt(host)).toContain("原生语音答复-唯一");
+  });
+});

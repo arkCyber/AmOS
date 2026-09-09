@@ -905,6 +905,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resident_capture_submits_each_utterance_and_final_partial_on_end() {
+        use amos_audio::mock::FrameMic;
+        use amos_proto::ai_agent::client_message::Payload;
+
+        // Two utterances back-to-back:
+        //   speech A ─► 6 silence frames (crosses the end-gate → AudioEnd #1)
+        //   speech B ─► stream EOF (mic ends) → the worker's trailing `if heard`
+        //               must force-finalize the still-open second utterance (AudioEnd #2).
+        // This locks the always-on listener's real-world shape: a user speaks, pauses
+        // (utterance submitted), speaks again, and the stream ends mid-sentence — the
+        // partial second turn must NOT be dropped.
+        let mut frames: Vec<f32> = Vec::new();
+        frames.extend(std::iter::repeat(0.5f32).take(160)); // speech A (10 ms @16 kHz)
+        frames.extend(std::iter::repeat(0.0f32).take(160 * 6)); // trailing silence A
+        frames.extend(std::iter::repeat(0.5f32).take(160 * 2)); // speech B
+                                                                // No trailing silence: the mic (FrameMic) ends right after speech B.
+
+        let (feeder, mut rx) = tokio::sync::mpsc::channel(64);
+        let handle = spawn_resident_capture::<FrameMic>(
+            feeder.clone(),
+            FrameMic::new(16_000, frames),
+            16_000,
+            3, // end after 3 silent 160-sample frames
+            false,
+        )
+        .expect("valid capture spawns");
+
+        // Read until the worker closes the channel (finite FrameMic → feeder drop),
+        // tolerating idle gaps under load the way the single-utterance test does.
+        let mut ends = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if matches!(msg.payload, Some(Payload::AudioEnd(_))) {
+                        ends += 1;
+                    }
+                }
+                Ok(None) => break, // worker ended and closed the stream
+                Err(_) => {}       // idle gap under load — keep waiting until the deadline
+            }
+        }
+
+        assert_eq!(handle.submitted(), 2, "two utterances must be submitted");
+        assert_eq!(
+            ends, 2,
+            "each submitted utterance must reach the daemon as AudioEnd"
+        );
+        handle.stop();
+    }
+
+    #[tokio::test]
     async fn platform_mic_facade_drives_the_resident_worker() {
         use amos_audio::PlatformMic;
         use amos_proto::ai_agent::client_message::Payload;

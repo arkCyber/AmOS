@@ -36,10 +36,12 @@ pub mod incall;
 pub mod interpret;
 pub mod mail;
 pub mod media;
+pub mod mic_permission;
 pub mod netguard;
 pub mod note_export;
 pub mod privacy_client;
 pub mod radio;
+pub mod rag_client;
 pub mod real_dial;
 pub mod sensor_host;
 pub mod sensors;
@@ -118,6 +120,8 @@ pub fn run() {
             assistant_voice::device_mic_start,
             assistant_voice::device_mic_stop,
             assistant_voice::device_mic_status,
+            mic_permission::mic_permission_state,
+            mic_permission::mic_permission_request,
             ai_bridge::get_android_apps,
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,
@@ -225,6 +229,10 @@ pub fn run() {
             privacy_client::perm_recent_audit,
             netguard::netguard_toggle,
             netguard::netguard_status,
+            rag_client::rag_status,
+            rag_client::rag_query,
+            rag_client::rag_index,
+            rag_client::rag_remove,
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
             taskmgr::taskmgr_job_action,

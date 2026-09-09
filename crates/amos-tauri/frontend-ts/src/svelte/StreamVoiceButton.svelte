@@ -3,10 +3,16 @@
   // No React. Hold-to-talk **streaming** assistant voice: on hold it opens the
   // resident daemon Chat via `assistant_voice_start`, streams 16 kHz f32-le frames
   // via `assistant_voice_feed`, and on release force-finalizes with
-  // `assistant_voice_end`. The assistant's reply arrives as an
-  // `assistant-voice-event` `turn_done` and is reported through `onReply`.
-  import { assistantVoiceEnd, assistantVoiceFeed, assistantVoiceStart, subscribe } from "../lib/backend";
-  import { pcmToAssistantChunk, parseVoiceEvent } from "../lib/voice";
+  // `assistant_voice_end`.
+  //
+  // The assistant's reply is NOT subscribed here: the host screen (AiApp.svelte)
+  // owns the SINGLE `assistant-voice-event` `turn_done` sink and turns it into an
+  // agent bubble. Keeping that sink in exactly one place means a reply — whether
+  // from this push-to-talk mic or from the always-on native device mic — renders
+  // exactly once (no double bubbles), and DeviceMicButton never has to depend on
+  // this button being mounted.
+  import { assistantVoiceEnd, assistantVoiceFeed, assistantVoiceStart } from "../lib/backend";
+  import { pcmToAssistantChunk } from "../lib/voice";
   import { loadLedger, saveLedger, grantCap, revokeCap, capSet, type Capability } from "../lib/permissions";
   import { t } from "./locale.svelte";
 
@@ -15,7 +21,6 @@
     online,
     session,
     onStart,
-    onReply,
     disabled = false,
   }: {
     online: boolean;
@@ -23,7 +28,6 @@
      * speaking) — never call a side-effecting getter during render. */
     session: () => string;
     onStart?: () => void;
-    onReply: (text: string) => void;
     disabled?: boolean;
   } = $props();
 
@@ -60,26 +64,15 @@
     streamRef = null;
   }
 
-  // A reply to any streamed utterance arrives as an `assistant-voice-event`
-  // `turn_done` frame — forward it to the caller while mounted.
-  let subscribed = false;
+  // A reply to any streamed utterance is rendered by the host screen's single
+  // `assistant-voice-event` sink — see the header comment. No per-button
+  // subscription here, so a device-mic reply and a push-to-talk reply can never
+  // both forward (no double bubbles) and DeviceMicButton doesn't need this button.
+
+  // Release the mic capture (getUserMedia tracks + AudioContext) if this
+  // component unmounts mid-hold, so no orphaned stream/context is left behind.
   $effect(() => {
-    if (subscribed) return;
-    subscribed = true;
-    let alive = true;
-    let unsub: (() => void) | null = null;
-    void (async () => {
-      unsub = await subscribe("assistant-voice-event", (p) => {
-        if (!alive) return;
-        const e = parseVoiceEvent(p);
-        if (e?.kind === "turn_done" && e.text.trim()) {
-          onReply(e.text.trim());
-        }
-      });
-    })();
     return () => {
-      alive = false;
-      unsub?.();
       cleanup();
     };
   });

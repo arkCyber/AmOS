@@ -42,6 +42,10 @@ object PermissionWire {
 
     /** Request CAMERA (and RECORD_AUDIO) if not already granted. Idempotent. */
     fun requestNeeded(activity: Activity) {
+        // Bind the native-only RECORD_AUDIO glue (always-on AAudio mic) so the
+        // Rust mic_permission_request can drive isGranted()/request() on demand,
+        // independent of the WebView CAMERA grant path.
+        MicPermissionGlue.ensureBound(activity)
         val want = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO).filter {
             ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
         }
@@ -92,6 +96,17 @@ object PermissionWire {
                         .onFailure { Log.w(TAG, "media attach failed: ${it.message}") }
                 } else {
                     Toast.makeText(activity, "Media access denied — external collections unavailable", Toast.LENGTH_LONG).show()
+                }
+            }
+            MicPermissionGlue.REQ_MIC -> {
+                // Native-only RECORD_AUDIO result (always-on AAudio mic, requested by
+                // mic_permission_request — NOT the WebView getUserMedia path). Resolve
+                // the pending Rust request so the JS await returns granted/denied.
+                val granted = grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+                MicPermissionGlue.onMicResult(granted)
+                if (!granted) {
+                    Toast.makeText(activity, "Microphone denied — native voice unavailable", Toast.LENGTH_LONG).show()
                 }
             }
         }

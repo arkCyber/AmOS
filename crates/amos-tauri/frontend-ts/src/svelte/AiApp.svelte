@@ -21,8 +21,10 @@
   } from "../lib/backend";
   import { tokenOf, cardOf, sessionMetaOf, type AiCard } from "../lib/stream";
   import { capTail } from "../lib/bounded";
+  import { parseVoiceEvent } from "../lib/voice";
   import VoiceMicButton from "./VoiceMicButton.svelte";
   import StreamVoiceButton from "./StreamVoiceButton.svelte";
+  import DeviceMicButton from "./DeviceMicButton.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
@@ -141,6 +143,21 @@
           curId = null;
           aborted = false;
           busy = false;
+        }),
+      );
+      // SINGLE assistant-voice sink: a finalized utterance — from the push-to-talk
+      // mic (StreamVoiceButton) OR the always-on native device mic
+      // (DeviceMicButton) — becomes one agent bubble. Because this is the only
+      // place that forwards `assistant-voice-event` `turn_done`, a reply renders
+      // exactly once and the native mic never depends on StreamVoiceButton being
+      // mounted.
+      unsubs.push(
+        await subscribe("assistant-voice-event", (p) => {
+          if (!alive) return;
+          const e = parseVoiceEvent(p);
+          if (e?.kind === "turn_done" && e.text.trim()) {
+            pushMsg("agent", e.text.trim());
+          }
         }),
       );
     })();
@@ -405,7 +422,11 @@
       disabled={busy}
       session={() => conversationId()}
       onStart={() => pushMsg("user", t("ai.voicePrompt"))}
-      onReply={(text) => pushMsg("agent", text)}
+    />
+    <DeviceMicButton
+      online={online}
+      disabled={busy}
+      session={() => conversationId()}
     />
     <VoiceMicButton
       online={online}

@@ -4,6 +4,11 @@ import {
   assistantVoiceFeed,
   assistantVoiceStart,
   assistantVoiceStop,
+  deviceMicStart,
+  deviceMicStatus,
+  deviceMicStop,
+  micPermissionRequest,
+  micPermissionState,
   bridged,
   bridgeDiag,
   cancelAiSession,
@@ -344,5 +349,61 @@ describe("backend bridge", () => {
     ]);
     expect(calls[0]!.args.sessionId).toBe("conv-v");
     expect(calls[1]!.args.frame).toEqual([1, 2, 3]);
+  });
+
+  test("device native-mic wrappers route to device_mic_start/status/stop", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    const fake = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args: args ?? {} });
+        if (cmd === "device_mic_start") return "aaudio";
+        if (cmd === "device_mic_status") return { running: true, backend: "aaudio", submitted: 2 };
+        return null;
+      },
+      listen: async () => async () => {},
+    };
+    setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
+    expect(bridged()).toBe(true);
+
+    const label = await deviceMicStart("conv-d");
+    expect(label).toBe("aaudio");
+    const st = await deviceMicStatus();
+    expect(st).toEqual({ running: true, backend: "aaudio", submitted: 2 });
+    await deviceMicStop();
+
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "device_mic_start",
+      "device_mic_status",
+      "device_mic_stop",
+    ]);
+    expect(calls[0]!.args.sessionId).toBe("conv-d");
+  });
+
+  test("device native-mic is an honest no-op (null) outside the bridge", async () => {
+    setWindow({ localStorage: new Map() as unknown as Storage });
+    expect(bridged()).toBe(false);
+    expect(await deviceMicStart()).toBeNull();
+    expect(await deviceMicStatus()).toBeNull();
+    expect(await deviceMicStop()).toBeNull();
+    expect(await micPermissionState()).toBeNull();
+    expect(await micPermissionRequest()).toBeNull();
+  });
+
+  test("RECORD_AUDIO grant wrappers route to state/request and map the result", async () => {
+    const calls: string[] = [];
+    const fake = {
+      invoke: async (cmd: string) => {
+        calls.push(cmd);
+        if (cmd === "mic_permission_request") return { native: true, granted: true };
+        return { native: true, granted: false };
+      },
+      listen: async () => async () => {},
+    };
+    setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
+    expect(bridged()).toBe(true);
+
+    expect(await micPermissionState()).toEqual({ native: true, granted: false });
+    expect(await micPermissionRequest()).toEqual({ native: true, granted: true });
+    expect(calls).toEqual(["mic_permission_state", "mic_permission_request"]);
   });
 });
