@@ -9,7 +9,7 @@ import {
   moveBefore,
   type HomeLayout,
 } from "../lib/amosStore";
-import { APPS, appIcon, appTitleKey } from "../apps";
+import { APP_META as APPS, appIcon, appTitleKey } from "../lib/appMeta";
 import { zh } from "../i18n/locales/zh";
 import { en } from "../i18n/locales/en";
 
