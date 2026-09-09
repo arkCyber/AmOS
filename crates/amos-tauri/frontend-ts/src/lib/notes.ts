@@ -119,6 +119,19 @@ export function searchNotes(list: Note[], query: string): Note[] {
   return list.filter((n) => n.text.toLowerCase().includes(q));
 }
 
+/** Split `text` around the first (case-insensitive) occurrence of `query`, for
+ *  highlighting a search hit. Returns `null` when there is no hit / blank query. */
+export function searchHighlight(
+  text: string,
+  query: string,
+): { before: string; match: string; after: string } | null {
+  const q = query.trim();
+  if (!q || !text) return null;
+  const i = text.toLowerCase().indexOf(q.toLowerCase());
+  if (i < 0) return null;
+  return { before: text.slice(0, i), match: text.slice(i, i + q.length), after: text.slice(i + q.length) };
+}
+
 /**
  * Back-compat: older persisted notes were `{text, ts}` with no id. Normalize any
  * stored array (tolerating malformed entries) so every note has a unique id.

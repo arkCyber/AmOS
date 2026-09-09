@@ -24,6 +24,7 @@
     orderPinned,
     prependNote,
     removeNote,
+    searchHighlight,
     searchNotes,
     setNoteState,
     setManyState,
@@ -435,7 +436,11 @@
         {:else if collapsed(n)}
           <button onclick={() => rowTap(n)} class="block w-full rounded-2xl bg-white/60 p-3 text-left shadow-sm ring-1 ring-black/5 transition active:bg-white/80 dark:bg-white/[0.06] dark:ring-white/10">
             <div class="flex items-start justify-between gap-2">
-              <span class="truncate text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">{titleOf(n.text)}</span>
+              <span class="truncate text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">
+                {#if mode === "all" && searchQ.trim() && searchHighlight(titleOf(n.text), searchQ)}
+                  {searchHighlight(titleOf(n.text), searchQ)?.before}<mark class="rounded-sm bg-amber-300/70 px-0.5 text-inherit dark:bg-amber-400/40">{searchHighlight(titleOf(n.text), searchQ)?.match}</mark>{searchHighlight(titleOf(n.text), searchQ)?.after}
+                {:else}{titleOf(n.text)}{/if}
+              </span>
               <span class="shrink-0 pt-0.5 text-xs text-neutral-500">{stampOf(n)}</span>
             </div>
             {#if notePreview(n.text)}

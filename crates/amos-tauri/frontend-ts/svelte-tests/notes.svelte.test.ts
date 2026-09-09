@@ -503,3 +503,23 @@ describe("NotesApp.svelte — 折叠行标题也去内联标记", () => {
   });
 });
 
+
+describe("NotesApp.svelte — 搜索高亮", () => {
+  test("typing a search highlights the matching title via <mark>", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "s1", text: "买牛奶计划\n今晚去买", ts: 10, created: 10 }]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const input = host.container.querySelector(
+      'input[aria-label="note-search"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: "牛奶" } });
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const mark = host.container.querySelector("mark");
+    expect(mark).toBeTruthy();
+    expect(mark?.textContent).toBe("牛奶");
+  });
+});
+

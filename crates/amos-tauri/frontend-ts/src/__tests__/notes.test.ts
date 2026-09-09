@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeNotes, prependNote, removeNote, editNote, duplicateNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf, stripInlineMarkers } from "../lib/notes";
+import { normalizeNotes, prependNote, removeNote, editNote, duplicateNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf, stripInlineMarkers, searchHighlight } from "../lib/notes";
 import { orderByModified } from "../lib/notes";
 
 describe("notes store helpers", () => {
@@ -574,6 +574,28 @@ describe("noteTitle strips inline markers (display/export titles stay clean)", (
     // a real `* ` bullet still strips, but `**` bold is never half-eaten
     expect(noteTitle(" * 列表行\n正文")).toBe("列表行");
   });
+
+describe("searchHighlight", () => {
+  test("returns before/match/after around the first case-insensitive hit", () => {
+    expect(searchHighlight("买牛奶计划", "牛奶")).toEqual({
+      before: "买",
+      match: "牛奶",
+      after: "计划",
+    });
+    expect(searchHighlight("Weekly Standup", "standup")).toEqual({
+      before: "Weekly ",
+      match: "Standup",
+      after: "",
+    });
+  });
+
+  test("null on no hit, blank query, or empty text", () => {
+    expect(searchHighlight("abc", "z")).toBeNull();
+    expect(searchHighlight("abc", "   ")).toBeNull();
+    expect(searchHighlight("", "a")).toBeNull();
+  });
+});
+
 });
 
 
