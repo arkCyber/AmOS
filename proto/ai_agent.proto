@@ -243,3 +243,66 @@ message GetHistoryReply {
   bool cancelled = 4;
   repeated HistoryTurn turns = 5;        // completed turns, oldest first
 }
+
+// RAG retrieval service: offline local vector search over the daemon's indexed
+// notes / documents ("ask my files"). A separate service from `AiAgent` so it
+// stays a clean, independently-testable seam; "retrieve-then-answer" is composed
+// by a caller as `Rag.Query` (returns the nearest ids + their passage text) then
+// `AiAgent.StreamChat` with that context dropped into the prompt. Honest scope:
+// retrieval relevance is what the local embedding model (Ollama `/api/embeddings`
+// on device) gives you — see docs/vector-db-rag.md.
+service Rag {
+  // Index (or re-index on edit) a passage under an id.
+  rpc Index(RagIndexRequest) returns (RagIndexReply);
+
+  // Drop a passage from future retrieval.
+  rpc Remove(RagRemoveRequest) returns (RagRemoveReply);
+
+  // Retrieve the nearest indexed ids to a query (embed + exact top-k).
+  rpc Query(RagQueryRequest) returns (RagQueryReply);
+
+  // Lightweight probe: how many passages are indexed + the vector dimension.
+  rpc Status(RagStatusRequest) returns (RagStatusReply);
+}
+
+message RagIndexRequest {
+  string id = 1;                 // stable identity (note id / chunk ref) to (re)index under
+  string text = 2;               // passage body to embed + index
+}
+
+message RagIndexReply {
+  bool indexed = 1;
+  uint32 dimension = 2;          // vector dimension after this ingest
+}
+
+message RagRemoveRequest {
+  string id = 1;
+}
+
+message RagRemoveReply {
+  bool removed = 1;              // true when the id was present and dropped
+}
+
+message RagQueryRequest {
+  string query = 1;              // natural-language query to embed
+  uint32 top_k = 2;              // max hits to return; 0 => daemon default (5)
+}
+
+message RagHit {
+  string id = 1;
+  double score = 2;              // cosine similarity (higher = closer); 0 for an empty index
+  string passage = 3;            // the indexed text for that id (for citations)
+}
+
+message RagQueryReply {
+  repeated RagHit hits = 1;      // highest-scoring first
+  uint32 count = 2;
+}
+
+message RagStatusRequest {}
+
+message RagStatusReply {
+  uint64 indexed = 1;            // passages currently indexed
+  uint32 dimension = 2;          // 0 when nothing indexed yet (dimension unknown)
+  string embedder = 3;           // "mock" | "ollama" (honest backend label)
+}

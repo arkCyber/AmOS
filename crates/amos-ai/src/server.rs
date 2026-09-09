@@ -1541,6 +1541,15 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         // feeds, so subscribers and producer see the same hits.
         .add_service(crate::telemetry_spy_service::server_for(
             telemetry_svc.clone(),
+        ))
+        // Offline local vector retrieval (proto ai_agent.proto, `service Rag`):
+        // index note/document passages and retrieve the nearest ids to a query
+        // over the same UDS, so Notes / System UI can "ask my files". Embedder
+        // is mock (offline) unless AMOS_RAG_EMBEDDER=ollama (real local model,
+        // docs/vector-db-rag.md). "Retrieve-then-answer" is composed by the
+        // caller from Rag.Query + AiAgent.StreamChat.
+        .add_service(crate::rag_service::server(
+            crate::rag_service::RagSvc::from_env()?,
         ));
 
     // (feature `telemetry-spy-audit`) Real-device capture producer: opens the data

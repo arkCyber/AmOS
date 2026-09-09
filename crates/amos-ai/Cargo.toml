@@ -37,6 +37,10 @@ amos-network-guard.workspace = true
 amos-telemetry-spy = { workspace = true, optional = true }
 amos-display.workspace = true
 amos-asr = { path = "../amos-asr" }
+# Offline local vector-retrieval core (FlatIndex + Embedder seam) — consumed by
+# `rag` (OllamaEmbedder + RagStore). Pure std, so it adds no native/network to
+# the daemon's default build.
+amos-vector-db = { path = "../amos-vector-db" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

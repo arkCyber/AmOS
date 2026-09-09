@@ -25,6 +25,8 @@ pub mod netguard_service;
 pub mod privacy;
 pub mod privacy_service;
 pub mod profiler;
+pub mod rag;
+pub mod rag_service;
 pub mod security;
 pub mod semantic;
 pub mod server;
