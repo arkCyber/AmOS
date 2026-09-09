@@ -547,6 +547,126 @@ fn parse_hermes_token(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// POST with arbitrary headers (Anthropic `x-api-key`/`anthropic-version`,
+/// Gemini `x-goog-api-key`, …) and collect text deltas from each SSE `data:`
+/// line with `parse`. Blocking HTTP + SSE parsing is moved off the executor —
+/// same contract as the Bearer-only [`stream_sse_completions`].
+async fn stream_sse_with_headers(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: serde_json::Value,
+    mut parse: impl FnMut(&str) -> Option<String> + Send + 'static,
+) -> Result<Vec<String>> {
+    let url = url.to_string();
+    let headers: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let body = body.to_string();
+
+    let inner: Result<Vec<String>, String> = tokio::task::spawn_blocking(move || {
+        let mut req = ureq::post(&url)
+            .timeout(Duration::from_secs(120))
+            .set("Content-Type", "application/json");
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.send_string(&body).map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(resp.into_reader());
+        let mut tokens = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                break; // EOF
+            }
+            if let Some(t) = parse(&line) {
+                tokens.push(t);
+            }
+        }
+        Ok(tokens)
+    })
+    .await
+    .map_err(|e| anyhow!("blocking task join error: {e}"))?;
+
+    inner.map_err(anyhow::Error::msg)
+}
+
+/// Parse one SSE `data:` line from the **Anthropic Messages** streaming API.
+/// Text arrives as `type: content_block_delta` whose `delta.type ==
+/// "text_delta"` carries `delta.text`; message_start / content_block_start /
+/// ping / stop control events yield `None`.
+fn parse_anthropic_sse(line: &str) -> Option<String> {
+    let data = line.strip_prefix("data:").unwrap_or(line).trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
+        return None;
+    }
+    let delta = v.get("delta")?;
+    if delta.get("type").and_then(|t| t.as_str()) != Some("text_delta") {
+        return None;
+    }
+    delta
+        .get("text")
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+}
+
+/// Parse one SSE `data:` line from **Google Gemini** `:streamGenerateContent`.
+/// Each frame carries `candidates[0].content.parts[].text`; a terminal frame
+/// (no candidate) yields `None` and the outer read loop ends at EOF.
+fn parse_gemini_sse(line: &str) -> Option<String> {
+    let data = line.strip_prefix("data:").unwrap_or(line).trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let parts = v
+        .get("candidates")?
+        .get(0)?
+        .get("content")?
+        .get("parts")?
+        .as_array()?;
+    parts
+        .iter()
+        .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(str::to_string))
+}
+
+/// Build the Anthropic Messages request body (native format, stream on).
+pub(crate) fn build_anthropic_body(
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "max_tokens": if max_tokens > 0 { max_tokens } else { 1024 },
+        "system": system,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": true,
+    })
+}
+
+/// Build the Gemini `streamGenerateContent` request body (model goes in the URL).
+pub(crate) fn build_gemini_body(
+    system: &str,
+    prompt: &str,
+    max_tokens: usize,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
+        "generationConfig": { "maxOutputTokens": if max_tokens > 0 { max_tokens } else { 1024 } },
+    });
+    if !system.trim().is_empty() {
+        body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system }] });
+    }
+    body
+}
+
 /// POST an OpenAI-compatible chat request and collect streamed text deltas.
 /// `bearer` is `None` for keyless servers (e.g. Ollama); blocking HTTP + SSE
 /// parsing is moved off the async executor.
@@ -866,6 +986,176 @@ impl InferenceBackend for HermesAgentBackend {
     }
 }
 
+/// First-class backend for the **Anthropic** Messages API (Claude).
+///
+/// Uses the native Anthropic protocol (not OpenAI-compatible): `POST /v1/messages`
+/// with `x-api-key` + `anthropic-version` headers and `stream: true` SSE events.
+pub struct AnthropicBackend {
+    endpoint: String,
+    model: String,
+    api_key: String,
+    anthropic_version: String,
+}
+
+impl AnthropicBackend {
+    /// Create a backend for an Anthropic Messages endpoint (full URL, e.g.
+    /// `https://api.anthropic.com/v1/messages`), an API key and a Claude model.
+    pub fn new(endpoint: String, api_key: String, model: String) -> Self {
+        Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            model,
+            api_key,
+            anthropic_version: "2023-06-01".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl InferenceBackend for AnthropicBackend {
+    async fn infer(
+        &self,
+        prompt: &str,
+        context: &HashMap<String, String>,
+        max_tokens: usize,
+    ) -> Result<Box<dyn TokenStream>> {
+        let mut system_prompt = String::from("You are a helpful assistant.");
+        if let Some(hint) = context.get("system_context") {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(hint);
+        }
+        let body = build_anthropic_body(&self.model, &system_prompt, prompt, max_tokens);
+        let headers = [
+            ("x-api-key", self.api_key.as_str()),
+            ("anthropic-version", self.anthropic_version.as_str()),
+        ];
+        let tokens =
+            stream_sse_with_headers(&self.endpoint, &headers, body, parse_anthropic_sse).await?;
+        Ok(Box::new(ApiTokenStream {
+            tokens: tokens.into_iter(),
+        }))
+    }
+
+    fn metadata(&self) -> BackendMetadata {
+        BackendMetadata {
+            name: "anthropic".to_string(),
+            version: "0.1.0".to_string(),
+            model_name: self.model.clone(),
+            max_context_length: 200_000,
+            supports_streaming: true,
+            // Claude exposes tool calling.
+            supports_function_calling: true,
+            supports_images: true,
+        }
+    }
+
+    async fn health_check(&self) -> Result<()> {
+        // No dedicated /health; any HTTP response from the host means it's
+        // reachable (auth/route errors surface per-request, never faked here).
+        let endpoint = self.endpoint.clone();
+        let probe = endpoint.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            match ureq::get(&probe).timeout(Duration::from_secs(8)).call() {
+                Ok(_) => Ok(()),
+                // Any HTTP response (incl. a 4xx/5xx route) proves reachability.
+                Err(ureq::Error::Status(_, _)) => Ok(()),
+                Err(err) => Err(format!("{err}")),
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("anthropic health task join: {e}"))?;
+        res.map_err(|msg| anyhow!("Anthropic unreachable at {endpoint}: {msg}"))
+    }
+
+    async fn get_stats(&self) -> BackendStats {
+        // Honest telemetry: not instrumented here -> report unknown (None), not 0.
+        BackendStats::default()
+    }
+}
+
+/// First-class backend for **Google Gemini** native REST (`streamGenerateContent`).
+///
+/// Auth is the Google API key via the `x-goog-api-key` header; the model id is
+/// embedded in the URL (`…/models/{model}:streamGenerateContent?alt=sse`).
+pub struct GeminiBackend {
+    base: String,
+    model: String,
+    api_key: String,
+}
+
+impl GeminiBackend {
+    /// Create a backend for a Gemini v1beta base URL (e.g.
+    /// `https://generativelanguage.googleapis.com/v1beta`), an API key and model.
+    pub fn new(base: String, api_key: String, model: String) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            model,
+            api_key,
+        }
+    }
+}
+
+#[async_trait]
+impl InferenceBackend for GeminiBackend {
+    async fn infer(
+        &self,
+        prompt: &str,
+        context: &HashMap<String, String>,
+        max_tokens: usize,
+    ) -> Result<Box<dyn TokenStream>> {
+        let mut system_prompt = String::from("You are a helpful assistant.");
+        if let Some(hint) = context.get("system_context") {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(hint);
+        }
+        let body = build_gemini_body(&system_prompt, prompt, max_tokens);
+        let url = format!(
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            self.base, self.model
+        );
+        let headers = [("x-goog-api-key", self.api_key.as_str())];
+        let tokens = stream_sse_with_headers(&url, &headers, body, parse_gemini_sse).await?;
+        Ok(Box::new(ApiTokenStream {
+            tokens: tokens.into_iter(),
+        }))
+    }
+
+    fn metadata(&self) -> BackendMetadata {
+        BackendMetadata {
+            name: "gemini".to_string(),
+            version: "0.1.0".to_string(),
+            model_name: self.model.clone(),
+            max_context_length: 1_000_000,
+            supports_streaming: true,
+            supports_function_calling: true,
+            supports_images: true,
+        }
+    }
+
+    async fn health_check(&self) -> Result<()> {
+        // Any HTTP response (incl. 4xx) proves the host is reachable.
+        let base = self.base.clone();
+        let probe_base = base.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            match ureq::get(&probe_base)
+                .timeout(Duration::from_secs(8))
+                .call()
+            {
+                Ok(_) => Ok(()),
+                Err(ureq::Error::Status(_, _)) => Ok(()), // reachable
+                Err(err) => Err(format!("{err}")),
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("gemini health task join: {e}"))?;
+        res.map_err(|msg| anyhow!("Gemini unreachable at {base}: {msg}"))
+    }
+
+    async fn get_stats(&self) -> BackendStats {
+        // Honest telemetry: not instrumented here -> report unknown (None), not 0.
+        BackendStats::default()
+    }
+}
+
 /// Token stream from API backend.
 struct ApiTokenStream {
     tokens: std::vec::IntoIter<String>,
@@ -954,6 +1244,18 @@ pub enum BackendKind {
     },
     /// Use the Hermes-Rust agent (which itself calls Ollama) via its HTTP API.
     Hermes { base_url: String, model: String },
+    /// Use the Anthropic Messages API (Claude, native protocol).
+    Anthropic {
+        api_key: String,
+        endpoint: String,
+        model: String,
+    },
+    /// Use the Google Gemini native REST API (`streamGenerateContent`).
+    Gemini {
+        api_key: String,
+        base: String,
+        model: String,
+    },
     /// Use mock backend (for testing).
     Mock,
 }
@@ -994,6 +1296,25 @@ impl BackendKind {
                 backend.health_check().await?;
                 Ok(Box::new(backend))
             }
+            BackendKind::Anthropic {
+                api_key,
+                endpoint,
+                model,
+            } => {
+                let backend =
+                    AnthropicBackend::new(endpoint.clone(), api_key.clone(), model.clone());
+                backend.health_check().await?;
+                Ok(Box::new(backend))
+            }
+            BackendKind::Gemini {
+                api_key,
+                base,
+                model,
+            } => {
+                let backend = GeminiBackend::new(base.clone(), api_key.clone(), model.clone());
+                backend.health_check().await?;
+                Ok(Box::new(backend))
+            }
             BackendKind::Mock => {
                 let backend = MockBackend::new();
                 backend.health_check().await?;
@@ -1006,6 +1327,76 @@ impl BackendKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_parser_extracts_text_delta_and_ignores_control() {
+        assert_eq!(
+            parse_anthropic_sse(
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}",
+            )
+            .as_deref(),
+            Some("Hel")
+        );
+        // Control / start / ping events carry no user text.
+        assert!(parse_anthropic_sse(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"}}"
+        )
+        .is_none());
+        assert!(parse_anthropic_sse("data: {\"type\":\"ping\"}").is_none());
+        assert!(parse_anthropic_sse("event: message_stop").is_none());
+        assert!(parse_anthropic_sse("data: [DONE]").is_none());
+    }
+
+    #[test]
+    fn gemini_parser_extracts_part_text_and_ignores_terminal() {
+        assert_eq!(
+            parse_gemini_sse(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你好\"}],\"role\":\"model\"}}]}"
+            )
+            .as_deref(),
+            Some("你好")
+        );
+        // A terminal frame without candidates yields None (loop ends on EOF).
+        assert!(parse_gemini_sse("data: {\"candidates\":[]}").is_none());
+        assert!(parse_gemini_sse("").is_none());
+    }
+
+    #[test]
+    fn anthropic_body_is_native_messages_shape() {
+        let b = build_anthropic_body("claude-x", "sys", "hello", 128);
+        assert_eq!(b["model"], "claude-x");
+        assert_eq!(b["max_tokens"], 128);
+        assert_eq!(b["system"], "sys");
+        assert_eq!(b["stream"], true);
+        assert_eq!(b["messages"][0]["role"], "user");
+        assert_eq!(b["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn gemini_body_is_native_contents_shape_and_drops_empty_system() {
+        let with_sys = build_gemini_body("be nice", "hello", 64);
+        assert_eq!(with_sys["contents"][0]["parts"][0]["text"], "hello");
+        assert_eq!(with_sys["generationConfig"]["maxOutputTokens"], 64);
+        assert_eq!(with_sys["systemInstruction"]["parts"][0]["text"], "be nice");
+
+        let no_sys = build_gemini_body("", "hello", 0);
+        assert!(no_sys.get("systemInstruction").is_none());
+        assert_eq!(no_sys["generationConfig"]["maxOutputTokens"], 1024);
+    }
+
+    #[test]
+    fn anthropic_and_gemini_metadata_report_their_engine() {
+        let a = AnthropicBackend::new(
+            "https://api.anthropic.com/v1/messages".into(),
+            "k".into(),
+            "claude-x".into(),
+        );
+        assert_eq!(a.metadata().name, "anthropic");
+        assert_eq!(a.metadata().model_name, "claude-x");
+        let g = GeminiBackend::new("https://g".into(), "k".into(), "gemini-x".into());
+        assert_eq!(g.metadata().name, "gemini");
+        assert_eq!(g.metadata().model_name, "gemini-x");
+    }
 
     #[test]
     fn ggml_metadata_is_correct() {

@@ -3,7 +3,7 @@
  * (Settings card, AI chat header, …) renders the *same* truthful engine view.
  *
  * Contract with `amos-ai` (see `proto/ai_agent.proto` StatusReply):
- *  - engine:      mock | api | ollama | hermes | ggml
+ *  - engine:      mock | api | ollama | hermes | ggml | anthropic | gemini
  *  - engine_model: concrete model behind `engine` (empty when mock)
  *  - degraded:    a real engine was requested but the daemon serves mock
  *  - asr:         mock | sherpa | off

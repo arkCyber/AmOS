@@ -356,7 +356,10 @@ impl AiAgentService {
 /// A real inference backend kind (as named by `AMOS_BACKEND`), as opposed to the
 /// dev/test `mock` (or an empty/unknown value).
 fn is_real_backend(kind: &str) -> bool {
-    matches!(kind, "api" | "ollama" | "hermes" | "ggml")
+    matches!(
+        kind,
+        "api" | "ollama" | "hermes" | "ggml" | "anthropic" | "gemini"
+    )
 }
 
 /// Trim + parse a non-negative integer; `None` for empty / malformed input.
@@ -507,9 +510,10 @@ fn accel_label_for_active(active: &str) -> Option<String> {
 /// Select and build the inference backend from the environment.
 ///
 /// Env vars:
-///   AMOS_BACKEND = "mock" | "api" | "ollama" | "hermes" | "ggml"  (default "mock")
+///   AMOS_BACKEND = "mock" | "api" | "ollama" | "hermes" | "ggml"
+///                 | "anthropic" | "gemini"                     (default "mock")
 ///   AMOS_MODEL_PATH                                       (ggml)
-///   AMOS_API_KEY / AMOS_API_ENDPOINT / AMOS_MODEL         (api)
+///   AMOS_API_KEY / AMOS_API_ENDPOINT / AMOS_MODEL         (api, anthropic, gemini)
 ///   AMOS_OLLAMA_HOST / AMOS_MODEL                         (ollama)
 ///   AMOS_HERMES_ENDPOINT / AMOS_MODEL                     (hermes)
 ///
@@ -565,6 +569,27 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
                 .unwrap_or_else(|_| "http://127.0.0.1:11438".into()),
             model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "hermes-rust".into()),
         },
+        // Claude (Anthropic Messages, native protocol). Endpoint defaults to the
+        // official API; model + key come from AMOS_MODEL / AMOS_API_KEY.
+        "anthropic" => BackendKind::Anthropic {
+            api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
+            endpoint: std::env::var("AMOS_API_ENDPOINT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".into()),
+            model: std::env::var("AMOS_MODEL")
+                .unwrap_or_else(|_| "claude-3-5-sonnet-latest".into()),
+        },
+        // Google Gemini native REST. AMOS_API_ENDPOINT (optional) is the v1beta
+        // base URL the model id is appended to.
+        "gemini" => BackendKind::Gemini {
+            api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
+            base: std::env::var("AMOS_API_ENDPOINT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()),
+            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".into()),
+        },
         _ => BackendKind::Mock,
     };
     // Ollama manages its own offload, so the accelerator can't be passed as CLI
@@ -581,7 +606,10 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
     match backend.build().await {
         Ok(b) => Arc::from(b),
         Err(e) => {
-            if matches!(kind.as_str(), "api" | "ollama" | "hermes" | "ggml") {
+            if matches!(
+                kind.as_str(),
+                "api" | "ollama" | "hermes" | "ggml" | "anthropic" | "gemini"
+            ) {
                 tracing::error!(
                     backend = %kind,
                     "requested inference backend failed to initialise: {e:#}; serving the \
@@ -1545,9 +1573,10 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         // Offline local vector retrieval (proto ai_agent.proto, `service Rag`):
         // index note/document passages and retrieve the nearest ids to a query
         // over the same UDS, so Notes / System UI can "ask my files". Embedder
-        // is mock (offline) unless AMOS_RAG_EMBEDDER=ollama (real local model,
-        // docs/vector-db-rag.md). "Retrieve-then-answer" is composed by the
-        // caller from Rag.Query + AiAgent.StreamChat.
+        // is mock (offline) unless AMOS_RAG_EMBEDDER=ollama (local Ollama) or
+        // =api (cloud OpenAI-compatible /v1/embeddings) — see rag_service.rs.
+        // "Retrieve-then-answer" is composed by the caller from Rag.Query +
+        // AiAgent.StreamChat.
         .add_service(crate::rag_service::server(
             crate::rag_service::RagSvc::from_env()?,
         ));
@@ -1717,7 +1746,7 @@ mod tests {
 
     #[test]
     fn real_backend_kinds_are_detected() {
-        for real in ["api", "ollama", "hermes", "ggml"] {
+        for real in ["api", "ollama", "hermes", "ggml", "anthropic", "gemini"] {
             assert!(is_real_backend(real), "{real} is a real backend");
         }
         for dev in ["mock", "", "unknown"] {
