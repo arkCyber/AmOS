@@ -25,10 +25,14 @@ export function noteTitle(text: string): string {
 }
 
 /** A whitespace-collapsed preview of the body *after* the title line, for the
- *  iOS-style list row. `max` caps the length (marker syntax is kept plain). */
+ *  iOS-style list row. `max` caps the length (inline markers are stripped so
+ *  the collapsed row reads cleanly — the rich view still shows them via
+ *  `fmtInline`). */
 export function notePreview(text: string, max = 140): string {
   const lines = text.split("\n");
-  const body = lines.slice(1).join(" ").replace(/\s+/g, " ").trim();
+  const body = stripInlineMarkers(lines.slice(1).join(" "))
+    .replace(/\s+/g, " ")
+    .trim();
   if (body) return body.length > max ? `${body.slice(0, max)}…` : body;
   return "";
 }
@@ -400,6 +404,17 @@ function splitTagged(text: string): RichSeg[] {
 /** Split a note body into plain / bold / highlighted / struck / link / hashtag
  * segments. Text not wrapped in markers stays plain; the original text is kept
  * verbatim (newlines included). Pure + headless-testable. */
+/** Remove Markdown inline markers from text, returning readable plain text (the
+ *  collapsed list-row preview equivalent of the rich `fmtInline` read view).
+ *  `**b**`/`==h==`/`~~s~~` are unwrapped, `[label](url)` keeps its label. `#tags`
+ *  and anything else is preserved verbatim (never partially eats a marker). */
+export function stripInlineMarkers(s: string): string {
+  return s.replace(
+    /(\*\*([^*]+?)\*\*|==([^=]+?)==|~~([^~]+?)~~|\[([^\]]+)\]\((?:https?:\/\/[^)\s]+)\))/g,
+    (_all, _a, bold, hl, strike, label) => label ?? bold ?? hl ?? strike ?? "",
+  );
+}
+
 export function fmtInline(text: string): RichSeg[] {
   const out: RichSeg[] = [];
   const re =

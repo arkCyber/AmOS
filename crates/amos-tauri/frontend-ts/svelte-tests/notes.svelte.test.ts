@@ -441,3 +441,27 @@ describe("NotesApp.svelte — 按修改时间排序偏好", () => {
   });
 });
 
+
+describe("NotesApp.svelte — 折叠预览去内联标记", () => {
+  test("collapsed row preview hides marker syntax but shows the text", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([
+        {
+          id: "m1",
+          text: "标题\n**粗体** 与 ==高亮== 和 ~~删除~~ 还有 [链接](https://example.com)",
+          ts: 10,
+          created: 10,
+        },
+      ]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const body = txt(host);
+    expect(body).toContain("粗体 与 高亮 和 删除 还有 链接");
+    expect(body).not.toContain("**");
+    expect(body).not.toContain("==");
+    expect(body).not.toContain("~~");
+  });
+});
+

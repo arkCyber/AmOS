@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf } from "../lib/notes";
+import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf, stripInlineMarkers } from "../lib/notes";
 import { orderByModified } from "../lib/notes";
 
 describe("notes store helpers", () => {
@@ -532,6 +532,28 @@ describe("orderByModified", () => {
       { id: "c", text: "new", ts: 9 },
     ];
     const before = list.map((n) => n.id);
+
+describe("stripInlineMarkers / notePreview clean preview", () => {
+  test("strips bold/highlight/strike markers and unwraps links to their label", () => {
+    expect(stripInlineMarkers("**粗** 与 ==高亮== 和 ~~删~~")).toBe("粗 与 高亮 和 删");
+    expect(stripInlineMarkers("看 [文档](https://example.com/a) 这")).toBe("看 文档 这");
+  });
+
+  test("preserves #tags and plain text, never eats partial markers", () => {
+    expect(stripInlineMarkers("含 #标签 与 **ok** 保真")).toBe("含 #标签 与 ok 保真");
+    // unclosed markers (no closing **) must stay literal
+    expect(stripInlineMarkers("坏 **粗体")).toBe("坏 **粗体");
+    expect(stripInlineMarkers("[只有文字](javascript:alert)")).toBe("[只有文字](javascript:alert)");
+  });
+
+  test("notePreview renders a clean collapsed preview without marker syntax", () => {
+    expect(notePreview("标题\n**粗** ==高亮== 且 ~~删~~ 还有 [链](https://a.io)")).toBe(
+      "粗 高亮 且 删 还有 链",
+    );
+    expect(notePreview("标题\n保留 #标签")).toBe("保留 #标签");
+  });
+});
+
     orderByModified(list);
     expect(list.map((n) => n.id)).toEqual(before);
   });
