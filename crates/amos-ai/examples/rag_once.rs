@@ -14,9 +14,7 @@
 use std::path::PathBuf;
 
 use amos_proto::ai_agent::rag_client::RagClient;
-use amos_proto::ai_agent::{
-    RagIndexRequest, RagQueryRequest, RagRemoveRequest, RagStatusRequest,
-};
+use amos_proto::ai_agent::{RagIndexRequest, RagQueryRequest, RagRemoveRequest, RagStatusRequest};
 use anyhow::{anyhow, Result};
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
@@ -82,14 +80,21 @@ async fn main() -> Result<()> {
         .into_inner();
     println!("query hits={}", q.hits.len());
     for h in &q.hits {
-        println!("  hit id={} score={:.6} passage_len={}", h.id, h.score, h.passage.len());
+        println!(
+            "  hit id={} score={:.6} passage_len={}",
+            h.id,
+            h.score,
+            h.passage.len()
+        );
     }
     if let Some(first) = q.hits.first() {
         println!("  top id={} passage='{}'", first.id, first.passage);
     }
 
     let removed = rag
-        .remove(RagRemoveRequest { id: "note:a".into() })
+        .remove(RagRemoveRequest {
+            id: "note:a".into(),
+        })
         .await?
         .into_inner();
     println!("remove note:a removed={}", removed.removed);
