@@ -21,8 +21,6 @@
     "smoke:ui": "bun scripts/smoke-ui.mjs"
   },
   "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
     "svelte": "^5.0.0"
   },
   "devDependencies": {
@@ -30,9 +28,6 @@
     "@sveltejs/vite-plugin-svelte": "^4.0.4",
     "@testing-library/svelte": "^5.4.2",
     "@types/bun": "^1.1.6",
-    "@types/react": "^18.3.3",
-    "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.20",
     "fake-indexeddb": "^6.2.5",
     "postcss": "^8.4.41",

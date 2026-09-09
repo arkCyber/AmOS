@@ -1,14 +1,11 @@
 import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 // Tauri expects the frontend to listen on a fixed port in dev (`devUrl`) and
 // write static output to `frontendDist` for production. Keep 1420 (Tauri default).
 export default defineConfig({
   plugins: [
-    react(),
-    // Coexistence migration seam: .svelte files are compiled by this plugin while
-    // the rest of the tree stays React. Svelte 5 runes are the default.
+    // Pure-Svelte System UI shell (Svelte 5 runes). No React in the graph.
     svelte(),
   ],
   clearScreen: false,

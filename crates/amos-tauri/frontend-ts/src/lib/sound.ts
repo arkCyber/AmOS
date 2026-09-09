@@ -7,8 +7,6 @@
  * of the persisted bits (see `effectiveAlert`).
  */
 import { readStoreValue, writeStoreValue } from "./amosStore";
-import { useStoreValue } from "./useStoreValue";
-import { SETTINGS_KEY, dndActive, normalizeQuick } from "./settings";
 
 /** Shared-store key under which the sound policy is persisted. */
 export const SOUND_KEY = "amos.sound";
@@ -76,19 +74,3 @@ export function shouldRingOnArrival(
   return currentUnread > previousUnread && normalizeSound(effective).ring;
 }
 
-/**
- * Reactive sound policy for a component: returns the persisted bits, whether
- * DND is active, and the *effective* (possibly muted) alert policy. Re-renders
- * when either the sound store or quick-settings (DND) change.
- */
-export function useAlertPolicy(): {
-  policy: SoundPolicy;
-  dnd: boolean;
-  effective: SoundPolicy;
-} {
-  const sound = useStoreValue<unknown>(SOUND_KEY, {});
-  const policy = normalizeSound(sound);
-  const quick = useStoreValue<unknown>(SETTINGS_KEY, {});
-  const dnd = dndActive(normalizeQuick(quick));
-  return { policy, dnd, effective: effectiveAlert(policy, dnd) };
-}
