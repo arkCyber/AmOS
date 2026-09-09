@@ -1,6 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { onTelephonyEvent, type TelephonyCall } from "./backend";
 import { holdSet } from "./useTelephonyHold";
+// Pure reason bus lives in the React-free keepAwakeCore (single source of truth);
+// this legacy file re-exports it for existing React consumers and adds React hooks.
+import { assertHold, onHoldChange, releaseHold, screenHeld } from "./keepAwakeCore";
+export {
+  assertHold,
+  clearAllHolds,
+  heldReasons,
+  releaseHold,
+  screenHeld,
+} from "./keepAwakeCore";
 
 /**
  * Frontend **keep-awake reason bus** — the mirror of the Rust
@@ -14,42 +24,6 @@ import { holdSet } from "./useTelephonyHold";
  * [`useScreenHold`]. Reasons are sticky until explicitly released, and each
  * source owns its own reason (call + nav can both hold).
  */
-const reasons = new Set<string>();
-const listeners = new Set<() => void>();
-
-function notify(): void {
-  for (const l of listeners) l();
-}
-
-/** True only when no reason is active (conservative). */
-export function screenHeld(): boolean {
-  return reasons.size > 0;
-}
-
-/** Active hold reasons, ascending (diagnostics / logging). */
-export function heldReasons(): string[] {
-  return [...reasons].sort();
-}
-
-/** Assert a reason the display must stay on (idempotent). */
-export function assertHold(reason: string): void {
-  if (reasons.has(reason)) return;
-  reasons.add(reason);
-  notify();
-}
-
-/** Revoke a reason. No-op if it wasn't active. */
-export function releaseHold(reason: string): void {
-  if (!reasons.delete(reason)) return;
-  notify();
-}
-
-/** Test/teardown: drop every reason. Not used by production code. */
-export function clearAllHolds(): void {
-  if (reasons.size === 0) return;
-  reasons.clear();
-  notify();
-}
 
 /**
  * Reactive "is the screen being held on by any reason?" — the Shell feeds this
@@ -58,13 +32,7 @@ export function clearAllHolds(): void {
  */
 export function useScreenHold(): boolean {
   const [held, setHeld] = useState<boolean>(screenHeld);
-  useEffect(() => {
-    const upd = () => setHeld(screenHeld());
-    listeners.add(upd);
-    return () => {
-      listeners.delete(upd);
-    };
-  }, []);
+  useEffect(() => onHoldChange(() => setHeld(screenHeld())), []);
   return held;
 }
 
