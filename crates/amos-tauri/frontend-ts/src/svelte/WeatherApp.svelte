@@ -70,8 +70,7 @@
   const dayName = (daysFromNow: number): string =>
     daysFromNow === 0 ? t("weather.today") : dayLabel(locale(), base, daysFromNow);
 
-  // Local equivalents of the React-only helpers (chip / GROUP live in the React
-  // components/ui.tsx — imported here they'd drag React into the Svelte chunk).
+  // Local chip/GROUP class helpers kept here (Svelte-only UI).
   function chipCls(on: boolean): string {
     return `px-3 py-1 text-xs rounded-full transition ${
       on ? "bg-accent text-white" : "bg-neutral-300 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-200"

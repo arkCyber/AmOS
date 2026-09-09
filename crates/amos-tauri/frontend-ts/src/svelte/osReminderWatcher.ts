@@ -1,9 +1,9 @@
 /**
- * React-free, shell-level reminder watcher for the pure-Svelte host.
+ * Shell-level reminder watcher for the Svelte host.
  *
- * The pure sync lives in `lib/reminderCore.ts`; this module is the React-free
- * scheduler that calls it unless the Reminders app is the focused surface (its
- * due items are already on screen). Mirrors `osTimerWatcher` / `osAlarmWatcher`.
+ * The pure sync lives in `lib/reminderCore.ts`; this module is the scheduler
+ * that calls it unless the Reminders app is the focused surface (its due items
+ * are already on screen). Mirrors `osTimerWatcher` / `osAlarmWatcher`.
  */
 import {
   DUE_ALERT_INTERVAL_MS,

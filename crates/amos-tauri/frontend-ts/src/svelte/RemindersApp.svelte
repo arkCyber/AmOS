@@ -289,7 +289,7 @@
     return { done, past, dueLabel };
   }
 
-  /* class token helpers inlined from components/ui.tsx (React-free) */
+  /* Shared class-token helpers for card groups. */
   const GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
   const ROW = "flex items-center justify-between gap-3 px-4 py-3";

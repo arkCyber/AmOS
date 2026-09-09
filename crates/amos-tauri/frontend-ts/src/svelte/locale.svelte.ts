@@ -8,10 +8,10 @@
  * Svelte re-renders them the instant `setLocale()` is called (fine-grained
  * signal tracking works through function calls during render).
  *
- * Cross-framework sync: the React shell owns locale switching. Its Svelte host
- * (`src/components/SvelteAppHost.tsx`) calls `setLocale()` whenever the shell
- * locale changes, so every mounted Svelte app updates in place — no remount, no
- * state loss. It persists to the same key the shell writes (`amos-ui.locale`).
+ * Cross-window sync: the shell owns locale switching and calls `setLocale()`
+ * whenever the UI locale changes, so every mounted Svelte app updates in place
+ * — no remount, no state loss. It persists to the same key the shell writes
+ * (`amos-ui.locale`).
  */
 import { zh } from "../i18n/locales/zh";
 import { en } from "../i18n/locales/en";

@@ -1,8 +1,8 @@
 /**
  * focusTrap.ts — Framework-agnostic modal focus trap (no React/Svelte imports).
  *
- * Shared by the React hook (src/lib/useFocusTrap.ts) and Svelte controlled
- * overlays (Recents/Spotlight/etc.), so the trap behaviour can never drift.
+ * Shared by the Svelte controlled overlays that need a modal trap
+ * (Recents/Spotlight/etc.), so the trap behaviour can never drift.
  */
 
 const SEL =

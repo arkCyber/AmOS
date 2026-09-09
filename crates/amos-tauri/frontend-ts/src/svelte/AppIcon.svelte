@@ -1,7 +1,6 @@
 <script lang="ts">
-  // AppIcon.svelte — the Svelte twin of components/AppIcon.tsx.
-  // Both paint the SAME pure model in src/lib/appIcon.ts (tone/face/SVG markup),
-  // so the two renderers can never drift on colour or geometry.
+  // AppIcon.svelte — paints the launcher tile model from src/lib/appIcon.ts
+  // (tone/face/SVG markup), the single source of truth for colour/geometry.
   import type { Snippet } from "svelte";
   import { bespokeGlyphSvg, isBespokeTile, tileBackground } from "../lib/appIcon";
 

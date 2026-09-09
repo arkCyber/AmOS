@@ -1,15 +1,13 @@
 /**
- * shellState.svelte.ts — Svelte top-level shell navigation state (Phase-3).
+ * shellState.svelte.ts — Svelte top-level shell navigation state.
  *
- * The React-free counterpart of App.tsx's Shell state machine. A future
  * `Shell.svelte` reads this runes store to decide what to render (home / an app
- * screen / lock / edit) and the open overlay flags, and persists amos.home.layout
- * the way the React shell does. Actions are pure state transitions with NO React
- * on the import graph.
+ * screen / lock / edit) and the open overlay flags, and persists `amos.home.layout`.
+ * Actions are pure state transitions with no framework UI on the import graph.
  *
  * NOTE: `open()` already records a recent for built-in apps (drives the App
- * Library "Frequently Used" group) using the React-free appMeta module. Clearing
- * the opened app's notification badge is still a later Phase-3 foundation.
+ * Library "Frequently Used" group) using the appMeta module. Clearing the opened
+ * app's notification badge is still a later foundation step.
  */
 import { saveLayout, pushRecent, getLayout, defaultLayout, type HomeLayout } from "../lib/amosStore";
 import { appTitleKey, appIds } from "../lib/appMeta";

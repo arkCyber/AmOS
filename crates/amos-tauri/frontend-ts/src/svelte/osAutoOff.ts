@@ -1,11 +1,10 @@
 /**
- * React-free auto screen-off watcher for the pure-Svelte shell.
+ * Auto screen-off watcher for the Svelte shell.
  *
  * The decision math lives in `lib/display` (`autoOffDue`/`clampAutoOffSec`). This
- * module is the React-free host loop Shell.svelte starts: it reads the persisted
- * auto-off timeout, tracks the last activity time, and calls `onSleep` once the
- * device has been idle long enough (then stops). React-free so it can live on the
- * Svelte import graph (the React host's keepAwake path is separate until cut over).
+ * module is the host loop Shell.svelte starts: it reads the persisted auto-off
+ * timeout, tracks the last activity time, and calls `onSleep` once the device
+ * has been idle long enough (then stops).
  */
 import { AUTOOFF_STORE_KEY, autoOffDue, clampAutoOffSec } from "../lib/display";
 import { readStoreValue } from "../lib/amosStore";

@@ -43,7 +43,7 @@
     bus.emit("close");
   };
 
-  // Keyboard focus trap while the overlay is open (parity with React useFocusTrap).
+  // Keyboard focus trap while the overlay is open (shared lib/focusTrap).
   let rootEl: HTMLDivElement | undefined = $state();
   $effect(() => {
     if (!open || !rootEl) return;

@@ -39,10 +39,7 @@
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
 
-  // Persisted history — createStoreValue is the Svelte counterpart of React's
-  // useStoreValue. Here it's a REAL consumer: history is seeded from and
-  // persisted to the shared amos.* store, and stays reactive to any writer, so
-  // completed calculations survive closing/reopening the calculator.
+  // Persisted history — createStoreValue keeps it live (src/svelte/store.ts).
   const HISTORY_KEY = "amos.calculator.history";
   function normalizeHistory(v: unknown): CalcEntry[] {
     if (!Array.isArray(v)) return [];

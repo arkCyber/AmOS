@@ -1,12 +1,10 @@
 /**
- * Reactive, persisted store value for Svelte 5 apps — the Svelte counterpart of
- * the React `useStoreValue` hook (`src/lib/useStoreValue.ts`).
+ * Reactive, persisted store value for Svelte 5 apps, usable from plain `.ts`.
  *
- * React's hook is state-per-component + `useEffect`. Svelte 5's runes can't
- * create dynamic `$state` from a function, so for ARBITRARY persisted keys the
- * idiomatic primitive is a `svelte/store` `writable` (dynamic, works in plain
- * `.ts`). Any Svelte store subscriber (incl. React host glue, future non-runes
- * code, or a `$derived` adapter) is notified when the key changes from ANY of:
+ * Svelte 5's runes can't create dynamic `$state` from a function, so for
+ * ARBITRARY persisted keys the idiomatic primitive is a `svelte/store`
+ * `writable` (dynamic, works in plain `.ts`). Any Svelte store subscriber is
+ * notified when the key changes from ANY of:
  *   - the same window (writers dispatch `STORE_CHANGED_EVENT`),
  *   - another tab/window sharing localStorage (`storage` event),
  *   - a Tauri cross-window update (`store-updated` backend event, when bridged).

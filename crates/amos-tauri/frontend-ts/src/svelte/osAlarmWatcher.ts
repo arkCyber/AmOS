@@ -1,10 +1,10 @@
 /**
- * React-free, shell-level alarm watcher for the pure-Svelte host.
+ * Shell-level alarm watcher for the Svelte host.
  *
  * When Shell.svelte is the production host it must run the OS "due alarm"
- * reconcile itself. All real logic lives in React-free `lib/alarmCore.ts`; this
- * module is the React-free timer/scheduler that calls `syncDueAlarmAlerts` unless
- * the Clock app is the focused surface (its own in-app ring is on screen).
+ * reconcile itself. All real logic lives in `lib/alarmCore.ts`; this module is
+ * the timer/scheduler that calls `syncDueAlarmAlerts` unless the Clock app is
+ * the focused surface (its own in-app ring is on screen).
  */
 import {
   ALARM_ALERT_INTERVAL_MS,

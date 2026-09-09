@@ -6,7 +6,7 @@
   // to null so the offline shell renders a localized banner and never crashes;
   // live mic capture + daemon streaming need a real device + amos-interp daemon.
   import { bridged, subscribe, interpretStart, interpretStop, interpretPause, interpretResume, interpretAudio, interpretText } from "../lib/backend";
-  import { frameToChunk } from "../lib/audio";
+  import { frameToInterpChunk } from "../lib/audio";
   import { speakText } from "../lib/realtimeTts";
   import { capTail } from "../lib/bounded";
   import {
@@ -118,7 +118,7 @@
     proc.onaudioprocess = (e) => {
       const chunk = e.inputBuffer.getChannelData(0);
       const id = sid;
-      if (id) void interpretAudio(id, frameToChunk(chunk, ctx.sampleRate));
+      if (id) void interpretAudio(id, frameToInterpChunk(chunk, ctx.sampleRate));
     };
     src.connect(proc);
     proc.connect(ctx.destination);
@@ -278,7 +278,7 @@
     }
   }
 
-  // Reusable pill/button class helpers (inlined from components/ui, React-free).
+  // Reusable pill/button class helpers.
   const chipCls = (active: boolean) =>
     "px-3 py-1 text-xs rounded-full transition " +
     (active ? "bg-accent text-white" : "bg-neutral-300 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-200");

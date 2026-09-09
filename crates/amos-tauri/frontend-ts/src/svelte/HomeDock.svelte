@@ -10,7 +10,7 @@
   //
   // Pure logic is REUSED, not rewritten: model helpers from lib/settings,
   // i18n from locale.svelte.ts, notifications/DND reactively via createStoreValue
-  // (svelte/store) — the twin of React's useStoreValue.
+  // (src/svelte/store.ts).
   import { t, locale } from "./locale.svelte";
   import { homeDownToSpotlight } from "../lib/edgeSwipe";
   import { onMount } from "svelte";

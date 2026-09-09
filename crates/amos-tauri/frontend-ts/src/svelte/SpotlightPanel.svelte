@@ -49,7 +49,7 @@
     bus.emit("close");
   };
 
-  // Keyboard focus trap while open (parity with React useFocusTrap). Tab wraps
+  // Keyboard focus trap while open (shared lib/focusTrap). Tab wraps
   // inside the sheet; Escape closes. The search field keeps its own rAF focus.
   let rootEl: HTMLDivElement | undefined = $state();
   $effect(() => {

@@ -6,17 +6,17 @@
  * glyph. A small set of first-party apps instead use a dedicated "bespoke face"
  * (paper/night/tinted wash) plus bespoke vector art.
  *
- * WHY THIS MODULE EXISTS: React (components/AppIcon.tsx) and Svelte
- * (svelte/AppIcon.svelte) each need to paint these tiles. Keeping the tone
- * palette, per-app gradient, face washes AND the bespoke glyph geometry as pure
- * data here means the two renderers can never drift — the exact numbers that
- * decide colour / geometry live in exactly one place, and both frameworks
- * consume them. (This is the audit-flagged #1 regression source: a duplicated
- * icon implementation.)
+ * WHY THIS MODULE EXISTS: the Svelte tile renderer (svelte/AppIcon.svelte) needs
+ * to paint these tiles. Keeping the tone palette, per-app gradient, face washes
+ * AND the bespoke glyph geometry as pure data here means the renderer can never
+ * drift — the exact numbers that decide colour / geometry live in exactly one
+ * place, and both the emoji-tile path and the bespoke-glyph path consume them.
+ * (This file keeps that #1 audit-flagged regression source — a duplicated icon
+ * implementation — in exactly one place.)
  *
- * The bespoke glyphs are returned as *SVG markup strings* so either framework
- * can embed them (React via dangerouslySetInnerHTML, Svelte via {@html}).
- * No React/Svelte import here — pure, unit-testable, SSR-safe.
+ * The bespoke glyphs are returned as *SVG markup strings* so the Svelte tile
+ * renderer can embed them via `{@html}`.
+ * No framework import here — pure, unit-testable, SSR-safe.
  */
 
 /** Deterministic soft tonal gradient families (top lighter → bottom deeper). */
@@ -97,8 +97,8 @@ export function tileBackground(id: string): string {
 
 /* =====================================================================
  * Bespoke glyph geometry -> SVG markup strings.
- * These are the exact numbers previously inlined as React <svg> JSX in
- * components/AppIcon.tsx (converted from camelCase to kebab-case SVG attrs).
+ * Pure geometry numbers; the Svelte renderer embeds them as `<svg>` markup
+ * (SVG attrs use kebab-case).
  * ===================================================================== */
 
 const round = (n: number, d = 2): number => {
