@@ -9,8 +9,16 @@ describe("normalizeNotesPrefs", () => {
     expect(normalizeNotesPrefs(undefined)).toEqual(defaultNotesPrefs);
   });
   test("accepts a boolean openInEditor and ignores junk", () => {
-    expect(normalizeNotesPrefs({ openInEditor: true })).toEqual({ openInEditor: true });
+    expect(normalizeNotesPrefs({ openInEditor: true })).toEqual({ openInEditor: true, sortByModified: false });
     expect(normalizeNotesPrefs({ openInEditor: "yes" })).toEqual(defaultNotesPrefs);
-    expect(normalizeNotesPrefs({ openInEditor: true, extra: 1 })).toEqual({ openInEditor: true });
+    expect(normalizeNotesPrefs({ openInEditor: true, extra: 1 })).toEqual({ openInEditor: true, sortByModified: false });
+  });
+  test("sortByModified defaults off and is boolean-coerced", () => {
+    expect(normalizeNotesPrefs({})).toEqual({ openInEditor: false, sortByModified: false });
+    expect(normalizeNotesPrefs({ openInEditor: true, sortByModified: true })).toEqual({
+      openInEditor: true,
+      sortByModified: true,
+    });
+    expect(normalizeNotesPrefs({ sortByModified: "yes" })).toEqual(defaultNotesPrefs);
   });
 });

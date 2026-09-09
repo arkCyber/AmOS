@@ -72,6 +72,16 @@ export function orderPinned(list: Note[]): Note[] {
   return [...list.filter((n) => n.pinned), ...list.filter((n) => !n.pinned)];
 }
 
+/** Sort by last-modified desc, but keep pinned notes on top (each group sorted
+ *  by `ts` desc). Stable for equal `ts` (keeps insertion order). */
+export function orderByModified(list: Note[]): Note[] {
+  const pinned: Note[] = [];
+  const rest: Note[] = [];
+  for (const n of list) (n.pinned ? pinned : rest).push(n);
+  const byTs = (a: Note, b: Note) => b.ts - a.ts;
+  return [...pinned.sort(byTs), ...rest.sort(byTs)];
+}
+
 /** Move a note into a lifecycle bucket: "archived", "trash", or back to active
  * (`undefined`). No-op (same ref) if the id is missing. */
 export function setNoteState(

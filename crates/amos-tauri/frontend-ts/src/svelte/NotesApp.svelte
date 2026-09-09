@@ -19,6 +19,7 @@
     notesOf,
     createdOf,
     editedOf,
+    orderByModified,
     orderPinned,
     prependNote,
     removeNote,
@@ -188,9 +189,10 @@
   };
 
   let selTag = $state<string | null>(null); // active #tag filter (lowercased)
-  const activeAll = $derived(
-    orderPinned(searchNotes(notesOf(notes, undefined), mode === "all" ? searchQ : "")),
-  );
+  const activeAll = $derived.by(() => {
+    const base = searchNotes(notesOf(notes, undefined), mode === "all" ? searchQ : "");
+    return prefs.sortByModified ? orderByModified(base) : orderPinned(base);
+  });
   const tagRow = $derived.by(() => {
     const map = new Map<string, { name: string; count: number }>();
     for (const n of activeAll)
@@ -344,10 +346,16 @@
   </div>
 
   {#if mode === "all"}
-    <label class="mt-2 flex items-center gap-2 text-xs opacity-70">
-      <input type="checkbox" bind:checked={prefs.openInEditor} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-open-in-editor" />
-      点按笔记直接进入整页编辑
-    </label>
+    <div class="mt-2 flex flex-col gap-1 text-xs opacity-70">
+      <label class="flex items-center gap-2">
+        <input type="checkbox" bind:checked={prefs.openInEditor} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-open-in-editor" />
+        点按笔记直接进入整页编辑
+      </label>
+      <label class="flex items-center gap-2">
+        <input type="checkbox" bind:checked={prefs.sortByModified} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-sort-by-modified" />
+        列表按修改时间排序（置顶优先）
+      </label>
+    </div>
   {/if}
 
   {#if mode === "all"}

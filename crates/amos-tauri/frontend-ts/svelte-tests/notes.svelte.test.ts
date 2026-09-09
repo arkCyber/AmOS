@@ -390,3 +390,54 @@ describe("NotesApp.svelte — 已编辑 badge on collapsed rows", () => {
   });
 });
 
+describe("NotesApp.svelte — 按修改时间排序偏好", () => {
+  function rowTexts(host: { container: HTMLElement }): string[] {
+    const box = host.container.querySelector(".mt-3.space-y-2");
+    if (!box) return [];
+    return [...box.querySelectorAll("button")].map((b) => b.textContent ?? "");
+  }
+  function seed(notes: unknown[], sortByModified: boolean) {
+    window.localStorage.setItem("amos.notes", JSON.stringify(notes));
+    window.localStorage.setItem("amos.notesPrefs", JSON.stringify({ sortByModified }));
+  }
+  // stored order = [older(ts 100), newer(ts 900)]; with the pref on the newer
+  // note (ts 900) must surface first even though it was inserted second.
+  const notes = [
+    { id: "old", text: "更早创建的备注", ts: 100, created: 100 },
+    { id: "new", text: "最近修改的备注", ts: 900, created: 100 },
+  ];
+
+  test("toggle exists and persists sortByModified", async () => {
+    window.localStorage.removeItem("amos.notes");
+    window.localStorage.removeItem("amos.notesPrefs");
+    const host = render(NotesApp);
+    const cb = host.container.querySelector(
+      'input[aria-label="note-pref-sort-by-modified"]',
+    ) as HTMLInputElement;
+    expect(cb).toBeTruthy();
+    expect(cb.checked).toBe(false);
+    await fireEvent.click(cb);
+    const saved = JSON.parse(window.localStorage.getItem("amos.notesPrefs") ?? "{}");
+    expect(saved.sortByModified).toBe(true);
+  });
+
+  test("sortByModified on reorders rows by last-modified (newest first)", async () => {
+    seed(notes, true);
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const texts = rowTexts(host);
+    expect(texts.length).toBeGreaterThanOrEqual(2);
+    expect(texts[0]).toContain("最近修改的备注");
+    expect(texts[1]).toContain("更早创建的备注");
+  });
+
+  test("off keeps stored/insertion order", async () => {
+    seed(notes, false);
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const texts = rowTexts(host);
+    expect(texts[0]).toContain("更早创建的备注");
+    expect(texts[1]).toContain("最近修改的备注");
+  });
+});
+

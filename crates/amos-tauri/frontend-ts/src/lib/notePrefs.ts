@@ -15,15 +15,21 @@ export interface NotesPrefs {
   /** When on, tapping a collapsed note row opens the full-page editor instead of
    *  expanding it inline. Default off (preserves the existing list behaviour). */
   openInEditor: boolean;
+  /** When on, the active list is ordered by last-modified (desc), pinned on top.
+   *  Default off (preserves insertion/newest-first order). */
+  sortByModified: boolean;
 }
 
-export const defaultNotesPrefs: NotesPrefs = { openInEditor: false };
+export const defaultNotesPrefs: NotesPrefs = { openInEditor: false, sortByModified: false };
 
 /** Pure: coerce unknown stored bytes into a sane [`NotesPrefs`]. */
 export function normalizeNotesPrefs(raw: unknown): NotesPrefs {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return defaultNotesPrefs;
   const o = raw as Record<string, unknown>;
-  return { openInEditor: typeof o.openInEditor === "boolean" ? o.openInEditor : false };
+  return {
+    openInEditor: typeof o.openInEditor === "boolean" ? o.openInEditor : false,
+    sortByModified: typeof o.sortByModified === "boolean" ? o.sortByModified : false,
+  };
 }
 
 /** Read + normalize prefs from the store. */

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { normalizeNotes, prependNote, removeNote, editNote, togglePin, orderPinned, setNoteState, notesOf, searchNotes, makeNote, fmtTime, noteStats, tasksOf, toggleTaskInText, toggleTaskInNote, taskSummary, completeTasksInText, completeAllTasks, noteListProgress, fmtInline, noteTitle, notePreview, noteDayOf, tagsOf, hasTag, filterByTag, setManyState, setPinned, removeMany, exportBaseName, noteExportText, createdOf, editedOf } from "../lib/notes";
+import { orderByModified } from "../lib/notes";
 
 describe("notes store helpers", () => {
   test("prependNote adds newest first, each with a unique id", () => {
@@ -502,6 +503,37 @@ describe("note created/modified storage", () => {
     const list = normalizeNotes([{ text: "a", ts: 5, created: "nope" }]);
     expect(list[0]!.created).toBeUndefined();
     expect(createdOf(list[0]!)).toBe(5);
+  });
+});
+
+
+describe("orderByModified", () => {
+  test("sorts by modified desc but keeps pinned notes on top", () => {
+    const list = [
+      { id: "a", text: "old", ts: 1 },
+      { id: "b", text: "pinned old", ts: 2, pinned: true },
+      { id: "c", text: "newest", ts: 9 },
+    ];
+    expect(orderByModified(list).map((n) => n.id)).toEqual(["b", "c", "a"]);
+  });
+
+  test("equal ts keeps insertion order (stable)", () => {
+    const list = [
+      { id: "x", text: "1", ts: 5 },
+      { id: "y", text: "2", ts: 5 },
+      { id: "z", text: "3", ts: 4 },
+    ];
+    expect(orderByModified(list).map((n) => n.id)).toEqual(["x", "y", "z"]);
+  });
+
+  test("does not mutate the input", () => {
+    const list = [
+      { id: "a", text: "old", ts: 1 },
+      { id: "c", text: "new", ts: 9 },
+    ];
+    const before = list.map((n) => n.id);
+    orderByModified(list);
+    expect(list.map((n) => n.id)).toEqual(before);
   });
 });
 
