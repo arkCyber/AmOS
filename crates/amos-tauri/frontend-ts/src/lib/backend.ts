@@ -3,6 +3,8 @@
  * legacy vanilla UI's commands. Outside Tauri every call degrades to null/false so
  * the UI can show a localized "daemon not connected" state instead of crashing.
  */
+import type { AiProviderId } from "./providers";
+
 interface TauriBridge {
   invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
   listen(channel: string, handler: (e: { payload: unknown }) => void): Promise<() => void>;
@@ -74,7 +76,7 @@ export async function subscribe(channel: string, onEvent: (payload: unknown) => 
 export type AiStatus = {
   model?: string;
   active_sessions?: number;
-  /** Active inference engine kind: mock|api|ollama|hermes|ggml. */
+  /** Active inference engine kind: mock|api|ollama|hermes|ggml|anthropic|gemini. */
   engine?: string;
   /** Concrete model behind `engine` (empty when mock). */
   engine_model?: string;
@@ -134,13 +136,28 @@ export async function getSessionHistory(sessionId: string): Promise<SessionHisto
   return invoke<SessionHistory>("get_ai_session_history", { sessionId });
 }
 
-/** One-click backend switch (local mock | DeepSeek cloud). Returns the daemon
- * launch report. No-op (null) when not running inside Tauri. */
+/** Optional cloud fields for `switchAiBackend`. */
+export interface AiBackendSwitchOpts {
+  /** Cloud model id. Empty/omitted → the daemon/preset default is used. */
+  model?: string;
+  /** OpenAI-compatible chat/completions endpoint. Empty → preset default. */
+  endpoint?: string;
+  /** API key (kept out of settings; handed once to the Rust command). */
+  apiKey?: string;
+}
+
+/** One-click backend switch (local Ollama | OpenAI | DeepSeek | custom cloud).
+ * Returns the daemon launch report. No-op (null) when not running inside Tauri. */
 export async function switchAiBackend(
-  provider: "local" | "deepseek",
-  apiKey = "",
+  provider: AiProviderId,
+  opts: AiBackendSwitchOpts = {},
 ): Promise<string | null> {
-  return invoke<string>("ai_backend_switch", { provider, apiKey });
+  return invoke<string>("ai_backend_switch", {
+    provider,
+    apiKey: opts.apiKey ?? "",
+    model: opts.model ?? "",
+    endpoint: opts.endpoint ?? "",
+  });
 }
 
 /** Stable conversation id persisted for multi-turn memory. */

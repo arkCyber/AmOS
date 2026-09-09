@@ -99,7 +99,8 @@ AMOS_SOCKET=/tmp/amos-test.sock cargo run -p amos-tauri
 
 ## Backend operations (ops cheatsheet)
 
-Single-command controls for the local ↔ cloud (DeepSeek) inference + translate backends:
+Single-command controls for the local (Ollama) ↔ cloud (OpenAI-compatible:
+DeepSeek / OpenAI / custom endpoint) inference + translate backends:
 
 ```bash
 # One-click switch AI backend and persist the choice (0600 key file on cloud).
@@ -107,6 +108,11 @@ scripts/ai-backend.sh local                          # real local Ollama (auto m
 scripts/ai-backend.sh mock                           # force deterministic mock (dev/offline)
 scripts/ai-backend.sh ollama                         # force the real local Ollama engine
 scripts/ai-backend.sh deepseek "$AMOS_API_KEY"       # DeepSeek cloud (api)
+scripts/ai-backend.sh openai  "$AMOS_API_KEY"        # OpenAI cloud preset (gpt-4o-mini)
+scripts/ai-backend.sh custom  "$AMOS_API_KEY"        # any OpenAI-compatible endpoint
+#   (custom: set AMOS_API_ENDPOINT to the full .../v1/chat/completions URL + AMOS_MODEL)
+scripts/ai-backend.sh anthropic "$ANTHROPIC_KEY"     # Claude (native Anthropic Messages)
+scripts/ai-backend.sh gemini    "$GEMINI_KEY"        # Google Gemini (native)
 scripts/ai-backend.sh                                # resume last persisted choice
 
 # Start the backends the UI needs (honors persisted choice); optionally gate on

@@ -160,9 +160,16 @@ fn creds_path() -> Option<std::path::PathBuf> {
 }
 
 /// One-click backend switch: runs `scripts/ai-backend.sh` which stops the current
-/// amos-ai and starts it with the selected provider (local mock | DeepSeek api).
+/// amos-ai and starts it with the selected provider (local Ollama | OpenAI |
+/// DeepSeek | custom OpenAI-compatible endpoint). `model`/`endpoint` carry the
+/// cloud preset so openai/deepseek/custom map onto the daemon's generic `api`.
 #[tauri::command]
-pub async fn ai_backend_switch(provider: String, api_key: String) -> Result<String, String> {
+pub async fn ai_backend_switch(
+    provider: String,
+    api_key: String,
+    model: Option<String>,
+    endpoint: Option<String>,
+) -> Result<String, String> {
     let root = repo_root();
     let script = root.join("scripts").join("ai-backend.sh");
     let script_s = script.display().to_string();
@@ -170,11 +177,15 @@ pub async fn ai_backend_switch(provider: String, api_key: String) -> Result<Stri
     let cred = creds_path();
 
     tauri::async_runtime::spawn_blocking(move || {
+        let provider_id = provider.trim().to_string();
+        // Any non-local/mock/ollama id is a cloud OpenAI-compatible backend.
+        let cloud = !matches!(provider_id.as_str(), "local" | "mock" | "ollama");
+
         // Resolve an effective key: caller-provided wins and is persisted;
         // otherwise fall back to the 0600 key file (so switching cloud later,
         // or resuming after a restart, needs no re-entry).
         let mut effective = api_key;
-        if provider == "deepseek" {
+        if cloud {
             if !effective.is_empty() {
                 if let Some(path) = cred.clone() {
                     if let Some(dir) = path.parent() {
@@ -191,13 +202,23 @@ pub async fn ai_backend_switch(provider: String, api_key: String) -> Result<Stri
             }
         }
 
-        let out = std::process::Command::new("bash")
-            .arg(&script_s)
-            .arg(&provider)
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&script_s)
+            .arg(&provider_id)
             .arg(&effective)
             .env("AMOS_ROOT", &root_s)
-            .env("AMOS_API_KEY", &effective)
-            .output();
+            .env("AMOS_API_KEY", &effective);
+        // Only hand through a real cloud model/endpoint so a preset default
+        // (resolved in ai-backend.sh) is used when the UI left them empty.
+        for (name, val) in [("AMOS_MODEL", model), ("AMOS_API_ENDPOINT", endpoint)] {
+            if let Some(v) = val {
+                let t = v.trim();
+                if !t.is_empty() {
+                    cmd.env(name, t);
+                }
+            }
+        }
+        let out = cmd.output();
         match out {
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout).to_string();

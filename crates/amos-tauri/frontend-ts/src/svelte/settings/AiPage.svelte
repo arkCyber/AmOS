@@ -1,14 +1,16 @@
 <script lang="ts">
   // AiPage.svelte — 「AI 与智能」sub page (the old AI-inference-backend group
-  // relocated). Lets the user pick local vs cloud (DeepSeek) and configure the
+  // relocated). Lets the user pick local Ollama vs a cloud OpenAI-compatible
+  // provider (OpenAI / DeepSeek / custom endpoint) and configure the
   // model/endpoint/API key; shows the live engine state via lib/aiEngine.
   import { readStoreValue, writeStoreValue } from "../../lib/amosStore";
   import { SETTINGS_KEY } from "../../lib/settings";
   import {
-    DEEPSEEK_ENDPOINT,
-    DEEPSEEK_MODEL,
+    cloudDefaultEndpoint,
+    cloudDefaultModel,
     readAiConfig,
     setAiConfig,
+    type AiConfig,
     type AiProviderId,
   } from "../../lib/providers";
   import { describeEngine, type EngineView } from "../../lib/aiEngine";
@@ -19,13 +21,18 @@
   const initialCfg = readAiConfig(readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {}));
   let aiEdits = $state({
     provider: initialCfg.provider as AiProviderId,
-    model: initialCfg.model ?? DEEPSEEK_MODEL,
-    endpoint: initialCfg.endpoint ?? DEEPSEEK_ENDPOINT,
+    model:
+      initialCfg.model ??
+      (initialCfg.provider !== "local" ? cloudDefaultModel(initialCfg.provider) : ""),
+    endpoint:
+      initialCfg.endpoint ??
+      (initialCfg.provider !== "local" ? cloudDefaultEndpoint(initialCfg.provider) : ""),
     apiKey: initialCfg.apiKey ?? "",
   });
   let aiMsg = $state("");
   let aiLive = $state<string | null>(null);
   let aiView = $state<EngineView>(describeEngine(null));
+  const isCloud = $derived(aiEdits.provider !== "local");
 
   $effect(() => {
     if (!bridged()) return;
@@ -35,13 +42,53 @@
       aiView = describeEngine(s);
     });
   });
-  const pickProvider = (p: AiProviderId) => (aiEdits.provider = p);
+  const pickProvider = (p: AiProviderId) => {
+    // A key is per-provider and lives only in transient UI state (never in
+    // settings). Switching to a *different* provider clears it so we never send
+    // one provider's key to another. A previously-saved cloud key still resumes
+    // via the 0600 file (~/.amos/ai.key) when that provider is re-applied.
+    if (aiEdits.provider !== p) aiEdits.apiKey = "";
+    aiEdits.provider = p;
+    if (p === "local") return;
+    // A preset owns its model + endpoint: adopt its defaults on switch so we
+    // never silently keep the previous provider's model/endpoint (e.g. an OpenAI
+    // URL sent to Claude). "custom" has no default → cleared, ready to fill.
+    aiEdits.model = cloudDefaultModel(p);
+    aiEdits.endpoint = cloudDefaultEndpoint(p);
+  };
+  const PROVIDERS: { id: AiProviderId; labelKey: string }[] = [
+    { id: "local", labelKey: "settings.aiLocal" },
+    { id: "openai", labelKey: "settings.aiOpenai" },
+    { id: "deepseek", labelKey: "settings.aiDeepseek" },
+    { id: "moonshot", labelKey: "settings.aiMoonshot" },
+    { id: "qwen", labelKey: "settings.aiQwen" },
+    { id: "zhipu", labelKey: "settings.aiZhipu" },
+    { id: "groq", labelKey: "settings.aiGroq" },
+    { id: "mistral", labelKey: "settings.aiMistral" },
+    { id: "anthropic", labelKey: "settings.aiAnthropic" },
+    { id: "gemini", labelKey: "settings.aiGemini" },
+    { id: "custom", labelKey: "settings.aiCustom" },
+  ];
   const saveAi = () => {
+    // A custom endpoint is required — don't silently send requests nowhere.
+    if (aiEdits.provider === "custom" && !aiEdits.endpoint.trim()) {
+      aiMsg = t("settings.aiCustomNeedsEndpoint");
+      return;
+    }
+    const cfg: AiConfig = {
+      provider: aiEdits.provider,
+      model: isCloud && aiEdits.model ? aiEdits.model : undefined,
+      endpoint: isCloud && aiEdits.endpoint ? aiEdits.endpoint : undefined,
+      apiKey: aiEdits.apiKey,
+    };
     const cur = readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {});
-    writeStoreValue(SETTINGS_KEY, setAiConfig(cur, aiEdits));
+    writeStoreValue(SETTINGS_KEY, setAiConfig(cur, cfg));
     if (bridged()) {
-      const provider = aiEdits.provider === "deepseek" ? "deepseek" : "local";
-      void switchAiBackend(provider, aiEdits.apiKey).then((report) => {
+      void switchAiBackend(cfg.provider, {
+        model: cfg.model,
+        endpoint: cfg.endpoint,
+        apiKey: cfg.apiKey,
+      }).then((report) => {
         aiMsg = report ? `${t("settings.aiApplied")}: ${report}` : t("settings.aiSaved");
         getAiStatus().then((s) => {
           const m = s?.model && s.model.trim() ? s.model : "offline";
@@ -58,35 +105,31 @@
 <section class={"p-4 " + GROUP}>
   <div class="flex items-center justify-between gap-2">
     <span class={LABEL}>{t("settings.aiBackend")}</span>
-    <div class="flex gap-1.5" role="group" aria-label={t("settings.aiBackend")}>
-      <button
-        onclick={() => pickProvider("local")}
-        aria-pressed={aiEdits.provider === "local"}
-        class={"rounded-full px-3 py-1.5 text-xs transition " +
-          (aiEdits.provider === "local"
-            ? "bg-accent text-white"
-            : "bg-black/5 text-neutral-600 dark:bg-white/10 dark:text-neutral-300")}
-      >
-        {t("settings.aiLocal")}
-      </button>
-      <button
-        onclick={() => pickProvider("deepseek")}
-        aria-pressed={aiEdits.provider === "deepseek"}
-        class={"rounded-full px-3 py-1.5 text-xs transition " +
-          (aiEdits.provider === "deepseek"
-            ? "bg-accent text-white"
-            : "bg-black/5 text-neutral-600 dark:bg-white/10 dark:text-neutral-300")}
-      >
-        {t("settings.aiCloud")}
-      </button>
+    <div class="flex flex-wrap gap-1.5" role="group" aria-label={t("settings.aiBackend")}>
+      {#each PROVIDERS as p (p.id)}
+        <button
+          onclick={() => pickProvider(p.id)}
+          aria-pressed={aiEdits.provider === p.id}
+          class={"rounded-full px-3 py-1.5 text-xs transition " +
+            (aiEdits.provider === p.id
+              ? "bg-accent text-white"
+              : "bg-black/5 text-neutral-600 dark:bg-white/10 dark:text-neutral-300")}
+        >
+          {t(p.labelKey)}
+        </button>
+      {/each}
     </div>
   </div>
-  {#if aiEdits.provider === "deepseek"}
+  {#if isCloud}
     <div class="mt-3 space-y-2">
       <span class="block text-[11px] opacity-60">{t("settings.aiModel")}</span>
-      <input bind:value={aiEdits.model} class={FIELD} />
+      <input bind:value={aiEdits.model} class={FIELD} placeholder={t("settings.aiModelPlaceholder")} />
       <span class="block text-[11px] opacity-60">{t("settings.aiEndpoint")}</span>
-      <input bind:value={aiEdits.endpoint} class={FIELD} />
+      <input
+        bind:value={aiEdits.endpoint}
+        class={FIELD}
+        placeholder={aiEdits.provider === "custom" ? t("settings.aiEndpointPlaceholder") : undefined}
+      />
       <span class="block text-[11px] opacity-60">{t("settings.aiKey")}</span>
       <input
         bind:value={aiEdits.apiKey}
@@ -95,6 +138,9 @@
         class={FIELD}
       />
       <p class="text-[11px] opacity-50">{t("settings.aiKeyHint")}</p>
+      {#if aiEdits.provider === "custom"}
+        <p class="text-[11px] opacity-50">{t("settings.aiCustomHint")}</p>
+      {/if}
     </div>
   {/if}
   <div class="mt-3 flex items-center justify-between gap-2">

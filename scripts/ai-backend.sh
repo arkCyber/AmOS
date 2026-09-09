@@ -4,7 +4,10 @@
 #   scripts/ai-backend.sh local            # prefer a real local Ollama; else mock
 #   scripts/ai-backend.sh ollama           # force the local Ollama engine
 #   scripts/ai-backend.sh mock             # force the deterministic mock (offline/dev)
-#   scripts/ai-backend.sh deepseek [API_KEY]
+#   scripts/ai-backend.sh deepseek [API_KEY]   # DeepSeek cloud (OpenAI-compatible api)
+#   scripts/ai-backend.sh openai  [API_KEY]   # OpenAI cloud preset
+#   scripts/ai-backend.sh custom  [API_KEY]   # any OpenAI-compatible endpoint
+#                                            #   (endpoint/model via AMOS_API_ENDPOINT / AMOS_MODEL)
 #
 # It stops the running amos-ai (pid file /tmp/amos-ai.pid), writes the chosen
 # config to /tmp/amos-ai-backend.json, and starts amos-ai again with the env the
@@ -34,19 +37,36 @@ api_key="${2:-${AMOS_API_KEY:-}}"
 if [ -z "$provider" ] && [ -f "$CFG" ]; then
   saved="$(sed -n 's/.*"provider":"\([a-z]*\)".*/\1/p' "$CFG" | head -1)"
   case "$saved" in
-    local|ollama|mock|deepseek) provider="$saved" ;;
-    *) provider=local ;;
+    '') provider=local ;;
+    *) provider="$saved" ;;   # local/ollama/mock, or any cloud provider id
   esac
+  # Restore a cloud provider's persisted endpoint/model so it resumes
+  # identically. Only non-empty values are exported — an empty endpoint must NOT
+  # override a provider's built-in default (e.g. native Claude/Gemini).
+  if [ -z "${AMOS_API_ENDPOINT:-}" ]; then
+    ep_saved="$(sed -n 's/.*"endpoint":"\([^"]*\)".*/\1/p' "$CFG" | head -1)"
+    [ -n "$ep_saved" ] && export AMOS_API_ENDPOINT="$ep_saved"
+  fi
+  if [ -z "${AMOS_MODEL:-}" ]; then
+    model_saved="$(sed -n 's/.*"model":"\([^"]*\)".*/\1/p' "$CFG" | head -1)"
+    [ -n "$model_saved" ] && export AMOS_MODEL="$model_saved"
+  fi
   echo "resuming last backend: $provider (from $CFG)"
 fi
 [ -n "$provider" ] || provider=local
 
 # Cloud key fallback: a persisted 0600 key file (written by the Tauri command).
+# Applies to any cloud provider (i.e. anything that isn't local/ollama/mock).
 CREDS="${AMOS_CRED_FILE:-$HOME/.amos/ai.key}"
-if [ "$provider" = deepseek ] && [ -z "$api_key" ] && [ -f "$CREDS" ]; then
-  api_key="$(tr -d '\r\n' < "$CREDS")"
-  [ -n "$api_key" ] && echo "using saved cloud key ($CREDS)"
-fi
+case "$provider" in
+  local|ollama|mock) ;;
+  *)
+    if [ -z "$api_key" ] && [ -f "$CREDS" ]; then
+      api_key="$(tr -d '\r\n' < "$CREDS")"
+      [ -n "$api_key" ] && echo "using saved cloud key ($CREDS)"
+    fi
+    ;;
+esac
 
 # Reachability probe for a local Ollama server (used by the `local` resolver).
 # Returns 0 when /api/tags answers within ~1 s; curls with no proxy so a stray
@@ -110,22 +130,36 @@ case "$provider" in
     ENVS=(env -u ALL_PROXY -u all_proxy AMOS_BACKEND=ollama AMOS_OLLAMA_HOST="$OLLAMA_HOST")
     ;;
 
-  deepseek)
-    MODEL="${DEEPSEEK_MODEL:-deepseek-chat}"
-    EP="${DEEPSEEK_ENDPOINT:-https://api.deepseek.com/v1/chat/completions}"
-    [ -n "$api_key" ] || { echo "error: deepseek requires an API key (arg or AMOS_API_KEY)" >&2; exit 1; }
-    printf '{"provider":"deepseek","model":"%s","endpoint":"%s"}' "$MODEL" "$EP" > "$CFG"
-    ENVS=(env -u ALL_PROXY -u all_proxy AMOS_BACKEND=api AMOS_API_ENDPOINT="$EP" AMOS_MODEL="$MODEL" AMOS_API_KEY="$api_key")
+  *)
+    # Cloud backends. OpenAI-compatible ones (openai / deepseek / … / custom) go
+    # to the generic `api` engine and need an endpoint; native Claude (`anthropic`)
+    # and Gemini have a dedicated daemon engine and use the official endpoint by
+    # default (only model + key are required).
+    case "$provider" in
+      openai)     backend="api"; DEF_EP="https://api.openai.com/v1/chat/completions"; DEF_MODEL="gpt-4o-mini" ;;
+      deepseek)   backend="api"; DEF_EP="https://api.deepseek.com/v1/chat/completions"; DEF_MODEL="deepseek-chat" ;;
+      anthropic)  backend="anthropic"; DEF_EP=""; DEF_MODEL="claude-3-5-sonnet-latest" ;;
+      gemini)     backend="gemini"; DEF_EP=""; DEF_MODEL="gemini-2.0-flash" ;;
+      *)          backend="api"; DEF_EP=""; DEF_MODEL="gpt-4o-mini" ;;
+    esac
+    EP="${AMOS_API_ENDPOINT:-$DEF_EP}"
+    MODEL="${AMOS_MODEL:-$DEF_MODEL}"
+    # Native engines (anthropic/gemini) default their endpoint; others require one.
+    if [ "$backend" != anthropic ] && [ "$backend" != gemini ] && [ -z "$EP" ]; then
+      echo "error: $provider requires an endpoint (set it in Settings, or AMOS_API_ENDPOINT)" >&2
+      exit 2
+    fi
+    [ -n "$api_key" ] || { echo "error: $provider requires an API key (arg or AMOS_API_KEY)" >&2; exit 1; }
+    printf '{"provider":"%s","backend":"%s","endpoint":"%s","model":"%s"}' \
+      "$provider" "$backend" "$EP" "$MODEL" > "$CFG"
+    ENVS=(env -u ALL_PROXY -u all_proxy AMOS_BACKEND="$backend" AMOS_MODEL="$MODEL" AMOS_API_KEY="$api_key")
+    # Only native engines leave the endpoint to their built-in default.
+    if [ -n "$EP" ]; then ENVS+=(AMOS_API_ENDPOINT="$EP"); fi
     # Persist the key (0600) so later switches/resumes need no re-entry.
     CREDS="${AMOS_CRED_FILE:-$HOME/.amos/ai.key}"
     mkdir -p "$(dirname "$CREDS")"
     printf '%s' "$api_key" > "$CREDS"
     chmod 600 "$CREDS"
-    ;;
-
-  *)
-    echo "usage: $0 local|ollama|mock|deepseek [API_KEY]" >&2
-    exit 2
     ;;
 esac
 
