@@ -32,6 +32,7 @@
     calcFontPx,
     calcFromKey,
     calcInit,
+    calcPendingOperator,
     calcPress,
     ERR,
   } from "../lib/calculator";
@@ -70,7 +71,12 @@
   });
 
   // --- Derived (recomputed when st/t change) ---
-  const big = $derived(st.cur === ERR ? t("calc.error") : st.cur);
+  // While an operator is awaiting its second operand show the operator itself
+  // (iOS-like) rather than the staged "0" the reducer keeps in `cur`.
+  const pendingOp = $derived(calcPendingOperator(st));
+  const big = $derived(
+    st.cur === ERR ? t("calc.error") : pendingOp ? pendingOp : st.cur,
+  );
   const operand = $derived(st.acc ? st.acc.trimEnd() : "");
   const isErr = $derived(st.cur === ERR);
   const clearGlyph = $derived(calcClearLabel(st));

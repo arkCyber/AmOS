@@ -6,12 +6,13 @@ export interface CalcState {
   acc: string; // accumulated "left operand + operator", e.g. "9 − "
   cur: string; // current operand being typed
   justEq: boolean; // last press was "=" → a fresh number starts next
+  justOp: boolean; // an operator was just pressed and no second operand typed yet
 }
 
 export const ERR = "ERR";
 
 export function calcInit(): CalcState {
-  return { acc: "", cur: "0", justEq: false };
+  return { acc: "", cur: "0", justEq: false, justOp: false };
 }
 
 /** Normalize iOS display symbols to ASCII math operators. */
@@ -103,13 +104,14 @@ function fmt(v: number): string {
 
 /** Apply one button press and return the next state (pure). */
 export function calcPress(st: CalcState, label: string): CalcState {
-  let { acc, cur, justEq } = st;
+  let { acc, cur, justEq, justOp } = st;
 
   // Aerospace-grade error policy: once ERR, the display is frozen — only "C"
   // clears it (no half-typed "ERR × …" garbage, no NaN leak).
   if (cur === ERR && label !== "C") return st;
 
   if (/[0-9]/.test(label)) {
+    justOp = false;
     if (justEq) {
       acc = "";
       cur = label;
@@ -118,6 +120,7 @@ export function calcPress(st: CalcState, label: string): CalcState {
       cur = cur === "0" ? label : cur + label;
     }
   } else if (label === ".") {
+    justOp = false;
     if (justEq) {
       acc = "";
       cur = "0.";
@@ -130,11 +133,13 @@ export function calcPress(st: CalcState, label: string): CalcState {
     // reducer stages right after an operator) is a no-op so "-0" never appears.
     if (cur !== "0" && cur !== "0.") {
       cur = cur.startsWith("-") ? cur.slice(1) : `-${cur}`;
+      justOp = false;
     }
   } else if (label === "C") {
     acc = "";
     cur = "0";
     justEq = false;
+    justOp = false;
   } else if (label === "⌫") {
     cur = cur.length > 1 ? cur.slice(0, -1) : "0";
   } else if (label === "%") {
@@ -143,6 +148,7 @@ export function calcPress(st: CalcState, label: string): CalcState {
     // (10 % of 50 = 5), "50 × 10 % =" → 250, "100 ÷ 4 % =" → 25. With no pending
     // op (standalone or right after "=") it is simply the current entry / 100,
     // so "5 % =" → 0.05. evalExpr is reused so negatives/decimals parse too.
+    justOp = false; // % yields a concrete value, not a pending operator
     try {
       if (acc) {
         const leftExpr = normalize(acc).replace(/\s*[+\-*/]\s*$/, ""); // strip trailing op
@@ -154,6 +160,7 @@ export function calcPress(st: CalcState, label: string): CalcState {
       cur = ERR;
     }
   } else if (label === "=") {
+    justOp = false;
     try {
       cur = fmt(evalNum(acc + cur));
     } catch {
@@ -164,18 +171,19 @@ export function calcPress(st: CalcState, label: string): CalcState {
   } else {
     // operator (＋ − × ÷); fold any pending operation, then stage this one
     justEq = false;
+    justOp = true; // awaiting the second operand — show the operator, not a "0"
     if (acc) {
       try {
         cur = fmt(evalNum(acc + cur));
       } catch {
         // hard error: freeze at ERR until cleared with C
-        return { acc: "", cur: ERR, justEq: false };
+        return { acc: "", cur: ERR, justEq: false, justOp: false };
       }
     }
     acc = `${cur} ${label} `;
     cur = "0";
   }
-  return { acc, cur, justEq };
+  return { acc, cur, justEq, justOp };
 }
 
 /** Text shown in the display for a state. */
@@ -191,6 +199,15 @@ export function calcDisplay(st: CalcState): string {
  * Both presses perform the same full clear in this reducer — only the label
  * differs, matching how iOS signals the reset scope.
  */
+/** The operator glyph that is awaiting its second operand, or "" otherwise.
+ * Used so the main display shows e.g. "+" right after pressing it — never the
+ * staged "0" that sits in `cur` until the next operand is typed. */
+export function calcPendingOperator(st: CalcState): string {
+  if (!st.justOp) return "";
+  const t = st.acc.trimEnd();
+  return t.length ? t.charAt(t.length - 1) : "";
+}
+
 export function calcClearLabel(st: CalcState): string {
   // Once ERR the only way out is a full clear (the reducer ignores every other
   // key), so it always reads "AC" — mirroring iOS after an error.

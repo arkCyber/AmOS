@@ -1,9 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { addHistory, calcClearLabel, calcDisplay, calcEntry, calcFontPx, calcFromKey, calcInit, calcPress, calcRun, ERR } from "../lib/calculator";
+import { addHistory, calcClearLabel, calcDisplay, calcEntry, calcFontPx, calcFromKey, calcInit, calcPendingOperator, calcPress, calcRun, ERR } from "../lib/calculator";
 
 describe("calculator", () => {
   test("adds 2 + 3 = 5", () => {
     expect(calcRun(["2", "+", "3", "="])).toBe("5");
+  });
+
+  test("after an operator the pending-operator glyph shows (not a staged 0)", () => {
+    let s = calcInit();
+    for (const k of ["2", "+"]) s = calcPress(s, k);
+    expect(calcPendingOperator(s)).toBe("+");
+    expect(s.cur).toBe("0"); // cur still stages 0 internally
+    // typing the second operand clears the pending-operator display
+    s = calcPress(s, "3");
+    expect(calcPendingOperator(s)).toBe("");
+    expect(s.cur).toBe("3");
+    s = calcPress(s, "=");
+    expect(s.cur).toBe("5");
   });
 
   test("supports − × ÷ (iOS symbols evaluate)", () => {
