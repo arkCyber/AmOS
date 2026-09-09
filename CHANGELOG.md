@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Notes 离线自给 + “AI 离线”提示（前端，2026-09-09）**：备忘录核心（新建/编辑/搜索/导入导出/归档等）本就纯本地、不依赖 AI；新增诚实的能力探测 `lib/aiAvailability.ts`（纯：`classifyAiAvailability` 判定 `offline|unknown|mock|real`，`aiIsUnavailable`）——Notes 后台探测一次 daemon `get_status`，AI 不可用（无 Tauri 桥/daemon 挂/mock/degraded）时在顶部显示一行“AI 离线·备忘录可正常用”的**非阻塞**提示（`data-testid=note-ai-offline`），真实引擎在线则隐藏；**绝不**因 AI 缺失阻塞/报错任何备忘录操作。i18n `note.aiOffline`（en/zh）。测试：纯 `aiAvailability.test.ts` **5 例**（offline/unknown/mock/real/degraded 全分支）；DOM `notes.svelte.test.ts` 扩至 **31 例**（新增：无桥时提示出现且仍能新建；桥接真实引擎时提示隐藏）——Svelte 组件套件 350/350、`tsc`/`svelte-check`/纯测试全绿。
+
+
 - **RAG 向量化后端扩展：Ollama `/api/embed` 支持 + 云端 embedding（`amos-ai`，2026-09-09）**：为“问我的笔记”的真实向量化补齐两条路径。(a) **本地 Ollama**：`OllamaEmbedder` 升级为先打新 `/api/embed`（复数响应 `{"embeddings":[[…]]}`）、404 时回退旧 `/api/embeddings`，并支持 `AMOS_OLLAMA_API_KEY` bearer（token 门控网关上也可用）；`rag_service` 的 `ollama` 分支附上该 bearer。(b) **云端**：新增 `ApiEmbedder`（任意 OpenAI 兼容 `/v1/embeddings`，`Authorization: Bearer`，body `{"model","input"}`→解析 `data[0].embedding`）；`AMOS_RAG_EMBEDDER=api` 选择，base 用 `AMOS_RAG_EMBED_BASE`（默认 OpenAI）、模型 `AMOS_RAG_EMBED_MODEL`（默认 text-embedding-3-small）、key 复用 `AMOS_API_KEY`。`Status.embedder` 标签诚实报 `mock|ollama|api`。验证：`amos-ai --lib` **212 passed**（+5：`/api/embed`/OpenAI 响应解析器、`ApiEmbedder`/`OllamaEmbedder` 对本地 mock HTTP 服务器的传输 round-trip + bearer 头断言），`clippy --all-targets -D warnings` 干净、fmt 清洁。诚实边界：本地/云端真实 embedding 均需对应可用的 key/可达端点（本机 Ollama 鉴权 401 阻断真实调用）；这些代码已把“升级到新接口/加云端”落地并本地 mock 验证，真实语义数值待有 key 实测（见 `docs/vector-db-rag.md`）。
 
 

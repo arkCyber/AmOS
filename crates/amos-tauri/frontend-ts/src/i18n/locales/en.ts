@@ -149,6 +149,7 @@ export const en: Record<MessageKey, string> = {
   "clock.repeatDaily": "Every day",
   "note.placeholder": "Write something…",
   "note.search": "Search notes…",
+  "note.aiOffline": "AI is offline — Notes is fully local and still works normally.",
   "note.add": "Save",
   "note.edit": "Edit",
   "note.pin": "Pin",

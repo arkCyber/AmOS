@@ -52,7 +52,12 @@
   import type { ClipboardEntry } from "../lib/clipboard";
   import { iconSvg } from "../lib/sysIcons";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
-  import { exportTxtFile } from "../lib/backend";
+  import { bridged, exportTxtFile, getAiStatus } from "../lib/backend";
+  import {
+    aiIsUnavailable,
+    classifyAiAvailability,
+    type AiAvailability,
+  } from "../lib/aiAvailability";
   import { t } from "./locale.svelte";
   import NoteEditor from "./NoteEditor.svelte";
   import { markdownTitleOf, parseMarkdownImport, toMarkdownFile } from "../lib/markdown";
@@ -82,6 +87,28 @@
   let editor = $state<Note | null>(null);
   // Notes preference: tap a collapsed row to open the full-page editor directly.
   let prefs = $state<NotesPrefs>(loadNotesPrefs());
+
+  // AI is NOT required for Notes to work — this is only an honest, non-blocking
+  // indicator. Probe once in the background; never gate note CRUD/search on it.
+  let aiAvail = $state<AiAvailability>(
+    classifyAiAvailability({ bridged: bridged(), status: null }),
+  );
+  let aiProbed = false;
+  $effect(() => {
+    if (aiProbed) return;
+    if (!bridged()) {
+      aiAvail = "offline"; // no Tauri shell -> no daemon/AI path
+      aiProbed = true;
+      return;
+    }
+    aiProbed = true;
+    getAiStatus().then((s) => {
+      // Daemon unreachable / no reply => treat as offline (never fake real).
+      aiAvail = s ? classifyAiAvailability({ bridged: true, status: s }) : "offline";
+    });
+  });
+  // Show the hint only when AI can't really serve (offline or mock); notes still work.
+  const aiOffline = $derived(aiIsUnavailable(aiAvail));
 
 
   const persist = (list: Note[]) => {
@@ -332,6 +359,11 @@
 </script>
 
 <div class="p-4">
+  {#if aiOffline}
+    <p role="status" data-testid="note-ai-offline" class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-[11px] text-neutral-500 dark:bg-white/10 dark:text-neutral-400">
+      {t("note.aiOffline")}
+    </p>
+  {/if}
   {#if editor}
     <NoteEditor note={editor} onClose={closeEditor} />
   {:else}

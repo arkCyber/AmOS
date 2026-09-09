@@ -12,6 +12,9 @@ import NotesApp from "../src/svelte/NotesApp.svelte";
 import { readStoreValue } from "../src/lib/amosStore";
 
 afterEach(cleanup);
+afterEach(() => {
+  delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+});
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const btnTrim = (h: { container: HTMLElement }, s: string) =>
@@ -591,6 +594,32 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     const marks = host.container.querySelectorAll("mark");
     expect(marks.length).toBeGreaterThanOrEqual(1);
     expect([...marks].some((m) => m.textContent === "转账")).toBe(true);
+  });
+
+  test("shows the AI-offline hint and Notes still work when no bridge/AI", async () => {
+    // No __TAURI_INTERNALS__ => not bridged => AI offline, but Notes is local.
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(host.container.querySelector('[data-testid="note-ai-offline"]')).toBeTruthy();
+
+    // Creating a memo still works while AI is offline (never blocked).
+    const ta = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(ta, { target: { value: "离线也能记" } });
+    await fireEvent.click(btnTrim(host, "保存")!);
+    expect(txt(host)).toContain("离线也能记");
+  });
+
+  test("hides the AI-offline hint when a real AI engine is bridged", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async () => ({ engine: "api", engine_model: "deepseek-chat", degraded: false }),
+      listen: async () => () => {},
+    };
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(host.container.querySelector('[data-testid="note-ai-offline"]')).toBeNull();
   });
 });
 
