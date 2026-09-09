@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Messages 本地多会话：可增删联系人多线程（前端，2026-09-09）**：把原来写死“单联系人小安”的本地聊天 UI 扩成**多联系人/多会话**——仍是本地离线演示，非真机 SMS（真机短信读取属后续 amos-sms，见 `docs/telephony.md`）。(a) `lib/messages.ts` 新增纯层 `Conversation`/`seedConversations`/`normalizeConversations`/`addConversation`/`removeConversation`/`findConversation`，存储键 `amos.messages.convs`。(b) `MessagesApp.svelte`：顶部会话条可切换线程、常驻“新建会话”输入行（填联系人即建空线程并选中）、每个线程独立收发/清空/删除（>1 才出现“删除会话”，删除后回落到剩余线程）；未读跨线程汇总为通知。测试：纯 `messages.test.ts` 扩至 **11 例**（新增 seed/normalize 垃圾容错与缺 id 回退/add 拒空拒重/remove）；Svelte DOM `messages.svelte.test.ts` 扩至 **6 例**（新增：新建联系人得空线程、线程间消息隔离、>1 时删除会话回落）。验证：Svelte 套件 **56 文件 / 354 全绿**、纯套件 `[bun-iso] test OK`、`tsc`/`svelte-check` 0 错 0 警、dist 重建。
+
+
 - **Notes 离线自给 + “AI 离线”提示（前端，2026-09-09）**：备忘录核心（新建/编辑/搜索/导入导出/归档等）本就纯本地、不依赖 AI；新增诚实的能力探测 `lib/aiAvailability.ts`（纯：`classifyAiAvailability` 判定 `offline|unknown|mock|real`，`aiIsUnavailable`）——Notes 后台探测一次 daemon `get_status`，AI 不可用（无 Tauri 桥/daemon 挂/mock/degraded）时在顶部显示一行“AI 离线·备忘录可正常用”的**非阻塞**提示（`data-testid=note-ai-offline`），真实引擎在线则隐藏；**绝不**因 AI 缺失阻塞/报错任何备忘录操作。i18n `note.aiOffline`（en/zh）。测试：纯 `aiAvailability.test.ts` **5 例**（offline/unknown/mock/real/degraded 全分支）；DOM `notes.svelte.test.ts` 扩至 **31 例**（新增：无桥时提示出现且仍能新建；桥接真实引擎时提示隐藏）——Svelte 组件套件 350/350、`tsc`/`svelte-check`/纯测试全绿。
 
 

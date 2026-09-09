@@ -8,6 +8,16 @@
 import { describe, expect, test } from "vitest";
 import { fireEvent, render } from "@testing-library/svelte";
 import MessagesApp from "../src/svelte/MessagesApp.svelte";
+import { writeStoreValue } from "../src/lib/amosStore";
+import { CONV_KEY, seedConversations } from "../src/lib/messages";
+import { beforeEach } from "vitest";
+import { tick } from "svelte";
+
+// Each test starts from a fresh, single seeded 小安 conversation (the Messages
+// screen persists to the shared store, which is not reset between tests).
+beforeEach(() => {
+  writeStoreValue(CONV_KEY, seedConversations(Date.now()));
+});
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const input = (h: { container: HTMLElement }) =>
@@ -44,5 +54,59 @@ describe("MessagesApp.svelte", () => {
     expect(clearBtn).toBeTruthy();
     await fireEvent.click(clearBtn as HTMLButtonElement);
     expect(txt(host)).toContain("暂无消息");
+  });
+
+  test("adding a new contact opens an empty thread and switches to it", async () => {
+    const host = render(MessagesApp);
+    const ni = host.container.querySelector('input[aria-label="new-contact"]') as HTMLInputElement | null;
+    expect(ni).toBeTruthy();
+    await fireEvent.input(ni as HTMLInputElement, { target: { value: "李四" } });
+    const addBtn = host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement | null;
+    expect(addBtn).toBeTruthy();
+    await fireEvent.click(addBtn as HTMLButtonElement);
+    await tick();
+    // new empty thread becomes active
+    expect(txt(host)).toContain("李四");
+    expect(txt(host)).toContain("暂无消息");
+  });
+
+  test("each thread keeps its own messages (send stays in the active one)", async () => {
+    const host = render(MessagesApp);
+    // add 李四 (the new-contact row is always visible)
+    const ni = host.container.querySelector('input[aria-label="new-contact"]') as HTMLInputElement;
+    await fireEvent.input(ni, { target: { value: "李四" } });
+    await fireEvent.click(host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement);
+    await tick();
+    // send a message to 李四
+    const msgIn = host.container.querySelector('input[aria-label="message-input"]') as HTMLInputElement;
+    await fireEvent.input(msgIn, { target: { value: "给李四的私信" } });
+    const sendBtn = host.container.querySelector('button[aria-label="send"]') as HTMLButtonElement;
+    await fireEvent.click(sendBtn);
+    await tick();
+    expect(txt(host)).toContain("给李四的私信");
+    // switch back to 小安 chip → that message must not leak
+    const xiaoanChip = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").trim().startsWith("小安"),
+    ) as HTMLButtonElement;
+    expect(xiaoanChip).toBeTruthy();
+    await fireEvent.click(xiaoanChip);
+    await tick();
+    expect(txt(host)).not.toContain("给李四的私信");
+  });
+
+  test("deleting a thread (only when >1) removes it and selects another", async () => {
+    const host = render(MessagesApp);
+    // only one thread → no delete button yet
+    expect(host.container.querySelector('button[aria-label="delete-thread"]')).toBeNull();
+    const ni = host.container.querySelector('input[aria-label="new-contact"]') as HTMLInputElement;
+    await fireEvent.input(ni, { target: { value: "王五" } });
+    await fireEvent.click(host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement);
+    await tick();
+    expect(host.container.querySelector('button[aria-label="delete-thread"]')).toBeTruthy();
+    await fireEvent.click(host.container.querySelector('button[aria-label="delete-thread"]') as HTMLButtonElement);
+    await tick();
+    // falls back to the remaining 小安 thread
+    expect(txt(host)).toContain("小安");
+    expect(txt(host)).not.toContain("王五");
   });
 });

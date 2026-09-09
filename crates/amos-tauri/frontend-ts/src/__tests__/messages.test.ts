@@ -15,6 +15,11 @@ import {
   unreadCount,
   markRead,
   markAllRead,
+  seedConversations,
+  normalizeConversations,
+  addConversation,
+  removeConversation,
+  findConversation,
 } from "../lib/messages";
 
 const day = (y: number, mo: number, d: number, h = 12) =>
@@ -109,5 +114,46 @@ describe("messages", () => {
     expect(MSG_KEY).toBe("amos.messages");
     expect(MESSAGE_CAP).toBeGreaterThan(0);
     expect(MESSAGE_CAP).toBe(200);
+  });
+
+  test("seedConversations starts one 小安 thread with seeded messages", () => {
+    const c = seedConversations(1234);
+    expect(c.length).toBe(1);
+    const c0 = c[0]!;
+    expect(c0.name).toBe("小安");
+    expect(c0.msgs.length).toBeGreaterThan(0);
+  });
+
+  test("normalizeConversations guards garbage and coerces", () => {
+    expect(normalizeConversations(null)).toEqual([]);
+    expect(
+      normalizeConversations([
+        { id: "a", name: " 李四 ", msgs: [{ from: "them", text: "hi", ts: 1 }] },
+      ]),
+    ).toEqual([{ id: "a", name: "李四", msgs: [{ from: "them", text: "hi", ts: 1 }] }]);
+    // missing/invalid name or non-object → skipped
+    expect(normalizeConversations([{ id: "x", msgs: [] }, "junk", 5])).toEqual([]);
+    // missing id → derived from name
+    const d = normalizeConversations([{ name: "王五", msgs: [] }]);
+    expect(d[0]!.id).toBe("c:王五");
+  });
+
+  test("addConversation adds once and refuses blank/duplicate", () => {
+    let c = seedConversations(1);
+    const n1 = addConversation(c, " 李四 ", 2);
+    expect(n1.length).toBe(2);
+    // duplicate (same name) and blank → unchanged
+    expect(addConversation(n1, "李四", 3).length).toBe(2);
+    expect(addConversation(n1, "   ", 3).length).toBe(2);
+    const addedConv = n1[1]!;
+    expect(findConversation(n1, addedConv.id)?.name).toBe("李四");
+  });
+
+  test("removeConversation drops by id (absent → unchanged)", () => {
+    const withLi = addConversation(seedConversations(1), "李四", 2);
+    const id = withLi[1]!.id;
+    const gone = removeConversation(withLi, id);
+    expect(gone.length).toBe(1);
+    expect(removeConversation(withLi, "nope").length).toBe(2);
   });
 });

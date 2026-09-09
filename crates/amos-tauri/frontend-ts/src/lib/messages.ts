@@ -119,3 +119,59 @@ export function markAllRead(list: Msg[]): Msg[] {
   if (!unreadCount(list)) return list;
   return list.map((m) => (m.from === "them" ? { ...m, read: true } : m));
 }
+
+/**
+ * A local conversation thread: one contact (or group label) plus its message
+ * list. This is the offline, local-demo model of the Messages screen — NOT a
+ * real SMS reader. A future `amos-sms` provider would feed these from the
+ * device inbox; the UI/domain below does not claim to (see docs/telephony.md).
+ */
+export interface Conversation {
+  /** Stable id (persisted). */
+  id: string;
+  /** Display name of the other party, e.g. "小安". */
+  name: string;
+  msgs: Msg[];
+}
+
+/** Store key holding the ordered conversation list. */
+export const CONV_KEY = "amos.messages.convs";
+
+/** Fresh demo: one seeded thread with "小安" (kept for back-compat of the UI). */
+export function seedConversations(now: number): Conversation[] {
+  return [{ id: "c:xiaoan", name: "小安", msgs: seedMessages(now) }];
+}
+
+/** Find a conversation by its stable id; `null` when absent. */
+export function findConversation(convs: readonly Conversation[], id: string): Conversation | null {
+  return convs.find((c) => c.id === id) ?? null;
+}
+
+/** Corruption / back-compat guard for the stored conversation list. */
+export function normalizeConversations(v: unknown): Conversation[] {
+  if (!Array.isArray(v)) return [];
+  const out: Conversation[] = [];
+  for (const raw of v) {
+    if (!raw || typeof raw !== "object") continue;
+    const o = raw as Record<string, unknown>;
+    const name = typeof o.name === "string" ? o.name.trim() : "";
+    if (!name) continue;
+    const id = typeof o.id === "string" && o.id ? o.id : `c:${name}`;
+    out.push({ id, name, msgs: normalizeMessages(o.msgs) });
+  }
+  return out;
+}
+
+/** Add a conversation for `name` (blank/duplicate → unchanged). Returns a new list. */
+export function addConversation(convs: Conversation[], name: string, now: number): Conversation[] {
+  const n = name.trim();
+  if (!n) return convs;
+  const dup = convs.some((c) => c.name.toLowerCase() === n.toLowerCase());
+  if (dup) return convs;
+  return [...convs, { id: `c:${n}-${now}`, name: n, msgs: [] }];
+}
+
+/** Remove the conversation with `id` (absent → unchanged). Returns a new list. */
+export function removeConversation(convs: Conversation[], id: string): Conversation[] {
+  return convs.filter((c) => c.id !== id);
+}
