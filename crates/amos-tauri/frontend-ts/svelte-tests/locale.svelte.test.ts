@@ -7,7 +7,7 @@
  */
 import { afterEach, describe, expect, test } from "vitest";
 import { setLocale, locale, t, setLocaleSafe } from "../src/svelte/locale.svelte";
-import { LOCALE_KEY } from "../src/i18n";
+import { LOCALE_KEY } from "../src/svelte/i18n";
 
 afterEach(() => {
   setLocale("zh");

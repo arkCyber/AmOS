@@ -1,5 +1,5 @@
 import { describe, expect, test, mock } from "bun:test";
-import { applyDarkClass, isThemeMode, resolveDark } from "../theme";
+import { applyDarkClass, isThemeMode, resolveDark } from "../lib/themeCore";
 
 describe("theme", () => {
   test("resolveDark honours explicit light/dark and OS auto", () => {

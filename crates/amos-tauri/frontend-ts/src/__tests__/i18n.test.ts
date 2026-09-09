@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
-import { translate } from "../i18n";
+import { translate } from "../svelte/i18n";
 import { zh } from "../i18n/locales/zh";
 import { en } from "../i18n/locales/en";
 import { isLocale } from "../i18n/types";

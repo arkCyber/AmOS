@@ -9,7 +9,7 @@ import {
   toSpyHit,
   type SpyHitPayload,
 } from "../lib/telemetrySpy";
-import { translate } from "../i18n";
+import { translate } from "../svelte/i18n";
 import { zh } from "../i18n/locales/zh";
 import { en } from "../i18n/locales/en";
 
