@@ -36,6 +36,7 @@ members = [
     "crates/amos-web3",
     "crates/amos-identity",
     "crates/amos-pdf-parser",
+    "crates/amos-vector-db",
 ]
 
 [workspace.package]

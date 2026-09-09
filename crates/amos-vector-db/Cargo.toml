@@ -1,0 +1,22 @@
+[package]
+name = "amos-vector-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AmOS offline local vector-retrieval infrastructure: a deterministic, pure-Rust flat (ANN-free) index with dimension-checked, finite-only vectors, deterministic top-k, versioned snapshots — plus a transport-agnostic embedder seam (Mock on host; the Ollama /api/embeddings adapter lives in the amos-ai daemon crate). This is the index/retrieve half of the #7 'RAG / local retrieval' gap (amos-pdf-parser is the extract half). Pure-Rust on serde; compiles for host and Android. Design: docs/vector-db-rag.md."
+
+[lib]
+name = "amos_vector_db"
+path = "src/lib.rs"
+
+[dependencies]
+# Snapshot serialisation (index state -> versioned bytes). Pure Rust, no C, so
+# this crate stays host + aarch64-linux-android cross-compilable with no NDK
+# linker (mirrors amos-pdf-parser's lean profile).
+serde.workspace = true
+serde_json = "1.0"
+
+[[example]]
+name = "bench_arm"
+path = "examples/bench_arm.rs"
