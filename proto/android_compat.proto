@@ -91,11 +91,24 @@ enum ActivityEvent {
   ACTIVITY_EVENT_PAUSE = 2;   // lost focus but still visible (split/overlay)
   ACTIVITY_EVENT_STOP = 3;    // hidden -> background tier
   ACTIVITY_EVENT_DESTROY = 4; // task/surface torn down
+  // An activity entered the live task (onStart / first observation). In the
+  // per-activity model this registers the activity as *alive* so a task is kept
+  // until its last activity is destroyed — without demoting an existing top.
+  ACTIVITY_EVENT_STARTED = 5;
 }
 
 message ActivityEventRequest {
   string package_name = 1;
   ActivityEvent event = 2;
+  // Opaque per-activity identity of the emitting activity within the task
+  // (e.g. its `ComponentName`+instance or a monotonically-assigned token). When
+  // present and consistent, the LMK-proxy folds per-activity lifecycles: a task
+  // (container process) is kept alive while >=1 activity lives, and is only torn
+  // down on the Destroy of its LAST activity — so finishing a stacked/sub
+  // activity doesn't kill the whole app. Absent (empty) → legacy whole-task
+  // semantics (a Destroy always tears the task down); the real container adapter
+  // that can name activities is what fills this (docs/lmk-proxy.md).
+  string activity_id = 3;
 }
 
 message ActivityEventResponse {

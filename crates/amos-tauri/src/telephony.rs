@@ -208,15 +208,19 @@ async fn watch_round(app: AppHandle) -> Result<(), String> {
 }
 
 /// Background task forwarding the daemon telephony `Watch` stream to the WebView for
-/// the lifetime of the app. Reconnects with bounded backoff so a late-starting (or
-/// restarted) daemon is picked up without a full UI reload.
+/// the lifetime of the app. Reconnects with the shared bounded backoff
+/// ([`crate::watch_backoff`]) so a late-starting (or restarted) daemon is picked
+/// up without a full UI reload.
 pub fn spawn_telephony_watch(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut backoff_ms: u64 = 500;
+        use crate::watch_backoff::{next_backoff_ms, WATCH_BACKOFF_BASE_MS};
+        let mut backoff_ms: u64 = WATCH_BACKOFF_BASE_MS;
         loop {
-            let _ = watch_round(app.clone()).await;
+            // `Ok` means the round opened a live stream (daemon reachable) before
+            // it ended — reset the backoff so the next reconnect is immediate.
+            let connected = watch_round(app.clone()).await.is_ok();
+            backoff_ms = next_backoff_ms(backoff_ms, connected);
             sleep(Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(8000);
         }
     });
 }

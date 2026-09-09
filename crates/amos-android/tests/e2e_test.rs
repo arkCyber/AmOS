@@ -124,6 +124,7 @@ async fn android_manager_rpc_over_uds() {
         .on_activity(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         })
         .await
         .expect("on_activity")

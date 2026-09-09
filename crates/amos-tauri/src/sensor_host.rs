@@ -5,18 +5,26 @@
 //! APK* (it owns the `Context`), not from the headless `amos-ai` daemon. This
 //! module is that host surface: a [`SensorHost`] holding an
 //! `amos_sensor::LiveSensorProvider` stream bus under a `SensorManager` energy
-//! policy. On-device glue (a `SensorEventListener` + `Camera2`/`ImageReader`,
-//! landed next round) pushes each new sample/frame in via
-//! [`SensorHost::record_imu`] / [`SensorHost::record_frame`]; the Tauri commands
-//! below let the WebView read a snapshot, set the energy mode and drive the same
-//! bus for host/dev bring-up.
+//! policy. On-device glue (a `SensorEventListener` + `Camera2`/`ImageReader`)
+//! pushes each new sample/frame in via the shared bus; the Tauri commands below
+//! let the WebView read a snapshot, set the energy mode and drive the same bus
+//! for host/dev bring-up.
+//!
+//! In addition to pull reads ([`SensorHost::snapshot`]) the host is a **real-time
+//! push source**: it subscribes to the stream bus's [`StreamChange`] so that every
+//! accepted IMU sample / camera frame — from the WebView `record_*` commands, the
+//! on-device `android_glue` or a host feeder — is fanned out through an installed
+//! notifier. The app wires that notifier to a Tauri `emit(SENSOR_DATA_EVENT, …)`,
+//! so the System UI updates a live sensor view without polling (mirroring
+//! `telephony-event` / `telemetry-spy-hit` / `clipboard-changed`).
 //!
 //! ```text
 //! [ Android glue / host dev ]   [ WebView sensor_host commands ]
-//!    record_imu/record_frame          sensor_host_snapshot …
-//!            │                                  ▲
-//!            ▼                                  │
-//!      SensorHost { bus: LiveSensorProvider · manager: SensorManager }
+//!    record_imu/record_frame          sensor_host_snapshot …     ◄── subscribe(SENSOR_DATA_EVENT)
+//!            │                                  ▲                          │
+//!            ▼            StreamChange          │        SensorHostEvent    │
+//!      LiveSensorProvider ───────────────► SensorHost ──────────────────────┘
+//!      (shared stream bus)                (notifier → Tauri emit)
 //! ```
 //!
 //! Everything is `SensorManager`-free to unit-test: the domain types come from
@@ -25,11 +33,11 @@
 //! [`SensorHost::bind_android`], which attaches the real `AndroidSensorProvider`
 //! (GNSS via `LocationManager`) to this host — mirroring `radio::from_android`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use amos_sensor::{
-    CameraConfig, CameraId, ImuSample, LiveSensorProvider, PixelFormat, Resolution, SensorKind,
-    SensorManager, SensorMode, SensorProvider, Vec3,
+    CameraConfig, CameraFrame, CameraId, ImuSample, LiveSensorProvider, PixelFormat, Resolution,
+    SensorKind, SensorManager, SensorMode, SensorProvider, StreamChange, Vec3,
 };
 use serde::Serialize;
 use tauri::State;
@@ -97,6 +105,156 @@ pub struct HostGnss {
     pub accuracy_m: f64,
 }
 
+/// The Tauri event the System UI broadcasts to the WebView (via
+/// [`SensorHostEvent`]) whenever a producer records a new IMU sample / camera
+/// frame on the sensor bus, the energy mode changes, or the glue clears samples.
+/// Flat + defensive-shape friendly so the frontend can `listen` without polling.
+pub const SENSOR_DATA_EVENT: &str = "sensor-data";
+
+/// Metadata of the newest camera frame. The frame payload bytes are intentionally
+/// *never* put on the UI event bus — they stay in the media plane (the event only
+/// tells the UI a new preview frame is ready, at what size/format/sequence).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct HostFrameMeta {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub seq: u64,
+}
+
+impl From<&CameraFrame> for HostFrameMeta {
+    fn from(f: &CameraFrame) -> Self {
+        Self {
+            id: f.camera.0,
+            width: f.resolution.width,
+            height: f.resolution.height,
+            format: pixel_format_str(f.format).to_string(),
+            seq: f.seq,
+        }
+    }
+}
+
+/// One real-time sensor change, serialized for the WebView. Exactly one of `imu`
+/// / `frame` is set for `kind` `"imu"` / `"camera_frame"`; `"mode"` carries
+/// `prev_mode`; `"cleared"` carries no family payload.
+#[derive(Clone, Debug, Serialize)]
+pub struct SensorHostEvent {
+    /// Wall-clock milliseconds (UTC) when the change landed.
+    pub ts_ms: u64,
+    /// `"imu"` | `"camera_frame"` | `"mode"` | `"cleared"`.
+    pub kind: String,
+    /// Backend label the sample came from (`"live"`, or `"android"` once bound).
+    pub backend: String,
+    /// The energy mode in effect for this event.
+    pub mode: String,
+    /// Set when `kind == "imu"`.
+    pub imu: Option<HostImu>,
+    /// Set when `kind == "camera_frame"` (metadata only).
+    pub frame: Option<HostFrameMeta>,
+    /// Set when `kind == "mode"` — the mode we left.
+    pub prev_mode: Option<String>,
+}
+
+fn pixel_format_str(f: PixelFormat) -> &'static str {
+    match f {
+        PixelFormat::Rgba8 => "rgba8",
+        PixelFormat::Nv21 => "nv21",
+    }
+}
+
+/// A broadcaster invoked with each [`SensorHostEvent`]; installed by the app and
+/// testable by swapping in a collector.
+pub(crate) type SensorNotifier = Arc<dyn Fn(SensorHostEvent) + Send + Sync>;
+
+/// Shared notifier cell: the bus observer and `set_mode` both fire into it; the
+/// app installs a broadcaster (`Tauri emit`) via [`SensorHost::set_notifier`].
+struct EventSink {
+    inner: Mutex<Option<SensorNotifier>>,
+}
+
+impl EventSink {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Install (replace) the effective broadcaster.
+    fn set(&self, f: SensorNotifier) {
+        *self.inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+    }
+
+    /// Fire `event` into the installed broadcaster, if any (a quiet no-op before
+    /// boot installs one — never a fabricated sample).
+    fn fire(&self, event: SensorHostEvent) {
+        let f = self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(f) = f {
+            f(event);
+        }
+    }
+}
+
+/// **On-device GNSS provider** (feature `android`): built exactly once from the
+/// app `Context` the Kotlin `SensorGlue.attachContext(...)` upcall hands over, so
+/// `SensorHost`'s snapshot reflects the real `LocationManager` fix. Mirrors
+/// `flashlight::device`'s once-per-attach provider static; kept Tauri-free so host
+/// builds stay light.
+#[cfg(feature = "android")]
+mod android_ctx {
+    use std::sync::{Arc, OnceLock};
+
+    /// The real GNSS provider installed once at device attach (exactly-once).
+    static PROV: OnceLock<Arc<amos_sensor::AndroidSensorProvider>> = OnceLock::new();
+
+    /// Build + store the provider from the Kotlin-supplied `Context`. Idempotent:
+    /// first attach wins; `env` is only used to create the provider's global ref.
+    pub fn bind(
+        vm: jni::JavaVM,
+        env: &jni::JNIEnv<'_>,
+        context: jni::objects::JObject<'_>,
+    ) -> Result<(), String> {
+        let provider =
+            amos_sensor::AndroidSensorProvider::new(vm, env, context).map_err(|e| e.to_string())?;
+        PROV.set(Arc::new(provider))
+            .map_err(|_| "sensor provider is already bound".to_string())
+    }
+
+    /// The installed provider (`None` before Kotlin attaches). Returns a clone of
+    /// the shared `Arc`, so the caller can hand it to `SensorHost` to own.
+    pub fn provider() -> Option<Arc<amos_sensor::AndroidSensorProvider>> {
+        PROV.get().cloned()
+    }
+}
+
+/// JNI entry: `SensorGlue.attachContext(Context)` — an instance `external fun` on
+/// the Kotlin `object SensorGlue` — hands the app `Context` to Rust so the host
+/// can build the real GNSS provider (`LocationManager`) lazily on first read.
+///
+/// # Safety
+/// `env`/`context` are the JVM-supplied arguments of this native call and are live
+/// for its duration; `context` is promoted to a global ref here.
+#[cfg(feature = "android")]
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_amos_ai_glue_SensorGlue_attachContext(
+    env: *mut jni::sys::JNIEnv,
+    _this: jni::sys::jobject,
+    context: jni::sys::jobject,
+) {
+    if env.is_null() || context.is_null() {
+        return;
+    }
+    // SAFETY: `env` is the JVM-supplied JNIEnv* for this native call.
+    let env = unsafe { jni::JNIEnv::from_raw(env) };
+    // SAFETY: `context` is a live local ref for the duration of this native call.
+    let ctx = unsafe { jni::objects::JObject::from_raw(context) };
+    if let Ok(env) = env {
+        if let Ok(vm) = env.get_java_vm() {
+            let _ = android_ctx::bind(vm, &env, ctx);
+        }
+    }
+}
+
 /// One read of the whole System-UI sensor host.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct SensorHostSnapshot {
@@ -121,8 +279,10 @@ pub struct StreamGate {
 /// a [`SensorManager`] energy policy. Producers (device glue or host/dev) push the
 /// newest camera frame / IMU sample; reads return the latest value, gated by mode.
 pub struct SensorHost {
-    manager: SensorManager,
+    manager: Arc<SensorManager>,
     bus: Arc<LiveSensorProvider>,
+    /// Real-time broadcaster (see [`SensorHostEvent`]).
+    sink: Arc<EventSink>,
     /// When bound on Android (`bind_android`), a real `AndroidSensorProvider`
     /// whose synchronous `LocationManager` GNSS read feeds the snapshot's `gnss`.
     #[cfg(feature = "android")]
@@ -134,22 +294,99 @@ impl SensorHost {
     /// [`Self::set_cameras`] then [`Self::record_imu`] / [`Self::record_frame`].
     pub fn new() -> Self {
         let bus = Arc::new(LiveSensorProvider::new(Vec::new(), 0));
-        let manager = SensorManager::new(bus.clone(), SensorMode::Balanced);
-        Self::build(manager, bus)
+        let manager = Arc::new(SensorManager::new(bus.clone(), SensorMode::Balanced));
+        let sink = Arc::new(EventSink::new());
+        let host = Self::build(Arc::clone(&manager), Arc::clone(&bus), Arc::clone(&sink));
+        // Observe the shared bus so *every* producer — a WebView `record_*`
+        // command, the on-device `android_glue`, a host feeder — that pushes a new
+        // sample into the same bus this host reads also fans out to the notifier.
+        host.wire_bus_observer();
+        host
+    }
+
+    /// Register a handler translating each accepted [`StreamChange`] on the shared
+    /// bus into a [`SensorHostEvent`] and firing it into the installed notifier
+    /// (attaching the current mode + backend label for context). Called once from
+    /// [`Self::new`]. The observer holds a `Weak` to the manager so it never forms
+    /// a reference cycle with the host.
+    fn wire_bus_observer(&self) {
+        let sink = Arc::clone(&self.sink);
+        let manager = Arc::downgrade(&self.manager);
+        self.bus.subscribe(Arc::new(move |change: &StreamChange| {
+            let Some(mgr) = manager.upgrade() else {
+                return; // host is gone → nothing to notify
+            };
+            let ts_ms = now_ms();
+            let mode = mgr.mode().key().to_string();
+            let backend = mgr.provider_name().to_string();
+            let event = match change {
+                StreamChange::Imu(s) => SensorHostEvent {
+                    ts_ms,
+                    kind: "imu".to_string(),
+                    backend,
+                    mode,
+                    imu: Some(HostImu::from(*s)),
+                    frame: None,
+                    prev_mode: None,
+                },
+                StreamChange::Frame(f) => SensorHostEvent {
+                    ts_ms,
+                    kind: "camera_frame".to_string(),
+                    backend,
+                    mode,
+                    imu: None,
+                    frame: Some(HostFrameMeta::from(f)),
+                    prev_mode: None,
+                },
+                StreamChange::Cleared => SensorHostEvent {
+                    ts_ms,
+                    kind: "cleared".to_string(),
+                    backend,
+                    mode,
+                    imu: None,
+                    frame: None,
+                    prev_mode: None,
+                },
+            };
+            sink.fire(event);
+        }));
+    }
+
+    /// Install (replace) the real-time broadcaster invoked on every sensor change
+    /// (accepted IMU / camera frame, energy-mode switch, sample clear). The app
+    /// wires this to a Tauri `emit(SENSOR_DATA_EVENT, …)` at boot; until then each
+    /// fire is a quiet no-op (never a fabricated event).
+    pub fn set_notifier(&self, notifier: SensorNotifier) {
+        self.sink.set(notifier);
+    }
+
+    /// Fire an app-level event directly (used for mode changes, which the stream
+    /// bus itself does not observe).
+    fn fire(&self, event: SensorHostEvent) {
+        self.sink.fire(event);
     }
 
     #[cfg(feature = "android")]
-    fn build(manager: SensorManager, bus: Arc<LiveSensorProvider>) -> Self {
+    fn build(
+        manager: Arc<SensorManager>,
+        bus: Arc<LiveSensorProvider>,
+        sink: Arc<EventSink>,
+    ) -> Self {
         Self {
             manager,
             bus,
+            sink,
             gnss: std::sync::Mutex::new(None),
         }
     }
 
     #[cfg(not(feature = "android"))]
-    fn build(manager: SensorManager, bus: Arc<LiveSensorProvider>) -> Self {
-        Self { manager, bus }
+    fn build(
+        manager: Arc<SensorManager>,
+        bus: Arc<LiveSensorProvider>,
+        sink: Arc<EventSink>,
+    ) -> Self {
+        Self { manager, bus, sink }
     }
 
     /// Backend label for logs / UI ("live" on this host).
@@ -175,8 +412,22 @@ impl SensorHost {
     }
 
     /// Switch the energy mode (battery-saver → PowerSave throttling of streams).
+    /// Fires a `"mode"` broadcast only when the mode actually changes.
     pub fn set_mode(&self, mode: SensorMode) {
+        let prev = self.manager.mode();
+        if prev == mode {
+            return;
+        }
         self.manager.set_mode(mode);
+        self.fire(SensorHostEvent {
+            ts_ms: now_ms(),
+            kind: "mode".to_string(),
+            backend: self.manager.provider_name().to_string(),
+            mode: mode.key().to_string(),
+            imu: None,
+            frame: None,
+            prev_mode: Some(prev.key().to_string()),
+        });
     }
 
     /// Push the newest IMU sample from `[x,y,z]` accel/gyro (WebView / host friendly).
@@ -299,6 +550,10 @@ impl SensorHost {
 
     #[cfg(feature = "android")]
     fn read_gnss(&self) -> Option<HostGnss> {
+        // First read on device lazily builds the real LocationManager provider from
+        // the Kotlin-handled Context (`SensorGlue.attachContext`), so GNSS reflects
+        // the true fix without an explicit boot ordering.
+        self.ensure_gnss();
         let guard = self.gnss.lock().unwrap_or_else(|p| p.into_inner());
         let provider = guard.as_ref()?;
         let enabled = provider.gnss_enabled();
@@ -310,6 +565,28 @@ impl SensorHost {
             longitude_deg: fix.map(|f| f.longitude_deg).unwrap_or(0.0),
             accuracy_m: fix.map(|f| f.horizontal_accuracy_m).unwrap_or(0.0),
         })
+    }
+
+    /// If a Kotlin context has been attached but the real provider is not built yet,
+    /// build it once and store it. No-op when already bound / context not present.
+    #[cfg(feature = "android")]
+    fn ensure_gnss(&self) {
+        if self
+            .gnss
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        // If Kotlin has attached a context but we have not built the provider yet,
+        // adopt the shared one now.
+        if let Some(provider) = android_ctx::provider() {
+            let mut g = self.gnss.lock().unwrap_or_else(|p| p.into_inner());
+            if g.is_none() {
+                *g = Some(provider);
+            }
+        }
     }
 
     #[cfg(not(feature = "android"))]
@@ -478,5 +755,82 @@ mod tests {
         // A 30 FPS camera config > 15 FPS save ceiling → refused for capture.
         assert!(!h.acquire_gate(SensorKind::Camera.key(), 30).allowed);
         assert!(h.acquire_gate(SensorKind::Camera.key(), 15).allowed);
+    }
+
+    fn host_with_collector() -> (SensorHost, Arc<Mutex<Vec<SensorHostEvent>>>) {
+        let h = SensorHost::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        h.set_notifier(Arc::new(move |e: SensorHostEvent| {
+            sink.lock().unwrap_or_else(|g| g.into_inner()).push(e);
+        }));
+        (h, seen)
+    }
+
+    #[test]
+    fn accepted_samples_broadcast_live_events() {
+        let (h, seen) = host_with_collector();
+        h.set_cameras(vec![cam(0)]);
+        // A valid 16x16 RGBA8 frame (1024 bytes) → camera_frame event.
+        h.record_frame_bytes(0, 16, 16, "rgba8", 30, vec![9u8; 1024])
+            .unwrap();
+        h.record_imu_values([0.0, -9.8, 0.0], [0.0, 0.0, 0.0], 36.5);
+
+        let got = seen.lock().unwrap_or_else(|g| g.into_inner());
+        assert_eq!(got.len(), 2, "one frame + one imu event");
+        let frame = got
+            .iter()
+            .find(|e| e.kind == "camera_frame")
+            .expect("frame event");
+        assert_eq!(frame.backend, "live");
+        assert_eq!(frame.frame.as_ref().map(|f| f.id), Some(0));
+        assert_eq!(frame.frame.as_ref().map(|f| f.seq), Some(1));
+        assert_eq!(
+            frame.frame.as_ref().map(|f| f.format.as_str()),
+            Some("rgba8")
+        );
+        let imu = got.iter().find(|e| e.kind == "imu").expect("imu event");
+        assert_eq!(imu.mode, "balanced");
+        let s = imu.imu.as_ref().expect("imu payload");
+        assert!((s.accel_y + 9.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn invalid_or_unadvertised_frame_does_not_broadcast() {
+        let (h, seen) = host_with_collector();
+        h.set_cameras(vec![cam(0)]);
+        // Wrong payload length is refused → no event.
+        assert!(h
+            .record_frame_bytes(0, 16, 16, "rgba8", 30, vec![0u8; 3])
+            .is_err());
+        // Camera never advertised → refused before the bus → no event.
+        assert!(h
+            .record_frame_bytes(7, 16, 16, "rgba8", 30, vec![0u8; 1024])
+            .is_err());
+        assert!(seen.lock().unwrap_or_else(|g| g.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn mode_change_broadcasts_once_with_prev_mode() {
+        let (h, seen) = host_with_collector();
+        h.set_mode(SensorMode::PowerSave);
+        h.set_mode(SensorMode::PowerSave); // no-op: same mode
+        let got = seen.lock().unwrap_or_else(|g| g.into_inner());
+        assert_eq!(got.len(), 1, "only a real mode change broadcasts");
+        assert_eq!(got[0].kind, "mode");
+        assert_eq!(got[0].mode, "power_save");
+        assert_eq!(got[0].prev_mode.as_deref(), Some("balanced"));
+        assert!(got[0].imu.is_none() && got[0].frame.is_none());
+    }
+
+    #[test]
+    fn no_notifier_means_quiet_noop() {
+        // A fresh host with no installed notifier must not panic when samples land.
+        let h = SensorHost::new();
+        h.set_cameras(vec![cam(0)]);
+        h.record_imu_values([0.0, -9.8, 0.0], [0.0, 0.0, 0.0], 30.0);
+        h.record_frame_bytes(0, 16, 16, "rgba8", 30, vec![9u8; 1024])
+            .unwrap();
+        h.set_mode(SensorMode::PowerSave);
     }
 }

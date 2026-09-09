@@ -19,7 +19,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::lmk::{
-    host_state, HostAction, LmkError, LmkHost, LmkProxy, MemoryPressure, NoopLmkHost,
+    host_state, ActivityState, HostAction, LmkError, LmkHost, LmkProxy, MemoryPressure, NoopLmkHost,
 };
 use crate::manager::EnhancedAndroidManager;
 use crate::runtime::AndroidRuntime;
@@ -118,6 +118,14 @@ impl AndroidManagerService {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .window_id(package_name)
+    }
+
+    /// Whether the proxy still tracks `package_name` (its task/surface is up).
+    fn task_tracked(&self, package_name: &str) -> bool {
+        self.lmk
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(package_name)
     }
 
     /// Apply a *host* governor decision back to the container (reverse half of
@@ -277,14 +285,17 @@ impl AndroidManager for AndroidManagerService {
         if event == ActivityEvent::Unspecified {
             return Err(Status::invalid_argument("unspecified activity event"));
         }
-        // Capture the surface before a Destroy tears the task down.
+        // Capture the surface before a Destroy may tear the task down.
         let window = self.task_window(&req.package_name);
-        let state =
-            dispatch_activity(&self.lmk, &req.package_name, event).map_err(|e| lmk_status(&e))?;
+        let state = dispatch_activity(&self.lmk, &req.package_name, &req.activity_id, event)
+            .map_err(|e| lmk_status(&e))?;
         // Reflect the container tier up to the host governor bridge (mapped:
         // container `Visible` → host `Foreground`).
         self.report_host_state(&req.package_name, state);
-        if event == ActivityEvent::Destroy {
+        // Emit `Destroyed` only when the task is actually gone (its last activity
+        // finished). Under per-activity folding a sub-activity `Destroy` that
+        // leaves siblings alive keeps the task + its `legacy` surface.
+        if event == ActivityEvent::Destroy && !self.task_tracked(&req.package_name) {
             self.emit_event(&req.package_name, window, LmkEventKind::Destroyed);
         }
         Ok(Response::new(ActivityEventResponse {
@@ -409,21 +420,93 @@ fn host_action_from_proto_i32(raw: i32) -> Option<HostAction> {
 
 /// Apply a container-observed Activity event to the shared LMK-proxy and return
 /// the derived importance tier (rank ladder shared with `amos-applife` /
-/// `governor.proto`). A `Destroy` leaves no tracked task, so it is reported as
-/// `stopped` (saved-state retained → cheap relaunch).
+/// `governor.proto`). A `Destroy` of a task's last activity leaves no tracked
+/// task, reported as `stopped` (saved-state retained → cheap relaunch).
+///
+/// `activity_id` selects the model:
+/// - empty → **legacy whole-task** semantics (each event addresses the task; a
+///   `Destroy` always tears it down), and untracked packages are self-healed
+///   into the proxy (post-restart re-sync);
+/// - non-empty → **per-activity folding**: the identity is recorded as alive on
+///   Resume/Pause/Stop, and a `Destroy` only tears the task down when it is the
+///   **last** live activity (finishing a stacked/sub activity keeps the app).
 fn dispatch_activity(
     lmk: &Arc<Mutex<LmkProxy>>,
     package_name: &str,
+    activity_id: &str,
     event: ActivityEvent,
 ) -> Result<AppState, LmkError> {
     let mut p = lmk.lock().unwrap_or_else(|poison| poison.into_inner());
+
+    // Legacy whole-task model (System UI / no identity on the wire).
+    if activity_id.is_empty() {
+        return dispatch_whole_task(&mut p, package_name, event);
+    }
+
+    // Per-activity identity folding: importance is driven only by the *top*
+    // activity; every non-destroyed activity keeps the task alive.
     match event {
-        ActivityEvent::Resume => p.resume(package_name),
-        ActivityEvent::Pause => p.pause(package_name),
-        ActivityEvent::Stop => p.stop(package_name),
+        ActivityEvent::Resume => p.resume_activity(package_name, activity_id),
+        ActivityEvent::Pause => p.pause_activity(package_name, activity_id),
+        ActivityEvent::Stop => p.stop_activity(package_name, activity_id),
+        ActivityEvent::Started => p.start_activity(package_name, activity_id),
+        ActivityEvent::Destroy => match p.destroy_last(package_name, activity_id)? {
+            Some(state) => Ok(state),      // other activities remain — task survives
+            None => Ok(AppState::Stopped), // last activity gone
+        },
+        ActivityEvent::Unspecified => Err(LmkError::Unknown("unspecified event".to_string())),
+    }
+}
+
+/// The legacy whole-task interpretation of an activity event (no identity). The
+/// container feed is the authoritative source: an event for a package this proxy
+/// doesn't yet track (daemon restart wiped the registry, or an app surfaced from
+/// inside the container / a notification) **self-heals** it at the minimal tier
+/// the event implies; a `Destroy` always tears the (whole) task down.
+fn dispatch_whole_task(
+    p: &mut LmkProxy,
+    package_name: &str,
+    event: ActivityEvent,
+) -> Result<AppState, LmkError> {
+    match event {
+        ActivityEvent::Resume => {
+            if p.contains(package_name) {
+                p.resume(package_name)
+            } else {
+                Ok(p.adopt(package_name, ActivityState::Resumed)) // foreground
+            }
+        }
+        ActivityEvent::Pause => {
+            if p.contains(package_name) {
+                p.pause(package_name)
+            } else {
+                Ok(p.adopt(package_name, ActivityState::Paused)) // visible, protected
+            }
+        }
+        ActivityEvent::Stop => {
+            if p.contains(package_name) {
+                p.stop(package_name)
+            } else {
+                Ok(p.adopt(package_name, ActivityState::Stopped)) // background
+            }
+        }
         ActivityEvent::Destroy => {
-            p.destroy(package_name)?;
+            if p.contains(package_name) {
+                p.destroy(package_name)?;
+            }
+            // Whether or not we tracked it, the task is gone → benign `stopped`
+            // (saved-state retained → cheap relaunch), never a hard error.
             Ok(AppState::Stopped)
+        }
+        // Whole-task mode has no per-activity identity, so a bare `Started` is
+        // either a first observation (self-heal to visible) or a no-op when the
+        // task is already tracked.
+        ActivityEvent::Started => {
+            if p.contains(package_name) {
+                p.importance(package_name)
+            } else {
+                Ok(p.adopt(package_name, ActivityState::Started)) // visible
+            }
         }
         ActivityEvent::Unspecified => Err(LmkError::Unknown("unspecified event".to_string())),
     }
@@ -561,6 +644,7 @@ mod tests {
             .on_activity(Request::new(ActivityEventRequest {
                 package_name: "com.tencent.mm".into(),
                 event: ActivityEvent::Pause as i32,
+                activity_id: String::new(),
             }))
             .await
             .unwrap()
@@ -572,6 +656,7 @@ mod tests {
             .on_activity(Request::new(ActivityEventRequest {
                 package_name: "com.tencent.mm".into(),
                 event: ActivityEvent::Stop as i32,
+                activity_id: String::new(),
             }))
             .await
             .unwrap()
@@ -601,6 +686,7 @@ mod tests {
         svc.on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();
@@ -641,6 +727,7 @@ mod tests {
         svc.on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();
@@ -687,6 +774,7 @@ mod tests {
             .on_activity(Request::new(ActivityEventRequest {
                 package_name: "com.tencent.mm".into(),
                 event: ActivityEvent::Unspecified as i32,
+                activity_id: String::new(),
             }))
             .await
             .unwrap_err();
@@ -711,6 +799,7 @@ mod tests {
         svc.on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();
@@ -751,6 +840,7 @@ mod tests {
         svc.on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Pause as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();
@@ -884,6 +974,7 @@ mod tests {
         svc.on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();
@@ -928,6 +1019,7 @@ mod tests {
         svc.on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();
@@ -953,5 +1045,134 @@ mod tests {
         assert_eq!(evt.kind, LmkEventKind::Reclaimed as i32);
         assert_eq!(evt.package_name, "com.tencent.mm");
         assert_eq!(evt.window_id, "waydroid_demo_com.tencent.mm");
+    }
+
+    #[test]
+    fn resume_for_untracked_package_adopts_it_as_foreground() {
+        let lmk = std::sync::Arc::new(std::sync::Mutex::new(LmkProxy::new()));
+
+        // An app this proxy never launched (daemon restart / foregrounded from
+        // inside the container) comes to the foreground: it must be adopted as a
+        // tracked, protected foreground task — not rejected with an Unknown error.
+        let state = dispatch_activity(&lmk, "com.tencent.mm", "", ActivityEvent::Resume).unwrap();
+        assert_eq!(state, AppState::Foreground);
+
+        let snap = lmk.lock().unwrap().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].package_name, "com.tencent.mm");
+        assert_eq!(snap[0].state, AppState::Foreground);
+
+        // A second Resume on the now-tracked task is a plain resume, no duplicate.
+        let again = dispatch_activity(&lmk, "com.tencent.mm", "", ActivityEvent::Resume).unwrap();
+        assert_eq!(again, AppState::Foreground);
+        assert_eq!(lmk.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pause_stop_destroy_self_heal_untracked_packages() {
+        let lmk = std::sync::Arc::new(std::sync::Mutex::new(LmkProxy::new()));
+
+        // Stop for an untracked package: it exists but is hidden → adopt Background.
+        let bg = dispatch_activity(&lmk, "com.tencent.mm", "", ActivityEvent::Stop).unwrap();
+        assert_eq!(bg, AppState::Background);
+
+        // Pause for a (different) untracked package: still visible → adopt Visible.
+        let vs = dispatch_activity(&lmk, "com.taobao.taobao", "", ActivityEvent::Pause).unwrap();
+        assert_eq!(vs, AppState::Visible);
+        let snap = lmk.lock().unwrap().snapshot();
+        assert_eq!(snap.len(), 2);
+        let tb = snap
+            .iter()
+            .find(|t| t.package_name == "com.taobao.taobao")
+            .unwrap();
+        assert_eq!(tb.activity, ActivityState::Paused);
+        assert_eq!(tb.state, AppState::Visible);
+        let mm = snap
+            .iter()
+            .find(|t| t.package_name == "com.tencent.mm")
+            .unwrap();
+        assert_eq!(mm.state, AppState::Background);
+
+        // Destroy of a package we never saw is a benign no-op (gone), not an error.
+        assert_eq!(
+            dispatch_activity(&lmk, "com.never.seen", "", ActivityEvent::Destroy).unwrap(),
+            AppState::Stopped
+        );
+
+        // A Destroy of the adopted Background task removes it cleanly.
+        assert!(dispatch_activity(&lmk, "com.tencent.mm", "", ActivityEvent::Destroy).is_ok());
+        assert_eq!(lmk.lock().unwrap().len(), 1); // only the Visible task remains
+    }
+
+    #[test]
+    fn per_activity_folding_keeps_task_until_the_last_activity_dies() {
+        let lmk = std::sync::Arc::new(std::sync::Mutex::new(LmkProxy::new()));
+
+        // Two stacked activities in one task, both alive (identity-folding path).
+        let first = dispatch_activity(&lmk, "com.app", "act:A", ActivityEvent::Resume).unwrap();
+        assert_eq!(first, AppState::Foreground);
+        let second = dispatch_activity(&lmk, "com.app", "act:B", ActivityEvent::Resume).unwrap();
+        assert_eq!(second, AppState::Foreground);
+        assert_eq!(lmk.lock().unwrap().len(), 1, "one task for the package");
+
+        // A re-resume of the SAME identity must not double-count it.
+        let _ = dispatch_activity(&lmk, "com.app", "act:A", ActivityEvent::Resume).unwrap();
+        assert_eq!(lmk.lock().unwrap().len(), 1);
+
+        // Finishing the top activity (B) leaves A alive → the task + surface stay.
+        let after_top =
+            dispatch_activity(&lmk, "com.app", "act:B", ActivityEvent::Destroy).unwrap();
+        assert_eq!(after_top, AppState::Foreground, "A is still resumed");
+        assert_eq!(
+            lmk.lock().unwrap().len(),
+            1,
+            "sub-activity finish keeps the app"
+        );
+
+        // Destroying the LAST live activity (A) tears the whole task down.
+        let last = dispatch_activity(&lmk, "com.app", "act:A", ActivityEvent::Destroy).unwrap();
+        assert_eq!(last, AppState::Stopped);
+        assert!(lmk.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stopped_sibling_neither_demotes_top_nor_prematurely_kills_the_task() {
+        let lmk = std::sync::Arc::new(std::sync::Mutex::new(LmkProxy::new()));
+        let pkg = "com.app";
+
+        // A foreground top activity.
+        assert_eq!(
+            dispatch_activity(&lmk, pkg, "act:A", ActivityEvent::Resume).unwrap(),
+            AppState::Foreground
+        );
+        // B enters (Started: liveness only) then becomes the resumed top.
+        let _ = dispatch_activity(&lmk, pkg, "act:B", ActivityEvent::Started).unwrap();
+        assert_eq!(
+            dispatch_activity(&lmk, pkg, "act:B", ActivityEvent::Resume).unwrap(),
+            AppState::Foreground
+        );
+        // A is now a *stopped sibling* below B. A real adapter sends its onStop,
+        // but that must NOT demote the package (B is still foreground).
+        let st = dispatch_activity(&lmk, pkg, "act:A", ActivityEvent::Stop).unwrap();
+        assert_eq!(
+            st,
+            AppState::Foreground,
+            "stopping a non-top sibling must not demote the resumed top"
+        );
+
+        // B (the top) finishes → the stopped sibling A is still alive, so the task
+        // + surface survive (demoted to a visible placeholder, never torn down).
+        let after_b = dispatch_activity(&lmk, pkg, "act:B", ActivityEvent::Destroy).unwrap();
+        assert_eq!(after_b, AppState::Visible, "A is still alive");
+        assert_eq!(lmk.lock().unwrap().len(), 1);
+
+        // A comes back to the foreground, then finishes → last activity gone.
+        assert_eq!(
+            dispatch_activity(&lmk, pkg, "act:A", ActivityEvent::Resume).unwrap(),
+            AppState::Foreground
+        );
+        let last = dispatch_activity(&lmk, pkg, "act:A", ActivityEvent::Destroy).unwrap();
+        assert_eq!(last, AppState::Stopped);
+        assert!(lmk.lock().unwrap().is_empty());
     }
 }

@@ -38,6 +38,9 @@
 //!   [`AudioCapture`]) + honest [`PlatformMicKind::detect`], resolving AAudio /
 //!   TinyALSA on Android and a clear "no native mic" error (or an explicit mock)
 //!   on a host build. This is what the always-on voice worker consumes.
+//! * [`ring`] — a bounded, host-testable sample buffer that bridges a real-time
+//!   audio producer (the AAudio **data callback** thread) to the pull
+//!   [`AudioCapture`] reader the voice worker drives.
 //! * [`android`] — **compile-time-gated** direct TinyALSA / AAudio FFI bindings
 //!   (feature `tinyalsa` / `aaudio` + `target_os = "android"`). On a host build
 //!   these modules are empty so the default workspace stays light and green.
@@ -60,6 +63,7 @@ pub mod capture;
 pub mod error;
 pub mod mock;
 pub mod resample;
+pub mod ring;
 pub mod sink;
 pub mod source;
 pub mod spec;
@@ -79,6 +83,6 @@ pub use source::{PlatformMic, PlatformMicKind};
 pub use spec::{AudioSpec, ASR_SAMPLE_RATE};
 
 #[cfg(all(feature = "aaudio", target_os = "android"))]
-pub use crate::android::aaudio::{AAudioCapture, AAudioSink};
+pub use crate::android::aaudio::{AAudioCallbackCapture, AAudioCapture, AAudioSink};
 #[cfg(all(feature = "tinyalsa", target_os = "android"))]
 pub use crate::android::tinyalsa::{TinyAlsaCapture, TinyAlsaSink};

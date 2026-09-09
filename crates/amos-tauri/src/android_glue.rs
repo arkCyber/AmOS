@@ -151,6 +151,37 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_CameraGlue_recordFrame(
     }
 }
 
+/// `CameraGlue.advertiseCamera(cameraId,width,height,fps)` — JNI `(IIIII)V`. The
+/// Kotlin producer reports the NV21 preview config it is about to push, so the
+/// host advertises the camera capability (id / size / NV21 format / fps) on the
+/// armed bus — matching the design that reads serve a frame only for an advertised
+/// camera, and the snapshot's camera list reflects what is really available.
+///
+/// # Safety
+/// Called by the JVM as a registered native method; `env`/`this` are the standard
+/// JNI instance-method arguments and must be valid for the call.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_amos_ai_glue_CameraGlue_advertiseCamera(
+    _env: *mut jni::sys::JNIEnv,
+    _this: jni::sys::jobject,
+    camera_id: i32,
+    width: i32,
+    height: i32,
+    fps: i32,
+) {
+    if camera_id < 0 || width <= 0 || height <= 0 || fps <= 0 {
+        return;
+    }
+    if let Some(b) = bus() {
+        b.set_cameras(vec![CameraConfig {
+            id: CameraId(camera_id as u32),
+            resolution: Resolution::new(width as u32, height as u32),
+            fps: fps as u32,
+            format: PixelFormat::Nv21,
+        }]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1043,4 +1043,118 @@ mod tests {
             }
         }
     }
+
+    /// A pull `AudioCapture` backed by the same bounded [`SampleRing`] a device
+    /// `AAudioCallbackCapture` uses, fed by an external *producer* thread that
+    /// stands in for AAudio's real-time data callback. `read` drains the ring and
+    /// only reports EOF once the producer has closed (`open == false`) *and* the
+    /// ring is drained — a live, momentarily-silent capture must never look like
+    /// the end of the stream. This is the exact contract the Android-only
+    /// callback seam relies on, exercised here through a real consumer.
+    #[derive(Clone)]
+    struct RingCapture {
+        ring: std::sync::Arc<amos_audio::ring::SampleRing>,
+        spec: amos_audio::spec::AudioSpec,
+        open: std::sync::Arc<AtomicBool>,
+    }
+
+    impl RingCapture {
+        /// A 16 kHz mono capture over a ring. The short per-wait budget keeps a
+        /// starved read prompt so the worker can re-check `open`; the ring
+        /// capacity is far larger than any test utterance so it never overflows.
+        fn at_asr() -> Self {
+            Self {
+                ring: std::sync::Arc::new(amos_audio::ring::SampleRing::with_read_timeout(
+                    8192,
+                    std::time::Duration::from_millis(20),
+                )),
+                spec: amos_audio::spec::AudioSpec::new(16_000, 1),
+                open: std::sync::Arc::new(AtomicBool::new(true)),
+            }
+        }
+
+        /// Handles for the external producer: push samples and, when finished,
+        /// close the capture so `read` can report EOF.
+        fn producer(
+            &self,
+        ) -> (
+            std::sync::Arc<amos_audio::ring::SampleRing>,
+            std::sync::Arc<AtomicBool>,
+        ) {
+            (self.ring.clone(), self.open.clone())
+        }
+    }
+
+    impl amos_audio::AudioCapture for RingCapture {
+        fn spec(&self) -> amos_audio::spec::AudioSpec {
+            self.spec
+        }
+
+        fn read(&mut self, out: &mut [f32]) -> Result<usize, amos_audio::error::AudioError> {
+            loop {
+                let n = self.ring.read(out);
+                if n > 0 {
+                    return Ok(n);
+                }
+                // Empty for a whole wait slice. If the producer is still live it
+                // can push at any moment, so keep waiting (never a false EOF); only
+                // a closed + drained producer is the genuine end of the stream.
+                if !self.open.load(Ordering::Relaxed) {
+                    return Ok(0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ring_backed_push_capture_drives_resident_worker_segmentation() {
+        use amos_proto::ai_agent::client_message::Payload;
+
+        // Emulate AAudio data callbacks: an external producer thread pushes ~10 ms
+        // periods (speech, then enough trailing silence to cross the gate) into the
+        // shared ring while the resident worker drains it — mirroring how a device
+        // `AAudioCallbackCapture` feeds `assistant_voice`.
+        let capture = RingCapture::at_asr();
+        let (ring, open) = capture.producer();
+
+        let producer = std::thread::spawn(move || {
+            ring.push(&vec![0.5f32; 160]);
+            for _ in 0..6 {
+                ring.push(&[0.0f32; 160]);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            open.store(false, Ordering::Relaxed); // producer done -> EOF for the worker
+        });
+
+        let (feeder, mut rx) = tokio::sync::mpsc::channel(64);
+        let handle =
+            spawn_resident_capture::<RingCapture>(feeder.clone(), capture, 16_000, 3, false)
+                .expect("ring-backed push capture spawns (Send + AudioCapture)");
+
+        let mut saw_audio = false;
+        let mut saw_end = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(msg)) => match msg.payload {
+                    Some(Payload::Audio(_)) => saw_audio = true,
+                    Some(Payload::AudioEnd(_)) => {
+                        saw_end = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        producer.join().unwrap();
+        assert!(saw_audio, "pushed speech must stream as Audio payloads");
+        assert!(
+            saw_end,
+            "trailing silence past the gate must finalize with AudioEnd"
+        );
+        assert_eq!(handle.submitted(), 1, "exactly one utterance submitted");
+        handle.stop(); // the producer already closed the capture; join is prompt
+    }
 }

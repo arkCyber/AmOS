@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::time::{sleep, Duration};
 
 use crate::ai_bridge::with_client_id;
+use crate::watch_backoff::{next_backoff_ms, WATCH_BACKOFF_BASE_MS};
 
 /// Tauri event name carrying one [`LmkSurfacePayload`] per daemon `WatchLmk` event.
 pub const LMK_SURFACE_EVENT: &str = "lmk-surface";
@@ -78,15 +79,18 @@ async fn lmk_round(app: AppHandle) -> Result<(), String> {
 }
 
 /// Background task forwarding the daemon `WatchLmk` stream to the WebView for the
-/// lifetime of the app. Reconnects with bounded backoff so a late-starting (or
-/// restarted) daemon is picked up without a full UI reload.
+/// lifetime of the app. Reconnects with the shared bounded backoff
+/// ([`crate::watch_backoff`]) so a late-starting (or restarted) daemon is picked
+/// up without a full UI reload.
 pub fn spawn_lmk_watch(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut backoff_ms: u64 = 500;
+        let mut backoff_ms: u64 = WATCH_BACKOFF_BASE_MS;
         loop {
-            let _ = lmk_round(app.clone()).await;
+            // `Ok` means the round opened a live stream (daemon reachable) before
+            // it ended — reset the backoff so the next reconnect is immediate.
+            let connected = lmk_round(app.clone()).await.is_ok();
+            backoff_ms = next_backoff_ms(backoff_ms, connected);
             sleep(Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(8000);
         }
     });
 }
@@ -256,6 +260,28 @@ mod tests {
         );
         assert_eq!(parse_debug_action(""), None);
         assert_eq!(parse_debug_action("nuke"), None);
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_capped_on_failed_connects() {
+        // Policy lives in `watch_backoff`; here we only assert it stays shared so
+        // the LMK watcher can't silently reintroduce a non-resetting backoff.
+        assert_eq!(
+            next_backoff_ms(4000, false),
+            crate::watch_backoff::WATCH_BACKOFF_MAX_MS
+        );
+        assert_eq!(
+            next_backoff_ms(8000, true),
+            crate::watch_backoff::WATCH_BACKOFF_BASE_MS
+        );
+    }
+    #[test]
+    fn backoff_resets_to_base_after_a_successful_connect() {
+        // Delegates to the shared policy (full policy tests live in `watch_backoff`).
+        assert_eq!(
+            next_backoff_ms(crate::watch_backoff::WATCH_BACKOFF_MAX_MS, true),
+            crate::watch_backoff::WATCH_BACKOFF_BASE_MS
+        );
     }
 
     #[test]

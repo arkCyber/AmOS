@@ -126,27 +126,36 @@ cd crates/amos-tauri/frontend-ts && bun run typecheck && bun run test   # lmk.te
 
 ## 7. 诚实边界（本机 / 无真机不可端到端验证的部分）
 
-- **容器侧 Kill 已执行，但表面拆除仍是 seam**：`LmkAction::Kill` 现会移除 proxy 记录、
+- **容器侧 Kill 已执行；状态机层拆除 + 通知链路已闭环（真机像素 teardown 除外）**：`LmkAction::Kill` 现会移除 proxy 记录、
   返回 `window_id`，并**真下发容器 `am force-stop`**（`WaydroidRuntime` 走
   `waydroid shell am force-stop <pkg>`；`DemoRuntime` 记录 `stops()`；service 的
   `TriggerLmk` 对每个 Kill victim 经 `EnhancedAndroidManager::force_stop_app` 调用，
-  `CommandRunner` 可注入、离线可断言）。**表面拆除原语已存在，缺的是通知**：System UI
-  侧 `amos-tauri::wm` 的 `open_surface("legacy:<id>")` 注册 external 表面，且 `close`/
-  `wm_close` 已能在状态机层把它移除（`Closed` 事件对 external 只跳过 host 端真实关闭）。
-  真正的缺口是 **daemon（proxy/beat）→ System UI 的 kill 推送**——System UI 目前没有订阅
-  LMK 事件的通道，无法得知该关哪个 `legacy` 表面；以及 no-UI 基座（`SurfaceControl`）的
-  进程/表面 teardown。
+  `CommandRunner` 可注入、离线可断言）。**状态机层的拆除原语与通知均已具备**：System UI
+  侧 `amos-tauri::wm` 的 `open_surface("legacy:<id>")` 注册 external 表面，`close`/
+  `wm_close` 在状态机层把它移除（`Closed` 事件对 external 只跳过 host 端真实关闭）；daemon
+  经 `WatchLmk` 推送（governor-beat 与容器侧都接入同一广播），`amos-tauri::android_lmk` 订阅并
+  转发为 `lmk-surface`，前端 `lib/lmk.ts::startLmkSurfaceWatcher` 在 `close_surface` 时对
+  `legacy:<id>` 调 `wm_close`（另有周期 reconcile 兜底）。真正的剩余是**真机像素层**：no-UI
+  基座（`SurfaceControl`）的进程/表面 teardown，以及把移除/回收翻译到 Waydroid 合成表面的视觉层。
 - **容器事件喂入是 seam**：`OnActivity` 由调用方（System UI/桥）按容器实际 Activity
-  回调填入；本模块不解析 binder/lmkd。真实 Android 一个进程可含多 Activity，这里按
-  「每包一 top-Activity 任务」建模，真容器适配器需把 per-Activity 信号折叠进 top Activity。
+  回调填入；本模块不解析 binder/lmkd。真实 Android 一个进程可含多 Activity：当
+  `ActivityEventRequest.activity_id` **为空**时按「每包一 top-Activity 任务」建模（由适配器
+  折叠成顶层事件）；**带上 activity_id** 时走「活动折叠」——**存活性与 importance 解耦**：
+  `STARTED(id)` 把该活动记为存活（任务只在**最后一个**活动 Destroy 时才拆），`Resume` 才把
+  它升为顶层驱动 importance，且**针对非顶层的 `Stop`/`Pause` 不改变包 tier**（叠层里被盖住的
+  “stopped 兄弟”既不误降前台、也不在顶层结束时被误拆）。离线单测已覆盖该语义。真正接线仍需
+  能命名活动的真容器适配器把 identity 填上。
+   `amos-android::activity_observer` 已提供**稳定 identity（`ComponentName#instance`）+ 顶层折叠**
+   的可离线测试核心（onStart→STARTED / 顶层 Resume/Pause/Stop / onDestroy→带 id）。剩下的接线是把
+   真机 **ActivityManager（binder / `dumpsys activity`）** 的活动回调喂进该折叠器。
+
 - **「每包一个任务」的简化**：demo/单 surface 路径成立；真实 split/多任务需扩展为
   per-task 栈。VM 无法在 mac 上起 Waydroid 验证像素层。
 - **桥已双向（容器→host 上报 + host→容器回收驱动），但「物理执行」限于 force-stop**：
   正向 `GovernorLmkHost` 上送；反向由 `serve()` 的 governor beat 在每次 `observe` 后经
   `drive_host_decisions` 只对**容器管理** app 执行真 `am force-stop`/冻结/解冻镜像（§8）。
-  仍留的 seam：daemon→System UI 的 **kill 推送**（System UI `close`/`wm_close` 已能在状态机
-  层拆 `legacy:<id>` external 表面，缺的是得知该关哪个的通道）、no-UI 基座 `SurfaceControl`
-  teardown、以及把 host 解冻（thaw）翻译成容器内真实 surface 唤醒。
+  已留的 seam：no-UI 基座 `SurfaceControl` teardown、以及把 host 解冻（thaw）翻译成容器内
+  真实 surface 唤醒——「kill 推送」已不再是缺口（见上一条与 §8）。
 
 ## 8. container ↔ host 双向桥（正向上报 + 反向驱动，均已接线）
 
@@ -169,6 +178,7 @@ cd crates/amos-tauri/frontend-ts && bun run typecheck && bun run test   # lmk.te
 
 - `launch_android_app` 成功 → proxy 前台 → `report_state(Foreground)` → host `register_app`（未注册则建前台）。
 - `OnActivity`（Resume/Pause/Stop/Destroy）→ 派生容器 tier → `report_state(host_state(tier))`。
+  容器事件流对 proxy 是**权威来源**，因此对「未跟踪」包也**自愈收养**（daemon 重启清空 registry 但容器 app 仍在跑、或 app 自容器内/通知前台化时，靠事件流即可重建，无需人工 relaunch）：`Resume`→前台、`Pause`→`Visible`（受保护）、`Stop`→`Background`、`Destroy`→任务移除（本就未跟踪则良性 `stopped`）；已跟踪包走常规状态迁移。无事件喂入的静默 app 无法凭空重建（需适配器在重启后补发当前态事件）。**可选 `activity_id`**：带上时走「活动折叠」——`STARTED` 记存活、`Resume` 升顶层驱动 importance、`Stop`/`Pause` 只作用于顶层、`Destroy` 仅在**最后**存活活动时才拆任务/发 `Destroyed`（见 §7）。
 - `TriggerLmk`：`Freeze` victim → `report_state(Cached)`；`Kill` victim → `am force-stop` + `report_killed()`（host `kill_app`，无 saved state）。
 - `host_state`：容器 `Visible` → host `Foreground`（host 无可设 `Visible`；保证「可见但失焦」的 legacy 仍受 host 保护）；其余 tier 一一对应。容器权威的 `visible` 仍由 `GetLmkSnapshot` 精确上报。
 

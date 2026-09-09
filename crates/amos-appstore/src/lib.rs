@@ -62,8 +62,8 @@ pub mod webinstall;
 pub mod http;
 
 pub use android::{
-    ffi, ApiLevel, CommitOutcome, InstallMode, InstallRequest, INSTALL_PACKAGES_PERMISSION,
-    PackageInstallerBridge, Posture, Precondition, Privilege, SideloadOnlyBridge, Session,
+    ffi, ApiLevel, CommitOutcome, InstallMode, InstallRequest, PackageInstallerBridge, Posture,
+    Precondition, Privilege, Session, SideloadOnlyBridge, INSTALL_PACKAGES_PERMISSION,
     STATUS_PENDING_USER_ACTION,
 };
 pub use client::AppStore;

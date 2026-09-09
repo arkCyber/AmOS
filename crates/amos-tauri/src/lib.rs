@@ -51,6 +51,7 @@ pub mod telephony;
 pub mod terminal;
 pub mod translate;
 pub mod tts;
+pub mod watch_backoff;
 pub mod wm;
 
 use ai_bridge::AiBridge;
@@ -270,6 +271,29 @@ pub fn run() {
             // can surface an exfiltration warning live (reconnects if the daemon
             // starts; quiet until a real `audit`-feature capture producer is wired).
             telemetry_spy::spawn_telemetry_spy_watch(app.handle().clone());
+            // Broadcast real-time sensor changes (new IMU sample / camera frame /
+            // energy-mode switch) from the System UI's SensorHost stream bus to the
+            // WebView as `sensor-data`, so a live sensor tile updates without
+            // polling. Fires for *every* producer: WebView `record_*` commands,
+            // on-device `android_glue` IMU/frame callbacks and host feeders all
+            // land on the shared bus the host observes.
+            {
+                let host = app.state::<sensor_host::SensorHost>();
+                let handle = app.handle().clone();
+                let notifier = Arc::new(move |ev: sensor_host::SensorHostEvent| {
+                    let _ = handle.emit(sensor_host::SENSOR_DATA_EVENT, ev);
+                });
+                host.set_notifier(notifier);
+            }
+            // On-device: arm the shared sensor bus with the managed SensorHost's
+            // producer so the Kotlin SensorGlue/CameraGlue upcalls (recordImu /
+            // recordFrame) land in the same LiveSensorProvider SensorHost reads —
+            // and the real-time `sensor-data` broadcast fans out to the WebView.
+            #[cfg(feature = "android")]
+            {
+                let host = app.state::<sensor_host::SensorHost>();
+                let _ = android_glue::arm(host.producer());
+            }
             // On device, arm the torch device-seam UI pusher so OS-driven torch
             // changes (TorchCallback) reach the System UI live via the shared
             // store's `store-updated` event (status bar + open control-center).

@@ -135,3 +135,79 @@ Camera/IMU 是**流**不是 getter：Android 把每个新帧/运动样本投递�
   再加订阅）。相机**原始帧字节**走独立媒体通道（本服务只给帧元数据 + 尺寸，见 `proto/sensor.proto` 头注释）。
 - **模型/功耗联动**：把 `SensorManager` 与 `amos-profiling` 的功耗读数联起来——跑本地 LLM 时自动
   切 `PowerSave` 采样档并记录热/电（见 `docs/profiling.md`）。
+
+## 8. System UI 实时数据流广播（2026-09-09，`sensor-data` 事件）
+
+补上此前「传感器数据向 System UI 的实时 Context 总线广播」的缺口：除了按需快照（拉取），现在 System
+UI 的 `SensorHost` 是一个**实时推送源**——凡向共享流桥推入一个被接受的 IMU 样本 / 相机帧、能量档真实
+切换或 glue detach 清空样本，都会把一条 `sensor-data` 事件 `emit` 给 WebView（镜像
+`telephony-event` / `telemetry-spy-hit` / `clipboard-changed` 的事件语义）。
+
+```text
+[ Android glue / WebView record_* / host feeder ]
+        │  record_imu / record_frame（进入同一 bus）
+        ▼
+ LiveSensorProvider（共享流桥）
+        │  StreamChange{Imu|Frame|Cleared}  （accept 才触发：陈旧 IMU 与非法帧不广播）
+        ▼
+ SensorHost（持 Weak→manager，附当前 mode/backend）
+        │  SensorNotifier（sensor_host::set_notifier 安装）
+        ▼
+ Tauri emit("sensor-data", SensorHostEvent)
+        ▼
+ 前端 lib/sensorEvents.ts：subscribeSensorData / toSensorData（防御式）
+```
+
+- **领域层（`amos-sensor`）**：`LiveSensorProvider` 新增 Tauri-free 订阅点——`subscribe(Arc<dyn
+  Fn(&StreamChange)> + Send + Sync)`，`ImuLatest::record` 改为返回 `bool`（是否 accept）以只在真收到
+  更新时通知；`record_frame` 只在校验通过后广播带 `seq` 的最新帧；`clear_samples` 广播 `Cleared`。
+  `notify` 先快照订阅者列表、**释放锁后**再调用，杜绝死锁/重入。
+- **System UI（`amos-tauri`）**：`SensorHost` 增 `manager: Arc<SensorManager>` + `sink: EventSink`；
+  `set_notifier` 安装广播；`wire_bus_observer` 把 `StreamChange` 映射成扁平 `SensorHostEvent`
+  （`ts_ms`/`kind`/`backend`/`mode`/`imu`/`frame`/`prev_mode`，`SENSOR_DATA_EVENT="sensor-data"`）。
+  相机事件只带**元数据**（id/尺寸/format/seq），原始帧字节永不上 UI 事件总线（留在媒体平面）。
+  能量档仅在**真实变化**时广播并带 `prev_mode`。boot 在 `lib.rs::setup()` 用
+  `host.set_notifier(handle.emit(SENSOR_DATA_EVENT, …))` 接上 WebView。
+- **验证**：`amos-sensor` stream 新增 3 项单测（accept→imu+frame 事件、陈旧/非法 push 不广播、
+  clear→Cleared）；`amos-tauri` sensor_host 新增 4 项（live 事件含 mode/backend/元数据、非法/未
+  通告帧不广播、mode 仅变化一次带 prev_mode、未装 notifier 时静默 no-op）；前端
+  `lib/sensorEvents.ts` + `__tests__/sensorEvents.test.ts`（7 项，事件名/归一化/防御/订阅 no-op）。
+  `cargo test -p amos-sensor`（37+1 e2e）、`cargo test -p amos-tauri --lib`（165）、
+  `cargo clippy -p amos-sensor/-p amos-tauri --lib -- -D warnings`、fmt、前端 `bun test`+`tsc`、
+  `cargo check -p amos-tauri --features android --lib` 全绿。
+- **System UI 消费端（本轮）**：新增 `lib/sensorLive.ts`（纯 reducer `applySensorLive` + 订阅式
+  `createSensorLive`，`start()` 打开 `sensor-data` listen 并从 `sensor_host_snapshot` 尽力 seed
+  能量档/后端；`pushRaw` 走与真实监听同一归一化器）与 `svelte/LiveSensors.svelte`（挂在
+  `DiagnosticsPage`，事件驱动刷新：绿色 LIVE 点、IMU/预览帧/清空计数、最近 IMU 样本、最近帧元数据、
+  能量档变化实时更新；无数据时显示等待提示而非假样本；重置仅清零本端计数，不动宿主总线）。前端测试：
+  `__tests__/sensorLive.test.ts`（7 项，事件驱动刷新/计数/防御/订阅/reset）+ `svelte-tests/
+  sensor-live.svelte.test.ts`（1 项 mount 冒烟）。桌面 host 演示：WebView 调
+  `sensor_host_record_imu`/`record_frame` 即触发 `sensor-data` → 卡片实时刷新（无需 daemon）。
+- **仍剩（真机，本字段外）**：把 §7 的设备侧 producer glue（`SensorEventListener` /
+  Camera2 `ImageReader`）真正跑起来并 `arm` 到同一 `bus`——那样真机推入的样本会自动经 §8 广播到
+  System UI 的 `LiveSensors` 卡片；桌面/host 已用 `sensor_host_record_*`/测试覆盖同一条推送路径。
+
+## 9. 真机 Rust↔Kotlin 接线（2026-09-09，代码已落地 · 装机验证待跑）
+
+把 §7「System UI 宿主侧接线」从注释级补到代码级，使 Kotlin 生产者能把真实样本真正送进 Rust 总线：
+
+- **arm 共享总线（`amos-tauri/src/lib.rs`，android cfg）**：boot `setup()` 里用
+  `android_glue::arm(host.producer())`，把托管 `SensorHost` 的 `LiveSensorProvider` 设为 Kotlin
+  `SensorGlue.recordImu`/`CameraGlue.recordFrame` 上行的落点——这样真机样本与 §8 的 `sensor-data`
+  实时广播、`LiveSensors` 卡片同一条链路。
+- **GNSS 惰性绑定（`amos-tauri/src/sensor_host.rs`，android cfg）**：`android_ctx` 模块存一次由
+  Kotlin `SensorGlue.attachContext(context)` 上行给的真实 `AndroidSensorProvider`
+  （`LocationManager`）；`SensorHost::read_gnss` 首次读时 `ensure_gnss()` 把它采纳进 `gnss` 字段，
+  于是快照反映真实定位（无需显式 boot 时序）。新增 no_mangle
+  `Java_com_amos_ai_glue_SensorGlue_attachContext`。
+- **相机能力通告（`amos-tauri/src/android_glue.rs` + Kotlin `CameraGlue.kt`）**：`CameraGlue.attach`
+  在拿到 CAMERA 后按协商出的 NV21 尺寸调 `advertiseCamera(id,w,h,fps)` → no_mangle
+  `Java_com_amos_ai_glue_CameraGlue_advertiseCamera` 把相机写进已 arm 的总线，快照的相机列表因此反映
+  真机能力。
+- Kotlin 端改动都在 `android-glue/` 模板（`SensorGlue.attachContext`/`CameraGlue.advertiseCamera`，
+  均 try/catch 防缺 native 符号崩溃），并已同步拷贝进 `gen/android/app/.../glue/`。
+- **验证**：`cargo check/clippy -p amos-tauri --features android --lib -- -D warnings` 与宿主
+  `--lib` 全绿、fmt 干净。**仍待（本环境无法稳定跑长任务的真机 APK 构建）**：`cd crates/amos-tauri &&
+  cargo tauri android build --apk --debug` 装机启动后，用 adb 观测
+  `dumpsys sensorservice`（活跃 IMU 连接）/ `media.camera`（CONNECT device 0）与 `logcat` 里
+  `SensorGlue`/`AmosGlue`/`record*` 日志，确认样本真到达总线（runbook 见 docs/android-glue.md）。

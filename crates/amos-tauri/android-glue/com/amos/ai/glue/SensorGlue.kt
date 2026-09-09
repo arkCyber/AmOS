@@ -6,6 +6,7 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.SystemClock
+import android.util.Log
 
 /**
  * Amos sensor producer glue — **System UI APK side**.
@@ -45,6 +46,14 @@ object SensorGlue : SensorEventListener {
             sm.registerListener(this, it, SAMPLING_PERIOD_US)
         }
         attached = true
+        // Hand the app Context to Rust so the host can build the real GNSS provider
+        // (LocationManager) for its snapshot. Guarded: if the APK was built without
+        // the `android` native feature the symbol is missing and must not crash boot.
+        try {
+            attachContext(context)
+        } catch (t: Throwable) {
+            Log.w("AmosGlue", "sensor attachContext unavailable: ${t.javaClass.simpleName}")
+        }
     }
 
     /** Release the listeners (System UI teardown / when the user revokes). */
@@ -99,6 +108,13 @@ object SensorGlue : SensorEventListener {
     }
 
     private val DEFAULT_DIE_TEMP_C = 25.0f
+
+    /**
+     * Hand the app `Context` to the AmOS native runtime so the System UI host can
+     * build the real GNSS provider (LocationManager) for its sensor snapshot.
+     * Rust: `Java_com_amos_ai_glue_SensorGlue_attachContext` (see sensor_host.rs).
+     */
+    external fun attachContext(context: Context)
 
     /** JNI upcall into the AmOS native runtime (see android_glue.rs). */
     external fun recordImu(

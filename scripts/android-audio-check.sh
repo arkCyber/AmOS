@@ -57,5 +57,14 @@ if ! llvm-readelf -d "$BIN" 2>/dev/null | grep -q 'libaaudio.so' \
   exit 1
 fi
 echo "ok: $BIN links against libaaudio.so (DT_NEEDED confirmed)"
+
+echo
+echo "== AAudio data-callback probe (arm64-v8a) =="
+# The run-time callback probe must also compile + link (it references the same
+# AAudioStreamBuilder_setDataCallback/setFramesPerDataCallback FFI as the seam).
+cargo ndk -t arm64-v8a -P "$API" build --release -p amos-audio \
+  --features aaudio --example aaudio_callback_probe
+echo "ok: aaudio_callback_probe compiled + linked for arm64-v8a"
+
 echo
 echo "Amos audio Android seams: compile + AAudio link gate PASSED."

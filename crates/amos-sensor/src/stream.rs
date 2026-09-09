@@ -52,7 +52,10 @@ impl ImuLatest {
 
     /// Store `sample` as the latest value. A sample whose timestamp is older than
     /// the current one is **dropped** (out-of-order push) so readers never regress.
-    pub fn record(&self, sample: ImuSample) {
+    /// Returns `true` when the push was *accepted* (a newer value was stored) and
+    /// `false` when it was dropped as stale — so a caller can skip announcing a
+    /// non-change.
+    pub fn record(&self, sample: ImuSample) -> bool {
         let mut guard = self.latest.lock().unwrap_or_else(|p| p.into_inner());
         let is_newer = guard
             .as_ref()
@@ -61,6 +64,9 @@ impl ImuLatest {
         if is_newer {
             *guard = Some(sample);
             self.recorded.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 
@@ -160,12 +166,44 @@ impl FrameLatest {
 /// GNSS is *not* streamed here (Android exposes it synchronously via
 /// `LocationManager`, which `AndroidSensorProvider` calls directly); this
 /// provider reports it as disabled/absent.
-#[derive(Debug)]
+/// A change that happened on a [`LiveSensorProvider`] stream bus after a producer
+/// stored a new value (or cleared the samples). A pure domain type — deliberately
+/// Tauri-free — so host tooling and the System UI's real-time broadcast can both
+/// subscribe to the same bus without dragging the UI layer into the domain crate.
+#[derive(Clone, Debug)]
+pub enum StreamChange {
+    /// A producer accepted a newer [`ImuSample`].
+    Imu(ImuSample),
+    /// A producer accepted a validated [`CameraFrame`].
+    Frame(CameraFrame),
+    /// A producer cleared every stored sample (glue detach).
+    Cleared,
+}
+
+/// A callback invoked with each [`StreamChange`]. Kept on the bus for its whole
+/// life (a live host lives for the whole app); keep it cheap and **non-reentrant**
+/// — calling `record_*`/`clear_samples` on the same bus from inside one recurses.
+type StreamListener = Arc<dyn Fn(&StreamChange) + Send + Sync>;
+
 pub struct LiveSensorProvider {
     cameras: std::sync::RwLock<Vec<CameraConfig>>,
     imu_rate_hz: AtomicU64,
     imu: ImuLatest,
     frames: FrameLatest,
+    /// Subscribers announced (outside any lock) on each accepted change.
+    listeners: Mutex<Vec<StreamListener>>,
+}
+
+impl std::fmt::Debug for LiveSensorProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `listeners` hold `Arc<dyn Fn>` values, which are not `Debug`; skip them.
+        f.debug_struct("LiveSensorProvider")
+            .field("cameras", &self.cameras)
+            .field("imu_rate_hz", &self.imu_rate_hz)
+            .field("imu", &self.imu)
+            .field("frames", &self.frames)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for LiveSensorProvider {
@@ -182,6 +220,7 @@ impl LiveSensorProvider {
             imu_rate_hz: AtomicU64::new(u64::from(imu_rate_hz)),
             imu: ImuLatest::new(),
             frames: FrameLatest::new(),
+            listeners: Mutex::new(Vec::new()),
         }
     }
 
@@ -199,13 +238,46 @@ impl LiveSensorProvider {
     /// Producer entry point: store the newest IMU sample (e.g. from an Android
     /// `SensorEventListener` / `ASensorEventQueue`, or a host motion generator).
     pub fn record_imu(&self, sample: ImuSample) {
-        self.imu.record(sample);
+        if self.imu.record(sample) {
+            self.notify(&StreamChange::Imu(sample));
+        }
     }
 
     /// Producer entry point: store the newest camera frame. The payload is
     /// validated against `cfg` before it is accepted.
     pub fn record_frame(&self, cfg: CameraConfig, bytes: Vec<u8>) -> Result<()> {
-        self.frames.record(cfg, bytes)
+        self.frames.record(cfg, bytes)?;
+        if let Some(frame) = self.frames.latest(cfg.id) {
+            self.notify(&StreamChange::Frame(frame));
+        }
+        Ok(())
+    }
+
+    /// Register `listener`, announced (after any store lock is released) whenever
+    /// a producer records a new IMU sample / camera frame or clears the samples on
+    /// this bus. Observers are kept for the life of the bus (a live host lives for
+    /// the whole app); use an internal sink if the effective handler must be
+    /// swapped later. A listener must not call `record_*` / `clear_samples` on the
+    /// same bus synchronously (it would recurse).
+    pub fn subscribe(&self, listener: StreamListener) {
+        self.listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(listener);
+    }
+
+    /// Announce `change` to every subscriber. The list is snapshotted under the
+    /// lock and invoked *outside* it, so a handler can never re-enter or deadlock
+    /// the mutex, and a slow handler does not stall another producer thread.
+    fn notify(&self, change: &StreamChange) {
+        let listeners: Vec<StreamListener> = self
+            .listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for listener in listeners {
+            listener(change);
+        }
     }
 
     /// Share the store with a component that needs to push from another thread
@@ -225,6 +297,7 @@ impl LiveSensorProvider {
     pub fn clear_samples(&self) {
         self.imu.clear();
         self.frames.clear_all();
+        self.notify(&StreamChange::Cleared);
     }
 }
 
@@ -461,5 +534,70 @@ mod tests {
         assert_eq!(p.camera_configs().len(), 1);
         p.record_frame(rear, vec![7u8; 64]).unwrap();
         assert!(p.frame_store().latest(CameraId::REAR).is_some());
+    }
+
+    #[test]
+    fn live_subscribers_see_accepted_imu_and_frame_changes() {
+        let rear = cam(CameraId::REAR, 16, 16, 30, PixelFormat::Rgba8);
+        let p = Arc::new(LiveSensorProvider::new(vec![rear], 200));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        p.subscribe(Arc::new(move |c: &StreamChange| {
+            sink.lock()
+                .unwrap_or_else(|g| g.into_inner())
+                .push(c.clone());
+        }));
+
+        p.record_imu(imu(7));
+        p.record_frame(rear, vec![9u8; 1024]).unwrap();
+        p.record_imu(imu(8));
+
+        let got = seen.lock().unwrap_or_else(|g| g.into_inner());
+        assert_eq!(got.len(), 3, "each accepted imu + frame announces");
+        match &got[0] {
+            StreamChange::Imu(s) => assert_eq!(s.timestamp_ms, 7),
+            _ => panic!("first change should be the IMU sample"),
+        }
+        match &got[1] {
+            StreamChange::Frame(f) => {
+                assert_eq!(f.camera, CameraId::REAR);
+                assert_eq!(f.seq, 1);
+                assert_eq!(f.bytes.len(), 1024);
+            }
+            _ => panic!("second change should be the camera frame"),
+        }
+    }
+
+    #[test]
+    fn live_does_not_announce_stale_or_invalid_pushes() {
+        let rear = cam(CameraId::REAR, 16, 16, 30, PixelFormat::Rgba8);
+        let p = Arc::new(LiveSensorProvider::new(vec![rear], 200));
+        let count = Arc::new(AtomicU64::new(0));
+        let sink = Arc::clone(&count);
+        p.subscribe(Arc::new(move |_: &StreamChange| {
+            sink.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        p.record_imu(imu(10)); // accepted
+        p.record_imu(imu(5)); // stale → dropped, no announce
+        assert!(p.record_frame(rear, vec![0u8; 3]).is_err()); // bad length, no announce
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn live_announces_clear_samples_to_subscribers() {
+        let rear = cam(CameraId::REAR, 4, 4, 30, PixelFormat::Rgba8);
+        let p = Arc::new(LiveSensorProvider::new(vec![rear], 200));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        p.subscribe(Arc::new(move |c: &StreamChange| {
+            sink.lock()
+                .unwrap_or_else(|g| g.into_inner())
+                .push(c.clone());
+        }));
+        p.record_imu(imu(1));
+        p.clear_samples();
+        let got = seen.lock().unwrap_or_else(|g| g.into_inner());
+        assert!(matches!(got.last(), Some(StreamChange::Cleared)));
     }
 }

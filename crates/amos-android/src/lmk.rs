@@ -25,7 +25,7 @@
 //! protected tier and must never become a reclaim candidate. Design & honest
 //! boundaries: `docs/lmk-proxy.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use amos_applife::{AppId, AppState};
@@ -225,6 +225,15 @@ struct Record {
     cached: bool,
     /// Monotonic "last active" sequence — larger = more recently used.
     seq: u64,
+    /// Opaque identities of the activities currently alive in this task (task
+    /// membership). Empty when the caller uses the legacy whole-task model.
+    /// A task is torn down only on the Destroy of its **last** live activity.
+    live: BTreeSet<String>,
+    /// The activity identity currently driving this task's *importance* (the
+    /// top). `None` in legacy whole-task mode (the single implicit activity).
+    /// Only Resume/Stop/Pause addressed at this top change importance; lifecycle
+    /// of non-top ("stopped sibling") activities must not demote the package.
+    top: Option<String>,
 }
 
 impl Record {
@@ -317,6 +326,8 @@ impl LmkProxy {
             service: false,
             cached: false,
             seq: 0,
+            live: BTreeSet::new(),
+            top: None,
         });
         if window_id.is_some() {
             rec.window_id = window_id;
@@ -326,6 +337,28 @@ impl LmkProxy {
         self.counter += 1;
         rec.seq = self.counter;
         Ok(rec.importance())
+    }
+
+    /// Adopt a previously-untracked package from an observed container lifecycle
+    /// event (post-restart re-sync, or an app foregrounded outside AmOS). Inserts
+    /// a fresh task at `activity` (no bound surface / service) and returns its
+    /// derived importance. The caller must only invoke this for packages not yet
+    /// tracked, so an existing record (with its window_id / service / recency)
+    /// is never silently overwritten.
+    pub fn adopt(&mut self, package_name: &str, activity: ActivityState) -> AppState {
+        self.counter += 1;
+        let rec = Record {
+            window_id: None,
+            activity,
+            service: false,
+            cached: false,
+            seq: self.counter,
+            live: BTreeSet::new(),
+            top: None,
+        };
+        let importance = rec.importance();
+        self.records.insert(AppId::new(package_name), rec);
+        importance
     }
 
     /// The focused top Activity regained focus (`onResume`). Requires a tracked
@@ -372,6 +405,145 @@ impl LmkProxy {
             return Err(LmkError::Unknown(package_name.to_string()));
         }
         Ok(())
+    }
+
+    // ---- Per-activity (identity) lifecycle — see resume/start/pause/stop/
+    // destroy_last below: importance & liveness are decoupled so stacked tasks
+    // with stopped siblings behave like a real Android task.
+
+    /// A fresh task for `package_name` at `state` (single implicit activity).
+    fn open_task(&mut self, package_name: &str, state: ActivityState) {
+        let id = AppId::new(package_name);
+        self.counter += 1;
+        self.records.insert(
+            id,
+            Record {
+                window_id: None,
+                activity: state,
+                service: false,
+                cached: false,
+                seq: self.counter,
+                live: BTreeSet::new(),
+                top: None,
+            },
+        );
+    }
+
+    /// `activity_id` became the resumed top (`onResume`): it drives importance as
+    /// foreground and is registered alive. Self-heals if the task was untracked.
+    pub fn resume_activity(&mut self, package_name: &str, activity_id: &str) -> Result<AppState> {
+        let id = AppId::new(package_name);
+        if !self.records.contains_key(&id) {
+            self.open_task(package_name, ActivityState::Resumed);
+        }
+        let rec = self
+            .records
+            .get_mut(&id)
+            .ok_or_else(|| LmkError::Unknown(package_name.to_string()))?;
+        rec.top = Some(activity_id.to_string());
+        rec.activity = ActivityState::Resumed;
+        rec.cached = false;
+        rec.live.insert(activity_id.to_string());
+        self.counter += 1;
+        rec.seq = self.counter;
+        Ok(rec.importance())
+    }
+
+    /// `activity_id` entered the task as *alive* (`onStart` / first observation)
+    /// without necessarily becoming the top. Liveness is what keeps the task up;
+    /// it only becomes top (visible) if nothing more important is on stage.
+    pub fn start_activity(&mut self, package_name: &str, activity_id: &str) -> Result<AppState> {
+        let id = AppId::new(package_name);
+        if !self.records.contains_key(&id) {
+            self.open_task(package_name, ActivityState::Started);
+        }
+        let rec = self
+            .records
+            .get_mut(&id)
+            .ok_or_else(|| LmkError::Unknown(package_name.to_string()))?;
+        rec.live.insert(activity_id.to_string());
+        if rec.top.is_none() || rec.activity == ActivityState::Stopped {
+            rec.top = Some(activity_id.to_string());
+            rec.activity = ActivityState::Started;
+            self.counter += 1;
+            rec.seq = self.counter;
+        }
+        Ok(rec.importance())
+    }
+
+    /// The top activity lost focus but stays visible (`onPause`). Only changes
+    /// importance when addressed at the current top; a paused non-top sibling
+    /// merely stays alive.
+    pub fn pause_activity(&mut self, package_name: &str, activity_id: &str) -> Result<AppState> {
+        let id = AppId::new(package_name);
+        if !self.records.contains_key(&id) {
+            self.open_task(package_name, ActivityState::Paused);
+        }
+        let rec = self
+            .records
+            .get_mut(&id)
+            .ok_or_else(|| LmkError::Unknown(package_name.to_string()))?;
+        rec.live.insert(activity_id.to_string());
+        if rec.top.as_deref() == Some(activity_id) {
+            rec.activity = ActivityState::Paused;
+            self.counter += 1;
+            rec.seq = self.counter;
+        }
+        Ok(rec.importance())
+    }
+
+    /// The top activity was hidden (`onStop`). Only demotes the package when
+    /// addressed at the current top; a stopped non-top sibling keeps the task
+    /// alive but must not change its (still-shown) importance.
+    pub fn stop_activity(&mut self, package_name: &str, activity_id: &str) -> Result<AppState> {
+        let id = AppId::new(package_name);
+        if !self.records.contains_key(&id) {
+            self.open_task(package_name, ActivityState::Stopped);
+        }
+        let rec = self
+            .records
+            .get_mut(&id)
+            .ok_or_else(|| LmkError::Unknown(package_name.to_string()))?;
+        rec.live.insert(activity_id.to_string());
+        if rec.top.as_deref() == Some(activity_id) {
+            rec.activity = ActivityState::Stopped;
+            self.counter += 1;
+            rec.seq = self.counter;
+        }
+        Ok(rec.importance())
+    }
+
+    /// Fold a `Destroy` of one live activity `activity_id`. Returns:
+    /// - `Ok(None)` when this was the task's **last** live activity (or the task
+    ///   was untracked / running in legacy whole-task mode) — the task is gone;
+    /// - `Ok(Some(state))` when other activities remain alive — the task survives
+    ///   at `state`. If the destroyed activity was the top, the task stays alive
+    ///   (a stopped sibling remains) and is demoted to a visible placeholder
+    ///   rather than torn down (finishing a stacked/sub activity must not kill
+    ///   the app, nor may we keep claiming a foreground we can't back up).
+    pub fn destroy_last(
+        &mut self,
+        package_name: &str,
+        activity_id: &str,
+    ) -> Result<Option<AppState>> {
+        let id = AppId::new(package_name);
+        let Some(rec) = self.records.get_mut(&id) else {
+            return Ok(None); // untracked → already gone
+        };
+        rec.live.remove(activity_id);
+        if rec.live.is_empty() {
+            self.records.remove(&id);
+            return Ok(None);
+        }
+        // Other live activities remain (e.g. a stopped sibling). If the destroyed
+        // one was the top, point at a survivor and demote to a visible baseline.
+        if rec.top.as_deref() == Some(activity_id) {
+            rec.top = rec.live.iter().next().cloned();
+            rec.activity = ActivityState::Started;
+            self.counter += 1;
+            rec.seq = self.counter;
+        }
+        Ok(Some(rec.importance()))
     }
 
     /// Promote a running process to a user-perceptible foreground service
@@ -738,5 +910,63 @@ mod tests {
         ] {
             assert_eq!(host_state(s), s, "{s:?}");
         }
+    }
+
+    #[test]
+    fn adopt_creates_a_task_at_the_given_activity_and_tier() {
+        let mut p = LmkProxy::new();
+        // Adopt an untracked package from the lifecycle event it implies.
+        assert_eq!(
+            p.adopt("com.tencent.mm", ActivityState::Resumed),
+            AppState::Foreground
+        );
+        assert_eq!(p.adopt("com.a.b", ActivityState::Paused), AppState::Visible);
+        assert_eq!(
+            p.adopt("com.c.d", ActivityState::Stopped),
+            AppState::Background
+        );
+        assert_eq!(p.len(), 3);
+
+        let snap = p.snapshot();
+        let mm = snap
+            .iter()
+            .find(|t| t.package_name == "com.tencent.mm")
+            .unwrap();
+        // Adopted tasks carry no bound surface yet and are not service-promoted.
+        assert_eq!(mm.window_id, None);
+        assert_eq!(mm.activity, ActivityState::Resumed);
+        assert_eq!(mm.state, AppState::Foreground);
+    }
+
+    #[test]
+    fn adopt_overwrites_unconditionally_and_advances_recency() {
+        let mut p = LmkProxy::new();
+        // adopt() overwrites the key blindly by design; dispatch() gates it behind
+        // contains() so a tracked task is never adopted over. Pin that primitive
+        // contract here so a future caller can't misuse it silently.
+        let _ = p.launch("com.tencent.mm", Some("legacy:w".into()));
+        assert_eq!(p.window_id("com.tencent.mm").as_deref(), Some("legacy:w"));
+        let _ = p.adopt("com.tencent.mm", ActivityState::Stopped);
+        assert_eq!(
+            p.window_id("com.tencent.mm"),
+            None,
+            "adopt over a tracked task drops its surface (caller must gate it)"
+        );
+        assert_eq!(
+            p.importance("com.tencent.mm").unwrap(),
+            AppState::Background
+        );
+
+        // adopt() bumps the LRU recency (seq) like a launch, so an adopted
+        // background app is a real reclaim candidate under Critical pressure.
+        p.adopt("com.third", ActivityState::Stopped);
+        let victims = p.plan(MemoryPressure::Critical, 10);
+        assert!(
+            victims
+                .victims
+                .iter()
+                .any(|v| v.package_name == "com.third"),
+            "adopted background task is reclaimable"
+        );
     }
 }

@@ -17,10 +17,11 @@
 //! ```
 //!
 //! * On an Android build the facade opens the **real** device mic:
-//!   `AAudioCapture` (the low-latency app path the AI assistant uses) when the
-//!   `aaudio` feature is compiled in — preferred — otherwise `TinyAlsaCapture`
-//!   (the system/TinyALSA seam) behind `tinyalsa`. It asks for 16 kHz so the
-//!   resident worker needs no down-sampling.
+//!   `AAudioCallbackCapture` (the low-latency app path the AI assistant uses,
+//!   driven by AAudio's real-time data callback) when the `aaudio` feature is
+//!   compiled in — preferred — otherwise `TinyAlsaCapture` (the system/TinyALSA
+//!   seam) behind `tinyalsa`. It asks for 16 kHz so the resident worker needs no
+//!   down-sampling.
 //! * On a host build there is **no native mic**: [`PlatformMic::open_device`]
 //!   returns a clear error rather than silently fabricating audio (honesty rule —
 //!   never mistake a host mock for a real microphone). Hosts and demos that want a
@@ -134,8 +135,13 @@ impl PlatformMic {
     pub fn open_device() -> Result<Self, AudioError> {
         #[cfg(all(feature = "aaudio", target_os = "android"))]
         {
-            let cap = crate::AAudioCapture::open(crate::spec::ASR_SAMPLE_RATE)?;
-            return Ok(Self::boxed(PlatformMicKind::Aaudio, cap));
+            // Prefer the data-callback capture (the AAudio "hardware sampling
+            // callback" pushes samples on AAudio's real-time thread into a ring
+            // that `read` drains) — the model the always-on voice worker wants.
+            // `AAudioCapture` (blocking `AAudioStream_read`) remains available for
+            // callers that explicitly prefer the pull model.
+            let cap = crate::AAudioCallbackCapture::open(crate::spec::ASR_SAMPLE_RATE)?;
+            Ok(Self::boxed(PlatformMicKind::Aaudio, cap))
         }
         #[cfg(all(
             all(feature = "tinyalsa", target_os = "android"),
@@ -143,7 +149,7 @@ impl PlatformMic {
         ))]
         {
             let cap = crate::TinyAlsaCapture::open(crate::spec::ASR_SAMPLE_RATE)?;
-            return Ok(Self::boxed(PlatformMicKind::TinyAlsa, cap));
+            Ok(Self::boxed(PlatformMicKind::TinyAlsa, cap))
         }
         #[cfg(not(any(
             all(feature = "aaudio", target_os = "android"),

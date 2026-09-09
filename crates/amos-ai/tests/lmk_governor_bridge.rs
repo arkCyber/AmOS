@@ -52,6 +52,7 @@ async fn container_lifecycle_and_kill_reflect_into_shared_governor() {
         .on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();

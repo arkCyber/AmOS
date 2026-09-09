@@ -5,6 +5,7 @@ import {
   bytesToDataUri,
   displayName,
   readRecents,
+  runTierForPackage,
 } from "../lib/android";
 import { getAndroidAppIcon, getAndroidApps, launchAndroidApp } from "../lib/backend";
 
@@ -52,6 +53,29 @@ describe("android helpers", () => {
   test("displayName prefers name over package", () => {
     expect(displayName({ name: "WeChat", package_name: "com.tencent.mm" })).toBe("WeChat");
     expect(displayName({ package_name: "com.tencent.mm" })).toBe("com.tencent.mm");
+  });
+
+  test("runTierForPackage classifies running, background and absent packages", () => {
+    const tasks = [
+      { package_name: "com.tencent.mm", window_id: "w1", state: "foreground" },
+      { package_name: "com.a.b", window_id: "w2", state: "cached" },
+      { package_name: "com.c.d", window_id: "w3", state: "visible" },
+      { package_name: "com.e.f", window_id: "w4", state: "foreground_service" },
+    ];
+    expect(runTierForPackage("com.tencent.mm", tasks)).toBe("running");
+    expect(runTierForPackage("com.a.b", tasks)).toBe("background");
+    expect(runTierForPackage("com.c.d", tasks)).toBe("running");
+    expect(runTierForPackage("com.e.f", tasks)).toBe("running");
+    expect(runTierForPackage("com.not.running", tasks)).toBeNull();
+  });
+
+  test("runTierForPackage treats stopped/unknown as no indicator", () => {
+    const tasks = [
+      { package_name: "com.tencent.mm", window_id: "w1", state: "stopped" },
+      { package_name: "com.weird", window_id: "w2", state: "mystate" },
+    ];
+    expect(runTierForPackage("com.tencent.mm", tasks)).toBeNull();
+    expect(runTierForPackage("com.weird", tasks)).toBeNull();
   });
 });
 

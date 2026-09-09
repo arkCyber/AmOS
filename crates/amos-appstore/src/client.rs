@@ -469,12 +469,7 @@ impl<P: StoreProvider> AppStore<P> {
     }
 
     /// Stage + silently commit an already-verified APK through the bridge.
-    fn commit_apk(
-        &self,
-        manifest: &AppManifest,
-        mode: InstallMode,
-        bytes: &[u8],
-    ) -> Result<()> {
+    fn commit_apk(&self, manifest: &AppManifest, mode: InstallMode, bytes: &[u8]) -> Result<()> {
         let bridge = self.silent_bridge()?;
         let req = InstallRequest {
             // The catalog id doubles as the Android package name for APK apps; a
@@ -551,10 +546,10 @@ fn check_publisher(manifest: &AppManifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::android::{Posture, SideloadOnlyBridge};
     use crate::model::{AppCategory, AppStatus, PackageFormat, PackageRef};
     use crate::provider::MockStoreProvider;
+    use async_trait::async_trait;
 
     fn app(id: &str, name: &str, ver: &str) -> AppManifest {
         AppManifest {
@@ -1010,7 +1005,8 @@ mod tests {
     #[tokio::test]
     async fn install_apk_refuses_a_web_bundle_catalog_entry() {
         let p = MockStoreProvider::new();
-        p.add(app("org.amos.web", "Web", "1.0.0"), b"tgz".to_vec()).unwrap();
+        p.add(app("org.amos.web", "Web", "1.0.0"), b"tgz".to_vec())
+            .unwrap();
         let store = AppStore::new(p)
             .with_android_bridge(Arc::new(SideloadOnlyBridge::new(Posture::oem_platform())));
         let err = store.install_apk("org.amos.web").await.unwrap_err();

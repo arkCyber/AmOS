@@ -67,6 +67,15 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
             PackageManager.PERMISSION_GRANTED
         if (!granted) return // caller must request CAMERA first
 
+        // Advertise the NV21 preview config we are about to push so the host's
+        // snapshot lists this camera and reads can serve it. Guarded: missing
+        // `android` native feature must never crash the camera producer.
+        try {
+            advertiseCamera(cameraNumber, w, h, PREVIEW_FPS)
+        } catch (t: Throwable) {
+            Log.w(TAG, "camera advertise unavailable: ${t.javaClass.simpleName}")
+        }
+
         try {
             cm.openCamera(id, stateCallback, handler)
         } catch (e: Exception) {
@@ -104,6 +113,13 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
         fps: Int,
         bytes: ByteArray,
     )
+
+    /**
+     * Advertise the NV21 preview config this producer will push, so the host lists
+     * the camera as available. Rust: `Java_com_amos_ai_glue_CameraGlue_advertiseCamera`
+     * (see android_glue.rs).
+     */
+    external fun advertiseCamera(cameraId: Int, width: Int, height: Int, fps: Int)
 
     override fun onImageAvailable(reader: ImageReader) {
         val image = reader.acquireLatestImage() ?: return

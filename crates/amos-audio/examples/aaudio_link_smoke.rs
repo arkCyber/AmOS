@@ -25,6 +25,10 @@ fn main() {
         // recorded at this stage.
         let _ = amos_audio::AAudioCapture::open(amos_audio::ASR_SAMPLE_RATE);
         let _ = amos_audio::AAudioSink::open(amos_audio::ASR_SAMPLE_RATE);
+        // The data-callback path pulls in the AAudioStreamBuilder_setDataCallback /
+        // setFramesPerDataCallback externs too, so this link gate proves those
+        // resolve against libaaudio.so as well as the blocking-read ones.
+        let _ = amos_audio::AAudioCallbackCapture::open(amos_audio::ASR_SAMPLE_RATE);
     }
     #[cfg(not(target_os = "android"))]
     {

@@ -56,3 +56,32 @@ export function bytesToDataUri(bytes: ArrayLike<number>): string {
 export function displayName(a: { name?: string; package_name: string }): string {
   return a.name || a.package_name;
 }
+
+/** How a launched package is surfaced in the grid: actively used vs. parked. */
+export type AndroidRunTier = "running" | "background";
+
+/**
+ * Classify a package's container lifecycle tier for UI surfacing, from the
+ * daemon's live LMK snapshot (`android_lmk_tasks`, mirror of `GetLmkSnapshot`):
+ * focused / visible / foreground-service tasks are "running"; frozen ("cached")
+ * or plain background tasks are "background". Absent or stopped / unknown →
+ * `null` (no indicator), so the tile never lies about an app being alive.
+ */
+export function runTierForPackage(
+  pkg: string,
+  tasks: { package_name: string; state: string }[],
+): AndroidRunTier | null {
+  const task = tasks.find((t) => t.package_name === pkg);
+  if (!task) return null;
+  switch (task.state) {
+    case "foreground":
+    case "visible":
+    case "foreground_service":
+      return "running";
+    case "background":
+    case "cached":
+      return "background";
+    default:
+      return null; // stopped / unknown → nothing to show
+  }
+}

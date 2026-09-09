@@ -37,6 +37,7 @@
   import { startReminderWatcher } from "./osReminderWatcher";
   import { startOsAutoOff } from "./osAutoOff";
   import { startOsInputBridge, startOsHardwarePoll } from "./osInputBridge";
+  import { startLmkSurfaceWatcher, startPeriodicReconcile } from "../lib/lmk";
   import HomeDock from "./HomeDock.svelte";
   import EditHome from "./EditHome.svelte";
   import AppLibrary from "./AppLibrary.svelte";
@@ -152,6 +153,10 @@
 
   let ready = $state(false);
   let stopWatchers: Array<() => void> = [];
+  // Async LMK surface-watch unsubscribe (resolved after onMount returns), released
+  // in onDestroy — also released immediately if unmount beats the resolution.
+  let stopLmkWatch = () => {};
+  let lmkDisposed = false;
   onMount(() => {
     ready = true;
     // Pure-Svelte host: surface a running countdown's "time's up" and a due alarm
@@ -160,7 +165,11 @@
       const s = surface();
       return s.kind === "app" ? s.id : null;
     };
+    // Keep `legacy:*` external surfaces consistent with the daemon's authoritative
+    // container LMK snapshot (parity with the React shell's startup wiring): tear
+    // down surfaces the container reclaimed/destroyed and reconcile periodically.
     stopWatchers = [
+      startPeriodicReconcile(),
       startTimerWatcher(getActive),
       startAlarmWatcher(getActive),
       startReminderWatcher(getActive),
@@ -172,8 +181,14 @@
         onNav: (a) => (a === "home" ? goHome() : open("ai")),
       }),
     ];
+    void startLmkSurfaceWatcher().then((stop) => {
+      if (lmkDisposed) stop();
+      else stopLmkWatch = stop;
+    });
   });
   onDestroy(() => {
+    lmkDisposed = true;
+    stopLmkWatch();
     stopWatchers.forEach((stop) => stop());
   });
 

@@ -82,6 +82,7 @@ async fn host_reclaim_drives_container_force_stop_for_managed_apps_only() {
         .on_activity(Request::new(ActivityEventRequest {
             package_name: "com.tencent.mm".into(),
             event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
         }))
         .await
         .unwrap();

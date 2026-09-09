@@ -41,12 +41,14 @@ impl Default for AndroidManagerConfig {
     }
 }
 
-/// Icon cache entry with metadata.
+/// Icon cache entry with metadata. `last_used` is touched on every hit so the
+/// eviction policy is a genuine LRU (least-recently-used by access), not FIFO by
+/// insertion — a hot icon is never evicted just because it was cached first.
 #[derive(Debug, Clone)]
 struct CacheEntry {
     png_data: Vec<u8>,
     access_count: usize,
-    created_at: std::time::Instant,
+    last_used: std::time::Instant,
 }
 
 /// Enhanced Android manager with production features.
@@ -200,6 +202,7 @@ impl EnhancedAndroidManager {
             let mut cache = self.icon_cache.write().await;
             if let Some(entry) = cache.get_mut(package_name) {
                 entry.access_count += 1;
+                entry.last_used = std::time::Instant::now();
                 tracing::debug!("icon cache hit: {}", package_name);
                 return Ok(Some(entry.png_data.clone()));
             }
@@ -221,15 +224,16 @@ impl EnhancedAndroidManager {
 
         match result {
             Ok(Ok(Some(png_data))) => {
-                // Store in cache.
-                {
+                // Store in cache (skip entirely when the cache is disabled, so a
+                // capacity of 0 genuinely caches nothing rather than holding 1).
+                if self.config.icon_cache_size > 0 {
                     let mut cache = self.icon_cache.write().await;
 
-                    // Evict oldest entry if cache is full.
+                    // Evict the least-recently-used entry when at capacity.
                     if cache.len() >= self.config.icon_cache_size {
                         if let Some(oldest_key) = cache
                             .iter()
-                            .min_by_key(|(_, entry)| entry.created_at)
+                            .min_by_key(|(_, entry)| entry.last_used)
                             .map(|(k, _)| k.clone())
                         {
                             cache.remove(&oldest_key);
@@ -242,7 +246,7 @@ impl EnhancedAndroidManager {
                         CacheEntry {
                             png_data: png_data.clone(),
                             access_count: 1,
-                            created_at: std::time::Instant::now(),
+                            last_used: std::time::Instant::now(),
                         },
                     );
                 }
@@ -417,6 +421,53 @@ mod tests {
 
         let stats = manager.cache_stats().await;
         assert_eq!(stats.entries, 2); // Still 2, oldest was evicted
+    }
+
+    #[tokio::test]
+    async fn icon_cache_evicts_lru_not_oldest_inserted() {
+        let runtime = Arc::new(DemoRuntime::new());
+        let config = AndroidManagerConfig {
+            icon_cache_size: 2,
+            ..Default::default()
+        };
+        let manager = EnhancedAndroidManager::with_config(runtime, config);
+
+        // Fill to capacity: mm (inserted first), then aweme.
+        manager.get_icon("com.tencent.mm").await.unwrap();
+        manager.get_icon("com.ss.android.ugc.aweme").await.unwrap();
+        // Touch mm again -> it is now the most-recently-used; aweme is the LRU.
+        manager.get_icon("com.tencent.mm").await.unwrap();
+
+        // Inserting a third must evict aweme (least-recently-used), NOT mm — even
+        // though mm was inserted first (this is what makes it LRU, not FIFO).
+        manager.get_icon("com.taobao.taobao").await.unwrap();
+
+        let cache = manager.icon_cache.read().await;
+        assert!(
+            cache.contains_key("com.tencent.mm"),
+            "a hot icon must survive a cache fill"
+        );
+        assert!(cache.contains_key("com.taobao.taobao"));
+        assert!(
+            !cache.contains_key("com.ss.android.ugc.aweme"),
+            "the least-recently-used entry is the one evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn icon_cache_disabled_when_capacity_is_zero() {
+        let runtime = Arc::new(DemoRuntime::new());
+        let config = AndroidManagerConfig {
+            icon_cache_size: 0,
+            ..Default::default()
+        };
+        let manager = EnhancedAndroidManager::with_config(runtime, config);
+
+        manager.get_icon("com.tencent.mm").await.unwrap();
+
+        let stats = manager.cache_stats().await;
+        assert_eq!(stats.entries, 0, "capacity 0 must not cache anything");
+        assert_eq!(stats.capacity, 0);
     }
 
     #[tokio::test]

@@ -25,6 +25,14 @@ fn audio(bytes: &[u8]) -> ClientMessage {
     }
 }
 
+/// The client-side "done speaking" signal the resident voice worker sends: force
+/// the recognizer to finalize whatever was streamed so far.
+fn audio_end() -> ClientMessage {
+    ClientMessage {
+        payload: Some(Payload::AudioEnd(true)),
+    }
+}
+
 fn model_dir() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/sherpa-en-20m");
     p.join("tokens.txt").exists().then_some(p)
@@ -156,4 +164,79 @@ fn f32le(samples: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&s.to_le_bytes());
     }
     out
+}
+
+/// Same real-sherpa daemon, but the utterance is finalized the way the **resident
+/// voice worker** finalizes it: stream `Payload::Audio` during speech, then send an
+/// explicit `Payload::AudioEnd` on the trailing-silence gate (this is exactly what
+/// `amos-tauri`'s `spawn_resident_capture` / `assistant_voice_end` send) — rather
+/// than waiting on sherpa's own VAD/endpoint like the test above. Proves the
+/// daemon's `AudioEnd → ChatAsr::finish()` force-finalize path works against a real
+/// local recognizer, not just the deterministic mock. Combined with
+/// `assistant_voice_e2e` (the worker sending these exact frames to a daemon), this
+/// closes the host "capture worker → real sherpa" loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn bidi_audio_real_sherpa_finalizes_on_explicit_audio_end() {
+    let Some(dir) = model_dir() else {
+        eprintln!("skip: sherpa model files not present");
+        return;
+    };
+
+    let bytes = std::fs::read(dir.join("test_wavs/0.wav")).expect("demo wav readable");
+    let (_rate, samples) = amos_asr::sherpa::decode_pcm16_wav(&bytes).expect("wav decodes to PCM");
+    assert!(!samples.is_empty(), "wav has audio");
+
+    std::env::set_var("AMOS_ASR_BACKEND", "sherpa");
+    std::env::set_var("AMOS_SHERPA_MODEL_DIR", &dir);
+
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-bidi-sherpa-audioend-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        amos_ai::server::serve(server_path).await.unwrap();
+    });
+    for _ in 0..100 {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let mut client = connect(&path).await.expect("connect");
+    let (tx, rx) = mpsc::channel(512);
+    let mut stream = client
+        .chat(ReceiverStream::new(rx))
+        .await
+        .expect("open bidi chat")
+        .into_inner();
+
+    // Stream the whole utterance in 400 ms (6400-sample) wire frames — the same
+    // cadence sherpa's decoder needs and what a resident worker would push from a
+    // mic — then the worker's "done speaking" release signal.
+    for chunk in samples.chunks(6400) {
+        tx.send(audio(&f32le(chunk)))
+            .await
+            .expect("send audio frame");
+    }
+    tx.send(audio_end())
+        .await
+        .expect("send AudioEnd (worker release)");
+
+    let (full, done) =
+        collect_until_done_or_timeout(&mut stream, std::time::Duration::from_secs(60)).await;
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        done,
+        "AudioEnd-finalized turn must end with a done frame; got: {full:?}"
+    );
+    assert!(
+        full.to_uppercase().contains("YELLOW"),
+        "AudioEnd-finalized turn should reference the real sherpa transcript; got: {full:?}"
+    );
 }

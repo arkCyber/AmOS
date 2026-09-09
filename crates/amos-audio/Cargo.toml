@@ -38,3 +38,11 @@ required-features = []
 name = "aaudio_link_smoke"
 required-features = ["aaudio"]
 
+# Build-only *and* run-time probe for the AAudio data-callback capture: opens the
+# mic through `AAudioCallbackCapture` and reads real samples. Used in device
+# bring-up to confirm the real-time callback fires. Android-only (cfg'd no-op on a
+# host), so it never touches the default workspace build.
+[[example]]
+name = "aaudio_callback_probe"
+required-features = ["aaudio"]
+

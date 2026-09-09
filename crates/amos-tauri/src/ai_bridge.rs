@@ -702,9 +702,20 @@ pub struct AndroidLaunchResult {
     pub success: bool,
     pub window_id: String,
     /// Window label the surface was registered under in the window manager
-    /// (e.g. `legacy:<window_id>`); empty if the launch failed.
+    /// (e.g. `legacy:<window_id>`); empty if the launch failed (or returned no
+    /// window id), so the shell can tell "registered" from "not registered".
     pub window_label: String,
     pub error: String,
+}
+
+/// The external WM surface label for a container launch — `Some("legacy:<id>")`
+/// **only** when the container actually started the app and gave back a real
+/// window id. A failed launch (or a success that returned no id) yields `None`
+/// so the WM never registers a bogus empty `legacy:` System window for an app
+/// that did not start. Mirrors the daemon's `AppLaunchResponse` semantics
+/// (`service.rs`: `success=false → window_id=""`).
+fn legacy_surface_label(success: bool, window_id: &str) -> Option<String> {
+    (success && !window_id.is_empty()).then(|| format!("legacy:{window_id}"))
 }
 
 /// Tauri command: list installed Android apps (from the container runtime).
@@ -760,8 +771,13 @@ pub async fn launch_android_app(
                 // Register the launched legacy app as an *external* System window
                 // in the window manager (no WebviewWindow is created; the surface
                 // is composited separately by Waydroid). Focus/z-order are tracked.
-                let label = format!("legacy:{}", r.window_id);
-                let _ = wm.open_surface(&label);
+                // Only a *successful* launch (with a real window id) opens a
+                // surface — a failed launch must not leave a stale `legacy:`
+                // System window behind.
+                let label = legacy_surface_label(r.success, &r.window_id).unwrap_or_default();
+                if !label.is_empty() {
+                    let _ = wm.open_surface(&label);
+                }
                 return Ok(AndroidLaunchResult {
                     success: r.success,
                     window_id: r.window_id,
@@ -859,7 +875,7 @@ pub async fn android_lmk_tasks(
 
 #[cfg(test)]
 mod tests {
-    use super::merge_system_selection;
+    use super::{legacy_surface_label, merge_system_selection};
     use crate::clipboard::GlobalClipboard;
     use crate::wm::SystemContext;
     use std::collections::HashMap;
@@ -900,5 +916,28 @@ mod tests {
         let mut out = HashMap::new();
         merge_system_selection(&ctx, "ai", &clip, &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn legacy_label_from_successful_launch() {
+        assert_eq!(
+            legacy_surface_label(true, "waydroid_com.tencent.mm"),
+            Some("legacy:waydroid_com.tencent.mm".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_label_none_when_container_launch_failed() {
+        // Daemon returns success=false (and an empty window_id) for a failed
+        // launch — we must NOT register a stale empty `legacy:` System surface.
+        assert_eq!(legacy_surface_label(false, ""), None);
+        assert_eq!(legacy_surface_label(false, "waydroid_x"), None);
+    }
+
+    #[test]
+    fn legacy_label_none_when_success_has_no_window_id() {
+        // Defensive: a success that somehow carried no window id must not map to
+        // the degenerate `legacy:` label either.
+        assert_eq!(legacy_surface_label(true, ""), None);
     }
 }

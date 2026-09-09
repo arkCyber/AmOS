@@ -11,6 +11,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod activity_observer;
 pub mod capability;
 pub mod controller;
 pub mod lmk;

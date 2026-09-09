@@ -82,8 +82,17 @@ cargo build -p amos-audio --features aaudio  --target aarch64-linux-android --re
 - `TinyAlsaCapture/Sink`：绑 `libtinyalsa` PCM（card 0 / device 0）。普通 app 无法直开
   `/dev/snd`；它面向 AOSP 系统组件 / 通话语音流位置（仍需 HAL 路由钩子才能拦通话）。
 - `AAudioCapture/Sink`：绑 NDK `libaaudio`，app 侧实时听麦的可行路径（AI 助手常驻监听用）。
+  其中 **`AAudioCallbackCapture`**（`aaudio.rs` 新增）改走 AAudio 的**真实 data
+  callback**（`AAudioStreamBuilder_setDataCallback`）——硬件在其实时线程把采样**推**给
+  一个宿主可测的有界 `SampleRing`（`ring.rs`），`AudioCapture::read` 只从该 ring 拉取；
+  `source::PlatformMic::open_device()` 的 aaudio 分支**默认**用它（`AAudioCapture`
+  的阻塞 `read` 拉模式仍保留为显式选择）。`unsafe impl Send`（单所有者移交）。
 - 这两个模块是手写 `extern`（无 bindgen/三方原生依赖），需在 NDK 交叉构建与真机
-  bring-up 时编译/联调；CI 的 Linux/macOS host 只保证其余 crate。
+  bring-up 时编译/联调；CI 的 Linux/macOS host 只保证其余 crate。Android 侧 clippy
+  与 NDK 链接由本仓库门禁覆盖（`aaudio_link_smoke` 亦引用回调 capture 以解析其 FFI）。
+- 另有一个**真机运行时探针** example `aaudio_callback_probe`（host 上 cfg no-op）：在设备上
+  真开 `AAudioCallbackCapture` 读 ~1 s 采样并打印到达样数/峰值/EOF 诊断，用于 bring-up 时
+  先单独确认 data-callback 在出样，再接 System UI（纳入 `scripts/android-audio-check.sh` 门禁）。
 
 ## System UI 侧：常驻听麦流式推送（2026-09-04）
 
@@ -129,7 +138,9 @@ cargo build -p amos-audio --features aaudio  --target aarch64-linux-android --re
 - 在 AI 应用 UI 上落一个"常驻听麦"控件：`VoiceMicButton` 改用
   `assistantVoiceStart/Feed/End` 流式推 `Payload::Audio`（替代整段 WAV `transcribe_audio`），
   并订阅 `assistant-voice-event` 渲染中间/最终回复。
-- **设备 AAudio 采集线程（`amos-audio`）真正喂进 `assistant_voice_feed`。**
+- ~~设备 AAudio 采集线程真正喂进 `assistant_voice_feed`~~（已在代码面落地：AAudio **data-callback**
+  采集 seam `AAudioCallbackCapture` + 宿主可测 `SampleRing` + `PlatformMic::open_device()`
+  默认走回调；剩余为**真机 bring-up 运行时**验收，见下文）。
 - 逐句语义卡等 UI 中间态（`AudioEnd` 的 wire 语义已落地）。
 
 ## 平台麦克风 facade：把设备 seam 接进常驻管线（2026-09-04，Option-A seam）
@@ -167,7 +178,22 @@ cargo build -p amos-audio --features aaudio  --target aarch64-linux-android --re
   语音+尾静音捕获走真实 `spawn_resident_capture`，断言 `Audio` 流出、`AudioEnd` 收句、
   `submitted()==1`（无需 daemon/设备）。
 
-**验收（设备 bring-up）**：Android/NDK 交叉构建 `cargo build -p amos-audio --features aaudio
---target aarch64-linux-android` 后，System UI 在 `PlatformMic::open_device()` 上跑
-`VoiceLink::spawn_resident`，对着真机麦说话 → sherpa 真实转写作答、`get_status.asr` 报 sherpa。
-host 只能保证上述 seam 可编译、可单测；设备端行为仍需真机验收（诚实边界不变）。
+**验收（设备 bring-up）**：
+1. 门禁（本机/CI 已验证，无真机也可跑）：
+   ```bash
+   cargo test -p amos-audio                                   # host 24 passed（含 ring 6）
+   cargo clippy -p amos-audio --all-targets -- -D warnings    # host 干净
+   cargo clippy --target aarch64-linux-android -p amos-audio --features aaudio --all-targets -- -D warnings  # 干净
+   cargo ndk -t arm64-v8a -P 26 build -p amos-audio --features aaudio --example aaudio_link_smoke
+   # ↑ 链接通过 ⇒ 回调 seam 的 AAudioStreamBuilder_setDataCallback/setFramesPerDataCallback 对 libaaudio.so 可解析
+   cargo ndk -t arm64-v8a -P 26 build -p amos-audio --features aaudio --example aaudio_callback_probe
+   # ↑ 运行时探针 example 亦须编译+链接（bash scripts/android-audio-check.sh 一并覆盖）
+   ```
+2. 真机：**先**跑探针 `aaudio_callback_probe` 单测 data-callback 是否出样（读 ~1 s 打印样数/峰值），
+   再跑 System UI（带 `amos-tauri --features android` + `amos-audio --features aaudio` 的 APK）
+   在 `PlatformMic::open_device()`（现在默认开 `AAudioCallbackCapture`，AAudio 实时 data-callback 推采样）
+   上跑 `device_mic_start` / `VoiceLink::spawn_resident`；开麦前先授予 `RECORD_AUDIO`。对着真机麦说话 →
+   回调把采样推进 `SampleRing`、resident 采集线程经 `assistant_voice_feed`/`Payload::Audio` 推到 daemon →
+   sherpa 真实转写并作答、`get_status.asr` 报 sherpa。看 `device_mic_status.submitted` 递增即回调→管线在走。
+   诚实边界：host 只能保证 seam 可编译、可 clippy、可链接、可单测（ring 桥接逻辑已单测）；**回调的运行时
+   采样正确性、线程优先级、权限与延迟只能由上述真机步骤验收**，仓库不伪造设备行为。

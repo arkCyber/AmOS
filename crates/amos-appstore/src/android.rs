@@ -55,8 +55,7 @@ pub const REQUEST_INSTALL_PACKAGES_PERMISSION: &str = "android.permission.REQUES
 pub const PRIV_APP_DIR: &str = "/system/priv-app/AmosStore";
 
 /// `privapp-permissions.xml` allow-list file that must carry the store package.
-pub const PRIVAPP_PERMISSIONS_XML: &str =
-    "/system/etc/permissions/privapp-permissions-amos.xml";
+pub const PRIVAPP_PERMISSIONS_XML: &str = "/system/etc/permissions/privapp-permissions-amos.xml";
 
 // ---------------------------------------------------------------------------
 // PackageInstaller constants we mirror from the *public* Android SDK
@@ -168,12 +167,8 @@ pub fn valid_android_package(pkg: &str) -> bool {
     if pkg.is_empty() {
         return false;
     }
-    pkg.split('.').all(|seg| {
-        !seg.is_empty()
-            && seg
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+    pkg.split('.')
+        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// Outcome of a session [`PackageInstallerBridge::commit`].
@@ -308,15 +303,15 @@ impl Posture {
                 "store is sideloaded: preinstall it under /system/priv-app signed with \
                  the platform key (see android::preconditions)",
             ),
-            Privilege::PlatformPrivileged if !self.has_install_packages => Some(
-                "priv-app lacks INSTALL_PACKAGES: add it to privapp-permissions.xml",
-            ),
+            Privilege::PlatformPrivileged if !self.has_install_packages => {
+                Some("priv-app lacks INSTALL_PACKAGES: add it to privapp-permissions.xml")
+            }
             Privilege::PlatformPrivileged if !self.platform_signed => {
                 Some("priv-app is not signed with the platform key")
             }
-            Privilege::PlatformPrivileged => Some(
-                "priv-app not allow-listed in privapp-permissions.xml (Android 9+)",
-            ),
+            Privilege::PlatformPrivileged => {
+                Some("priv-app not allow-listed in privapp-permissions.xml (Android 9+)")
+            }
             Privilege::DeviceOwnerPrivileged => {
                 Some("device-owner store does not hold INSTALL_PACKAGES")
             }
@@ -607,15 +602,27 @@ mod tests {
     #[test]
     fn install_mode_code_roundtrips() {
         assert_eq!(InstallMode::Full.code(), INSTALL_MODE_FULL);
-        assert_eq!(InstallMode::InheritExisting.code(), INSTALL_MODE_INHERIT_EXISTING);
-        assert_eq!(InstallMode::from_code(INSTALL_MODE_FULL), Some(InstallMode::Full));
-        assert_eq!(InstallMode::from_code(2), Some(InstallMode::InheritExisting));
+        assert_eq!(
+            InstallMode::InheritExisting.code(),
+            INSTALL_MODE_INHERIT_EXISTING
+        );
+        assert_eq!(
+            InstallMode::from_code(INSTALL_MODE_FULL),
+            Some(InstallMode::Full)
+        );
+        assert_eq!(
+            InstallMode::from_code(2),
+            Some(InstallMode::InheritExisting)
+        );
         assert_eq!(InstallMode::from_code(99), None);
     }
 
     #[test]
     fn status_codes_map_to_names() {
-        assert_eq!(status_name(STATUS_PENDING_USER_ACTION), "pending user action");
+        assert_eq!(
+            status_name(STATUS_PENDING_USER_ACTION),
+            "pending user action"
+        );
         assert_eq!(status_name(STATUS_SUCCESS), "success");
         assert_eq!(status_name(-1234), "unknown status");
     }
@@ -655,7 +662,9 @@ mod tests {
 
         // Full OEM platform posture: silent.
         assert!(Posture::oem_platform().can_silent_commit());
-        assert!(Privilege::PlatformPrivileged.api_level().allows_silent_commit());
+        assert!(Privilege::PlatformPrivileged
+            .api_level()
+            .allows_silent_commit());
 
         // Priv-app placed but missing the allow-list / platform signature -> not silent.
         let incomplete = Posture {
@@ -744,10 +753,3 @@ mod tests {
         assert_eq!(super::status_name(-1), "pending user action");
     }
 }
-
-
-
-
-
-
-
