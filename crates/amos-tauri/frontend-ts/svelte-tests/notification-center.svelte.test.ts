@@ -10,14 +10,21 @@ import { fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import NotificationCenter from "../src/svelte/NotificationCenter.svelte";
 import { propsChannel, resetPropsChannels } from "../src/svelte/propsBus";
+import { setCellularRadio, clearCellularRadio } from "../src/svelte/cellularRadio";
 import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
 import { NOTIF_KEY, SETTINGS_KEY } from "../src/lib/settings";
+import { CELLULAR_KEY, type CellularPrefs } from "../src/lib/cellular";
+import { zh } from "../src/i18n/locales/zh";
 
 beforeEach(() => {
   window.localStorage.clear();
   resetPropsChannels();
+  clearCellularRadio();
 });
-afterEach(() => resetPropsChannels());
+afterEach(() => {
+  resetPropsChannels();
+  clearCellularRadio();
+});
 
 async function renderOpen() {
   propsChannel<{ open: boolean }>("nc").set({ open: true });
@@ -84,5 +91,30 @@ describe("NotificationCenter.svelte (controlled via propsBus 'nc')", () => {
     expect(events).toContain("lock");
     expect(events).toContain("close");
     off();
+  });
+
+  test("cellular module is hidden by default (no modem — honest, not misleading)", async () => {
+    const c = await renderOpen();
+    expect(c.querySelector('[data-testid="nc-cellular"]')).toBeNull();
+  });
+
+  test("cellular module appears ONLY when a real radio is present, with an honest label", async () => {
+    // A real (future) signal source reports present + a real signal.
+    setCellularRadio({ present: true, signal: 2 });
+    const c = await renderOpen();
+    await tick();
+    const module = c.querySelector('[data-testid="nc-cellular"]');
+    expect(module).not.toBeNull();
+    // data on (default) + real signal → "connected" text; never a fabricated carrier.
+    expect(module?.textContent ?? "").toContain(zh["settings.cellularConnected"]);
+  });
+
+  test("cellular module reflects 'data off' honestly when the radio is present", async () => {
+    writeStoreValue<CellularPrefs>(CELLULAR_KEY, { data: false, roaming: false });
+    setCellularRadio({ present: true, signal: 0 });
+    const c = await renderOpen();
+    await tick();
+    const module = c.querySelector('[data-testid="nc-cellular"]');
+    expect(module?.textContent ?? "").toContain(zh["settings.cellularDataOff"]);
   });
 });

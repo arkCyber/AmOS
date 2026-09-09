@@ -96,6 +96,17 @@ describe("Settings real sub pages (interactions)", () => {
     expect(saved).toEqual({ dnd: true, work: true, sleep: false });
   });
 
+  test("外发网闸: honest offline state renders (no bridge → not connected, switch disabled)", async () => {
+    const host = render(SettingsApp);
+    await navigate(host, "外发网闸");
+    expect(txt(host)).toContain("外发网闸");
+    // No Tauri bridge in this harness → the daemon is unreachable, so the guard
+    // UI reports the honest "not connected" state and disables the switch rather
+    // than pretending to arm a firewall it cannot reach.
+    expect(txt(host)).toContain("守护进程未连接");
+    expect(switchByLabel(host, "外发网闸")?.disabled).toBe(true);
+  });
+
   test("飞行模式 disables the Wi‑Fi master switch on its radio page", async () => {
     const host = render(SettingsApp);
     // Turn airplane mode on from the index (forces Wi‑Fi/蓝牙 off).

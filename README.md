@@ -258,6 +258,15 @@ A few first-party apps (Reminders ✅-style, Voice Memos, Notes) render **bespok
 Apple-inspired tile icons** (`AppIcon.tsx` `isBespokeTile`) instead of the generic
 emoji-on-gradient tile; every other app keeps the uniform tonal face.
 
+The **status bar** (and lock screen / System Monitor / About) shows a **real
+battery** reading, layered daemon `system_health` → desktop-host OS battery
+(`pmset`/sysfs via `system_host_battery`) → browser Battery API, and **never a
+fabricated number**. Cellular is handled honestly too: on a build with no real
+modem it shows an explicit "no cellular service" in Settings (蜂窝网络 / 关于本机)
+and no fake signal bars anywhere; the Control Center's cellular module only
+appears once a real radio source is present (`svelte/cellularRadio.ts`). See
+[docs/status-battery-cellular.md](./docs/status-battery-cellular.md).
+
 ### Home screen editing (iOS style)
 
 * **Long-press** an icon (≈500 ms) to enter **jiggle/edit mode**.
@@ -394,6 +403,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/power-policy.md](./docs/power-policy.md) — Energy Governor → CPU/NPU frequency closed loop: `amos-power` folds battery/thermal/live-power/foreground-background into a `SensorMode` decision, then maps it to per-cluster + NPU frequency ceilings (`FreqPlan`/`FrequencyGovernor`) and a Linux `scaling_max_freq` cap/restore applier (`feature linux`)
 - [docs/system-monitor.md](./docs/system-monitor.md) — System working status (health): `amos-monitor` folds CPU/memory load, battery/power and per-app process tiers into one honest `SystemHealth`, exposed as `GetStatus.system` and surfaced through a `system_health` Tauri bridge to the Settings `SystemPanel` and a dedicated dock「System Monitor」dashboard app
 - [docs/monitor-dock-verify.md](./docs/monitor-dock-verify.md) — Real-device acceptance checklist for the dock「系统监控 / System Monitor」app (dock entry, live overview, offline/no-data empty states + auto-recovery, detail/regulation panels, a11y progress bars)
+- [docs/status-battery-cellular.md](./docs/status-battery-cellular.md) — Status-bar/system-monitor honest battery (layered daemon → desktop-host → browser Battery API, `system_host_battery`) + honest cellular service state & the controlled `cellularRadio` seam (real modem source only)
 - [docs/dvfs-power-bringup.md](./docs/dvfs-power-bringup.md) — 真机 bring-up runbook：电源/DVFS 子系统部署与验收（env 开关、架构速览、host 验证命令、设备步骤/判据、诚实边界）
 - [docs/bidi-voice-asr.md](./docs/bidi-voice-asr.md) — AI-assistant voice wiring: bidi `Payload::Audio` → local ASR (design)
 - [docs/audio-hal-bridge.md](./docs/audio-hal-bridge.md) — Hardware audio (Audio HAL Bridge): `amos-audio` capture/playback traits + resample + mocks + gated TinyALSA/AAudio seams; bidi real-sherpa ASR (`asr-sherpa` feature)

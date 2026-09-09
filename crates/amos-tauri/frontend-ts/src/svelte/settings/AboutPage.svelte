@@ -3,9 +3,20 @@
   // OS/build identity from lib/version (this UI client) plus live device telemetry
   // (battery / charging) from the daemon when bridged via lib/system. Nothing is
   // fabricated — offline device fields show the honest "—" placeholder.
-  import { systemHealth, normalizeSystemHealth, type SystemStatus } from "../../lib/system";
+  import {
+    systemStatusWithHostBattery,
+    normalizeSystemHealth,
+    type SystemStatus,
+  } from "../../lib/system";
   import { bridged } from "../../lib/backend";
   import { AMOS_OS_NAME, AMOS_UI_VERSION, AMOS_DEVICE_LABEL } from "../../lib/version";
+  import { CELLULAR_KEY, defaultCellular, normalizeCellular } from "../../lib/cellular";
+  import {
+    cellularService,
+    cellularStateKey,
+    defaultRadioSignal,
+  } from "../../lib/cellularService";
+  import { readStoreValue } from "../../lib/amosStore";
   import { t } from "../locale.svelte";
   import { GROUP, ROW, LABEL, VALUE } from "./kit";
 
@@ -15,14 +26,25 @@
   $effect(() => {
     if (!bridged()) return;
     connected = true;
-    systemHealth()
+    systemStatusWithHostBattery()
       .then((raw) => {
-        if (raw) sys = normalizeSystemHealth(raw);
+        if (raw) sys = raw;
       })
       .catch(() => {
         /* daemon offline → keep '—' */
       });
   });
+
+  const cellularValue = $derived(
+    t(
+      cellularStateKey(
+        cellularService(
+          normalizeCellular(readStoreValue(CELLULAR_KEY, defaultCellular())),
+          defaultRadioSignal(),
+        ),
+      ),
+    ),
+  );
 
   const batteryLabel = $derived(
     sys.battery_level_pct === null
@@ -45,9 +67,13 @@
       <span class={LABEL}>{t("settings.aboutVersion")}</span>
       <span class={VALUE}>v{AMOS_UI_VERSION}</span>
     </div>
-    <div class={ROW}>
+    <div class={ROW} data-testid="about-battery">
       <span class={LABEL}>{t("settings.aboutBattery")}</span>
       <span class={VALUE}>{batteryLabel}</span>
+    </div>
+    <div class={ROW} data-testid="about-cellular">
+      <span class={LABEL}>{t("settings.aboutCellular")}</span>
+      <span class={VALUE}>{cellularValue}</span>
     </div>
   </section>
   {#if !connected}

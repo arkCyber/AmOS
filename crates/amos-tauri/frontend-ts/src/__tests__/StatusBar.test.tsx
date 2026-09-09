@@ -21,7 +21,21 @@ afterEach(() => {
     m.root.unmount();
     m.host.remove();
   }
+  delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 });
+
+function installBridge(systemHealth: unknown, hostBatteryPayload?: unknown) {
+  const invoke = async (cmd: string) => {
+    if (cmd === "system_health") return systemHealth;
+    if (cmd === "system_host_battery") return hostBatteryPayload ?? null;
+    return null;
+  };
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+    invoke,
+    listen: async () => () => {},
+  };
+}
+
 
 function mount() {
   window.localStorage.clear();
@@ -80,12 +94,36 @@ describe("StatusBar vector icons (SF-style, no emoji)", () => {
     expect(icon(host, "mutedBell")?.getAttribute("aria-label")).toBe("alerts muted");
   });
 
-  test("battery shows a glyph + live percentage text", async () => {
+  test("battery shows an honest glyph + — when no real source reports a level", async () => {
+    // No daemon bridge and (in happy-dom) no host Battery API → honest unknown.
     const host = mount();
     await act(async () => {});
-    expect(host.querySelector('[aria-label="battery level"]')).not.toBeNull();
-    expect(host.textContent).toMatch(/%$/);
-    expect(host.querySelector('[aria-label="battery level"]')?.querySelector("svg")).not.toBeNull();
+    const batt = host.querySelector('[aria-label="battery level"]');
+    expect(batt).not.toBeNull();
+    expect(batt?.querySelector("svg")).not.toBeNull();
+    expect(batt?.textContent ?? "").toContain("—"); // never a fabricated %
+  });
+
+  test("battery shows a REAL percentage when the daemon reports a level", async () => {
+    installBridge({ battery_level_pct: 80, battery_charging: false });
+    const host = mount();
+    await act(async () => {});
+    await new Promise((r) => setTimeout(r, 5)); // let the async poll resolve
+    await act(async () => {});
+    const batt = host.querySelector('[aria-label="battery level"]');
+    expect(batt?.textContent ?? "").toContain("80%");
+  });
+
+  test("host battery fills the bar when the daemon has no /proc reading (desktop)", async () => {
+    // macOS desktop: daemon system_health has no battery; the Tauri host command
+    // reads the real laptop battery → the bar is NOT an empty "—".
+    installBridge({}, { level_pct: 75, charging: false });
+    const host = mount();
+    await act(async () => {});
+    await new Promise((r) => setTimeout(r, 5)); // let the async poll resolve
+    await act(async () => {});
+    const batt = host.querySelector('[aria-label="battery level"]');
+    expect(batt?.textContent ?? "").toContain("75%");
   });
 
   test("flashlight indicator appears only while the torch is lit", async () => {

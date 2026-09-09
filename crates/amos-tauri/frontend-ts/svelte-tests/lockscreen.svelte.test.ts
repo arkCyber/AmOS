@@ -16,7 +16,10 @@ beforeEach(() => {
   window.localStorage.clear();
   resetPropsChannels();
 });
-afterEach(() => resetPropsChannels());
+afterEach(() => {
+  resetPropsChannels();
+  delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+});
 
 const key = (c: HTMLElement, aria: string) =>
   c.querySelector(`button[aria-label="${aria}"]`) as HTMLButtonElement | null;
@@ -67,3 +70,38 @@ describe("LockScreen.svelte", () => {
     off();
   });
 });
+
+describe("LockScreen.svelte — real battery indicator", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 40));
+  const lockBatt = (c: HTMLElement) => c.querySelector('[data-testid="lock-battery"]');
+
+  function installBridge(systemHealth: unknown, hostBatteryPayload?: unknown) {
+    const invoke = async (cmd: string) => {
+      if (cmd === "system_health") return systemHealth;
+      if (cmd === "system_host_battery") return hostBatteryPayload ?? null;
+      return null;
+    };
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke,
+      listen: async () => () => {},
+    };
+  }
+
+  test("renders no battery when no real source reports a level (honest, unobtrusive)", async () => {
+    const { container } = render(LockScreen);
+    await tick();
+    await settle();
+    expect(lockBatt(container)).toBeNull();
+  });
+
+  test("shows the REAL battery top-right when the host reports a level", async () => {
+    installBridge({}, { level_pct: 75, charging: false });
+    const { container } = render(LockScreen);
+    await tick();
+    await settle();
+    const b = lockBatt(container);
+    expect(b).not.toBeNull();
+    expect(b?.textContent ?? "").toContain("75%");
+  });
+});
+

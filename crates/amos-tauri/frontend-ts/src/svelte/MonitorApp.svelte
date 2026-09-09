@@ -23,7 +23,7 @@
     memUsedBytes,
     memUsedPct,
     normalizeSystemHealth,
-    systemHealth,
+    systemStatusWithHostBattery,
     type SystemStatus,
   } from "../lib/system";
   import { bridged } from "../lib/backend";
@@ -55,7 +55,7 @@
     if (inflight || disposed) return;
     inflight = true;
     busy = true;
-    systemHealth()
+    systemStatusWithHostBattery()
       .then((raw) => {
         if (disposed) return;
         // "Connected" means a daemon actually answered us (raw is non-null): the
@@ -63,7 +63,7 @@
         // Tauri bridge or a failed command (daemon down) → offline; every poll is a
         // reconnect probe that flips us back to live the moment the daemon returns.
         online = raw !== null;
-        if (raw) sys = normalizeSystemHealth(raw);
+        if (raw) sys = raw;
       })
       .catch(() => {
         /* daemon went away mid-flight → keep the previous reading, go offline */

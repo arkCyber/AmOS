@@ -47,9 +47,47 @@ message StatusReply {
   repeated EgressSample top_egress = 5;
 }
 
+// The metadata signal kind that produced one audited egress event.
+enum EgressKind {
+  EGRESS_KIND_UNSPECIFIED = 0;
+  // A DNS query for a hostname.
+  EGRESS_KIND_DNS = 1;
+  // A TLS ClientHello (SNI observed).
+  EGRESS_KIND_TLS = 2;
+  // Other userspace data-plane traffic not classified by a higher-level signal.
+  EGRESS_KIND_OTHER = 3;
+}
+
+// One metadata egress signal to fold into the guard's rolling audit counter that
+// backs `StatusReply.top_egress`. Carries destination domain / SNI + bytes only —
+// never payload contents (docs/anti-telemetry-egress-guard.md §3.2).
+message NoteEgressRequest {
+  // Wall-clock ms (UTC) when observed.
+  uint64 ts_ms = 1;
+  // The Android uid that produced the traffic.
+  uint32 uid = 2;
+  // The app package name, when resolvable.
+  string app = 3;
+  // The observed destination domain / SNI (empty => unknown).
+  string domain = 4;
+  // Bytes attributed to this event (0 when unknown).
+  uint64 bytes = 5;
+  // The metadata signal kind.
+  EgressKind kind = 6;
+}
+
+message NoteEgressReply {}
+
 service NetGuardService {
   // Arm or disarm the egress guard.
   rpc Toggle(ToggleRequest) returns (ToggleReply);
   // Current armed state + backend + small audit summary.
   rpc Status(StatusRequest) returns (StatusReply);
+  // TEST/INJECTION: fold one metadata egress event into the audit counter so
+  // `Status.top_egress` reflects a feed. Served ONLY when the process opts in via
+  // `AMOS_NETGUARD_ALLOW_INJECT=1` (off on every production boot, mirroring the
+  // telemetry-spy `SimulateHit` gate); otherwise PermissionDenied. A real device
+  // producer (VpnService / nftables observability) feeds the same counter
+  // directly and needs no RPC.
+  rpc NoteEgress(NoteEgressRequest) returns (NoteEgressReply);
 }

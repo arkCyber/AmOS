@@ -30,11 +30,13 @@ pub mod clipboard_guest;
 pub mod daemon;
 pub mod display;
 pub mod flashlight;
+pub mod host_battery;
 #[cfg(feature = "android")]
 pub mod incall;
 pub mod interpret;
 pub mod mail;
 pub mod media;
+pub mod netguard;
 pub mod note_export;
 pub mod privacy_client;
 pub mod radio;
@@ -212,6 +214,7 @@ pub fn run() {
             sensor_host::sensor_host_record_frame,
             sensor_host::sensor_host_acquire,
             system::system_health,
+            host_battery::system_host_battery,
             display::screen_state_set,
             display::screen_state_get,
             privacy_client::perm_authorize,
@@ -219,6 +222,8 @@ pub fn run() {
             privacy_client::perm_revoke,
             privacy_client::perm_granted,
             privacy_client::perm_recent_audit,
+            netguard::netguard_toggle,
+            netguard::netguard_status,
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
             taskmgr::taskmgr_job_action,

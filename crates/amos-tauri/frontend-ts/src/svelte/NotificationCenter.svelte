@@ -21,6 +21,14 @@
   import { iconSvg, quickIcon } from "../lib/sysIcons";
   import { propsChannel } from "./propsBus";
   import { createStoreValue } from "./store";
+  import { cellularRadio } from "./cellularRadio";
+  import { CELLULAR_KEY, defaultCellular, normalizeCellular, type CellularPrefs } from "../lib/cellular";
+  import {
+    cellularService,
+    cellularStateKey,
+    defaultRadioSignal,
+    type RadioSignal,
+  } from "../lib/cellularService";
   import {
     FLASHLIGHT_KEY,
     NOTIF_KEY,
@@ -71,6 +79,9 @@
   let settings = $state<QuickSettings>({});
   let notifs = $state<Notif[]>([]);
   let flash = $state<FlashlightStore>({ on: false, torch_present: true });
+  let cellPrefs = $state<CellularPrefs>(defaultCellular());
+  let radio = $state<RadioSignal>(defaultRadioSignal());
+  const cellularStore = createStoreValue<unknown>(CELLULAR_KEY, {});
   $effect(() => {
     const un = settingsStore.subscribe((v) => (settings = normalizeQuick(v)));
     return un;
@@ -81,6 +92,14 @@
   });
   $effect(() => {
     const un = flashStore.subscribe((v) => (flash = normalizeFlashlight(v)));
+    return un;
+  });
+  $effect(() => {
+    const un = cellularStore.subscribe((v) => (cellPrefs = normalizeCellular(v)));
+    return un;
+  });
+  $effect(() => {
+    const un = cellularRadio.subscribe((v) => (radio = v));
     return un;
   });
 
@@ -96,6 +115,9 @@
 
   const dark = $derived(themeDark());
   const quiet = $derived(dndActive(settings));
+  // Controlled cellular: only meaningful once a REAL radio is present (on-device).
+  // No modem → radio.present false → nothing is shown (honest, not misleading).
+  const cellStatusKey = $derived(cellularStateKey(cellularService(cellPrefs, radio)));
   let rootEl: HTMLDivElement | undefined = $state();
   $effect(() => {
     if (!open || !rootEl) return;
@@ -223,6 +245,19 @@
         </span>
       {/if}
     </button>
+
+    <!-- Cellular module — only when a REAL modem source is present. This build has
+         none (radio.present=false) so it stays hidden: honest, never a fake phone
+         affordance. Once a real Android signal source is wired it appears here. -->
+    {#if radio.present}
+      <div
+        class="mt-3 flex items-center justify-between rounded-3xl bg-white/55 px-4 py-3 text-sm font-semibold text-neutral-800 ring-1 ring-white/50 shadow-sm dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
+        data-testid="nc-cellular"
+      >
+        <span class="flex items-center gap-2.5">{t("settings.cellular")}</span>
+        <span class="text-xs font-medium opacity-70">{t(cellStatusKey)}</span>
+      </div>
+    {/if}
 
     <!-- Quick settings tiles. -->
     <div class="mt-4 grid grid-cols-3 gap-2.5">

@@ -35,6 +35,14 @@ import {
   type RadioKey,
 } from "../lib/settings";
 import { iconSvg, quickIcon } from "../lib/sysIcons";
+import { CELLULAR_KEY, normalizeCellular } from "../lib/cellular";
+import {
+  cellularService,
+  cellularStateKey,
+  defaultRadioSignal,
+  type RadioSignal,
+} from "../lib/cellularService";
+import { cellularRadio } from "../svelte/cellularRadio";
 
 const QUICK: { key: QuickKey; label: "q.wifi" | "q.bluetooth" | "q.airplane" | "q.dark" | "q.dnd" | "q.location" }[] = [
   { key: "wifi", label: "q.wifi" },
@@ -82,6 +90,16 @@ export default function NotificationCenter({
   const rootRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(open, rootRef, onClose);
   const quiet = dndActive(settings);
+
+  // Controlled cellular: real radio source seam (absent by default → nothing shown,
+  // honest/non-misleading; a future on-device modem sets `present` to surface it).
+  const cellPrefs = normalizeCellular(useStoreValue<unknown>(CELLULAR_KEY, {}));
+  const [radio, setRadio] = useState<RadioSignal>(defaultRadioSignal);
+  useEffect(() => {
+    const unsub = cellularRadio.subscribe(setRadio);
+    return () => unsub();
+  }, []);
+  const cellStatusKey = cellularStateKey(cellularService(cellPrefs, radio));
 
   // Merge an authoritative backend snapshot into the local quick-settings,
   // preserving the non-radio toggles (darkmode/dnd/location).
@@ -283,6 +301,19 @@ export default function NotificationCenter({
           </span>
         )}
       </button>
+
+      {/* Cellular module — only when a REAL modem source is present (on-device). This
+          build has none (radio.present=false) so it stays hidden: honest, never a fake
+          phone affordance. Once a real Android signal source is wired it appears here. */}
+      {radio.present && (
+        <div
+          data-testid="nc-cellular"
+          className="mt-3 flex items-center justify-between rounded-3xl bg-white/55 px-4 py-3 text-sm font-semibold text-neutral-800 ring-1 ring-white/50 shadow-sm dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
+        >
+          <span className="flex items-center gap-2.5">{t("settings.cellular")}</span>
+          <span className="text-xs font-medium opacity-70">{t(cellStatusKey)}</span>
+        </div>
+      )}
 
       {/* Quick settings — iOS Control-Center style translucent tiles */}
       <div className="mt-4 grid grid-cols-3 gap-2.5">

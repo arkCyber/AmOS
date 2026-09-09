@@ -10,7 +10,9 @@
   import { createStoreValue } from "./store";
   import { propsChannel } from "./propsBus";
   import { isCustomWallpaper, WALLPAPER_FILES } from "../lib/wallpaper";
-  import { iconSvg } from "../lib/sysIcons";
+  import { iconSvg, batterySvg } from "../lib/sysIcons";
+  import { batteryTone } from "../lib/batteryStatus";
+  import { systemStatusWithHostBattery } from "../lib/system";
 
   const bus = propsChannel<{ ready?: boolean }>("lock");
 
@@ -59,6 +61,29 @@
     }).format(now),
   );
 
+  // Real battery, top-right (iOS-style). Layered daemon → host → browser; when no
+  // source reports a level we render nothing (honest, never a fabricated number).
+  // Polled slowly — a lock screen can sit for a long time.
+  const BATTERY_POLL_MS = 30_000;
+  let batteryLevel = $state<number | null>(null);
+  let batteryCharging = $state<boolean | null>(null);
+  const battTone = $derived(batteryTone({ levelPct: batteryLevel, charging: batteryCharging }));
+  $effect(() => {
+    let stopped = false;
+    const read = async () => {
+      const sys = await systemStatusWithHostBattery();
+      if (!sys || stopped) return;
+      batteryLevel = sys.battery_level_pct;
+      batteryCharging = sys.battery_charging;
+    };
+    void read();
+    const id = window.setInterval(read, BATTERY_POLL_MS);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  });
+
   const tap = (d: string) => {
     if (pin.length < 6) pin += d;
     bad = false;
@@ -98,6 +123,16 @@
   {#if lockBgUrl}
     <div aria-hidden="true" class="absolute inset-0 bg-cover bg-center" style={`background-image:url(${lockBgUrl})`}></div>
     <div aria-hidden="true" class="absolute inset-0 bg-black/35"></div>
+  {/if}
+  {#if batteryLevel !== null}
+    <div
+      data-testid="lock-battery"
+      aria-label="battery level"
+      class="absolute right-6 top-6 z-20 flex items-center gap-1.5 text-neutral-100 tabular-nums"
+    >
+      {@html batterySvg(batteryLevel, "h-3.5 w-3.5", battTone)}
+      <span>{Math.round(batteryLevel)}%</span>
+    </div>
   {/if}
   <div class="relative z-10 flex w-full flex-col items-center">
     <div class="text-center leading-none">

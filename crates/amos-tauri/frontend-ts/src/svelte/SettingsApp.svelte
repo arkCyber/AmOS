@@ -44,6 +44,7 @@
   import RadioPage from "./settings/RadioPage.svelte";
   import PrivacyPage from "./settings/PrivacyPage.svelte";
   import TelemetrySpyPage from "./settings/TelemetrySpyPage.svelte";
+  import NetGuardPage from "./settings/NetGuardPage.svelte";
   import NotificationsPage from "./settings/NotificationsPage.svelte";
   import SoundPage from "./settings/SoundPage.svelte";
   import AboutPage from "./settings/AboutPage.svelte";
@@ -65,6 +66,7 @@
     | "ai"
     | "privacy"
     | "spy"
+    | "guard"
     | "about"
     | "diagnostics";
   type Page = "index" | Sub;
@@ -84,6 +86,7 @@
     ai: "settings.ai",
     privacy: "settings.privacy",
     spy: "settings.spy",
+    guard: "settings.guard",
     about: "settings.about",
     diagnostics: "settings.diagnostics",
   };
@@ -109,6 +112,7 @@
     account: ["sync", "backup", "同步", "备份", "iCloud"],
     privacy: ["permission", "grant", "授权", "权限", "敏感"],
     spy: ["egress", "leak", "audit", "telemetry", "serial", "imei", "cell", "回传", "外发", "泄漏", "审计", "序列号"],
+    guard: ["firewall", "netfilter", "block", "网闸", "防火墙", "阻断", "回传"],
     about: ["version", "battery", "device", "版本", "电量", "设备", "storage"],
     diagnostics: ["monitor", "debug", "lmk", "监控", "进程", "开发者", "developer"],
   };
@@ -241,6 +245,7 @@
       { kind: "nav", page: "ai", key: "settings.ai" },
       { kind: "nav", page: "privacy", key: "settings.privacy" },
       { kind: "nav", page: "spy", key: "settings.spy" },
+      { kind: "nav", page: "guard", key: "settings.guard" },
     ],
     // 系统：关于本机 / 系统监控与开发者
     [
@@ -399,6 +404,8 @@
         <PrivacyPage />
       {:else if page === "spy"}
         <TelemetrySpyPage />
+      {:else if page === "guard"}
+        <NetGuardPage />
       {:else if page === "notifications"}
         <NotificationsPage />
       {:else if page === "sound"}

@@ -12,6 +12,9 @@ import {
   type FlashlightStore,
   type QuickSettings,
 } from "../lib/settings";
+import { setCellularRadio, clearCellularRadio } from "../svelte/cellularRadio";
+import { CELLULAR_KEY } from "../lib/cellular";
+import { en } from "../i18n/locales/en";
 
 try {
   GlobalRegistrator.register();
@@ -28,6 +31,7 @@ afterEach(() => {
     m.host.remove();
   }
   window.localStorage.clear();
+  clearCellularRadio();
 });
 
 function mount() {
@@ -164,5 +168,39 @@ describe("NotificationCenter quick tiles", () => {
     });
     expect(torch!.getAttribute("aria-pressed")).toBe("false");
     expect(torch!.textContent).toContain("OFF");
+  });
+});
+
+
+describe("controlled cellular module (React fallback)", () => {
+  const cell = (host: HTMLElement) => host.querySelector('[data-testid="nc-cellular"]');
+
+  test("hidden by default (no modem — honest, not misleading)", async () => {
+    const host = mount();
+    await act(async () => {});
+    expect(cell(host)).toBeNull();
+  });
+
+  test("appears only when a real radio is present, with an honest label", async () => {
+    setCellularRadio({ present: true, signal: 2 });
+    const host = mount();
+    await act(async () => {});
+    await act(async () => {});
+    const m = cell(host);
+    expect(m).not.toBeNull();
+    expect(m?.textContent ?? "").toContain(en["settings.cellularConnected"]);
+  });
+
+  test("reflects 'data off' honestly when the radio is present", async () => {
+    setCellularRadio({ present: true, signal: 0 });
+    const host = mount();
+    await act(async () => {});
+    await act(async () => {
+      writeStoreValue(CELLULAR_KEY, { data: false, roaming: false });
+    });
+    await act(async () => {});
+    const m = cell(host);
+    expect(m).not.toBeNull();
+    expect(m?.textContent ?? "").toContain(en["settings.cellularDataOff"]);
   });
 });

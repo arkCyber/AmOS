@@ -153,3 +153,39 @@ async function call<T>(command: string): Promise<T | null> {
 export function systemHealth(): Promise<SystemStatus | null> {
   return call<SystemStatus>("system_health");
 }
+
+/** The desktop host's own OS battery, read via the Tauri `system_host_battery`
+ * command (macOS `pmset` / Linux sysfs). This is the REAL laptop/desktop battery
+ * that a daemon-less or `/proc`-less desktop dev host would otherwise hide behind
+ * an honest "—". `null` when not bridged or the host reports no battery. */
+export interface HostBatteryStatus {
+  level_pct: number | null;
+  charging: boolean | null;
+}
+
+export function hostBattery(): Promise<HostBatteryStatus | null> {
+  return call<HostBatteryStatus>("system_host_battery");
+}
+
+/**
+ * Read system working status AND, when the daemon carries no battery reading on a
+ * desktop host (no `/proc`), fill the battery block from the host OS battery so a
+ * macOS/Linux desktop shows a real level instead of an honest "—". The daemon's
+ * own reading always wins when present (authoritative on-device). Returns null
+ * offline (callers keep their existing "not connected" handling).
+ */
+export async function systemStatusWithHostBattery(): Promise<SystemStatus | null> {
+  const raw = await systemHealth();
+  if (!raw) return null;
+  const sys = normalizeSystemHealth(raw);
+  if (sys.battery_level_pct !== null) return sys;
+  const host = await hostBattery();
+  if (host && typeof host.level_pct === "number" && Number.isFinite(host.level_pct)) {
+    return {
+      ...sys,
+      battery_level_pct: host.level_pct,
+      battery_charging: host.charging,
+    };
+  }
+  return sys;
+}

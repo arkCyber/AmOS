@@ -5,12 +5,12 @@
   // when there is no data (offline), never a broken card. Auto-refreshes (~2.5s)
   // only while live data is present.
   import {
+    systemStatusWithHostBattery,
+    normalizeSystemHealth,
     fmtBytes,
     liveProcesses,
     memUsedBytes,
     memUsedPct,
-    normalizeSystemHealth,
-    systemHealth,
     type SystemStatus,
   } from "../lib/system";
   import { t } from "./locale.svelte";
@@ -29,9 +29,9 @@
     if (inflight) return;
     inflight = true;
     busy = true;
-    systemHealth()
+    systemStatusWithHostBattery()
       .then((raw) => {
-        if (raw) sys = normalizeSystemHealth(raw);
+        if (raw) sys = raw;
       })
       .catch(() => {
         /* daemon offline → keep previous / nothing */

@@ -13,6 +13,8 @@
  * line weight/round-caps stay crisp at tiny status-bar sizes.
  */
 
+import type { BatteryTone } from "./batteryStatus";
+
 export type SysIconName =
   | "wifi"
   | "bluetooth"
@@ -199,16 +201,37 @@ export function iconSvg(name: SysIconName, cls = "h-3.5 w-3.5"): string {
 /**
  * Battery glyph whose inner fill tracks the live percentage. The numeric % is
  * rendered separately by the caller (the icon itself is aria-hidden).
+ *
+ * `tone` maps onto the iOS colouring so a REAL reading is legible at a glance:
+ * charging → green, critical (≤10%, draining) → red, low (≤20%, draining) →
+ * amber, ok → the neutral `currentColor`, and unknown → an empty outline (the
+ * caller passes 0). Callers that don't care (the legacy cosmetic React bar)
+ * omit `tone` and keep the neutral currentColor fill, so this stays backward
+ * compatible.
  */
-export function batterySvg(percent: number, cls = "h-3 w-3"): string {
+export function batterySvg(
+  percent: number,
+  cls = "h-3 w-3",
+  tone: BatteryTone = "ok",
+): string {
   const p = Math.max(0, Math.min(100, percent));
   const OUTER =
     '<rect x="1.2" y="7.6" width="17.6" height="8.8" rx="2.6"/>' +
     '<rect x="19" y="9.8" width="3" height="4.4" rx="1.4"/>';
+  const fill =
+    tone === "charging"
+      ? "#34c759"
+      : tone === "critical"
+        ? "#ff3b30"
+        : tone === "low"
+          ? "#ffcc00"
+          : tone === "unknown"
+            ? "none"
+            : "currentColor";
+  const drawFill = p > 0 && tone !== "unknown";
   const fillW = 14.4 * (p / 100);
-  const FILL =
-    p > 0
-      ? `<rect x="2.6" y="9" width="${Math.max(fillW, 1.4).toFixed(2)}" height="6" rx="1.6" fill="currentColor" stroke="none"/>`
-      : "";
+  const FILL = drawFill
+    ? `<rect x="2.6" y="9" width="${Math.max(fillW, 1.4).toFixed(2)}" height="6" rx="1.6" fill="${fill}" stroke="none"/>`
+    : "";
   return svgStroke(OUTER + FILL, cls);
 }
