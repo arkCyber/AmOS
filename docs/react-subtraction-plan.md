@@ -1,10 +1,10 @@
 # React → Svelte subtraction plan (System UI)
 
-Status: **in progress** (2026-09-09). Goal: the System UI is **Svelte-only** at
-runtime already (`index.html → src/shell-entry.ts → Shell.svelte`); React is
-**retired residual source + its own DOM tests**. This doc is the safe, stepwise
-plan to actually delete React without breaking tests or the `make cov` (≥90% on
-`src/lib/**`) gate.
+Status: **DONE** (2026-09-09). React is fully removed from the runtime graph,
+deps and vite config on branch `react-subtraction`; dev/`vite build`/all gates
+(tsc, svelte-check 0/0, `[bun-iso] test OK` 772 tests, vitest 56 files/337,
+`src/lib` coverage 94.96% ≥ 90%) are green. Kept as the audit/rollback record;
+see `CHANGELOG.md` + commits on that branch.
 
 ## Verified facts
 - Runtime graph (`.svelte` + `src/lib` non-test + `src/index.css`) does **not**

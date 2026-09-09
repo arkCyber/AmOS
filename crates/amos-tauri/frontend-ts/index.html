@@ -7,10 +7,9 @@
   </head>
   <body class="h-full bg-neutral-900">
     <!-- Root / index.html IS the pure-Svelte System UI shell (Shell.svelte).
-         The legacy React host (main.tsx/App.tsx) is retired by the React→Svelte
-         migration; keep this page loading the same entry as shell.html so the
-         Tauri main window (which serves frontendDist root "/") mounts the
-         Svelte shell instead of a blank React root. -->
+         React is fully removed (docs/react-subtraction-plan.md). Keep this page
+         loading the same entry as shell.html so the Tauri main window (which
+         serves frontendDist root "/") mounts the Svelte shell. -->
     <div id="root" class="h-full"></div>
     <script type="module" src="/src/shell-entry.ts"></script>
   </body>

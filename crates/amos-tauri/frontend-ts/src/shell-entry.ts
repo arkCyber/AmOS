@@ -1,8 +1,7 @@
 /**
- * shell-entry.ts — the **production** System UI entry: `index.html` mounts the
- * pure-Svelte top-level `Shell.svelte` (the React host `App.tsx`/`main.tsx` is
- * retired by the React→Svelte migration; only stale sources remain until the
- * subtraction phase deletes them). `shell.html` is the same Svelte shell behind a
+ * shell-entry.ts — the **pure-Svelte** System UI entry: `index.html` mounts
+ * `Shell.svelte`. React is fully removed from the runtime graph (see
+ * docs/react-subtraction-plan.md). `shell.html` is the same Svelte shell behind a
  * second build input for headless/visual acceptance.
  */
 import "./index.css";
@@ -16,9 +15,8 @@ import {
   resetShellState,
 } from "./svelte/shellState.svelte";
 
-// Apply persisted theme/locale to the document before first paint (the React
-// host used to do this via ThemeProvider/I18nProvider; the Svelte host is the
-// one true host going forward).
+// Apply persisted theme/locale to the document before first paint (the Svelte
+// host is the one true host; theme/locale cores are in src/lib + svelte).
 bootOsChrome();
 
 const root = document.getElementById("root") ?? (() => {
