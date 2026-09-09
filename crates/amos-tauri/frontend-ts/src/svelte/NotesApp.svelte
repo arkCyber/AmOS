@@ -444,7 +444,11 @@
               <span class="shrink-0 pt-0.5 text-xs text-neutral-500">{stampOf(n)}</span>
             </div>
             {#if notePreview(n.text)}
-              <p class="mt-0.5 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">{notePreview(n.text)}</p>
+              <p class="mt-0.5 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
+                {#if mode === "all" && searchQ.trim() && searchHighlight(notePreview(n.text), searchQ)}
+                  {searchHighlight(notePreview(n.text), searchQ)?.before}<mark class="rounded-sm bg-amber-300/70 px-0.5 text-inherit dark:bg-amber-400/40">{searchHighlight(notePreview(n.text), searchQ)?.match}</mark>{searchHighlight(notePreview(n.text), searchQ)?.after}
+                {:else}{notePreview(n.text)}{/if}
+              </p>
             {/if}
             <div class="mt-1 flex items-center gap-2 text-xs text-neutral-500">
               {#if mode === "all" && n.pinned}

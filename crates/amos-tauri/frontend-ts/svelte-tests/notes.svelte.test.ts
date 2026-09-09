@@ -523,3 +523,23 @@ describe("NotesApp.svelte — 搜索高亮", () => {
   });
 });
 
+
+describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
+  test("a term found only in the body highlights inside the collapsed preview", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "p1", text: "周末安排\n去超市买牛奶并转账水费", ts: 10, created: 10 }]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const input = host.container.querySelector(
+      'input[aria-label="note-search"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: "转账" } });
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const marks = host.container.querySelectorAll("mark");
+    expect(marks.length).toBeGreaterThanOrEqual(1);
+    expect([...marks].some((m) => m.textContent === "转账")).toBe(true);
+  });
+});
+
