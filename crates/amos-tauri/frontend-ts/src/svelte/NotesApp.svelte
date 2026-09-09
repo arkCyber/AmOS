@@ -74,6 +74,7 @@
   let mode = $state<"all" | "archived" | "trash">("all");
   let searchQ = $state("");
   let openId = $state<string | null>(null);
+  let armedEmpty = $state(false);
   let selecting = $state(false); // multi-select batch mode
   let selected = $state<string[]>([]);
   // Full-page editor (NoteEditor, docs/notes-editor.md): set to a note to swap the
@@ -316,6 +317,7 @@
     `rounded-full px-3 py-1 text-xs ${on ? "bg-accent text-white" : "bg-neutral-300 dark:bg-neutral-700"}`;
   const switchMode = (m: "all" | "archived" | "trash") => {
     mode = m;
+    armedEmpty = false; // leaving the trash tab drops an armed "empty" state
     if (m !== "all") selTag = null;
     if (selecting) exitSel(); // select mode is scoped to the current tab
   };
@@ -378,6 +380,18 @@
     <button onclick={() => switchMode("archived")} aria-pressed={mode === "archived"} class={chipCls(mode === "archived")}>{t("note.tabArchived")} ({archived.length})</button>
     <button onclick={() => switchMode("trash")} aria-pressed={mode === "trash"} class={chipCls(mode === "trash")}>{t("note.tabTrash")} ({trashed.length})</button>
   </div>
+
+  {#if mode === "trash" && trashed.length > 0}
+    <div class="mt-2 flex items-center justify-end gap-2 text-xs">
+      {#if armedEmpty}
+        <span class="text-danger">{t("note.emptyTrashConfirm")}</span>
+        <button onclick={() => { armedEmpty = false; persist(removeMany(notes, trashed.map((n) => n.id))); }} aria-label="note-empty-trash-confirm" class="text-danger hover:underline">{t("note.deleteForever")}</button>
+        <button onclick={() => (armedEmpty = false)} class="opacity-60 hover:underline">{t("note.cancel")}</button>
+      {:else}
+        <button onclick={() => (armedEmpty = true)} aria-label="note-empty-trash" class="text-danger hover:underline">{t("note.emptyTrash")}</button>
+      {/if}
+    </div>
+  {/if}
 
   {#if mode === "all" && (tagRow.length > 0 || selTag)}
     <div class="mt-2 flex flex-wrap items-center gap-1.5">

@@ -524,6 +524,57 @@ describe("NotesApp.svelte — 搜索高亮", () => {
 });
 
 
+
+describe("NotesApp.svelte — 清空最近删除（两步确认）", () => {
+  test("arming then confirming empties the trash; cancel keeps notes", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([
+        { id: "t1", text: "待清空的条目", ts: 5, created: 5, state: "trash" },
+        { id: "keep", text: "正常便签", ts: 6, created: 6 },
+      ]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    // switch to the trash tab
+    const chip = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("最近删除"),
+    );
+    await fireEvent.click(chip as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    // arm
+    const arm = host.container.querySelector(
+      'button[aria-label="note-empty-trash"]',
+    ) as HTMLButtonElement;
+    expect(arm).toBeTruthy();
+    await fireEvent.click(arm);
+    // nothing deleted yet (only armed)
+    expect(JSON.parse(window.localStorage.getItem("amos.notes") ?? "[]").length).toBe(2);
+
+    // cancel path keeps everything
+    const cancel = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("取消"),
+    );
+    await fireEvent.click(cancel as HTMLButtonElement);
+    expect(JSON.parse(window.localStorage.getItem("amos.notes") ?? "[]").length).toBe(2);
+
+    // arm again and confirm
+    const arm2 = host.container.querySelector(
+      'button[aria-label="note-empty-trash"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(arm2);
+    const confirmBtn = host.container.querySelector(
+      'button[aria-label="note-empty-trash-confirm"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(confirmBtn);
+    const saved = JSON.parse(window.localStorage.getItem("amos.notes") ?? "[]");
+    expect(saved.length).toBe(1);
+    expect(saved[0].id).toBe("keep");
+  });
+});
+
 describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
   test("a term found only in the body highlights inside the collapsed preview", async () => {
     window.localStorage.setItem(

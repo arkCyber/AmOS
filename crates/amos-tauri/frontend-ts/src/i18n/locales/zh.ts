@@ -170,6 +170,8 @@ export const zh = {
   "note.archive": "归档",
   "note.restore": "恢复",
   "note.deleteForever": "彻底删除",
+  "note.emptyTrash": "清空最近删除",
+  "note.emptyTrashConfirm": "确认全部彻底删除？",
   "note.tabNotes": "备忘录",
   "note.tabArchived": "归档",
   "note.tasks": "任务",

@@ -172,6 +172,8 @@ export const en: Record<MessageKey, string> = {
   "note.archive": "Archive",
   "note.restore": "Restore",
   "note.deleteForever": "Delete forever",
+  "note.emptyTrash": "Empty Trash",
+  "note.emptyTrashConfirm": "Permanently delete all?",
   "note.tabNotes": "Notes",
   "note.tabArchived": "Archived",
   "note.tasks": "Tasks",
