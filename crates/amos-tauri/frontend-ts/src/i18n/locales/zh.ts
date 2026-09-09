@@ -147,6 +147,7 @@ export const zh = {
   "clock.repeatDaily": "每天",
   "note.placeholder": "写点什么…",
   "note.search": "搜索备忘录…",
+  "note.aiMock": "AI 仅模拟/未配真实模型——备忘录完全本地，可正常使用。",
   "note.aiOffline": "AI 当前离线——备忘录完全本地，可正常使用。",
   "note.add": "保存",
   "note.edit": "编辑",

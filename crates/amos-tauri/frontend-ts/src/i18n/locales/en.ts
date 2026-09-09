@@ -149,6 +149,7 @@ export const en: Record<MessageKey, string> = {
   "clock.repeatDaily": "Every day",
   "note.placeholder": "Write something…",
   "note.search": "Search notes…",
+  "note.aiMock": "AI is only mock/dev (no real model) — Notes is fully local and works.",
   "note.aiOffline": "AI is offline — Notes is fully local and still works normally.",
   "note.add": "Save",
   "note.edit": "Edit",

@@ -109,6 +109,8 @@
   });
   // Show the hint only when AI can't really serve (offline or mock); notes still work.
   const aiOffline = $derived(aiIsUnavailable(aiAvail));
+  // Distinguish "no AI at all (offline)" from "daemon is only a mock (no real model)".
+  const aiHintKey = $derived(aiAvail === "mock" ? "note.aiMock" : "note.aiOffline");
 
 
   const persist = (list: Note[]) => {
@@ -361,7 +363,7 @@
 <div class="p-4">
   {#if aiOffline}
     <p role="status" data-testid="note-ai-offline" class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-[11px] text-neutral-500 dark:bg-white/10 dark:text-neutral-400">
-      {t("note.aiOffline")}
+      {t(aiHintKey)}
     </p>
   {/if}
   {#if editor}
