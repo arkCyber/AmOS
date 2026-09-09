@@ -435,6 +435,9 @@
               {#if taskSummary(n.text).total > 0}
                 <span class="text-accent">☑ {taskSummary(n.text).done}/{taskSummary(n.text).total}</span>
               {/if}
+              {#if editedOf(n)}
+                <span class="text-accent">· {t("note.edited")}</span>
+              {/if}
               <span class="ml-auto text-accent">{t("note.open")}</span>
             </div>
           </button>

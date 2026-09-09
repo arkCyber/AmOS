@@ -367,3 +367,26 @@ describe("NotesApp.svelte — open-in-editor preference", () => {
 });
 
 
+
+describe("NotesApp.svelte — 已编辑 badge on collapsed rows", () => {
+  test("an edited note shows the badge without opening it", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "e1", text: "改过的备忘录", ts: 2000, created: 1000 }]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(txt(host)).toContain("已编辑");
+  });
+
+  test("a freshly-created note shows no badge on its collapsed row", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "f1", text: "新备忘录", ts: 3000, created: 3000 }]),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(txt(host)).not.toContain("已编辑");
+  });
+});
+
