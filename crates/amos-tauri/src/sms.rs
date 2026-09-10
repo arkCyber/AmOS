@@ -199,9 +199,10 @@ pub fn sms_status(state: State<'_, SmsBridge>) -> SmsStatusOut {
     status_of(active_arc(&state).as_ref())
 }
 
-/// Read one folder's threads (newest first). `Err` (permission denied /
-/// unavailable / unknown folder) is honest and must never be shown as "no
-/// messages"; an `Ok` empty list means that folder is empty.
+/// Read one folder's threads (newest first), with **blocked senders removed**.
+/// `Err` (permission denied / unavailable / unknown folder) is honest and must
+/// never be shown as "no messages"; an `Ok` empty list means that folder is
+/// empty (or fully filtered — [`filter_threads`] reports the hidden count).
 #[tauri::command]
 pub async fn sms_snapshot(
     state: State<'_, SmsBridge>,
@@ -209,10 +210,14 @@ pub async fn sms_snapshot(
 ) -> Result<Vec<SmsThreadOut>, String> {
     let folder = amos_sms::SmsFolder::from_wire(&folder).map_err(|e| e.to_string())?;
     let provider = active_arc(&state);
-    blocking(move || provider.snapshot(folder))
+    let threads = blocking(move || provider.snapshot(folder))
         .await
-        .map(|v| v.iter().map(SmsThreadOut::from).collect())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let (kept, hidden) = crate::blocklist::filter_threads(threads, &crate::blocklist::shared());
+    if hidden > 0 {
+        tracing::info!(target: "amos::sms", hidden, "blocked senders filtered from the list");
+    }
+    Ok(kept.iter().map(SmsThreadOut::from).collect())
 }
 
 /// Distinct thread counts per folder (inbox / sent / draft).
@@ -227,14 +232,24 @@ pub async fn sms_counts(state: State<'_, SmsBridge>) -> Result<SmsFolderCountsOu
 
 /// Read one thread's messages (chronological). An empty/absent `folder` means
 /// "the whole conversation"; otherwise only that folder's rows.
+///
+/// `address` is the thread's remote party: when it is blocked for SMS the read
+/// is refused with an honest error (a blocked sender's content must not appear
+/// even if a caller asks for the thread id directly).
 #[tauri::command]
 pub async fn sms_messages(
     state: State<'_, SmsBridge>,
     thread_id: String,
     folder: Option<String>,
+    address: Option<String>,
 ) -> Result<Vec<SmsMessageOut>, String> {
     if thread_id.trim().is_empty() {
         return Err("invalid SMS payload: blank thread id".to_string());
+    }
+    if let Some(addr) = address.as_deref().filter(|a| !a.trim().is_empty()) {
+        if let Some(reason) = crate::blocklist::shared().check(addr, amos_blocklist::Channel::Sms) {
+            return Err(format!("blocked by rule: {reason:?}"));
+        }
     }
     let folder = match folder.as_deref().map(str::trim) {
         None | Some("") => None,
@@ -354,6 +369,17 @@ mod events {
         let jstr = unsafe { JString::from_raw(address) };
         let addr: String = env.get_string(&jstr).map(|s| s.into()).unwrap_or_default();
         let payload = incoming_payload(&addr);
+        // A blocked sender must not raise an AmOS notification or refresh the
+        // Messages screen. (The message row itself is owned by the platform's
+        // default SMS app; we cannot delete it — see docs/sms.md.)
+        if !payload.address.is_empty() && crate::blocklist::shared().blocks_sms(&payload.address) {
+            tracing::info!(
+                target: "amos::sms",
+                from = %mask_address(&payload.address),
+                "incoming SMS from a blocked sender ignored"
+            );
+            return;
+        }
         tracing::info!(
             target: "amos::sms",
             from = %if payload.address.is_empty() { "<unknown>".to_string() } else { mask_address(&payload.address) },

@@ -58,6 +58,14 @@ object AmosGlue {
         // the AndroidSmsProvider instead of the empty host Mock. Reads/sends
         // succeed once READ_SMS/SEND_SMS are granted (checked at call time).
         startQuietly("sms") { SmsGlue.bind(context.applicationContext) }
+        // Point the spam blocklist at its JSON store so the SMS filter and the
+        // call-screening service read the same rules; if the user has call rules
+        // but AmOS lacks the system Call Screening role, ask for it (the system
+        // shows its own dialog) — otherwise blocked calls could not be rejected.
+        startQuietly("blocklist") {
+            BlocklistGlue.bind(context.applicationContext)
+            BlocklistGlue.requestScreeningRoleIfNeeded(context.applicationContext)
+        }
     }
 
     /** Run [block], logging (never throwing) if a producer can't start. */

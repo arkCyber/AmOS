@@ -880,7 +880,65 @@ export interface SmsMessageOut {
   read: boolean;
 }
 
-/** SMS folders, mirroring `amos_sms::SmsFolder` (wire names). */
+/** Spam-blocking rules (`amos-tauri::blocklist`). */
+export interface BlockRuleOut {
+  id: string;
+  pattern: string;
+  kind: "exact" | "prefix";
+  channel: "call" | "sms" | "both";
+  label: string;
+  created_ms: number;
+}
+
+/** The whole blocklist: rules (newest first) + the unknown-number switch. */
+export interface BlocklistOut {
+  block_unknown: boolean;
+  rules: BlockRuleOut[];
+}
+
+/** Why an address is blocked (`null` = allowed). */
+export type BlockReasonOut =
+  | { kind: "rule"; id: string; pattern: string; label: string; channel: BlockRuleOut["channel"] }
+  | { kind: "unknown" };
+
+/** Read the blocklist. `null` when unavailable. */
+export async function blocklistSnapshot(): Promise<BlocklistOut | null> {
+  return invoke<BlocklistOut>("blocklist_snapshot");
+}
+
+/** Add (or refresh) a rule; rejects with the domain's honest error message. */
+export async function blocklistAdd(
+  pattern: string,
+  kind: BlockRuleOut["kind"],
+  channel: BlockRuleOut["channel"],
+  label = "",
+): Promise<BlockRuleOut | null> {
+  return invoke<BlockRuleOut>("blocklist_add", { pattern, kind, channel, label });
+}
+
+/** Remove a rule by id. */
+export async function blocklistRemove(id: string): Promise<boolean> {
+  return (await invoke<boolean>("blocklist_remove", { id })) === true;
+}
+
+/** Drop every rule (keeps the unknown-number switch). */
+export async function blocklistClear(): Promise<void> {
+  await invoke<null>("blocklist_clear");
+}
+
+/** Turn unknown/withheld-number blocking on/off. */
+export async function blocklistSetUnknown(on: boolean): Promise<void> {
+  await invoke<null>("blocklist_set_unknown", { on });
+}
+
+/** Why an address is blocked for a channel (`null` = allowed / unavailable). */
+export async function blocklistCheck(
+  address: string,
+  channel: BlockRuleOut["channel"],
+): Promise<BlockReasonOut | null> {
+  return invoke<BlockReasonOut | null>("blocklist_check", { address, channel });
+}
+
 export type SmsFolder = "inbox" | "sent" | "draft";
 
 /** Every folder, in the order the UI shows them. */
@@ -939,7 +997,9 @@ export async function smsFolderSnapshot(folder: SmsFolder): Promise<SmsFolderSna
 }
 
 /** Messages of one SMS thread (chronological). `folder` scopes them to a folder;
- *  omitted = the whole conversation. `null` when unavailable.
+ *  omitted = the whole conversation. `address` is the thread's remote party: when
+ *  it is blocked for SMS the command refuses with an honest error. `null` when
+ *  unavailable.
  *
  * Tauri v2 deserializes command args in camelCase, so the key must be
  * `threadId` (the Rust param is `thread_id`); passing snake_case fails with
@@ -947,8 +1007,13 @@ export async function smsFolderSnapshot(folder: SmsFolder): Promise<SmsFolderSna
 export async function smsMessages(
   threadId: string,
   folder?: SmsFolder,
+  address?: string,
 ): Promise<SmsMessageOut[] | null> {
-  return invoke<SmsMessageOut[]>("sms_messages", { threadId, folder: folder ?? "" });
+  return invoke<SmsMessageOut[]>("sms_messages", {
+    threadId,
+    folder: folder ?? "",
+    address: address ?? "",
+  });
 }
 
 /** Send a real SMS. `true` only on the command's explicit success marker. */

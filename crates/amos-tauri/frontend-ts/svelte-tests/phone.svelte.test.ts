@@ -56,4 +56,61 @@ describe("PhoneApp.svelte (offline UI)", () => {
     expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
     expect(host.container.querySelector('[role="alert"]')).toBeTruthy();
   });
+
+  test("blocklist tab adds, lists and removes rules through the bridge", async () => {
+    const calls: Record<string, unknown>[] = [];
+    let rules: Record<string, unknown>[] = [];
+    let unknown = false;
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, ...(args ?? {}) });
+        if (cmd === "blocklist_snapshot") return { block_unknown: unknown, rules };
+        if (cmd === "blocklist_add") {
+          const r = {
+            id: `${String(args?.pattern)}|exact|both`,
+            pattern: String(args?.pattern),
+            kind: String(args?.kind),
+            channel: String(args?.channel),
+            label: String(args?.label ?? ""),
+            created_ms: 1,
+          };
+          rules = [...rules, r];
+          return r;
+        }
+        if (cmd === "blocklist_remove") {
+          rules = rules.filter((r) => r.id !== args?.id);
+          return true;
+        }
+        if (cmd === "blocklist_set_unknown") {
+          unknown = args?.on === true;
+          return null;
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(PhoneApp);
+    const blockTab = [...host.container.querySelectorAll('button[role="tab"]')].find((b) =>
+      (b.textContent ?? "").includes("拦截"),
+    ) as HTMLButtonElement;
+    await fireEvent.click(blockTab);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await fireEvent.input(host.container.querySelector('input[aria-label="block-number"]') as HTMLInputElement, {
+      target: { value: "1069" },
+    });
+    await fireEvent.click(host.container.querySelector('button[aria-label="block-add"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const added = calls.find((c) => c.cmd === "blocklist_add");
+    expect(added?.pattern).toBe("1069");
+    expect(added?.kind).toBe("exact");
+    expect(added?.channel).toBe("both");
+    expect(txt(host)).toContain("1069");
+    // The unknown-number switch reaches the same rule store.
+    await fireEvent.click(host.container.querySelector('button[aria-label="block-unknown"]') as HTMLButtonElement);
+    expect(calls.find((c) => c.cmd === "blocklist_set_unknown")?.on).toBe(true);
+    // Removing the rule drops it from the list.
+    await fireEvent.click(host.container.querySelector('button[aria-label="block-remove-1069"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(rules.length).toBe(0);
+  });
 });

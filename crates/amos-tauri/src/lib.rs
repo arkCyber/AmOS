@@ -18,6 +18,9 @@ pub mod android_glue;
 pub mod android_lmk;
 pub mod appstore;
 pub mod assistant_voice;
+/// Spam blocking (calls + SMS): rule storage, SMS filtering and the Android
+/// call-screening JNI hook.
+pub mod blocklist;
 pub mod buttons;
 pub mod clipboard;
 #[cfg(feature = "android")]
@@ -105,6 +108,7 @@ pub fn run() {
         .manage(appstore::StoreBridge::new())
         .manage(sensor_host::SensorHost::new())
         .manage(sms::SmsBridge::boot())
+        .manage(blocklist::shared())
         .invoke_handler(tauri::generate_handler![
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
@@ -240,6 +244,12 @@ pub fn run() {
             sms::sms_counts,
             sms::sms_messages,
             sms::sms_send,
+            blocklist::blocklist_snapshot,
+            blocklist::blocklist_add,
+            blocklist::blocklist_remove,
+            blocklist::blocklist_clear,
+            blocklist::blocklist_set_unknown,
+            blocklist::blocklist_check,
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
             taskmgr::taskmgr_job_action,
@@ -319,6 +329,12 @@ pub fn run() {
             // refreshes live instead of on a manual pull.
             #[cfg(feature = "android")]
             sms::install_events(app.handle().clone());
+            // Point the blocklist at its JSON file so the rules survive restarts
+            // (the Android CallScreeningService can also configure this itself
+            // when the system cold-starts the process for an incoming call).
+            if let Ok(dir) = app.path().app_data_dir() {
+                blocklist::shared().configure(blocklist::file_in(&dir));
+            }
             // Real in-call bridge (default-dialer / InCallService): give the Rust side
             // an AppHandle so Kotlin-pushed real call states reach the WebView as
             // `telephony-event`, and so telephony answer/end can drive the real call.

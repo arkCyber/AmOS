@@ -132,9 +132,36 @@ Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就�
 
 **工程保障**：新增 `make android-app`，把「先 `bun run build` 再 `tauri android build` 再 `adb install -g`」固定成一条命令——本轮真机上曾因忘记重建 `dist` 而装出旧 UI（`tauri.conf.json` 的 `beforeBuildCommand` 为空，构建会原样嵌入既有 `dist/`），该目标专门防止这类回归。
 
-### 10. 测试与门禁（本机全绿）
-- `amos-sms`：**23 例**（folder 往返/Android type/非法文件夹、三文件夹线程与计数、按文件夹取消息、地址规范化/拒绝、分段计数、GSM-7 判定、线协议上限与越界、错误类型映射、线程交叉校验、send 成功语义）。
-- `amos-tauri --lib sms::`：**10 例**（含按文件夹映射与计数镜像、未知文件夹在调用 provider 前被拒、发送前校验、地址掩码、**卡死 provider 超时**、阻塞结果传递）。
-- 前端：`typecheck` / `typecheck:svelte` 0 error、`test:svelte` **362 例**（新增文件夹切换+计数、草稿保存→编辑→发送→消费；权限拒绝→重试恢复、空收件箱诚实态、宿主 mock 保持本地会话）+ `smsDrafts` 纯函数 **5 例**。
+### 11. 骚扰拦截（黑名单）：来电 + 短信（2026-09-10）
+按仓库 `domain + Provider` 惯例新增独立域 crate 与三处执法点，规则只有**一处真相**：
+
+| 层 | 实现 |
+|---|---|
+| 域 `crates/amos-blocklist`（新增） | `Rule{pattern, kind∈exact\|prefix, channel∈call\|sms\|both, label}` + `Blocklist`：号码规范化（`+`/分隔符/`00`/前导 0）、**同号等价匹配**（`+8618616091470` ≡ `18616091470` ≡ `8618616091470` ≡ `0086…`，只允许丢弃 1–3 位前导国家码，绝不误并无关号码）、前缀规则最短 3 位、未知/隐藏号码开关、一地址一条去重、上限 500（超限淘汰最旧）、JSON 往返且**不信任**损坏文件（版本/非法规则/超限 → 诚实报错） |
+| Rust 桥 `amos-tauri/src/blocklist.rs` | 进程级共享状态（命令 / SMS 过滤 / JNI 三处共用）；命令 `blocklist_snapshot/add/remove/clear/set_unknown/check`；持久化到 `app_data_dir/blocklist.json`（临时文件 + rename 原子写；损坏文件记日志后以空表启动，不崩） |
+| **短信执法** | `sms_snapshot` 过滤被屏蔽发件人（带 `hidden` 计数日志）；`sms_messages(threadId, folder, address)` 命中规则即拒绝（诚实报错并指出规则）；**实时收信**在 JNI upcall 里先查黑名单，命中则**不发事件**（不通知、不刷新）；文档明确边界：系统短信库由默认短信应用拥有，AmOS 无法删除行 |
+| **来电执法** | Kotlin `AmosCallScreeningService`（`CallScreeningService` + 清单声明 `BIND_SCREENING_SERVICE`）对每个来电询问 Rust（JNI `BlocklistGlue.shouldBlockCall`），命中则 `disallowCall+rejectCall+skipNotification` —— **系统级拒接**；`BlocklistGlue` 自身可 `configure(filesDir)`，因为系统可能为一次来电冷启动进程。原生不可用时**失败开放**（不静默拦截所有来电） |
+| 权限/角色 | 来电拦截需系统 `ROLE_CALL_SCREENING`：`BlocklistGlue.requestScreeningRoleIfNeeded` 在「存在来电规则且未授权」时于启动后请求（系统弹窗）；`AmosGlue.onStart` 调用 |
+| UI | 电话 App 第 5 个标签「拦截」：号码 + 精确/前缀 + 来电/短信/两者 + 加入/移除、未知号码开关、角色说明；`smsDrafts` 之外的 i18n 中英 |
+
+**真机验收（YY000286）**：
+- `CallScreeningService` 已注册：`dumpsys package` 显示 `com.amos.ai/.glue.AmosCallScreeningService` + `android.telecom.CallScreeningService` + `BIND_SCREENING_SERVICE`。
+- 黑名单生效：加入 `1069`（前缀/短信）与 `+8618616091470`（精确/短信）后，收件箱 **7 → 3**（3 个 1069 号段 + 本机号被隐藏）。
+- 持久化：重装 + 重启后 `blocklist_snapshot` 仍有这两条规则（读自 JSON 文件）。
+- 读取拒绝：对被屏蔽线程 `sms_messages` 返回 `blocked by rule: …`（含规则 id/pattern/channel）。
+- **实时抑制**：被屏蔽号码来信 `sms-received` 事件 **0 次**（未屏蔽时为 2 次，动态+清单两个接收器），UI 不刷新、不通知；移除规则后再发 → 事件恢复、线程回归（3 → 4）。
+- 号码等价（真机发现并修复的缺陷）：网络把回环短信给成国内格式 `18616091470`，而规则是 `+8618616091470` —— 修前 `blocklist_check("18616091470")` 为 `null`，修后命中同一条规则（`same_number` 容忍国家码/前导 0）。
+- UI：电话 App 出现「拦截」标签，规则列表（`1069 · 前缀 · 仅短信 · bulk`）、未知号码开关、移除均可用；移除后列表为空（测试规则已清理）。
+
+### 12. 测试与门禁（本机全绿）
+- `amos-blocklist`：**14 例**（规范化/同号等价/前缀保守性、渠道、未知号码、命中原因、去重、上限淘汰、JSON 往返、损坏载荷拒绝）。
+- `amos-tauri --lib blocklist::`：**6 例**（增删查、非法 kind/channel、重启持久化、损坏文件起源、短信线程过滤、仅来电规则不影响短信）。
+- `amos-sms` **23 例**、`amos-tauri --lib sms::` **10 例**、`clippy -D warnings`（host + `--features android`）。
+- 前端：`test:svelte` **363 例**（新增「拦截」标签增删规则用例）+ `tsc`/`svelte-check` 0 error。
+
+### 已知边界 / 下一步
+- 系统短信库由默认短信应用拥有：AmOS 只能在**自己的视图与通知**层面屏蔽短信，无法删除系统行（除非 AmOS 成为默认短信应用）。
+- 来电拦截需用户授予系统「来电筛选」角色；未授权时仅记录规则、不拒接（UI 已如实说明）。
+- 未做「信息页一键屏蔽此号码」「通话记录一键拉黑」等快捷入口（规则已在 `blocklist_*` 命令层就绪，接 UI 即可）。
 
 

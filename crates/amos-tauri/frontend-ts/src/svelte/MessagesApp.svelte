@@ -107,16 +107,17 @@
   const activeRealName = $derived(
     activeReal ? activeReal.display_name || activeReal.address : "",
   );
-  const loadReal = (id: string) => {
+  const loadReal = (id: string, address?: string) => {
     realErr = "";
-    void smsMessages(id, folder).then((m) => {
+    void smsMessages(id, folder, address).then((m) => {
       if (m) realMsgs = [...m].sort((a, b) => a.ts_ms - b.ts_ms);
       else realErr = t("message.loadFailed");
     });
   };
   const openReal = (id: string) => {
     realActiveId = id;
-    loadReal(id);
+    const th = realThreads.find((x) => x.id === id);
+    loadReal(id, th?.address);
   };
   const refreshCounts = () => {
     void smsCounts().then((c) => {
@@ -139,7 +140,7 @@
         } else if (realActiveId) {
           // Same thread still open → reload its messages, so a message that just
           // arrived (live `sms-received` refresh) shows up without a manual pull.
-          loadReal(realActiveId);
+          loadReal(realActiveId, activeReal?.address);
         }
       } else {
         realThreads = [];

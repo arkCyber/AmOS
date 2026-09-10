@@ -10,7 +10,10 @@
   import {
     onTelephonyEvent, telephonyDial, telephonyEnd, telephonySimulateIncoming,
     telephonyStartRecording, telephonyStopRecording,
+    blocklistAdd, blocklistRemove, blocklistSetUnknown, blocklistSnapshot,
+    bridged,
   } from "../lib/backend";
+  import type { BlockRuleOut } from "../lib/backend";
   import { CONTACTS_KEY, contactNameFor, normalizeContacts } from "../lib/contacts";
   import type { Contact } from "../lib/contacts";
   import { CALLLOG_KEY, frequentNumbers, normalizeCallLog, recentNumbers, recordCall } from "../lib/calllog";
@@ -23,7 +26,7 @@
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
 
-  type PhoneTab = "keys" | "recent" | "frequent" | "emergency";
+  type PhoneTab = "keys" | "recent" | "frequent" | "emergency" | "block";
   const SUB: Record<string, string> = {
     "2": "ABC", "3": "DEF", "4": "GHI", "5": "JKL",
     "6": "MNO", "7": "PQRS", "8": "TUV", "9": "WXYZ",
@@ -51,6 +54,49 @@
   let elapsedSec = $state(0);
   let activeRef: string | null = null;
   let activeAtRef: number | null = null;
+
+  // ---- Spam blocking (calls + SMS) -------------------------------------------
+  // Rules live in Rust (shared with the SMS filter and the Android call-screening
+  // service), so this screen is a thin, honest view over that one source.
+  let blockRules = $state<BlockRuleOut[]>([]);
+  let blockUnknown = $state(false);
+  let blockNum = $state("");
+  let blockKind = $state<BlockRuleOut["kind"]>("exact");
+  let blockChannel = $state<BlockRuleOut["channel"]>("both");
+  let blockErr = $state("");
+  const loadBlocklist = () => {
+    void blocklistSnapshot().then((b) => {
+      if (!b) return;
+      blockRules = b.rules;
+      blockUnknown = b.block_unknown;
+    });
+  };
+  $effect(() => {
+    if (!bridged()) return;
+    loadBlocklist();
+  });
+  const addBlockRule = () => {
+    const pattern = blockNum.trim();
+    if (!pattern) return;
+    blockErr = "";
+    void blocklistAdd(pattern, blockKind, blockChannel).then((r) => {
+      if (!r) {
+        // The domain rejects junk patterns (too short, letters, bad prefix).
+        blockErr = t("phone.blockInvalid");
+        return;
+      }
+      blockNum = "";
+      loadBlocklist();
+    });
+  };
+  const removeBlockRule = (id: string) => {
+    void blocklistRemove(id).then(() => loadBlocklist());
+  };
+  const toggleBlockUnknown = () => {
+    const next = !blockUnknown;
+    blockUnknown = next;
+    void blocklistSetUnknown(next);
+  };
 
   const initContacts = normalizeContacts(readStoreValue<unknown>(CONTACTS_KEY, []));
   let contacts = $state<Contact[]>(initContacts);
@@ -198,6 +244,7 @@
         { id: "recent", label: t("phone.tabRecent") },
         { id: "frequent", label: t("phone.tabFrequent") },
         { id: "emergency", label: t("phone.tabEmergency") },
+        { id: "block", label: t("phone.tabBlock") },
       ] as tb (tb.id)}
         <button role="tab" aria-selected={tab === tb.id} onclick={() => (tab = tb.id as PhoneTab)}
           class="flex-1 rounded-full px-2 py-1.5 text-xs font-medium transition {tab === tb.id ? 'bg-white text-neutral-900 shadow dark:bg-white/20 dark:text-white' : 'text-neutral-600 hover:text-neutral-900 dark:text-white/70 dark:hover:text-white'}">
@@ -360,6 +407,49 @@
         {/each}
       </ul>
       <p class="mt-4 max-w-xs text-center text-xs leading-relaxed opacity-50">{t("phone.emergencyHint")}</p>
+    </div>
+  {/if}
+
+  {#if tab === "block"}
+    <div class="flex w-full flex-col items-center" data-testid="blocklist-panel">
+      <!-- Add a rule: pattern + exact/prefix + which channel it covers. -->
+      <div class="mb-2 flex w-full max-w-sm flex-wrap items-center gap-1.5">
+        <input bind:value={blockNum} aria-label="block-number" onkeydown={(e) => e.key === "Enter" && addBlockRule()} placeholder={t("phone.blockPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
+        <select bind:value={blockKind} aria-label="block-kind" class="rounded-full bg-black/5 px-2 py-1.5 text-xs dark:bg-white/10">
+          <option value="exact">{t("phone.blockKindExact")}</option>
+          <option value="prefix">{t("phone.blockKindPrefix")}</option>
+        </select>
+        <select bind:value={blockChannel} aria-label="block-channel" class="rounded-full bg-black/5 px-2 py-1.5 text-xs dark:bg-white/10">
+          <option value="both">{t("phone.blockChannelBoth")}</option>
+          <option value="call">{t("phone.blockChannelCall")}</option>
+          <option value="sms">{t("phone.blockChannelSms")}</option>
+        </select>
+        <button onclick={addBlockRule} aria-label="block-add" class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("phone.blockAdd")}</button>
+      </div>
+      {#if blockErr}
+        <p class="mb-1 text-xs text-red-500" role="alert">{blockErr}</p>
+      {/if}
+      <button onclick={toggleBlockUnknown} aria-pressed={blockUnknown} aria-label="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/15 text-accent" : "bg-black/5 dark:bg-white/10")}>
+        {t("phone.blockUnknown")} · {blockUnknown ? t("phone.on") : t("phone.off")}
+      </button>
+      {#if blockRules.length === 0}
+        <p class="py-6 text-center text-sm opacity-60">{t("phone.blockEmpty")}</p>
+      {:else}
+        <ul class="w-full max-w-sm space-y-2">
+          {#each blockRules as r (r.id)}
+            <li class="flex items-center justify-between gap-2 rounded-2xl bg-black/5 px-3 py-2 dark:bg-white/10">
+              <div class="min-w-0">
+                <div class="truncate text-sm font-medium">{r.pattern}</div>
+                <div class="text-xs opacity-60">
+                  {r.kind === "prefix" ? t("phone.blockKindPrefix") : t("phone.blockKindExact")} · {r.channel === "both" ? t("phone.blockChannelBoth") : r.channel === "call" ? t("phone.blockChannelCall") : t("phone.blockChannelSms")}{#if r.label} · {r.label}{/if}
+                </div>
+              </div>
+              <button onclick={() => removeBlockRule(r.id)} aria-label={`block-remove-${r.pattern}`} class="shrink-0 rounded-full bg-neutral-200 px-2 py-1 text-xs dark:bg-neutral-700">{t("phone.blockRemove")}</button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <p class="mt-4 max-w-sm text-center text-xs leading-relaxed opacity-50">{t("phone.blockHint")}</p>
     </div>
   {/if}
 </div>
