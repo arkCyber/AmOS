@@ -1,6 +1,6 @@
 # Amos — AI-First Mobile OS
 
-[![CI](https://github.com/yourusername/amos/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/amos/actions/workflows/ci.yml)
+[![CI](https://github.com/arkCyber/AmOS/actions/workflows/ci.yml/badge.svg)](https://github.com/arkCyber/AmOS/actions/workflows/ci.yml)
 [![License: MIT OR Apache 2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue)](./LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org/)
 [![Cargo Workspace](https://img.shields.io/badge/workspace-monorepo-brightgreen)](./Cargo.toml)
@@ -57,6 +57,8 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-monitor/             # system working-status (health) domain core: folds SystemSampler load (CPU/mem) + amos-profiling battery/power + amos-applife process counts into one honest SystemHealth (real /proc `linux` sampler, `android` skeleton) (docs/system-monitor.md)
     ├── amos-display/             # display-protection / auto screen-off domain core: deterministic ScreenState + IdlePolicy (battery vs charging timeouts, hold-while-call) + the AMOS_SCREEN_STATE_PATH file contract the daemon energy beat and the System UI host share (docs/display-idle.md)
     ├── amos-media/               # media / external-storage domain core: spec types for the standard Android collections (DCIM/Camera, Pictures, Download, Recordings…), a pluggable MediaProvider seam (deterministic Mock today; Android MediaStore via Kotlin glue + optional HostFsProvider raw read_dir for root/Waydroid later) + a permission-policy MediaManager (nothing readable/writable until granted) + a cross-compilable `scan_dir` DCIM-scan example (docs/media.md · docs/android-storage-unify.md)
+    ├── amos-sms/                 # SMS domain core: threads/messages/folders (inbox/sent/draft), validate (normalize + bounded segments), pluggable SmsProvider seam (Mock / Android `android`-gated SmsGlue reading content://sms + SmsManager send), push-receive events (docs/sms.md)
+    ├── amos-blocklist/           # spam-blocking rule core: exact/prefix rules per channel (call/sms/both), number equivalence (+CC / leading-0), unknown-number toggle, cap-500 LRU + JSON persistence shared by the SMS filter and the Android CallScreeningService (docs/sms.md §11)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -348,8 +350,11 @@ git-ignored `.cargo/config.toml`, so a stale machine path can't leak into CI.
 Native-gated CI jobs can opt into running inside that pinned container by setting
 the repository Variable `CI_ANDROID_IMAGE`. See `docs/ci-engineering.md`.
 
-## Recent additions (2026-09-04)
+## Recent additions (2026-09-10)
 
+- **Spam blocking (blacklist) — calls + SMS**: new domain crate `crates/amos-blocklist` (exact/prefix rules per channel, number equivalence tolerant of `+86`/leading-0 forms, unknown-number toggle, cap 500) shared by three enforcement points: the SMS filter (`sms_snapshot` hides blocked senders, live receipts raise no event), the Android `CallScreeningService` (system-level call rejection via `BlocklistGlue` JNI + `ROLE_CALL_SCREENING`), and the Phone app「拦截」tab (rule list, one-tap block from call history & message threads, honest role-status banner). See `docs/sms.md` §11.
+- **SMS — real device end-to-end + folders**: push receive (`SMS_RECEIVED` receiver + manifest `SmsReceiver` → `sms-received` event, no manual refresh), sending via `SmsManager`, and full inbox/sent/drafts folders (`SmsFolder` domain + folder tabs + counts + AmOS-local drafts). `make android-app` rebuilds dist then installs. See `docs/sms.md`.
+- **Call history page**: direction (incoming/outgoing/missed) recorded from real transitions, relative timestamps, filter chips, two-step clear, and per-record 回电 / 回短信 / 拉黑 actions with cross-app deep links (`appLinks.ts`). See `docs/telephony.md` §13.
 - **Call recording — first-class, contractual (`crates/amos-telephony` + `proto/telephony.proto` + `amos-tauri` + `frontend-ts`)**: per-call `RecordingState{Off,On,Failed}` domain state machine; `TelephonyProvider::start/stop_recording` allow/deny consent seam with a **hard no-record rule for emergency (110/112/911…) lines**; wire `StartRecording`/`StopRecording` RPCs, `CallSnapshot.recording`, Tauri `telephony_start/stop_recording`, and a record toggle + live "正在录音" indicator in `PhoneApp`. `Call`-state recording is broadcast on `Watch`, so every surface stays consistent.
 - **Phone calls — real end-to-end loop (dial → talk → record → hang up) + incoming surface**: `amos-ai` mounts a demo `TelephonyService` that auto-connects dialed calls; a `Watch`→`telephony-event` bridge streams every transition (connect / record / local+remote end) to the WebView; `PhoneApp` shows a talking screen when its call connects; a system **`IncomingCall`** overlay offers Answer/Decline then a recordable in-call banner. A **模拟来电** demo trigger (`SimulateIncoming`) exercises the incoming path by hand. See `docs/telephony.md`.
 - **Radio / connectivity**: quick-settings Wi‑Fi / Bluetooth / Airplane now go through a real policy layer — `crates/amos-radio` (`RadioManager` airplane cascade + guard, `MockRadioProvider`; Android `AndroidRadioProvider` behind the `android` feature, wired into `amos-tauri` via `RadioBridge::from_android`) — persisted `amos.settings`, status-bar indicators, and `scripts/build-android.sh` cross-compiles `amos-radio --features android`. See `docs/radio.md`.
@@ -402,7 +407,8 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/lmk-proxy.md](./docs/lmk-proxy.md) — Android Activity/Task lifecycle proxy + LMK (AmOS-controlled freeze/kill of container APKs)
 - [docs/android-lmk-e2e.md](./docs/android-lmk-e2e.md) — Android LMK end-to-end acceptance runbook (real device / live Tauri host)
 - [docs/appstore.md](./docs/appstore.md) — App-store core: catalog/package JSON publish contract + download→verify→install (developer onboarding)
-- [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams)
+- [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams, call-recording consent, call-history page)
+- [docs/sms.md](./docs/sms.md) — SMS: real device send/receive, inbox/sent/drafts folders, validation bounds, and the shared spam blocklist (rules + SMS filter + CallScreeningService)
 - [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
 - [docs/sensors.md](./docs/sensors.md) — Device sensors/multimedia domain core: `amos-sensor` camera / GPS-GNSS / IMU spec types + SensorProvider seam + energy-policy SensorManager (real HAL + service-bus wiring left as seams)
 - [docs/profiling.md](./docs/profiling.md) — Inference performance & power profiling domain core: `amos-profiling` prompt/decode tokens-per-second, TTFT, per-token latency, real `BatterySample` power model + `mean_power_mw`, PowerSource seam (live `CURRENT_NOW` × `EXTRA_VOLTAGE`) + honest energy estimate (`est_energy_j`)
@@ -457,8 +463,8 @@ You may use this project under either license at your discretion. See [LICENSE](
 ## Support
 
 For issues, feature requests, or questions:
-- 📖 Check [existing issues](https://github.com/arksong/amos/issues)
-- 🐛 [Report a bug](https://github.com/arksong/amos/issues/new?template=bug_report.md)
-- ✨ [Request a feature](https://github.com/arksong/amos/issues/new?template=feature_request.md)
+- 📖 Check [existing issues](https://github.com/arkCyber/AmOS/issues)
+- 🐛 [Report a bug](https://github.com/arkCyber/AmOS/issues/new?template=bug_report.md)
+- ✨ [Request a feature](https://github.com/arkCyber/AmOS/issues/new?template=feature_request.md)
 - 🔒 For security issues, see [SECURITY.md](./SECURITY.md)
 - 📧 Contact: arksong2018@gmail.com

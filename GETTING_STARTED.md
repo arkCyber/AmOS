@@ -53,7 +53,7 @@ sudo apt-get install -y \
 ### 3. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/amos.git
+git clone https://github.com/arkCyber/AmOS.git
 cd amos
 ```
 
@@ -237,8 +237,8 @@ rm /tmp/amos-ai.sock
 ## Getting Help
 
 - 📖 Read the [documentation](../docs/)
-- 🐛 Check [existing issues](https://github.com/arksong/amos/issues)
-- 💬 Open a [discussion](https://github.com/arksong/amos/discussions)
+- 🐛 Check [existing issues](https://github.com/arkCyber/AmOS/issues)
+- 💬 Open a [discussion](https://github.com/arkCyber/AmOS/discussions)
 - 📧 Email: arksong2018@gmail.com
 
 Happy coding! 🚀

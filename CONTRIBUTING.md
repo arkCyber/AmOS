@@ -19,7 +19,7 @@ This project adheres to a [Code of Conduct](./CODE_OF_CONDUCT.md). By participat
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/amos.git
+   git clone https://github.com/arkCyber/AmOS.git
    cd amos
    ```
 
