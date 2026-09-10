@@ -116,9 +116,25 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
 3. **推式接收（无手动刷新）**：打开该会话后经命令发送 `LIVE4-…`，logcat 显示 `SmsGlue: SMS_RECEIVED from '18616091470'`，WebView 原始事件计数 +2，**DOM 自动出现新收到的消息**。
 4. **UI 撰写**：点「新短信」→ 填号码/内容 → 发送 `UISEND-…`，provider 中出现 `from_me=true` 与回环 `from_me=false` 两条，DOM 同步可见。
 
-### 8. 测试与门禁（本机全绿）
-- `amos-sms`：**19 例**（含地址规范化/拒绝、分段计数、GSM-7 判定、线协议上限与越界、错误类型映射、线程交叉校验、send 成功语义）。
-- `amos-tauri --lib sms::`：**8 例**（含宿主空收件箱、mock/设备状态区分、发送前校验、地址掩码、**卡死 provider 超时**、阻塞结果传递）。
-- 前端：`typecheck` / `typecheck:svelte` 0 error、`test:svelte` **358 例**（新增权限拒绝→重试恢复、空收件箱诚实态、宿主 mock 保持本地会话）。
+### 9. 文件夹全面实现：收件箱 / 发件箱 / 草稿（2026-09-10）
+Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就是该标签。本次把这一模型贯通全栈：
+
+| 层 | 实现 |
+|---|---|
+| 域 | 新增 `crates/amos-sms/src/folder.rs`：`SmsFolder{Inbox,Sent,Draft}`（wire 名 `inbox/sent/draft`，`android_type()` = 1/2/3，`from_wire` 未知值**诚实报错**）+ `SmsFolderCounts`。`SmsProvider` 契约改为 `snapshot(folder)` / `messages(thread_id, Option<folder>)` / `counts()`；Mock 改用**单一数据源**（`seeded_rows()`）派生三个文件夹的线程、消息与计数（收件箱才有未读，发件箱/草稿永不“未读”） |
+| 线协议 | `parse_counts()`（`{"inbox":n,"sent":n,"draft":n}`，缺省 0）；线程/消息解析沿用既有加固（上限、越界、错误类型、线程交叉校验） |
+| 桥 | `sms_snapshot(folder)`、`sms_counts`、`sms_messages(threadId, folder?)`；文件夹名在桥层解析（非法值在调用 provider 前就被拒）；仍为 `async` + `spawn_blocking` + 8s 超时 |
+| Kotlin glue | `snapshot(folder)` 按 `type = ?` 过滤（含 `LIMIT` 有界窗口，未读只在收件箱统计）；`messages(threadId, folder)` 叠加 `type` 过滤（空文件夹=整段会话）；`counts()` 三个有界的去重线程计数；未知文件夹 → `error_kind:"invalid"` |
+| 前端 | `smsFolderSnapshot(folder)` / `smsCounts()` / `smsMessages(threadId, folder)`；`MessagesApp` 增加文件夹标签（含计数）、切文件夹即重读该文件夹的线程与消息 |
+| **草稿** | 系统草稿（`type=3`）由平台写入，**只有默认短信应用能写**；因此 AmOS 草稿存在本地（`lib/smsDrafts.ts`，纯函数 + 上限 + 去重，一个地址一条草稿），UI 明确标注「AmOS 草稿（写入系统草稿需将 AmOS 设为默认短信应用）」；若设备本身有系统草稿，则另列一节「系统草稿（只读）」。草稿标签计数 = 平台草稿线程数 + 本地草稿数（两者都真的可见，不为凑数） |
+
+**真机验收（YY000286）**：`sms_counts → {inbox:7, sent:2, draft:0}`；UI 标签「收件箱7 / 发件箱2 / 草稿」；发件箱只列已发送消息（不含回环收到的）；草稿页显示说明与「暂无草稿」；新建草稿后标签变「草稿1」且列表可见；点草稿→编辑器预填→发送→**草稿被消费**（回到「暂无草稿」）且该文本真实出现在发件箱（`from_me=true`）。
+
+**工程保障**：新增 `make android-app`，把「先 `bun run build` 再 `tauri android build` 再 `adb install -g`」固定成一条命令——本轮真机上曾因忘记重建 `dist` 而装出旧 UI（`tauri.conf.json` 的 `beforeBuildCommand` 为空，构建会原样嵌入既有 `dist/`），该目标专门防止这类回归。
+
+### 10. 测试与门禁（本机全绿）
+- `amos-sms`：**23 例**（folder 往返/Android type/非法文件夹、三文件夹线程与计数、按文件夹取消息、地址规范化/拒绝、分段计数、GSM-7 判定、线协议上限与越界、错误类型映射、线程交叉校验、send 成功语义）。
+- `amos-tauri --lib sms::`：**10 例**（含按文件夹映射与计数镜像、未知文件夹在调用 provider 前被拒、发送前校验、地址掩码、**卡死 provider 超时**、阻塞结果传递）。
+- 前端：`typecheck` / `typecheck:svelte` 0 error、`test:svelte` **362 例**（新增文件夹切换+计数、草稿保存→编辑→发送→消费；权限拒绝→重试恢复、空收件箱诚实态、宿主 mock 保持本地会话）+ `smsDrafts` 纯函数 **5 例**。
 
 

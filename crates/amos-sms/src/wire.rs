@@ -16,6 +16,7 @@
 use serde_json::Value;
 
 use crate::error::SmsError;
+use crate::folder::SmsFolderCounts;
 use crate::spec::{SmsMessage, SmsThread};
 
 /// Upper bound on a single glue reply (4 MiB). A snapshot for 500 threads with
@@ -111,6 +112,18 @@ pub fn parse_messages_for(
 /// that do not hold the request id, e.g. host tests).
 pub fn parse_messages(payload: &str) -> Result<Vec<SmsMessage>, SmsError> {
     parse_messages_for(payload, None)
+}
+
+/// Parse a folder-counts payload from the glue:
+/// `{"inbox":2,"sent":1,"draft":0}` (missing folders default to 0 — honest only
+/// because a folder with no rows really has no threads).
+pub fn parse_counts(payload: &str) -> Result<SmsFolderCounts, SmsError> {
+    let v = checked(payload)?;
+    Ok(SmsFolderCounts {
+        inbox: opt_u32(&v, "inbox"),
+        sent: opt_u32(&v, "sent"),
+        draft: opt_u32(&v, "draft"),
+    })
 }
 
 /// Parse a send reply: `{"ok":true}` on success, or

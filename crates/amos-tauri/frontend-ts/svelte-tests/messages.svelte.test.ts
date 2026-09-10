@@ -10,13 +10,16 @@ import { fireEvent, render } from "@testing-library/svelte";
 import MessagesApp from "../src/svelte/MessagesApp.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import { CONV_KEY, seedConversations } from "../src/lib/messages";
+import { DRAFT_KEY } from "../src/lib/smsDrafts";
 import { beforeEach } from "vitest";
 import { tick } from "svelte";
 
 // Each test starts from a fresh, single seeded 小安 conversation (the Messages
-// screen persists to the shared store, which is not reset between tests).
+// screen persists to the shared store, which is not reset between tests) and an
+// empty local drafts store.
 beforeEach(() => {
   writeStoreValue(CONV_KEY, seedConversations(Date.now()));
+  writeStoreValue(DRAFT_KEY, []);
 });
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
@@ -330,5 +333,135 @@ describe("MessagesApp.svelte", () => {
     expect(sent?.text).toBe("测试短信");
     // The send is followed by a re-read so a newly created thread shows up.
     expect(calls.filter((c) => c.cmd === "sms_snapshot").length).toBeGreaterThan(1);
+  });
+
+  test("folder tabs read that folder and show thread counts", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const threadsFor: Record<string, unknown[]> = {
+      inbox: [
+        {
+          id: "1",
+          address: "13800138000",
+          display_name: "家人",
+          last_text: "回吗",
+          last_ts_ms: 1_700_000_000_000,
+          unread: 1,
+        },
+      ],
+      sent: [
+        {
+          id: "1",
+          address: "13800138000",
+          display_name: "家人",
+          last_text: "好的，六点到家。",
+          last_ts_ms: 1_699_999_500_000,
+          unread: 0,
+        },
+      ],
+      draft: [],
+    };
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, ...(args ?? {}) });
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_counts") return { inbox: 2, sent: 1, draft: 0 };
+        if (cmd === "sms_snapshot") return threadsFor[String(args?.folder)] ?? [];
+        if (cmd === "sms_messages") {
+          // Folder-scoped messages, so the panel proves which folder was read.
+          return args?.folder === "sent"
+            ? [
+                {
+                  thread_id: "1",
+                  id: "s1",
+                  from_me: true,
+                  text: "好的，六点到家。",
+                  ts_ms: 1_699_999_500_000,
+                  read: true,
+                },
+              ]
+            : [
+                {
+                  thread_id: "1",
+                  id: "i1",
+                  from_me: false,
+                  text: "回吗",
+                  ts_ms: 1_700_000_000_000,
+                  read: false,
+                },
+              ];
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    // Inbox by default, with the count badge from `sms_counts`.
+    expect(calls.find((c) => c.cmd === "sms_snapshot")?.folder).toBe("inbox");
+    expect(txt(host)).toContain("回吗");
+    expect(txt(host)).toContain("2"); // inbox count chip
+    // Switching to 发件箱 re-reads that folder (and never shows the inbox preview).
+    await fireEvent.click(host.container.querySelector('button[data-folder="sent"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    const sentCalls = calls.filter((c) => c.cmd === "sms_snapshot");
+    expect(sentCalls[sentCalls.length - 1]?.folder).toBe("sent");
+    expect(txt(host)).toContain("好的，六点到家。");
+    // Messages are scoped to the folder too.
+    const msgCall = calls.filter((c) => c.cmd === "sms_messages").pop();
+    expect(msgCall?.folder).toBe("sent");
+  });
+
+  test("a draft is kept locally and removed once sent", async () => {
+    const calls: Record<string, unknown>[] = [];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, ...(args ?? {}) });
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_counts") return { inbox: 0, sent: 0, draft: 0 };
+        if (cmd === "sms_snapshot") return [];
+        if (cmd === "sms_messages") return [];
+        if (cmd === "sms_send") return "sent";
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    // Compose → 存草稿 (not sending anything).
+    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms"]') as HTMLButtonElement);
+    await tick();
+    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-to"]') as HTMLInputElement, {
+      target: { value: "10086" },
+    });
+    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-text"]') as HTMLInputElement, {
+      target: { value: "想问下流量包" },
+    });
+    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms-draft"]') as HTMLButtonElement);
+    await tick();
+    expect(calls.some((c) => c.cmd === "sms_send")).toBe(false); // nothing was sent
+    // The drafts folder lists it from the local store.
+    await fireEvent.click(host.container.querySelector('button[data-folder="draft"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    expect(host.container.querySelector('[data-testid="drafts-list"]')).toBeTruthy();
+    expect(txt(host)).toContain("想问下流量包");
+    // Editing it prefils the composer; sending clears the draft and sends for real.
+    await fireEvent.click(host.container.querySelector('button[aria-label="draft-edit-10086"]') as HTMLButtonElement);
+    await tick();
+    const to = host.container.querySelector('input[aria-label="new-sms-to"]') as HTMLInputElement;
+    expect(to.value).toBe("10086");
+    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms-send"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    const sent = calls.find((c) => c.cmd === "sms_send");
+    expect(sent?.address).toBe("10086");
+    expect(sent?.text).toBe("想问下流量包");
+    expect(txt(host)).not.toContain("想问下流量包"); // draft consumed
+    expect(txt(host)).toContain("暂无草稿");
   });
 });

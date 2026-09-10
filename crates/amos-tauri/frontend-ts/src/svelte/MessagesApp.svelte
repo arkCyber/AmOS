@@ -28,15 +28,25 @@
   import { iconSvg } from "../lib/sysIcons";
   import type { Notif } from "../lib/settings";
   import {
+    SMS_FOLDERS,
     SMS_RECEIVED_EVENT,
     bridged,
+    smsCounts,
+    smsFolderSnapshot,
     smsMessages,
     smsSend,
-    smsSnapshotResult,
     smsStatus,
     subscribe,
   } from "../lib/backend";
-  import type { SmsMessageOut, SmsThreadOut } from "../lib/backend";
+  import type { SmsFolder, SmsFolderCounts, SmsMessageOut, SmsThreadOut } from "../lib/backend";
+  import {
+    DRAFT_KEY,
+    draftId,
+    normalizeDrafts,
+    removeDraft,
+    saveDraft,
+  } from "../lib/smsDrafts";
+  import type { SmsDraft } from "../lib/smsDrafts";
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
 
@@ -68,13 +78,15 @@
   };
 
   // ---- Real SMS (device) --------------------------------------------------------
-  // The real device inbox lives in its OWN state and never mixes with the local
+  // The real device store lives in its OWN state and never mixes with the local
   // conversations / notification machinery (that coupling caused a render loop on
   // device). `smsMode` is resolved from the backend status so the honest host
   // mock keeps the local conversations, while a device backend shows the real
-  // inbox — including its *empty* and *unreadable* (permission) states, which
-  // must never be collapsed into "no messages".
+  // folders (inbox / sent / drafts) — including their *empty* and *unreadable*
+  // (permission) states, which must never be collapsed into "no messages".
   let smsMode = $state<"unknown" | "local" | "real">("unknown");
+  let folder = $state<SmsFolder>("inbox");
+  let counts = $state<SmsFolderCounts>({ inbox: 0, sent: 0, draft: 0 });
   let realThreads = $state<SmsThreadOut[]>([]);
   let realActiveId = $state("");
   let realMsgs = $state<SmsMessageOut[]>([]);
@@ -83,13 +95,21 @@
   let smsErr = $state("");
   let smsDenied = $state(false);
   let smsBusy = $state(false);
+  // AmOS-local drafts (the platform only lets the *default* SMS app write
+  // drafts, so ours are stored locally and labelled as such).
+  let drafts = $state<SmsDraft[]>(normalizeDrafts(readStoreValue<unknown>(DRAFT_KEY, [])));
+  const saveDrafts = (next: SmsDraft[]) => {
+    const norm = normalizeDrafts(next);
+    drafts = norm;
+    writeStoreValue(DRAFT_KEY, norm);
+  };
   const activeReal = $derived(realThreads.find((th) => th.id === realActiveId) ?? null);
   const activeRealName = $derived(
     activeReal ? activeReal.display_name || activeReal.address : "",
   );
   const loadReal = (id: string) => {
     realErr = "";
-    void smsMessages(id).then((m) => {
+    void smsMessages(id, folder).then((m) => {
       if (m) realMsgs = [...m].sort((a, b) => a.ts_ms - b.ts_ms);
       else realErr = t("message.loadFailed");
     });
@@ -98,10 +118,16 @@
     realActiveId = id;
     loadReal(id);
   };
-  // Re-read the inbox: success (possibly empty) vs failure are distinct states.
+  const refreshCounts = () => {
+    void smsCounts().then((c) => {
+      if (c) counts = c;
+    });
+  };
+  // Re-read the active folder: success (possibly empty) vs failure are distinct.
   const refreshReal = () => {
     smsBusy = true;
-    void smsSnapshotResult().then((r) => {
+    refreshCounts();
+    void smsFolderSnapshot(folder).then((r) => {
       smsBusy = false;
       if (r.ok) {
         smsErr = "";
@@ -122,6 +148,16 @@
         smsErr = r.denied ? t("message.smsDenied") : t("message.smsUnavailable");
       }
     });
+  };
+  // Switching folders re-reads that folder's threads and messages.
+  const setFolder = (f: SmsFolder) => {
+    if (folder === f) return;
+    folder = f;
+    realActiveId = "";
+    realMsgs = [];
+    realErr = "";
+    smsErr = "";
+    refreshReal();
   };
   // Resolve the backend (mock → keep local conversations; device → real).
   // The Kotlin glue attaches in the Activity's `onStart`, which can land *after*
@@ -162,6 +198,14 @@
     newText = "";
     realErr = "";
   };
+  // Keep a draft instead of sending (local store; one draft per address).
+  const saveDraftNow = () => {
+    if (!newTo.trim() || !newText.trim()) return;
+    saveDrafts(saveDraft(drafts, newTo, newText, Date.now()));
+    newTo = "";
+    newText = "";
+    showNew = false;
+  };
   const sendNew = () => {
     const to = newTo.trim();
     const v = newText.trim();
@@ -173,11 +217,23 @@
         realErr = t("message.sendFailed");
         return;
       }
+      // A sent draft is no longer a draft.
+      saveDrafts(removeDraft(drafts, draftId(to)));
       newTo = "";
       newText = "";
       showNew = false;
       refreshReal();
     });
+  };
+  // Edit an existing draft: load it into the composer (send or re-save/delete).
+  const editDraft = (d: SmsDraft) => {
+    newTo = d.address;
+    newText = d.text;
+    showNew = true;
+    realErr = "";
+  };
+  const deleteDraft = (d: SmsDraft) => {
+    saveDrafts(removeDraft(drafts, d.id));
   };
   const sendReal = () => {
     const v = realText.trim();
@@ -188,7 +244,7 @@
         return;
       }
       realText = "";
-      loadReal(activeReal.id);
+      refreshReal();
     });
   };
   // Probe once (guarded so the effect can never re-enter).
@@ -291,6 +347,13 @@
 
 <div class="flex h-full flex-col p-3">
   {#if smsMode === "real"}
+    <!-- Folder tabs: inbox / sent / drafts (counts are distinct threads) -->
+    <div class="mb-1.5 flex items-center gap-1 overflow-x-auto" data-testid="sms-folders">
+      {#each SMS_FOLDERS as f (f)}
+        {@const badge = counts[f] + (f === "draft" ? drafts.length : 0)}
+        <button onclick={() => setFolder(f)} aria-pressed={folder === f} data-folder={f} class={"shrink-0 rounded-full px-3 py-1 text-xs " + (folder === f ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{t(`message.folder.${f}`)}{#if badge > 0}<span class="ml-1 opacity-80">{badge}</span>{/if}</button>
+      {/each}
+    </div>
     <!-- Device inbox toolbar: compose a new message + refresh the real inbox -->
     <div class="mb-1.5 flex items-center justify-between gap-1.5">
       <button onclick={startNew} aria-label="new-sms" class="rounded-full bg-accent px-3 py-1 text-xs text-white active:scale-95">{t("message.newSms")}</button>
@@ -303,10 +366,40 @@
         <input bind:value={newTo} aria-label="new-sms-to" placeholder={t("message.toPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
         <input bind:value={newText} aria-label="new-sms-text" placeholder={t("message.newSmsHint")} onkeydown={(e) => e.key === "Enter" && sendNew()} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
         <button onclick={sendNew} disabled={smsBusy} aria-label="new-sms-send" class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95 disabled:opacity-40">{t("message.send")}</button>
+        <button onclick={saveDraftNow} aria-label="new-sms-draft" class="shrink-0 rounded-full bg-neutral-200 px-3 py-1.5 text-xs dark:bg-neutral-700">{t("message.saveDraft")}</button>
         <button onclick={cancelNew} aria-label="new-sms-cancel" class="shrink-0 rounded-full bg-neutral-200 px-2 py-1.5 text-xs dark:bg-neutral-700">{t("message.cancel")}</button>
       </div>
     {/if}
-    {#if smsErr}
+    {#if folder === "draft"}
+      <!-- Drafts: AmOS-local (only the default SMS app may write system drafts) -->
+      <div class="flex-1 space-y-2 overflow-auto" data-testid="drafts-list">
+        <p class="pb-1 text-xs opacity-60">{t("message.draftsLocalHint")}</p>
+        {#if drafts.length === 0}
+          <p class="py-10 text-center text-sm opacity-60">{t("message.draftsEmpty")}</p>
+        {:else}
+          {#each drafts as d (d.id)}
+            <div class="flex items-start gap-2 rounded-xl bg-black/5 px-3 py-2 dark:bg-white/10">
+              <button onclick={() => editDraft(d)} aria-label={`draft-edit-${d.address}`} class="min-w-0 flex-1 text-left">
+                <div class="text-xs opacity-60">{d.address}</div>
+                <div class="truncate text-sm">{d.text}</div>
+              </button>
+              <button onclick={() => deleteDraft(d)} aria-label={`draft-delete-${d.address}`} class="shrink-0 rounded-full bg-neutral-200 px-2 py-1 text-xs dark:bg-neutral-700">{t("message.delete")}</button>
+            </div>
+          {/each}
+        {/if}
+        {#if realThreads.length > 0}
+          <!-- Draft rows the platform itself holds (written by the default SMS
+               app). Read-only for us: only the default SMS app may write them. -->
+          <p class="pt-2 text-xs opacity-60">{t("message.draftsSystem")}</p>
+          {#each realThreads as th (th.id)}
+            <div class="rounded-xl bg-black/5 px-3 py-2 dark:bg-white/10" data-testid="system-draft">
+              <div class="text-xs opacity-60">{th.display_name || th.address}</div>
+              <div class="truncate text-sm">{th.last_text}</div>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    {:else if smsErr}
       <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center" data-testid="sms-error">
         <p class="text-sm text-red-500" role="alert">{smsErr}</p>
         {#if smsDenied}

@@ -880,10 +880,17 @@ export interface SmsMessageOut {
   read: boolean;
 }
 
-/** Real-SMS inbox snapshot (threads). `null` when not bridged/errored; an empty
- *  array means "no real SMS available" (never fabricated). */
-export async function smsSnapshot(): Promise<SmsThreadOut[] | null> {
-  return invoke<SmsThreadOut[]>("sms_snapshot");
+/** SMS folders, mirroring `amos_sms::SmsFolder` (wire names). */
+export type SmsFolder = "inbox" | "sent" | "draft";
+
+/** Every folder, in the order the UI shows them. */
+export const SMS_FOLDERS: readonly SmsFolder[] = ["inbox", "sent", "draft"];
+
+/** Per-folder distinct-thread counts (`amos-tauri::sms::SmsFolderCountsOut`). */
+export interface SmsFolderCounts {
+  inbox: number;
+  sent: number;
+  draft: number;
 }
 
 /** Which backend backs SMS: `device: false` means the honest host mock, so the
@@ -902,32 +909,46 @@ export async function smsStatus(): Promise<SmsStatusOut | null> {
   return invoke<SmsStatusOut>("sms_status");
 }
 
-/** A snapshot outcome that keeps "empty inbox" and "could not read" distinct:
- *  the former is a real (empty) inbox, the latter needs an honest message
+/** Distinct thread counts per folder (tabs/badges). `null` when unavailable. */
+export async function smsCounts(): Promise<SmsFolderCounts | null> {
+  return invoke<SmsFolderCounts>("sms_counts");
+}
+
+/** A snapshot outcome that keeps "empty folder" and "could not read" distinct:
+ *  the former is a real (empty) folder, the latter needs an honest message
  *  (e.g. READ_SMS denied) — collapsing them would lie to the user. */
-export type SmsSnapshotResult =
+export type SmsFolderSnapshotResult =
   | { ok: true; threads: SmsThreadOut[] }
   | { ok: false; error: string; denied: boolean; notBridged: boolean };
 
-/** Read the inbox distinguishing success (possibly empty) from failure. */
-export async function smsSnapshotResult(): Promise<SmsSnapshotResult> {
-  const threads = await invoke<SmsThreadOut[]>("sms_snapshot");
+/** Read one folder's threads, distinguishing success (possibly empty) from failure. */
+export async function smsFolderSnapshot(folder: SmsFolder): Promise<SmsFolderSnapshotResult> {
+  const threads = await invoke<SmsThreadOut[]>("sms_snapshot", { folder });
   if (threads) return { ok: true, threads };
   const diag = bridgeDiag();
   if (!diag.ok && diag.kind === "not-bridged") {
     return { ok: false, error: "not bridged", denied: false, notBridged: true };
   }
   const error = diag.ok ? "no result" : String(diag.detail ?? "failed");
-  return { ok: false, error, denied: /permission|denied|not granted/i.test(error), notBridged: false };
+  return {
+    ok: false,
+    error,
+    denied: /permission|denied|not granted/i.test(error),
+    notBridged: false,
+  };
 }
 
-/** Messages of one SMS thread (chronological). `null` when unavailable.
+/** Messages of one SMS thread (chronological). `folder` scopes them to a folder;
+ *  omitted = the whole conversation. `null` when unavailable.
  *
  * Tauri v2 deserializes command args in camelCase, so the key must be
  * `threadId` (the Rust param is `thread_id`); passing snake_case fails with
  * "missing required key threadId" — verified on device. */
-export async function smsMessages(threadId: string): Promise<SmsMessageOut[] | null> {
-  return invoke<SmsMessageOut[]>("sms_messages", { threadId });
+export async function smsMessages(
+  threadId: string,
+  folder?: SmsFolder,
+): Promise<SmsMessageOut[] | null> {
+  return invoke<SmsMessageOut[]>("sms_messages", { threadId, folder: folder ?? "" });
 }
 
 /** Send a real SMS. `true` only on the command's explicit success marker. */

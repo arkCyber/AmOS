@@ -18,10 +18,11 @@ use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 
 use crate::error::SmsError;
+use crate::folder::{SmsFolder, SmsFolderCounts};
 use crate::provider::SmsProvider;
 use crate::spec::{SmsMessage, SmsThread};
 use crate::validate::{normalize_address, validate_text};
-use crate::wire::{parse_messages_for, parse_send_reply, parse_snapshot};
+use crate::wire::{parse_counts, parse_messages_for, parse_send_reply, parse_snapshot};
 
 /// Map a JNI error into an [`SmsError::Failed`].
 fn jerr(e: jni::errors::Error) -> SmsError {
@@ -112,18 +113,27 @@ impl SmsProvider for AndroidSmsProvider {
         "android-sms"
     }
 
-    fn snapshot(&self) -> Result<Vec<SmsThread>, SmsError> {
-        parse_snapshot(&self.call0("snapshot")?)
+    fn snapshot(&self, folder: SmsFolder) -> Result<Vec<SmsThread>, SmsError> {
+        parse_snapshot(&self.call1("snapshot", folder.wire())?)
     }
 
-    fn messages(&self, thread_id: &str) -> Result<Vec<SmsMessage>, SmsError> {
+    fn messages(
+        &self,
+        thread_id: &str,
+        folder: Option<SmsFolder>,
+    ) -> Result<Vec<SmsMessage>, SmsError> {
         let id = thread_id.trim();
         if id.is_empty() {
             return Err(SmsError::Invalid("blank SMS thread id".into()));
         }
         // Cross-check the reply against the requested thread: a glue bug must
         // never silently show another conversation.
-        parse_messages_for(&self.call1("messages", id)?, Some(id))
+        let wire_folder = folder.map(SmsFolder::wire).unwrap_or("");
+        parse_messages_for(&self.call2("messages", id, wire_folder)?, Some(id))
+    }
+
+    fn counts(&self) -> Result<SmsFolderCounts, SmsError> {
+        parse_counts(&self.call0("counts")?)
     }
 
     fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {

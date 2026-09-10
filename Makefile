@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-app android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor
 
 all: build
 
@@ -181,6 +181,19 @@ android-voice-bringup:
 # Pass extra args through ARGS (e.g. `make android-rag-bringup ARGS='--apply --device X'`).
 android-rag-bringup:
 	bash scripts/android-rag-bringup.sh $(ARGS)
+
+# Build + install the System UI APK on a connected device, with the two steps
+# that are easy to forget made explicit and ordered:
+#   1. rebuild the frontend `dist` (tauri.conf's beforeBuildCommand is EMPTY, so
+#      `cargo tauri android build` embeds whatever `dist/` already holds — a
+#      stale bundle silently ships an old UI),
+#   2. build the arm64 debug APK with the `android` feature,
+#   3. install it with runtime permissions granted (`-g`).
+# Override the package/devices as needed: `make android-app DEVICE=...`.
+android-app: 
+	cd crates/amos-tauri/frontend-ts && bun run build
+	cargo tauri android build --debug --features android --target aarch64
+	adb install -r -g crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk $(if $(DEVICE),-s $(DEVICE),)
 
 # Cross-compile gate for the offline-RAG PDF data-extraction crate on Android.
 # The crate is pure Rust on lopdf (no C), so this only needs the rustup android

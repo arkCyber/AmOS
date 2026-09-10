@@ -11,6 +11,7 @@
 //! SEND_SMS). This crate validates every shape without faking a message.
 
 pub mod error;
+pub mod folder;
 pub mod provider;
 pub mod spec;
 pub mod validate;
@@ -20,6 +21,7 @@ pub mod wire;
 pub mod android;
 
 pub use error::SmsError;
+pub use folder::{SmsFolder, SmsFolderCounts};
 pub use provider::{MockSms, SmsProvider, MOCK_PROVIDER};
 pub use spec::{SmsMessage, SmsThread};
 pub use validate::{normalize_address, segment_count, validate_text};

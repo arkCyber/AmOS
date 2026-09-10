@@ -62,6 +62,11 @@ object SmsGlue {
     private const val MAX_ADDRESS_DIGITS = 20
     private const val MIN_ADDRESS_DIGITS = 3
 
+    /** `Telephony.Sms.MESSAGE_TYPE_*` — the folder tag on each `content://sms` row. */
+    private const val TYPE_INBOX = 1
+    private const val TYPE_SENT = 2
+    private const val TYPE_DRAFT = 3
+
     /**
      * How many newest inbox rows the snapshot scan reads (single bounded query).
      * Latest-message-per-thread and unread counts are derived from this window;
@@ -185,22 +190,22 @@ object SmsGlue {
     }
 
     /** Latest message per thread + per-thread unread incoming count (bounded). */
-    fun snapshot(): String {
+    fun snapshot(folder: String): String {
         val ctx = app ?: return err("SmsGlue not bound", "unavailable")
         if (!SmsPermissions.hasRead(ctx)) return err("READ_SMS not granted", "permission")
+        val type = typeOf(folder) ?: return err("unknown SMS folder '$folder'", "invalid")
         val last = LinkedHashMap<String, JSONObject>()
         val unread = HashMap<String, Int>()
         val cols = arrayOf("thread_id", "address", "body", "date", "read", "type")
         try {
             ctx.contentResolver
-                .query(URI, cols, null, null, "date DESC LIMIT $SNAPSHOT_ROW_LIMIT")
+                .query(URI, cols, "type = ?", arrayOf(type.toString()), "date DESC LIMIT $SNAPSHOT_ROW_LIMIT")
                 ?.use { c ->
                     val iTid = c.getColumnIndexOrThrow("thread_id")
                     val iAddr = c.getColumnIndexOrThrow("address")
                     val iBody = c.getColumnIndexOrThrow("body")
                     val iDate = c.getColumnIndexOrThrow("date")
                     val iRead = c.getColumnIndexOrThrow("read")
-                    val iType = c.getColumnIndexOrThrow("type")
                     while (c.moveToNext()) {
                         val tid = c.getString(iTid) ?: continue
                         // Rows are newest-first: the first row per thread is its latest.
@@ -212,8 +217,8 @@ object SmsGlue {
                                 .put("last_text", c.getString(iBody) ?: "")
                                 .put("last_ts_ms", c.getLong(iDate))
                         }
-                        // MESSAGE_TYPE_INBOX == 1; count unread incoming.
-                        if (c.getInt(iType) == 1 && c.getInt(iRead) == 0) {
+                        // Unread only means something for received messages.
+                        if (type == TYPE_INBOX && c.getInt(iRead) == 0) {
                             unread[tid] = (unread[tid] ?: 0) + 1
                         }
                     }
@@ -231,8 +236,52 @@ object SmsGlue {
         return JSONObject().put("threads", arr).toString()
     }
 
+    /** Distinct thread counts per folder, for the folder tabs/badges. */
+    fun counts(): String {
+        val ctx = app ?: return err("SmsGlue not bound", "unavailable")
+        if (!SmsPermissions.hasRead(ctx)) return err("READ_SMS not granted", "permission")
+        return try {
+            JSONObject()
+                .put("inbox", distinctThreads(ctx, TYPE_INBOX))
+                .put("sent", distinctThreads(ctx, TYPE_SENT))
+                .put("draft", distinctThreads(ctx, TYPE_DRAFT))
+                .toString()
+        } catch (e: SecurityException) {
+            err(msg(e), "permission")
+        } catch (e: Exception) {
+            err(msg(e), "failed")
+        }
+    }
+
+    /** Android `Telephony.Sms.MESSAGE_TYPE_*` for a wire folder name, else null. */
+    private fun typeOf(folder: String): Int? = when (folder.trim().lowercase()) {
+        "inbox" -> TYPE_INBOX
+        "sent" -> TYPE_SENT
+        "draft", "drafts" -> TYPE_DRAFT
+        else -> null
+    }
+
+    /**
+     * Number of distinct threads holding at least one row of `type`, bounded by
+     * the same window the snapshot uses (so the badges can never scan the whole
+     * table or disagree with the list).
+     */
+    private fun distinctThreads(ctx: Context, type: Int): Int {
+        val seen = HashSet<String>()
+        ctx.contentResolver
+            .query(URI, arrayOf("thread_id"), "type = ?", arrayOf(type.toString()), "date DESC LIMIT $SNAPSHOT_ROW_LIMIT")
+            ?.use { c ->
+                val iTid = c.getColumnIndexOrThrow("thread_id")
+                while (c.moveToNext()) {
+                    c.getString(iTid)?.let { seen.add(it) }
+                    if (seen.size >= MAX_THREADS) break // protocol cap (wire.rs)
+                }
+            }
+        return seen.size
+    }
+
     /** All messages of one thread, chronological (bounded to the newest cap). */
-    fun messages(threadId: String): String {
+    fun messages(threadId: String, folder: String): String {
         val ctx = app ?: return err("SmsGlue not bound", "unavailable")
         if (!SmsPermissions.hasRead(ctx)) return err("READ_SMS not granted", "permission")
         // Thread ids are numeric in the Telephony provider; reject anything else
@@ -241,12 +290,23 @@ object SmsGlue {
         if (tid.isEmpty() || tid.length > 20 || !tid.all { it.isDigit() }) {
             return err("invalid thread id", "invalid")
         }
+        // Empty folder = the whole conversation; otherwise scope to that folder.
+        val selection: String
+        val args: Array<String>
+        if (folder.isBlank()) {
+            selection = "thread_id = ?"
+            args = arrayOf(tid)
+        } else {
+            val type = typeOf(folder) ?: return err("unknown SMS folder '$folder'", "invalid")
+            selection = "thread_id = ? AND type = ?"
+            args = arrayOf(tid, type.toString())
+        }
         val rows = ArrayList<JSONObject>()
         val cols = arrayOf("_id", "body", "date", "read", "type")
         try {
             // Newest first + LIMIT, then reversed below → bounded, chronological.
             ctx.contentResolver
-                .query(URI, cols, "thread_id = ?", arrayOf(tid), "date DESC LIMIT $MAX_MESSAGES")
+                .query(URI, cols, selection, args, "date DESC LIMIT $MAX_MESSAGES")
                 ?.use { c ->
                     val iId = c.getColumnIndexOrThrow("_id")
                     val iBody = c.getColumnIndexOrThrow("body")
@@ -257,7 +317,7 @@ object SmsGlue {
                         rows.add(
                             JSONObject()
                                 .put("id", c.getString(iId))
-                                .put("from_me", c.getInt(iType) == 2) // MESSAGE_TYPE_SENT
+                                .put("from_me", c.getInt(iType) == TYPE_SENT) // MESSAGE_TYPE_SENT
                                 .put("text", c.getString(iBody) ?: "")
                                 .put("ts_ms", c.getLong(iDate))
                                 .put("read", c.getInt(iRead) == 1),

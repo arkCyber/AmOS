@@ -106,6 +106,24 @@ impl From<&SmsMessage> for SmsMessageOut {
     }
 }
 
+/// Serializable folder counts (tabs/badges).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SmsFolderCountsOut {
+    pub inbox: u32,
+    pub sent: u32,
+    pub draft: u32,
+}
+
+impl From<&amos_sms::SmsFolderCounts> for SmsFolderCountsOut {
+    fn from(c: &amos_sms::SmsFolderCounts) -> Self {
+        Self {
+            inbox: c.inbox,
+            sent: c.sent,
+            draft: c.draft,
+        }
+    }
+}
+
 /// Serializable backend status so the UI can distinguish the device inbox from
 /// the host mock without guessing (and without doing any I/O).
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -181,29 +199,49 @@ pub fn sms_status(state: State<'_, SmsBridge>) -> SmsStatusOut {
     status_of(active_arc(&state).as_ref())
 }
 
-/// Read the inbox snapshot (threads, newest first). `Err` (e.g. permission
-/// denied / provider unavailable) is honest and must never be shown as "no
-/// messages"; an `Ok` empty list means the (real) inbox is empty.
+/// Read one folder's threads (newest first). `Err` (permission denied /
+/// unavailable / unknown folder) is honest and must never be shown as "no
+/// messages"; an `Ok` empty list means that folder is empty.
 #[tauri::command]
-pub async fn sms_snapshot(state: State<'_, SmsBridge>) -> Result<Vec<SmsThreadOut>, String> {
+pub async fn sms_snapshot(
+    state: State<'_, SmsBridge>,
+    folder: String,
+) -> Result<Vec<SmsThreadOut>, String> {
+    let folder = amos_sms::SmsFolder::from_wire(&folder).map_err(|e| e.to_string())?;
     let provider = active_arc(&state);
-    blocking(move || provider.snapshot())
+    blocking(move || provider.snapshot(folder))
         .await
         .map(|v| v.iter().map(SmsThreadOut::from).collect())
         .map_err(|e| e.to_string())
 }
 
-/// Read one thread's messages (chronological).
+/// Distinct thread counts per folder (inbox / sent / draft).
+#[tauri::command]
+pub async fn sms_counts(state: State<'_, SmsBridge>) -> Result<SmsFolderCountsOut, String> {
+    let provider = active_arc(&state);
+    blocking(move || provider.counts())
+        .await
+        .map(|c| SmsFolderCountsOut::from(&c))
+        .map_err(|e| e.to_string())
+}
+
+/// Read one thread's messages (chronological). An empty/absent `folder` means
+/// "the whole conversation"; otherwise only that folder's rows.
 #[tauri::command]
 pub async fn sms_messages(
     state: State<'_, SmsBridge>,
     thread_id: String,
+    folder: Option<String>,
 ) -> Result<Vec<SmsMessageOut>, String> {
     if thread_id.trim().is_empty() {
         return Err("invalid SMS payload: blank thread id".to_string());
     }
+    let folder = match folder.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(name) => Some(amos_sms::SmsFolder::from_wire(name).map_err(|e| e.to_string())?),
+    };
     let provider = active_arc(&state);
-    blocking(move || provider.messages(&thread_id))
+    blocking(move || provider.messages(&thread_id, folder))
         .await
         .map(|v| v.iter().map(SmsMessageOut::from).collect())
         .map_err(|e| e.to_string())
@@ -330,8 +368,11 @@ pub use events::install as install_events;
 
 /// Test-only mapping helper (the commands map inline through [`blocking`]).
 #[cfg(test)]
-fn snapshot_of(p: &dyn SmsProvider) -> Result<Vec<SmsThreadOut>, String> {
-    p.snapshot()
+fn snapshot_of(
+    p: &dyn SmsProvider,
+    folder: amos_sms::SmsFolder,
+) -> Result<Vec<SmsThreadOut>, String> {
+    p.snapshot(folder)
         .map(|v| v.iter().map(SmsThreadOut::from).collect())
         .map_err(|e| e.to_string())
 }
@@ -391,22 +432,53 @@ mod tests {
     use amos_sms::SmsError;
 
     #[test]
-    fn host_boot_is_an_empty_honest_inbox() {
+    fn host_boot_is_an_empty_honest_store() {
         let b = SmsBridge::boot();
-        assert!(snapshot_of(b.provider.as_ref()).unwrap().is_empty());
+        for f in amos_sms::SmsFolder::ALL {
+            assert!(b.provider.snapshot(f).unwrap().is_empty(), "{f:?}");
+        }
+        assert!(snapshot_of(b.provider.as_ref(), amos_sms::SmsFolder::Inbox)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
-    fn maps_seeded_threads_and_messages() {
+    fn maps_seeded_threads_and_messages_per_folder() {
         let b = SmsBridge::with_provider(Box::new(MockSms::seeded()));
-        let ts = snapshot_of(b.provider.as_ref()).unwrap();
-        assert_eq!(ts.len(), 2);
-        assert_eq!(ts[0].address, "13800138000");
-        assert_eq!(ts[0].unread, 1);
-        let msgs = b.provider.messages("1").unwrap();
+        let inbox = snapshot_of(b.provider.as_ref(), amos_sms::SmsFolder::Inbox).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[0].address, "13800138000");
+        assert_eq!(inbox[0].unread, 1);
+        let sent = snapshot_of(b.provider.as_ref(), amos_sms::SmsFolder::Sent).unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|t| t.unread == 0));
+        let msgs = b
+            .provider
+            .messages("1", Some(amos_sms::SmsFolder::Inbox))
+            .unwrap();
         let out: Vec<SmsMessageOut> = msgs.iter().map(SmsMessageOut::from).collect();
         assert_eq!(out.len(), 2);
-        assert!(!out[1].read);
+        assert!(out.iter().all(|m| !m.from_me));
+        // Counts surface through the serializable mirror.
+        let counts = SmsFolderCountsOut::from(&b.provider.counts().unwrap());
+        assert_eq!(
+            counts,
+            SmsFolderCountsOut {
+                inbox: 2,
+                sent: 2,
+                draft: 1
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_folder_is_rejected_before_any_provider_call() {
+        assert!(amos_sms::SmsFolder::from_wire("outbox").is_err());
+        assert!(amos_sms::SmsFolder::from_wire("").is_err());
+        assert_eq!(
+            amos_sms::SmsFolder::from_wire("sent").unwrap(),
+            amos_sms::SmsFolder::Sent
+        );
     }
 
     #[test]
@@ -432,11 +504,18 @@ mod tests {
             fn name(&self) -> &'static str {
                 "android-sms"
             }
-            fn snapshot(&self) -> Result<Vec<SmsThread>, SmsError> {
+            fn snapshot(&self, _f: amos_sms::SmsFolder) -> Result<Vec<SmsThread>, SmsError> {
                 Ok(Vec::new())
             }
-            fn messages(&self, _t: &str) -> Result<Vec<SmsMessage>, SmsError> {
+            fn messages(
+                &self,
+                _t: &str,
+                _f: Option<amos_sms::SmsFolder>,
+            ) -> Result<Vec<SmsMessage>, SmsError> {
                 Ok(Vec::new())
+            }
+            fn counts(&self) -> Result<amos_sms::SmsFolderCounts, SmsError> {
+                Ok(amos_sms::SmsFolderCounts::default())
             }
             fn send(&self, _a: &str, _t: &str) -> Result<(), SmsError> {
                 Ok(())

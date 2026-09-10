@@ -237,6 +237,7 @@ pub fn run() {
             rag_client::rag_remove,
             sms::sms_status,
             sms::sms_snapshot,
+            sms::sms_counts,
             sms::sms_messages,
             sms::sms_send,
             taskmgr::taskmgr_snapshot,
