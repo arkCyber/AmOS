@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core capabilities for the AmOS System UI. Notably `core:event:default`: Tauri v2 does not inject a `listen` helper and gates `plugin:event|listen` behind the ACL — without this permission every event-driven UI path (sms-received live refresh, ai-token-received streaming, sensor-data, layout-changed, telephony-event, store-updated) is silently dead on device.",
+  "windows": ["*"],
+  "permissions": ["core:event:default"]
+}

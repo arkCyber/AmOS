@@ -253,6 +253,81 @@ fn status_of(p: &dyn SmsProvider) -> SmsStatusOut {
     }
 }
 
+/// Event emitted when the device reports a new SMS (the inbox changed). The
+/// frontend refreshes on it instead of polling; the payload carries the sender
+/// only when the platform provided it (empty string otherwise — never invented).
+pub const SMS_RECEIVED_EVENT: &str = "sms-received";
+
+/// Payload of [`SMS_RECEIVED_EVENT`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SmsIncomingOut {
+    /// Sender address when known, else `""` (we never guess it).
+    pub address: String,
+}
+
+/// Build the incoming payload (pure: trims, never fabricates an address).
+#[cfg(any(feature = "android", test))]
+fn incoming_payload(address: &str) -> SmsIncomingOut {
+    SmsIncomingOut {
+        address: address.trim().to_string(),
+    }
+}
+
+/// On-device push: the Kotlin `SmsGlue` registers a `SMS_RECEIVED` receiver and
+/// upcalls here, so received messages reach the UI live instead of on a manual
+/// refresh. Compile-checked under `--features android`; exercised at device time.
+#[cfg(feature = "android")]
+mod events {
+    use super::*;
+    use jni::objects::JString;
+    use jni::sys::{jobject, jstring};
+    use std::sync::OnceLock;
+    use tauri::{AppHandle, Emitter};
+
+    static APP: OnceLock<AppHandle> = OnceLock::new();
+
+    /// Install the emitter (called once from `lib.rs::setup`).
+    pub fn install(app: AppHandle) {
+        let _ = APP.set(app);
+    }
+
+    /// `SmsGlue.onIncoming(address)` — JNI `(JNIEnv*, jobject, String)`.
+    ///
+    /// # Safety
+    /// `env`/`this`/`address` are the standard JNI args of the instance-method
+    /// call on the main thread; `address` is valid for the duration of the call.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_com_amos_ai_glue_SmsGlue_onIncoming(
+        env: *mut jni::sys::JNIEnv,
+        _this: jobject,
+        address: jstring,
+    ) {
+        let Some(app) = APP.get() else {
+            return; // no UI attached → nothing to notify (honest no-op)
+        };
+        if env.is_null() || address.is_null() {
+            return;
+        }
+        // SAFETY: `env` is the JVM-supplied JNIEnv* for this native call.
+        let Ok(mut env) = (unsafe { jni::JNIEnv::from_raw(env) }) else {
+            return;
+        };
+        // SAFETY: `address` is a live local ref for the duration of this call.
+        let jstr = unsafe { JString::from_raw(address) };
+        let addr: String = env.get_string(&jstr).map(|s| s.into()).unwrap_or_default();
+        let payload = incoming_payload(&addr);
+        tracing::info!(
+            target: "amos::sms",
+            from = %if payload.address.is_empty() { "<unknown>".to_string() } else { mask_address(&payload.address) },
+            "incoming SMS signalled by the device"
+        );
+        let _ = app.emit(SMS_RECEIVED_EVENT, payload);
+    }
+}
+
+#[cfg(feature = "android")]
+pub use events::install as install_events;
+
 /// Test-only mapping helper (the commands map inline through [`blocking`]).
 #[cfg(test)]
 fn snapshot_of(p: &dyn SmsProvider) -> Result<Vec<SmsThreadOut>, String> {
@@ -398,6 +473,13 @@ mod tests {
         assert_eq!(mask_address("+8613800138000"), "***8000");
         assert_eq!(mask_address("1008"), "***1008");
         assert_eq!(mask_address("12"), "***12"); // never panics on short input
+    }
+
+    #[test]
+    fn incoming_event_payload_never_invents_an_address() {
+        assert_eq!(SMS_RECEIVED_EVENT, "sms-received");
+        assert_eq!(incoming_payload(" 10086 ").address, "10086");
+        assert_eq!(incoming_payload("").address, ""); // unknown stays unknown
     }
 
     /// A provider that hangs must not keep the caller waiting forever.

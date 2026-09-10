@@ -129,6 +129,52 @@ describe("backend bridge", () => {
     expect(typeof handlers["ai-token-received"]).toBe("function");
   });
 
+  test("subscribes through the event plugin when the host has no listen helper", async () => {
+    // Tauri v2 injects `invoke` + `transformCallback` but NOT `listen` — the
+    // bridge must synthesize one (otherwise events never reach the UI).
+    const calls: { cmd: string; args?: Record<string, unknown> }[] = [];
+    const callbacks = new Map<number, (payload: unknown) => void>();
+    let nextId = 1;
+    const unregistered: number[] = [];
+    const fake = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "plugin:event|listen") return 42; // event id
+        return null;
+      },
+      transformCallback: (cb: (payload: unknown) => void) => {
+        const id = nextId++;
+        callbacks.set(id, cb);
+        return id;
+      },
+      unregisterCallback: (id: number) => {
+        unregistered.push(id);
+        callbacks.delete(id);
+      },
+    };
+    const store = new Map<string, string>();
+    setWindow({
+      __TAURI_INTERNALS__: fake,
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => void store.set(k, v),
+      },
+    });
+    const got: unknown[] = [];
+    const un = await subscribe("sms-received", (payload) => got.push(payload));
+    const listen = calls.find((c) => c.cmd === "plugin:event|listen");
+    expect(listen?.args?.event).toBe("sms-received");
+    expect(typeof listen?.args?.handler).toBe("number");
+    // Simulate the host dispatching the event into the registered callback.
+    const cb = callbacks.get(listen?.args?.handler as number);
+    cb?.({ event: "sms-received", id: 42, payload: { address: "10086" } });
+    expect(got).toEqual([{ address: "10086" }]);
+    // Unsubscribing releases both the callback and the host registration.
+    un();
+    expect(unregistered).toContain(listen?.args?.handler as number);
+    expect(calls.some((c) => c.cmd === "plugin:event|unlisten")).toBe(true);
+  });
+
   test("records structured diagnostics instead of losing failure root cause", async () => {
     // Not bridged → classified as such.
     setWindow({ localStorage: new Map() as unknown as Storage });

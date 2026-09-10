@@ -241,4 +241,94 @@ describe("MessagesApp.svelte", () => {
     expect(txt(host)).toContain("本机暂无短信");
     expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
   });
+
+  test("refreshes live when the device pushes a received SMS", async () => {
+    const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+    const one = {
+      id: "1",
+      address: "13800138000",
+      display_name: "家人",
+      last_text: "回吗",
+      last_ts_ms: 1_700_000_000_000,
+      unread: 1,
+    };
+    const two = {
+      id: "2",
+      address: "10086",
+      display_name: "中国移动",
+      last_text: "新消息",
+      last_ts_ms: 1_700_000_100_000,
+      unread: 0,
+    };
+    let threads = [one];
+    // The open thread gains a message when the push arrives (loopback incoming).
+    let msgs = [
+      { thread_id: "1", id: "m1", from_me: false, text: "回吗", ts_ms: 1_700_000_000_000, read: true },
+    ];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_snapshot") return threads;
+        if (cmd === "sms_messages") return msgs;
+        return null;
+      },
+      listen: async (channel: string, handler: (e: { payload: unknown }) => void) => {
+        handlers[channel] = handler;
+        return () => {};
+      },
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    expect(txt(host)).not.toContain("中国移动");
+    expect(txt(host)).not.toContain("刚收到的新短信");
+    // The device pushes `sms-received` → the screen re-reads the inbox AND the
+    // open thread's messages itself (no manual refresh, no polling).
+    threads = [one, two];
+    msgs = [
+      ...msgs,
+      { thread_id: "1", id: "m2", from_me: false, text: "刚收到的新短信", ts_ms: 1_700_000_100_000, read: false },
+    ];
+    handlers["sms-received"]?.({ payload: { address: "13800138000" } });
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    expect(txt(host)).toContain("中国移动");
+    expect(txt(host)).toContain("刚收到的新短信");
+  });
+
+  test("composes to an arbitrary number and refreshes the inbox", async () => {
+    const calls: Record<string, unknown>[] = [];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, ...(args ?? {}) });
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_snapshot") return [];
+        if (cmd === "sms_messages") return [];
+        if (cmd === "sms_send") return "sent";
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms"]') as HTMLButtonElement);
+    await tick();
+    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-to"]') as HTMLInputElement, {
+      target: { value: "+8613800138000" },
+    });
+    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-text"]') as HTMLInputElement, {
+      target: { value: "测试短信" },
+    });
+    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms-send"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    const sent = calls.find((c) => c.cmd === "sms_send");
+    expect(sent?.address).toBe("+8613800138000");
+    expect(sent?.text).toBe("测试短信");
+    // The send is followed by a re-read so a newly created thread shows up.
+    expect(calls.filter((c) => c.cmd === "sms_snapshot").length).toBeGreaterThan(1);
+  });
 });

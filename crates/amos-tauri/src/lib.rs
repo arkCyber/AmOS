@@ -313,6 +313,11 @@ pub fn run() {
             // store's `store-updated` event (status bar + open control-center).
             #[cfg(feature = "android")]
             flashlight::install_ui_pusher(app.handle().clone());
+            // On device, hand the SMS seam an AppHandle so the Kotlin SmsGlue's
+            // SMS_RECEIVED receiver can push `sms-received` → the Messages screen
+            // refreshes live instead of on a manual pull.
+            #[cfg(feature = "android")]
+            sms::install_events(app.handle().clone());
             // Real in-call bridge (default-dialer / InCallService): give the Rust side
             // an AppHandle so Kotlin-pushed real call states reach the WebView as
             // `telephony-event`, and so telephony answer/end can drive the real call.

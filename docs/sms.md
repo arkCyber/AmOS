@@ -96,7 +96,27 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
 - `smsStatus()` + `smsSnapshotResult()`：把「成功（可能为空）」「权限被拒」「其它失败」「未桥接」区分开。
 - UI 三态：`device=false`（宿主 mock）→ 保持本地会话；“真实收件箱为空”→ **本机暂无短信**（不显示本地演示会话）；读取失败 → 红字错误 + 授权提示 + 「重试」按钮（重试会重新探测后端状态）。读取期间按钮置灰（`smsBusy`）。
 
-### 6. 测试与门禁（本机全绿）
+### 6. 收发能力补全（2026-09-10）
+- **推式接收（真正“收”）**：`SmsGlue` 双保险注册 `SMS_RECEIVED`：
+  1. **动态接收器**（`bind()` 内，API 33+ 用 **`RECEIVER_EXPORTED`**——实测 `NOT_EXPORTED` **收不到**该广播）；
+  2. **清单接收器** `SmsReceiver`（`android:exported="true"` + `android:permission="android.permission.BROADCAST_SMS"`），进程未运行时也能被系统唤起。
+  两者都经 JNI upcall `SmsGlue.onIncoming(address)` → Rust `sms::events` 用 `AppHandle` 发射 `sms-received`（负载只含平台给出的发件人，缺省空串）→ 前端 `subscribe("sms-received")` **重读**收件箱**并重载当前打开的会话**（新消息立即出现在打开的聊天里）。
+- **新短信撰写**：真机态顶部「新短信」工具条 → 收件人 + 内容 → `sms_send` → 成功后重读收件箱；系统会把已发送短信写入 provider，新线程自动出现。
+- **探测竞态修复**：`sms_status` 可能在 Kotlin `Attach` 之前返回（glue 在 Activity `onStart` 注册），原先一次性探测会**永久停在本地会话**；改为**有界重试**（4 次 × 1.5s，无无限轮询），之后诚实地落到 local。
+- **UI 结构**：真机态顶部固定「新短信 / 刷新」工具条；其下三态（错误 / 空收件箱 / 线程面板）。
+
+### 6b. 顺带修复的两个**跨领域**前端缺陷（本次真机调试发现）
+1. **`window.__TAURI_INTERNALS__.listen` 并不存在**（Tauri v2 只注入 `invoke`/`transformCallback`）。原 `backend.ts::bridge()` 直接转发 `listen`，调用即抛错并被 `try/catch` 吞掉 → `subscribe()` 与 `wm.onLayoutChanged()` **全部静默失效**。现由 `bridge()` **合成** `listen`：优先宿主自带，否则走事件插件 `plugin:event|listen` + `transformCallback`（与 `@tauri-apps/api` 同款），`plugin:event|unlisten` + `unregisterCallback` 取消。
+2. **缺少 capabilities → 事件插件被 ACL 拒绝**：真机报 `event.listen not allowed. Permissions associated with this command: core:event:allow-listen, core:event:default`。新增 `crates/amos-tauri/capabilities/default.json`（`windows: ["*"]`，`permissions: ["core:event:default"]`）。这同时**解除了所有事件驱动 UI 的封锁**（sms-received / ai-token-received / sensor-data / layout-changed / telephony-event / store-updated 等）。
+
+### 7. 真机实测：真实的“发 + 收”闭环（2026-09-10）
+用 `service call iphonesubinfo 15` 解出本机号码 **+8618616091470**，随后：
+1. 经 App 命令发送 `AmOS self-test <ISO 时间>` → 返回 `sent`（真实 `SmsManager`）。
+2. 约 2s 后回环到达：线程 id 9，消息 `id=11 from_me=true`（我方发出）+ `id=12 from_me=false read=false`（收到），线程 `unread=1`。—— 证明**发送、入库、接收、读取**四条路径均真实工作。
+3. **推式接收（无手动刷新）**：打开该会话后经命令发送 `LIVE4-…`，logcat 显示 `SmsGlue: SMS_RECEIVED from '18616091470'`，WebView 原始事件计数 +2，**DOM 自动出现新收到的消息**。
+4. **UI 撰写**：点「新短信」→ 填号码/内容 → 发送 `UISEND-…`，provider 中出现 `from_me=true` 与回环 `from_me=false` 两条，DOM 同步可见。
+
+### 8. 测试与门禁（本机全绿）
 - `amos-sms`：**19 例**（含地址规范化/拒绝、分段计数、GSM-7 判定、线协议上限与越界、错误类型映射、线程交叉校验、send 成功语义）。
 - `amos-tauri --lib sms::`：**8 例**（含宿主空收件箱、mock/设备状态区分、发送前校验、地址掩码、**卡死 provider 超时**、阻塞结果传递）。
 - 前端：`typecheck` / `typecheck:svelte` 0 error、`test:svelte` **358 例**（新增权限拒绝→重试恢复、空收件箱诚实态、宿主 mock 保持本地会话）。

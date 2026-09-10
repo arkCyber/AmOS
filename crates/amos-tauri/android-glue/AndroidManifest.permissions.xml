@@ -50,7 +50,8 @@
     <!-- Real SMS (docs/sms.md): read the device inbox (content://sms) and send
          via SmsManager. Both are runtime permissions; SmsGlue.bind installs the
          provider at boot and reads/sends succeed once granted (no re-bind
-         needed — the glue checks at call time). -->
+         needed — the glue checks at call time). SEND/RECEIVE are also what the
+         SMS_RECEIVED receiver below requires to observe incoming messages. -->
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />

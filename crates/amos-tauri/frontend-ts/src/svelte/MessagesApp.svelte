@@ -27,7 +27,15 @@
   import { NOTIF_KEY, removeAppNotifs } from "../lib/settings";
   import { iconSvg } from "../lib/sysIcons";
   import type { Notif } from "../lib/settings";
-  import { bridged, smsMessages, smsSend, smsSnapshotResult, smsStatus } from "../lib/backend";
+  import {
+    SMS_RECEIVED_EVENT,
+    bridged,
+    smsMessages,
+    smsSend,
+    smsSnapshotResult,
+    smsStatus,
+    subscribe,
+  } from "../lib/backend";
   import type { SmsMessageOut, SmsThreadOut } from "../lib/backend";
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
@@ -102,6 +110,10 @@
         const first = r.threads[0];
         if (first && !r.threads.some((th) => th.id === realActiveId)) {
           openReal(first.id);
+        } else if (realActiveId) {
+          // Same thread still open → reload its messages, so a message that just
+          // arrived (live `sms-received` refresh) shows up without a manual pull.
+          loadReal(realActiveId);
         }
       } else {
         realThreads = [];
@@ -111,20 +123,61 @@
       }
     });
   };
-  // Resolve the backend once (mock → keep local conversations; device → real).
-  const probeSms = () => {
-    void smsStatus().then((st) => {
-      if (!st || !st.device) {
-        smsMode = "local";
+  // Resolve the backend (mock → keep local conversations; device → real).
+  // The Kotlin glue attaches in the Activity's `onStart`, which can land *after*
+  // the WebView boots, so a single probe could see "mock" and wrongly stay local
+  // forever. Bounded retries (no endless polling) close that race.
+  const SMS_PROBE_ATTEMPTS = 4;
+  const SMS_PROBE_DELAY_MS = 1500;
+  const probeSms = async () => {
+    for (let attempt = 0; attempt < SMS_PROBE_ATTEMPTS; attempt++) {
+      const st = await smsStatus();
+      if (st && st.device) {
+        smsMode = "real";
+        refreshReal();
         return;
       }
-      smsMode = "real";
-      refreshReal();
-    });
+      if (attempt < SMS_PROBE_ATTEMPTS - 1) {
+        await new Promise((r) => setTimeout(r, SMS_PROBE_DELAY_MS));
+      }
+    }
+    smsMode = "local"; // honest: no device backend after the bounded retries
   };
   const retrySms = () => {
     if (smsMode === "real") refreshReal();
-    else probeSms();
+    else void probeSms();
+  };
+  // Compose to an arbitrary number (device mode). The platform persists the send,
+  // so the new thread shows up in the provider and `refreshReal` picks it up.
+  let showNew = $state(false);
+  let newTo = $state("");
+  let newText = $state("");
+  const startNew = () => {
+    showNew = true;
+    realErr = "";
+  };
+  const cancelNew = () => {
+    showNew = false;
+    newTo = "";
+    newText = "";
+    realErr = "";
+  };
+  const sendNew = () => {
+    const to = newTo.trim();
+    const v = newText.trim();
+    if (!to || !v) return;
+    smsBusy = true;
+    void smsSend(to, v).then((ok) => {
+      smsBusy = false;
+      if (!ok) {
+        realErr = t("message.sendFailed");
+        return;
+      }
+      newTo = "";
+      newText = "";
+      showNew = false;
+      refreshReal();
+    });
   };
   const sendReal = () => {
     const v = realText.trim();
@@ -143,7 +196,24 @@
   $effect(() => {
     if (probed || !bridged()) return;
     probed = true;
-    probeSms();
+    void probeSms();
+  });
+
+  // Live receive: the device pushes `sms-received` (SMS_RECEIVED broadcast →
+  // Kotlin → JNI → here); we re-read the inbox through the validated read path
+  // instead of polling. Only subscribed while the device backend is active.
+  $effect(() => {
+    if (smsMode !== "real") return;
+    let un: (() => void) | null = null;
+    let cancelled = false;
+    void subscribe(SMS_RECEIVED_EVENT, () => refreshReal()).then((u) => {
+      if (cancelled) u();
+      else un = u;
+    });
+    return () => {
+      cancelled = true;
+      if (un) un();
+    };
   });
 
   // Publish unread incoming messages across conversations as app notifications.
@@ -221,6 +291,21 @@
 
 <div class="flex h-full flex-col p-3">
   {#if smsMode === "real"}
+    <!-- Device inbox toolbar: compose a new message + refresh the real inbox -->
+    <div class="mb-1.5 flex items-center justify-between gap-1.5">
+      <button onclick={startNew} aria-label="new-sms" class="rounded-full bg-accent px-3 py-1 text-xs text-white active:scale-95">{t("message.newSms")}</button>
+      <button onclick={retrySms} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
+    </div>
+    {#if showNew}
+      <!-- Compose to any number: the platform persists the send, so the thread
+           appears in the provider and the list refreshes below. -->
+      <div class="mb-1.5 flex items-center gap-1.5" data-testid="new-sms-form">
+        <input bind:value={newTo} aria-label="new-sms-to" placeholder={t("message.toPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
+        <input bind:value={newText} aria-label="new-sms-text" placeholder={t("message.newSmsHint")} onkeydown={(e) => e.key === "Enter" && sendNew()} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
+        <button onclick={sendNew} disabled={smsBusy} aria-label="new-sms-send" class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95 disabled:opacity-40">{t("message.send")}</button>
+        <button onclick={cancelNew} aria-label="new-sms-cancel" class="shrink-0 rounded-full bg-neutral-200 px-2 py-1.5 text-xs dark:bg-neutral-700">{t("message.cancel")}</button>
+      </div>
+    {/if}
     {#if smsErr}
       <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center" data-testid="sms-error">
         <p class="text-sm text-red-500" role="alert">{smsErr}</p>
@@ -232,7 +317,9 @@
     {:else if realThreads.length === 0}
       <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center" data-testid="sms-empty">
         <p class="text-sm opacity-60">{t("message.inboxEmpty")}</p>
-        <button onclick={retrySms} disabled={smsBusy} aria-label="sms-retry" class="rounded-full bg-neutral-200 px-4 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.retry")}</button>
+        {#if realErr}
+          <p class="text-xs text-red-500" role="alert">{realErr}</p>
+        {/if}
       </div>
     {:else}
     <!-- Real device inbox (SmsGlue over JNI): read threads + send via SmsManager -->
@@ -246,7 +333,6 @@
         <span class="text-sm font-semibold">{activeRealName}</span>
         <span data-testid="real-sms-badge" class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-[10px] text-accent">📡 {t("message.realSms")}</span>
       </div>
-      <button onclick={refreshReal} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
     </div>
     <div class="flex-1 space-y-2 overflow-auto">
       {#if realMsgs.length === 0}

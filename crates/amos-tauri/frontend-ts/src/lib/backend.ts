@@ -10,10 +10,72 @@ interface TauriBridge {
   listen(channel: string, handler: (e: { payload: unknown }) => void): Promise<() => void>;
 }
 
+/**
+ * What the host actually injects into `window.__TAURI_INTERNALS__`.
+ *
+ * Tauri v2 exposes `invoke` + `transformCallback`/`unregisterCallback` — but **no
+ * `listen`**. Code that assumed `internals.listen(...)` existed therefore threw
+ * and (behind a `try/catch`) silently disabled every event-driven feature.
+ */
+interface TauriInternals {
+  invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
+  listen?(channel: string, handler: (e: { payload: unknown }) => void): Promise<() => void>;
+  transformCallback?(cb: (payload: unknown) => void, once?: boolean): number;
+  unregisterCallback?(id: number): void;
+}
+
 function bridge(): TauriBridge | null {
   if (typeof window === "undefined") return null;
-  const w = window as unknown as { __TAURI_INTERNALS__?: TauriBridge };
-  return w && typeof w.__TAURI_INTERNALS__ === "object" ? (w.__TAURI_INTERNALS__ as TauriBridge) : null;
+  const internals = (window as unknown as { __TAURI_INTERNALS__?: TauriInternals })
+    .__TAURI_INTERNALS__;
+  if (!internals || typeof internals !== "object" || typeof internals.invoke !== "function") {
+    return null;
+  }
+  const invoke = internals.invoke.bind(internals);
+  return {
+    invoke: (command, args) => invoke(command, args),
+    listen: (channel, handler) => listenEvent(internals, invoke, channel, handler),
+  };
+}
+
+/**
+ * Subscribe to a host event, honestly.
+ *
+ * Uses a host-provided `listen` when present; otherwise registers through the
+ * event plugin exactly like `@tauri-apps/api` does
+ * (`plugin:event|listen` + a `transformCallback` id), because the internal
+ * `listen` helper does not exist. Returns an unsubscribe function; a no-op when
+ * the host cannot subscribe at all (offline / test double).
+ */
+async function listenEvent(
+  internals: TauriInternals,
+  invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
+  channel: string,
+  handler: (e: { payload: unknown }) => void,
+): Promise<() => void> {
+  if (typeof internals.listen === "function") {
+    return internals.listen(channel, handler);
+  }
+  const transform = internals.transformCallback?.bind(internals);
+  if (typeof transform !== "function") return () => {};
+  const handlerId = transform((raw: unknown) => {
+    handler({ payload: (raw as { payload?: unknown } | null)?.payload });
+  });
+  const target = { kind: "Any" };
+  try {
+    const eventId = await invoke("plugin:event|listen", {
+      event: channel,
+      target,
+      handler: handlerId,
+    });
+    return () => {
+      internals.unregisterCallback?.(handlerId);
+      void invoke("plugin:event|unlisten", { event: channel, eventId, target }).catch(() => {});
+    };
+  } catch {
+    internals.unregisterCallback?.(handlerId);
+    return () => {};
+  }
 }
 
 export function bridged(): boolean {
@@ -830,6 +892,10 @@ export interface SmsStatusOut {
   provider: string;
   device: boolean;
 }
+
+/** Event the device backend emits when an SMS arrived (`amos-tauri::sms`
+ *  `SMS_RECEIVED_EVENT`); the Messages screen re-reads the inbox on it. */
+export const SMS_RECEIVED_EVENT = "sms-received";
 
 /** Ask which SMS backend is active (no device I/O). `null` outside Tauri. */
 export async function smsStatus(): Promise<SmsStatusOut | null> {

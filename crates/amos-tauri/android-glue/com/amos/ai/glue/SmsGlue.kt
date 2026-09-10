@@ -20,11 +20,16 @@
 
 package com.amos.ai.glue
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.provider.Telephony
 import android.telephony.SmsManager
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -32,12 +37,16 @@ import org.json.JSONObject
 object SmsPermissions {
     const val READ = "android.permission.READ_SMS"
     const val SEND = "android.permission.SEND_SMS"
+    const val RECEIVE = "android.permission.RECEIVE_SMS"
 
     /** Whether the SMS inbox may be read. */
     fun hasRead(context: Context): Boolean = granted(context, READ)
 
     /** Whether an SMS may be sent. */
     fun hasSend(context: Context): Boolean = granted(context, SEND)
+
+    /** Whether incoming SMS may be observed (live refresh). */
+    fun hasReceive(context: Context): Boolean = granted(context, RECEIVE)
 
     private fun granted(context: Context, perm: String): Boolean =
         context.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
@@ -63,17 +72,116 @@ object SmsGlue {
 
     private val URI: Uri = Uri.parse("content://sms")
 
+    /** Log tag (registration/delivery diagnostics must never be silent). */
+    private const val TAG = "SmsGlue"
+
     @Volatile
     private var app: Context? = null
+
+    /** Registered once in [bind]; delivers `SMS_RECEIVED` as a live refresh. */
+    @Volatile
+    private var receiver: BroadcastReceiver? = null
 
     /** Rust JNI upcall: `Java_com_amos_ai_glue_SmsGlue_attach`. */
     private external fun attach(glue: SmsGlue)
 
-    /** Bind the app context and install the real provider (idempotent). */
+    /** Rust JNI upcall: an SMS arrived (`Java_..._SmsGlue_onIncoming`). */
+    private external fun onIncoming(address: String)
+
+    /** Bind the app context, register the receiver and install the provider. */
     fun bind(context: Context) {
         if (app != null) return
-        app = context.applicationContext
+        val ctx = context.applicationContext
+        app = ctx
         attach(this)
+        registerIncomingReceiver(ctx)
+        Log.i(TAG, "SmsGlue bound")
+    }
+
+    /**
+     * Register a `SMS_RECEIVED` receiver so received messages push a refresh to
+     * the UI instead of waiting for a manual pull. The receiver only signals
+     * "inbox changed" (+ the sender when the platform provides it); the UI then
+     * re-reads the provider through the normal, validated read path — we never
+     * build UI state from the broadcast itself.
+     *
+     * API 33+ requires an export flag on context-registered receivers. For
+     * `SMS_RECEIVED` we register **EXPORTED**: the telephony stack delivers the
+     * broadcast as an external sender, and a `RECEIVER_NOT_EXPORTED` filter was
+     * observed (on a real S25/S5-class device) to never receive it. This is safe
+     * because `SMS_RECEIVED` is a **protected** broadcast — only a process holding
+     * `BROADCAST_SMS` (i.e. the system/telephony) can send it, so no third-party
+     * app can inject a fake "received SMS". `NOT_EXPORTED` is kept only as a
+     * fallback for hosts that reject the exported registration.
+     */
+    private fun registerIncomingReceiver(ctx: Context) {
+        if (receiver != null) return
+        if (!SmsPermissions.hasReceive(ctx)) {
+            Log.i(TAG, "SMS_RECEIVED receiver not registered: RECEIVE_SMS not granted")
+            return
+        }
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, intent: Intent?) {
+                if (intent?.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+                val sender = senderOf(intent)
+                Log.i(TAG, "SMS_RECEIVED from '${if (sender.isEmpty()) "<unknown>" else sender}'")
+                onIncoming(sender)
+            }
+        }
+        val filter = IntentFilter(Telephony.Sms.Intents.SMS_RECEIVED_ACTION)
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                ctx.registerReceiver(r, filter, Context.RECEIVER_EXPORTED)
+                receiver = r
+                Log.i(TAG, "SMS_RECEIVED receiver registered (EXPORTED)")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "EXPORTED registration failed, trying NOT_EXPORTED", e)
+            }
+            try {
+                ctx.registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
+                receiver = r
+                Log.i(TAG, "SMS_RECEIVED receiver registered (NOT_EXPORTED)")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "SMS_RECEIVED receiver registration failed", e)
+            }
+        } else {
+            try {
+                ctx.registerReceiver(r, filter)
+                receiver = r
+                Log.i(TAG, "SMS_RECEIVED receiver registered (legacy)")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "SMS_RECEIVED receiver registration failed", e)
+            }
+        }
+        receiver = null
+    }
+
+    /** Sender address of an incoming PDU set, or "" when the platform omits it. */
+    private fun senderOf(intent: Intent): String = try {
+        Telephony.Sms.Intents.getMessagesFromIntent(intent)
+            ?.firstOrNull()
+            ?.originatingAddress
+            ?.trim()
+            ?: ""
+    } catch (e: Exception) {
+        "" // never invent a sender
+    }
+
+    /**
+     * Entry point for the manifest-registered [SmsReceiver] (works even when the
+     * System UI process/activity was not running). Signals the same Rust upcall
+     * as the dynamic receiver; the Rust side is a no-op until a UI is attached.
+     */
+    fun onSmsReceived(intent: Intent) {
+        val sender = senderOf(intent)
+        try {
+            onIncoming(sender)
+        } catch (t: Throwable) {
+            Log.w(TAG, "incoming upcall failed (Rust not attached yet?)", t)
+        }
     }
 
     /** Latest message per thread + per-thread unread incoming count (bounded). */
