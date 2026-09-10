@@ -52,7 +52,15 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
 - [ ] **真正发出一条短信**：留给你在 UI 输入并点发送（会真实发送/计费，故由你确认目标后再做）。
 - [ ] 收新短信后刷新：点“刷新”重读当前会话。
 
-### 真机踩到的两个问题（已修）
+### 加固版真机复核（2026-09-10，YY000286 第二次装机）
+- [x] `sms_status` → `{"provider":"android-sms","device":true}`（UI 据此进入真实态）。
+- [x] 有界快照：`sms_snapshot` 返回 7 个真实线程（含新收到的“刚刚好 10:00”），未再全表扫描。
+- [x] `sms_messages` camelCase `threadId` → 线程消息正常（交叉校验通过）。
+- [x] **边界校验**：`sms_send(address="abc")` → `invalid SMS payload: invalid character 'a' in SMS address`；空正文 → `invalid SMS payload: blank SMS text`——均在域层拒绝，**未触达 `SmsManager`**。
+- [x] **诚实权限态**：`pm revoke READ_SMS` → 重启后信息页显示「短信权限被拒绝 / 请在系统设置中授予后重试 / 重试」，既不是假空收件箱也不是本地演示会话。
+- [x] **恢复**：`pm grant READ_SMS` 后点「重试」→ 立即回到真实收件箱（`📡 真实短信` + 线程 + 消息）。
+- [ ] 真正发出一条短信：仍留给你在 UI 确认目标后执行（会真实发送/计费）。
+
 1. **Tauri 参数命名**：`sms_messages` 必须传 **camelCase `threadId`**（Rust 参数是 `thread_id`）；原先 `backend.ts` 传 `thread_id` 被拒（`missing required key threadId`），导致线程消息读不出（UI 显示“无法读取该会话”）。已在 `lib/backend.ts` 修正并加测试断言锁定。
 2. **真实数据混入本地会话/通知 `$effect`** 会在真机 shell 下引发整窗卡死：改为**独立真实态**，本地会话与通知同步完全不受影响，离线行为不变。
 3. 另注（非应用缺陷）：重装 APK 后偶发 `SandboxedProcessService ... process is bad`，WebView 渲染沙箱需重启设备才恢复；属设备侧 WebView 状态，重启后一切正常。
