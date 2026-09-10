@@ -240,6 +240,7 @@ export const zh = {
   "message.confirm": "添加",
   "message.deleteThread": "删除会话",
   "message.noThreads": "暂无会话——点 ＋ 新建一个",
+  "message.realSms": "真实短信",
   "phone.call": "呼叫",
   "phone.dialFailed": "无法拨号——系统电话服务未连接",
   "phone.dialed": "已拨出",

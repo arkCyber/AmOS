@@ -86,6 +86,9 @@ android = [
     "amos-audio/aaudio",
     # Media backend over the Kotlin MediaStoreGlue (crates/amos-media android).
     "amos-media/android",
+    # Real SMS backend over the Kotlin SmsGlue (crates/amos-sms android:
+    # content://sms read + SmsManager send).
+    "amos-sms/android",
 ]
 sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]
 piper-tts = ["amos-tts/piper"]

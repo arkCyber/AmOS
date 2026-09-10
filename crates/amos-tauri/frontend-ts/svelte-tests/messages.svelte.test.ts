@@ -109,4 +109,47 @@ describe("MessagesApp.svelte", () => {
     expect(txt(host)).toContain("小安");
     expect(txt(host)).not.toContain("王五");
   });
+
+  test("shows real device SMS threads when a provider is bridged", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "sms_snapshot") {
+          return [
+            {
+              id: "1",
+              address: "13800138000",
+              display_name: "家人",
+              last_text: "回吗",
+              last_ts_ms: 1_700_000_000_000,
+              unread: 1,
+            },
+          ];
+        }
+        if (cmd === "sms_messages") {
+          return [
+            {
+              thread_id: "1",
+              id: "m1",
+              from_me: false,
+              text: "晚上回家吃饭吗？",
+              ts_ms: 1_700_000_000_000,
+              read: false,
+            },
+          ];
+        }
+        if (cmd === "sms_send") return "sent";
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    expect(host.container.querySelector('[data-testid="real-sms-badge"]')).toBeTruthy();
+    expect(txt(host)).toContain("家人");
+    expect(txt(host)).toContain("晚上回家吃饭吗？");
+    // local-only affordances are hidden in real-SMS mode
+    expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
+  });
 });

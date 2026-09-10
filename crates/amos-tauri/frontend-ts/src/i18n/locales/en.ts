@@ -242,6 +242,7 @@ export const en: Record<MessageKey, string> = {
   "message.confirm": "Add",
   "message.deleteThread": "Delete chat",
   "message.noThreads": "No conversations yet — tap ＋ to start one",
+  "message.realSms": "device SMS",
   "phone.call": "Call",
   "phone.dialFailed": "Could not dial — system phone service not connected",
   "phone.dialed": "Dialed",

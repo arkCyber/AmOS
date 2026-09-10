@@ -54,6 +54,10 @@ object AmosGlue {
         // Bind the real torch (rear camera flash) so FlashlightBridge boots with
         // the AndroidFlashlightProvider instead of the desktop Mock.
         startQuietly("flashlight") { FlashlightGlue.bind(context.applicationContext) }
+        // Bind real SMS (content://sms read + SmsManager send) so SmsBridge uses
+        // the AndroidSmsProvider instead of the empty host Mock. Reads/sends
+        // succeed once READ_SMS/SEND_SMS are granted (checked at call time).
+        startQuietly("sms") { SmsGlue.bind(context.applicationContext) }
     }
 
     /** Run [block], logging (never throwing) if a producer can't start. */

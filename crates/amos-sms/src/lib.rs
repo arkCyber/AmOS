@@ -15,6 +15,12 @@ pub mod provider;
 pub mod spec;
 pub mod wire;
 
+#[cfg(feature = "android")]
+pub mod android;
+
 pub use error::SmsError;
 pub use provider::{MockSms, SmsProvider};
 pub use spec::{SmsMessage, SmsThread};
+
+#[cfg(feature = "android")]
+pub use android::AndroidSmsProvider;

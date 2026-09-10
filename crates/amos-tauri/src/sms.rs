@@ -85,11 +85,23 @@ impl From<&SmsMessage> for SmsMessageOut {
     }
 }
 
+/// The provider in effect: the installed on-device backend when present
+/// (feature `android`), else the host mock held by the bridge.
+fn active(state: &SmsBridge) -> &dyn SmsProvider {
+    #[cfg(feature = "android")]
+    {
+        if let Some(p) = device::DEVICE.get() {
+            return p.as_ref();
+        }
+    }
+    state.provider.as_ref()
+}
+
 /// Read the inbox snapshot (threads, newest first). Empty when no real SMS
 /// provider is available; never fabricated.
 #[tauri::command]
 pub fn sms_snapshot(state: State<'_, SmsBridge>) -> Result<Vec<SmsThreadOut>, String> {
-    snapshot_of(state.provider.as_ref())
+    snapshot_of(active(&state))
 }
 
 /// Read one thread's messages (chronological).
@@ -98,8 +110,7 @@ pub fn sms_messages(
     state: State<'_, SmsBridge>,
     thread_id: String,
 ) -> Result<Vec<SmsMessageOut>, String> {
-    state
-        .provider
+    active(&state)
         .messages(&thread_id)
         .map(|v| v.iter().map(SmsMessageOut::from).collect())
         .map_err(|e| e.to_string())
@@ -114,8 +125,7 @@ pub fn sms_send(
     address: String,
     text: String,
 ) -> Result<String, String> {
-    state
-        .provider
+    active(&state)
         .send(&address, &text)
         .map(|()| "sent".to_string())
         .map_err(|e| e.to_string())
@@ -126,6 +136,55 @@ fn snapshot_of(p: &dyn SmsProvider) -> Result<Vec<SmsThreadOut>, String> {
     p.snapshot()
         .map(|v| v.iter().map(SmsThreadOut::from).collect())
         .map_err(|e| e.to_string())
+}
+
+/// On-device SMS attach (feature `android`): the Kotlin `SmsGlue` instance
+/// (which owns the Context / ContentResolver) is handed to Rust over JNI,
+/// wrapped in a real `amos_sms::AndroidSmsProvider`, and installed into a
+/// process global the commands consult — mirroring the media/flashlight device
+/// seam. Compile-checked under `--features android`; exercised at device time.
+#[cfg(feature = "android")]
+mod device {
+    use super::*;
+    use jni::objects::JObject;
+    use jni::sys::jobject;
+    use std::sync::{Arc, OnceLock};
+
+    /// The real Android SMS provider, installed exactly-once at attach.
+    pub(crate) static DEVICE: OnceLock<Arc<dyn SmsProvider>> = OnceLock::new();
+
+    fn install(vm: jni::JavaVM, env: &jni::JNIEnv<'_>, glue: JObject<'_>) {
+        use amos_sms::AndroidSmsProvider;
+        if let Ok(p) = AndroidSmsProvider::new(vm, env, glue) {
+            let _ = DEVICE.set(Arc::new(p)); // first attach wins (exactly-once)
+        }
+    }
+
+    /// `SmsGlue.attach()` — JNI `(JNIEnv*, jobject)`; `this` is the Kotlin
+    /// `SmsGlue` instance holding the app Context / ContentResolver.
+    ///
+    /// # Safety
+    /// `env`/`this` are the standard JNI arguments of a native call on the main
+    /// thread; `this` is valid for the duration of the call.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_com_amos_ai_glue_SmsGlue_attach(
+        env: *mut jni::sys::JNIEnv,
+        this: jobject,
+    ) {
+        if env.is_null() || this.is_null() {
+            return; // nothing valid → honest no-op (mock stays active)
+        }
+        // SAFETY: `env` is the JVM-supplied JNIEnv* for this native call.
+        let Ok(env) = (unsafe { jni::JNIEnv::from_raw(env) }) else {
+            return;
+        };
+        let Ok(vm) = env.get_java_vm() else {
+            return;
+        };
+        // SAFETY: `this` is a live local ref for the duration of this call.
+        let glue = unsafe { JObject::from_raw(this) };
+        install(vm, &env, glue);
+    }
 }
 
 #[cfg(test)]

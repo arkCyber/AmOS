@@ -13,4 +13,16 @@ path = "src/lib.rs"
 [dependencies]
 thiserror = "1"
 serde_json = "1"
+# Real Android SMS backend (content://sms + SmsManager via the Kotlin SmsGlue).
+# Optional: only pulled in when the `android` feature is enabled, so desktop/CI
+# builds stay free of the JNI stack.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enables `src/android.rs` (AndroidSmsProvider). Intended for on-device builds of
+# the System UI APK (aarch64-linux-android); deliberately excluded from
+# desktop/CI. Runtime needs a real Android VM + Context; `cargo check --features
+# android` validates that it *compiles*.
+android = ["dep:jni"]
 
