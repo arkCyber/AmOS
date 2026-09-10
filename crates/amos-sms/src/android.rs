@@ -20,7 +20,8 @@ use jni::{JNIEnv, JavaVM};
 use crate::error::SmsError;
 use crate::provider::SmsProvider;
 use crate::spec::{SmsMessage, SmsThread};
-use crate::wire::{parse_messages, parse_snapshot};
+use crate::validate::{normalize_address, validate_text};
+use crate::wire::{parse_messages_for, parse_send_reply, parse_snapshot};
 
 /// Map a JNI error into an [`SmsError::Failed`].
 fn jerr(e: jni::errors::Error) -> SmsError {
@@ -107,25 +108,29 @@ impl AndroidSmsProvider {
 }
 
 impl SmsProvider for AndroidSmsProvider {
+    fn name(&self) -> &'static str {
+        "android-sms"
+    }
+
     fn snapshot(&self) -> Result<Vec<SmsThread>, SmsError> {
         parse_snapshot(&self.call0("snapshot")?)
     }
 
     fn messages(&self, thread_id: &str) -> Result<Vec<SmsMessage>, SmsError> {
-        parse_messages(&self.call1("messages", thread_id)?)
+        let id = thread_id.trim();
+        if id.is_empty() {
+            return Err(SmsError::Invalid("blank SMS thread id".into()));
+        }
+        // Cross-check the reply against the requested thread: a glue bug must
+        // never silently show another conversation.
+        parse_messages_for(&self.call1("messages", id)?, Some(id))
     }
 
     fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
-        let payload = self.call2("send", address, text)?;
-        let v: serde_json::Value = serde_json::from_str(&payload)
-            .map_err(|e| SmsError::Invalid(format!("unparseable send reply: {e}")))?;
-        if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
-            return Err(SmsError::Failed(err.to_string()));
-        }
-        if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-            Ok(())
-        } else {
-            Err(SmsError::Invalid("send reply without ok/error".into()))
-        }
+        // Domain-boundary validation: fail deterministically here rather than
+        // handing malformed input to the radio (the glue re-checks too).
+        let address = normalize_address(address)?;
+        validate_text(text)?;
+        parse_send_reply(&self.call2("send", &address, text)?)
     }
 }

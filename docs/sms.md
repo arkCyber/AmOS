@@ -54,6 +54,43 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
 
 ### 真机踩到的两个问题（已修）
 1. **Tauri 参数命名**：`sms_messages` 必须传 **camelCase `threadId`**（Rust 参数是 `thread_id`）；原先 `backend.ts` 传 `thread_id` 被拒（`missing required key threadId`），导致线程消息读不出（UI 显示“无法读取该会话”）。已在 `lib/backend.ts` 修正并加测试断言锁定。
-2. **真实数据混入本地会话/通知 `$effect`** 会在真机 shell 下引发整窗卡死：改为**独立真实态**（`realThreads`/`realMsgs`/`realActiveId`，探测 `$effect` 用 `probed` 一次性守卫），本地会话与通知同步完全不受影响，离线行为不变。
+2. **真实数据混入本地会话/通知 `$effect`** 会在真机 shell 下引发整窗卡死：改为**独立真实态**，本地会话与通知同步完全不受影响，离线行为不变。
 3. 另注（非应用缺陷）：重装 APK 后偶发 `SandboxedProcessService ... process is bad`，WebView 渲染沙箱需重启设备才恢复；属设备侧 WebView 状态，重启后一切正常。
+
+## 工程加固（航空航天级审计，2026-09-10）
+按“**有界 · 诚实 · 可审计 · 可测试**”四条准则逐层加固，全部在本机确定性验证；设备侧仍按上文清单复核。
+
+### 1. 输入校验与分段（`crates/amos-sms/src/validate.rs`，新增）
+- `normalize_address`：剥离 `- 空格 ( ) .`，保留首个 `+`；位数 3..=20（E.164 ≤15、短号更短）；非数字/纯 `+`/`+` 非首位一律拒绝。返回**规范化地址**，杜绝把用户原串直接交给基带。
+- `validate_text`：拒绝空、NUL、>1600 字符（≈10 段）；超出**报错而非静默截断**（截断会篡改用户消息）。
+- `is_gsm7` / `segment_count`：GSM 03.38 七位字母表判定 → 160/153 段；其余 UCS-2 → 70/67 段（非 BMP 字符按 2 个 UTF-16 单元计）。桥层用它产出审计用的段数。
+
+### 2. 线协议有界 + 类型化错误（`wire.rs`）
+- 尺寸/数量上限：载荷 4 MiB、线程 500、消息 1000、单条正文 16 KiB；**超限即 `Invalid`**（协议违规，不静默截断）。
+- 取值范围：时间戳必须 ≥0（负值渲染成假日期）；`id`/`address` 不得为空。
+- `{"error":…,"error_kind":…}` → 类型化错误：`permission`→`PermissionDenied`、`unavailable`→`Unavailable`、`invalid`→`Invalid`，其余→`Failed`；**错误绝不等价于“空收件箱”**。
+- `parse_messages_for(payload, expected)`：回包线程 ID 必须等于请求 ID（否则会静默显示**别的会话**）。
+- `parse_send_reply`：只有 `{"ok":true}` 才算成功；`{}`/畸形回包 → `Invalid`，**永不假设已发送**。
+
+### 3. 桥层：不阻塞 UI、硬超时、审计（`crates/amos-tauri/src/sms.rs`）
+- 命令改为 `async`，provider 调用经 `tauri::async_runtime::spawn_blocking` 卸载到阻塞池，并套 `tokio::time::timeout`（**8s**）。理由：Tauri 的**同步**命令跑在主线程，而 ContentResolver/JNI 是阻塞调用——否则大收件箱查询会冻结整个 WebView。超时后调用方得到诚实错误（阻塞任务无法取消，但不再拖住 UI）。测试用 50ms 超时 + 500ms 阻塞闭包验证。
+- 新增 `sms_status`（无 I/O）返回 `{provider, device}`，让 UI 能区分**真机后端**与**宿主 mock**（后者不是“空收件箱”）。
+- `sms_send` 先做域校验（规范化地址 + 正文 + 段数），再下发；成功/失败各记一条 `tracing` 审计日志，地址**掩码**为 `***后四位`，正文永不入日志（隐私）。
+- `SmsProvider` 增加 `name()`（`"mock"` / `"android-sms"`，常量 `MOCK_PROVIDER`）。
+
+### 4. Kotlin glue（`SmsGlue.kt`）
+- **有界查询**：`snapshot()` 单次 `date DESC LIMIT 4000` 窗口内推导“每线程最新一条 + 未读计数”（不再全表扫描）；输出受 `MAX_THREADS` 约束。文档明确：仅统计窗口内的未读（**有界并已声明**的取舍，而非静默）。
+- `messages()`：线程 ID 必须为 ≤20 位纯数字；`date DESC LIMIT 1000` 取最新后**反转为时间序**，并在回包中回显 `thread_id` 供 Rust 交叉校验。
+- `send()`：先查 `SEND_SMS` 权限；地址/正文按域规则复校；用 `SmsManager.divideMessage` **真分段**（>1 段走 `sendMultipartTextMessage`）；`SecurityException`→permission、`IllegalArgumentException`→invalid、其余→failed。
+- `SmsPermissions`（READ/SEND）与 `MediaPermissions` 同构；所有失败返回 `{"error":…,"error_kind":…}`，不再把异常吞成“空收件箱”。
+
+### 5. 前端状态机（`backend.ts` + `MessagesApp.svelte`）
+- `smsStatus()` + `smsSnapshotResult()`：把「成功（可能为空）」「权限被拒」「其它失败」「未桥接」区分开。
+- UI 三态：`device=false`（宿主 mock）→ 保持本地会话；“真实收件箱为空”→ **本机暂无短信**（不显示本地演示会话）；读取失败 → 红字错误 + 授权提示 + 「重试」按钮（重试会重新探测后端状态）。读取期间按钮置灰（`smsBusy`）。
+
+### 6. 测试与门禁（本机全绿）
+- `amos-sms`：**19 例**（含地址规范化/拒绝、分段计数、GSM-7 判定、线协议上限与越界、错误类型映射、线程交叉校验、send 成功语义）。
+- `amos-tauri --lib sms::`：**8 例**（含宿主空收件箱、mock/设备状态区分、发送前校验、地址掩码、**卡死 provider 超时**、阻塞结果传递）。
+- 前端：`typecheck` / `typecheck:svelte` 0 error、`test:svelte` **358 例**（新增权限拒绝→重试恢复、空收件箱诚实态、宿主 mock 保持本地会话）。
+
 

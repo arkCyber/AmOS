@@ -115,6 +115,7 @@ describe("MessagesApp.svelte", () => {
     (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (cmd: string, args?: Record<string, unknown>) => {
         seen.push({ cmd, ...(args ?? {}) });
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
         if (cmd === "sms_snapshot") {
           return [
             {
@@ -156,6 +157,88 @@ describe("MessagesApp.svelte", () => {
     expect(msgCall?.threadId).toBe("1");
     expect(msgCall && "thread_id" in msgCall).toBe(false);
     // local-only affordances are hidden in real-SMS mode
+    expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
+  });
+
+  test("keeps local conversations with the honest host mock", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "sms_status") return { provider: "mock", device: false };
+        return null; // a mock backend has no device snapshot
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    // Host/offline: local conversations stay, and no real-SMS state is shown.
+    expect(txt(host)).toContain("小安");
+    expect(host.container.querySelector('[data-testid="real-sms-badge"]')).toBeNull();
+    expect(host.container.querySelector('[data-testid="sms-error"]')).toBeNull();
+  });
+
+  test("shows an honest permission error and recovers on retry", async () => {
+    let granted = false;
+    const threads = [
+      {
+        id: "1",
+        address: "13800138000",
+        display_name: "家人",
+        last_text: "回吗",
+        last_ts_ms: 1_700_000_000_000,
+        unread: 1,
+      },
+    ];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_snapshot") {
+          if (!granted) throw new Error("SMS permission denied: READ_SMS not granted");
+          return threads;
+        }
+        if (cmd === "sms_messages") {
+          return [
+            { thread_id: "1", id: "m1", from_me: false, text: "晚上回家吃饭吗？", ts_ms: 1_700_000_000_000, read: false },
+          ];
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    // Denied is an error state — never an empty inbox, never the local demo chat.
+    expect(host.container.querySelector('[data-testid="sms-error"]')).toBeTruthy();
+    expect(txt(host)).toContain("短信权限被拒绝");
+    expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
+    // Granting the permission and retrying recovers into the real inbox.
+    granted = true;
+    await fireEvent.click(host.container.querySelector('button[aria-label="sms-retry"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    expect(host.container.querySelector('[data-testid="sms-error"]')).toBeNull();
+    expect(host.container.querySelector('[data-testid="real-sms-badge"]')).toBeTruthy();
+    expect(txt(host)).toContain("家人");
+  });
+
+  test("an empty device inbox is honest, not the local demo chat", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_snapshot") return []; // real, empty inbox
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    expect(host.container.querySelector('[data-testid="sms-empty"]')).toBeTruthy();
+    expect(txt(host)).toContain("本机暂无短信");
     expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
   });
 });

@@ -27,7 +27,7 @@
   import { NOTIF_KEY, removeAppNotifs } from "../lib/settings";
   import { iconSvg } from "../lib/sysIcons";
   import type { Notif } from "../lib/settings";
-  import { bridged, smsMessages, smsSend, smsSnapshot } from "../lib/backend";
+  import { bridged, smsMessages, smsSend, smsSnapshotResult, smsStatus } from "../lib/backend";
   import type { SmsMessageOut, SmsThreadOut } from "../lib/backend";
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
@@ -62,14 +62,20 @@
   // ---- Real SMS (device) --------------------------------------------------------
   // The real device inbox lives in its OWN state and never mixes with the local
   // conversations / notification machinery (that coupling caused a render loop on
-  // device). When the bridge reports real threads we render the real panel;
-  // otherwise the screen falls back to local conversations unchanged.
-  let realThreads = $state<SmsThreadOut[] | null>(null);
+  // device). `smsMode` is resolved from the backend status so the honest host
+  // mock keeps the local conversations, while a device backend shows the real
+  // inbox — including its *empty* and *unreadable* (permission) states, which
+  // must never be collapsed into "no messages".
+  let smsMode = $state<"unknown" | "local" | "real">("unknown");
+  let realThreads = $state<SmsThreadOut[]>([]);
   let realActiveId = $state("");
   let realMsgs = $state<SmsMessageOut[]>([]);
   let realText = $state("");
   let realErr = $state("");
-  const activeReal = $derived(realThreads?.find((th) => th.id === realActiveId) ?? null);
+  let smsErr = $state("");
+  let smsDenied = $state(false);
+  let smsBusy = $state(false);
+  const activeReal = $derived(realThreads.find((th) => th.id === realActiveId) ?? null);
   const activeRealName = $derived(
     activeReal ? activeReal.display_name || activeReal.address : "",
   );
@@ -84,8 +90,41 @@
     realActiveId = id;
     loadReal(id);
   };
+  // Re-read the inbox: success (possibly empty) vs failure are distinct states.
   const refreshReal = () => {
-    if (realActiveId) loadReal(realActiveId);
+    smsBusy = true;
+    void smsSnapshotResult().then((r) => {
+      smsBusy = false;
+      if (r.ok) {
+        smsErr = "";
+        smsDenied = false;
+        realThreads = r.threads;
+        const first = r.threads[0];
+        if (first && !r.threads.some((th) => th.id === realActiveId)) {
+          openReal(first.id);
+        }
+      } else {
+        realThreads = [];
+        realMsgs = [];
+        smsDenied = r.denied;
+        smsErr = r.denied ? t("message.smsDenied") : t("message.smsUnavailable");
+      }
+    });
+  };
+  // Resolve the backend once (mock → keep local conversations; device → real).
+  const probeSms = () => {
+    void smsStatus().then((st) => {
+      if (!st || !st.device) {
+        smsMode = "local";
+        return;
+      }
+      smsMode = "real";
+      refreshReal();
+    });
+  };
+  const retrySms = () => {
+    if (smsMode === "real") refreshReal();
+    else probeSms();
   };
   const sendReal = () => {
     const v = realText.trim();
@@ -99,17 +138,12 @@
       loadReal(activeReal.id);
     });
   };
-  // Probe once (guarded so the effect can never re-enter): switch to the real
-  // inbox when the bridge reports threads; keep local conversations otherwise.
+  // Probe once (guarded so the effect can never re-enter).
   let probed = false;
   $effect(() => {
     if (probed || !bridged()) return;
     probed = true;
-    void smsSnapshot().then((ts) => {
-      if (!ts || ts.length === 0) return; // no real SMS → stay local
-      realThreads = ts;
-      if (ts[0]) openReal(ts[0].id);
-    });
+    probeSms();
   });
 
   // Publish unread incoming messages across conversations as app notifications.
@@ -186,7 +220,21 @@
 </script>
 
 <div class="flex h-full flex-col p-3">
-  {#if realThreads && realThreads.length}
+  {#if smsMode === "real"}
+    {#if smsErr}
+      <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center" data-testid="sms-error">
+        <p class="text-sm text-red-500" role="alert">{smsErr}</p>
+        {#if smsDenied}
+          <p class="text-xs opacity-60">{t("message.smsDeniedHint")}</p>
+        {/if}
+        <button onclick={retrySms} disabled={smsBusy} aria-label="sms-retry" class="rounded-full bg-accent px-4 py-1.5 text-xs text-white active:scale-95 disabled:opacity-40">{t("message.retry")}</button>
+      </div>
+    {:else if realThreads.length === 0}
+      <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center" data-testid="sms-empty">
+        <p class="text-sm opacity-60">{t("message.inboxEmpty")}</p>
+        <button onclick={retrySms} disabled={smsBusy} aria-label="sms-retry" class="rounded-full bg-neutral-200 px-4 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.retry")}</button>
+      </div>
+    {:else}
     <!-- Real device inbox (SmsGlue over JNI): read threads + send via SmsManager -->
     <div class="mb-1 flex items-center gap-1.5 overflow-x-auto">
       {#each realThreads as th (th.id)}
@@ -198,7 +246,7 @@
         <span class="text-sm font-semibold">{activeRealName}</span>
         <span data-testid="real-sms-badge" class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-[10px] text-accent">📡 {t("message.realSms")}</span>
       </div>
-      <button onclick={refreshReal} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">{t("message.refresh")}</button>
+      <button onclick={refreshReal} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
     </div>
     <div class="flex-1 space-y-2 overflow-auto">
       {#if realMsgs.length === 0}
@@ -221,6 +269,7 @@
       <input bind:value={realText} onkeydown={(e) => e.key === "Enter" && sendReal()} placeholder={t("message.placeholder", { name: activeRealName })} aria-label="real-message-input" class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
       <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label="send" data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
     </div>
+    {/if}
   {:else}
   <!-- Conversation bar: switch threads -->
   <div class="mb-1 flex items-center gap-1.5 overflow-x-auto">

@@ -824,6 +824,37 @@ export async function smsSnapshot(): Promise<SmsThreadOut[] | null> {
   return invoke<SmsThreadOut[]>("sms_snapshot");
 }
 
+/** Which backend backs SMS: `device: false` means the honest host mock, so the
+ *  UI must keep using local conversations instead of showing an empty inbox. */
+export interface SmsStatusOut {
+  provider: string;
+  device: boolean;
+}
+
+/** Ask which SMS backend is active (no device I/O). `null` outside Tauri. */
+export async function smsStatus(): Promise<SmsStatusOut | null> {
+  return invoke<SmsStatusOut>("sms_status");
+}
+
+/** A snapshot outcome that keeps "empty inbox" and "could not read" distinct:
+ *  the former is a real (empty) inbox, the latter needs an honest message
+ *  (e.g. READ_SMS denied) — collapsing them would lie to the user. */
+export type SmsSnapshotResult =
+  | { ok: true; threads: SmsThreadOut[] }
+  | { ok: false; error: string; denied: boolean; notBridged: boolean };
+
+/** Read the inbox distinguishing success (possibly empty) from failure. */
+export async function smsSnapshotResult(): Promise<SmsSnapshotResult> {
+  const threads = await invoke<SmsThreadOut[]>("sms_snapshot");
+  if (threads) return { ok: true, threads };
+  const diag = bridgeDiag();
+  if (!diag.ok && diag.kind === "not-bridged") {
+    return { ok: false, error: "not bridged", denied: false, notBridged: true };
+  }
+  const error = diag.ok ? "no result" : String(diag.detail ?? "failed");
+  return { ok: false, error, denied: /permission|denied|not granted/i.test(error), notBridged: false };
+}
+
 /** Messages of one SMS thread (chronological). `null` when unavailable.
  *
  * Tauri v2 deserializes command args in camelCase, so the key must be

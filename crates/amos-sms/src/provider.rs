@@ -2,10 +2,23 @@
 
 use crate::error::SmsError;
 use crate::spec::{SmsMessage, SmsThread};
+use crate::validate::{normalize_address, validate_text};
+
+/// [`SmsProvider::name`] of the honest host/offline mock. Callers can compare
+/// against this to tell "no real device backend" from a real one.
+pub const MOCK_PROVIDER: &str = "mock";
 
 /// A backend that can list SMS threads, list a thread's messages and send a
 /// text. Host/test code uses [`MockSms`]; the real device backend plugs in here.
+///
+/// Providers **must** validate sends ([`normalize_address`] + [`validate_text`])
+/// and must never report success for something they did not hand to the
+/// platform. A read that fails because a permission is missing returns
+/// [`SmsError::PermissionDenied`], never an empty list.
 pub trait SmsProvider: Send + Sync {
+    /// Stable backend id ("mock", "android-sms", …) so callers can tell a real
+    /// device provider from the honest host mock without guessing.
+    fn name(&self) -> &'static str;
     /// List all SMS threads (newest first).
     fn snapshot(&self) -> Result<Vec<SmsThread>, SmsError>;
     /// List messages of one thread (chronological).
@@ -41,6 +54,10 @@ impl Default for MockSms {
 }
 
 impl SmsProvider for MockSms {
+    fn name(&self) -> &'static str {
+        MOCK_PROVIDER
+    }
+
     fn snapshot(&self) -> Result<Vec<SmsThread>, SmsError> {
         if !self.seed {
             return Ok(Vec::new());
@@ -66,6 +83,9 @@ impl SmsProvider for MockSms {
     }
 
     fn messages(&self, thread_id: &str) -> Result<Vec<SmsMessage>, SmsError> {
+        if thread_id.trim().is_empty() {
+            return Err(SmsError::Invalid("blank SMS thread id".into()));
+        }
         if !self.seed {
             // Honest: an empty (host) inbox has no threads to read.
             return Err(SmsError::Unavailable(
@@ -103,10 +123,10 @@ impl SmsProvider for MockSms {
         }
     }
 
-    fn send(&self, _address: &str, text: &str) -> Result<(), SmsError> {
-        if text.trim().is_empty() {
-            return Err(SmsError::Invalid("blank SMS text".into()));
-        }
+    fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
+        // Validate exactly like the real backend (domain-level contract).
+        let _address = normalize_address(address)?;
+        validate_text(text)?;
         // Honest mock: we accept the request but never claim a real delivery.
         Ok(())
     }
@@ -140,5 +160,20 @@ mod tests {
         let p = MockSms::seeded();
         assert!(p.send("10086", "   ").is_err());
         assert!(p.send("10086", "TZ").is_ok());
+    }
+
+    #[test]
+    fn providers_are_identified_and_sends_are_validated() {
+        let p = MockSms::seeded();
+        assert_eq!(p.name(), "mock");
+        // Blank/oversized/bad-address sends are rejected at the domain boundary.
+        assert!(p.send("", "hi").is_err());
+        assert!(p.send("abc", "hi").is_err());
+        assert!(p.send("+86 138-0013-8000", "hi").is_ok()); // separators normalized
+        assert!(p
+            .send("10086", &"a".repeat(crate::validate::MAX_TEXT_CHARS + 1))
+            .is_err());
+        // A blank thread id is a caller bug, not "no messages".
+        assert!(p.messages("  ").is_err());
     }
 }
