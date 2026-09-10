@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **真实短信领域地基 `amos-sms`（2026-09-09）**：为“端到端真机短信”新增独立领域 crate（对齐 amos-flashlight 范式）：`spec.rs`（`SmsThread`/`SmsMessage`）、`error.rs`（`Unavailable/Failed/Invalid`）、`provider.rs`（`SmsProvider` trait + `MockSms`：`new()`=空收件箱·诚实“host 无短信”，`seeded()`=固定演示收件箱）、`wire.rs`（纯 JSON 契约 `parse_snapshot`/`parse_messages`，缺字段一律 `Invalid` 不伪造）。workspace 注册。测试 **6 例**（empty/seed/mock send 拒空、snapshot/messages 解析与垃圾容错）全绿；`cargo fmt`/`clippy -D warnings` 干净。诚实边界：这只是**领域层地基**；真实读收件箱/发送需后续 Android provider(JNI) + Kotlin `SmsGlue` + 权限 + amos-tauri 桥 + Messages 接真线程，并须在你手机验收（见 `docs/sms.md` 进度与真机清单）。
+
+
 - **Messages 本地多会话：可增删联系人多线程（前端，2026-09-09）**：把原来写死“单联系人小安”的本地聊天 UI 扩成**多联系人/多会话**——仍是本地离线演示，非真机 SMS（真机短信读取属后续 amos-sms，见 `docs/telephony.md`）。(a) `lib/messages.ts` 新增纯层 `Conversation`/`seedConversations`/`normalizeConversations`/`addConversation`/`removeConversation`/`findConversation`，存储键 `amos.messages.convs`。(b) `MessagesApp.svelte`：顶部会话条可切换线程、常驻“新建会话”输入行（填联系人即建空线程并选中）、每个线程独立收发/清空/删除（>1 才出现“删除会话”，删除后回落到剩余线程）；未读跨线程汇总为通知。测试：纯 `messages.test.ts` 扩至 **11 例**（新增 seed/normalize 垃圾容错与缺 id 回退/add 拒空拒重/remove）；Svelte DOM `messages.svelte.test.ts` 扩至 **6 例**（新增：新建联系人得空线程、线程间消息隔离、>1 时删除会话回落）。验证：Svelte 套件 **56 文件 / 354 全绿**、纯套件 `[bun-iso] test OK`、`tsc`/`svelte-check` 0 错 0 警、dist 重建。
 
 

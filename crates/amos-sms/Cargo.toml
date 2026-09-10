@@ -1,0 +1,16 @@
+[package]
+name = "amos-sms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos SMS domain core: real SMS threads/messages, a pluggable SmsProvider seam (Mock for host/tests + Android SmsGlue backend reading content://sms / sending via SmsManager), and a stable JSON wire contract. Design: docs/sms.md."
+
+[lib]
+name = "amos_sms"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+serde_json = "1"
+
