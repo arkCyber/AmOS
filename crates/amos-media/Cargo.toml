@@ -18,7 +18,7 @@ base64 = "0.21"
 # Real Android MediaStore backend (`src/android.rs`, feature `android`): talks to
 # the Kotlin `MediaStoreGlue` in the System UI APK over JNI (String↔String JSON).
 # Optional so desktop/CI stay light.
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 
 [dev-dependencies]
 

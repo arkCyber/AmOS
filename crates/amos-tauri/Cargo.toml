@@ -47,7 +47,7 @@ async-trait = "0.1"
 amos-sensor = { path = "../amos-sensor" }
 # Real Android radio provider (via amos-radio/android). Optional: only pulled in
 # when amos-tauri's `android` feature is on (System UI APK on-device build).
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 tauri.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

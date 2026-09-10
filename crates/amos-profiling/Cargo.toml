@@ -13,7 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 # Real Android power backend (BatteryManager via JNI, hosted in the System UI APK
 # which owns the Context). Optional: only pulled in with the `android` feature.
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 
 [features]
 default = []

@@ -20,7 +20,7 @@ tonic.workspace = true
 # Real Android backend (dial via the System UI's app Context → `ACTION_CALL`/Telecom
 # under ROLE_DIALER). Optional: only pulled in when the `android` feature is enabled,
 # so desktop/CI builds stay free of the JNI stack (mirrors `amos-radio`).
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 
 [features]
 default = []

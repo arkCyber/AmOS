@@ -17,7 +17,7 @@ tokio.workspace = true
 # Real Android backend (Android ConnectivityManager/WifiManager + BluetoothManager
 # via JNI). Optional: only pulled in when the `android` feature is enabled, so
 # desktop/CI builds stay free of the JNI stack.
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 
 [features]
 default = []
