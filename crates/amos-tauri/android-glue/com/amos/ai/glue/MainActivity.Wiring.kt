@@ -162,6 +162,26 @@ object NativeBootGuard {
  * NativeBootGuard.quiet("home") { onPhysicalHome() }
  * ```
  * Kept here so it survives Tauri regenerating `MainActivity.kt`.
+ *
+ * **Spam blocking (re-apply after a regen, alongside [AlwaysOn]):** the generated
+ * `MainActivity.onStart` must call [`BlocklistGlue.bind`] **unconditionally** — NOT
+ * behind the `cameraGranted()` gate that guards `AmosGlue.onStart` — and hand the
+ * Activity to [`BlocklistGlue.attachActivity`]:
+ * ```
+ * try {
+ *   BlocklistGlue.bind(applicationContext)
+ *   BlocklistGlue.attachActivity(this)
+ * } catch (t: Throwable) { Log.w(TAG, "blocklist glue unavailable: $t") }
+ * ```
+ * Four reasons: (1) the one JSON rule store must resolve to the *same* file for the
+ * WebView, the SMS filter and the `AmosCallScreeningService`; (2) the Rust
+ * `blocklist_status` / `blocklist_request_role` commands call the Kotlin role
+ * helpers through this glue; (3) `bind` is idempotent and fails soft, so it is safe
+ * even when the APK was built without the `android` native feature; (4) the Call
+ * Screening role dialog must be started from a **foreground Activity** — an
+ * application-context `startActivity` is silently swallowed by the Android 10+
+ * background-activity-start rules (device-verified on API 34: the command reported
+ * success while no dialog appeared and the role stayed unheld).
  */
 
 /**

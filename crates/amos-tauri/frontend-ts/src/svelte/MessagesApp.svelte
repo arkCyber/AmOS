@@ -30,6 +30,8 @@
   import {
     SMS_FOLDERS,
     SMS_RECEIVED_EVENT,
+    blocklistAdd,
+    bridgeDiag,
     bridged,
     smsCounts,
     smsFolderSnapshot,
@@ -49,6 +51,7 @@
   import type { SmsDraft } from "../lib/smsDrafts";
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
+  import { messagesChannel } from "./appLinks";
 
   const seeded = ((): Conversation[] => {
     const stored = readStoreValue<unknown>(CONV_KEY, []);
@@ -95,6 +98,10 @@
   let smsErr = $state("");
   let smsDenied = $state(false);
   let smsBusy = $state(false);
+  // Block-sender feedback for the open real thread (see `blockSender`).
+  let blockBusy = $state(false);
+  let blockMsg = $state("");
+  let blockOk = $state(false);
   // AmOS-local drafts (the platform only lets the *default* SMS app write
   // drafts, so ours are stored locally and labelled as such).
   let drafts = $state<SmsDraft[]>(normalizeDrafts(readStoreValue<unknown>(DRAFT_KEY, [])));
@@ -135,12 +142,25 @@
         smsDenied = false;
         realThreads = r.threads;
         const first = r.threads[0];
-        if (first && !r.threads.some((th) => th.id === realActiveId)) {
-          openReal(first.id);
-        } else if (realActiveId) {
+        // The thread we were reading, looked up in the *fresh* list (so this never
+        // depends on a derived value recomputing in the same tick).
+        const current = r.threads.find((th) => th.id === realActiveId);
+        if (!current) {
+          // The open thread is gone (e.g. its sender was just blocked, so the filter
+          // dropped it): fall back to the newest thread, or clear the pane entirely.
+          // Reading a thread the list no longer shows — and that the blocklist would
+          // refuse anyway — must never happen.
+          if (first) {
+            openReal(first.id);
+          } else {
+            realActiveId = "";
+            realMsgs = [];
+            realErr = "";
+          }
+        } else {
           // Same thread still open → reload its messages, so a message that just
           // arrived (live `sms-received` refresh) shows up without a manual pull.
-          loadReal(realActiveId, activeReal?.address);
+          loadReal(realActiveId, current.address);
         }
       } else {
         realThreads = [];
@@ -158,6 +178,8 @@
     realMsgs = [];
     realErr = "";
     smsErr = "";
+    blockMsg = "";
+    blockOk = false;
     refreshReal();
   };
   // Resolve the backend (mock → keep local conversations; device → real).
@@ -192,6 +214,8 @@
   const startNew = () => {
     showNew = true;
     realErr = "";
+    blockMsg = "";
+    blockOk = false;
   };
   const cancelNew = () => {
     showNew = false;
@@ -247,6 +271,34 @@
       realText = "";
       refreshReal();
     });
+  };
+  // One-tap "block this sender": an exact/both rule in the SAME shared store the
+  // phone's 拦截 tab and the SMS filter read, so the sender's texts stop appearing
+  // (and their calls are rejected once the Call Screening role is held). Honest:
+  // `blocklistAdd` returns null when the command was rejected — we say so instead
+  // of pretending the number is now blocked.
+  const blockSender = async () => {
+    const addr = activeReal?.address;
+    if (!addr || blockBusy) return;
+    blockBusy = true;
+    blockMsg = "";
+    blockOk = false;
+    try {
+      const rule = await blocklistAdd(addr, "exact", "both");
+      if (!rule) {
+        blockOk = false;
+        blockMsg = t("message.blockSenderFailed");
+        console.warn("[messages] blocklist_add failed", bridgeDiag());
+        return;
+      }
+      blockOk = true;
+      blockMsg = t("message.blockSenderDone", { addr });
+      // A blocked sender is filtered out of the inbox, so the thread disappears
+      // on the next read — the note above the list explains why.
+      refreshReal();
+    } finally {
+      blockBusy = false;
+    }
   };
   // Probe once (guarded so the effect can never re-enter).
   let probed = false;
@@ -344,6 +396,59 @@
     const dl = messageDayLabel(ts, Date.now());
     return dl === "today" ? t("message.today") : dl === "yesterday" ? t("message.yesterday") : dl;
   };
+
+  // ---- Deep link: "回短信" from the phone's call history -------------------------
+  // The call-history page sets the `messages` channel and opens this app; we then
+  // open the composer addressed to that number — the REAL SMS composer on a device
+  // backend, or a local conversation in host/offline mode. The link is *consumed*
+  // (channel cleared) so re-opening Messages from the dock never re-fires it.
+  let pendingCompose: string | null = null;
+  let composeNonce = 0;
+  const openLocalThread = (name: string) => {
+    const n = name.trim();
+    if (n === "") return;
+    const existing = conversations.find((c) => c.name.toLowerCase() === n.toLowerCase());
+    if (existing) {
+      activeId = existing.id;
+      newName = "";
+      return;
+    }
+    newName = n;
+    confirmAdd();
+  };
+  /** Returns false when the device-vs-local backend is not resolved yet. */
+  const applyCompose = (to: string): boolean => {
+    const n = to.trim();
+    if (n === "") return true;
+    if (smsMode === "real") {
+      newTo = n;
+      newText = "";
+      showNew = true;
+      realErr = "";
+    } else if (smsMode === "local" || !bridged()) {
+      openLocalThread(n);
+    } else {
+      return false; // device probe still running — retry when it settles
+    }
+    // Consume the link so a later remount starts clean.
+    messagesChannel().set({ composeTo: "", nonce: composeNonce });
+    return true;
+  };
+  $effect(() => {
+    return messagesChannel().subscribe((v) => {
+      if (!v || v.composeTo.trim() === "" || v.nonce === composeNonce) return;
+      composeNonce = v.nonce;
+      if (!applyCompose(v.composeTo)) pendingCompose = v.composeTo;
+    });
+  });
+  $effect(() => {
+    // A link that arrived while the backend probe was still running.
+    if (pendingCompose && smsMode !== "unknown") {
+      const p = pendingCompose;
+      pendingCompose = null;
+      applyCompose(p);
+    }
+  });
 </script>
 
 <div class="flex h-full flex-col p-3">
@@ -352,14 +457,20 @@
     <div class="mb-1.5 flex items-center gap-1 overflow-x-auto" data-testid="sms-folders">
       {#each SMS_FOLDERS as f (f)}
         {@const badge = counts[f] + (f === "draft" ? drafts.length : 0)}
-        <button onclick={() => setFolder(f)} aria-pressed={folder === f} data-folder={f} class={"shrink-0 rounded-full px-3 py-1 text-xs " + (folder === f ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{t(`message.folder.${f}`)}{#if badge > 0}<span class="ml-1 opacity-80">{badge}</span>{/if}</button>
+        <button onclick={() => setFolder(f)} aria-pressed={folder === f} data-folder={f} class={"shrink-0 rounded-full px-3 py-1.5 text-xs " + (folder === f ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{t(`message.folder.${f}`)}{#if badge > 0}<span class="ml-1 opacity-80">{badge}</span>{/if}</button>
       {/each}
     </div>
     <!-- Device inbox toolbar: compose a new message + refresh the real inbox -->
     <div class="mb-1.5 flex items-center justify-between gap-1.5">
-      <button onclick={startNew} aria-label="new-sms" class="rounded-full bg-accent px-3 py-1 text-xs text-white active:scale-95">{t("message.newSms")}</button>
-      <button onclick={retrySms} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
+      <button onclick={startNew} aria-label="new-sms" class="rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.newSms")}</button>
+      <button onclick={retrySms} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
     </div>
+    {#if blockMsg}
+      <!-- Outcome of "block this sender": success explains the vanished thread,
+           failure is an explicit error — never a silent no-op. -->
+      <p class={"mb-1.5 rounded-xl px-3 py-1.5 text-xs " + (blockOk ? "bg-accent/10 text-accent" : "bg-red-500/10 text-red-500")}
+        data-testid="block-sender-msg" data-ok={blockOk} role={blockOk ? "status" : "alert"}>{blockMsg}</p>
+    {/if}
     {#if showNew}
       <!-- Compose to any number: the platform persists the send, so the thread
            appears in the provider and the list refreshes below. -->
@@ -419,7 +530,7 @@
     <!-- Real device inbox (SmsGlue over JNI): read threads + send via SmsManager -->
     <div class="mb-1 flex items-center gap-1.5 overflow-x-auto">
       {#each realThreads as th (th.id)}
-        <button onclick={() => openReal(th.id)} aria-pressed={th.id === realActiveId} class={"shrink-0 rounded-full px-3 py-1 text-xs " + (th.id === realActiveId ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{th.display_name || th.address}{#if th.unread > 0}<span class="ml-1">●{th.unread}</span>{/if}</button>
+        <button onclick={() => openReal(th.id)} aria-pressed={th.id === realActiveId} class={"shrink-0 rounded-full px-3 py-1.5 text-xs " + (th.id === realActiveId ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{th.display_name || th.address}{#if th.unread > 0}<span class="ml-1">●{th.unread}</span>{/if}</button>
       {/each}
     </div>
     <div class="flex items-center justify-between pb-2">
@@ -427,6 +538,10 @@
         <span class="text-sm font-semibold">{activeRealName}</span>
         <span data-testid="real-sms-badge" class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-[10px] text-accent">📡 {t("message.realSms")}</span>
       </div>
+      {#if activeReal}
+        <button onclick={() => void blockSender()} disabled={blockBusy} aria-label={`block-sender-${activeReal.address}`} title={t("message.blockSender")}
+          class="shrink-0 rounded-full bg-danger/10 px-3 py-1 text-[11px] text-danger active:scale-95 disabled:opacity-40 dark:bg-danger/20">{t("message.blockSender")}</button>
+      {/if}
     </div>
     <div class="flex-1 space-y-2 overflow-auto">
       {#if realMsgs.length === 0}
@@ -454,7 +569,7 @@
   <!-- Conversation bar: switch threads -->
   <div class="mb-1 flex items-center gap-1.5 overflow-x-auto">
     {#each conversations as c (c.id)}
-      <button onclick={() => (activeId = c.id)} aria-pressed={c.id === activeId} class={"shrink-0 rounded-full px-3 py-1 text-xs " + (c.id === activeId ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{c.name}{#if unreadCount(c.msgs) > 0}<span class="ml-1">●</span>{/if}</button>
+      <button onclick={() => (activeId = c.id)} aria-pressed={c.id === activeId} class={"shrink-0 rounded-full px-3 py-1.5 text-xs " + (c.id === activeId ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{c.name}{#if unreadCount(c.msgs) > 0}<span class="ml-1">●</span>{/if}</button>
     {/each}
   </div>
   <!-- Always-visible row to start a new contact-thread (local conversations) -->
@@ -473,9 +588,9 @@
       </div>
       <div class="flex items-center gap-1.5">
         {#if conversations.length > 1}
-          <button onclick={deleteThread} aria-label="delete-thread" title={t("message.deleteThread")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">{t("message.deleteThread")}</button>
+          <button onclick={deleteThread} aria-label="delete-thread" title={t("message.deleteThread")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs dark:bg-neutral-700">{t("message.deleteThread")}</button>
         {/if}
-        <button onclick={clear} disabled={msgs.length === 0} aria-label={t("message.clear")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700"><span data-icon="trash" class="inline-flex align-[-1px]">{@html iconSvg("trash", "h-3 w-3")}</span> {t("message.clear")}</button>
+        <button onclick={clear} disabled={msgs.length === 0} aria-label={t("message.clear")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700"><span data-icon="trash" class="inline-flex align-[-1px]">{@html iconSvg("trash", "h-3 w-3")}</span> {t("message.clear")}</button>
       </div>
     </div>
     <div class="flex-1 space-y-2 overflow-auto">

@@ -15,6 +15,20 @@ export interface CallRecord {
   name?: string;
   /** Wall-clock ms when the call was placed. */
   ts: number;
+  /**
+   * Which way the call went. Optional for **back-compat**: records written before
+   * directions existed have none, and the UI shows a neutral row for those rather
+   * than pretending they were outgoing.
+   */
+  direction?: CallDirection;
+}
+
+/** Call direction as shown in the call-history page. */
+export type CallDirection = "incoming" | "outgoing" | "missed";
+
+/** Whitelist a stored direction (anything else → undefined, never guessed). */
+export function normalizeDirection(raw: unknown): CallDirection | undefined {
+  return raw === "incoming" || raw === "outgoing" || raw === "missed" ? raw : undefined;
 }
 
 /** Shared-store key under which the call log is persisted. */
@@ -52,11 +66,14 @@ export function normalizeCallLog(raw: unknown): CallRecord[] {
     const number = typeof o.number === "string" ? o.number.trim() : "";
     if (number === "" || callDigits(number) === "") continue;
     const ts = typeof o.ts === "number" && Number.isFinite(o.ts) ? o.ts : 0;
-    out.push({
+    const rec: CallRecord = {
       number,
       name: typeof o.name === "string" && o.name.trim() !== "" ? o.name.trim() : undefined,
       ts,
-    });
+    };
+    const direction = normalizeDirection(o.direction);
+    if (direction) rec.direction = direction;
+    out.push(rec);
   }
   return [...out].sort((a, b) => b.ts - a.ts).slice(0, CALLLOG_CAP);
 }
@@ -67,6 +84,7 @@ export function recordCall(
   number: string,
   name?: string,
   now: number = Date.now(),
+  direction?: CallDirection,
 ): CallRecord[] {
   const n = number.trim();
   if (n === "" || callDigits(n) === "") return list;
@@ -77,6 +95,8 @@ export function recordCall(
     name: hint,
     ts: now,
   };
+  const dir = normalizeDirection(direction);
+  if (dir) entry.direction = dir;
   return [entry, ...list].slice(0, CALLLOG_CAP);
 }
 
@@ -120,4 +140,64 @@ export function frequentNumbers(list: CallRecord[], n: number): string[] {
     .sort((a, b) => b.count - a.count || b.last - a.last)
     .slice(0, n)
     .map((g) => g.display);
+}
+
+// ---- Call-history page helpers (pure; formatting is locale-neutral) -------------
+
+/** The full call history, newest first and capped (the history page's source). */
+export function callHistory(list: unknown): CallRecord[] {
+  return normalizeCallLog(list);
+}
+
+/** How many history rows are missed calls (for the page's summary line). */
+export function missedCalls(list: CallRecord[]): number {
+  return list.filter((r) => r.direction === "missed").length;
+}
+
+/** Which subset of the history a filter shows. */
+export type CallFilter = "all" | "incoming" | "outgoing" | "missed";
+
+/** The history rows a filter selects (`all` = every row), newest-first + capped
+ * through the SAME normalization as `callHistory`. The input is `unknown` (store
+ * data), so junk degrades to the empty log rather than throwing. */
+export function filterHistory(list: unknown, filter: CallFilter): CallRecord[] {
+  const rows = callHistory(list);
+  return filter === "all" ? rows : rows.filter((r) => r.direction === filter);
+}
+
+/** A cleared call log — a named seam so callers never have to spell the empty
+ * literal and tests can assert the intent. */
+export function clearCallHistory(): CallRecord[] {
+  return [];
+}
+
+/** Local calendar-day stamp (YYYY-MM-DD); empty for a non-positive timestamp. */
+export function callDateStamp(ts: number): string {
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/**
+ * Which day bucket a timestamp falls in, so the UI can localize it:
+ * `"today"` / `"yesterday"` / `"date"` (render `callDateStamp`) / `"unknown"`.
+ */
+export function callWhenLabel(
+  ts: number,
+  now: number = Date.now(),
+): "today" | "yesterday" | "date" | "unknown" {
+  const stamp = callDateStamp(ts);
+  if (stamp === "") return "unknown";
+  if (stamp === callDateStamp(now)) return "today";
+  if (stamp === callDateStamp(now - 86400000)) return "yesterday";
+  return "date";
+}
+
+/** Local wall-clock `HH:MM` for a call timestamp (`""` for an unknown time). */
+export function fmtCallClock(ts: number): string {
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
 }

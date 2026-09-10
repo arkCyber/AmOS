@@ -193,7 +193,7 @@ android-rag-bringup:
 android-app: 
 	cd crates/amos-tauri/frontend-ts && bun run build
 	cargo tauri android build --debug --features android --target aarch64
-	adb install -r -g crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk $(if $(DEVICE),-s $(DEVICE),)
+	adb $(if $(DEVICE),-s $(DEVICE),) install -r -g crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 
 # Cross-compile gate for the offline-RAG PDF data-extraction crate on Android.
 # The crate is pure Rust on lopdf (no C), so this only needs the rustup android

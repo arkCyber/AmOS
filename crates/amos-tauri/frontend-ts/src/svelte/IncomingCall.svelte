@@ -27,6 +27,9 @@
   // Tracks the incoming call we surfaced so we write one log entry per finished
   // call (answered / missed / declined) — never duplicate on repeat events.
   let surfacedId: string | null = null;
+  // Whether the surfaced call was actually answered, so the history row is
+  // "incoming" (talked) vs "missed" (rang out / declined) instead of guessing.
+  let answered = false;
   let contacts = $state<Contact[]>(
     normalizeContacts(readStoreValue<unknown>(CONTACTS_KEY, [])),
   );
@@ -36,24 +39,30 @@
       if (c.direction !== "Incoming") return; // outgoing = Phone screen's own UI
       if (c.state === "Ringing") {
         surfacedId = c.id;
+        answered = false;
         call = c;
         phase = "ringing";
         recording = "Off";
         muted = false;
       } else if (c.state === "Active") {
+        answered = true;
         call = c;
         phase = "talking";
         recording = c.recording as "Off" | "On" | "Failed";
       } else if (c.state === "Ended") {
         // Persist the finished incoming call into the shared log so the Phone
-        // screen's Recent/Frequent list reflects it too. The log is number-keyed,
-        // so calls with no (empty/hidden) caller id are intentionally not recorded.
+        // screen's history reflects it too. The log is number-keyed, so calls with
+        // no (empty/hidden) caller id are intentionally not recorded.
         if (surfacedId === c.id && c.peer) {
           const prev = normalizeCallLog(readStoreValue<unknown>(CALLLOG_KEY, []));
           const label = contactNameFor(contacts, c.peer) ?? c.peer;
-          writeStoreValue(CALLLOG_KEY, recordCall(prev, c.peer, label, Date.now()));
+          writeStoreValue(
+            CALLLOG_KEY,
+            recordCall(prev, c.peer, label, Date.now(), answered ? "incoming" : "missed"),
+          );
         }
         surfacedId = null;
+        answered = false;
         muted = false;
         call = call && call.id === c.id ? null : call;
       }

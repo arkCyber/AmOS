@@ -901,6 +901,21 @@ export type BlockReasonOut =
   | { kind: "rule"; id: string; pattern: string; label: string; channel: BlockRuleOut["channel"] }
   | { kind: "unknown" };
 
+/**
+ * Whether call blocking can actually take effect (rules alone are not enough —
+ * Android only rejects calls while AmOS holds the Call Screening role).
+ */
+export interface BlocklistStatusOut {
+  has_call_rules: boolean;
+  has_sms_rules: boolean;
+  /** The platform supports the role (Android 10+). */
+  role_supported: boolean;
+  /** AmOS holds the role right now → incoming calls really are rejected. */
+  role_held: boolean;
+  /** The native glue is bound, so "grant the role" can actually do something. */
+  role_requestable: boolean;
+}
+
 /** Read the blocklist. `null` when unavailable. */
 export async function blocklistSnapshot(): Promise<BlocklistOut | null> {
   return invoke<BlocklistOut>("blocklist_snapshot");
@@ -937,6 +952,19 @@ export async function blocklistCheck(
   channel: BlockRuleOut["channel"],
 ): Promise<BlockReasonOut | null> {
   return invoke<BlockReasonOut | null>("blocklist_check", { address, channel });
+}
+
+/** Rules + on-device enforcement status. `null` when the bridge is unavailable. */
+export async function blocklistStatus(): Promise<BlocklistStatusOut | null> {
+  return invoke<BlocklistStatusOut>("blocklist_status");
+}
+
+/**
+ * Ask the system for the Call Screening role (foreground). Resolves `true` when the
+ * dialog was posted or the role is already held; rejects when unsupported.
+ */
+export async function blocklistRequestRole(): Promise<boolean> {
+  return (await invoke<boolean>("blocklist_request_role")) === true;
 }
 
 export type SmsFolder = "inbox" | "sent" | "draft";

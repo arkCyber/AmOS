@@ -153,15 +153,71 @@ Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就�
 - 号码等价（真机发现并修复的缺陷）：网络把回环短信给成国内格式 `18616091470`，而规则是 `+8618616091470` —— 修前 `blocklist_check("18616091470")` 为 `null`，修后命中同一条规则（`same_number` 容忍国家码/前导 0）。
 - UI：电话 App 出现「拦截」标签，规则列表（`1069 · 前缀 · 仅短信 · bulk`）、未知号码开关、移除均可用；移除后列表为空（测试规则已清理）。
 
-### 12. 测试与门禁（本机全绿）
+#### 11.1 审计修复：来电拦截页"不正常"的根因（2026-09-10）
+
+真机反馈「拦截（电话）页面不正常」，逐层审计出四个缺陷并修复：
+
+1. **规则库被拆成两个目录（严重）。** `lib.rs::setup` 持久化到 `app_data_dir()`，而在 Android 上 Tauri 的该路径等于 `Context.getDataDir()`（`…/<pkg>`，见 `tauri-2.11.5/mobile/android/.../PathPlugin.kt` 的 `getDataDir → activity.dataDir`）；Kotlin `BlocklistGlue.bind` 却配置 `Context.filesDir`（`…/<pkg>/files`）。`BlocklistState::configure` 会**替换**路径并重新载入，于是两处互相覆盖；而 `MainActivity` 只在**授予 CAMERA** 时才调 `AmosGlue.onStart` → 未授相机时 UI 停在 `dataDir`、来电筛选服务用 `filesDir`，**UI 加的规则永远到不了来电拦截**。修复：`lib.rs` 在 Android 上把 `files` 追加到 `app_data_dir()`，与 glue 收敛到**同一个文件**，`configure` 因此幂等（早返回、不再清空内存表）。
+2. **来电筛选角色不可见、且只有后台申请路径。** UI 无法知道是否真持有 `ROLE_CALL_SCREENING`，而唯一申请来自应用上下文的 `startActivity`（受 Android 10+ 后台启动限制，可能静默失败）。修复：新增命令 `blocklist_status`（`has_call_rules/has_sms_rules/role_supported/role_held/role_requestable`，经 JNI 调 Kotlin `screeningRoleSupported/screeningRoleHeldBound`）与 `blocklist_request_role`（前台显式申请，`requestScreeningRoleBound`）；UI 增加状态横幅与「授予来电筛选权限」按钮。
+3. **诚实错误被丢弃。** `addBlockRule/loadBlocklist/toggleBlockUnknown` 只有 `.then()` 没有 `.catch()`，而 Tauri 对域拒绝是 **reject** → 非法号码**不报任何错**、快照失败显示空列表。修复：全部改为 `async/await + try/catch`，非法规则显示本地化原因，保存失败回滚开关，并加 `blockBusy` 防重复提交。
+4. **缺少一键入口。** 通话记录「最近」行新增「拦截」按钮：一键写入 `exact/both` 规则并切到拦截页（命令层早已就绪）。
+
+另外：`MainActivity.onStart` 现在**无条件** `BlocklistGlue.bind(applicationContext)`（不再受相机授权门控），保证路径一致与 JNI 角色可达；`MainActivity.Wiring.kt` 记录该接线以便 `tauri android init` 重生成后重新挂上。
+
+#### 11.2 「信息」页屏蔽此号码（2026-09-10）
+
+真机在线程页给出与通话记录对称的**一键入口**——但只对**真机后端**开放（离线/宿主态会话按名字而非号码组织，写入号码规则没有意义，诚实起见不显示该入口）：
+
+- 打开的真机线程标题栏右侧新增「屏蔽此号码」按钮（`aria-label="block-sender-<address>"`），点击写入 `exact/both` 规则到**同一共享规则库**（电话「拦截」标签、`sms_snapshot` 过滤、`CallScreeningService` 三处同源）。
+- 结果**显式可见**：成功 → 状态条「已屏蔽 <addr>：其短信不再显示，来电将被拒接」（`data-ok="true"`）；失败（`blocklist_add` 被域拒绝，`invoke()` 吞成 `null`）→ 红色 `role="alert"`「屏蔽失败，请重试」并 `bridgeDiag()` 留证。绝不静默假装已屏蔽。
+- 成功后线程在刷新时被 `sms_snapshot` 过滤消失（当它是最后一条线程时显示「本机暂无短信」），状态条**留在列表上方**解释原因，不会让用户以为数据丢失。
+
+### 11.3 真机（YY000286 / S5 / API 34）审计：两个真实缺陷（2026-09-10）
+
+用 WebView DevTools 协议直连真机页面（`adb forward tcp:9401 localabstract:webview_devtools_remote_<pid>` → CDP `Runtime.evaluate`）逐屏驱动 UI 后，发现并修复：
+
+1. **「拦截」标签把整个「紧急号码」页渲染在拦截面板之上（用户报的「拦截页面不正常」的真因）。** `PhoneApp.svelte` 的标签链 `{#if calling}{:else if keys}{:else if recent}{:else if frequent}{:else}` 以**裸 `{:else}`** 结尾，拦截面板另起一个独立的 `{#if tab === "block"}`，于是 `tab === "block"` 时**两个分支同时成立** —— 紧急呼叫 110/119/120/122/112 整页 + 「紧急号码」标题出现在黑名单列表上方。修复：末端改为 `{:else if tab === "emergency"}`，并把拦截面板并入同一链 `{:else if tab === "block"}`，结构上不可能再共渲染。真机复验：拦截页只剩黑名单面板（无「紧急号码」/「紧急呼叫 110」）；「紧急」标签仍正常。
+2. **「授予来电筛选权限」按钮谎报成功、系统对话框不出现。** `blocklist_request_role` 返回 `true`，但 `role_held` 仍为 `false`。两层原因：(a) 角色对话框用 **application context** 的 `startActivity` 启动，被 Android 10+ 后台启动规则吞掉；(b) 即使改从 Activity 启动，普通 `startActivity` 不建立 caller 身份，PermissionController 立刻记 `RequestRoleActivity: Package name cannot be null or empty: null` 并在 ~100 ms 内 self-finish。修复：`MainActivity.onStart` 通过新的 `BlocklistGlue.attachActivity(this)` 交出前台 Activity，`BlocklistGlue.requestScreeningRole(activity)` 改用 **`startActivityForResult`**（建立 caller 身份），并在 `screeningRoleIntent` 里补 `Intent.EXTRA_PACKAGE_NAME`（部分 ROM 读取该 extra）。真机复验：点按钮 → 出现系统「要将Amos设为您的默认来电显示和骚扰电话屏蔽应用吗？」→ 选 Amos + 设为默认应用 → `role_held` 变 `true`，页面横幅变为「来电拦截已生效（已获系统「来电筛选」权限）。」；随后 `cmd role remove-role-holder` 反向验证 `role_held` 回到 `false`（状态链路诚实）。
+
+其余真机确认（同一轮）：
+
+- **一键拉黑（信息页）**：真机线程页点「屏蔽此号码」→ 规则写入共享库（`blocklist_snapshot` 得 `+8618616091470/exact/both`）→ 该发件人被 `sms_snapshot` 过滤、**线程从收件箱消失**（7 → 6）→ 状态条「已屏蔽 +8618616091470：其短信不再显示，来电将被拒接」。
+- **拦截页增删/校验**：输入 `1069` 加入黑名单 → 规则即时出现且持久化；输入 `abc` → 诚实报「号码无效：至少 3 位数字（可带开头 +）」，不静默失败；未知号码开关可切「已开」。
+- **通话记录**：注入 4 条记录（去电/来电/未接/旧记录无方向）→ 方向图标（↗/↙/红↙/•）+「今天|昨天|YYYY-MM-DD HH:MM」全部正确；方向筛选收窄行数；两段式清空可取消、可确认，确认后持久化为空并回到空态。
+- **UI 打磨（真机量测）**：拦截页号码输入框由 **65×32 → 336×36**（原单行布局在 360px 宽屏上连占位符都放不下）；通话记录行内动作由 **32×32 → 40×40**；筛选 chip / 清空按钮 / 标签栏 / 信息页工具栏均加高（20–28 → 28–32）；无横向溢出。
+
+> **本机构建备注（非仓库代码）**：这台 macOS 上 `cargo tauri android build` 会在 Gradle 阶段楔死（wrapper 停在 `ProcessHandleImpl_waitForProcessExit`，daemon 收不到构建请求；`gen/android/buildSrc/.../BuildTask.kt` 里的 `cargo tauri android android-studio-script` 递归任务持续挂起）。`gen/` 是 git-ignored 的生成树，本地做了三处旁路：该 rust 任务改为 no-op（Tauri 自身已编译并 symlink `.so`）、`org.gradle.daemon=false`、`org.gradle.vfs.watch=false`；之后 `./gradlew :app:assembleUniversalDebug --no-daemon`（`JAVA_HOME` 指向 Android Studio JBR；本机默认 JDK 26 会让 AGP 报 `26.0.1` 配置错误）**8–11 秒**出包，`adb install -r -g` 安装。重新生成 `gen/` 会恢复上游行为。
+
+
 - `amos-blocklist`：**14 例**（规范化/同号等价/前缀保守性、渠道、未知号码、命中原因、去重、上限淘汰、JSON 往返、损坏载荷拒绝）。
-- `amos-tauri --lib blocklist::`：**6 例**（增删查、非法 kind/channel、重启持久化、损坏文件起源、短信线程过滤、仅来电规则不影响短信）。
+- `amos-tauri --lib blocklist::`：**9 例**（增删查、非法 kind/channel、重启持久化、损坏文件起源、短信线程过滤、仅来电规则不影响短信、`status_of` 渠道判定、宿主无来电筛选角色时的诚实状态、持久化路径单一来源）。
 - `amos-sms` **23 例**、`amos-tauri --lib sms::` **10 例**、`clippy -D warnings`（host + `--features android`）。
-- 前端：`test:svelte` **363 例**（新增「拦截」标签增删规则用例）+ `tsc`/`svelte-check` 0 error。
+- 前端：`test:svelte` **374 例**（含「拦截」标签增删规则、非法规则诚实报错、来电筛选角色横幅+授权、通话记录一键拉黑、**通话记录方向筛选/两段式清空**、**「信息」屏蔽此号码成功/被拒两态**）+ `tsc`/`svelte-check` 0 error；纯逻辑 `calllog.test.ts` 含**方向筛选与清空**共 **17 例**。
+
+#### 11.4 一致性补全：文件夹徽标 + 角色状态（2026-09-10）
+
+对上文的短信执法与来电执法做一致性审计，补两处用户可见的缺口：
+
+| 缺口 | 根因 | 修复 |
+|---|---|---|
+| 拉黑发件人后**列表少一条、标签徽标仍多一** | `sms_snapshot` 走 `filter_threads` 过滤被屏蔽线程，`sms_counts` 却直接返回平台 `counts()`，两者不同源 | `sms.rs` 新增纯函数 `filtered_counts(provider, rules)`：**存在短信规则**时按同一 `filter_threads` 从各文件夹快照派生计数（徽标 = 可见列表长度，**按构造相等**）；无规则时仍用平台 `counts()`（不引入额外读取）。纯函数可测：`sms::tests` +2 |
+| 授予来电筛选角色后**横幅不更新**（仍显示「未获权限」） | `blocklist_request_role` 只负责**弹出**系统对话框；作答发生在**另一个 Activity**，耗时远晚于命令返回，`loadBlockStatus()` 早已读回旧值 | `PhoneApp` 在 `document.visibilitychange` / `window.focus`（回到前台）与**每次切到「拦截」标签**时重新探测 `blocklist_status`，横幅立即翻转；外部 `cmd role remove-role-holder` 撤销也会如实回到「需授权」。DOM 回归用例 +1 |
+| 「信息」页屏蔽成功文案**过度承诺**（未持角色也说来电会被拒接） | `message.blockSenderDone` 固定说「来电将被拒接」 | 改为「其短信不再显示；AmOS 持有「来电筛选」权限时来电将被拒接」（中英同步） |
+| 仅开启**「拦截未知号码」开关**时，徽标又比列表多 | `Blocklist::check` 把**无法解析的地址**（字母数字发送者 ID，如 `TM-ALIPAY`）判为 `Unknown` 而非「放行」→ 列表被 `filter_threads` 隐藏；但 `sms_counts` 的守卫只看 `has_sms_rules()`（此时一条规则都没有）→ 退回平台计数 | `BlocklistState::filters_sms()` =「有短信规则 **或** 未知开关开启」作为唯一守卫，`sms_counts` 改用它；`sms.rs` 测试 +1（字母数字发送者 ID 在开关开启时不计入、逐文件夹等于可见列表长度；关掉开关后平台计数重新生效）、`blocklist.rs` 测试 +1（守卫由规则或开关任一武装，仅来电规则不启用短信过滤） |
+| **有来电规则但平台无法执法时，横幅完全不渲染** | `block-role-unavailable` 分支被 `needsCallRole` 打开，而 `needsCallRole` 要求 `role_supported` → 桌面端 / 无角色 Android 上「规则已记录但没人执行」看起来像「一切正常」（或什么都没发生） | 横幅改为三段式且**互斥穷尽**：`role_held` → 生效；`role_supported && role_requestable` → 需授权 + 前台授权按钮；**其余一律**渲染「不可用」说明（无授权按钮）。移除不可达的 `needsCallRole`，`phone.blockRoleUnsupported` 措辞覆盖三种成因（桌面端 / Android 10 以下 / 原生桥未就绪）。DOM 用例 +2（不可用态可见且无授权按钮；已持角色只显示生效） |
+| 被屏蔽后**打开中的线程仍被读取** | `refreshReal` 只判断「列表里还有没有别的线程」，活动线程消失且列表为空时仍按旧 id 调 `sms_messages`（真机上该读取会被 `sms_messages` 的屏蔽判定拒绝） | 改为在**新列表**里查找活动线程：消失则切到最新线程，或清空 `realActiveId`/`realMsgs`/`realErr`；屏蔽后不再读取不可见线程。`messages.svelte.test.ts` 增断言（屏蔽后 `sms_messages` 调用次数不增加） |
+
+其它清理：删除从未被引用的文案键 `phone.blockAction`（中英）。
+
+> 说明：`sms_counts` 的过滤只在**确实可能隐藏线程**时启用（有短信规则，或「拦截未知号码」开关开启），因此正常量级下不增加任何 ContentResolver 读取；这也是把「是否过滤」的判定放在桥层（读取进程级规则状态）而非 Kotlin 的原因——规则只有一份真相在 Rust。
+>
+> 守卫为什么不能只看规则：`Unknown` 是**地址解析失败**（服务号/字母发送者 ID）的分类，与「有没有规则」无关。只按规则守卫会留下一个必然复现的缝隙（开关开、规则空），因此守卫被提炼为 `filters_sms()` 这一处语义。
+
+**本节验证（本机）**：`cargo test -p amos-tauri --lib` **194 例**（`sms::` **13**、`blocklist::` **10**）；`clippy -D warnings`（host + `--features android`）、`fmt --check` 干净；`bun run check` **EXIT=0**、`test:svelte` **378 例**、`tsc`/`svelte-check` 0 error、i18n 奇偶保持。
 
 ### 已知边界 / 下一步
 - 系统短信库由默认短信应用拥有：AmOS 只能在**自己的视图与通知**层面屏蔽短信，无法删除系统行（除非 AmOS 成为默认短信应用）。
-- 来电拦截需用户授予系统「来电筛选」角色；未授权时仅记录规则、不拒接（UI 已如实说明）。
-- 未做「信息页一键屏蔽此号码」「通话记录一键拉黑」等快捷入口（规则已在 `blocklist_*` 命令层就绪，接 UI 即可）。
+- 来电拦截需用户授予系统「来电筛选」角色；未授权时仅记录规则、不拒接（UI 现在**明确显示**状态并提供前台授权按钮）。
+- 一键入口已做两处：**通话记录「最近」→「拦截」**（写入 `exact/both` 规则并切到拦截页）与**「信息」真机线程标题栏 →「屏蔽此号码」**（同一共享规则库；成功后该发件人被 `sms_snapshot` 过滤、线程消失，并以状态条说明原因）。
 
 

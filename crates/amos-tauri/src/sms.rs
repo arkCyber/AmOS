@@ -221,13 +221,50 @@ pub async fn sms_snapshot(
 }
 
 /// Distinct thread counts per folder (inbox / sent / draft).
+///
+/// When the blocklist can hide an SMS thread the badges are **derived from the
+/// same filtered snapshots the thread list uses**, so a folder can never claim a
+/// thread that `sms_snapshot` hides (blocking a sender — or merely switching on
+/// unknown-number blocking — would otherwise leave the inbox badge one too
+/// high). When nothing can be hidden the provider's cheap `counts()` is
+/// authoritative and no extra read happens.
 #[tauri::command]
 pub async fn sms_counts(state: State<'_, SmsBridge>) -> Result<SmsFolderCountsOut, String> {
     let provider = active_arc(&state);
-    blocking(move || provider.counts())
-        .await
-        .map(|c| SmsFolderCountsOut::from(&c))
-        .map_err(|e| e.to_string())
+    let rules = crate::blocklist::shared();
+    let filter = rules.filters_sms();
+    blocking(move || {
+        if filter {
+            filtered_counts(provider.as_ref(), &rules)
+        } else {
+            provider.counts()
+        }
+    })
+    .await
+    .map(|c| SmsFolderCountsOut::from(&c))
+    .map_err(|e| e.to_string())
+}
+
+/// Per-folder thread counts with blocked senders removed (see [`sms_counts`]).
+///
+/// Pure so it is unit-testable: it reuses [`crate::blocklist::filter_threads`]
+/// on each folder's snapshot, making the badges agree with the visible list by
+/// construction rather than by assumption.
+fn filtered_counts(
+    p: &dyn SmsProvider,
+    rules: &crate::blocklist::BlocklistState,
+) -> Result<amos_sms::SmsFolderCounts, amos_sms::SmsError> {
+    let mut out = amos_sms::SmsFolderCounts::default();
+    for folder in amos_sms::SmsFolder::ALL {
+        let (kept, _) = crate::blocklist::filter_threads(p.snapshot(folder)?, rules);
+        let n = u32::try_from(kept.len()).unwrap_or(u32::MAX);
+        match folder {
+            amos_sms::SmsFolder::Inbox => out.inbox = n,
+            amos_sms::SmsFolder::Sent => out.sent = n,
+            amos_sms::SmsFolder::Draft => out.draft = n,
+        }
+    }
+    Ok(out)
 }
 
 /// Read one thread's messages (chronological). An empty/absent `folder` means
@@ -495,6 +532,118 @@ mod tests {
                 draft: 1
             }
         );
+    }
+
+    #[test]
+    fn folder_counts_hide_blocked_senders_like_the_list_does() {
+        // Blocking a sender removes that thread from every folder's list; the
+        // badges must drop with it or the inbox tab would count a hidden thread.
+        let rules = crate::blocklist::BlocklistState::empty();
+        rules.add("13800138000", "exact", "sms", "", 1).unwrap();
+        let p = MockSms::seeded();
+        // Sanity: the unfiltered provider really does count both senders.
+        assert_eq!(p.counts().unwrap().inbox, 2);
+        let counts = filtered_counts(&p, &rules).unwrap();
+        // Thread "1" (13800138000) is gone from inbox+sent; thread "3" (10086)
+        // stays in sent+draft. The hidden thread is *not* counted anywhere.
+        assert_eq!(
+            counts,
+            amos_sms::SmsFolderCounts {
+                inbox: 1,
+                sent: 1,
+                draft: 1
+            }
+        );
+        // The badge count equals the filtered list length for every folder.
+        for folder in amos_sms::SmsFolder::ALL {
+            let visible = crate::blocklist::filter_threads(p.snapshot(folder).unwrap(), &rules).0;
+            assert_eq!(counts.of(folder) as usize, visible.len(), "{folder:?}");
+        }
+    }
+
+    #[test]
+    fn a_call_only_rule_does_not_shrink_the_sms_badges() {
+        // Only SMS rules feed the filter; a call rule must leave the counts as the
+        // provider reported them (the UI keys the role prompt off call rules).
+        let rules = crate::blocklist::BlocklistState::empty();
+        rules.add("10086", "exact", "call", "", 1).unwrap();
+        let p = MockSms::seeded();
+        let counts = filtered_counts(&p, &rules).unwrap();
+        assert_eq!(
+            counts,
+            amos_sms::SmsFolderCounts {
+                inbox: 2,
+                sent: 2,
+                draft: 1
+            }
+        );
+    }
+
+    /// A provider with one numeric sender and one **alphanumeric service id** —
+    /// the latter is what the unknown-number switch classifies as `Unknown`.
+    struct ServiceIdSms;
+
+    impl SmsProvider for ServiceIdSms {
+        fn name(&self) -> &'static str {
+            "service-id-test"
+        }
+        fn snapshot(&self, folder: amos_sms::SmsFolder) -> Result<Vec<SmsThread>, SmsError> {
+            Ok(match folder {
+                amos_sms::SmsFolder::Inbox => vec![
+                    SmsThread::new("1", "13800138000", "家人", "下班买菜", 2, 0),
+                    SmsThread::new("2", "TM-ALIPAY", "支付宝", "验证码 1234", 1, 0),
+                ],
+                amos_sms::SmsFolder::Sent => {
+                    vec![SmsThread::new("1", "13800138000", "家人", "好的", 3, 0)]
+                }
+                amos_sms::SmsFolder::Draft => Vec::new(),
+            })
+        }
+        fn messages(
+            &self,
+            _thread_id: &str,
+            _folder: Option<amos_sms::SmsFolder>,
+        ) -> Result<Vec<SmsMessage>, SmsError> {
+            Ok(Vec::new())
+        }
+        fn counts(&self) -> Result<amos_sms::SmsFolderCounts, SmsError> {
+            Ok(amos_sms::SmsFolderCounts {
+                inbox: 2,
+                sent: 1,
+                draft: 0,
+            })
+        }
+        fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
+            let _ = normalize_address(address)?;
+            validate_text(text)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_unknown_number_switch_hides_threads_from_the_badges_too() {
+        // `is_blocked` reports an unparseable sender id (an alphanumeric service
+        // id) as `Unknown`, so with the switch ON the list hides that thread even
+        // with **no rules at all**: the badges must be derived the same way, or
+        // the inbox tab counts a thread that is not in the list.
+        let rules = crate::blocklist::BlocklistState::empty();
+        let p = ServiceIdSms;
+        // Sanity: the provider itself counts both inbox threads...
+        assert_eq!(p.counts().unwrap().inbox, 2);
+        // ...and no *rule* is involved — only the switch.
+        assert!(!rules.has_sms_rules());
+        rules.set_block_unknown(true);
+        assert!(rules.filters_sms());
+        let counts = filtered_counts(&p, &rules).unwrap();
+        assert_eq!(counts.inbox, 1, "the service id must not be counted");
+        for folder in amos_sms::SmsFolder::ALL {
+            let visible = crate::blocklist::filter_threads(p.snapshot(folder).unwrap(), &rules).0;
+            assert_eq!(counts.of(folder) as usize, visible.len(), "{folder:?}");
+        }
+        // Switch off again → nothing can be hidden, so the platform count wins.
+        rules.set_block_unknown(false);
+        assert!(!rules.filters_sms());
+        assert_eq!(filtered_counts(&p, &rules).unwrap().inbox, 2);
     }
 
     #[test]

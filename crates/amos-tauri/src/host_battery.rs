@@ -33,6 +33,11 @@ impl HostBattery {
 }
 
 /// Clamp a level into 0..100 and keep only finite values.
+///
+/// Used by the macOS/Linux readers; also compiled under `test` so the pure unit
+/// test can run on any host. Without the gate the Android/Windows builds (where
+/// neither reader is compiled) would warn `dead_code`.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn clamp_level(level: f64) -> Option<f64> {
     if !level.is_finite() {
         return None;

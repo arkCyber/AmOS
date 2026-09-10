@@ -250,6 +250,8 @@ pub fn run() {
             blocklist::blocklist_clear,
             blocklist::blocklist_set_unknown,
             blocklist::blocklist_check,
+            blocklist::blocklist_status,
+            blocklist::blocklist_request_role,
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
             taskmgr::taskmgr_job_action,
@@ -333,6 +335,15 @@ pub fn run() {
             // (the Android CallScreeningService can also configure this itself
             // when the system cold-starts the process for an incoming call).
             if let Ok(dir) = app.path().app_data_dir() {
+                // On Android, Tauri's `app_data_dir()` resolves to
+                // `Context.getDataDir()` (…/<pkg>), while the Kotlin glue persists
+                // under `Context.getFilesDir()` (…/<pkg>/files). Configure the SAME
+                // directory the glue uses: two paths would silently keep two
+                // different rule stores, so rules added in the UI would never reach
+                // the call-screening service (and `configure` would keep wiping the
+                // in-memory list on every switch).
+                #[cfg(feature = "android")]
+                let dir = dir.join("files");
                 blocklist::shared().configure(blocklist::file_in(&dir));
             }
             // Real in-call bridge (default-dialer / InCallService): give the Rust side

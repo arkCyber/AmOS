@@ -12,7 +12,10 @@ import { writeStoreValue } from "../src/lib/amosStore";
 import { CONV_KEY, seedConversations } from "../src/lib/messages";
 import { DRAFT_KEY } from "../src/lib/smsDrafts";
 import { beforeEach } from "vitest";
+import { afterEach } from "vitest";
 import { tick } from "svelte";
+import { messagesChannel } from "../src/svelte/appLinks";
+import { resetPropsChannels } from "../src/svelte/propsBus";
 
 // Each test starts from a fresh, single seeded 小安 conversation (the Messages
 // screen persists to the shared store, which is not reset between tests) and an
@@ -20,6 +23,14 @@ import { tick } from "svelte";
 beforeEach(() => {
   writeStoreValue(CONV_KEY, seedConversations(Date.now()));
   writeStoreValue(DRAFT_KEY, []);
+  resetPropsChannels();
+});
+
+// Never let a fake device bridge leak into the next test (the screen resolves its
+// backend on mount, so a leftover bridge would flip offline tests into device mode).
+afterEach(() => {
+  delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  resetPropsChannels();
 });
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
@@ -463,5 +474,114 @@ describe("MessagesApp.svelte", () => {
     expect(sent?.text).toBe("想问下流量包");
     expect(txt(host)).not.toContain("想问下流量包"); // draft consumed
     expect(txt(host)).toContain("暂无草稿");
+  });
+
+  test("a compose link from the call history opens a local thread for that number", async () => {
+    const host = render(MessagesApp);
+    await tick();
+    // The phone's "回短信" sets the channel; offline this opens a local thread.
+    messagesChannel().set({ composeTo: "18616091470", nonce: 1 });
+    await tick();
+    expect(txt(host)).toContain("18616091470");
+    // The link is consumed, so re-opening Messages must not re-fire it.
+    expect(messagesChannel().get()?.composeTo).toBe("");
+  });
+
+  test("blocks the open device thread's sender (exact/both) and explains the outcome", async () => {
+    const seen: Record<string, unknown>[] = [];
+    let blocked = false;
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        seen.push({ cmd, ...(args ?? {}) });
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_counts") return { inbox: blocked ? 0 : 1, sent: 0, draft: 0 };
+        if (cmd === "sms_snapshot") {
+          // Once blocked the provider filters the sender out — like the SMS filter does.
+          if (blocked) return [];
+          return [
+            {
+              id: "1",
+              address: "18616091470",
+              display_name: "推销",
+              last_text: "优惠活动",
+              last_ts_ms: 1_700_000_000_000,
+              unread: 0,
+            },
+          ];
+        }
+        if (cmd === "sms_messages") {
+          return [
+            { thread_id: "1", id: "m1", from_me: false, text: "优惠活动", ts_ms: 1_700_000_000_000, read: true },
+          ];
+        }
+        if (cmd === "blocklist_add") {
+          blocked = true;
+          return {
+            id: "r1",
+            pattern: String(args?.pattern),
+            kind: args?.kind,
+            channel: args?.channel,
+            label: "",
+            created_ms: 1,
+          };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    const btn = host.container.querySelector(
+      'button[aria-label="block-sender-18616091470"]',
+    ) as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    const readsBefore = seen.filter((c) => c.cmd === "sms_messages").length;
+    await fireEvent.click(btn);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    const add = seen.find((c) => c.cmd === "blocklist_add");
+    expect(add?.pattern).toBe("18616091470");
+    expect(add?.kind).toBe("exact");
+    expect(add?.channel).toBe("both");
+    const note = host.container.querySelector('[data-testid="block-sender-msg"]')!;
+    expect(note.getAttribute("data-ok")).toBe("true");
+    expect(note.textContent).toContain("已屏蔽 18616091470");
+    // The blocked sender is filtered out of the inbox, so the thread is gone.
+    expect(host.container.querySelector('[data-testid="sms-empty"]')).toBeTruthy();
+    // …and the vanished thread is not read again (the block side refuses it
+    // anyway): the pane is cleared rather than refilled from a hidden thread.
+    expect(seen.filter((c) => c.cmd === "sms_messages").length).toBe(readsBefore);
+  });
+
+  test("a rejected block is an explicit error, never a silent no-op", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_counts") return { inbox: 1, sent: 0, draft: 0 };
+        if (cmd === "sms_snapshot")
+          return [
+            { id: "1", address: "10086", display_name: "", last_text: "hi", last_ts_ms: 1, unread: 0 },
+          ];
+        if (cmd === "sms_messages") return [];
+        if (cmd === "blocklist_add") throw new Error("invalid number");
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="block-sender-10086"]') as HTMLButtonElement,
+    );
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    const note = host.container.querySelector('[data-testid="block-sender-msg"]')!;
+    expect(note.getAttribute("data-ok")).toBe("false");
+    expect(note.getAttribute("role")).toBe("alert");
+    expect(note.textContent).toContain("屏蔽失败");
   });
 });

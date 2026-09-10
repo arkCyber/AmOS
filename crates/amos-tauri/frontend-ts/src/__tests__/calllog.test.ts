@@ -2,13 +2,22 @@ import { describe, expect, test } from "bun:test";
 import {
   CALLLOG_CAP,
   CALLLOG_KEY,
+  callDateStamp,
   callDigits,
+  callHistory,
+  callWhenLabel,
+  clearCallHistory,
+  filterHistory,
+  fmtCallClock,
   frequentNumbers,
   logNameFor,
+  missedCalls,
   normalizeCallLog,
+  normalizeDirection,
   recentNumbers,
   recordCall,
   sameCallNumber,
+  type CallFilter,
   type CallRecord,
 } from "../lib/calllog";
 
@@ -118,4 +127,112 @@ describe("calllog", () => {
     expect(logNameFor(list, "999")).toBeUndefined();
     expect(logNameFor(list, "")).toBeUndefined();
   });
+
+
+describe("call history: direction + time labels", () => {
+  test("normalizeDirection whitelists; junk never becomes a direction", () => {
+    expect(normalizeDirection("incoming")).toBe("incoming");
+    expect(normalizeDirection("outgoing")).toBe("outgoing");
+    expect(normalizeDirection("missed")).toBe("missed");
+    expect(normalizeDirection("Incoming")).toBeUndefined();
+    expect(normalizeDirection("received")).toBeUndefined();
+    expect(normalizeDirection(undefined)).toBeUndefined();
+    expect(normalizeDirection(1)).toBeUndefined();
+  });
+
+  test("recordCall stores a direction; junk directions are dropped", () => {
+    const out = recordCall([], "13800000001", "Alice", 5, "incoming");
+    expect(out[0]!.direction).toBe("incoming");
+    // An unknown direction is not silently coerced to something else.
+    const junk = recordCall([], "13800000001", undefined, 6, "bogus" as never);
+    expect(junk[0]!.direction).toBeUndefined();
+  });
+
+  test("legacy records without a direction stay direction-less (never guessed)", () => {
+    const out = normalizeCallLog([{ number: "111", ts: 1 }]);
+    expect(out[0]!.direction).toBeUndefined();
+    expect("direction" in out[0]!).toBe(false);
+    // …while a stored valid one survives a normalize round-trip.
+    const kept = normalizeCallLog([{ number: "222", ts: 2, direction: "missed" }]);
+    expect(kept[0]!.direction).toBe("missed");
+  });
+
+  test("callWhenLabel buckets today / yesterday / older / unknown", () => {
+    const now = new Date(2026, 8, 10, 12, 0, 0).getTime(); // local Sept 10 2026
+    expect(callWhenLabel(now, now)).toBe("today");
+    expect(callWhenLabel(now - 3600_000, now)).toBe("today");
+    expect(callWhenLabel(now - 86400000, now)).toBe("yesterday");
+    expect(callWhenLabel(new Date(2026, 7, 1, 9, 0).getTime(), now)).toBe("date");
+    expect(callWhenLabel(0, now)).toBe("unknown");
+    expect(callWhenLabel(Number.NaN, now)).toBe("unknown");
+    // A calendar-day boundary is not a 24h window: 23:59 vs 00:01 next day differ.
+    const late = new Date(2026, 8, 10, 23, 59, 0).getTime();
+    const nextMorning = new Date(2026, 8, 11, 0, 1, 0).getTime();
+    expect(callWhenLabel(late, nextMorning)).toBe("yesterday");
+  });
+
+  test("callDateStamp / fmtCallClock are padded and honest about unknown times", () => {
+    const ts = new Date(2026, 8, 10, 9, 5).getTime();
+    expect(callDateStamp(ts)).toBe("2026-09-10");
+    expect(fmtCallClock(ts)).toBe("09:05");
+    expect(callDateStamp(0)).toBe("");
+    expect(fmtCallClock(0)).toBe("");
+    expect(fmtCallClock(Number.NaN)).toBe("");
+  });
+
+  test("callHistory is newest-first + capped; missedCalls counts missed rows", () => {
+    const list = normalizeCallLog([
+      { number: "111", ts: 1, direction: "outgoing" },
+      { number: "222", ts: 3, direction: "missed" },
+      { number: "333", ts: 2, direction: "incoming" },
+    ]);
+    expect(callHistory(list).map((r) => r.number)).toEqual(["222", "333", "111"]);
+    expect(callHistory("nope")).toEqual([]);
+    expect(missedCalls(list)).toBe(1);
+    expect(missedCalls([])).toBe(0);
+    // cap still applies through callHistory
+    const many = Array.from({ length: CALLLOG_CAP + 5 }, (_, i) => ({ number: `n${i}`, ts: i }));
+    expect(callHistory(many)).toHaveLength(CALLLOG_CAP);
+  });
+
+  test("filterHistory selects one direction; 'all' is the whole (normalized) log", () => {
+    const raw = [
+      { number: "111", ts: 1, direction: "outgoing" },
+      { number: "222", ts: 3, direction: "missed" },
+      { number: "333", ts: 2, direction: "incoming" },
+      { number: "444", ts: 4, direction: "missed" },
+      { number: "555", ts: 5 }, // legacy row: no direction, never guessed into a bucket
+    ];
+    const all: CallFilter[] = ["all", "incoming", "outgoing", "missed"];
+    expect(filterHistory(raw, "all").length).toBe(5);
+    expect(filterHistory(raw, "missed").map((r) => r.number)).toEqual(["444", "222"]);
+    expect(filterHistory(raw, "incoming").map((r) => r.number)).toEqual(["333"]);
+    expect(filterHistory(raw, "outgoing").map((r) => r.number)).toEqual(["111"]);
+    // A direction-less legacy row appears under "all" only — it is never counted
+    // as any specific direction.
+    for (const f of all) {
+      const rows = filterHistory(raw, f);
+      const has555 = rows.some((r) => r.number === "555");
+      expect(has555).toBe(f === "all");
+    }
+    // Junk input degrades to the empty log rather than throwing.
+    expect(filterHistory("nope", "all")).toEqual([]);
+    expect(filterHistory([], "missed")).toEqual([]);
+    // Capping/normalization still applies through the filter.
+    const many = Array.from({ length: CALLLOG_CAP + 5 }, (_, i) => ({
+      number: `n${i}`,
+      ts: i,
+      direction: "missed" as const,
+    }));
+    expect(filterHistory(many, "missed")).toHaveLength(CALLLOG_CAP);
+  });
+
+  test("clearCallHistory is the empty (valid, normalized) log", () => {
+    const cleared = clearCallHistory();
+    expect(cleared).toEqual([]);
+    expect(callHistory(cleared)).toEqual([]);
+    expect(missedCalls(cleared)).toBe(0);
+    expect(filterHistory(cleared, "missed")).toEqual([]);
+  });
+});
 

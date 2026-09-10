@@ -147,6 +147,25 @@ impl BlocklistState {
         self.read().has_rules_for(Channel::Call)
     }
 
+    /// `true` when at least one rule covers SMS.
+    pub fn has_sms_rules(&self) -> bool {
+        self.read().has_rules_for(Channel::Sms)
+    }
+
+    /// `true` when the SMS read path can hide a thread *at all*: either a rule
+    /// covers SMS, **or** the unknown-number switch is on.
+    ///
+    /// The switch matters because [`Blocklist::check`] treats an unparseable
+    /// address as `BlockReason::Unknown` rather than "allowed" — an alphanumeric
+    /// service id like `TM-ALIPAY` is hidden from the thread list even with zero
+    /// rules. Callers that derive filtered data (e.g. the folder badges in
+    /// `sms_counts`) must gate on this, not on [`Self::has_sms_rules`], or the
+    /// badge would count a thread the list hides.
+    pub fn filters_sms(&self) -> bool {
+        let list = self.read();
+        list.has_rules_for(Channel::Sms) || list.block_unknown()
+    }
+
     /// Write the rules atomically (temp file + rename). Best-effort: failures are
     /// logged, never fatal (a full disk must not break call screening).
     pub fn persist(&self) {
@@ -225,6 +244,23 @@ pub struct BlocklistOut {
     pub rules: Vec<RuleOut>,
 }
 
+/// On-device enforcement status, so the UI can be honest about whether call
+/// blocking is *actually* live (rules alone are not enough — the OS role is).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BlocklistStatusOut {
+    /// At least one rule covers calls.
+    pub has_call_rules: bool,
+    /// At least one rule covers SMS.
+    pub has_sms_rules: bool,
+    /// The platform supports the Call Screening role (Android 10 / API 29+).
+    pub role_supported: bool,
+    /// AmOS currently holds `ROLE_CALL_SCREENING`, i.e. rejection is live.
+    pub role_held: bool,
+    /// The native glue is attached, so a role request can actually be delivered
+    /// (host/desktop or a not-yet-bound glue cannot).
+    pub role_requestable: bool,
+}
+
 // ---- Tauri commands ------------------------------------------------------------
 
 /// Read the whole blocklist (rules newest first + the unknown-number switch).
@@ -283,6 +319,66 @@ pub fn blocklist_check(
     Ok(state.check(&address, channel))
 }
 
+/// Whether call blocking can actually take effect right now (rules + OS role).
+///
+/// Deliberately I/O-free beyond a cheap JNI boolean call: the UI polls it after
+/// every rule change and on mount, so it must never block the WebView.
+#[tauri::command]
+pub fn blocklist_status(state: tauri::State<'_, Arc<BlocklistState>>) -> BlocklistStatusOut {
+    status_of(&state)
+}
+
+/// Pure status assembly (unit-testable without a Tauri app handle).
+pub fn status_of(state: &BlocklistState) -> BlocklistStatusOut {
+    let (role_supported, role_held, role_requestable) = role_probe();
+    BlocklistStatusOut {
+        has_call_rules: state.has_call_rules(),
+        has_sms_rules: state.has_sms_rules(),
+        role_supported,
+        role_held,
+        role_requestable,
+    }
+}
+
+/// Ask the system for the Call Screening role (foreground, user-initiated).
+///
+/// Returns `true` when the system dialog was posted **or** the role is already
+/// held. The startup path also requests it, but a background app-context
+/// `startActivity` is subject to Android 10+ background-start limits, so an
+/// explicit button (this command, running while AmOS is foreground) is the
+/// reliable way to grant it.
+#[tauri::command]
+pub fn blocklist_request_role() -> Result<bool, String> {
+    request_screening_role()
+}
+
+/// Host default: there is no Android Call Screening role (and no glue to reach).
+///
+/// Reported honestly as "unsupported" rather than pretending the feature exists,
+/// so the desktop UI can say so instead of showing a dead button.
+#[cfg(not(feature = "android"))]
+fn role_probe() -> (bool, bool, bool) {
+    (false, false, false)
+}
+
+/// Host default: refuse rather than silently do nothing.
+#[cfg(not(feature = "android"))]
+fn request_screening_role() -> Result<bool, String> {
+    Err("call screening role is only available on Android".to_string())
+}
+
+/// Device: ask the Kotlin `BlocklistGlue` (see `mod device`).
+#[cfg(feature = "android")]
+fn role_probe() -> (bool, bool, bool) {
+    device::role_probe()
+}
+
+/// Device: post the system role dialog (see `mod device`).
+#[cfg(feature = "android")]
+fn request_screening_role() -> Result<bool, String> {
+    device::request_screening_role()
+}
+
 /// Milliseconds since the Unix epoch (rules are ordered by this).
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -321,6 +417,57 @@ mod device {
     use super::*;
     use jni::objects::JString;
     use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
+    use jni::JavaVM;
+
+    /// The process `JavaVM`, captured on the first upcall so the `blocklist_status`
+    /// / `blocklist_request_role` commands can attach and call the Kotlin statics
+    /// (mirrors `incall`). `configure` runs at app start (unconditionally, from the
+    /// Activity) and again from the screening service, so it is captured early.
+    static VM: OnceLock<JavaVM> = OnceLock::new();
+
+    /// Call a `public static` boolean method on the Kotlin `BlocklistGlue` object.
+    ///
+    /// Returns `Err` when the glue was never bound (no VM captured) — the caller
+    /// reports that as "not requestable" instead of a fake `false`.
+    fn call_static_bool(method: &str) -> Result<bool, String> {
+        let vm = VM
+            .get()
+            .ok_or_else(|| "blocklist JVM not captured yet".to_string())?;
+        let mut env = vm
+            .attach_current_thread()
+            .map_err(|e| format!("blocklist attach failed: {e}"))?;
+        let class = env
+            .find_class("com/amos/ai/glue/BlocklistGlue")
+            .map_err(|e| e.to_string())?;
+        let value = env
+            .call_static_method(&class, method, "()Z", &[])
+            .map_err(|e| e.to_string())?;
+        value.z().map_err(|e| e.to_string())
+    }
+
+    /// `BlocklistGlue.screeningRoleSupported()` — platform supports the role.
+    fn role_supported() -> Result<bool, String> {
+        call_static_bool("screeningRoleSupported")
+    }
+
+    /// `BlocklistGlue.screeningRoleHeldBound()` — AmOS holds the role now.
+    fn role_held() -> Result<bool, String> {
+        call_static_bool("screeningRoleHeldBound")
+    }
+
+    /// `(role_supported, role_held, requestable)`; `requestable` is false when the
+    /// glue is not bound, so the UI can tell "not granted yet" from "cannot ask".
+    pub(super) fn role_probe() -> (bool, bool, bool) {
+        match role_supported() {
+            Ok(supported) => (supported, role_held().unwrap_or(false), true),
+            Err(_) => (false, false, false),
+        }
+    }
+
+    /// `BlocklistGlue.requestScreeningRoleBound()` — post the system role dialog.
+    pub(super) fn request_screening_role() -> Result<bool, String> {
+        call_static_bool("requestScreeningRoleBound")
+    }
 
     /// `BlocklistGlue.configure(filesDir)` — remember where rules are persisted.
     ///
@@ -339,6 +486,10 @@ mod device {
         let Ok(mut env) = (unsafe { jni::JNIEnv::from_raw(env) }) else {
             return;
         };
+        // Remember the VM so the status/role commands can call back into Kotlin.
+        if let Ok(vm) = env.get_java_vm() {
+            let _ = VM.set(vm);
+        }
         // SAFETY: `dir` is a live local ref for the duration of this call.
         let jdir = unsafe { JString::from_raw(dir) };
         let Ok(path) = env.get_string(&jdir) else {
@@ -488,5 +639,67 @@ mod tests {
         let (kept, hidden) = filter_threads(threads, &s);
         assert_eq!((kept.len(), hidden), (1, 0));
         assert!(s.blocks_call("10086"));
+    }
+
+    #[test]
+    fn status_reports_the_channels_the_rules_cover() {
+        let s = BlocklistState::empty();
+        let empty = status_of(&s);
+        assert!(!empty.has_call_rules);
+        assert!(!empty.has_sms_rules);
+        // An SMS-only rule must not claim call coverage (the UI keys the
+        // "grant the role" prompt off `has_call_rules`).
+        s.add("1069", "prefix", "sms", "", 1).unwrap();
+        let sms = status_of(&s);
+        assert!(sms.has_sms_rules);
+        assert!(!sms.has_call_rules);
+        s.add("10086", "exact", "call", "", 2).unwrap();
+        let both = status_of(&s);
+        assert!(both.has_call_rules && both.has_sms_rules);
+    }
+
+    #[test]
+    fn sms_filtering_is_armed_by_a_rule_or_the_unknown_switch() {
+        // The badge guard must be "can this hide a thread?", not "are there SMS
+        // rules?" — an unparseable sender id is `Unknown` (hidden), not allowed.
+        let s = BlocklistState::empty();
+        assert!(!s.filters_sms()); // nothing can hide a thread
+        s.set_block_unknown(true);
+        assert!(!s.has_sms_rules()); // still no rule…
+        assert!(s.filters_sms()); // …yet the switch alone hides unparsable senders
+        s.set_block_unknown(false);
+        s.add("1069", "prefix", "sms", "", 1).unwrap();
+        assert!(s.filters_sms());
+        let calls = BlocklistState::empty();
+        calls.add("10086", "exact", "call", "", 1).unwrap();
+        assert!(
+            !calls.filters_sms(),
+            "a call-only rule must not arm SMS filtering"
+        );
+    }
+
+    /// On the host there is no Android Call Screening role; the status must say
+    /// so honestly (rather than reporting `held: false` as if a grant could help),
+    /// and requesting must be an explicit error, never a silent no-op.
+    #[cfg(not(feature = "android"))]
+    #[test]
+    fn host_status_is_honest_about_the_missing_call_screening_role() {
+        let s = BlocklistState::empty();
+        let st = status_of(&s);
+        assert!(!st.role_supported);
+        assert!(!st.role_held);
+        assert!(!st.role_requestable);
+        assert!(request_screening_role().is_err());
+    }
+
+    #[test]
+    fn the_persistence_file_is_the_one_path_we_always_configure() {
+        // Guards the dataDir/filesDir split: `file_in` is the single place both
+        // the Rust setup and the Kotlin `configure` upcall resolve the store.
+        let p = file_in(Path::new("/data/user/0/com.amos.ai/files"));
+        assert_eq!(
+            p,
+            Path::new("/data/user/0/com.amos.ai/files/blocklist.json")
+        );
     }
 }

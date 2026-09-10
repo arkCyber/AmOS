@@ -11,13 +11,15 @@
     onTelephonyEvent, telephonyDial, telephonyEnd, telephonySimulateIncoming,
     telephonyStartRecording, telephonyStopRecording,
     blocklistAdd, blocklistRemove, blocklistSetUnknown, blocklistSnapshot,
-    bridged,
+    blocklistStatus, blocklistRequestRole,
+    bridged, bridgeDiag,
   } from "../lib/backend";
-  import type { BlockRuleOut } from "../lib/backend";
+  import type { BlockRuleOut, BlocklistStatusOut } from "../lib/backend";
   import { CONTACTS_KEY, contactNameFor, normalizeContacts } from "../lib/contacts";
   import type { Contact } from "../lib/contacts";
-  import { CALLLOG_KEY, frequentNumbers, normalizeCallLog, recentNumbers, recordCall } from "../lib/calllog";
-  import type { CallRecord } from "../lib/calllog";
+  import { CALLLOG_KEY, callDateStamp, callHistory, callWhenLabel, clearCallHistory, filterHistory, fmtCallClock, frequentNumbers, missedCalls, normalizeCallLog, recordCall } from "../lib/calllog";
+  import type { CallFilter, CallRecord } from "../lib/calllog";
+  import { composeSmsTo } from "./appLinks";
   import { NOTIF_KEY, addNotif } from "../lib/settings";
   import type { Notif } from "../lib/settings";
   import { zh } from "../i18n/locales/zh";
@@ -25,6 +27,7 @@
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
+  import { onMount } from "svelte";
 
   type PhoneTab = "keys" | "recent" | "frequent" | "emergency" | "block";
   const SUB: Record<string, string> = {
@@ -57,46 +60,141 @@
 
   // ---- Spam blocking (calls + SMS) -------------------------------------------
   // Rules live in Rust (shared with the SMS filter and the Android call-screening
-  // service), so this screen is a thin, honest view over that one source.
+  // service), so this screen is a thin, honest view over that one source. The
+  // shared `invoke()` helper does NOT throw: it swallows a command rejection and
+  // returns `null`, leaving the reason in `bridgeDiag()`. So every call here must
+  // check `null` / `bridgeDiag()` — otherwise a rejected rule silently does nothing.
   let blockRules = $state<BlockRuleOut[]>([]);
   let blockUnknown = $state(false);
+  let blockStatus = $state<BlocklistStatusOut | null>(null);
   let blockNum = $state("");
   let blockKind = $state<BlockRuleOut["kind"]>("exact");
   let blockChannel = $state<BlockRuleOut["channel"]>("both");
   let blockErr = $state("");
-  const loadBlocklist = () => {
-    void blocklistSnapshot().then((b) => {
-      if (!b) return;
-      blockRules = b.rules;
-      blockUnknown = b.block_unknown;
-    });
+  let blockBusy = $state(false);
+
+  const loadBlocklist = async () => {
+    const b = await blocklistSnapshot();
+    if (!b) {
+      // `invoke` returns null when the command failed (reason in `bridgeDiag()`);
+      // never shown as a silent empty list.
+      if (bridged()) blockErr = t("phone.blockLoadFailed");
+      return;
+    }
+    blockRules = b.rules;
+    blockUnknown = b.block_unknown;
+  };
+  // Rules alone do not block calls — the OS Call Screening role does. Probe it so
+  // the UI can say whether rejection is actually live.
+  const loadBlockStatus = async () => {
+    // `null` = host/desktop (no Call Screening role exists) or a failed probe; the
+    // honest default is "no status", so the banner simply stays hidden.
+    blockStatus = await blocklistStatus();
+  };
+  const refreshBlock = async () => {
+    await loadBlocklist();
+    await loadBlockStatus();
   };
   $effect(() => {
     if (!bridged()) return;
-    loadBlocklist();
+    void refreshBlock();
   });
-  const addBlockRule = () => {
-    const pattern = blockNum.trim();
-    if (!pattern) return;
+  // The Call Screening role is granted in a *separate* system Activity, so the
+  // user's answer lands long after `blocklist_request_role` returned (that command
+  // only posts the dialog). Re-probe the status on resume/focus — and every time
+  // the 拦截 tab is opened — so the banner flips to "active" (or back to "needs
+  // granting" after an external revoke) without restarting the app.
+  $effect(() => {
+    if (tab !== "block" || !bridged()) return;
+    void loadBlockStatus();
+  });
+  onMount(() => {
+    const recheck = () => {
+      if (document.visibilityState === "visible" && bridged()) void loadBlockStatus();
+    };
+    document.addEventListener("visibilitychange", recheck);
+    window.addEventListener("focus", recheck);
+    return () => {
+      document.removeEventListener("visibilitychange", recheck);
+      window.removeEventListener("focus", recheck);
+    };
+  });
+
+  const addBlockRule = async (
+    raw: string = blockNum,
+    kind: BlockRuleOut["kind"] = blockKind,
+    channel: BlockRuleOut["channel"] = blockChannel,
+  ) => {
+    const pattern = raw.trim();
+    if (!pattern) return false;
     blockErr = "";
-    void blocklistAdd(pattern, blockKind, blockChannel).then((r) => {
-      if (!r) {
-        // The domain rejects junk patterns (too short, letters, bad prefix).
+    blockBusy = true;
+    try {
+      // The domain rejects junk (too short / letters / short prefix); the injected
+      // error surfaces as a `null` result (see `invoke`), not a thrown promise.
+      const rule = await blocklistAdd(pattern, kind, channel);
+      if (!rule) {
+        console.warn("[blocklist] add rejected", bridgeDiag());
         blockErr = t("phone.blockInvalid");
-        return;
+        return false;
       }
       blockNum = "";
-      loadBlocklist();
-    });
+      await refreshBlock();
+      return true;
+    } finally {
+      blockBusy = false;
+    }
   };
-  const removeBlockRule = (id: string) => {
-    void blocklistRemove(id).then(() => loadBlocklist());
+  const removeBlockRule = async (id: string) => {
+    blockErr = "";
+    const removed = await blocklistRemove(id);
+    if (!bridgeDiag().ok) {
+      blockErr = t("phone.blockRemoveFailed");
+      console.warn("[blocklist] remove failed", bridgeDiag());
+    } else if (!removed) {
+      // Not an error: the rule was already gone (e.g. removed elsewhere).
+      console.warn("[blocklist] remove: rule not found", id);
+    }
+    await refreshBlock();
   };
-  const toggleBlockUnknown = () => {
+  const toggleBlockUnknown = async () => {
     const next = !blockUnknown;
-    blockUnknown = next;
-    void blocklistSetUnknown(next);
+    blockUnknown = next; // optimistic, rolled back on failure
+    blockErr = "";
+    await blocklistSetUnknown(next);
+    if (!bridgeDiag().ok) {
+      blockUnknown = !next;
+      blockErr = t("phone.blockSaveFailed");
+      console.warn("[blocklist] set_unknown failed", bridgeDiag());
+    }
   };
+  const requestBlockRole = async () => {
+    blockErr = "";
+    blockBusy = true;
+    try {
+      const ok = await blocklistRequestRole();
+      if (!ok && bridged()) {
+        blockErr = t("phone.blockRoleFailed");
+        console.warn("[blocklist] role request failed", bridgeDiag());
+      }
+    } finally {
+      blockBusy = false;
+    }
+    await loadBlockStatus();
+  };
+  // One-tap entry (call log): block this exact number on both channels and show it.
+  const blockFromRecents = (n: string) => {
+    tab = "block";
+    void addBlockRule(n, "exact", "both");
+  };
+  // The enforcement banner is about CALL rules, and the role probe answers one of
+  // three things: held (rejection is live), askable (supported + the native glue is
+  // bound → a foreground grant can be offered), or neither (desktop build, Android
+  // without the role, or a bridge that is not ready). All three must render — the
+  // "neither" case is exactly where the user must not assume calls are blocked.
+  const hasCallRules = $derived(!!blockStatus?.has_call_rules);
+  const roleHeld = $derived(!!blockStatus?.role_held);
+  const roleAskable = $derived(!!blockStatus?.role_supported && !!blockStatus.role_requestable);
 
   const initContacts = normalizeContacts(readStoreValue<unknown>(CONTACTS_KEY, []));
   let contacts = $state<Contact[]>(initContacts);
@@ -108,15 +206,71 @@
     const unsub = callLogStore.subscribe((v) => (callLog = normalizeCallLog(v)));
     return unsub;
   });
-  const recents = $derived(
-    recentNumbers(callLog, 4).map((n) => ({ num: n, label: contactNameFor(contacts, n) ?? n })),
-  );
   const frequent = $derived(
     frequentNumbers(callLog, 3).map((n) => ({ num: n, label: contactNameFor(contacts, n) ?? n })),
   );
 
+  // ---- Call history page ------------------------------------------------------
+  // The full log (newest-first, capped) with the three per-row actions the user
+  // asked for: call back / text back / block. The log is the single shared source
+  // (`amos.calllog`), written by outgoing dials AND finished incoming calls.
+  //
+  // The page adds a direction filter and a two-step "clear" over that one source;
+  // both are honest — clearing really drops the local records (there is no system
+  // call log to reconcile with), and the filter only ever hides rows it also
+  // normalizes (see `filterHistory`).
+  const FILTERS: CallFilter[] = ["all", "incoming", "outgoing", "missed"];
+  let logFilter = $state<CallFilter>("all");
+  let confirmClear = $state(false);
+  const history = $derived(
+    filterHistory(callLog, logFilter).map((r) => ({
+      num: r.number,
+      label: contactNameFor(contacts, r.number) ?? r.name ?? r.number,
+      ts: r.ts,
+      direction: r.direction ?? null,
+    })),
+  );
+  // Total rows across every direction (so an empty *filtered* view can be told
+  // apart from an empty log — "该筛选下暂无记录" vs "暂无最近通话").
+  const historyTotal = $derived(callHistory(callLog).length);
+  const missedTotal = $derived(missedCalls(callLog));
+  const whenOf = (ts: number): string => {
+    const bucket = callWhenLabel(ts);
+    if (bucket === "unknown") return "";
+    const day =
+      bucket === "today"
+        ? t("phone.whenToday")
+        : bucket === "yesterday"
+          ? t("phone.whenYesterday")
+          : callDateStamp(ts);
+    const clock = fmtCallClock(ts);
+    return clock ? `${day} ${clock}` : day;
+  };
+  const dirLabel = (d: string | null): string =>
+    d === "incoming"
+      ? t("phone.dirIncoming")
+      : d === "outgoing"
+        ? t("phone.dirOutgoing")
+        : d === "missed"
+          ? t("phone.dirMissed")
+          : t("phone.dirUnknown");
+  // Filter-chip label: the "all" chip is its own word; the rest reuse the exact
+  // direction wording shown on the rows, so a chip never says something the rows
+  // do not.
+  const filterLabel = (f: CallFilter): string =>
+    f === "all" ? t("phone.historyFilterAll") : dirLabel(f);
+  // Clear the whole history (two-step: the first tap arms, the second commits so a
+  // stray tap cannot wipe the log). Resets the filter, since an empty log has none.
+  const clearLog = () => {
+    callLogStore.save(clearCallHistory());
+    confirmClear = false;
+    logFilter = "all";
+  };
+  const callBack = (n: string) => void startCall(n);
+  const smsBack = (n: string) => composeSmsTo(n);
+
   const recordOutgoing = (number: string, name?: string, body?: string) => {
-    const next = recordCall(callLog, number, name);
+    const next = recordCall(callLog, number, name, Date.now(), "outgoing");
     callLogStore.save(next);
     const label = name && name.trim() !== "" ? name.trim() : number;
     const entry: Notif = {
@@ -247,7 +401,7 @@
         { id: "block", label: t("phone.tabBlock") },
       ] as tb (tb.id)}
         <button role="tab" aria-selected={tab === tb.id} onclick={() => (tab = tb.id as PhoneTab)}
-          class="flex-1 rounded-full px-2 py-1.5 text-xs font-medium transition {tab === tb.id ? 'bg-white text-neutral-900 shadow dark:bg-white/20 dark:text-white' : 'text-neutral-600 hover:text-neutral-900 dark:text-white/70 dark:hover:text-white'}">
+          class="flex-1 rounded-full px-2 py-2 text-xs font-medium transition {tab === tb.id ? 'bg-white text-neutral-900 shadow dark:bg-white/20 dark:text-white' : 'text-neutral-600 hover:text-neutral-900 dark:text-white/70 dark:hover:text-white'}">
           {tb.label}
         </button>
       {/each}
@@ -353,22 +507,62 @@
 
 
   {:else if tab === "recent"}
-    <div class="flex w-full flex-col items-center">
-      <div class="py-5 text-center text-lg font-medium opacity-70">{t("phone.tabRecent")}</div>
-      {#if recents.length === 0}
-        <p class="py-10 text-sm opacity-50">{t("phone.emptyRecent")}</p>
+    <div class="flex w-full flex-col items-center" data-testid="call-history">
+      <div class="flex w-full max-w-sm items-baseline justify-between gap-2 pb-1 pt-3">
+        <span class="text-lg font-medium opacity-80">{t("phone.historyTitle")}</span>
+        <div class="flex shrink-0 items-center gap-2">
+          {#if missedTotal > 0}
+            <span class="text-xs text-danger" data-testid="missed-count">{t("phone.missedCount", { n: missedTotal })}</span>
+          {/if}
+          {#if historyTotal > 0}
+            {#if confirmClear}
+              <button onclick={clearLog} aria-label="history-clear-confirm" class="rounded-full bg-danger/15 px-2.5 py-1 text-xs text-danger active:scale-95">{t("phone.historyClearConfirm")}</button>
+              <button onclick={() => (confirmClear = false)} aria-label="history-clear-cancel" class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClearCancel")}</button>
+            {:else}
+              <button onclick={() => (confirmClear = true)} aria-label="history-clear" title={t("phone.historyClear")} class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClear")}</button>
+            {/if}
+          {/if}
+        </div>
+      </div>
+      {#if historyTotal > 0}
+        <div class="flex w-full max-w-sm items-center gap-1.5 overflow-x-auto pb-1" data-testid="history-filters">
+          {#each FILTERS as f (f)}
+            <button onclick={() => (logFilter = f)} aria-pressed={logFilter === f} data-filter={f} class={"shrink-0 rounded-full px-3.5 py-1.5 text-xs " + (logFilter === f ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{filterLabel(f)}</button>
+          {/each}
+        </div>
+      {/if}
+      {#if history.length === 0}
+        <p class="py-10 text-sm opacity-50" data-testid="history-empty">{historyTotal === 0 ? t("phone.emptyRecent") : t("phone.historyEmptyFilter")}</p>
       {:else}
-        <ul class="w-full max-w-xs divide-y divide-black/5 dark:divide-white/10">
-          {#each recents as it (it.num)}
-            <li>
-              <button onclick={() => pick(it.num)} title={it.num} class="flex w-full items-center justify-between gap-2 py-3 text-left">
-                <span class="truncate text-sm">{it.label}</span>
-                <span class="shrink-0 text-xs opacity-50 tabular-nums">{it.num}</span>
-              </button>
+        <ul class="w-full max-w-sm divide-y divide-black/5 dark:divide-white/10">
+          {#each history as it, i (`${it.num}-${it.ts}-${i}`)}
+            {@const missed = it.direction === "missed"}
+            <li class="flex items-center gap-2 py-2" data-testid="history-row" data-direction={it.direction ?? "unknown"}>
+              <span aria-label={dirLabel(it.direction)} title={dirLabel(it.direction)}
+                class={"grid h-7 w-7 shrink-0 place-items-center rounded-full text-sm " + (missed ? "bg-danger/15 text-danger" : "bg-black/5 opacity-70 dark:bg-white/10")}>
+                {it.direction === "outgoing" ? "↗" : it.direction === "incoming" || missed ? "↙" : "•"}
+              </span>
+              <div class="min-w-0 flex-1">
+                <div class={"truncate text-sm " + (missed ? "text-danger" : "")}>{it.label}</div>
+                {#if it.label !== it.num}
+                  <div class="truncate text-xs opacity-55 tabular-nums">{it.num}{#if whenOf(it.ts)}{" · "}{whenOf(it.ts)}{/if}</div>
+                {:else if whenOf(it.ts)}
+                  <div class="truncate text-xs opacity-55 tabular-nums">{whenOf(it.ts)}</div>
+                {/if}
+              </div>
+              <div class="flex shrink-0 items-center gap-1.5">
+                <button onclick={() => callBack(it.num)} aria-label={`call-back-${it.num}`} title={t("phone.callBack")} data-icon="phone"
+                  class="grid h-10 w-10 place-items-center rounded-full bg-emerald-500/15 text-emerald-600 active:scale-90 dark:text-emerald-300">{@html iconSvg("phone", "h-[18px] w-[18px]")}</button>
+                <button onclick={() => smsBack(it.num)} aria-label={`sms-back-${it.num}`} title={t("phone.smsBack")} data-icon="messageCircle"
+                  class="grid h-10 w-10 place-items-center rounded-full bg-accent/15 text-accent active:scale-90">{@html iconSvg("messageCircle", "h-[18px] w-[18px]")}</button>
+                <button onclick={() => blockFromRecents(it.num)} aria-label={`block-caller-${it.num}`} title={t("phone.blockThisNumber")} data-icon="x"
+                  class="grid h-10 w-10 place-items-center rounded-full bg-danger/10 text-danger active:scale-90 dark:bg-danger/20">{@html iconSvg("x", "h-[18px] w-[18px]")}</button>
+              </div>
             </li>
           {/each}
         </ul>
       {/if}
+      <p class="mt-3 max-w-sm text-center text-xs leading-relaxed opacity-40">{t("phone.historyHint")}</p>
     </div>
   {:else if tab === "frequent"}
     <div class="flex w-full flex-col items-center">
@@ -390,7 +584,7 @@
     </div>
 
 
-  {:else}
+  {:else if tab === "emergency"}
     <div class="flex w-full flex-col items-center">
       <div class="py-5 text-center text-lg font-medium opacity-70">{t("phone.emergencyTitle")}</div>
       <ul class="w-full max-w-xs space-y-2.5">
@@ -408,28 +602,53 @@
       </ul>
       <p class="mt-4 max-w-xs text-center text-xs leading-relaxed opacity-50">{t("phone.emergencyHint")}</p>
     </div>
-  {/if}
 
-  {#if tab === "block"}
+  {:else if tab === "block"}
     <div class="flex w-full flex-col items-center" data-testid="blocklist-panel">
-      <!-- Add a rule: pattern + exact/prefix + which channel it covers. -->
-      <div class="mb-2 flex w-full max-w-sm flex-wrap items-center gap-1.5">
-        <input bind:value={blockNum} aria-label="block-number" onkeydown={(e) => e.key === "Enter" && addBlockRule()} placeholder={t("phone.blockPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
-        <select bind:value={blockKind} aria-label="block-kind" class="rounded-full bg-black/5 px-2 py-1.5 text-xs dark:bg-white/10">
-          <option value="exact">{t("phone.blockKindExact")}</option>
-          <option value="prefix">{t("phone.blockKindPrefix")}</option>
-        </select>
-        <select bind:value={blockChannel} aria-label="block-channel" class="rounded-full bg-black/5 px-2 py-1.5 text-xs dark:bg-white/10">
-          <option value="both">{t("phone.blockChannelBoth")}</option>
-          <option value="call">{t("phone.blockChannelCall")}</option>
-          <option value="sms">{t("phone.blockChannelSms")}</option>
-        </select>
-        <button onclick={addBlockRule} aria-label="block-add" class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("phone.blockAdd")}</button>
+      <!-- Enforcement status: rules alone do not reject calls — the OS role does.
+           All three states are rendered, so "rules exist but nothing enforces
+           them" can never look like "all good" (or like nothing at all). -->
+      {#if hasCallRules}
+        {#if roleHeld}
+          <p data-testid="block-role-held" class="mb-2 w-full max-w-sm rounded-2xl bg-emerald-500/15 px-3 py-2 text-center text-xs text-emerald-700 dark:text-emerald-300">
+            {t("phone.blockRoleHeld")}
+          </p>
+        {:else if roleAskable}
+          <div data-testid="block-role-needed" class="mb-2 w-full max-w-sm rounded-2xl bg-amber-500/15 px-3 py-2 text-center text-xs text-amber-700 dark:text-amber-300">
+            <p>{t("phone.blockRoleNeeded")}</p>
+            <button onclick={() => void requestBlockRole()} disabled={blockBusy} aria-label="block-grant-role"
+              class="mt-1.5 rounded-full bg-accent px-3 py-1 text-xs text-white active:scale-95 disabled:opacity-50">
+              {t("phone.blockRoleGrant")}
+            </button>
+          </div>
+        {:else}
+          <p data-testid="block-role-unavailable" class="mb-2 w-full max-w-sm rounded-2xl bg-black/5 px-3 py-2 text-center text-xs opacity-70 dark:bg-white/10">
+            {t("phone.blockRoleUnsupported")}
+          </p>
+        {/if}
+      {/if}
+      <!-- Add a rule: pattern + exact/prefix + which channel it covers. The input
+           gets its own full-width row (on a 360px phone the old single row left it
+           only ~65px wide, so the placeholder never fit). -->
+      <div class="mb-2 w-full max-w-sm space-y-1.5">
+        <input bind:value={blockNum} aria-label="block-number" onkeydown={(e) => e.key === "Enter" && void addBlockRule()} placeholder={t("phone.blockPlaceholder")} class="w-full rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
+        <div class="flex items-center gap-1.5">
+          <select bind:value={blockKind} aria-label="block-kind" class="min-w-0 flex-1 rounded-full bg-black/5 px-2.5 py-2 text-xs dark:bg-white/10">
+            <option value="exact">{t("phone.blockKindExact")}</option>
+            <option value="prefix">{t("phone.blockKindPrefix")}</option>
+          </select>
+          <select bind:value={blockChannel} aria-label="block-channel" class="min-w-0 flex-1 rounded-full bg-black/5 px-2.5 py-2 text-xs dark:bg-white/10">
+            <option value="both">{t("phone.blockChannelBoth")}</option>
+            <option value="call">{t("phone.blockChannelCall")}</option>
+            <option value="sms">{t("phone.blockChannelSms")}</option>
+          </select>
+          <button onclick={() => void addBlockRule()} disabled={blockBusy} aria-label="block-add" class="shrink-0 rounded-full bg-accent px-4 py-2 text-xs text-white active:scale-95 disabled:opacity-50">{t("phone.blockAdd")}</button>
+        </div>
       </div>
       {#if blockErr}
         <p class="mb-1 text-xs text-red-500" role="alert">{blockErr}</p>
       {/if}
-      <button onclick={toggleBlockUnknown} aria-pressed={blockUnknown} aria-label="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/15 text-accent" : "bg-black/5 dark:bg-white/10")}>
+      <button onclick={() => void toggleBlockUnknown()} aria-pressed={blockUnknown} aria-label="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/15 text-accent" : "bg-black/5 dark:bg-white/10")}>
         {t("phone.blockUnknown")} · {blockUnknown ? t("phone.on") : t("phone.off")}
       </button>
       {#if blockRules.length === 0}
@@ -444,7 +663,7 @@
                   {r.kind === "prefix" ? t("phone.blockKindPrefix") : t("phone.blockKindExact")} · {r.channel === "both" ? t("phone.blockChannelBoth") : r.channel === "call" ? t("phone.blockChannelCall") : t("phone.blockChannelSms")}{#if r.label} · {r.label}{/if}
                 </div>
               </div>
-              <button onclick={() => removeBlockRule(r.id)} aria-label={`block-remove-${r.pattern}`} class="shrink-0 rounded-full bg-neutral-200 px-2 py-1 text-xs dark:bg-neutral-700">{t("phone.blockRemove")}</button>
+              <button onclick={() => void removeBlockRule(r.id)} aria-label={`block-remove-${r.pattern}`} class="shrink-0 rounded-full bg-neutral-200 px-2 py-1 text-xs dark:bg-neutral-700">{t("phone.blockRemove")}</button>
             </li>
           {/each}
         </ul>

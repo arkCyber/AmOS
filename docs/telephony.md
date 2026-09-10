@@ -295,5 +295,39 @@ service Telephony {
 - `cargo test -p amos-telephony --lib`：**68 通过**；`cargo test -p amos-telephony`（含 `telephony_rpc_e2e.rs`）：**2 e2e 通过**；`cargo clippy -p amos-telephony --all-targets -D warnings`：干净；`cargo check --features android` + `cargo clippy --features android -D warnings`：通过。
 - 前端：`bun test` 目标文件通过、`tsc --noEmit` 通过（全量 `bun test` 在本机环境存在个别文件空转，非本轮改动引入）。
 
+---
+
+## 13. 通话记录页（Call History，前端，2026-09-10）
+
+电话 App 的「最近」标签从"最近 4 个号码"升级为**完整通话记录页**，每行可 **回电 / 回短信 / 拉黑**。
+
+### 数据模型（`lib/calllog.ts`，纯逻辑）
+- `CallRecord` 增可选 `direction: "incoming" | "outgoing" | "missed"`：
+  - `normalizeDirection` 白名单校验，未知值一律丢弃（**不猜**）；
+  - **向后兼容**：历史记录没有方向时保持 `undefined`（UI 显示中性「通话」），绝不假装是去电；
+  - `normalizeCallLog` / `recordCall(list, number, name?, now?, direction?)` 读写方向并保持不可变 + 上限 60。
+- 新增页面辅助（locale-neutral，便于测试与本地化）：`callHistory`（最新在前、有界）、`missedCalls`（未接计数）、`callWhenLabel`（today/yesterday/date/unknown）、`callDateStamp`（YYYY-MM-DD）、`fmtCallClock`（HH:MM）。
+- **筛选与清空**：`CallFilter = "all" | "incoming" | "outgoing" | "missed"`；`filterHistory(list, filter)` 复用 `callHistory` 的同一归一化（旧的无方向记录只在「全部」出现，绝不被算作某方向）；`clearCallHistory()` 是清空的具名 seam（空日志的单一出处）。
+- 写入端：去电 `recordOutgoing` 记 `outgoing`；来电 `IncomingCall` 在 `Ended` 时按"是否接通过"记 `incoming` / `missed`（此前不区分，来电一律无方向）。
+
+### UI（`PhoneApp.svelte`「最近」标签）
+- 标题「通话记录」+ 未接计数 + **两段式「清空」**（先 arm 后确认，带取消，避免误触清库）；清空后回到「全部」筛选。
+- **方向筛选 chips**：全部 / 来电 / 去电 / 未接（`data-filter`，`filterHistory` 驱动，只显示该方向的记录）；筛选后无记录时显示「该筛选下暂无记录」，与空日志的「暂无最近通话」**区分**（`data-testid="history-empty"`）。
+- 行 = 方向图标（↗ 去电 / ↙ 来电 / 红色 ↙ 未接）+ 名称/号码 + 相对时间（`今天|昨天|YYYY-MM-DD HH:MM`）。
+- 每行三个动作：**回电**（`telephony_dial`，走既有 AmOS 托管呼叫）、**回短信**（深链到「信息」并预填该号码）、**拉黑**（写入 `exact/both` 拦截规则）；动作按钮 **40×40px**（真机量测原 32×32 偏小，已放大）。
+- 无联系人名的行不再把号码重复打印两遍（标题即号码时，次行只显示时间）。
+- 底部诚实说明（本机最多 60 条、来电与去电都记录）。
+
+### 跨应用深链（`svelte/appLinks.ts`）
+- 壳一次只挂载一个应用（`Shell.svelte`），因此「回短信」先写目标应用的 props 通道再切面：`composeSmsTo(number)` = `messagesChannel().set({composeTo, nonce}) + shellState.open("messages")`。
+- `MessagesApp` 订阅该通道：**真机后端**预填真实短信撰写框（`newTo`/`showNew`）；**宿主/离线**则打开（或选中）同号本地会话；后端探测未完成时暂存，落定后补发。链接在应用后**消费并清空**，因此再从桌面打开「信息」不会重复触发。
+- 诚实边界：深链只是"请求撰写"，从不声称已发送。
+
+### 测试与门禁
+- 纯逻辑 `src/__tests__/calllog.test.ts`：**17 例**（方向白名单/写入/旧记录不猜、`callWhenLabel` 跨午夜日历日、`callDateStamp`/`fmtCallClock` 补零与未知时间、`callHistory` 顺序/上限 + `missedCalls`；**+2**：`filterHistory` 各方向/旧的 neutral 行只在 all/上限、`clearCallHistory`）。
+- DOM `svelte-tests/phone.svelte.test.ts`：记录页方向/未接统计 + 回电真实调 `telephony_dial`；回短信写入 `messages` 通道并切到 `messages` 面；**+3**：方向筛选收窄、空筛选态诚实文案、两段式清空（arm/cancel/confirm + 持久化为空）。
+- DOM `svelte-tests/messages.svelte.test.ts`：深链在离线态打开同号本地会话且链接被消费；**+2**：真机线程「屏蔽此号码」写入 `exact/both` 规则 + 成功态、被拒时显式 `role="alert"` 报错。同时新增 `afterEach` 清理假桥接，避免设备态泄漏进离线用例。
+- 本机全绿：`bun run check`（`bun test` 含 i18n 奇偶校验、`tsc`/`svelte-check` 0 error、`test:svelte` **374 例**）、`vite build` ✓。
+
 
 
