@@ -24,13 +24,14 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
   - `wire.rs`：纯 JSON 契约解析 `parse_snapshot` / `parse_messages`（缺字段/坏类型一律 `Invalid`，绝不伪造）。
   - 测试 **6 例** 全绿；`cargo fmt`/`clippy -D warnings` 干净。
 - workspace 注册该 crate。
+- **`amos-tauri` SMS 桥**（`src/sms.rs`）：`SmsBridge`（host= `MockSms::new()` 空收件箱·诚实；`with_provider` 供设备/测试）+ 命令 `sms_snapshot` / `sms_messages` / `sms_send`（`send` 成功返回 `"sent"` 以便区分成功/错误/离线）；序列化镜像 `SmsThreadOut` / `SmsMessageOut`。lib.rs 已 `manage` + 注册。测试 **3 例**（host 空 inbox / seeded 映射 / send 拒空）全绿；`clippy`/`fmt` 干净。
+- **前端桥函数**（`lib/backend.ts`）：`smsSnapshot()` / `smsMessages(threadId)` / `smsSend(address,text)`（离线返回 `null`/`false`，绝不伪造）。
 
 ## 待接入（下一步，逐层做，真机验收）
 1. **`amos-sms` Android provider**（feature `android = ["dep:jni"]`）：`AndroidSmsProvider`，经 JNI 调 Kotlin `SmsGlue`，把 JSON 用 `wire.rs` 解析成领域类型。桌面/CI 不拉 jni。
 2. **Kotlin `SmsGlue.kt`**（`crates/amos-tauri/android-glue/.../glue/`）：注册 upcall 提供 `Context`；`snapshot()`（查 `content://sms`，按 thread_id 聚合 address/body/date/read）+ `messages(threadId)` + `send(address,text)`（`SmsManager`）。
 3. **权限**：`AndroidManifest` 声明 `READ_SMS` + `SEND_SMS`（参照仓库 permissions fragment 惯例），运行时请求。
-4. **amos-tauri 桥**：`sms` bridge 持有 `Box<dyn SmsProvider>`（host=Mock，android=`AndroidSmsProvider`），注册命令 `sms_snapshot` / `sms_send`（无真机/无桥→描述性错误）。
-5. **MessagesApp 接真实线程**：桥接真机时用 `sms_snapshot` 填充会话（`sms:` 前缀，address=联系人），发送走 `sms_send`；离线退回本地会话。
+4. **MessagesApp 接真实线程**：桥接真机时用 `sms_snapshot`/`sms_messages` 展示真实线程并 `sms_send` 发送；离线退回本地会话。
 
 ## 真机验收清单（需在你的设备 YY000286 上）
 - [ ] 授予 READ_SMS（及 SEND_SMS）；System UI 为默认短信应用（`SmsManager` 发送需要）。

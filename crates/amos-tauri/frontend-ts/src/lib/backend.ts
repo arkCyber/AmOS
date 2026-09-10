@@ -796,3 +796,42 @@ export async function pollNativeAlarms(nowMs?: number): Promise<{ due: string[] 
   return invoke<{ due: string[] }>("scheduler_alarm_poll", { nowMs });
 }
 
+/* ---- SMS (real device inbox via amos-sms; empty/absent on host) ---- */
+
+/** One SMS thread (mirrors `amos-tauri::sms::SmsThreadOut`). */
+export interface SmsThreadOut {
+  id: string;
+  address: string;
+  display_name: string;
+  last_text: string;
+  last_ts_ms: number;
+  unread: number;
+}
+
+/** One SMS message (mirrors `amos-tauri::sms::SmsMessageOut`). */
+export interface SmsMessageOut {
+  thread_id: string;
+  id: string;
+  from_me: boolean;
+  text: string;
+  ts_ms: number;
+  read: boolean;
+}
+
+/** Real-SMS inbox snapshot (threads). `null` when not bridged/errored; an empty
+ *  array means "no real SMS available" (never fabricated). */
+export async function smsSnapshot(): Promise<SmsThreadOut[] | null> {
+  return invoke<SmsThreadOut[]>("sms_snapshot");
+}
+
+/** Messages of one SMS thread (chronological). `null` when unavailable. */
+export async function smsMessages(threadId: string): Promise<SmsMessageOut[] | null> {
+  return invoke<SmsMessageOut[]>("sms_messages", { thread_id: threadId });
+}
+
+/** Send a real SMS. `true` only on the command's explicit success marker. */
+export async function smsSend(address: string, text: string): Promise<boolean> {
+  const r = await invoke<string>("sms_send", { address, text });
+  return r === "sent";
+}
+

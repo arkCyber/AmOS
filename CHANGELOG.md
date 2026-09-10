@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **真实短信上接层：amos-tauri SMS 桥 + 前端桥函数（2026-09-09）**：在 `amos-sms` 领域地基之上接通宿主侧。(a) `crates/amos-tauri/src/sms.rs`：`SmsBridge`（host= `MockSms::new()` 空收件箱·诚实无伪造；`with_provider` 供设备/测试）持有 `Box<dyn SmsProvider>`，Tauri 命令 `sms_snapshot` / `sms_messages` / `sms_send`（成功返回 `"sent"` 以区分成功/错误/离线），序列化镜像 `SmsThreadOut` / `SmsMessageOut`；`lib.rs` 已 `manage` + 注册。(b) 前端 `lib/backend.ts`：`smsSnapshot()` / `smsMessages(threadId)` / `smsSend(address,text)`（未桥接/出错一律 `null`/`false`）。测试：`amos-tauri --lib sms::` **3 例**（host 空 inbox / seeded 映射 / send 拒空）全绿；`cargo fmt`、`clippy -D warnings`、`tsc` 干净。诚实边界：仍是 host=Mock；真机读收件箱/发送需下一步 Android provider(JNI)+Kotlin `SmsGlue`+权限+Messages 接真线程（`docs/sms.md`）。
+
+
 - **真实短信领域地基 `amos-sms`（2026-09-09）**：为“端到端真机短信”新增独立领域 crate（对齐 amos-flashlight 范式）：`spec.rs`（`SmsThread`/`SmsMessage`）、`error.rs`（`Unavailable/Failed/Invalid`）、`provider.rs`（`SmsProvider` trait + `MockSms`：`new()`=空收件箱·诚实“host 无短信”，`seeded()`=固定演示收件箱）、`wire.rs`（纯 JSON 契约 `parse_snapshot`/`parse_messages`，缺字段一律 `Invalid` 不伪造）。workspace 注册。测试 **6 例**（empty/seed/mock send 拒空、snapshot/messages 解析与垃圾容错）全绿；`cargo fmt`/`clippy -D warnings` 干净。诚实边界：这只是**领域层地基**；真实读收件箱/发送需后续 Android provider(JNI) + Kotlin `SmsGlue` + 权限 + amos-tauri 桥 + Messages 接真线程，并须在你手机验收（见 `docs/sms.md` 进度与真机清单）。
 
 

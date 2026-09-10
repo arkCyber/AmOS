@@ -28,6 +28,9 @@ amos-asr = { path = "../amos-asr", optional = true }
 amos-audio = { path = "../amos-audio" }
 amos-radio = { path = "../amos-radio" }
 amos-flashlight.workspace = true
+# amos-sms: real-SMS domain core — the System UI's Messages screen reads/writes
+# through the SmsProvider seam (Mock on host, Android SmsGlue on device).
+amos-sms = { path = "../amos-sms" }
 amos-display.workspace = true
 # amos-media: external-storage/media domain core — its MediaManager + MediaProvider
 # seam backs the local `media_*` commands (Mock on host; Android MediaStore on-device

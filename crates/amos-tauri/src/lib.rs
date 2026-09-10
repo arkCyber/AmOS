@@ -45,6 +45,7 @@ pub mod rag_client;
 pub mod real_dial;
 pub mod sensor_host;
 pub mod sensors;
+pub mod sms;
 pub mod store;
 pub mod system;
 pub mod taskmgr;
@@ -103,6 +104,7 @@ pub fn run() {
         .manage(mail::MailBridge::new())
         .manage(appstore::StoreBridge::new())
         .manage(sensor_host::SensorHost::new())
+        .manage(sms::SmsBridge::boot())
         .invoke_handler(tauri::generate_handler![
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
@@ -233,6 +235,9 @@ pub fn run() {
             rag_client::rag_query,
             rag_client::rag_index,
             rag_client::rag_remove,
+            sms::sms_snapshot,
+            sms::sms_messages,
+            sms::sms_send,
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
             taskmgr::taskmgr_job_action,
