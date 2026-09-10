@@ -125,6 +125,37 @@ describe("wm command wrappers", () => {
     expect(listeners.has(LAYOUT_CHANGED_EVENT)).toBe(false);
   });
 
+  test("subscribes through the event plugin when the host injects no listen helper", async () => {
+    // Tauri v2's `__TAURI_INTERNALS__` has no `listen`; a local `b.listen` call
+    // used to be a silent no-op, so layout changes never reached the UI.
+    const box: { snap: LayoutSnapshot | null } = { snap: null };
+    const calls: string[] = [];
+    const callbacks = new Map<number, (payload: unknown) => void>();
+    let nextId = 1;
+    setWindow({
+      __TAURI_INTERNALS__: {
+        invoke: async (cmd: string) => {
+          calls.push(cmd);
+          return cmd === "plugin:event|listen" ? 7 : null;
+        },
+        transformCallback: (cb: (payload: unknown) => void) => {
+          const id = nextId++;
+          callbacks.set(id, cb);
+          return id;
+        },
+        unregisterCallback: (id: number) => callbacks.delete(id),
+      },
+    });
+    const un = await onLayoutChanged((s) => {
+      box.snap = s;
+    });
+    expect(calls).toContain("plugin:event|listen");
+    // Dispatch through the registered transformCallback id.
+    callbacks.forEach((cb) => cb({ event: LAYOUT_CHANGED_EVENT, id: 7, payload: splitSnap }));
+    expect(box.snap).toEqual(splitSnap);
+    un();
+  });
+
   test("wmSplitDemo calls wm_split_demo; event name matches the host", async () => {
     expect(LAYOUT_CHANGED_EVENT).toBe("layout-changed");
     const snap = await wmSplitDemo();

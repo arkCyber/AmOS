@@ -7,6 +7,8 @@
  *
  * Wire shapes mirror the Rust `LayoutSnapshot` / `SplitLayoutInfo` / `PaneLayout`.
  */
+import { subscribe } from "./backend";
+
 export type SplitAxis = "vertical" | "horizontal" | string;
 
 export interface PaneLayout {
@@ -109,24 +111,16 @@ export const LAYOUT_CHANGED_EVENT = "layout-changed";
  * Subscribe to layout changes broadcast by the host (so non-initiating windows /
  * surfaces refresh without their own command round-trip). Payloads are normalized
  * before `handler` runs. Resolves to an unsubscribe function; a no-op when the
- * bridge has no `listen` (offline / host build).
+ * bridge cannot subscribe (offline / host build).
+ *
+ * Delegates to the shared `subscribe` helper: Tauri v2 injects no `listen` on
+ * `__TAURI_INTERNALS__`, so a local `b.listen` call here was silently dead on
+ * device (the bridge now synthesizes one through the event plugin).
  */
 export function onLayoutChanged(
   handler: (snap: LayoutSnapshot) => void,
 ): Promise<() => void> {
-  const b = bridge();
-  if (!b || typeof b.listen !== "function") {
-    return Promise.resolve(() => {});
-  }
-  const registered = b.listen(LAYOUT_CHANGED_EVENT, (e) => {
-    handler(normalizeLayout(e.payload));
-  });
-  // Defensive: the real Tauri bridge returns a Promise<unlisten>, but treat a
-  // plain function (test double / older host) as already-unsubscribable.
-  if (registered && typeof (registered as { then?: unknown }).then === "function") {
-    return (registered as Promise<() => void>).catch(() => () => {});
-  }
-  return Promise.resolve(registered as unknown as () => void);
+  return subscribe(LAYOUT_CHANGED_EVENT, (payload) => handler(normalizeLayout(payload)));
 }
 
 // ---- Pure model helpers (render the split deterministically) ----
