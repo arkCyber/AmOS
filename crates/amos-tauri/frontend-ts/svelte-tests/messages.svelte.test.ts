@@ -111,8 +111,10 @@ describe("MessagesApp.svelte", () => {
   });
 
   test("shows real device SMS threads when a provider is bridged", async () => {
+    const seen: Record<string, unknown>[] = [];
     (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
-      invoke: async (cmd: string) => {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        seen.push({ cmd, ...(args ?? {}) });
         if (cmd === "sms_snapshot") {
           return [
             {
@@ -149,6 +151,10 @@ describe("MessagesApp.svelte", () => {
     expect(host.container.querySelector('[data-testid="real-sms-badge"]')).toBeTruthy();
     expect(txt(host)).toContain("家人");
     expect(txt(host)).toContain("晚上回家吃饭吗？");
+    // the messages call must use Tauri's camelCase arg key (device-verified)
+    const msgCall = seen.find((c) => c.cmd === "sms_messages");
+    expect(msgCall?.threadId).toBe("1");
+    expect(msgCall && "thread_id" in msgCall).toBe(false);
     // local-only affordances are hidden in real-SMS mode
     expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
   });

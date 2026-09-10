@@ -41,10 +41,19 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
 > 注：本机只能证明“编译/契约/前端行为”；真实收件箱读取与发送必须在 Android 设备上验收。
 
 
-## 真机验收清单（需在你的设备 YY000286 上）
-- [ ] 授予 READ_SMS（及 SEND_SMS）；System UI 为默认短信应用（`SmsManager` 发送需要）。
-- [ ] 打开“信息”：能列出真实收件箱线程（地址/显示名/最近一条/未读数）。
-- [ ] 打开某线程：按时间列出真实往来消息（含是否本人发出）。
-- [ ] 回复/发送：调用系统 `SmsManager` 真正发出一条；对照系统短信应用确认。
-- [ ] 断网/无权限路径：诚实错误而非伪造线程。
-- [ ] 首次真机在系统短信里新收一条，回 AmOS 验证刷新。
+## 真机验收结果（2026-09-10，YY000286 / S5，arm64 debug）
+已装 APK 并逐项验证（`adb` + WebView CDP 实调命令/读 DOM）：
+
+- [x] 权限：`adb install -g` 后 `READ_SMS` / `SEND_SMS` 均 `granted=true`。
+- [x] 读收件箱：`sms_snapshot` 返回真实线程（如 `10010` 未读 2、`18516766470`、`+8610655777` 等），含最近一条与未读计数。
+- [x] 读线程：`sms_messages` 返回真实往来（`from_me` / `ts_ms` 正确），UI 中切换会话即加载（18516766470 → “现在无法接听。有什么事吗？”）。
+- [x] 发送路径：空地址调用 `sms_send` → `SMS operation failed: Invalid destinationAddress`（Kotlin → Rust → 命令 → JS 全链路真实到达 `SmsManager`，诚实报错不伪造）。
+- [x] UI：打开“信息”显示真实线程 + `📡 真实短信` 标识 + 真实消息气泡 + 发送输入框；`sms_messages` 参数键为 camelCase。
+- [ ] **真正发出一条短信**：留给你在 UI 输入并点发送（会真实发送/计费，故由你确认目标后再做）。
+- [ ] 收新短信后刷新：点“刷新”重读当前会话。
+
+### 真机踩到的两个问题（已修）
+1. **Tauri 参数命名**：`sms_messages` 必须传 **camelCase `threadId`**（Rust 参数是 `thread_id`）；原先 `backend.ts` 传 `thread_id` 被拒（`missing required key threadId`），导致线程消息读不出（UI 显示“无法读取该会话”）。已在 `lib/backend.ts` 修正并加测试断言锁定。
+2. **真实数据混入本地会话/通知 `$effect`** 会在真机 shell 下引发整窗卡死：改为**独立真实态**（`realThreads`/`realMsgs`/`realActiveId`，探测 `$effect` 用 `probed` 一次性守卫），本地会话与通知同步完全不受影响，离线行为不变。
+3. 另注（非应用缺陷）：重装 APK 后偶发 `SandboxedProcessService ... process is bad`，WebView 渲染沙箱需重启设备才恢复；属设备侧 WebView 状态，重启后一切正常。
+

@@ -824,9 +824,13 @@ export async function smsSnapshot(): Promise<SmsThreadOut[] | null> {
   return invoke<SmsThreadOut[]>("sms_snapshot");
 }
 
-/** Messages of one SMS thread (chronological). `null` when unavailable. */
+/** Messages of one SMS thread (chronological). `null` when unavailable.
+ *
+ * Tauri v2 deserializes command args in camelCase, so the key must be
+ * `threadId` (the Rust param is `thread_id`); passing snake_case fails with
+ * "missing required key threadId" — verified on device. */
 export async function smsMessages(threadId: string): Promise<SmsMessageOut[] | null> {
-  return invoke<SmsMessageOut[]>("sms_messages", { thread_id: threadId });
+  return invoke<SmsMessageOut[]>("sms_messages", { threadId });
 }
 
 /** Send a real SMS. `true` only on the command's explicit success marker. */

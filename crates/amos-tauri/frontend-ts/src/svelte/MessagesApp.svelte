@@ -28,6 +28,7 @@
   import { iconSvg } from "../lib/sysIcons";
   import type { Notif } from "../lib/settings";
   import { bridged, smsMessages, smsSend, smsSnapshot } from "../lib/backend";
+  import type { SmsMessageOut, SmsThreadOut } from "../lib/backend";
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
 
@@ -59,46 +60,56 @@
   };
 
   // ---- Real SMS (device) --------------------------------------------------------
-  // When a real SMS provider is present (device SmsGlue over JNI), show the real
-  // inbox threads and send through `sms_send`. `smsAddr` maps a conv id → its
-  // remote address; local conversations are untouched when there is no real SMS.
-  let realSms = $state(false);
-  let smsAddr = $state<Record<string, string>>({});
-  const smsThreadId = (convId: string): string | null =>
-    convId.startsWith("sms:") ? convId.slice(4) : null;
-  const loadRealMsgs = (convId: string) => {
-    const tid = smsThreadId(convId);
-    if (!tid) return;
-    void smsMessages(tid).then((m) => {
-      if (!m) return;
-      const mapped: Msg[] = [...m]
-        .sort((a, b) => a.ts_ms - b.ts_ms)
-        .map((x) => ({ from: x.from_me ? "me" : "them", text: x.text, ts: x.ts_ms, read: x.read }));
-      conversations = conversations.map((c) => (c.id === convId ? { ...c, msgs: mapped } : c));
+  // The real device inbox lives in its OWN state and never mixes with the local
+  // conversations / notification machinery (that coupling caused a render loop on
+  // device). When the bridge reports real threads we render the real panel;
+  // otherwise the screen falls back to local conversations unchanged.
+  let realThreads = $state<SmsThreadOut[] | null>(null);
+  let realActiveId = $state("");
+  let realMsgs = $state<SmsMessageOut[]>([]);
+  let realText = $state("");
+  let realErr = $state("");
+  const activeReal = $derived(realThreads?.find((th) => th.id === realActiveId) ?? null);
+  const activeRealName = $derived(
+    activeReal ? activeReal.display_name || activeReal.address : "",
+  );
+  const loadReal = (id: string) => {
+    realErr = "";
+    void smsMessages(id).then((m) => {
+      if (m) realMsgs = [...m].sort((a, b) => a.ts_ms - b.ts_ms);
+      else realErr = t("message.loadFailed");
     });
   };
-  // Probe once: if the device reports real threads, switch the screen to them.
-  $effect(() => {
-    if (!bridged()) return;
-    void smsSnapshot().then((ts) => {
-      if (!ts || ts.length === 0) return; // no real SMS → keep local conversations
-      realSms = true;
-      const convs: Conversation[] = ts.map((th) => ({
-        id: `sms:${th.id}`,
-        name: th.display_name || th.address,
-        msgs: [],
-      }));
-      const addr: Record<string, string> = {};
-      for (const th of ts) addr[`sms:${th.id}`] = th.address;
-      smsAddr = addr;
-      conversations = convs;
-      activeId = convs[0]?.id ?? "";
-      if (activeId) loadRealMsgs(activeId);
+  const openReal = (id: string) => {
+    realActiveId = id;
+    loadReal(id);
+  };
+  const refreshReal = () => {
+    if (realActiveId) loadReal(realActiveId);
+  };
+  const sendReal = () => {
+    const v = realText.trim();
+    if (!v || !activeReal) return;
+    void smsSend(activeReal.address, v).then((ok) => {
+      if (!ok) {
+        realErr = t("message.sendFailed");
+        return;
+      }
+      realText = "";
+      loadReal(activeReal.id);
     });
-  });
-  // Load a thread's messages whenever the active real thread changes.
+  };
+  // Probe once (guarded so the effect can never re-enter): switch to the real
+  // inbox when the bridge reports threads; keep local conversations otherwise.
+  let probed = false;
   $effect(() => {
-    if (realSms && activeId) loadRealMsgs(activeId);
+    if (probed || !bridged()) return;
+    probed = true;
+    void smsSnapshot().then((ts) => {
+      if (!ts || ts.length === 0) return; // no real SMS → stay local
+      realThreads = ts;
+      if (ts[0]) openReal(ts[0].id);
+    });
   });
 
   // Publish unread incoming messages across conversations as app notifications.
@@ -123,16 +134,6 @@
   const send = () => {
     const v = text.trim();
     if (!v || !active) return;
-    // Real device thread → send via SmsManager (then reload the thread).
-    if (realSms && smsThreadId(active.id)) {
-      const addr = smsAddr[active.id];
-      if (!addr) return;
-      void smsSend(addr, v).then((ok) => {
-        text = "";
-        if (ok) loadRealMsgs(active.id);
-      });
-      return;
-    }
     setMsgs(
       replyTo
         ? appendQuote(markAllRead(msgs), v, replyTo, Date.now())
@@ -185,33 +186,64 @@
 </script>
 
 <div class="flex h-full flex-col p-3">
+  {#if realThreads && realThreads.length}
+    <!-- Real device inbox (SmsGlue over JNI): read threads + send via SmsManager -->
+    <div class="mb-1 flex items-center gap-1.5 overflow-x-auto">
+      {#each realThreads as th (th.id)}
+        <button onclick={() => openReal(th.id)} aria-pressed={th.id === realActiveId} class={"shrink-0 rounded-full px-3 py-1 text-xs " + (th.id === realActiveId ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{th.display_name || th.address}{#if th.unread > 0}<span class="ml-1">●{th.unread}</span>{/if}</button>
+      {/each}
+    </div>
+    <div class="flex items-center justify-between pb-2">
+      <div class="flex min-w-0 items-center gap-2">
+        <span class="text-sm font-semibold">{activeRealName}</span>
+        <span data-testid="real-sms-badge" class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-[10px] text-accent">📡 {t("message.realSms")}</span>
+      </div>
+      <button onclick={refreshReal} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">{t("message.refresh")}</button>
+    </div>
+    <div class="flex-1 space-y-2 overflow-auto">
+      {#if realMsgs.length === 0}
+        <p class="py-10 text-center text-sm opacity-60">{t("message.empty")}</p>
+      {:else}
+        {#each realMsgs as m, i (m.id + "-" + i)}
+          <div role="group" class={"flex items-start gap-1.5 max-w-[86%] " + (m.from_me ? "ml-auto" : "")}>
+            <div class={"rounded-2xl px-3 py-2 text-sm " + (m.from_me ? "bg-accent text-white" : "bg-neutral-300 text-neutral-900 dark:bg-neutral-700 dark:text-white")}>
+              <div class="whitespace-pre-wrap">{m.text}</div>
+              <div class="mt-0.5 text-right text-xs tabular-nums opacity-60">{fmtBubbleTime(m.ts_ms)}</div>
+            </div>
+          </div>
+        {/each}
+      {/if}
+    </div>
+    {#if realErr}
+      <p class="mt-1 text-xs text-red-500" role="alert">{realErr}</p>
+    {/if}
+    <div class="mt-2 flex items-center gap-2 pb-1">
+      <input bind:value={realText} onkeydown={(e) => e.key === "Enter" && sendReal()} placeholder={t("message.placeholder", { name: activeRealName })} aria-label="real-message-input" class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
+      <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label="send" data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
+    </div>
+  {:else}
   <!-- Conversation bar: switch threads -->
   <div class="mb-1 flex items-center gap-1.5 overflow-x-auto">
     {#each conversations as c (c.id)}
       <button onclick={() => (activeId = c.id)} aria-pressed={c.id === activeId} class={"shrink-0 rounded-full px-3 py-1 text-xs " + (c.id === activeId ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{c.name}{#if unreadCount(c.msgs) > 0}<span class="ml-1">●</span>{/if}</button>
     {/each}
   </div>
-  <!-- Always-visible row to start a new contact-thread (local conversations only) -->
-  {#if !realSms}
-    <div class="mb-1.5 flex items-center gap-1.5">
-      <input bind:value={newName} aria-label="new-contact" onkeydown={(e) => e.key === "Enter" && confirmAdd()} placeholder={t("message.contactPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:text-white dark:ring-white/10 dark:placeholder:text-white/30" />
-      <button onclick={confirmAdd} aria-label="add-contact" title={t("message.addThread")} class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.confirm")}</button>
-    </div>
-  {/if}
+  <!-- Always-visible row to start a new contact-thread (local conversations) -->
+  <div class="mb-1.5 flex items-center gap-1.5">
+    <input bind:value={newName} aria-label="new-contact" onkeydown={(e) => e.key === "Enter" && confirmAdd()} placeholder={t("message.contactPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:text-white dark:ring-white/10 dark:placeholder:text-white/30" />
+    <button onclick={confirmAdd} aria-label="add-contact" title={t("message.addThread")} class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.confirm")}</button>
+  </div>
 
   {#if active}
     <div class="flex items-center justify-between pb-2">
       <div class="flex min-w-0 items-center gap-2">
         <span class="text-sm font-semibold">{active.name}</span>
-        {#if realSms}
-          <span data-testid="real-sms-badge" class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-[10px] text-accent">📡 {t("message.realSms")}</span>
-        {/if}
         {#if unreadCount(msgs) > 0}
           <button onclick={() => setMsgs(markAllRead(msgs))} title={t("message.markRead")} class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-xs text-accent">{unreadCount(msgs)} {t("message.unread")}</button>
         {/if}
       </div>
       <div class="flex items-center gap-1.5">
-        {#if conversations.length > 1 && !realSms}
+        {#if conversations.length > 1}
           <button onclick={deleteThread} aria-label="delete-thread" title={t("message.deleteThread")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs dark:bg-neutral-700">{t("message.deleteThread")}</button>
         {/if}
         <button onclick={clear} disabled={msgs.length === 0} aria-label={t("message.clear")} class="rounded-full bg-neutral-200 px-3 py-1 text-xs disabled:opacity-40 dark:bg-neutral-700"><span data-icon="trash" class="inline-flex align-[-1px]">{@html iconSvg("trash", "h-3 w-3")}</span> {t("message.clear")}</button>
@@ -252,6 +284,7 @@
     </div>
   {:else}
     <p class="py-16 text-center text-sm opacity-60">{t("message.noThreads")}</p>
+  {/if}
   {/if}
 </div>
 
