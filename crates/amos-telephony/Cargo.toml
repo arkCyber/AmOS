@@ -14,7 +14,7 @@ path = "src/lib.rs"
 tokio.workspace = true
 tokio-stream.workspace = true
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 amos-proto.workspace = true
 tonic.workspace = true
 # Real Android backend (dial via the System UI's app Context → `ACTION_CALL`/Telecom

@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 tokio.workspace = true
 # Real Android backend (Android ConnectivityManager/WifiManager + BluetoothManager
 # via JNI). Optional: only pulled in when the `android` feature is enabled, so

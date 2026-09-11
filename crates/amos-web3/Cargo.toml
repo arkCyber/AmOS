@@ -14,4 +14,4 @@ path = "src/lib.rs"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
 sha3 = "0.10"
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
