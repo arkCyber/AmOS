@@ -170,6 +170,20 @@ impl MediaManager {
         self.provider.load(item)
     }
 
+    /// Read at most `len` bytes from `offset`, gated by the same **read** grant.
+    /// This is the streaming counterpart of [`MediaManager::load`]: it never
+    /// materialises the whole item, so it is the correct primitive for large
+    /// media (the policy is identical, so a denial is identical too).
+    pub fn read_range(&self, item: &MediaItem, offset: u64, len: u64) -> Result<Vec<u8>> {
+        if !self.is_granted(AccessKind::Read, item.collection) {
+            return Err(MediaError::Unauthorized {
+                access: AccessKind::Read,
+                collection: item.collection,
+            });
+        }
+        self.provider.read_range(item, offset, len)
+    }
+
     /// Snapshot of the grant set (poison-safe lock).
     fn grant_set(&self) -> std::sync::MutexGuard<'_, Vec<Grant>> {
         self.grants.lock().unwrap_or_else(|p| p.into_inner())

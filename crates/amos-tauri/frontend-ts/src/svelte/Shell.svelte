@@ -35,6 +35,7 @@
   import { startTimerWatcher } from "./osTimerWatcher";
   import { startAlarmWatcher } from "./osAlarmWatcher";
   import { startReminderWatcher } from "./osReminderWatcher";
+  import { startCalendarWatcher } from "./osCalendarWatcher";
   import { startOsAutoOff } from "./osAutoOff";
   import { startOsInputBridge, startOsHardwarePoll } from "./osInputBridge";
   import { startLmkSurfaceWatcher, startPeriodicReconcile } from "../lib/lmk";
@@ -173,6 +174,7 @@
       startTimerWatcher(getActive),
       startAlarmWatcher(getActive),
       startReminderWatcher(getActive),
+      startCalendarWatcher(getActive),
       startOsAutoOff({ onSleep: lock }),
       startOsHardwarePoll({
         onNav: (a) => (a === "home" ? goHome() : open("ai")),

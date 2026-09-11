@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-app android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor
 
 all: build
 
@@ -194,6 +194,12 @@ android-app:
 	cd crates/amos-tauri/frontend-ts && bun run build
 	cargo tauri android build --debug --features android --target aarch64
 	adb $(if $(DEVICE),-s $(DEVICE),) install -r -g crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+
+# Host-JVM gate for the Kotlin camera glue's pure NV21 packer (no device needed):
+# mirrors android-glue/ into the generated Android project and runs the packer's
+# JUnit tests + the Kotlin compile. Requires a JDK 17 (AGP/Kotlin reject newer).
+android-glue-check:
+	bash scripts/android-glue-nv21-check.sh
 
 # Cross-compile gate for the offline-RAG PDF data-extraction crate on Android.
 # The crate is pure Rust on lopdf (no C), so this only needs the rustup android

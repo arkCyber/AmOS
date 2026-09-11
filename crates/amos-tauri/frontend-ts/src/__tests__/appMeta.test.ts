@@ -13,16 +13,18 @@ import {
  * (src/lib/appMeta.ts) — the single source that apps.tsx re-exports as APPS.
  */
 describe("appMeta (React-free built-in app metadata)", () => {
-  test("covers 24 built-in apps with unique ids", () => {
-    expect(APP_META.length).toBe(24);
+  test("covers 27 built-in apps with unique ids", () => {
+    expect(APP_META.length).toBe(27);
     const ids = APP_META.map((a) => a.id);
     expect(new Set(ids).size).toBe(ids.length);
-    expect(appIds().length).toBe(24);
+    expect(appIds().length).toBe(27);
   });
 
   test("lookup helpers resolve titleKey / icon / presence", () => {
     expect(appTitleKey("phone")).toBe("app.phone");
     expect(appIcon("notes")).toBe("📝");
+    expect(appIcon("calendar")).toBe("📅");
+    expect(appTitleKey("calendar")).toBe("app.calendar");
     expect(isKnownApp("phone")).toBe(true);
     expect(appMetaById("mail")?.titleKey).toBe("app.mail");
     // Unknown ids are handled without throwing.

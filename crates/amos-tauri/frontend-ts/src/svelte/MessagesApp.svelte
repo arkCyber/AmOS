@@ -38,9 +38,19 @@
     smsMessages,
     smsSend,
     smsStatus,
+    smsTrashAdd,
+    smsTrashList,
+    smsTrashPurge,
+    smsTrashRestore,
     subscribe,
   } from "../lib/backend";
-  import type { SmsFolder, SmsFolderCounts, SmsMessageOut, SmsThreadOut } from "../lib/backend";
+  import type {
+    SmsFolder,
+    SmsFolderCounts,
+    SmsMessageOut,
+    SmsThreadOut,
+    SmsTrashEntryOut,
+  } from "../lib/backend";
   import {
     DRAFT_KEY,
     draftId,
@@ -102,6 +112,14 @@
   let blockBusy = $state(false);
   let blockMsg = $state("");
   let blockOk = $state(false);
+  // View-layer trash (REQ-A42): device messages are *hidden* here, not deleted —
+  // the platform store is off-limits (default-SMS-app ownership), so the panel
+  // says so instead of pretending the texts are gone from the phone.
+  let trash = $state<SmsTrashEntryOut[]>([]);
+  let trashOpen = $state(false);
+  let trashBusy = $state(false);
+  let trashMsg = $state("");
+  let trashOk = $state(false);
   // AmOS-local drafts (the platform only lets the *default* SMS app write
   // drafts, so ours are stored locally and labelled as such).
   let drafts = $state<SmsDraft[]>(normalizeDrafts(readStoreValue<unknown>(DRAFT_KEY, [])));
@@ -135,6 +153,7 @@
   const refreshReal = () => {
     smsBusy = true;
     refreshCounts();
+    refreshTrash(); // keep the trash panel/badge in step with the reads
     void smsFolderSnapshot(folder).then((r) => {
       smsBusy = false;
       if (r.ok) {
@@ -180,6 +199,8 @@
     smsErr = "";
     blockMsg = "";
     blockOk = false;
+    trashMsg = "";
+    trashOk = false;
     refreshReal();
   };
   // Resolve the backend (mock → keep local conversations; device → real).
@@ -299,6 +320,71 @@
     } finally {
       blockBusy = false;
     }
+  };
+  // ---- View-layer trash (REQ-A42) ------------------------------------------
+  const refreshTrash = () => {
+    void smsTrashList().then((l) => {
+      if (l) trash = l;
+    });
+  };
+  const noteTrash = (ok: boolean, msg: string) => {
+    trashOk = ok;
+    trashMsg = msg;
+  };
+  // Hide one device message from the AmOS UI. Honest about every outcome:
+  // hidden, refused (backend error), or stale (the row is no longer in the
+  // folder being viewed). The message itself stays in the platform store.
+  const trashOne = async (m: SmsMessageOut) => {
+    if (trashBusy || !realActiveId) return;
+    trashBusy = true;
+    noteTrash(false, "");
+    try {
+      const r = await smsTrashAdd(realActiveId, m.id, folder);
+      if (!r) {
+        console.warn("[messages] sms_trash_add failed", bridgeDiag());
+        noteTrash(false, t("message.trashFailed"));
+        return;
+      }
+      if (!r.trashed) {
+        noteTrash(false, "notFound" in r ? t("message.trashNotFound") : t("message.trashFailed"));
+        return;
+      }
+      noteTrash(true, t("message.trashDone"));
+      // Hidden rows vanish from the reads; previews/badges recompute backend-side.
+      refreshReal();
+    } finally {
+      trashBusy = false;
+    }
+  };
+  const restoreOne = async (e: SmsTrashEntryOut) => {
+    if (trashBusy) return;
+    trashBusy = true;
+    try {
+      const ok = await smsTrashRestore(e.threadId, e.messageId);
+      noteTrash(ok, ok ? t("message.trashRestored") : t("message.trashFailed"));
+      if (ok) refreshReal();
+    } finally {
+      trashBusy = false;
+    }
+  };
+  // "Purge" is an honest restore-all: nothing is destroyed (it can't be — the
+  // system SMS app owns the store), every hidden message becomes visible again.
+  const purgeTrash = async () => {
+    if (trashBusy) return;
+    trashBusy = true;
+    try {
+      const ok = await smsTrashPurge();
+      noteTrash(ok, ok ? t("message.trashPurged") : t("message.trashFailed"));
+      if (ok) refreshReal();
+    } finally {
+      trashBusy = false;
+    }
+  };
+  // Label for a trash entry: the thread's display name when the current folder
+  // still lists it, else the raw thread id (honest, never invented).
+  const trashThreadName = (threadId: string): string => {
+    const th = realThreads.find((x) => x.id === threadId);
+    return th ? th.display_name || th.address : threadId;
   };
   // Probe once (guarded so the effect can never re-enter).
   let probed = false;
@@ -460,11 +546,46 @@
         <button onclick={() => setFolder(f)} aria-pressed={folder === f} data-folder={f} class={"shrink-0 rounded-full px-3 py-1.5 text-xs " + (folder === f ? "bg-accent text-white" : "bg-black/5 text-neutral-700 dark:bg-white/10 dark:text-neutral-300")}>{t(`message.folder.${f}`)}{#if badge > 0}<span class="ml-1 opacity-80">{badge}</span>{/if}</button>
       {/each}
     </div>
-    <!-- Device inbox toolbar: compose a new message + refresh the real inbox -->
+    <!-- Device inbox toolbar: compose a new message + trash panel + refresh -->
     <div class="mb-1.5 flex items-center justify-between gap-1.5">
       <button onclick={startNew} aria-label="new-sms" class="rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.newSms")}</button>
-      <button onclick={retrySms} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
+      <div class="flex items-center gap-1.5">
+        <button onclick={() => (trashOpen = !trashOpen)} disabled={trashBusy} aria-pressed={trashOpen} data-testid="trash-toggle" title={t("message.trashPanel")}
+          class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.trashPanel")}{#if trash.length > 0}<span class="ml-1 opacity-80">{trash.length}</span>{/if}</button>
+        <button onclick={retrySms} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
+      </div>
     </div>
+    {#if trashMsg}
+      <!-- Outcome of a trash action: what happened, said plainly (hidden vs
+           refused vs stale) — never a silent no-op. -->
+      <p class={"mb-1.5 rounded-xl px-3 py-1.5 text-xs " + (trashOk ? "bg-accent/10 text-accent" : "bg-red-500/10 text-red-500")}
+        data-testid="trash-msg" data-ok={trashOk} role={trashOk ? "status" : "alert"}>{trashMsg}</p>
+    {/if}
+    {#if trashOpen}
+      <!-- View-layer trash (REQ-A42): these messages are hidden from AmOS only —
+           the platform store still holds them, and the hint below says so. -->
+      <div class="mb-1.5 rounded-xl bg-black/[0.03] px-3 py-2 dark:bg-white/5" data-testid="trash-panel">
+        <div class="mb-1 flex items-center justify-between gap-2">
+          <span class="text-xs font-semibold">{t("message.trashPanel")}{#if trash.length > 0} ({trash.length}){/if}</span>
+          <button onclick={() => void purgeTrash()} disabled={trashBusy || trash.length === 0} data-testid="trash-purge"
+            class="rounded-full bg-neutral-200 px-2.5 py-1 text-[11px] disabled:opacity-40 dark:bg-neutral-700">{t("message.trashPurge")}</button>
+        </div>
+        <p class="mb-1.5 text-[11px] leading-snug opacity-60">{t("message.trashHint")}</p>
+        {#if trash.length === 0}
+          <p class="py-1 text-center text-xs opacity-60">{t("message.trashEmpty")}</p>
+        {:else}
+          <ul class="max-h-32 space-y-1 overflow-auto">
+            {#each trash as e (e.threadId + "/" + e.messageId)}
+              <li class="flex items-center justify-between gap-2 text-xs">
+                <span class="min-w-0 truncate opacity-80">{trashThreadName(e.threadId)} · {fmtBubbleTime(e.trashedMs)}</span>
+                <button onclick={() => void restoreOne(e)} disabled={trashBusy} data-testid={`trash-restore-${e.messageId}`}
+                  class="shrink-0 rounded-full bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent disabled:opacity-40">{t("message.trashRestore")}</button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    {/if}
     {#if blockMsg}
       <!-- Outcome of "block this sender": success explains the vanished thread,
            failure is an explicit error — never a silent no-op. -->
@@ -548,11 +669,15 @@
         <p class="py-10 text-center text-sm opacity-60">{t("message.empty")}</p>
       {:else}
         {#each realMsgs as m, i (m.id + "-" + i)}
-          <div role="group" class={"flex items-start gap-1.5 max-w-[86%] " + (m.from_me ? "ml-auto" : "")}>
+          <div role="group" class={"group flex items-start gap-1.5 max-w-[86%] " + (m.from_me ? "ml-auto" : "")}>
             <div class={"rounded-2xl px-3 py-2 text-sm " + (m.from_me ? "bg-accent text-white" : "bg-neutral-300 text-neutral-900 dark:bg-neutral-700 dark:text-white")}>
               <div class="whitespace-pre-wrap">{m.text}</div>
               <div class="mt-0.5 text-right text-xs tabular-nums opacity-60">{fmtBubbleTime(m.ts_ms)}</div>
             </div>
+            <!-- Hide this message from AmOS (view-layer trash, REQ-A42): the
+                 text stays in the platform store; the panel explains that. -->
+            <button onclick={() => void trashOne(m)} disabled={trashBusy} aria-label={t("message.trash")} title={t("message.trash")} data-testid={`trash-msg-btn-${m.id}`}
+              class="mt-1 shrink-0 rounded-full px-1 text-xs opacity-0 transition-opacity group-hover:opacity-60 disabled:opacity-40">{@html iconSvg("trash", "h-3.5 w-3.5")}</button>
           </div>
         {/each}
       {/if}

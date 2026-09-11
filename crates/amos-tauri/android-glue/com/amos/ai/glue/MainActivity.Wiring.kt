@@ -185,6 +185,30 @@ object NativeBootGuard {
  */
 
 /**
+ * AmOS **device care (手机管家) glue** — re-apply after a Tauri regen, alongside
+ * [AlwaysOn] and [BlocklistGlue].
+ *
+ * The generated `MainActivity.onStart` must hand this glue the foreground
+ * Activity and bind it:
+ * ```
+ * try {
+ *   DevCareGlue.attachActivity(this)
+ *   DevCareGlue.bind(applicationContext)
+ * } catch (t: Throwable) { Log.w(TAG, "devcare glue unavailable: $t") }
+ * ```
+ * Three reasons: (1) `bind` installs the real backend (PackageManager inventory,
+ * `ACTION_DELETE` uninstall, `StatFs` storage totals, app-private junk scan) into
+ * the Rust `DevCareBridge` through a JNI upcall; (2) the uninstall dialog must be
+ * started from a **foreground Activity** — an application-context `startActivity`
+ * is silently dropped by the Android 10+ background-activity-start rules; (3)
+ * `bind` is idempotent and fails soft, so an APK built without the `android`
+ * native feature only logs a warning.
+ *
+ * See `DevCareGlue.kt` for the wire contract and the honest scope of a non-root
+ * retail app (it cleans its own cache/logs/APK residue, not other apps').
+ */
+
+/**
  * AmOS **always-on / 常驻·永亮 display** helper — keeps the System UI visible on a
  * real handset "forever" (a wall-mount / showcase build, USB-connected S5…).
  *

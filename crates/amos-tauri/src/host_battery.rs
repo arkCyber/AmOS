@@ -45,6 +45,26 @@ fn clamp_level(level: f64) -> Option<f64> {
     Some(level.clamp(0.0, 100.0))
 }
 
+/// Map a sysfs `status` word onto the charging flag; `None` when ambiguous.
+///
+/// `Full` / `Not charging` both mean the battery is **plugged in** (just not
+/// taking current — e.g. a charge limit), which is what the flag is documented to
+/// mean; only `Charging`/`Discharging` are unambiguous otherwise. An unrecognised
+/// word stays `None` (unknown), never a guess.
+///
+/// Compiled on Linux (its only caller) **and** under `test` — the same gate
+/// [`clamp_level`] uses — so the mapping is actually exercised on the dev host
+/// instead of being unverifiable until a Linux build runs.
+#[cfg(any(target_os = "linux", test))]
+fn charging_from_status(status: &str) -> Option<bool> {
+    match status.trim() {
+        "Charging" => Some(true),
+        "Discharging" => Some(false),
+        "Full" | "Not charging" => Some(true),
+        _ => None,
+    }
+}
+
 /// Tauri command: read the REAL host (desktop) OS battery, or `null` when this
 /// platform has no battery / reader (honest unknown, never fabricated). The UI
 /// layers this below the daemon's authoritative on-device `system_health`.
@@ -122,42 +142,48 @@ mod macos {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Linux `/sys/class/power_supply` reader.
+///
+/// Compiled on Linux (its only caller) **and** under `test`, so the whole reader —
+/// the directory walk and the pure mapping — is exercised on the dev host rather
+/// than being a Linux-CI-only blind spot (same gate as [`clamp_level`]).
+#[cfg(any(target_os = "linux", test))]
 mod linux {
     use std::path::Path;
 
-    use super::HostBattery;
+    use super::{charging_from_status, HostBattery};
 
     /// True when a power-supply entry is a real battery (vs AC/adapter).
     fn is_battery_type(kind: &str) -> bool {
         kind.trim() == "Battery"
     }
 
-    /// Map a sysfs `status` word onto the charging flag; `None` when ambiguous.
-    fn charging_from_status(status: &str) -> Option<bool> {
-        match status.trim() {
-            "Charging" => Some(true),
-            "Discharging" => Some(false),
-            // Full / Not charging while still plugged reads as "plugged".
-            "Full" => Some(true),
-            _ => None,
-        }
-    }
-
     /// Read the first real battery under `root` (default `/sys/class/power_supply`).
+    ///
+    /// An entry that cannot be read is **skipped**, never fatal: a real
+    /// `/sys/class/power_supply` holds entries that are not batteries and may not
+    /// carry a `type` file at all, and one unreadable entry must not hide a battery
+    /// that *is* readable (the old `?` aborted the whole directory and the caller
+    /// reported "unknown" — an observation silently lost).
     pub fn read(root: &str) -> Option<HostBattery> {
         let base = Path::new(root);
         for entry in std::fs::read_dir(base).ok()? {
-            let dir = entry.ok()?.path();
-            let kind = std::fs::read_to_string(dir.join("type")).ok()?;
+            let Ok(entry) = entry else { continue };
+            let dir = entry.path();
+            let Ok(kind) = std::fs::read_to_string(dir.join("type")) else {
+                continue;
+            };
             if !is_battery_type(&kind) {
                 continue;
             }
-            let capacity = std::fs::read_to_string(dir.join("capacity"))
-                .ok()?
-                .trim()
-                .parse::<f64>()
-                .ok()?;
+            // A battery with no readable capacity is not a reading; keep looking
+            // (another battery may be fine) rather than giving up on the device.
+            let Some(capacity) = std::fs::read_to_string(dir.join("capacity"))
+                .ok()
+                .and_then(|c| c.trim().parse::<f64>().ok())
+            else {
+                continue;
+            };
             let status = std::fs::read_to_string(dir.join("status")).unwrap_or_default();
             return Some(HostBattery {
                 level_pct: super::clamp_level(capacity),
@@ -207,27 +233,60 @@ mod tests {
         assert_eq!(macos::parse_pmset("Now drawing from 'AC Power'\n"), None);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     #[test]
-    fn linux_maps_charging_status() {
-        assert_eq!(linux::charging_from_status("Charging"), Some(true));
-        assert_eq!(linux::charging_from_status("Discharging"), Some(false));
-        assert_eq!(linux::charging_from_status("Full"), Some(true));
-        assert_eq!(linux::charging_from_status("Unknown"), None);
+    fn sysfs_charging_status_maps_only_observed_states() {
+        assert_eq!(charging_from_status("Charging"), Some(true));
+        assert_eq!(charging_from_status("Discharging"), Some(false));
+        assert_eq!(charging_from_status("Full"), Some(true));
+        // Plugged but not taking current (charge limit / driver quirk) is still an
+        // *observed* plugged state: mapping it to `None` would silently drop the
+        // battery area from the care report (`BatteryReading::care` needs the flag).
+        assert_eq!(charging_from_status("Not charging"), Some(true));
+        // Trailing whitespace is normal in sysfs files.
+        assert_eq!(charging_from_status("Discharging\n"), Some(false));
+        // An unrecognised word is unknown — never a guess.
+        assert_eq!(charging_from_status("Unknown"), None);
+        assert_eq!(charging_from_status("Something New"), None);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     #[test]
     fn linux_reads_battery_from_a_real_tree() {
         let dir = std::env::temp_dir().join(format!("amos-host-bat-{}", std::process::id()));
+        // Decoy entries FIRST, as a real `/sys/class/power_supply` has them: one that
+        // is not a battery, and ones with **no `type` file at all**. They must be
+        // skipped — the previous `?` aborted the whole directory instead, silently
+        // losing the readable battery added below. (Decoys are created before the
+        // battery so a directory-order walk hits one of them first.)
+        std::fs::create_dir_all(dir.join("AC")).unwrap();
+        std::fs::write(dir.join("AC/type"), "Mains\n").unwrap();
+        std::fs::create_dir_all(dir.join("ADP1")).unwrap();
+        std::fs::create_dir_all(dir.join("zz_typoless")).unwrap();
         let bat = dir.join("BAT0");
         std::fs::create_dir_all(&bat).unwrap();
         std::fs::write(bat.join("type"), "Battery\n").unwrap();
         std::fs::write(bat.join("capacity"), "87\n").unwrap();
         std::fs::write(bat.join("status"), "Discharging\n").unwrap();
-        let b = linux::read(dir.to_str().unwrap()).unwrap();
+        let b = linux::read(dir.to_str().unwrap()).expect("the battery is still found");
         assert_eq!(b.level_pct, Some(87.0));
         assert_eq!(b.charging, Some(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn linux_reports_unknown_when_no_battery_is_readable() {
+        // Only decoys: the honest answer is `None` (unknown), never a fabricated
+        // reading — and a battery whose `capacity` cannot be parsed is not a reading.
+        let dir = std::env::temp_dir().join(format!("amos-host-nobat-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("AC")).unwrap();
+        std::fs::write(dir.join("AC/type"), "Mains\n").unwrap();
+        let broken = dir.join("BAT0");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("type"), "Battery\n").unwrap();
+        std::fs::write(broken.join("capacity"), "not-a-number\n").unwrap();
+        assert_eq!(linux::read(dir.to_str().unwrap()), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

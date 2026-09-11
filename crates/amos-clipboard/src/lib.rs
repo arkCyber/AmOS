@@ -30,6 +30,10 @@ pub mod agent;
 pub mod link;
 pub mod proto;
 pub mod provider;
+/// Real host↔guest byte channel over a Unix domain socket (P2b). `unix` only —
+/// the container topologies this crate targets are all Unix.
+#[cfg(unix)]
+pub mod unix;
 
 #[cfg(feature = "android")]
 pub mod android;

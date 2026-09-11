@@ -1050,3 +1050,57 @@ export async function smsSend(address: string, text: string): Promise<boolean> {
   return r === "sent";
 }
 
+// ---- View-layer trash (REQ-A42) ------------------------------------------------
+// Deleting a real SMS requires owning the platform's default-SMS-app role, which
+// AmOS does not hold. The trash therefore *hides* messages in the AmOS UI only —
+// the system SMS app keeps the originals. The backend stores ids + timestamps
+// (never bodies) and persists them across restarts.
+
+/** One trash entry (mirrors `amos-tauri::sms::TrashEntryOut`): ids and times
+ *  only — the hidden message body is deliberately not here. */
+export interface SmsTrashEntryOut {
+  threadId: string;
+  messageId: string;
+  tsMs: number;
+  trashedMs: number;
+}
+
+/** Outcome of a trash request, keeping the honest cases apart: trashed, refused
+ *  (blocked sender / storage error — `reason`), or the message was not found in
+ *  the given folder (e.g. the list went stale). */
+export type SmsTrashAddResult =
+  | { trashed: true }
+  | { trashed: false; reason: string }
+  | { trashed: false; notFound: true };
+
+/** Hide one message in the AmOS UI. `folder` scopes the request to the folder
+ *  the user is viewing (the whole thread when omitted). `null` outside Tauri. */
+export async function smsTrashAdd(
+  threadId: string,
+  messageId: string,
+  folder?: SmsFolder,
+): Promise<SmsTrashAddResult | null> {
+  const r = await invoke<SmsTrashAddResult>("sms_trash_add", {
+    threadId,
+    messageId,
+    folder: folder ?? "",
+  });
+  return r;
+}
+
+/** The current trash (newest first). `null` when unavailable. */
+export async function smsTrashList(): Promise<SmsTrashEntryOut[] | null> {
+  return invoke<SmsTrashEntryOut[]>("sms_trash_list");
+}
+
+/** Put a trashed message back (undo). `true` only when an entry was removed. */
+export async function smsTrashRestore(threadId: string, messageId: string): Promise<boolean> {
+  return (await invoke<string>("sms_trash_restore", { threadId, messageId })) === "restored";
+}
+
+/** Empty the trash: every hidden message becomes visible again (an honest
+ *  "restore all" — nothing is destroyed). */
+export async function smsTrashPurge(): Promise<boolean> {
+  return (await invoke<string>("sms_trash_purge")) === "purged";
+}
+

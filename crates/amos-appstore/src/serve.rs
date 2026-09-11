@@ -107,6 +107,8 @@ fn sanitize(request: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
     use crate::model::{AppCategory, PackageFormat, PackageRef, Version};
     use crate::webinstall::WebInstaller;
@@ -161,7 +163,18 @@ mod tests {
     }
 
     fn installed_dir() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("amos-serve-{}", std::process::id()));
+        // A **unique** install root per call. Keying the temp dir on the process id
+        // alone made every test in this binary share one directory, so parallel
+        // tests (Rust runs them on separate threads) re-installed under each other
+        // and raced on `resolve_request` — e.g. `resolves_index_asset_and_content_type`
+        // could `.unwrap()` a path another test had just wiped. That is a
+        // non-deterministic test (a failure that cannot be reproduced from the code
+        // is worthless evidence): it flipped red only under load. Each call now gets
+        // its own root (process id + atomic sequence), matching the repo's other
+        // temp fixtures (`amos-devocare::hostfs`, `amos-tauri::host_battery`).
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("amos-serve-{}-{}", std::process::id(), seq));
         let installer = WebInstaller::new(&root);
         let mf = manifest("org.amos.serve");
         installer.install(&mf, &bundle_bytes()).unwrap();

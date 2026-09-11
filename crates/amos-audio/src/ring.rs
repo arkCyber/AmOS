@@ -268,33 +268,60 @@ mod tests {
     fn concurrent_producer_consumer_loses_nothing() {
         // One producer streams a counter; one consumer reads until it has seen
         // every value, asserting strict ordering (an SPSC ring must not reorder).
-        // The producer is throttled to the consumer's ~10 ms drain cadence so the
-        // ring never overflows — proving the lossless ordered hand-off the voice
-        // pipeline depends on.
+        //
+        // **Determinism** (a non-deterministic test is itself a defect — a failure
+        // that cannot be reproduced from the code is worthless evidence): the
+        // producer waits for **room** instead of sleeping a fixed interval, and the
+        // consumer treats a `0` read as "nothing arrived within the read budget"
+        // — which is exactly what `read` documents — instead of asserting on it. The
+        // previous version asserted `n > 0` and `dropped() == 0` against wall-clock
+        // scheduling: on a loaded machine (e.g. a workspace test run alongside a
+        // Gradle build) the producer could be starved past the 1 s budget, or
+        // overrun the 512-sample ring while the consumer was descheduled, flipping
+        // the test red without any code change.
         const BATCH: usize = 4000;
+        const CHUNK: usize = 64;
         let ring = Arc::new(SampleRing::new(512));
         let ring2 = Arc::clone(&ring);
 
         let producer = std::thread::spawn(move || {
+            let cap = ring2.capacity();
             let mut buf = Vec::new();
+            let flush = |buf: &mut Vec<f32>| {
+                // Pace by the consumer: never push into a ring that cannot hold the
+                // whole callback period, so `dropped` stays 0 by construction rather
+                // than by luck.
+                while ring2.pending() + buf.len() > cap {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                ring2.push(buf);
+                buf.clear();
+            };
             for i in 0..BATCH {
                 buf.push(i as f32);
-                if buf.len() == 64 {
-                    ring2.push(&buf);
-                    buf.clear();
-                    std::thread::sleep(Duration::from_millis(1));
+                if buf.len() == CHUNK {
+                    flush(&mut buf);
                 }
             }
             if !buf.is_empty() {
-                ring2.push(&buf);
+                flush(&mut buf);
             }
         });
 
         let mut got = Vec::with_capacity(BATCH);
         let mut out = vec![0.0f32; 128];
+        let deadline = Instant::now() + Duration::from_secs(60);
         while got.len() < BATCH {
             let n = ring.read(&mut out);
-            assert!(n > 0, "producer never EOFs mid-stream");
+            if n == 0 {
+                // Starvation (no sample within the read budget), not proof of a bug:
+                // keep draining, but never spin forever.
+                assert!(
+                    Instant::now() < deadline,
+                    "producer starved for 60 s: the hand-off test cannot proceed"
+                );
+                continue;
+            }
             got.extend_from_slice(&out[..n]);
         }
         producer.join().unwrap();

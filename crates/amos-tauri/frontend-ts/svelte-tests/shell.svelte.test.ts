@@ -6,7 +6,7 @@
  * overlays (Spotlight / Notification Center) open from shellState; Esc closes them.
  * HomeDock/EditHome are fed their controlled channels by Shell from shellState.
  */
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import Shell from "../src/svelte/Shell.svelte";
@@ -156,8 +156,22 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(surf!.textContent ?? "").toContain(zh["app.monitor"]);
   });
 
+  test("opening the calendar app really mounts its month grid through the registry", async () => {
+    open("calendar");
+    const { container } = render(Shell);
+    await tick();
+    const surf = container.querySelector('[data-testid="app-surface"]');
+    expect(surf).toBeTruthy();
+    expect(surf!.textContent ?? "").toContain(zh["app.calendar"]);
+    // The registry's dynamic import resolves and the app screen renders for real
+    // (not just the chrome) — the month grid is the calendar's own DOM.
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="cal-grid"]')).toBeTruthy();
+    });
+    expect(container.querySelectorAll("[data-day]").length).toBe(42);
+  });
+
   test("unlocking from the LockScreen returns Shell to the home surface", async () => {
-    // No PIN configured → LockScreen shows a plain unlock button.
     lock();
     const { container } = render(Shell);
     await tick();

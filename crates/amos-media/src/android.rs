@@ -25,12 +25,29 @@ use serde_json::Value as Json;
 
 use crate::error::{MediaError, Result};
 use crate::mapping::mime_for;
-use crate::provider::MediaProvider;
+use crate::provider::{ensure_loadable, MediaProvider};
 use crate::spec::{MediaItem, MediaKind, StandardDir};
 
 /// Map a JNI error into a [`MediaError::Provider`].
 fn jerr(e: jni::errors::Error) -> MediaError {
     MediaError::Provider(format!("android mediastore glue error: {e}"))
+}
+
+/// Refuse a whole-item [`MediaProvider::load`] whose **declared** size already
+/// exceeds [`crate::MAX_LOAD_BYTES`] — the same ceiling `Mock` and `HostFs`
+/// enforce.
+///
+/// Pure and separate from the JNI round-trip so the policy is host-testable.
+/// Checking the MediaStore-reported size *before* calling the glue matters on a
+/// device: otherwise a multi-gigabyte video is base64-encoded by Kotlin and
+/// materialised in Rust as one unbounded `String`/`Vec<u8>`. A missing size is
+/// not trusted blindly — `AndroidMediaProvider::load` re-checks the bytes that
+/// actually arrived.
+fn check_declared_size(item: &MediaItem) -> Result<()> {
+    match item.size_bytes {
+        Some(size) => ensure_loadable(size),
+        None => Ok(()),
+    }
 }
 
 /// `Send + Sync` handle to the Kotlin `MediaStoreGlue` bridge instance.
@@ -140,6 +157,9 @@ impl MediaProvider for AndroidMediaProvider {
     }
 
     fn load(&self, item: &MediaItem) -> Result<Vec<u8>> {
+        // Bound the allocation like every other backend: a declared-oversized
+        // item is refused *before* the glue base64-encodes it across JNI.
+        check_declared_size(item)?;
         let mut env = self.attach()?;
         let glue = self.glue.0.as_obj();
         let juri = env.new_string(&item.uri).map_err(jerr)?;
@@ -157,9 +177,13 @@ impl MediaProvider for AndroidMediaProvider {
         let v: Json = serde_json::from_str(&json)
             .map_err(|e| MediaError::Provider(format!("glue load unparseable: {e}")))?;
         if let Some(b64) = v.get("base64").and_then(|x| x.as_str()) {
-            STANDARD
+            let bytes = STANDARD
                 .decode(b64)
-                .map_err(|e| MediaError::Provider(format!("glue load bad base64: {e}")))
+                .map_err(|e| MediaError::Provider(format!("glue load bad base64: {e}")))?;
+            // Belt-and-braces: `size_bytes` can be missing or wrong, so enforce
+            // the ceiling on what actually arrived too (never an unbounded `Vec`).
+            ensure_loadable(bytes.len() as u64)?;
+            Ok(bytes)
         } else if let Some(msg) = v.get("error").and_then(|x| x.as_str()) {
             Err(MediaError::Provider(msg.to_string()))
         } else {
@@ -188,5 +212,34 @@ mod tests {
         assert!(matches!(e, MediaError::Provider(m) if m == "no such uri"));
         assert!(glue_err("{not json}").is_none());
         assert!(glue_err(r#"{"id":"x"}"#).is_none());
+    }
+
+    fn item(size: Option<u64>) -> MediaItem {
+        let mut it = MediaItem::new(
+            "content://media/external/video/media/1".to_string(),
+            MediaKind::Video,
+            StandardDir::Movies,
+            "movie.mp4".to_string(),
+            "content://media/external/video/media/1".to_string(),
+            0,
+        )
+        .unwrap_or_else(|e| panic!("fixture: {e}"));
+        it.size_bytes = size;
+        it
+    }
+
+    #[test]
+    fn a_declared_oversized_item_is_refused_before_the_glue() {
+        // The whole-item load ceiling is enforced on the MediaStore-reported size,
+        // so a huge video is refused without a base64 round-trip across JNI.
+        assert!(check_declared_size(&item(Some(1024))).is_ok());
+        // An unknown size is not assumed dangerous; the decoded bytes are then
+        // checked in `load` (so it is still never unbounded).
+        assert!(check_declared_size(&item(None)).is_ok());
+        assert!(matches!(
+            check_declared_size(&item(Some(crate::MAX_LOAD_BYTES + 1))),
+            Err(MediaError::TooLarge { bytes, max })
+                if bytes == crate::MAX_LOAD_BYTES + 1 && max == crate::MAX_LOAD_BYTES
+        ));
     }
 }

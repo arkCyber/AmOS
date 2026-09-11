@@ -17,11 +17,13 @@
 //! deterministic mock); you opt in by constructing it with an explicit base path.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{MediaError, Result};
-use crate::provider::{MediaProvider, MAX_SAVE_BYTES};
+use crate::mapping::kind_and_mime_for_name;
+use crate::provider::{ensure_loadable, window, MediaProvider, MAX_LOAD_BYTES, MAX_SAVE_BYTES};
 use crate::spec::{MediaItem, MediaKind, StandardDir};
 
 /// Map an [`std::io::Error`] into a [`MediaError::Provider`].
@@ -109,7 +111,16 @@ impl MediaProvider for HostFsProvider {
             }
             let mut item = Self::meta(&entry);
             item.collection = dir;
-            item.kind = dir.default_kind();
+            // A real file's type comes from its own name: an `.mp3` in `Music` is
+            // audio, not the collection's generic default. An unknown/extensionless
+            // name keeps the collection's natural kind with **no** fabricated MIME.
+            match kind_and_mime_for_name(&item.name) {
+                Some((kind, mime)) => {
+                    item.kind = kind;
+                    item.mime = Some(mime.to_string());
+                }
+                None => item.kind = dir.default_kind(),
+            }
             items.push(item);
         }
         items.sort_by_key(|i| std::cmp::Reverse(i.ts));
@@ -152,7 +163,37 @@ impl MediaProvider for HostFsProvider {
     }
 
     fn load(&self, item: &MediaItem) -> Result<Vec<u8>> {
+        // Bound the allocation: stat first so a huge file is refused instead of
+        // read into memory unbounded (a streamer uses `read_range` instead).
+        let len = fs::metadata(&item.uri)
+            .map_err(|e| io_err("stat", e))?
+            .len();
+        ensure_loadable(len)?;
         fs::read(&item.uri).map_err(|e| io_err("read", e))
+    }
+
+    fn read_range(&self, item: &MediaItem, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let mut file = fs::File::open(&item.uri).map_err(|e| io_err("open", e))?;
+        let total = file.metadata().map_err(|e| io_err("stat", e))?.len();
+        let (start, end) = window(total, offset, len);
+        if end <= start {
+            return Ok(Vec::new()); // at/after EOF, or an empty request
+        }
+        // Never allocate more than the per-read ceiling.
+        let want = ((end - start) as u64).min(MAX_LOAD_BYTES) as usize;
+        file.seek(SeekFrom::Start(start as u64))
+            .map_err(|e| io_err("seek", e))?;
+        let mut buf = vec![0_u8; want];
+        let mut filled = 0_usize;
+        while filled < want {
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break, // short read at EOF is not an error
+                Ok(n) => filled += n,
+                Err(e) => return Err(io_err("read", e)),
+            }
+        }
+        buf.truncate(filled);
+        Ok(buf)
     }
 }
 
@@ -319,5 +360,123 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let p = HostFsProvider::new(file.clone());
         assert!(p.list(StandardDir::Root).is_err());
+    }
+
+    #[test]
+    fn read_range_reads_windows_from_a_real_file() {
+        let base = tmp_base("rangefs");
+        let p = HostFsProvider::new(base.clone());
+        let saved = p
+            .save(
+                StandardDir::Download,
+                MediaKind::File,
+                "a.bin",
+                b"0123456789",
+            )
+            .unwrap();
+        assert_eq!(p.read_range(&saved, 2, 3).unwrap(), b"234");
+        assert_eq!(p.read_range(&saved, 0, 999).unwrap(), b"0123456789");
+        assert_eq!(p.read_range(&saved, 8, 100).unwrap(), b"89"); // short at EOF
+        assert_eq!(p.read_range(&saved, 10, 5).unwrap(), b""); // at EOF
+        assert_eq!(p.read_range(&saved, 999, 5).unwrap(), b""); // past EOF
+        assert_eq!(p.read_range(&saved, 0, 0).unwrap(), b""); // empty request
+    }
+
+    #[test]
+    fn read_range_on_a_missing_file_is_an_honest_error() {
+        let p = HostFsProvider::new(tmp_base("rangemiss"));
+        let missing = p.dir_path(StandardDir::Download).join("nope.bin");
+        let item = MediaItem::new(
+            "x".to_string(),
+            MediaKind::File,
+            StandardDir::Download,
+            "nope.bin".to_string(),
+            missing.to_string_lossy().into_owned(),
+            0,
+        )
+        .unwrap();
+        assert!(p.read_range(&item, 0, 4).is_err());
+    }
+
+    #[test]
+    fn concurrent_read_range_is_safe() {
+        let base = tmp_base("rangeconc");
+        let p = std::sync::Arc::new(HostFsProvider::new(base.clone()));
+        let saved = p
+            .save(
+                StandardDir::Download,
+                MediaKind::File,
+                "a.bin",
+                b"0123456789",
+            )
+            .unwrap();
+        let mut handles = Vec::new();
+        for k in 0..8_u64 {
+            let p = std::sync::Arc::clone(&p);
+            let it = saved.clone();
+            handles.push(std::thread::spawn(move || {
+                let b = p.read_range(&it, k, 2).expect("range must not fail");
+                assert_eq!(b.len(), 2);
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread must not panic");
+        }
+    }
+
+    #[test]
+    fn list_infers_kind_and_mime_from_real_file_names() {
+        let base = tmp_base("infer");
+        // Real container magic so the fixtures are honest, not just a name.
+        touch(
+            &base.join("Music/晨光.mp3"),
+            b"ID3\x03\x00\x00\x00\x00\x00\x00",
+        );
+        touch(&base.join("Movies/星河.mp4"), b"\x00\x00\x00\x18ftypmp42");
+        touch(
+            &base.join("DCIM/Camera/IMG_1.MP4"),
+            b"\x00\x00\x00\x18ftypmp42",
+        );
+        touch(&base.join("Download/ReleaseNotes.pdf"), b"%PDF-1.4");
+        touch(&base.join("Music/readme.txt"), b"hi");
+        let p = HostFsProvider::new(base.clone());
+
+        let music = p.list(StandardDir::Music).unwrap();
+        let mp3 = music.iter().find(|i| i.name == "晨光.mp3").unwrap();
+        assert_eq!(mp3.kind, MediaKind::Audio);
+        assert_eq!(mp3.mime.as_deref(), Some("audio/mpeg"));
+        let txt = music.iter().find(|i| i.name == "readme.txt").unwrap();
+        assert_eq!(txt.kind, MediaKind::File);
+        assert_eq!(txt.mime.as_deref(), Some("text/plain"));
+
+        let movies = p.list(StandardDir::Movies).unwrap();
+        assert_eq!(movies[0].kind, MediaKind::Video);
+        assert_eq!(movies[0].mime.as_deref(), Some("video/mp4"));
+
+        // A real video in DCIM/Camera now classifies as video (it used to be the
+        // collection default for every entry, i.e. an image).
+        let cam = p.list(StandardDir::Camera).unwrap();
+        assert_eq!(cam[0].kind, MediaKind::Video);
+        assert_eq!(cam[0].mime.as_deref(), Some("video/mp4"));
+
+        let dl = p.list(StandardDir::Download).unwrap();
+        assert_eq!(dl[0].kind, MediaKind::File);
+        assert_eq!(dl[0].mime.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn list_falls_back_to_the_collection_default_for_unknown_types() {
+        let base = tmp_base("inferfallback");
+        touch(&base.join("Movies/mystery.dat"), b"???");
+        touch(&base.join("Recordings/note"), b"???");
+        let p = HostFsProvider::new(base.clone());
+
+        let movies = p.list(StandardDir::Movies).unwrap();
+        assert_eq!(movies[0].kind, MediaKind::Video); // collection default
+        assert!(movies[0].mime.is_none()); // never a fabricated MIME
+
+        let recs = p.list(StandardDir::Recordings).unwrap();
+        assert_eq!(recs[0].kind, MediaKind::Audio);
+        assert!(recs[0].mime.is_none());
     }
 }

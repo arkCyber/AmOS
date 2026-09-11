@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::audit::AuditFile;
+use crate::audit::{AuditFile, AuditRecord};
 
 /// A sensitive resource a third-party app may request access to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -193,6 +193,28 @@ impl PrivacyManager {
             .unwrap_or_default()
     }
 
+    /// A snapshot of **every** app that holds at least one grant, sorted by app
+    /// id with each resource list sorted.
+    ///
+    /// One call for a dashboard, instead of N `granted()` round-trips. This is
+    /// the authority a permission *review* must read — a frontend-local cache can
+    /// disagree with it, and deny-by-default means an app that was never granted
+    /// anything is simply absent.
+    pub async fn grants_snapshot(&self) -> Vec<(String, Vec<Resource>)> {
+        let grants = self.grants.read().await;
+        let mut out: Vec<(String, Vec<Resource>)> = grants
+            .iter()
+            .filter(|(_, set)| !set.is_empty())
+            .map(|(app, set)| {
+                let mut resources: Vec<Resource> = set.iter().copied().collect();
+                resources.sort_by_key(|r| r.key());
+                (app.clone(), resources)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Decide one access request (deny-by-default) and record it in the audit
     /// trail. This is the single chokepoint an interposer/sandbox should call.
     pub async fn authorize(&self, app: &str, resource: Resource) -> AccessDecision {
@@ -256,6 +278,52 @@ impl PrivacyManager {
             if let Err(e) = sink.log(rec).await {
                 tracing::warn!("privacy audit append failed: {e:#}");
             }
+        }
+    }
+
+    /// Append an **externally produced** audit record (e.g. a device-care clean
+    /// or an app uninstall) to the unified durable sink — the same JSON-lines
+    /// file the privacy decisions above are mirrored to.
+    ///
+    /// Returns whether the record was actually **persisted**. `false` means no
+    /// durable sink is attached (the daemon was started without
+    /// `AMOS_PRIVACY_PATH`), so the caller can report the honest state instead of
+    /// assuming a trail exists that does not.
+    pub async fn record_audit(&self, rec: crate::audit::AuditRecord) -> bool {
+        match &self.audit_file {
+            Some(sink) => match sink.log(rec).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("unified audit append failed: {e:#}");
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// A filtered view of the **unified durable trail** (newest first), plus
+    /// whether a durable sink is attached at all.
+    ///
+    /// Distinct from [`PrivacyManager::recent_audit`], which only holds *privacy
+    /// decisions*: this reads the shared [`AuditFile`] that the security layer and
+    /// the device-care bridge also append to (via
+    /// [`PrivacyManager::record_audit`]).
+    ///
+    /// `durable = false` means no sink is attached, so a trail **cannot** exist —
+    /// a caller must not render the empty list as "nothing ever happened".
+    pub async fn recent_trail(
+        &self,
+        limit: usize,
+        principal: Option<&str>,
+        resource: Option<&str>,
+    ) -> (Vec<AuditRecord>, bool) {
+        match &self.audit_file {
+            Some(sink) => (
+                sink.recent_matching(limit, principal, resource, None).await,
+                true,
+            ),
+            None => (Vec::new(), false),
         }
     }
 

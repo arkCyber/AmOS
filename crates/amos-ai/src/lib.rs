@@ -22,6 +22,13 @@ pub mod inference;
 pub mod life_guard;
 pub mod monitoring;
 pub mod netguard_service;
+// Bounded daemon-wide generation admission gate: enforces the long-dormant
+// `Config::max_concurrent_sessions` / `AMOS_MAX_SESSIONS` at the two generation
+// paths (stream_chat + bidi chat). See docs/daemon-resource-gate.md.
+pub mod pool;
+// Bounded LRU+TTL inference-response cache + transparent CachingBackend
+// decorator (opt-in via AMOS_RESPONSE_CACHE=1). Closes the cache.rs audit gap.
+pub mod cache;
 pub mod privacy;
 pub mod privacy_service;
 pub mod profiler;

@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use amos_media::{
-    AccessKind, Grant, MediaError, MediaItem, MediaKind, MediaManager, MediaProvider,
-    MockMediaProvider, StandardDir, MAX_SAVE_BYTES,
+    content_range, plan_response, AccessKind, Grant, MediaError, MediaItem, MediaKind,
+    MediaManager, MediaProvider, MockMediaProvider, ResponsePlan, StandardDir, MAX_RANGE_BYTES,
+    MAX_SAVE_BYTES,
 };
 
 const NOW: u64 = 1_700_000_000_000;
@@ -379,6 +380,73 @@ fn manager_load_is_gated_by_the_read_grant() {
     ));
     m.grant_read(StandardDir::Camera);
     assert_eq!(m.load(&saved).unwrap(), b"abc".to_vec());
+}
+
+#[test]
+fn manager_read_range_is_gated_and_windows_the_bytes() {
+    let m = MediaManager::with_grants(
+        Arc::new(MockMediaProvider::empty()),
+        vec![Grant::write(StandardDir::Download)],
+    );
+    let saved = m
+        .save(
+            StandardDir::Download,
+            MediaKind::File,
+            "a.bin",
+            b"0123456789",
+        )
+        .unwrap();
+    // The streaming primitive obeys the same read policy as `load`.
+    assert!(matches!(
+        m.read_range(&saved, 0, 4),
+        Err(MediaError::Unauthorized {
+            access: AccessKind::Read,
+            ..
+        })
+    ));
+    m.grant_read(StandardDir::Download);
+    assert_eq!(m.read_range(&saved, 2, 3).unwrap(), b"234");
+    assert_eq!(m.read_range(&saved, 8, 100).unwrap(), b"89"); // short at EOF
+    assert_eq!(m.read_range(&saved, 99, 1).unwrap(), b""); // past EOF
+}
+
+#[test]
+fn a_ranged_reply_plan_matches_the_bytes_the_core_serves() {
+    // End-to-end over the public API: plan the reply from a Range header, then
+    // read exactly that window through the manager (planner ↔ provider agree).
+    let m = MediaManager::with_grants(
+        Arc::new(MockMediaProvider::empty()),
+        vec![Grant::write(StandardDir::Download)],
+    );
+    let saved = m
+        .save(
+            StandardDir::Download,
+            MediaKind::File,
+            "a.bin",
+            b"0123456789",
+        )
+        .unwrap();
+    m.grant_read(StandardDir::Download);
+    let total = saved.size_bytes.unwrap_or_default();
+
+    match plan_response(Some("bytes=2-5"), total, MAX_RANGE_BYTES) {
+        ResponsePlan::Partial {
+            start,
+            end,
+            total: t,
+        } => {
+            let bytes = m.read_range(&saved, start, end - start + 1).unwrap();
+            assert_eq!(bytes, b"2345");
+            assert_eq!(content_range(start, end, t), "bytes 2-5/10");
+        }
+        other => panic!("expected partial, got {other:?}"),
+    }
+
+    // A request past the end is planned as 416 (no bytes to read).
+    assert_eq!(
+        plan_response(Some("bytes=99-"), total, MAX_RANGE_BYTES),
+        ResponsePlan::Unsatisfiable { total }
+    );
 }
 
 #[test]

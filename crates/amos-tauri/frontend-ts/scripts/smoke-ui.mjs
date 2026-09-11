@@ -38,7 +38,7 @@ const MARKERS = [
   'data-testid="home-grid"', // paged icon grid
   "home-dot", // page dots (multi-page layout)
   "dock-mag", // single-row bottom dock bar
-  'aria-label="search"', // search pill
+  'data-testid="home-search-entry"', // search pill (locale-independent hook)
 ];
 
 // Strict mode (UI_SMOKE_STRICT=1) additionally requires bespoke first-party

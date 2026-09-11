@@ -14,7 +14,7 @@
  * effecting entry point used by the hook (and callable on its own).
  */
 import { readStoreValue, writeStoreValue } from "./amosStore";
-import { NOTIF_KEY, NOTIF_CAP, type Notif } from "./settings";
+import { NOTIF_KEY, NOTIF_CAP, normalizeNotifs, type Notif } from "./settings";
 import {
   REMINDERS_KEY,
   normalizeReminders,
@@ -104,7 +104,9 @@ export function syncDueReminderAlerts(now = Date.now()): void {
   const fired = normalizeFired(readStoreValue<unknown>(FIRED_KEY, {}));
   const alerts = collectDueAlerts(reminders, fired, now);
   if (alerts.length > 0) {
-    const existing = readStoreValue<Notif[]>(NOTIF_KEY, []);
+    // Normalize the existing list: a corrupt value must not wedge the alert
+    // pipeline (spreading a non-array would throw on every tick, forever).
+    const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
     const fresh = alertsToNotifs(alerts, zh["app.reminders"], now);
     // Newest alert first, keep the rest, respect the notification cap.
     writeStoreValue(NOTIF_KEY, [...fresh.reverse(), ...existing].slice(0, NOTIF_CAP));

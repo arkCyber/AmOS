@@ -134,7 +134,7 @@ impl Rig {
                 .is_ok()
         };
         for msg in frames {
-            if handle_guest_msg(&guard, msg, &mut ingest) {
+            if handle_guest_msg(&guard, msg, &mut ingest).ingested() {
                 ingested += 1;
             }
         }
@@ -237,4 +237,152 @@ fn two_way_round_trip_is_clean_and_lossless() {
         "nothing left pending after both directions"
     );
     assert!(r.to_guest.is_empty());
+}
+
+// ---- P2b: the same two halves over a REAL Unix domain socket ----------------
+
+/// A unique socket path under the temp dir (keeps this test dependency-free).
+fn unique_socket_path(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "amos-clip-e2e-{}-{}-{}-{}.sock",
+        std::process::id(),
+        tag,
+        n,
+        nanos
+    ))
+}
+
+/// The **real transport** (P2b): the host half and the guest agent wired over an
+/// actual Unix domain socket (`bind`/`dial` + `split`), not an in-memory wire.
+///
+/// Unix sockets are available on the host, so this runs for real in CI — the only
+/// remaining P2b work is the Waydroid *namespace bridging* (host and guest do not
+/// share the default UNIX namespace), which needs a device.
+#[test]
+fn real_unix_socket_carries_the_clipboard_both_ways() {
+    use amos_clipboard::unix;
+    use std::io::{ErrorKind, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let path = unique_socket_path("both");
+    let listener = unix::bind(&path).expect("guest binds its socket");
+
+    let guest_clip = MockClipboardProvider::new();
+    let guest_for_thread = guest_clip.clone();
+    let applied = Arc::new(AtomicUsize::new(0));
+    let applied_in_thread = applied.clone();
+
+    // Guest process: accept the host, apply host pushes, report real container
+    // copies back over the same socket's other direction.
+    let server = std::thread::spawn(move || {
+        let conn = unix::accept_one(&listener).expect("guest accepts the host");
+        let (mut guest_read, guest_write) = unix::split(conn).expect("split guest socket");
+        let agent = GuestAgent::new(guest_for_thread);
+        agent
+            .attach(move |m: GuestToHost| {
+                if let Ok(frame) = encode(&m) {
+                    // `&UnixStream` is itself `Write`, so an immutable capture
+                    // satisfies the `Fn` bound (no interior mutability needed).
+                    let mut w = &guest_write;
+                    let _ = w.write_all(&frame);
+                }
+            })
+            .expect("guest change listener attaches");
+        let mut dec = FrameDecoder::<HostToGuest>::new();
+        let mut apply = |chunk: &[u8]| -> Result<(), String> {
+            for msg in dec.push(chunk)? {
+                if agent.apply(&msg).unwrap_or(false) {
+                    applied_in_thread.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        };
+        let _ = unix::drain(&mut guest_read, &mut apply); // ends on host close
+    });
+
+    // Host process: dial the guest, mirror copies out, ingest container copies.
+    let conn = unix::dial(&path).expect("host dials the guest");
+    let (mut host_read, host_write) = unix::split(conn).expect("split host socket");
+    let host_guard = Arc::new(Mutex::new(EchoGuard::new()));
+    let sink = GuestSink::over(host_write, Arc::clone(&host_guard));
+    let host_clip = GlobalClipboard::new();
+
+    // Host ──► guest, over the real socket.
+    host_clip
+        .write_plain("notes", "notes", "from-host")
+        .unwrap();
+    let entry = host_clip.latest().unwrap();
+    sink.push_out(&entry).expect("host push over the socket");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && guest_clip.text().as_deref() != Some("from-host") {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        guest_clip.text().as_deref(),
+        Some("from-host"),
+        "the host copy must reach the guest clipboard over a real socket"
+    );
+    assert_eq!(applied.load(Ordering::Relaxed), 1);
+
+    // Guest ──► host, over the same socket (a genuine container copy).
+    guest_clip.set_primary_text("from-guest").unwrap();
+
+    host_read
+        .set_nonblocking(true)
+        .expect("non-blocking host read");
+    let mut dec = FrameDecoder::<GuestToHost>::new();
+    let mut buf = [0u8; 4096];
+    let mut ingested = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && ingested == 0 {
+        match host_read.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let frames = dec.push(&buf[..n]).expect("guest->host frames decode");
+                let guard = host_guard.lock().unwrap();
+                let mut ingest = |src: &str, text: &str| {
+                    assert_eq!(src, "android:container");
+                    host_clip
+                        .write_plain("android:container", "", text.to_string())
+                        .is_ok()
+                };
+                for msg in frames {
+                    if handle_guest_msg(&guard, msg, &mut ingest).ingested() {
+                        ingested += 1;
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("host read failed: {e}"),
+        }
+    }
+
+    assert_eq!(ingested, 1, "exactly one container copy ingested");
+    assert_eq!(
+        host_clip.latest_text().as_deref(),
+        Some("from-guest"),
+        "the container copy must reach the host shared clipboard"
+    );
+    assert_eq!(
+        host_clip.history(None).len(),
+        2,
+        "exactly the two real copies (own push never echoes back)"
+    );
+
+    // Close the host end; the guest's drain sees EOF and the thread ends.
+    drop(sink);
+    drop(host_read);
+    server.join().expect("guest thread ends on host close");
+    let _ = std::fs::remove_file(&path);
 }

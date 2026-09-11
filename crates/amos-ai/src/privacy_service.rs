@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use amos_proto::amos_privacy::{
     privacy_service_server::{PrivacyService, PrivacyServiceServer},
-    AppGrants, AppRef, AuditQuery, AuditReply, DecisionReply, GrantReply, GrantRequest,
-    ResourceRef,
+    AllGrantsReply, AllGrantsRequest, AppGrants, AppRef, AuditQuery, AuditReply, DecisionReply,
+    GrantReply, GrantRequest, ResourceRef, TrailReply,
 };
 use tonic::{Request, Response, Status};
 
@@ -75,6 +75,32 @@ fn proto_audit(
         outcome: outcome.to_string().to_ascii_lowercase(),
         details: String::new(),
     }
+}
+
+/// Map a lowercase wire outcome back to an [`Outcome`]; unknown ⇒ reject.
+///
+/// An unrecognized outcome is never guessed into the nearest known one — an
+/// audit trail that silently reinterprets a decision is worse than no trail.
+fn parse_outcome(key: &str) -> Result<Outcome, Status> {
+    match key.to_ascii_lowercase().as_str() {
+        "success" => Ok(Outcome::Success),
+        "granted" => Ok(Outcome::Granted),
+        "denied" => Ok(Outcome::Denied),
+        "rejected" => Ok(Outcome::Rejected),
+        "error" => Ok(Outcome::Error),
+        _ => Err(Status::invalid_argument(format!(
+            "unknown audit outcome '{key}'"
+        ))),
+    }
+}
+
+/// Unix seconds now (the daemon's own clock; `0` only if the clock is before the
+/// epoch, which we report rather than panic on).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[tonic::async_trait]
@@ -141,6 +167,23 @@ impl PrivacyService for PrivacySvc {
         }))
     }
 
+    async fn granted_all(
+        &self,
+        _req: Request<AllGrantsRequest>,
+    ) -> Result<Response<AllGrantsReply>, Status> {
+        let apps = self
+            .manager
+            .grants_snapshot()
+            .await
+            .into_iter()
+            .map(|(app_id, resources)| AppGrants {
+                app_id,
+                resources: resources.iter().map(|r| r.key().to_string()).collect(),
+            })
+            .collect();
+        Ok(Response::new(AllGrantsReply { apps }))
+    }
+
     async fn recent_audit(&self, req: Request<AuditQuery>) -> Result<Response<AuditReply>, Status> {
         let r = req.into_inner();
         let limit = if r.limit == 0 {
@@ -168,6 +211,69 @@ impl PrivacyService for PrivacySvc {
             })
             .collect();
         Ok(Response::new(AuditReply { records }))
+    }
+
+    async fn record_audit(
+        &self,
+        req: Request<amos_proto::amos_privacy::AuditRecord>,
+    ) -> Result<Response<GrantReply>, Status> {
+        let r = req.into_inner();
+        let outcome = parse_outcome(&r.outcome)?;
+        if r.principal.trim().is_empty() {
+            return Err(Status::invalid_argument("audit record needs a principal"));
+        }
+        if r.op.trim().is_empty() {
+            return Err(Status::invalid_argument("audit record needs an op"));
+        }
+
+        // The daemon stamps the time: an audit timestamp is the daemon's
+        // authority, not the caller's (a client cannot backdate or forward-date
+        // an event in the trail).
+        let ts = now_secs();
+        let record = crate::audit::AuditRecord {
+            ts,
+            principal: r.principal,
+            op: r.op,
+            resource: r.resource,
+            outcome,
+            details: r.details,
+        };
+        let recorded = self.manager.record_audit(record).await;
+        Ok(Response::new(GrantReply {
+            ok: recorded,
+            message: if recorded {
+                format!("recorded at {ts}")
+            } else {
+                "no durable audit sink configured (AMOS_PRIVACY_PATH unset)".to_string()
+            },
+        }))
+    }
+
+    async fn recent_trail(&self, req: Request<AuditQuery>) -> Result<Response<TrailReply>, Status> {
+        let r = req.into_inner();
+        let limit = if r.limit == 0 {
+            AUDIT_DEFAULT
+        } else {
+            (r.limit as usize).min(AUDIT_MAX)
+        };
+        let principal = (!r.app_id.is_empty()).then_some(r.app_id.as_str());
+        let resource = (!r.resource.is_empty()).then_some(r.resource.as_str());
+
+        let (records, durable) = self.manager.recent_trail(limit, principal, resource).await;
+        Ok(Response::new(TrailReply {
+            records: records
+                .into_iter()
+                .map(|rec| amos_proto::amos_privacy::AuditRecord {
+                    ts: rec.ts,
+                    principal: rec.principal,
+                    op: rec.op,
+                    resource: rec.resource,
+                    outcome: rec.outcome.to_string().to_ascii_lowercase(),
+                    details: rec.details,
+                })
+                .collect(),
+            durable,
+        }))
     }
 }
 
@@ -339,6 +445,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn granted_all_lists_every_holder_once_in_a_stable_order() {
+        let (s, m) = svc();
+        // Deny-by-default: nothing granted ⇒ nothing listed.
+        let none = s
+            .granted_all(Request::new(AllGrantsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(none.apps.is_empty(), "deny-by-default lists nothing");
+
+        m.grant("com.b", Resource::Storage).await;
+        m.grant("com.a", Resource::Microphone).await;
+        m.grant("com.a", Resource::Camera).await;
+        // A revoke leaves an app with nothing ⇒ it must drop out entirely.
+        m.grant("com.c", Resource::Location).await;
+        m.revoke("com.c", Resource::Location).await;
+
+        let all = s
+            .granted_all(Request::new(AllGrantsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(all.apps.len(), 2, "only holders are listed");
+        assert_eq!(all.apps[0].app_id, "com.a", "sorted by app id");
+        assert_eq!(
+            all.apps[0].resources,
+            vec!["camera".to_string(), "microphone".to_string()],
+            "resources sorted by stable key"
+        );
+        assert_eq!(all.apps[1].app_id, "com.b");
+        assert_eq!(all.apps[1].resources, vec!["storage".to_string()]);
+    }
+
+    #[tokio::test]
     async fn granted_lists_and_revoke_clears() {
         let (s, _m) = svc();
         s.grant(Request::new(GrantRequest {
@@ -373,5 +513,206 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(g2.resources.is_empty(), "revoke_all clears the grant set");
+    }
+
+    #[tokio::test]
+    async fn record_audit_persists_to_the_unified_sink_and_validates() {
+        let dir = std::env::temp_dir().join(format!("amos-priv-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditFile::open(&path, 16).unwrap();
+        let m = Arc::new(PrivacyManager::with_audit_file(16, sink));
+        let s = PrivacySvc::new(m, None);
+
+        let reply = s
+            .record_audit(Request::new(amos_proto::amos_privacy::AuditRecord {
+                ts: 123, // ignored — the daemon stamps its own clock
+                principal: "com.amos.devocare".into(),
+                op: "devcare.clean".into(),
+                resource: "app_cache,log_file".into(),
+                outcome: "success".into(),
+                details: "planned=3 freed_bytes=512".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.ok, "a durable sink is attached ⇒ recorded");
+
+        // The record really is in the durable file, daemon-stamped.
+        let reopened = AuditFile::open(&path, 16).unwrap();
+        let recent = reopened.recent(10).await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].principal, "com.amos.devocare");
+        assert_eq!(recent[0].op, "devcare.clean");
+        assert_eq!(recent[0].outcome, Outcome::Success);
+        assert_ne!(recent[0].ts, 123, "the daemon stamps the time");
+
+        // An unknown outcome is rejected, never guessed.
+        let bad = s
+            .record_audit(Request::new(amos_proto::amos_privacy::AuditRecord {
+                ts: 0,
+                principal: "com.amos.devocare".into(),
+                op: "devcare.clean".into(),
+                resource: String::new(),
+                outcome: "maybe".into(),
+                details: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+
+        // A nameless principal / op is rejected.
+        for (principal, op) in [("  ", "devcare.clean"), ("com.x", "  ")] {
+            let err = s
+                .record_audit(Request::new(amos_proto::amos_privacy::AuditRecord {
+                    ts: 0,
+                    principal: principal.into(),
+                    op: op.into(),
+                    resource: String::new(),
+                    outcome: "success".into(),
+                    details: String::new(),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn record_audit_without_a_durable_sink_reports_not_recorded() {
+        // `svc()` builds a manager with NO sink: the honest answer is `ok=false`
+        // (never a false "recorded" that would fake a trail).
+        let (s, _m) = svc();
+        let reply = s
+            .record_audit(Request::new(amos_proto::amos_privacy::AuditRecord {
+                ts: 0,
+                principal: "com.amos.devocare".into(),
+                op: "app.uninstall".into(),
+                resource: "com.example.game".into(),
+                outcome: "success".into(),
+                details: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.ok, "no sink ⇒ not persisted");
+        assert!(reply.message.contains("AMOS_PRIVACY_PATH"));
+    }
+
+    #[tokio::test]
+    async fn recent_trail_reads_the_unified_sink_and_filters_by_principal() {
+        let dir = std::env::temp_dir().join(format!("amos-priv-trail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditFile::open(&path, 16).unwrap();
+        let m = Arc::new(PrivacyManager::with_audit_file(16, sink));
+        let s = PrivacySvc::new(m, None);
+
+        // A privacy decision lands in the *same* unified sink…
+        s.authorize(Request::new(ResourceRef {
+            app_id: "com.amos.phone".into(),
+            resource: "microphone".into(),
+        }))
+        .await
+        .unwrap();
+
+        // …as do ingested device-care actions.
+        for (op, resource, outcome, details) in [
+            (
+                "devcare.clean",
+                "app_cache,log_file",
+                "success",
+                "freed_bytes=175",
+            ),
+            (
+                "app.uninstall",
+                "com.android.settings",
+                "rejected",
+                "protected",
+            ),
+        ] {
+            s.record_audit(Request::new(amos_proto::amos_privacy::AuditRecord {
+                ts: 0,
+                principal: "com.amos.devocare".into(),
+                op: op.into(),
+                resource: resource.into(),
+                outcome: outcome.into(),
+                details: details.into(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Unfiltered: the whole trail, newest first.
+        let all = s
+            .recent_trail(Request::new(AuditQuery {
+                app_id: String::new(),
+                resource: String::new(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(all.durable, "a sink is attached");
+        assert_eq!(all.records.len(), 3, "1 decision + 2 ingested");
+        assert_eq!(all.records[0].op, "app.uninstall");
+        assert_eq!(all.records[1].op, "devcare.clean");
+        assert_eq!(all.records[2].op, "perm.authorize");
+
+        // Filtered by principal (the device-care actor).
+        let care = s
+            .recent_trail(Request::new(AuditQuery {
+                app_id: "com.amos.devocare".into(),
+                resource: String::new(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(care.records.len(), 2);
+        assert!(care
+            .records
+            .iter()
+            .all(|r| r.principal == "com.amos.devocare"));
+        assert_eq!(
+            care.records[0].outcome, "rejected",
+            "a refusal must be visible in the trail"
+        );
+        assert_eq!(care.records[1].outcome, "success");
+        assert_eq!(care.records[1].details, "freed_bytes=175");
+
+        // Filtered by resource.
+        let by_res = s
+            .recent_trail(Request::new(AuditQuery {
+                app_id: String::new(),
+                resource: "com.android.settings".into(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(by_res.records.len(), 1);
+        assert_eq!(by_res.records[0].op, "app.uninstall");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn recent_trail_without_a_sink_is_honestly_not_durable() {
+        // An empty list must never be mistaken for "nothing ever happened".
+        let (s, _m) = svc();
+        let reply = s
+            .recent_trail(Request::new(AuditQuery {
+                app_id: String::new(),
+                resource: String::new(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.durable, "no sink ⇒ a trail cannot exist");
+        assert!(reply.records.is_empty());
     }
 }

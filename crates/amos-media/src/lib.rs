@@ -60,12 +60,17 @@ pub mod hostfs;
 pub mod manager;
 pub mod mapping;
 pub mod provider;
+pub mod range;
 pub mod spec;
 
 pub use error::{MediaError, Result};
 pub use hostfs::HostFsProvider;
 pub use manager::{Grant, MediaManager};
-pub use provider::{MediaProvider, MockMediaProvider, MAX_SAVE_BYTES};
+pub use provider::{MediaProvider, MockMediaProvider, MAX_LOAD_BYTES, MAX_SAVE_BYTES};
+pub use range::{
+    clamp_window, content_range, content_range_unsatisfied, parse_range, plan_response, status_for,
+    window_for, window_len, RangeSpec, ResponsePlan, MAX_RANGE_BYTES,
+};
 pub use spec::{AccessKind, MediaItem, MediaKind, StandardDir};
 
 #[cfg(feature = "android")]

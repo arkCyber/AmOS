@@ -266,6 +266,7 @@ impl SecurityManager {
 - 无明显性能优化
 
 **建议**:
+> **✅ 状态更新（2026-09-11）**：两文件均已创建并通过全量测试——`cache.rs` 落地为 `ResponseCache`（LRU+TTL 与下方 `TokenCache` 意图一致）+ `CachingBackend`；`pool.rs` 因 amos-ai 是 gRPC **服务端**（无出站连接可池化），落地为语义更准确的**生成准入池** `GenerationPool`（并发资源管理，`AMOS_MAX_SESSIONS` 接线）。详见 `docs/daemon-resource-gate.md`（REQ-A43/A44）。
 ```rust
 // crates/amos-ai/src/cache.rs - 需要创建
 pub struct TokenCache {
@@ -353,6 +354,7 @@ pub struct ConnectionPool {
 ### 优先级 🟡 (性能与优化)
 
 #### 7. `crates/amos-ai/src/cache.rs` - 缓存层
+> **✅ 已于 2026-09-11 补全**：`ResponseCache`（有界 LRU+TTL、注入时钟、超限拒绝）+ `CachingBackend` 装饰器（默认关 `AMOS_RESPONSE_CACHE=1`，上游错误绝不缓存）。REQ-A44，见 `docs/daemon-resource-gate.md`。
 ```rust
 // 令牌缓存
 // 结果缓存
@@ -360,6 +362,7 @@ pub struct ConnectionPool {
 ```
 
 #### 8. `crates/amos-ai/src/pool.rs` - 连接池
+> **✅ 已于 2026-09-11 补全**（按守护进程语义落地为**生成准入池**）：`GenerationPool` 有界并发许可（`NonZeroUsize` 容量、fail-fast 默认 + 可选有界等待、RAII permit），`server.rs` 两条生成路径已接线，`AMOS_MAX_SESSIONS` 真正生效。REQ-A43，见 `docs/daemon-resource-gate.md`。
 ```rust
 // 连接复用
 // 资源管理

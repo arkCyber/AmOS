@@ -101,4 +101,15 @@ describe("reminderNotify — OS-level due alerts", () => {
     notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]");
     expect(notifs.filter((x) => x.id === "rem:later")).toHaveLength(1);
   });
+
+  test("a corrupt notifications store is repaired, not left wedging every tick", () => {
+    window.localStorage.setItem(REMINDERS_KEY, JSON.stringify([r("dueNow", NOW - 5_000)]));
+    // Non-array garbage: spreading it used to throw on EVERY reconcile, so no
+    // reminder alert could ever be delivered again (silent, permanent).
+    window.localStorage.setItem(NOTIF_KEY, JSON.stringify({ nope: true }));
+    expect(() => syncDueReminderAlerts(NOW)).not.toThrow();
+    const notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as { id: string }[];
+    expect(Array.isArray(notifs)).toBe(true);
+    expect(notifs.filter((x) => x.id === "rem:dueNow")).toHaveLength(1);
+  });
 });

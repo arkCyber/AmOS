@@ -18,7 +18,8 @@
     "test:svelte": "vitest run --config vitest.config.ts",
     "test:svelte:watch": "vitest --config vitest.config.ts",
     "check": "bun run test && bun run typecheck && bun run typecheck:svelte && bun run test:svelte",
-    "smoke:ui": "bun scripts/smoke-ui.mjs"
+    "smoke:ui": "bun scripts/smoke-ui.mjs",
+    "smoke:player": "bun scripts/smoke-player.mjs"
   },
   "dependencies": {
     "svelte": "^5.0.0"

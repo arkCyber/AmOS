@@ -39,6 +39,7 @@ members = [
     "crates/amos-vector-db",
     "crates/amos-sms",
     "crates/amos-blocklist",
+    "crates/amos-devocare",
 ]
 
 [workspace.package]

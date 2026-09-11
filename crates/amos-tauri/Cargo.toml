@@ -34,6 +34,10 @@ amos-sms = { path = "../amos-sms" }
 # amos-blocklist: spam-blocking rule core (exact/prefix, per channel) shared by
 # the SMS filter and the Android CallScreeningService.
 amos-blocklist = { path = "../amos-blocklist" }
+# amos-devocare: device-care (手机管家) domain core — junk scan/plan/clean, the
+# uninstall safety policy, the read-only permission review and the folded care
+# report. Its `hostfs` backend is the root-confined filesystem scanner/provider.
+amos-devocare = { path = "../amos-devocare" }
 amos-display.workspace = true
 # amos-media: external-storage/media domain core — its MediaManager + MediaProvider
 # seam backs the local `media_*` commands (Mock on host; Android MediaStore on-device
@@ -113,3 +117,6 @@ terminal-pty = ["dep:portable-pty"]
 # bridge command core can be exercised headlessly over UDS (no Tauri/GUI).
 [dev-dependencies]
 amos-ai = { path = "../amos-ai" }
+# The device-care domain crate, for building audit events in the bridge e2e the
+# same way `devcare_clean` does.
+amos-devocare = { path = "../amos-devocare" }

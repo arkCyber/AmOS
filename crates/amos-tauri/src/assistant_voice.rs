@@ -636,10 +636,14 @@ where
                     } else if heard {
                         silent += 1;
                         if silent >= endgap {
+                            // Count BEFORE the send: a consumer that observes the
+                            // `AudioEnd` must never see a stale `submitted()` (the
+                            // stream and the counter would otherwise briefly
+                            // disagree — an ordering race, not just test flakiness).
+                            submitted2.fetch_add(1, Ordering::Relaxed);
                             let _ = feeder.blocking_send(ClientMessage {
                                 payload: Some(Payload::AudioEnd(true)),
                             });
-                            submitted2.fetch_add(1, Ordering::Relaxed);
                             heard = false;
                             silent = 0;
                         }
@@ -647,10 +651,10 @@ where
                 }
             }
             if heard {
+                submitted2.fetch_add(1, Ordering::Relaxed);
                 let _ = feeder.blocking_send(ClientMessage {
                     payload: Some(Payload::AudioEnd(true)),
                 });
-                submitted2.fetch_add(1, Ordering::Relaxed);
             }
         })
         .map_err(|e| e.to_string())?;

@@ -1,7 +1,7 @@
 # 跨系统边界全局剪贴板同步（Container Clipboard Sync）
 
 **日期**: 2026-09-08 · **范围**: 宿主↔Android 容器（Waydroid / no-UI 基座）的全局剪贴板文本同步
-**状态**: 🟡 **P0（宿主半）+ P1（共享协议 + guest 代理 crate）+ P2a（离线可测 link supervisor：注入式 connect/Backoff 重连）已实现并测试**；P2b 真实宿主↔guest 字节通道与 P3 接线/审计为**设备侧待办**（⬜，需真 Waydroid/设备验收）
+**状态**: 🟡 **P0（宿主半）+ P1（共享协议 + guest 代理 crate）+ P2a（离线可测 link supervisor）+ P2b（真实 Unix 域套接字传输，host 上以真实 socket 端到端验证）+ P3 宿主半接线（env 门控、默认 inert，含审计与前台语义测试）已实现并测试**；仅剩 Waydroid 宿主↔guest **命名空间桥接**与 guest 进程托管为**设备侧待办**（⬜）
 
 > **定位判定（Deployment Decision）**：仓库同时维护**两套部署底座**（`docs/android-compat.md` 定位块 + `docs/no-ui-android.md`），而「跨系统边界剪贴板是否隔离」取决于底座，不能混谈：
 >
@@ -42,7 +42,7 @@
 
 **Echo 抑制**：推送会立刻使 guest 剪贴板变化、被 guest 代理如实回报；若不拦，宿主自己的推送会以「容器侧复制」身份回流成假条目（复制回环）。宿主 `EchoGuard` 记录最近一次推送，窗口 `ECHO_WINDOW_MS`=500ms 内**同文本**的 `ClipboardChanged` 判为本方回显并丢弃；异文本（或窗口外的同文本＝用户真再复制）正常 ingest。此语义与 Kotlin `SUPPRESS_WINDOW_MS` 一致，使形态 A/B 在 Rust 边界统一。
 
-**传输无关**：`GuestSink<W: Write> : ClipboardNative` 与 `run_ingest<R: Read>` 基于注入式字节通道——headless 全测，不绑定真实 socket。
+**传输无关**：`GuestSink<W: Write> : ClipboardNative` 与 `run_ingest<R: Read>` 基于注入式字节通道——headless 全测，不绑定具体传输。**真实传输**由 `unix` 模块提供（见 §5），宿主半的 `GuestSink` 可直接架在 `ReconnectingSink` 上。
 
 ## 3. 目标架构（形态 A：宿主 ↔ guest）
 
@@ -73,14 +73,61 @@
 
 实现形态二选一仍属设备判定（与两底座对应）：no-UI 基座（系统级 Rust 经 JNI/binder）或 Waydroid guest 内 system-app。`android` provider 是编译门 + Kotlin bridge 契约，**运行时未在设备验证**（诚实 no-op 惯例）。
 
-## 5. 宿主↔guest 通道桥（P2a 离线核心已实现 `link`；P2b 真实通道 ⬜ 待设备）
+## 5. 宿主↔guest 通道桥（P2a 离线核心 `link` + P2b 真实 UDS 传输 `unix`）
 
-`crates/amos-clipboard/src/link.rs` 落地通道桥里**传输无关、因此可离线全测**的生命周期编排：
+`crates/amos-clipboard/src/link.rs` 落地通道桥里**传输无关、因此可离线全测**的生命周期编排；**真实传输**在 `crates/amos-clipboard/src/unix.rs`（P2b，见下）：
 
 * **`link::Backoff`**——指数退避重连策略：`base×2^n`（封顶 `max`）、有限重试预算（fail-safe：死 peer 最终放弃而非永远重试）、有用连接后 `reset`。
 * **`link::supervise`**——阻塞式 connect→drain→重连驱动：注入式 `connect`（返回 `Read` 传输）、`on_connected`（每连接重建编解码器，绝不让半帧跨重连存活）、`consume`（喂原始字节）、注入式 `sleep`、`report`（诊断）。规则：连接失败按指数退避；**零字节**连接按失败处理（防 accept-即-drop 空转）；有字节的连接 `reset` 退避后立即重连。全部用内存连接器 headless 测试（Backoff 5 项 + supervise 5 项）。
 
-「局域 UDS 秒级同步」的**难点在通道本身**（P2b）：Waydroid guest 与宿主**不共享默认 UNIX 命名空间**，需显式架桥（`waydroid shell`/vsock/binder 之上铺字节流，或容器配置显式挂 socket）。与「表面合成/DMA-BUF、IME 共享」同级，属真实 Waydroid 验收项——届时宿主/guest 各给 `supervise` 一个真实 `connect`（client / listener）与 `|d| thread::sleep(d)`，字节层以上与本处测试完全一致。
+### P2b：真实 Unix 域套接字传输（`amos-clipboard::unix`）
+
+先前「真实 connect」只是文档里的一句委托。现把它实现为 `crates/amos-clipboard/src/unix.rs`
+（`#[cfg(unix)]`），**Unix socket 在 host 上同样可用**，因此整条通道在 CI 里就是真跑的：
+
+* **`bind(path)` / `dial(path)`** —— guest 监听、宿主拨号。`bind` 会先移除崩溃 peer 留下的**陈旧
+  socket 文件**（监听者崩溃不会 unlink 路径），但**拒绝替换非 socket 的真实文件**（绝不静默删文件）。
+* **`split(stream)`** —— 一条连接是全双工的，`try_clone` 给出同一 socket 上独立的 reader/writer，
+  于是 ingest 循环与 mirror sink 各持其一、无需共享锁。
+* **`accept_one` / `serve`** —— guest accept 侧。`serve` 一次跑**一个**会话（见下「重连模型」）。
+* **`drain(reader, consume)`** —— 读半边，形状与 `supervise` 一致（有界 4 KiB 循环、干净 EOF 返回字节数）。
+* **`ReconnectingSink<C>: Write`** —— 断线后**惰性重拨**（每次 write 至多一次），使宿主 `GuestSink`
+  熬过 guest 重启；重拨受 `Backoff` 预算约束（连续失败达上限后**不再拨号**，成功即复位预算）；
+  **绝不 sleep**——它跑在 UI 复制路径上，阻塞重连会冻住一次粘贴。
+
+**重连模型（显式写清）**：一个会话 = 一条全双工 socket，两个方向都走这条连接；连接断了双方都会观察到
+并重连，所以 `serve` **一次只跑一个会话**——这正是「一个宿主、一个 guest」的诚实形状。故意要重叠连接
+（例如两方向各自独立重连）的调用方应自己驱动 `accept_one` 循环，而不要用 `serve`。
+
+**仍剩设备侧**：Waydroid guest 与宿主**不共享默认 UNIX 命名空间**，需显式架桥（`waydroid shell`/vsock/binder
+之上铺字节流，或容器配置显式挂 socket）。与「表面合成/DMA-BUF、IME 共享」同级，属真实 Waydroid 验收项——
+届时宿主/guest 各给 `unix::dial` / `unix::bind` 一个**实际可达的路径**，字节层以上与本站测试完全一致。
+
+### P3 宿主半接线：`clipboard_guest_link`（env 门控、默认 inert）
+
+`crates/amos-tauri/src/clipboard_guest_link.rs` 把上面两块**组合进运行时**：
+
+* **默认什么都不做**。只有 `AMOS_GUEST_CLIPBOARD_SOCKET` 指到一个 socket 才会拨号；未设/空白即
+  **不建线程、不拨号、行为零变化**（`lib.rs::setup` 调 `activate_from_env()`，desktop/CI 走 no-op）。
+  空白不敏感（`parse_guest_socket` 纯函数，有测试）。
+* **单一共享全双工连接**：一轮会话 = 一条 socket。**ingest 循环是唯一的重连权威**——每次 (重)连都
+  `dial` 一次、`split`、把 writer 半边发布给镜像 sink、自己读 reader 半边；连接结束即清除已发布的
+  writer，于是断线期间的复制**诚实失败**（`NotConnected`，计入 `push_failures`）而不是另拨一条连接。
+  （两条独立连接会把 guest→host 方向搁死：guest 只能服务它 accept 的那条。）
+* **审计**：`GuestLinkStats` 单调计数每次推送/推送失败/不可映射拒发/ingest/回显丢弃/空文本/拒绝/确认/
+  拨号/拨号失败；`clipboard_guest_status` 命令返回 `GuestLinkStatus{armed, connected, socket, reason, stats}`
+  ——可以看见「到底发生了什么」。
+* **前台语义的不对称（不得被顺手"修掉"）**：推送发生在**写**时（任何窗口都能复制，与既有行为一致），
+  读共享缓冲仍是**仅前台**（`require_foreground`）。因此后台应用**不能**借 guest 链路抽干别的窗口的剪贴板
+  ——集成测试把这条边界钉死。
+* **空闲可停**：`link::supervise` 现在既在**循环顶部**也在**两次读之间**检查 stop 谓词，并把读超时
+  （`WouldBlock`/`TimedOut`）当作「暂无数据」而非错误——否则一条安静的长连接会让 `link::stop()` 的
+  join 永远挂住（这正是本模块接线时暴露并修掉的真实缺陷）。
+
+**仍剩设备侧**：命名空间桥接（同上）与 guest 进程托管；`clipboard_guest_link` 在非 Unix 构建上诚实报
+「transport is unix-only」。
+
+
 
 ## 6. 安全与隐私
 
@@ -93,23 +140,25 @@
 |---|---|---|---|
 | P0 ✅ | 宿主半传输 + 单源协议抽离 | `amos-tauri` `clipboard_guest.rs`；`amos-clipboard` `proto` | 宿主 **11/11**；`cargo test -p amos-tauri --lib` **143/143**；clippy/fmt 干净 |
 | P1 ✅ | guest 侧代理 crate（`ClipboardProvider` seam + Mock + `GuestAgent` + `android`-gated provider） | `amos-clipboard`（`provider`/`agent`/`android`） | `cargo test -p amos-clipboard`（proto/provider/agent） |
-| P2a ✅ | 通道桥离线核心（`Backoff` + `supervise`：注入式 connect/重连，含**零延迟防 flapping 地板** `min_delay`）+ **内存全双工 e2e**（host transport ↔ guest agent） | `amos-clipboard`（`link`）；`amos-tauri/tests/clipboard_e2e.rs` | `cargo test -p amos-clipboard` 全量 **43/43**；`cargo test -p amos-tauri --test clipboard_e2e` **4/4**（宿主复制→guest 应用无回环、容器复制→宿主 ingest、host guard 丢自回显、双向无损）；`cargo check --features android` + clippy(all-targets 默认 & android)/fmt 干净 |
-| P2b ⬜ | 宿主↔guest 真实字节通道桥（Waydroid socket/vsock 显式架桥） | Waydroid/设备 | 真 Waydroid e2e：A 复制→微信粘贴；微信复制→A 粘贴（秒级、无回环、断线重连） |
-| P3 ⬜ | 接线 `set_native_sink`/`supervise`/`run_ingest` + 审计 + guest 进程托管 | System UI + guest | 设备上长稳、断线重连、无明文泄漏 |
+| P2a ✅ | 通道桥离线核心（`Backoff` + `supervise`：注入式 connect/重连，含**零延迟防 flapping 地板** `min_delay`）+ **内存全双工 e2e**（host transport ↔ guest agent） | `amos-clipboard`（`link`）；`amos-tauri/tests/clipboard_e2e.rs` | `cargo test -p amos-clipboard` 全量 **57/57**（含 link `Backoff`/`supervise` 与 P2b `unix`）；`cargo test -p amos-tauri --test clipboard_e2e` **5/5**（4 内存全双工 + 1 真实 socket）；`cargo check --features android` + clippy(all-targets 默认 & android)/fmt 干净 |
+| P2b ✅(host) | **真实 Unix 域套接字传输**：`bind`/`dial`/`split`/`accept_one`/`serve` + `drain` + `ReconnectingSink` 惰性重拨（预算受限、绝不 sleep） | `amos-clipboard`（`unix`） | `cargo test -p amos-clipboard` 全量 **57/57**（`unix` **8**：bind↔dial 真实 socket 往返、`split` 双向、**陈旧 socket 文件可替换而真实文件被拒**、断线后重拨**恰好一次**、**预算耗尽不再拨号**、`serve` 顺序会话、`drain` 干净 EOF/消费者错误）；`cargo test -p amos-tauri --test clipboard_e2e` **5/5**（含 1 条**真实 Unix socket** 双向 e2e：宿主复制→guest、guest 复制→宿主、无回显） |
+| P2b-device ⬜ | Waydroid 宿主↔guest **命名空间桥接**（显式挂 socket / vsock / `waydroid shell` 之上铺字节流） | Waydroid/设备 | 真 Waydroid e2e：A 复制→微信粘贴；微信复制→A 粘贴（秒级、无回环、断线重连） |
+| P3 ✅(host) | **宿主半接线**：env 门控 + 默认 inert；单一共享全双工连接（ingest 循环为唯一重连权威，writer 发布给镜像 sink）；审计计数 + `clipboard_guest_status`；前台不对称（写不限、读仅前台）钉住；空闲可停 | `amos-tauri`（`clipboard_guest_link`、`lib.rs::setup`）、`amos-clipboard`（`link::supervise` 的 stop/超时语义） | `cargo test -p amos-tauri --test clipboard_guest_link_e2e` **2/2**（env 门控空白不敏感；**真实 UDS** 上：后台窗口复制仍镜像、容器复制回流、自推送回显被丢、审计计数如实、`stop()` 干净退出）；`cargo test -p amos-clipboard` **59/59**（新增 `stop_predicate_ends_the_loop_cleanly…`、`idle_stream_timeouts_are_retried_and_stop_still_works`）；`cargo test -p amos-tauri --test clipboard_e2e` **5/5** |
+| P3-device ⬜ | 设备侧剩余：Waydroid 命名空间桥接 + guest 进程托管 + 真机长稳/断线重连 | System UI + guest | 设备上长稳、断线重连、无明文泄漏 |
 
 
 
 ## 8. 诚实边界
 
-* P0（宿主半）+ P1（guest 代理 crate：provider/agent/proto）+ P2a（`link` Backoff/supervise 重连）已实现且**可离线验证**。P2b 真实宿主↔guest 字节通道、P3 接线与端到端为设备侧工作：`android` provider 仅**编译门** + Kotlin bridge 契约，guest 进程托管、真机 A↔微信互拷、断线重连 e2e 仍未在设备验证——不伪造（同 DMA-BUF 表面合成/IME 共享的既有诚实标注）。
+* P0（宿主半）+ P1（guest 代理 crate：provider/agent/proto）+ P2a（`link` Backoff/supervise 重连）已实现且**可离线验证**。**P2b 的传输代码已落地**（`unix`：真实 Unix 域套接字 bind/dial/split/serve + 惰性重拨 sink + drain），并在 **host 上用真实 socket 端到端验证**（`clipboard_e2e` 的 `real_unix_socket_carries_the_clipboard_both_ways`）。**P3 宿主半接线也已落地**（`clipboard_guest_link`：env 门控、默认 inert、单一共享全双工连接、审计计数、前台不对称与 `stop()` 均由 `clipboard_guest_link_e2e` 在真实 UDS 上钉住）。**仍属设备侧**的只有：Waydroid 宿主↔guest 的**命名空间桥接**（默认 UNIX 命名空间不互通）、`android` provider 的运行时（仅**编译门** + Kotlin bridge 契约）、guest 进程托管。真机 A↔微信互拷、断线重连的**产品级** e2e 仍未在设备验证——不伪造（同 DMA-BUF 表面合成/IME 共享的既有诚实标注）。
 * 本文只约束**文本**同步；图片/URI 多格式跨容器同步超出文本 `ClipboardManager` 能力，属后续。
 * 分支上 `crates/amos-tauri/src/terminal.rs` 存在**既有** fmt/clippy 债务（非本次改动引入），`make lint` 整体红需另行清理。
 
 ## 9. 相关工件
 
 * 代码：
-  * `crates/amos-clipboard/`（**新增**，P1/P2a）—— `proto.rs`（单源共享协议/分帧/echo guard）、`provider.rs`（`ClipboardProvider` seam + Mock）、`agent.rs`（`GuestAgent`）、`android.rs`（`android`-gated JNI provider）、`link.rs`（`Backoff` + `supervise` 通道桥生命周期）、`android-glue/com/amos/ai/glue/AndroidClipboardGlue.kt`（guest Kotlin bridge，设备 bring-up）。
-  * `crates/amos-tauri/src/clipboard.rs`（内核 seam）、`src/clipboard_guest.rs`（宿主半，`pub use amos_clipboard::proto`）、`src/clipboard_glue.rs` + `android-glue/.../ClipboardGlue.kt`（形态 B）。
+  * `crates/amos-clipboard/`（**新增**，P1/P2a/P2b）—— `proto.rs`（单源共享协议/分帧/echo guard）、`provider.rs`（`ClipboardProvider` seam + Mock）、`agent.rs`（`GuestAgent`）、`android.rs`（`android`-gated JNI provider）、`link.rs`（`Backoff` + `supervise` 通道桥生命周期）、**`unix.rs`（真实 Unix 域套接字传输：`bind`/`dial`/`split`/`accept_one`/`serve`/`drain` + `ReconnectingSink`）**、`android-glue/com/amos/ai/glue/AndroidClipboardGlue.kt`（guest Kotlin bridge，设备 bring-up）。
+  * `crates/amos-tauri/src/clipboard.rs`（内核 seam）、`src/clipboard_guest.rs`（宿主半协议 + 传输 seam + 审计计数）、**`src/clipboard_guest_link.rs`（P3 宿主半接线：env 门控、单一共享全双工连接、审计 sink、`clipboard_guest_status`）**、`src/clipboard_glue.rs` + `android-glue/.../ClipboardGlue.kt`（形态 B）。
 * 架构：`docs/android-compat.md`（形态 A）、`docs/no-ui-android.md`（形态 B）、`docs/multi-window.md`。
 
 

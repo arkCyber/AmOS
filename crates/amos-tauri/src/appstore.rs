@@ -53,6 +53,23 @@ fn web_install_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// One installed app as the device-care policy needs it.
+///
+/// `size_bytes` is `None` when the manifest declares no package size — the UI
+/// must show "unknown", never a fabricated `0 B`.
+///
+/// `system` is authoritative only on a device (from `PackageManager`'s
+/// `ApplicationInfo.FLAG_SYSTEM`); the host store registry only ever holds
+/// user-installed bundles, so it reports `false`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct InstalledEntry {
+    pub id: String,
+    pub name: String,
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub system: bool,
+}
+
 /// Attach the configured web-install dir (if any) to a freshly-built store.
 fn apply_web_dir(store: AppStore<Box<dyn StoreProvider>>) -> AppStore<Box<dyn StoreProvider>> {
     match web_install_dir() {
@@ -198,6 +215,53 @@ impl StoreBridge {
                 tracing::warn!("failed to persist appstore registry {}: {e}", p.display());
             }
         }
+    }
+
+    /// The display name of an installed app, if it is installed.
+    ///
+    /// Used by the device-care policy command, which needs the inventory to apply
+    /// [`amos_devocare::UninstallGuard`] before anything is removed.
+    pub fn installed_name(&self, id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .installed_inventory()?
+            .into_iter()
+            .find(|e| e.id == id)
+            .map(|e| e.name))
+    }
+
+    /// The installed inventory as device-care needs it, **sorted by id**.
+    ///
+    /// This is the *bridge-owned* policy input: the WebView never supplies it, so
+    /// the policy preview (`devcare_apps`) and the enforcement
+    /// (`devcare_uninstall`) cannot disagree, and a UI cannot talk the policy into
+    /// treating a package as removable. A device build fills the same shape from
+    /// `PackageManager` (where `system` is known).
+    pub fn installed_inventory(&self) -> Result<Vec<InstalledEntry>, String> {
+        let mut items: Vec<InstalledEntry> = self
+            .store
+            .installed()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|a| InstalledEntry {
+                id: a.manifest.id,
+                name: a.manifest.name,
+                size_bytes: a.manifest.package.size_bytes,
+                // The store registry holds user-installed bundles only.
+                system: false,
+            })
+            .collect();
+        items.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(items)
+    }
+
+    /// Uninstall one app by id and persist the registry.
+    ///
+    /// This is the **only** uninstall path the device-care policy command uses;
+    /// `appstore_uninstall` remains for the store's own UI.
+    pub fn uninstall_by_id(&self, id: &str) -> Result<(), String> {
+        self.store.uninstall(id).map_err(|e| e.to_string())?;
+        self.persist_best_effort();
+        Ok(())
     }
 }
 

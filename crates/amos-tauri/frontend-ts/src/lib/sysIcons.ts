@@ -49,7 +49,12 @@ export type SysIconName =
   | "check"
   | "rotateCcw"
   | "dialpad"
-  | "archive";
+  | "archive"
+  | "shuffle"
+  | "volume"
+  | "volumeX"
+  | "maximize"
+  | "film";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -191,6 +196,28 @@ const INNER: Record<SysIconName, string> = {
     '<rect x="2" y="3.5" width="20" height="5" rx="1.2"/>' +
     '<path d="M4 8.5V19a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8.5"/>' +
     '<path d="M10 12.5h4"/>',
+  shuffle:
+    '<path d="M16 3h5v5"/>' +
+    '<path d="M4 20 21 3"/>' +
+    '<path d="M21 16v5h-5"/>' +
+    '<path d="m15 15 6 6"/>' +
+    '<path d="m4 4 5 5"/>',
+  volume:
+    '<path d="M11 5 6 9H2v6h4l5 4z"/>' +
+    '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>' +
+    '<path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>',
+  volumeX:
+    '<path d="M11 5 6 9H2v6h4l5 4z"/>' +
+    '<path d="m22 9-6 6"/>' +
+    '<path d="m16 9 6 6"/>',
+  maximize:
+    '<path d="M8 3H5a2 2 0 0 0-2 2v3"/>' +
+    '<path d="M21 8V5a2 2 0 0 0-2-2h-3"/>' +
+    '<path d="M3 16v3a2 2 0 0 0 2 2h3"/>' +
+    '<path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
+  film:
+    '<rect x="2" y="3" width="20" height="18" rx="2"/>' +
+    '<path d="M7 3v18M17 3v18M2 9h5M2 15h5M17 9h5M17 15h5"/>',
 };
 
 /** Render a named icon as an SVG markup string. */

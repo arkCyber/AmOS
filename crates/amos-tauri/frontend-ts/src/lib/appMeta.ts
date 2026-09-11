@@ -1,7 +1,7 @@
 /**
  * appMeta.ts — React-free built-in app metadata (single source of truth).
  *
- * id → { titleKey, icon } for the 23 built-in apps. This used to live inside the
+ * id → { titleKey, icon } for the 27 built-in apps. This used to live inside the
  * React `apps.tsx`; extracting it here lets a Svelte shell / registry consume the
  * same data without pulling React, and `apps.tsx` re-exports it so nothing drifts.
  */
@@ -22,6 +22,7 @@ export const APP_META: AppMeta[] = [
   { id: "weather", titleKey: "app.weather", icon: "🌤️" },
   { id: "notes", titleKey: "app.notes", icon: "📝" },
   { id: "reminders", titleKey: "app.reminders", icon: "✅" },
+  { id: "calendar", titleKey: "app.calendar", icon: "📅" },
   { id: "vmemos", titleKey: "app.vmemos", icon: "🎙️" },
   { id: "photos", titleKey: "app.photos", icon: "🖼️" },
   { id: "files", titleKey: "app.files", icon: "📁" },
@@ -29,6 +30,7 @@ export const APP_META: AppMeta[] = [
   { id: "messages", titleKey: "app.messages", icon: "💬" },
   { id: "phone", titleKey: "app.phone", icon: "📞" },
   { id: "music", titleKey: "app.music", icon: "🎵" },
+  { id: "player", titleKey: "app.player", icon: "▶️" },
   { id: "maps", titleKey: "app.maps", icon: "🗺️" },
   { id: "camera", titleKey: "app.camera", icon: "📷" },
   { id: "ai", titleKey: "app.ai", icon: "🤖" },
@@ -39,6 +41,7 @@ export const APP_META: AppMeta[] = [
   { id: "contacts", titleKey: "app.contacts", icon: "👥" },
   { id: "magnifier", titleKey: "app.magnifier", icon: "🔍" },
   { id: "monitor", titleKey: "app.monitor", icon: "📈" },
+  { id: "devocare", titleKey: "app.devocare", icon: "🧹" },
   { id: "terminal", titleKey: "app.terminal", icon: "🖥️" },
 ];
 

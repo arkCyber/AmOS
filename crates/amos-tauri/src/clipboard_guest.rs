@@ -21,34 +21,72 @@
 //!
 //! Nothing is auto-wired (inert on desktop/CI) until a real host↔guest byte
 //! channel is installed on-device — consistent with the crate's "honest no-op
-//! until attached" convention.
+//! until attached" convention. The **real byte channel** itself now exists as
+//! [`amos_clipboard::unix`] (`bind`/`dial`/`split` + a reconnecting sink); wiring
+//! it into the running System UI (and the Waydroid namespace bridge) is the
+//! remaining device-side step — see `docs/clipboard-container-sync.md` §5/§7.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
 
 pub use amos_clipboard::proto::{encode, EchoGuard, FrameDecoder, GuestToHost, HostToGuest};
 
 use crate::clipboard::{ClipboardEntry, ClipboardNative};
 
+/// Why a decoded guest message did (or did not) change the shared clipboard.
+///
+/// Returning the *reason* rather than a bare `bool` lets the transport audit each
+/// outcome precisely (ingests vs echoes vs blank vs acks) without re-deriving the
+/// decision and drifting from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestMsgOutcome {
+    /// A real container copy was handed to the ingest callback and accepted.
+    Ingested,
+    /// Our own push echoed back within the suppression window — dropped.
+    Echo,
+    /// A change whose text is blank/whitespace-only — dropped.
+    Blank,
+    /// The ingest callback declined it (e.g. the ingest bus is not armed) — dropped.
+    Refused,
+    /// Informational ack — never an ingest.
+    Ack,
+}
+
+impl GuestMsgOutcome {
+    /// Did this message become a shared-clipboard entry?
+    pub fn ingested(self) -> bool {
+        matches!(self, GuestMsgOutcome::Ingested)
+    }
+}
+
 /// Act on one decoded guest message: ingest a real container copy, ignore echoes
-/// and acks. Returns `true` only when the copy was handed to `ingest` and the
-/// ingest accepted it.
+/// and acks. Returns *why* (see [`GuestMsgOutcome`]).
 pub fn handle_guest_msg(
     guard: &EchoGuard,
     msg: GuestToHost,
     ingest: &mut dyn FnMut(&str, &str) -> bool,
-) -> bool {
+) -> GuestMsgOutcome {
     match msg {
         GuestToHost::ClipboardChanged { text, .. } => {
             if text.trim().is_empty() {
-                return false;
+                return GuestMsgOutcome::Blank;
             }
             if guard.is_self_echo_now(&text) {
-                return false; // our own echo within the suppression window
+                return GuestMsgOutcome::Echo; // our own echo within the suppression window
             }
-            ingest("android:container", &text)
+            if ingest("android:container", &text) {
+                GuestMsgOutcome::Ingested
+            } else {
+                // The ingest callback declined it (e.g. the bus is not armed): honest,
+                // and explicitly *not* an ingest.
+                GuestMsgOutcome::Refused
+            }
         }
-        GuestToHost::PushAcked { .. } => false, // informational; never an ingest
+        GuestToHost::PushAcked { .. } => GuestMsgOutcome::Ack, // informational
     }
 }
 
@@ -141,11 +179,165 @@ pub fn run_ingest<R: Read>(
             return Ok(ingested); // clean EOF: peer closed
         }
         for msg in decoder.push(&chunk[..n])? {
-            if handle_guest_msg(guard, msg, &mut *ingest) {
+            if handle_guest_msg(guard, msg, &mut *ingest).ingested() {
                 ingested += 1;
             }
         }
     }
+}
+
+// ---- P3 host-half wiring: env-gated, inert by default ----------------------
+//
+// Everything above is transport + protocol. Below is the *wiring*: build the
+// audited mirror sink over `amos_clipboard::unix`, start the reconnecting ingest
+// loop, and install the sink as the process-global native transport.
+//
+// **Inert by default.** Nothing here dials anything unless the operator names a
+// socket via [`GUEST_SOCKET_ENV`]. `lib.rs::setup` calls [`arm_from_env`], which
+// returns `None` on desktop/CI (no socket configured) — no thread, no dial, no
+// behaviour change. That keeps the "honest no-op until attached" convention.
+
+/// Env var naming the guest clipboard socket. **Unset/empty ⇒ the whole guest link
+/// stays inert** — no dial and no thread; desktop/CI never touches a socket.
+pub const GUEST_SOCKET_ENV: &str = "AMOS_GUEST_CLIPBOARD_SOCKET";
+
+/// Parse the configured socket path from a raw env value. Pure (does not read the
+/// process environment), so it is testable without racing other tests. `None` and
+/// blank/whitespace-only both mean "not configured".
+pub fn parse_guest_socket(raw: Option<&str>) -> Option<PathBuf> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// The configured guest socket, or `None` when [`GUEST_SOCKET_ENV`] is unset/blank.
+pub fn guest_socket_from_env() -> Option<PathBuf> {
+    let raw = std::env::var(GUEST_SOCKET_ENV).ok();
+    parse_guest_socket(raw.as_deref())
+}
+
+/// Auditable counters for the host↔guest link.
+///
+/// Every counter is monotone and only moves when the thing really happened: a push
+/// that never reached the wire is not a push, and a container change we refused is
+/// not an ingest. This makes the §6 requirement — *cross-trust-domain pushes must be
+/// explicit and auditable, never a background backdoor* — concrete in the host half.
+#[derive(Debug, Default)]
+pub struct GuestLinkStats {
+    pushes: AtomicU64,
+    push_failures: AtomicU64,
+    pushes_refused_unmappable: AtomicU64,
+    ingests: AtomicU64,
+    echoes_dropped: AtomicU64,
+    blanks_dropped: AtomicU64,
+    refuses: AtomicU64,
+    acks: AtomicU64,
+    dials: AtomicU64,
+    dial_failures: AtomicU64,
+}
+
+impl GuestLinkStats {
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Host→guest pushes actually written to the socket.
+    pub fn pushes(&self) -> u64 {
+        self.pushes.load(Ordering::Relaxed)
+    }
+    /// Pushes that failed at the transport (nothing reached the guest).
+    pub fn push_failures(&self) -> u64 {
+        self.push_failures.load(Ordering::Relaxed)
+    }
+    /// Pushes refused before the wire (image-only payloads can't mirror to a text
+    /// container clipboard).
+    pub fn pushes_refused_unmappable(&self) -> u64 {
+        self.pushes_refused_unmappable.load(Ordering::Relaxed)
+    }
+    /// Container→host copies accepted into the shared clipboard.
+    pub fn ingests(&self) -> u64 {
+        self.ingests.load(Ordering::Relaxed)
+    }
+    /// Container changes dropped as our own echo (copy-loop guard).
+    pub fn echoes_dropped(&self) -> u64 {
+        self.echoes_dropped.load(Ordering::Relaxed)
+    }
+    /// Socket dial attempts (mirror-sink reconnects + ingest-loop reconnects).
+    pub fn dials(&self) -> u64 {
+        self.dials.load(Ordering::Relaxed)
+    }
+    /// Dial attempts that failed.
+    pub fn dial_failures(&self) -> u64 {
+        self.dial_failures.load(Ordering::Relaxed)
+    }
+
+    /// Classify one decoded guest message for the audit trail (called by the host
+    /// wiring's ingest loop).
+    pub fn record_guest_msg(&self, outcome: GuestMsgOutcome) {
+        match outcome {
+            GuestMsgOutcome::Ingested => Self::bump(&self.ingests),
+            GuestMsgOutcome::Echo => Self::bump(&self.echoes_dropped),
+            GuestMsgOutcome::Blank => Self::bump(&self.blanks_dropped),
+            GuestMsgOutcome::Refused => Self::bump(&self.refuses),
+            GuestMsgOutcome::Ack => Self::bump(&self.acks),
+        }
+    }
+
+    /// Record a host→guest push that reached the wire (called by the audited mirror
+    /// sink in `clipboard_guest_link`).
+    pub fn record_push(&self) {
+        Self::bump(&self.pushes);
+    }
+    /// Record a push that failed at the transport (nothing reached the guest).
+    pub fn record_push_failure(&self) {
+        Self::bump(&self.push_failures);
+    }
+    /// Record a push refused before the wire (unmappable payload).
+    pub fn record_push_refused_unmappable(&self) {
+        Self::bump(&self.pushes_refused_unmappable);
+    }
+    /// Record a dial attempt / a failed dial (mirror-sink reconnects).
+    pub fn record_dial(&self) {
+        Self::bump(&self.dials);
+    }
+    /// Record a dial attempt that failed.
+    pub fn record_dial_failure(&self) {
+        Self::bump(&self.dial_failures);
+    }
+
+    /// A serializable snapshot (what `clipboard_guest_status` returns).
+    pub fn snapshot(&self) -> GuestLinkStatsView {
+        GuestLinkStatsView {
+            pushes: self.pushes(),
+            push_failures: self.push_failures(),
+            pushes_refused_unmappable: self.pushes_refused_unmappable(),
+            ingests: self.ingests(),
+            echoes_dropped: self.echoes_dropped(),
+            blanks_dropped: self.blanks_dropped.load(Ordering::Relaxed),
+            refuses: self.refuses.load(Ordering::Relaxed),
+            acks: self.acks.load(Ordering::Relaxed),
+            dials: self.dials(),
+            dial_failures: self.dial_failures(),
+        }
+    }
+}
+
+/// Serializable view of [`GuestLinkStats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GuestLinkStatsView {
+    pub pushes: u64,
+    pub push_failures: u64,
+    pub pushes_refused_unmappable: u64,
+    pub ingests: u64,
+    pub echoes_dropped: u64,
+    pub blanks_dropped: u64,
+    pub refuses: u64,
+    pub acks: u64,
+    pub dials: u64,
+    pub dial_failures: u64,
 }
 
 #[cfg(test)]
@@ -170,7 +362,7 @@ mod tests {
                 true
             },
         );
-        assert!(handled);
+        assert_eq!(handled, GuestMsgOutcome::Ingested);
         assert_eq!(
             seen,
             vec![("android:container".to_string(), "from-wechat".into())]
@@ -193,7 +385,7 @@ mod tests {
                 true
             },
         );
-        assert!(!handled, "echo must not be ingested");
+        assert_eq!(handled, GuestMsgOutcome::Echo, "echo must not be ingested");
         assert_eq!(calls, 0);
     }
 
@@ -201,7 +393,11 @@ mod tests {
     fn handle_ignores_ack() {
         let g = EchoGuard::new();
         let handled = handle_guest_msg(&g, GuestToHost::PushAcked { seq: 1 }, &mut |_, _| true);
-        assert!(!handled, "an ack must never be ingested");
+        assert_eq!(
+            handled,
+            GuestMsgOutcome::Ack,
+            "an ack must never be ingested"
+        );
     }
 
     #[test]
@@ -215,7 +411,11 @@ mod tests {
             },
             &mut |_, _| true,
         );
-        assert!(!handled, "blank text must not be ingested");
+        assert_eq!(
+            handled,
+            GuestMsgOutcome::Blank,
+            "blank text must not be ingested"
+        );
     }
 
     #[test]
@@ -229,7 +429,11 @@ mod tests {
             },
             &mut |_, _| false, // e.g. ingest bus not armed
         );
-        assert!(!handled);
+        assert_eq!(
+            handled,
+            GuestMsgOutcome::Refused,
+            "a declined ingest is explicitly not an ingest"
+        );
     }
 
     // ---- sink (ClipboardNative) ----

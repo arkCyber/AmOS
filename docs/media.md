@@ -33,6 +33,8 @@
 | `spec` | `StandardDir`（DCIM/Camera、Screenshots、Pictures、Download、Recordings、Movies、Music、Root）+ `MediaKind`（Image/Video/Audio/File/Download）+ `AccessKind`（Read/Write）+ `MediaItem`（opaque `uri`：真机 `content://` / mock `mock://`）——均 serde，可直接过桥到 UI |
 | `error` | `MediaError`：`Unauthorized{access,collection}` / `NotFound` / `TooLarge{bytes,max}` / `InvalidArguments` / `Provider` |
 | `provider` | `MediaProvider` seam（哑读）+ 确定性 `MockMediaProvider`（`empty`/`from_items`/`seeded`/`single_photo`，`mock-<seq>` 确定性 id）+ `MAX_SAVE_BYTES`（64 MiB）上限 |
+| `range` | **RFC 7233 单范围**的纯决策：`RangeSpec`/`ResponsePlan` + `parse_range`/`plan_response`/`clamp_window`/`content_range`/`status_for`——"读哪一段、回什么状态码"在碰存储之前就定好（无 IO，可穷举测试） |
+| `read_range` seam | `MediaProvider::read_range`（默认=有界 `load` 后切片；Mock=blob 切片；HostFs=**真 seek+读**）+ 整项 `MAX_LOAD_BYTES`（256 MiB）上限，`MediaManager::read_range` 与 `load` **同一读授权** |
 | `manager` | `MediaManager` + `Grant`：持有 `Arc<dyn MediaProvider>` + 逐 `(access,collection)` 授权；**默认全无授权**；`list`=读门控，`save`=写门控；未授权返回 `Unauthorized`（绝不伪装空列表）；空名单校验先于权限 |
 
 **为何 provider「哑」、策略放 manager**：与 radio/sensor 一致——Mock 与未来真后端共享同一套
@@ -87,6 +89,20 @@
 | Android 映射（按 API 权限/MIME/路径） | `mapping::tests::*`（5 例） | `src/mapping.rs` |
 | `media_*` 命令层（boot mock/hostfs、读写往返、load、错误串、hostfs 端到端） | `amos-tauri --lib media::`（6 例） | `crates/amos-tauri/src/media.rs` |
 | 前端 TS 桥：normalize/合并/离线 null/有桥被拒 reject | `media.test.ts` + `photoLibrary.test.ts`（17 例） | `frontend-ts/src/__tests__/` |
+| RFC 7233 单范围解析与规划（开/闭/后缀/越界/畸形/多范围/空资源） | `range::tests::*`（**18 例**） | `src/range.rs` |
+| `read_range` 默认实现（有界 load 切片）+ 窗口数学全域 | `provider::tests::the_default_read_range_slices_the_loaded_bytes` / `window_is_total_and_clamped` | `src/provider.rs` |
+| Mock `read_range` 窗口 + 无内容诚实报错 | `provider::tests::mock_read_range_returns_windows_and_stays_honest` | 同上 |
+| 整项 load 上限（有界分配） | `provider::tests::ensure_loadable_enforces_the_ceiling` | 同上 |
+| Android `load` 整项上限：先按 MediaStore 声明尺寸拒绝（**跨 JNI 前**），解码后再兜底 | `android::tests::a_declared_oversized_item_is_refused_before_the_glue` | `src/android.rs`（`cargo test -p amos-media --features android`） |
+| HostFs `read_range` 真文件窗口 / EOF 短读 / 缺文件诚实报错 / 并发安全 | `hostfs::tests::read_range_reads_windows_from_a_real_file`、`read_range_on_a_missing_file_is_an_honest_error`、`concurrent_read_range_is_safe` | `src/hostfs.rs` |
+| manager `read_range` 与 `load` 同读授权门控 | `manager_read_range_is_gated_and_windows_the_bytes` | `tests/media_core.rs` |
+| 规划 ↔ provider 端到端一致（206 窗口字节 == `Content-Range`） | `a_ranged_reply_plan_matches_the_bytes_the_core_serves` | 同上 |
+| `media_read_range` 命令层（窗口 / 无内容 / 撤销读授权） | `amos-tauri --lib media::`（**13 例**，含 `command_core_read_range_windows_and_is_gated`） | `crates/amos-tauri/src/media.rs` |
+| 真实文件按**扩展名**推断 kind+MIME（未知/无扩展名不伪造） | `mapping::tests::kind_and_mime_infers_real_media_types` / `extension_of_is_path_aware_and_rejects_dotfiles` / `kind_and_mime_is_none_for_unknown_or_extensionless` | `src/mapping.rs` |
+| HostFs 用**真实类型**列表（`.mp3`→Audio/audio/mpeg；`DCIM/Camera` 的 `.mp4`→Video；未知回退集合默认且 mime=None） | `hostfs::tests::list_infers_kind_and_mime_from_real_file_names` / `list_falls_back_to_the_collection_default_for_unknown_types` | `src/hostfs.rs` |
+| 桥在**真实文件树**上分类 + 流式读取（`ftyp` 窗口 == 整项 load） | `amos-tauri --lib media::` 的 `hostfs_bridge_classifies_and_streams_real_media` | `crates/amos-tauri/src/media.rs` |
+| **真媒体验收探针**（容器魔数 + 窗口字节精确 + 206 规划；真机 root 树同一二进制） | `cargo run -p amos-media --example probe_media -- <ROOT>`（实测 **4 可播 / 0 失败**） | `examples/probe_media.rs` |
+| 本地多媒体播放器（扩展名/MIME 分类、三来源归一、队列去重、随机/循环/步进、有界缓冲、拒绝不伪装） | `player.test.ts`（19 例）+ `player.svelte.test.ts`（5 例） | `frontend-ts/src/lib/player.ts` + `src/svelte/PlayerApp.svelte`（设计/边界见 **`docs/media-player.md`**） |
 
 **工程红线（aerospace，编译期/静态保证）**：生产 `deny(clippy::unwrap_used/expect_used/panic)`；
 默认构建 `forbid(unsafe_code)`；锁毒化 `into_inner` 恢复；错误类型化、绝不伪装空/成功。
@@ -96,4 +112,35 @@
 
 > 测试机到手后的逐条执行步骤、命令与验收点见 **`docs/device-bringup-checklist.md`**（路径 A root 扫 DCIM /
 > B 普通 App 走 MediaStore / C Waydroid 直读，三选一）。
+
+## 7. 真媒体验收（2026-09-10，host 实测）
+
+用 **ffmpeg 生成的真实编码文件**（非合成占位）搭一棵符合 Android 布局的媒体树，再用
+`probe_media` 走**与播放器相同的领域路径**（list → 分类 → 有界 load → `read_range` → 范围规划）：
+
+```sh
+# 真实素材：LAME mp3 / H.264+AAC mp4 / AAC m4a（含 DCIM/Camera 与一个非媒体文件）
+ffmpeg -f lavfi -i 'sine=frequency=330:duration=2' -c:a libmp3lame /tmp/amos-real-media/Music/晨光.mp3
+ffmpeg -f lavfi -i testsrc=size=320x240:rate=15:duration=2 -f lavfi -i 'sine=frequency=220:duration=2' \
+       -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest /tmp/amos-real-media/Movies/星河.mp4
+cargo run -p amos-media --example probe_media -- /tmp/amos-real-media
+```
+
+实测输出（`0 failures`，退出码 0）：
+
+```text
+--  Music/readme.txt               kind=File  mime=text/plain         (not media — not queued)
+OK  Music/晨光.mp3                  kind=Audio mime=audio/mpeg  bytes=33062
+OK  Movies/星河.mp4                 kind=Video mime=video/mp4   bytes=30383
+OK  Camera/IMG_0001.mp4            kind=Video mime=video/mp4   bytes=5401
+OK  Recordings/Voice_001.m4a       kind=Audio mime=audio/mp4   bytes=25640
+--  Download/ReleaseNotes.pdf      kind=File  mime=application/pdf   (not media — not queued)
+probe: 6 files, 4 playable, 0 failures
+```
+
+每个可播文件都通过了三项检查：**容器魔数**与类型一致（`ftyp` / `ID3`）、**窗口读取逐字节等于**
+整项切片（起始/中间/尾/EOF/越界/非对齐）、以及 `Range: bytes=0-` 规划出合法 **206** 窗口。
+这次真机素材测试还**暴露并修掉**一个真实缺陷：`HostFsProvider` 原先按**所属集合的默认 kind**
+报告类型（`Music` 的默认是 `File`）且 `mime=None`，因此一个真实 `.mp3` 被报成"普通文件"——
+现改为按扩展名推断 kind+MIME（未知则不伪造）。
 

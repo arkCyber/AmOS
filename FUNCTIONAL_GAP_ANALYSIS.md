@@ -102,7 +102,7 @@
 32. ~~**无监控指标**（`monitoring.rs` 未创建）~~ → **✅ 已完成（2026-09-03）**：`amos-ai` 新增 `monitoring.rs`——`Monitor` 无锁计数（rpc_total、uptime、周期心跳）经 tonic interceptor 集中统计；`StatusReply` 现携带 `rpc_total`/`heartbeats`，任意 `GetStatus` 探针即可读实时指标；`AMOS_METRICS_INTERVAL_SECS` 调周期。
 33. ~~**无周期性健康检查/探针**（`GetStatus` 仅 boot 时查一次）~~ → **✅ 部分完成（2026-09-03）**：daemon 侧周期自健康心跳（heartbeat 计数 + 指标日志）已落地并随 `serve()` 启停；跨进程/客户端侧定时调用 `GetStatus` 的探针仍待接（见下）。
 34. **无日志持久化/聚合**（tracing 仅 stdout）。
-35. **无缓存层 / 连接池**（`cache.rs`、`pool.rs` 未创建）。
+35. **无缓存层 / 连接池**（~~`cache.rs`、`pool.rs` 未创建~~ **已于 2026-09-11 补全**：`pool.rs` = `GenerationPool` 生成准入池（`AMOS_MAX_SESSIONS` 已接线，REQ-A43）；`cache.rs` = `ResponseCache` + `CachingBackend`（默认关，`AMOS_RESPONSE_CACHE=1`，REQ-A44）；见 `docs/daemon-resource-gate.md`）。
 36. **无基准/压力/混沌测试**。
 
 ### 🟢 I. 生态 / 分发
@@ -121,7 +121,7 @@
 - [x] 集成 `EnhancedAndroidManager` 到 AndroidManager 服务（✅ 2026-09-01，`service.rs`）
 - [x] 实现真实 GGML/llama.cpp 后端（✅ 部分 2026-09-04：外部 `allama` 子进程路径 + `AMOS_GGML_STRICT=1` 诚实报错开关已落地；进程内 C 绑定与厂商 NPU 运行时仍待真机 + SDK，见 `docs/qcom-mtk-bringup.md`）
 - [x] 实现 `monitoring.rs`（性能指标/健康检查，✅ 2026-09-03）
-- [ ] 连接池 `pool.rs`、缓存层 `cache.rs`
+- [x] 连接池 `pool.rs`、缓存层 `cache.rs`（✅ 2026-09-11：`GenerationPool` 生成准入池 + `ResponseCache`/`CachingBackend`，REQ-A43/A44，`docs/daemon-resource-gate.md`）
 - [x] 会话持久化（✅ 2026-09-01，`SessionManager` + `AMOS_SESSIONS_PATH`）
 - [ ] 压力/负载测试
 

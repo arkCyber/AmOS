@@ -17,7 +17,7 @@
 //! guest: a listener) and `|d| std::thread::sleep(d)`; everything above the bytes
 //! is identical to what is tested here.
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::time::Duration;
 
 /// Exponential reconnect backoff policy (deterministic — no jitter).
@@ -82,12 +82,13 @@ impl Backoff {
     }
 }
 
-/// Drive a blocking connect → drain → reconnect loop until [`Backoff`] gives up.
+/// Drive a blocking connect → drain → reconnect loop until [`Backoff`] gives up or
+/// the `stop` predicate asks to shut down.
 ///
-/// The loop never returns on success (it runs until the peer is gone for good);
-/// it only terminates by returning `Err` once the [`Backoff`] retry budget is
-/// exhausted. Callers wanting to observe connection/session events use the
-/// `report` callback.
+/// On success it keeps running (a healthy link is long-lived); it returns `Err`
+/// once the [`Backoff`] retry budget is exhausted, or `Ok(())` when `stop` returns
+/// `true`. Callers wanting to observe connection/session events use the `report`
+/// callback.
 ///
 /// * `connect` — open a fresh connection; `Err` counts as one failed attempt.
 /// * `on_connected` — called once per successful open (reset per-connection codec
@@ -96,6 +97,13 @@ impl Backoff {
 ///   fatally out of sync and ends this connection.
 /// * `sleep` — injectable wait (tests record it; production passes `thread::sleep`).
 /// * `report` — receives a short reason for diagnostics each time a connection ends.
+/// * `stop` — polled at the top of every iteration **and between reads**; when it
+///   returns `true` the loop returns `Ok(())` — a **requested, clean shutdown**, not
+///   an error. This is how a long-lived supervisor (e.g. the clipboard guest ingest
+///   loop) is stopped by its owner without leaking a thread or abusing the retry
+///   budget. A caller with a **blocking** stream can only be stopped between
+///   connections; give the stream a read timeout (`set_read_timeout`) and a timed-out
+///   read is treated as "no data yet", so an idle link is interruptible too.
 ///
 /// Backoff rule: connect **failures** back off exponentially; a connection that
 /// carried **zero bytes** before ending is treated as a failure (guards against a
@@ -113,8 +121,12 @@ pub fn supervise<C: Read>(
     consume: &mut dyn FnMut(&[u8]) -> Result<(), String>,
     sleep: &mut dyn FnMut(Duration),
     report: &mut dyn FnMut(&str),
+    stop: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     loop {
+        if stop() {
+            return Ok(()); // owner asked us to stop: clean exit, not a failure
+        }
         let mut conn = match connect() {
             Ok(c) => c,
             Err(e) => {
@@ -132,6 +144,13 @@ pub fn supervise<C: Read>(
         let mut chunk = [0u8; 4096];
         let mut bytes_read: u64 = 0;
         let end: Result<(), String> = loop {
+            if stop() {
+                // A requested shutdown during an **idle** connection. Reaching here
+                // between reads requires the caller's stream to time out (see the
+                // `WouldBlock`/`TimedOut` arm below), so a long-lived but silent link
+                // no longer makes `stop` unobservable until the peer speaks.
+                return Ok(());
+            }
             match conn.read(&mut chunk) {
                 Ok(0) => break Ok(()), // clean EOF: peer closed
                 Ok(n) => {
@@ -139,6 +158,15 @@ pub fn supervise<C: Read>(
                     if let Err(e) = consume(&chunk[..n]) {
                         break Err(e);
                     }
+                }
+                // "No data yet" (a read timeout or a non-blocking stream) is NOT a
+                // failure: it is how an idle link stays interruptible. A blocking
+                // reader never produces these, so behaviour there is unchanged.
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    continue
                 }
                 Err(e) => break Err(format!("read error: {e}")),
             }
@@ -241,6 +269,7 @@ mod tests {
             &mut consume,
             &mut sleep,
             &mut report,
+            &|| false,
         );
         // Snapshot each counter before the Rc handles are dropped at end of scope.
         let connected = connected.get();
@@ -423,5 +452,80 @@ mod tests {
         let h = drive(Backoff::new(5, 40, 1), vec![b"ping".to_vec()], None);
         assert_eq!(h.connected, 1);
         assert_eq!(h.fed, b"ping");
+    }
+
+    /// A `stop` predicate that flips true ends the loop with `Ok(())` — a clean,
+    /// requested shutdown. It must be polled once per iteration and must not consume
+    /// the retry budget (the connect closure is never called).
+    #[test]
+    fn stop_predicate_ends_the_loop_cleanly_without_connecting() {
+        let polls = Rc::new(Cell::new(0u64));
+        let stop = {
+            let p = polls.clone();
+            move || {
+                p.set(p.get() + 1);
+                p.get() > 2 // true on the 3rd poll
+            }
+        };
+        let mut connect =
+            || -> Result<Cursor<Vec<u8>>, String> { Err("must never be dialed".into()) };
+        let mut on_connected = || {};
+        let mut consume = |_: &[u8]| -> Result<(), String> { Ok(()) };
+        let mut sleep = |_: Duration| {};
+        let mut report = |_: &str| {};
+
+        let outcome = supervise::<Cursor<Vec<u8>>>(
+            Backoff::new(10, 60, 2),
+            &mut connect,
+            &mut on_connected,
+            &mut consume,
+            &mut sleep,
+            &mut report,
+            &stop,
+        );
+        assert!(outcome.is_ok(), "a requested stop is a clean shutdown");
+        assert_eq!(polls.get(), 3, "stop is polled once per iteration");
+    }
+
+    /// An **idle** stream (one that only ever times out) must still be stoppable: a
+    /// timeout is "no data yet" (never fed as data, never fatal) and `stop` is
+    /// observed between reads, so `link::stop()` cannot hang on an idle link.
+    #[test]
+    fn idle_stream_timeouts_are_retried_and_stop_still_works() {
+        struct Idle(Rc<Cell<u64>>);
+        impl Read for Idle {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.set(self.0.get() + 1);
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle"))
+            }
+        }
+
+        let reads = Rc::new(Cell::new(0u64));
+        let reads_in = reads.clone();
+        let mut connect = move || -> Result<Idle, String> { Ok(Idle(reads_in.clone())) };
+        let mut on_connected = || {};
+        let consumed = Rc::new(Cell::new(0u64));
+        let c = consumed.clone();
+        let mut consume = move |_: &[u8]| -> Result<(), String> {
+            c.set(c.get() + 1);
+            Ok(())
+        };
+        let mut sleep = |_: Duration| {};
+        let mut report = |_: &str| {};
+        let stop_reads = reads.clone();
+        let stop = move || stop_reads.get() >= 5; // observed after a few idle reads
+
+        let outcome = supervise::<Idle>(
+            Backoff::new(1, 1, 1),
+            &mut connect,
+            &mut on_connected,
+            &mut consume,
+            &mut sleep,
+            &mut report,
+            &stop,
+        );
+        assert!(outcome.is_ok(), "an idle stream must still be stoppable");
+        assert_eq!(consumed.get(), 0, "a timed-out read is never fed as data");
+        assert!(reads.get() >= 5, "the idle stream was actually polled");
     }
 }

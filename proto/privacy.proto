@@ -52,6 +52,14 @@ message AppGrants {
   repeated string resources = 2;
 }
 
+// Every app that holds at least one grant, so a dashboard never has to ask
+// app-by-app. Deny-by-default ⇒ this is empty until something is granted.
+message AllGrantsRequest {}
+
+message AllGrantsReply {
+  repeated AppGrants apps = 1; // sorted by app id, resources sorted
+}
+
 // Normalised audit record (mirrors amos-ai::audit::AuditRecord). `outcome` is
 // one of "granted" | "denied" | "success" | "rejected" | "error".
 message AuditRecord {
@@ -74,6 +82,18 @@ message AuditReply {
   repeated AuditRecord records = 1; // newest first
 }
 
+// The daemon's **unified durable trail**. `records` is the shared `AuditFile`
+// window (bounded by `AuditQuery.limit`, newest first): privacy decisions *and*
+// externally-ingested actions (device-care cleans, app uninstalls).
+//
+// `durable = false` means no sink is attached at all (`AMOS_PRIVACY_PATH`
+// unset), so a trail cannot exist — a caller must NOT render the empty list as
+// "nothing ever happened".
+message TrailReply {
+  repeated AuditRecord records = 1;
+  bool durable = 2;
+}
+
 service PrivacyService {
   // Grant one resource to an app (persists when the daemon has a state file).
   rpc Grant(GrantRequest) returns (GrantReply);
@@ -85,6 +105,22 @@ service PrivacyService {
   rpc Authorize(ResourceRef) returns (DecisionReply);
   // Cheap, non-auditing check: the resources an app currently holds.
   rpc Granted(AppRef) returns (AppGrants);
+  // Every app holding at least one grant (one round-trip for a dashboard).
+  rpc GrantedAll(AllGrantsRequest) returns (AllGrantsReply);
   // Recent audited access decisions (newest first, optional filters).
   rpc RecentAudit(AuditQuery) returns (AuditReply);
+  // The **unified** durable trail (newest first) — privacy decisions plus every
+  // record ingested via `RecordAudit` (device-care cleans, app uninstalls).
+  // Filters reuse `AuditQuery`: `app_id` → principal, `resource` → resource.
+  rpc RecentTrail(AuditQuery) returns (TrailReply);
+  // Append one externally-produced audit record (e.g. a device-care clean or an
+  // app uninstall) to the SAME unified durable sink the privacy decisions are
+  // mirrored to, so "who removed what" lands in one trail.
+  //
+  // The daemon **stamps the timestamp with its own clock** (the audit time is
+  // the daemon's authority, not the caller's) and validates `outcome` against
+  // the known set. `ok = false` means the record was NOT persisted — the daemon
+  // has no durable sink configured (`AMOS_PRIVACY_PATH` unset) — so a caller can
+  // report the honest state instead of assuming the trail exists.
+  rpc RecordAudit(AuditRecord) returns (GrantReply);
 }

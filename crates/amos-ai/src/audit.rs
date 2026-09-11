@@ -35,17 +35,33 @@ use crate::security::{AuditEntry, AuditResult};
 /// decisions ([`AccessDecision`]) are folded into one enum so a single sink can
 /// hold both without inventing a false "the policy gate had an error" for an
 /// ordinary `Denied` decision (and vice-versa).
+///
+/// # One canonical spelling
+///
+/// Serialization is **lowercase** (`"rejected"`), identical to the gRPC wire
+/// form (`proto/privacy.proto`: `granted|denied|success|rejected|error`) — the
+/// on-disk JSON-lines trail and the RPC answer the *same* tag for the same
+/// record, so an external consumer (SIEM export, log parser) cannot be tripped
+/// by a casing mismatch. The PascalCase variant names are still **accepted when
+/// reading**, so a trail written before this normalization stays readable
+/// instead of being silently skipped as a malformed line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Outcome {
     /// Operation succeeded (security).
+    #[serde(alias = "Success")]
     Success,
     /// Access to a sensitive resource was permitted (privacy).
+    #[serde(alias = "Granted")]
     Granted,
     /// Access to a sensitive resource was denied (privacy; deny-by-default).
+    #[serde(alias = "Denied")]
     Denied,
     /// Operation was rejected (e.g. rate limit / permission denied).
+    #[serde(alias = "Rejected")]
     Rejected,
     /// Operation failed due to an error.
+    #[serde(alias = "Error")]
     Error,
 }
 
@@ -355,6 +371,38 @@ mod tests {
         assert_eq!(again.count().await, 2, "both records survived");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outcome_has_one_canonical_spelling_but_reads_the_legacy_one() {
+        // On disk AND over the wire the tag is lowercase, so an external consumer
+        // (SIEM export, log parser) can never be tripped by a casing mismatch.
+        for (outcome, tag) in [
+            (Outcome::Success, "success"),
+            (Outcome::Granted, "granted"),
+            (Outcome::Denied, "denied"),
+            (Outcome::Rejected, "rejected"),
+            (Outcome::Error, "error"),
+        ] {
+            let json = serde_json::to_string(&outcome).expect("serialize");
+            assert_eq!(json, format!("\"{tag}\""));
+            // The RPC form the privacy service emits is the same string.
+            assert_eq!(outcome.to_string().to_ascii_lowercase(), tag);
+            // And it round-trips.
+            assert_eq!(
+                serde_json::from_str::<Outcome>(&json).expect("deserialize"),
+                outcome
+            );
+        }
+
+        // A record written before the normalization (PascalCase) still reads.
+        let legacy = r#"{"ts":1,"principal":"a","op":"devcare.clean","resource":"r","outcome":"Rejected","details":""}"#;
+        let rec: AuditRecord = serde_json::from_str(legacy).expect("legacy line is readable");
+        assert_eq!(rec.outcome, Outcome::Rejected);
+        // Re-serializing normalizes it to the canonical spelling.
+        assert!(serde_json::to_string(&rec)
+            .expect("serialize")
+            .contains("\"rejected\""));
     }
 
     #[test]

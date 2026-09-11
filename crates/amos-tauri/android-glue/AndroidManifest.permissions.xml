@@ -14,7 +14,8 @@
    * The magnifier / camera WebView demo fallback needs no permission; only the
      live feed does. See docs/REAL_DEVICE_SYSTEM_UI_AUDIT.md § "WebView vs native".
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Magnifier / Camera live feed + native Camera2 preview producer + torch. -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -55,5 +56,13 @@
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
+
+    <!-- Device care (手机管家): list the device's installed packages so the
+         uninstall preview/enforcement can run the UninstallGuard policy over the
+         real `PackageManager` inventory (see DevCareGlue.kt). Without it, API 30+
+         filters the list and the manager honestly shows fewer apps than are
+         installed — nothing is faked either way. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
 
 </manifest>

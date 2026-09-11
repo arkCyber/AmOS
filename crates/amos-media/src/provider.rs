@@ -19,6 +19,24 @@ use crate::spec::{MediaItem, MediaKind, StandardDir};
 /// unbounded blob; MediaStore and scoped storage have similar caps).
 pub const MAX_SAVE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
+/// Upper bound on a single whole-item [`MediaProvider::load`]. A huge file must
+/// never trigger an unbounded allocation; callers that need a large item stream
+/// it with [`MediaProvider::read_range`] instead. Symmetric with the save cap.
+pub const MAX_LOAD_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Enforce the whole-item load ceiling. Pure + total so every backend shares one
+/// rule (and it is cheaply testable without allocating a huge buffer).
+pub fn ensure_loadable(len: u64) -> Result<()> {
+    if len > MAX_LOAD_BYTES {
+        Err(MediaError::TooLarge {
+            bytes: len,
+            max: MAX_LOAD_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// The external seam to the platform's media storage. Implementations must be
 /// [`Send`] + [`Sync`]; methods are synchronous and single-shot, cheap to test.
 pub trait MediaProvider: Send + Sync {
@@ -43,6 +61,29 @@ pub trait MediaProvider: Send + Sync {
     /// thumbnail placeholder instead of pretending. The manager enforces the read
     /// grant.
     fn load(&self, item: &MediaItem) -> Result<Vec<u8>>;
+
+    /// Read at most `len` bytes starting at `offset` (a backend may return fewer
+    /// bytes than asked at the end of the item). This is the streaming primitive
+    /// a range-capable HTTP layer serves from, so it must never allocate more than
+    /// it returns. The default implementation slices a bounded [`load`], which is
+    /// correct but loads the whole item — a provider with seekable storage (e.g.
+    /// [`crate::hostfs::HostFsProvider`]) overrides it.
+    ///
+    /// [`load`]: MediaProvider::load
+    fn read_range(&self, item: &MediaItem, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let all = self.load(item)?;
+        let (start, end) = window(all.len() as u64, offset, len);
+        // `get` (not indexing) so a degenerate window can never panic.
+        Ok(all.get(start..end).map(<[u8]>::to_vec).unwrap_or_default())
+    }
+}
+
+/// A byte window `[start, end)` clamped to `total` — the shared math of every
+/// `read_range` implementation (total, no underflow, no out-of-bounds).
+pub(crate) fn window(total: u64, offset: u64, len: u64) -> (usize, usize) {
+    let start = offset.min(total) as usize;
+    let end = offset.saturating_add(len).min(total) as usize;
+    (start, end)
 }
 
 /// All mutable state of a mock backend, behind one mutex so the instance is
@@ -240,7 +281,10 @@ impl MediaProvider for MockMediaProvider {
     fn load(&self, item: &MediaItem) -> Result<Vec<u8>> {
         let state = self.lock_state();
         match state.blobs.get(&item.uri) {
-            Some(bytes) => Ok(bytes.clone()),
+            Some(bytes) => {
+                ensure_loadable(bytes.len() as u64)?;
+                Ok(bytes.clone())
+            }
             // Honest: the mock only returns bytes it actually saved. Seeded /
             // demo items (sizes without content) yield a clear error so the UI
             // shows a placeholder instead of a fabricated "image".
@@ -249,5 +293,127 @@ impl MediaProvider for MockMediaProvider {
                 item.uri
             ))),
         }
+    }
+
+    fn read_range(&self, item: &MediaItem, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let state = self.lock_state();
+        match state.blobs.get(&item.uri) {
+            Some(bytes) => {
+                let (start, end) = window(bytes.len() as u64, offset, len);
+                Ok(bytes
+                    .get(start..end)
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default())
+            }
+            None => Err(MediaError::Provider(format!(
+                "mock holds no content for uri `{}` (only saved payloads)",
+                item.uri
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A provider that implements only the required methods, so the **default**
+    /// `read_range` (bounded load + slice) is exercised.
+    struct WholeProvider(Vec<u8>);
+
+    impl MediaProvider for WholeProvider {
+        fn name(&self) -> &'static str {
+            "whole"
+        }
+        fn available_collections(&self) -> Vec<StandardDir> {
+            vec![StandardDir::Download]
+        }
+        fn list(&self, _dir: StandardDir) -> Result<Vec<MediaItem>> {
+            Ok(Vec::new())
+        }
+        fn save(
+            &self,
+            _dir: StandardDir,
+            _kind: MediaKind,
+            _name: &str,
+            _data: &[u8],
+        ) -> Result<MediaItem> {
+            Err(MediaError::Provider("read-only".to_string()))
+        }
+        fn load(&self, _item: &MediaItem) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn item() -> MediaItem {
+        MediaItem::new(
+            "x".to_string(),
+            MediaKind::File,
+            StandardDir::Download,
+            "a.bin".to_string(),
+            "mock://Download/a.bin".to_string(),
+            0,
+        )
+        .unwrap_or_else(|e| panic!("fixture: {e}"))
+    }
+
+    #[test]
+    fn ensure_loadable_enforces_the_ceiling() {
+        assert!(ensure_loadable(0).is_ok());
+        assert!(ensure_loadable(MAX_LOAD_BYTES).is_ok());
+        assert_eq!(
+            ensure_loadable(MAX_LOAD_BYTES + 1),
+            Err(MediaError::TooLarge {
+                bytes: MAX_LOAD_BYTES + 1,
+                max: MAX_LOAD_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn window_is_total_and_clamped() {
+        assert_eq!(window(10, 0, 3), (0, 3));
+        assert_eq!(window(10, 8, 5), (8, 10)); // short read at EOF
+        assert_eq!(window(10, 10, 5), (10, 10)); // at EOF → empty
+        assert_eq!(window(10, 99, 5), (10, 10)); // past EOF → empty
+        assert_eq!(window(0, 0, 5), (0, 0));
+        assert_eq!(window(10, 0, 0), (0, 0));
+        assert_eq!(window(5, u64::MAX, u64::MAX), (5, 5)); // no overflow/underflow
+    }
+
+    #[test]
+    fn the_default_read_range_slices_the_loaded_bytes() {
+        let p = WholeProvider(b"0123456789".to_vec());
+        assert_eq!(p.read_range(&item(), 2, 3).unwrap(), b"234");
+        assert_eq!(p.read_range(&item(), 0, 100).unwrap(), b"0123456789");
+        assert_eq!(p.read_range(&item(), 9, 100).unwrap(), b"9");
+        assert_eq!(p.read_range(&item(), 10, 1).unwrap(), b"");
+        assert_eq!(p.read_range(&item(), 0, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn mock_read_range_returns_windows_and_stays_honest() {
+        let p = MockMediaProvider::empty();
+        let it = p
+            .save(
+                StandardDir::Download,
+                MediaKind::File,
+                "a.bin",
+                b"0123456789",
+            )
+            .unwrap_or_else(|e| panic!("save: {e}"));
+        assert_eq!(p.read_range(&it, 2, 3).unwrap(), b"234");
+        assert_eq!(p.read_range(&it, 0, 999).unwrap(), b"0123456789");
+        assert_eq!(p.read_range(&it, 8, 100).unwrap(), b"89");
+        assert_eq!(p.read_range(&it, 10, 5).unwrap(), b"");
+
+        // A seeded item holds no bytes → an honest error, never a fake empty read.
+        let seeded = MockMediaProvider::seeded(1);
+        let mut list = seeded.list(StandardDir::Camera).unwrap();
+        let item = match list.pop() {
+            Some(i) => i,
+            None => panic!("seeded camera item"),
+        };
+        assert!(seeded.read_range(&item, 0, 4).is_err());
     }
 }

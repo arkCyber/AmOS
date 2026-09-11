@@ -9,14 +9,14 @@ import { describe, expect, test } from "vitest";
 import { svelteAppIds, svelteAppLoader } from "../src/svelte/appRegistry";
 
 const EXPECTED: string[] = [
-  "clock", "settings", "calculator", "weather", "notes", "reminders",
+  "clock", "settings", "calculator", "weather", "notes", "reminders", "calendar",
   "vmemos", "photos", "files", "android", "messages", "phone",
-  "music", "maps", "camera", "ai", "interpreter", "mail",
-  "store", "privacy", "contacts", "magnifier", "monitor", "terminal",
+  "music", "player", "maps", "camera", "ai", "interpreter", "mail",
+  "store", "privacy", "contacts", "magnifier", "monitor", "devocare", "terminal",
 ];
 
 describe("svelte/appRegistry.ts", () => {
-  test("covers exactly the 24 built-in app ids", () => {
+  test("covers exactly the 27 built-in app ids", () => {
     expect(svelteAppIds().sort()).toEqual([...EXPECTED].sort());
   });
 

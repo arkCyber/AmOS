@@ -125,6 +125,9 @@ cargo build -p amos-audio --features aaudio  --target aarch64-linux-android --re
 - **正式 resident 采集线程**：`spawn_resident_capture` / `VoiceLink::spawn_resident`
   在命名线程上读 `amos_audio::AudioCapture` → 16k 下采样 → 推 `Payload::Audio` →
   尾静音门 `AudioEnd`；`ResidentVoiceHandle`（`stop()` join、`submitted()` 计数）。
+  **顺序保证**：`submitted` 在对应 `AudioEnd` **发出之前**自增，因此任何已收到 `AudioEnd`
+  的观察者读 `submitted()` 都绝不会看到落后的计数（此前是「先发后加」，消费方观察到
+  `AudioEnd` 时计数仍可能是 0——一个真实的一致性竞态，也表现为该路径单测在负载下偶发失败）。
   设备 AAudio seam 只需把 `AAudioCapture::open(16000)` 传入。已纳入 `gated-check`
   （`cargo test -p amos-tauri --test assistant_voice_e2e`）。
 - 前端（打通桥层）：`lib/audio.ts` `encodeF32le`/`frameToAssistantChunk`，

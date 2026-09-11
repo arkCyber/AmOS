@@ -23,6 +23,7 @@ use crate::energy::{EnergySnapshot, EnergyStore};
 use crate::governor::{parse_kinds_env, DvfsDriver, ResourceGovernor};
 use crate::inference::real::{BackendKind, InferenceBackend, MockBackend, OllamaBackend};
 use crate::monitoring::Monitor;
+use crate::pool::GenerationPool;
 use crate::profiler::{ProfileSnapshot, ProfileStore};
 use crate::security::{AuditResult, Permission, SecurityManager};
 use crate::session::SessionManager;
@@ -40,6 +41,13 @@ pub struct AiAgentService {
     security: Arc<SecurityManager>,
     /// The active inference backend (GGML / API / Mock), selected via env.
     backend: Arc<dyn InferenceBackend>,
+    /// Daemon-wide bound on concurrent in-flight generations — the enforcement
+    /// half of `Config::max_concurrent_sessions` / `AMOS_MAX_SESSIONS`, which
+    /// existed and was validated but was never wired into the serving path.
+    generation_pool: Arc<GenerationPool>,
+    /// How long a generation may wait for a pool slot before an honest
+    /// rejection (`AMOS_GEN_POOL_WAIT_MS`; zero = fail-fast, the default).
+    pool_wait: Duration,
     /// Startup snapshot of the effective engine + ASR, so `get_status` can tell a
     /// caller which real engine is serving and whether it degraded to mock.
     engine: EngineState,
@@ -82,6 +90,32 @@ impl AiAgentService {
         // stays bounded as one-off clients come and go.
         security.start_cleanup_task();
         let backend = build_backend_from_env().await;
+        // Snapshot the wrapped-to-be backend name BEFORE optional cache
+        // decoration, so EngineState still matches the real engine kind.
+        let inner_engine_name = backend.metadata().name;
+        // Opt-in response cache (`AMOS_RESPONSE_CACHE=1`): identical
+        // (model, prompt, context, max_tokens) generations replay from a
+        // bounded LRU+TTL cache. Default OFF — caching changes observable
+        // latency (a hit has near-zero TTFT), so it must be a deliberate
+        // operator choice; `get_status` shows it via the `+cache` name.
+        let backend: Arc<dyn InferenceBackend> = if std::env::var("AMOS_RESPONSE_CACHE")
+            .is_ok_and(|v| v == "1" || v.to_lowercase() == "true")
+        {
+            Arc::new(crate::cache::CachingBackend::new(
+                backend,
+                Arc::new(crate::cache::ResponseCache::with_defaults()),
+            ))
+        } else {
+            backend
+        };
+        // Daemon-wide generation gate (REQ-A43): `AMOS_MAX_SESSIONS` finally
+        // enforced; bounded wait defaults to fail-fast (deterministic).
+        let generation_pool = Arc::new(GenerationPool::from_env());
+        let pool_wait = std::env::var("AMOS_GEN_POOL_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::ZERO);
         let sessions_path = std::env::var("AMOS_SESSIONS_PATH")
             .ok()
             .filter(|s| !s.is_empty())
@@ -104,12 +138,14 @@ impl AiAgentService {
         // Snapshot the effective engine state (captured before the backend is
         // moved into the struct): reports which real engine is serving and
         // whether a requested real engine degraded to mock at startup.
-        let engine = EngineState::from_env(&backend.metadata().name);
+        let engine = EngineState::from_env(&inner_engine_name);
         Self {
             model: "amos-infer@0.1.0",
             active_sessions: Arc::new(AtomicUsize::new(0)),
             security: Arc::new(security),
             backend,
+            generation_pool,
+            pool_wait,
             engine,
             sessions,
             sessions_path,
@@ -129,6 +165,7 @@ impl AiAgentService {
     }
 
     /// Build a service with an explicit security manager and inference backend.
+    /// Uses the default generation gate (16 slots, fail-fast).
     pub fn with_security_and_backend(
         security: Arc<SecurityManager>,
         backend: Arc<dyn InferenceBackend>,
@@ -138,6 +175,8 @@ impl AiAgentService {
             active_sessions: Arc::new(AtomicUsize::new(0)),
             security,
             backend,
+            generation_pool: Arc::new(GenerationPool::from_env()),
+            pool_wait: Duration::ZERO,
             engine: EngineState::non_degraded(),
             sessions: Arc::new(SessionManager::default()),
             sessions_path: None,
@@ -148,6 +187,20 @@ impl AiAgentService {
             dvfs: None,
             system_sampler: default_system_sampler(),
         }
+    }
+
+    /// Build a service with an explicit security manager, backend, and
+    /// generation gate (used by tests to shrink the pool / shape the wait).
+    pub fn with_generation_gate(
+        security: Arc<SecurityManager>,
+        backend: Arc<dyn InferenceBackend>,
+        generation_pool: Arc<GenerationPool>,
+        pool_wait: Duration,
+    ) -> Self {
+        let mut svc = Self::with_security_and_backend(security, backend);
+        svc.generation_pool = generation_pool;
+        svc.pool_wait = pool_wait;
+        svc
     }
 
     /// Attach a session manager and a persistence path (used by tests / custom
@@ -694,6 +747,31 @@ impl AiAgent for AiAgentService {
             )));
         }
 
+        // Daemon-wide generation admission (REQ-A43): acquire a slot BEFORE any
+        // session/bookkeeping is created — a rejected request must not allocate
+        // resources. The permit is moved into the streaming task below and is
+        // released on drop on every exit path (client disconnect, error, done).
+        let gate_permit = match self.generation_pool.acquire(self.pool_wait).await {
+            Ok(p) => p,
+            Err(e) => {
+                let reason = e.reason();
+                tracing::warn!(client = %client_id, "stream_chat rejected: {reason}");
+                self.security
+                    .audit_logger
+                    .log(
+                        client_id.clone(),
+                        "stream_chat".to_string(),
+                        "inference".to_string(),
+                        AuditResult::Rejected,
+                        reason.clone(),
+                    )
+                    .await;
+                return Err(Status::resource_exhausted(format!(
+                    "generation gate: {reason}"
+                )));
+            }
+        };
+
         let req = request.into_inner();
         tracing::info!(session = %req.session_id, client = %client_id, "stream_chat start");
 
@@ -726,6 +804,10 @@ impl AiAgent for AiAgentService {
         let session_key = sessions.create(self.model.to_string()).await;
 
         tokio::spawn(async move {
+            // Hold the generation-gate permit for the whole task: dropping it on
+            // any exit path (card path, client disconnect, inference error, or
+            // normal completion) releases the daemon-wide slot exactly once.
+            let _gate = gate_permit;
             // Card intent: brief ack + terminal frame carrying the card.
             if let Some(card) = card {
                 let ack = AgentChunk {
@@ -879,6 +961,9 @@ impl AiAgent for AiAgentService {
         let backend = self.backend.clone();
         let sessions = self.sessions.clone();
         let profile = self.profile.clone();
+        // Generation-gate handle for per-turn admission inside the Prompt arm.
+        let pool = self.generation_pool.clone();
+        let pool_wait = self.pool_wait;
         let session_key = sessions.create(self.model.to_string()).await;
 
         tokio::spawn(async move {
@@ -965,6 +1050,36 @@ impl AiAgent for AiAgentService {
                         }
                         let gen_start = Instant::now();
                         let mut ttft_recorded = false;
+                        // Per-turn daemon-wide admission (REQ-A43): one slot per
+                        // executing bidi turn. A saturated gate answers this turn
+                        // with an honest error chunk + audit and keeps the
+                        // connection alive (the user may retry).
+                        let _gate = match pool.acquire(pool_wait).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let reason = e.reason();
+                                let _ = tx
+                                    .send(Ok(AgentChunk {
+                                        session_id: String::new(),
+                                        token: String::new(),
+                                        done: true,
+                                        error: format!("generation gate: {reason}"),
+                                        card: None,
+                                    }))
+                                    .await;
+                                security
+                                    .audit_logger
+                                    .log(
+                                        client_id.clone(),
+                                        "chat".to_string(),
+                                        "inference".to_string(),
+                                        AuditResult::Rejected,
+                                        reason,
+                                    )
+                                    .await;
+                                continue;
+                            }
+                        };
                         let mut stream = match backend.infer(&p, &chat_ctx, 256).await {
                             Ok(s) => s,
                             Err(e) => {
@@ -1992,6 +2107,169 @@ mod tests {
                 && e.result == AuditResult::Rejected
                 && e.details.contains("rate limit")),
             "the rejected request must be audited as rate-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_gate_rejects_when_saturated_then_serves_after_release() {
+        // Capacity 1, fail-fast: the second in-flight stream_chat must be
+        // rejected honestly (ResourceExhausted + audited), must not allocate a
+        // session, and the slot must be reusable once the first stream ends.
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let pool = Arc::new(GenerationPool::try_new(1).unwrap());
+        let svc = AiAgentService::with_generation_gate(
+            security,
+            Arc::new(MockBackend::new()),
+            pool.clone(),
+            Duration::ZERO,
+        );
+
+        // 1) The first request acquires the only slot and starts streaming.
+        let mut stream1 = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "s1"))
+            .await
+            .expect("first request passes the gate")
+            .into_inner();
+        assert_eq!(
+            pool.in_flight().await,
+            1,
+            "the accepted request holds the single slot"
+        );
+
+        // 2) A second request while saturated: honest typed rejection, and no
+        // session must be allocated for it (rejection precedes bookkeeping).
+        let err = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "s2"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::ResourceExhausted,
+            "a saturated gate must surface ResourceExhausted"
+        );
+        assert!(
+            err.message().contains("generation gate"),
+            "the rejection reason must name the gate, got: {}",
+            err.message()
+        );
+        assert_eq!(
+            svc.sessions.count_active().await,
+            1,
+            "a gate-rejected request must not allocate a session"
+        );
+        assert_eq!(
+            pool.counters(),
+            (1, 1, 0),
+            "one acquisition, one fail-fast rejection, zero timeouts"
+        );
+
+        // 3) Drain stream1 to completion; the permit is released on task end.
+        while let Some(chunk) = stream1.next().await {
+            if let Ok(c) = chunk {
+                if c.done {
+                    break;
+                }
+            }
+        }
+        for _ in 0..50 {
+            if pool.in_flight().await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            pool.in_flight().await,
+            0,
+            "the slot is released once the stream task ends"
+        );
+
+        // 4) A new request is served again on the released slot.
+        assert!(
+            svc.stream_chat(stream_req(DEFAULT_CLIENT_ID, "s3"))
+                .await
+                .is_ok(),
+            "a released slot must be reusable"
+        );
+
+        // 5) The saturation was audited against the caller.
+        let entries = svc.security.audit_logger.get_recent(20).await;
+        assert!(
+            entries.iter().any(|e| e.result == AuditResult::Rejected
+                && e.details.contains("generation pool saturated")),
+            "the gate rejection must be audited with its honest reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_cache_replays_identical_prompts_when_enabled() {
+        // With the cache decorator in the serving path, the second identical
+        // (session, prompt, context, max_tokens) request is a cache hit: the
+        // token sequence is replayed identically and the store saw exactly one
+        // store + one hit (the backend itself is called only once).
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let cache = Arc::new(crate::cache::ResponseCache::with_defaults());
+        let backend = Arc::new(crate::cache::CachingBackend::new(
+            Arc::new(MockBackend::new()),
+            cache.clone(),
+        ));
+        let svc = AiAgentService::with_generation_gate(
+            security,
+            backend.clone(),
+            Arc::new(GenerationPool::try_new(4).unwrap()),
+            Duration::ZERO,
+        );
+        // Same client session id ⇒ same cache key (the session participates in
+        // the key by design: identical conversations replay, divergent ones
+        // never share).
+        let mut s1 = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "same"))
+            .await
+            .expect("first call")
+            .into_inner();
+        let mut toks1 = Vec::new();
+        while let Some(chunk) = s1.next().await {
+            if let Ok(c) = chunk {
+                if c.done {
+                    break;
+                }
+                toks1.push(c.token);
+            }
+        }
+        let mut s2 = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "same"))
+            .await
+            .expect("second call")
+            .into_inner();
+        let mut toks2 = Vec::new();
+        while let Some(chunk) = s2.next().await {
+            if let Ok(c) = chunk {
+                if c.done {
+                    break;
+                }
+                toks2.push(c.token);
+            }
+        }
+        let s = cache.stats();
+        assert_eq!(
+            (s.stores, s.hits),
+            (1, 1),
+            "the second identical prompt must be a cache hit, not a new generation"
+        );
+        assert_eq!(
+            toks1, toks2,
+            "cache replay must be token-for-token identical"
+        );
+        assert!(
+            backend.metadata().name.ends_with("+cache"),
+            "get_status can see the cache via the backend name"
         );
     }
 

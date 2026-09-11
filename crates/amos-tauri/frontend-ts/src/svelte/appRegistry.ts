@@ -19,6 +19,7 @@ export const SVELTE_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   weather: () => import("./WeatherApp.svelte"),
   notes: () => import("./NotesApp.svelte"),
   reminders: () => import("./RemindersApp.svelte"),
+  calendar: () => import("./CalendarApp.svelte"),
   vmemos: () => import("./VoiceMemosApp.svelte"),
   photos: () => import("./PhotosApp.svelte"),
   files: () => import("./FilesApp.svelte"),
@@ -26,6 +27,7 @@ export const SVELTE_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   messages: () => import("./MessagesApp.svelte"),
   phone: () => import("./PhoneApp.svelte"),
   music: () => import("./MusicApp.svelte"),
+  player: () => import("./PlayerApp.svelte"),
   maps: () => import("./MapsApp.svelte"),
   camera: () => import("./CameraApp.svelte"),
   terminal: () => import("./TerminalApp.svelte"),
@@ -37,6 +39,7 @@ export const SVELTE_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   contacts: () => import("./ContactsApp.svelte"),
   magnifier: () => import("./MagnifierApp.svelte"),
   monitor: () => import("./MonitorApp.svelte"),
+  devocare: () => import("./DeviceCareApp.svelte"),
 };
 
 /** Resolve the Svelte screen loader for an app id; undefined if unregistered. */

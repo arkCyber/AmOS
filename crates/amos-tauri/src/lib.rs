@@ -30,7 +30,15 @@ pub mod clipboard_glue;
 /// sink + an ingest loop, transport-agnostic over an injectable byte channel.
 /// Inert (not auto-wired) until a real guest channel is attached on-device.
 pub mod clipboard_guest;
+/// Host-half **wiring** for the guest clipboard link: builds the audited mirror sink
+/// over the real Unix-domain-socket transport (`amos_clipboard::unix`) and starts the
+/// reconnecting ingest loop. **Env-gated, inert by default**
+/// (`AMOS_GUEST_CLIPBOARD_SOCKET`); see `docs/clipboard-container-sync.md` §5/§7.
+pub mod clipboard_guest_link;
 pub mod daemon;
+pub mod devcare;
+#[cfg(feature = "android")]
+pub mod devcare_device;
 pub mod display;
 pub mod flashlight;
 pub mod host_battery;
@@ -108,7 +116,9 @@ pub fn run() {
         .manage(appstore::StoreBridge::new())
         .manage(sensor_host::SensorHost::new())
         .manage(sms::SmsBridge::boot())
+        .manage(sms::trash_shared())
         .manage(blocklist::shared())
+        .manage(devcare::DevCareBridge::new())
         .invoke_handler(tauri::generate_handler![
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
@@ -157,6 +167,7 @@ pub fn run() {
             clipboard::clipboard_read,
             clipboard::clipboard_history,
             clipboard::clipboard_clear,
+            clipboard_guest_link::clipboard_guest_status,
             store::store_get,
             store::store_set,
             store::store_remove,
@@ -171,6 +182,7 @@ pub fn run() {
             media::media_list,
             media::media_save,
             media::media_load,
+            media::media_read_range,
             translate::transcribe_audio,
             translate::translate_text,
             interpret::interpret_start,
@@ -233,6 +245,9 @@ pub fn run() {
             privacy_client::perm_revoke,
             privacy_client::perm_granted,
             privacy_client::perm_recent_audit,
+            privacy_client::perm_record_audit,
+            privacy_client::perm_recent_trail,
+            privacy_client::perm_grants_all,
             netguard::netguard_toggle,
             netguard::netguard_status,
             rag_client::rag_status,
@@ -244,6 +259,10 @@ pub fn run() {
             sms::sms_counts,
             sms::sms_messages,
             sms::sms_send,
+            sms::sms_trash_add,
+            sms::sms_trash_list,
+            sms::sms_trash_restore,
+            sms::sms_trash_purge,
             blocklist::blocklist_snapshot,
             blocklist::blocklist_add,
             blocklist::blocklist_remove,
@@ -255,6 +274,17 @@ pub fn run() {
             taskmgr::taskmgr_snapshot,
             taskmgr::taskmgr_app_action,
             taskmgr::taskmgr_job_action,
+            devcare::devcare_status,
+            devcare::devcare_scan,
+            devcare::devcare_clean,
+            devcare::devcare_apps,
+            devcare::devcare_permissions,
+            devcare::devcare_report,
+            devcare::devcare_uninstall,
+            devcare::devcare_trail,
+            devcare::devcare_memory,
+            devcare::devcare_boost,
+            devcare::devcare_storage,
             terminal::term_spawn,
             terminal::term_write,
             terminal::term_read,
@@ -279,6 +309,17 @@ pub fn run() {
             let _ = clipboard::set_notifier(move |entry: &clipboard::ClipboardEntry| {
                 let _ = handle.emit("clipboard-changed", clipboard::ClipboardNotice::from(entry));
             });
+            // Guest-container clipboard link (host↔guest text sync): **env-gated and
+            // inert by default** — it only dials when `AMOS_GUEST_CLIPBOARD_SOCKET`
+            // names a socket, so desktop/CI is unaffected. When armed it installs the
+            // audited mirror sink over the real Unix-socket transport and starts the
+            // reconnecting ingest loop.
+            let guest_link = clipboard_guest_link::activate_from_env();
+            if guest_link.armed {
+                tracing::info!("clipboard guest link armed: socket={:?}", guest_link.socket);
+            } else {
+                tracing::debug!("clipboard guest link inert: {}", guest_link.reason);
+            }
             // System-wide readiness probe: log the daemon status once on boot.
             let bridge = app.state::<AiBridge>();
             match tauri::async_runtime::block_on(ai_bridge::fetch_status(&bridge)) {
@@ -345,6 +386,9 @@ pub fn run() {
                 #[cfg(feature = "android")]
                 let dir = dir.join("files");
                 blocklist::shared().configure(blocklist::file_in(&dir));
+                // The SMS trash lives next to the blocklist (same atomic-write,
+                // corrupt-file-logged policy; same glue-visible directory).
+                sms::trash_shared().configure(sms::trash_file_in(&dir));
             }
             // Real in-call bridge (default-dialer / InCallService): give the Rust side
             // an AppHandle so Kotlin-pushed real call states reach the WebView as
@@ -355,6 +399,11 @@ pub fn run() {
             // MainActivity's intercepted camera key can route as Home.
             #[cfg(feature = "android")]
             buttons::install_android_app(app.handle().clone());
+            // Device care on-device: hand the seam an AppHandle so the Kotlin
+            // `DevCareGlue`'s JNI attach can install the real `PackageManager` /
+            // `StatFs` / app-private-filesystem backend into the managed bridge.
+            #[cfg(feature = "android")]
+            devcare_device::install_android_app(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

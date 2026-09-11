@@ -303,6 +303,16 @@ fn cmd_load(m: &MediaManager, item: MediaItem) -> Result<Vec<u8>, String> {
     m.load(&item).map_err(|e| e.to_string())
 }
 
+/// Core of `media_read_range`.
+fn cmd_read_range(
+    m: &MediaManager,
+    item: MediaItem,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>, String> {
+    m.read_range(&item, offset, len).map_err(|e| e.to_string())
+}
+
 /// The underlying backend's name (for logs / settings).
 #[tauri::command]
 pub fn media_provider_name(state: State<'_, MediaBridge>) -> String {
@@ -366,6 +376,20 @@ pub fn media_save(
 #[tauri::command]
 pub fn media_load(state: State<'_, MediaBridge>, item: MediaItem) -> Result<Vec<u8>, String> {
     cmd_load(state.manager(), item)
+}
+
+/// Read a bounded byte window of an `item` (`offset`/`len`) — the streaming
+/// counterpart of `media_load`, obeying the same read grant. A caller that needs
+/// a large file reads it in windows instead of materialising the whole item; the
+/// bytes actually available are returned (a short/empty read is not an error).
+#[tauri::command]
+pub fn media_read_range(
+    state: State<'_, MediaBridge>,
+    item: MediaItem,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>, String> {
+    cmd_read_range(state.manager(), item, offset, len)
 }
 #[cfg(test)]
 mod tests {
@@ -494,6 +518,97 @@ mod tests {
         assert!(it.uri.ends_with("DCIM/Camera/IMG_real.jpg"));
         // Real bytes come back through load (no fabricated content).
         assert_eq!(b.manager().load(it).unwrap(), b"\xff\xd8\xff\xe0");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hostfs_bridge_classifies_and_streams_real_media() {
+        // A real (tiny) media tree, driven through the exact manager the
+        // `media_*` commands use. `ID3` is a real MP3 header; the length-prefixed
+        // `ftyp` box is a real MP4 header.
+        let base =
+            std::env::temp_dir().join(format!("amos-tauri-media-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Music")).unwrap();
+        std::fs::create_dir_all(base.join("Movies")).unwrap();
+        std::fs::write(
+            base.join("Music/晨光.mp3"),
+            b"ID3\x03\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+        let mut mp4: Vec<u8> = vec![0, 0, 0, 24];
+        mp4.extend_from_slice(b"ftypmp42");
+        mp4.extend_from_slice(&[0, 0, 0, 0]);
+        std::fs::write(base.join("Movies/星河.mp4"), &mp4).unwrap();
+        // A non-media file must never be mistaken for playable media.
+        std::fs::write(base.join("Music/readme.txt"), b"hello").unwrap();
+
+        let b = MediaBridge::hostfs(base.clone());
+        let m = b.manager();
+
+        // The bridge reports each real file's true kind + MIME (name inference).
+        let music = cmd_list(m, StandardDir::Music).unwrap();
+        let mp3 = music.iter().find(|i| i.name == "晨光.mp3").expect("mp3");
+        assert_eq!(mp3.kind, MediaKind::Audio);
+        assert_eq!(mp3.mime.as_deref(), Some("audio/mpeg"));
+        let txt = music.iter().find(|i| i.name == "readme.txt").expect("txt");
+        assert_eq!(txt.kind, MediaKind::File);
+        assert_eq!(txt.mime.as_deref(), Some("text/plain"));
+
+        let movies = cmd_list(m, StandardDir::Movies).unwrap();
+        let vid = movies.first().expect("video");
+        assert_eq!(vid.kind, MediaKind::Video);
+        assert_eq!(vid.mime.as_deref(), Some("video/mp4"));
+
+        // A browser-style first request reads the `ftyp` box through the very
+        // command core a streaming transport would call.
+        assert_eq!(
+            cmd_read_range(m, vid.clone(), 4, 4).unwrap(),
+            b"ftyp".to_vec()
+        );
+        // Whole-item load and the ranged read agree byte for byte.
+        assert_eq!(cmd_load(m, vid.clone()).unwrap(), mp4);
+        let total = vid.size_bytes.unwrap_or(0);
+        assert_eq!(cmd_read_range(m, vid.clone(), 0, total).unwrap(), mp4);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn boot_honours_amos_media_root_and_serves_real_media() {
+        // The exact startup path `lib.rs` uses: setting AMOS_MEDIA_ROOT turns
+        // boot into a real-filesystem backend (Waydroid / dev folder / root
+        // context). AMOS_MEDIA_ROOT is process-global, but `boot()` has no other
+        // caller in the test binary, so this is its only reader.
+        let base = std::env::temp_dir().join(format!("amos-tauri-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Music")).unwrap();
+        std::fs::write(
+            base.join("Music/晨光.mp3"),
+            b"ID3\x03\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+
+        let prev = std::env::var("AMOS_MEDIA_ROOT").ok();
+        std::env::set_var("AMOS_MEDIA_ROOT", &base);
+        let b = MediaBridge::boot();
+        match prev {
+            Some(v) => std::env::set_var("AMOS_MEDIA_ROOT", v),
+            None => std::env::remove_var("AMOS_MEDIA_ROOT"),
+        }
+
+        assert_eq!(b.manager().provider_name(), "hostfs");
+        // Boot pre-grants the collections the backend serves, so a real file is
+        // immediately listable/readable — i.e. the UI can play it right away.
+        let music = cmd_list(b.manager(), StandardDir::Music).unwrap();
+        assert_eq!(music.len(), 1);
+        assert_eq!(music[0].kind, MediaKind::Audio);
+        assert_eq!(music[0].mime.as_deref(), Some("audio/mpeg"));
+        assert_eq!(
+            b.manager().load(&music[0]).unwrap(),
+            b"ID3\x03\x00\x00\x00\x00\x00\x00"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -651,5 +766,46 @@ mod tests {
             .expect("seeded camera item");
         let err = cmd_load(m, seeded).unwrap_err();
         assert!(err.contains("holds no content"), "got: {err}");
+    }
+
+    #[test]
+    fn command_core_read_range_windows_and_is_gated() {
+        let b = bridge(); // mock, boot-like (read+write granted)
+        let m = b.manager();
+        let saved = cmd_save(
+            m,
+            StandardDir::Download,
+            MediaKind::File,
+            "r.bin".into(),
+            b"0123456789".to_vec(),
+        )
+        .expect("granted save ok");
+
+        // A windowed read returns exactly the requested slice (short at EOF).
+        assert_eq!(
+            cmd_read_range(m, saved.clone(), 2, 3).unwrap(),
+            b"234".to_vec()
+        );
+        assert_eq!(
+            cmd_read_range(m, saved.clone(), 8, 100).unwrap(),
+            b"89".to_vec()
+        );
+        assert!(cmd_read_range(m, saved.clone(), 99, 4).unwrap().is_empty());
+
+        // A seeded item holds no bytes → the honest provider error.
+        let seeded = cmd_list(m, StandardDir::Camera)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id.starts_with("mock-seed-"))
+            .expect("seeded camera item");
+        assert!(cmd_read_range(m, seeded, 0, 4)
+            .unwrap_err()
+            .contains("holds no content"));
+
+        // The streaming path obeys the same read grant as load.
+        cmd_revoke(m, AccessKind::Read, StandardDir::Download);
+        assert!(cmd_read_range(m, saved, 0, 4)
+            .unwrap_err()
+            .contains("not authorized"));
     }
 }

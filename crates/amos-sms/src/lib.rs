@@ -13,7 +13,9 @@
 pub mod error;
 pub mod folder;
 pub mod provider;
+pub mod redact;
 pub mod spec;
+pub mod trash;
 pub mod validate;
 pub mod wire;
 
@@ -23,7 +25,13 @@ pub mod android;
 pub use error::SmsError;
 pub use folder::{SmsFolder, SmsFolderCounts};
 pub use provider::{MockSms, SmsProvider, MOCK_PROVIDER};
+// Balance redaction on the display path (REQ-A41): domain-level so every
+// consumer (Tauri bridge, tests, future surfaces) inherits the same policy.
+pub use redact::{is_bank_sender, redact_balances, redact_for, REDACTION};
+// View-layer trash (REQ-A42): hide + restore, ids only — the platform store is
+// owned by the default SMS app and is never written by AmOS.
 pub use spec::{SmsMessage, SmsThread};
+pub use trash::{filter_messages, PreviewOverride, SmsTrash, TrashEntry, DEFAULT_TRASH_CAP};
 pub use validate::{normalize_address, segment_count, validate_text};
 
 #[cfg(feature = "android")]
