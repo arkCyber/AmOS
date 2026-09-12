@@ -71,3 +71,13 @@ and the reactive i18n / theme singletons (`locale.svelte.ts` /
 - The Tauri config already points at this package (`build.devUrl` → `:1420`,
   `build.frontendDist` → `../frontend-ts/dist`); there is no legacy vanilla UI to
   switch back to.
+- **Contacts** (`src/svelte/ContactsApp.svelte`) supports **vCard 3.0** import/export:
+  export/copy downloads or copies a `contacts.vcf`, and import accepts pasted text or a
+  picked `.vcf` file with a parse preview before merging. Editing the text after a
+  preview invalidates it (re-preview before confirming); a file that fails to read is a
+  read failure, distinct from "not a vCard". The pure logic lives in
+  `src/lib/contactTransfer.ts` (RFC 2426 subset: value escaping, 75-octet folding,
+  UID/REV, tolerant parser, UID-dedup merge; export counts cards by actually serializing
+  each one, multi-`NOTE` lines are joined, and an unrepresentable REV timestamp is
+  omitted rather than crashing the export); tests in `src/__tests__/contactTransfer.test.ts`
+  and `svelte-tests/contacts.svelte.test.ts`.

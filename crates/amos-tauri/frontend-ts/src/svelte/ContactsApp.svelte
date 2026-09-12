@@ -40,6 +40,9 @@
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
   import { contactsChannel } from "./appLinks";
+  import { buildVcf, countVCards, mergeImported, parseVcf } from "../lib/contactTransfer";
+  import type { ParseVcfResult } from "../lib/contactTransfer";
+  import { copySelection } from "../lib/clipboard";
 
   /** First visible glyph of a name for the avatar (uppercased), else "?". */
   function contactInitial(name: string): string {
@@ -73,6 +76,117 @@
   let note = $state("");
   let status = $state("");
   let confirmId = $state<string | null>(null);
+
+  // ---- vCard import/export (domain logic lives in lib/contactTransfer.ts) ----
+  let importOpen = $state(false);
+  let importText = $state("");
+  let pendingImport = $state<ParseVcfResult | null>(null);
+
+  /** Download `vcf` as contacts.vcf via a temporary object URL. */
+  function downloadVcf(vcf: string): boolean {
+    try {
+      if (typeof URL.createObjectURL !== "function") return false;
+      const url = URL.createObjectURL(new Blob([vcf], { type: "text/vcard" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "contacts.vcf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Export the whole book as a .vcf download (honest about empty / failure). */
+  function exportVcf(): void {
+    const vcf = buildVcf(contacts);
+    if (vcf === "") {
+      status = t("contacts.exportEmpty");
+      return;
+    }
+    if (!downloadVcf(vcf)) {
+      status = t("contacts.exportFailed");
+      return;
+    }
+    // Count with the lib (never by substring: a note may contain "BEGIN:VCARD").
+    status = t("contacts.exported", { n: countVCards(contacts) });
+  }
+
+  /** Copy the whole book as vCard text through the OS clipboard bridge. */
+  async function copyVcf(): Promise<void> {
+    const vcf = buildVcf(contacts);
+    if (vcf === "") {
+      status = t("contacts.exportEmpty");
+      return;
+    }
+    try {
+      if (!(await copySelection(vcf))) {
+        status = t("contacts.clipOffline"); // outside the shell the bridge is null
+        return;
+      }
+    } catch {
+      status = t("contacts.clipOffline");
+      return;
+    }
+    status = t("contacts.copied");
+  }
+
+  function openImport(): void {
+    importText = "";
+    pendingImport = null;
+    importOpen = true;
+    status = "";
+  }
+
+  function closeImport(): void {
+    importOpen = false;
+    pendingImport = null;
+    importText = "";
+  }
+
+  /** Read a picked .vcf file into the paste box (the same parse path either way). */
+  async function pickImportFile(e: Event): Promise<void> {
+    const file = (e.currentTarget as HTMLInputElement).files?.[0];
+    if (!file) return;
+    try {
+      importText = await file.text();
+      status = "";
+    } catch {
+      status = t("contacts.importReadFail"); // a read failure is not "not a vCard"
+    }
+  }
+
+  /** Parse the pasted/loaded text; zero vCard blocks is "not a vCard" — say so. */
+  function previewImport(): void {
+    const res = parseVcf(importText);
+    if (res.blocks === 0) {
+      pendingImport = null;
+      status = t("contacts.importBad");
+      return;
+    }
+    pendingImport = res;
+    status = "";
+  }
+
+  /** Merge the previewed entries in; counts are reported, never silent. */
+  function confirmImport(): void {
+    const pending = pendingImport;
+    if (!pending) return;
+    const out = mergeImported(contacts, pending.entries, Date.now());
+    // A rejected write keeps the dialog open (banner shows why); nothing was applied.
+    if (out.added > 0 && !persist(out.list)) return;
+    // "Unusable" = blocks the parser already rejected + anything the merge's
+    // defensive re-validation still catches (normally 0, but report it anyway).
+    status = t("contacts.importDone", {
+      added: out.added,
+      dup: out.dupSkipped,
+      invalid: out.invalidSkipped + pending.invalid,
+    });
+    closeImport();
+  }
 
   // ---- quick-dial chips come from the shared call log (reactive store) ----
   const callLogStore = createStoreValue<unknown>(CALLLOG_KEY, []);
@@ -220,8 +334,52 @@
     </button>
   </div>
 
+  <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
+    <button onclick={exportVcf} aria-label={t("contacts.export")} title={t("contacts.export")}
+      class="rounded-full bg-neutral-200/80 px-3 py-1 text-xs text-neutral-700 active:scale-95 dark:bg-white/10 dark:text-neutral-200">
+      ⬇️ {t("contacts.export")}
+    </button>
+    <button onclick={() => void copyVcf()} aria-label={t("contacts.copyVcf")} title={t("contacts.copyVcf")}
+      class="rounded-full bg-neutral-200/80 px-3 py-1 text-xs text-neutral-700 active:scale-95 dark:bg-white/10 dark:text-neutral-200">
+      📋 {t("contacts.copyVcf")}
+    </button>
+    <button onclick={openImport} aria-label={t("contacts.import")} title={t("contacts.import")}
+      class="rounded-full bg-neutral-200/80 px-3 py-1 text-xs text-neutral-700 active:scale-95 dark:bg-white/10 dark:text-neutral-200">
+      📄 {t("contacts.import")}
+    </button>
+  </div>
+
   {#if status}
     <p class="mt-1 text-xs text-accent">{status}</p>
+  {/if}
+
+  {#if importOpen}
+    <div class="mt-2 space-y-2 rounded-2xl bg-white/70 p-3 ring-1 ring-black/10 dark:bg-white/10 dark:ring-white/10">
+      <p class="text-sm font-medium">{t("contacts.importTitle")}</p>
+      <textarea bind:value={importText} rows="5" placeholder={t("contacts.importPaste")}
+        oninput={() => (pendingImport = null)} aria-label={t("contacts.importPaste")}
+        class="w-full rounded-xl bg-black/5 px-3 py-1.5 font-mono text-xs outline-none dark:bg-white/10"></textarea>
+      <input type="file" accept=".vcf,text/vcard" onchange={(e) => void pickImportFile(e)}
+        aria-label={t("contacts.importPick")}
+        class="block w-full text-xs text-neutral-500 dark:text-neutral-400" />
+      {#if pendingImport}
+        <p class="text-xs opacity-80">
+          {t("contacts.importPreview", { n: pendingImport.entries.length })}
+          {#if pendingImport.invalid > 0}
+            · {t("contacts.importInvalid", { n: pendingImport.invalid })}
+          {/if}
+        </p>
+      {/if}
+      <div class="flex gap-2">
+        <button onclick={previewImport} aria-label={t("contacts.importParse")}
+          class="rounded-full bg-accent px-4 py-1.5 text-sm text-white active:scale-95">{t("contacts.importParse")}</button>
+        <button onclick={confirmImport} disabled={pendingImport === null || pendingImport.entries.length === 0}
+          aria-label={t("contacts.importConfirm")}
+          class="rounded-full bg-green-600 px-4 py-1.5 text-sm text-white active:scale-95 disabled:opacity-40">{t("contacts.importConfirm")}</button>
+        <button onclick={closeImport} aria-label={t("contacts.cancel")}
+          class="rounded-full bg-neutral-300 px-4 py-1.5 text-sm dark:bg-neutral-700">{t("contacts.cancel")}</button>
+      </div>
+    </div>
   {/if}
 
   {#if frequent.length}
