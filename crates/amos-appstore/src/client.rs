@@ -146,6 +146,12 @@ impl<P: StoreProvider> AppStore<P> {
     }
 
     /// Persist the current installed registry to `path` as pretty JSON.
+    ///
+    /// Written **atomically** ([`crate::atomic::write_atomic`]): the registry is
+    /// the one file whose loss is unrecoverable. [`open`](Self::open) refuses a
+    /// corrupt registry rather than silently starting empty, so a torn write
+    /// would make *every* later command fail on it — a plain `fs::write`
+    /// truncates in place and leaves exactly that window.
     pub fn save_file(&self, path: &Path) -> Result<()> {
         let registry = self
             .installed
@@ -153,9 +159,7 @@ impl<P: StoreProvider> AppStore<P> {
             .map_err(|_| StoreError::Provider("registry poisoned".into()))?;
         let bytes = serde_json::to_vec_pretty(&*registry)
             .map_err(|e| StoreError::Provider(format!("serialize: {e}")))?;
-        std::fs::write(path, bytes)
-            .map_err(|e| StoreError::Provider(format!("write {path:?}: {e}")))?;
-        Ok(())
+        crate::atomic::write_atomic(path, &bytes)
     }
 
     /// Backend display name (e.g. `"mock-store"`).
@@ -241,6 +245,24 @@ impl<P: StoreProvider> AppStore<P> {
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+
+    /// Fetch the catalog's current package bytes for `id` and verify them
+    /// against the published sha256 — **without installing anything**.
+    ///
+    /// This is the honest "get the APK" primitive for networked sources like
+    /// an F-Droid repo on a host with no device PackageInstaller bridge: the
+    /// bytes come back digest-verified, the registry is untouched, and —
+    /// unlike [`install`](Self::install) — `PackageFormat::Apk` entries are
+    /// allowed (integrity is proven the same way; placement is someone
+    /// else's job).
+    pub async fn download(&self, id: &str) -> Result<(AppManifest, Vec<u8>)> {
+        let manifest = self.resolve_catalog(id).await?;
+        manifest.validate()?;
+        check_publisher(&manifest)?;
+        let bytes = self.provider.fetch_package(&manifest).await?;
+        verify_bytes(id, &manifest, &bytes)?;
+        Ok((manifest, bytes))
     }
 
     /// Install the catalog's current release of `id`.
@@ -570,6 +592,87 @@ mod tests {
             },
             publisher: None,
         }
+    }
+    #[test]
+    fn save_file_replaces_atomically_and_a_torn_registry_is_a_loud_error() {
+        use std::io::Read as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("amos-appstore-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+
+        let store = AppStore::new(MockStoreProvider::new());
+        store.save_file(&path).unwrap();
+        let first = std::fs::read(&path).unwrap();
+
+        // Hold the destination open, then persist a *different* registry. An
+        // atomic replace renames a new file over the destination, so this reader
+        // keeps the old inode and still sees the old bytes; a truncating
+        // `fs::write` would let it observe the new content — and, mid-crash, a
+        // half-written file.
+        let mut held = std::fs::File::open(&path).unwrap();
+        store
+            .record(app("org.amos.atomic", "Atomic", "1.0.0"))
+            .unwrap();
+        store.save_file(&path).unwrap();
+
+        let mut from_held = Vec::new();
+        held.read_to_end(&mut from_held).unwrap();
+        assert_eq!(
+            from_held, first,
+            "the replace must not mutate the old inode in place"
+        );
+        let now = std::fs::read(&path).unwrap();
+        assert_ne!(now, first, "the new registry must actually differ");
+        let _ = AppStore::open(MockStoreProvider::new(), &path).unwrap();
+
+        // No staged temp file survives a successful write.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A registry torn by a crash mid-write — the window a truncating
+        // `fs::write` leaves open — must be a hard error, **not** a silent
+        // "no apps installed". That consequence is why `save_file` stages a
+        // sibling temp and renames over the destination instead.
+        std::fs::write(&path, br#"{"apps":{"org.x":{"manifest":"#).unwrap();
+        let err = match AppStore::open(MockStoreProvider::new(), &path) {
+            Ok(_) => panic!("a torn registry must not load as an empty install set"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("parse"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn download_returns_verified_bytes_without_installing() {
+        let p = MockStoreProvider::new();
+        p.add(apk_app("org.amos.dl", "DL", "1.0.0"), b"apk bytes".to_vec())
+            .unwrap();
+        let store = AppStore::new(p);
+
+        let (mf, bytes) = store.download("org.amos.dl").await.unwrap();
+        assert_eq!(bytes, b"apk bytes");
+        assert_eq!(mf.id, "org.amos.dl");
+        assert!(
+            !store.is_installed("org.amos.dl").unwrap(),
+            "download never records an install"
+        );
+
+        // A tampered payload is refused exactly like an install would be.
+        let p = MockStoreProvider::new();
+        let mut evil = apk_app("org.amos.evil", "Evil", "1.0.0");
+        evil.package.sha256 = Some(Checksum::sha256("a".repeat(64)).unwrap());
+        p.add_broken(evil, b"evil bytes".to_vec()).unwrap();
+        let store = AppStore::new(p);
+        let err = store.download("org.amos.evil").await.unwrap_err();
+        assert!(matches!(err, StoreError::ChecksumMismatch { .. }), "{err}");
     }
 
     /// A catalog entry that ships as a Play-style APK (routes through the

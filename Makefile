@@ -91,6 +91,16 @@ gated-check:
 	cargo check -p amos-monitor --features linux
 	cargo test -p amos-monitor --features linux --lib
 	cargo check -p amos-monitor --features android
+	# Store `live` seams (`amos-appstore::http` — capped/streaming downloads, the
+	# proxy policy — plus the CLI's `--repo`/`--catalog`/`--pin` path). They are
+	# `#[cfg(feature = "live")]`, so **no other target compiles them**: deliberately
+	# placing a `compile_error!` in `http.rs` leaves `make lint` and `make test`
+	# green. Compile them with `-D warnings` and run their tests here instead of
+	# folding `live` into the default build (which is kept offline-green on
+	# purpose). Both steps are loopback-only — the single real-network test is
+	# `#[ignore]`-gated.
+	cargo clippy -p amos-appstore -p amos-appstore-cli --all-targets --features live -- -D warnings
+	cargo test -p amos-appstore -p amos-appstore-cli --features live
 
 # Production gate: formatting + clippy must be clean; TS shells must typecheck and
 # no `src/lib` export may lose its production call site (dead-export regression).

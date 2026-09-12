@@ -18,6 +18,7 @@ path = "src/main.rs"
 amos-appstore = { path = "../amos-appstore" }
 tokio.workspace = true
 anyhow.workspace = true
+serde_json = "1"
 
 # Forward the real HTTP capability: with `--features live`, `--catalog <URL>`
 # drives the HttpStoreProvider (remote catalog + package downloads) instead of

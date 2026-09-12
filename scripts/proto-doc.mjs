@@ -3,7 +3,7 @@
  * proto-doc.mjs — generate the gRPC API reference from `proto/*.proto`
  * (FUNCTIONAL_GAP_ANALYSIS #38: no developer API docs).
  *
- * The `.proto` files ARE the API contract (11 services / 58 RPCs over the shared
+ * The `.proto` files ARE the API contract (10 services / 59 RPCs over the shared
  * Unix Domain Socket), but nothing rendered them: a reader had to open nine files and
  * count braces. This generates `docs/api-grpc.md` — services, methods, messages,
  * fields and enums, each carrying the doc comment that lives beside it in the proto.

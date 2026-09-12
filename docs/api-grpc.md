@@ -5,7 +5,7 @@
 > contract and this page cannot drift apart.
 
 The daemon serves all of these over **one shared Unix Domain Socket** (default $AMOS_SOCKET).
-10 services · 58 RPCs · 117 messages · 18 enums,
+10 services · 59 RPCs · 119 messages · 18 enums,
 across 9 `.proto` files.
 
 ## Index
@@ -13,7 +13,7 @@ across 9 `.proto` files.
 | File | Package | Services | RPCs | Messages | Enums |
 |---|---|---|---|---|---|
 | [`ai_agent.proto`](#ai_agentproto) | `ai_agent` | 2 | 11 | 40 | 0 |
-| [`android_compat.proto`](#android_compatproto) | `android_compat` | 1 | 8 | 16 | 4 |
+| [`android_compat.proto`](#android_compatproto) | `android_compat` | 1 | 9 | 18 | 4 |
 | [`governor.proto`](#governorproto) | `amos_governor` | 1 | 6 | 9 | 2 |
 | [`netguard.proto`](#netguardproto) | `amos_netguard` | 1 | 3 | 7 | 1 |
 | [`privacy.proto`](#privacyproto) | `amos_privacy` | 1 | 9 | 12 | 0 |
@@ -411,6 +411,7 @@ The Tauri System UI never runs an APK directly. It talks to the Amos Rust core o
 | Method | Request | Reply | Kind | Notes |
 |---|---|---|---|---|
 | `LaunchAndroidApp` | `AppLaunchRequest` | `AppLaunchResponse` | unary | Launch a legacy Android app in the container and return its surface id. |
+| `InstallAndroidApp` | `AppInstallRequest` | `AppInstallResponse` | unary | Install a local APK into the container (`waydroid app install <path>`). The APK is expected to have been downloaded + sha256-verified by the caller (the store's download path); this call does not re-verify bytes it cannot see. On success the package is reset to deny-by-default in the container capability ledger, so an install/upgrade never inherits an earlier build's grants. See docs/fdroid-audit.md (gap 1). |
 | `GetInstalledApps` | `Empty` | `AppListResponse` | unary | List installed apps (so the Tauri Launcher can render their icons). |
 | `GetAppIcon` | `AppIconRequest` | `AppIconResponse` | unary | Fetch a PNG icon for an app (extracted from its APK / demo-generated). |
 | `OnActivity` | `ActivityEventRequest` | `ActivityEventResponse` | unary | Report a container-observed Activity lifecycle event to the LMK-proxy. The proxy tracks each running task's importance and its freeze/kill candidacy under memory pressure (docs/lmk-proxy.md). |
@@ -447,6 +448,20 @@ The Tauri System UI never runs an APK directly. It talks to the Amos Rust core o
 | `success` | `bool` | 1 | — |
 | `window_id` | `string` | 2 | Wayland surface / window id of the launched app |
 | `error` | `string` | 3 | non-empty when success is false |
+
+**`AppInstallRequest`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `apk_path` | `string` | 1 | host path of the APK to install |
+| `package_name` | `string` | 2 | the app id the caller knows; the container CLI |
+
+**`AppInstallResponse`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `success` | `bool` | 1 | — |
+| `error` | `string` | 2 | non-empty when success is false |
 
 **`AppListResponse`**
 

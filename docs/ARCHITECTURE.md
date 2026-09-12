@@ -48,7 +48,8 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 
 * `ai_agent.proto`: `StreamChat` (server-streaming tokens), `Chat` (bidi),
   `GetStatus`.
-* `android_compat.proto`: `LaunchAndroidApp`, `GetInstalledApps`, `GetAppIcon`.
+* `android_compat.proto`: `LaunchAndroidApp`, `InstallAndroidApp`,
+  `GetInstalledApps`, `GetAppIcon` (plus the Activity/LMK-proxy surface).
 * `governor.proto` (`amos_governor`): `RegisterApp`, `MoveApp`, `UnregisterApp`,
   `ScheduleJob`, `GetState` — drive the daemon's `ResourceGovernor` closed loop.
 

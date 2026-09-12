@@ -27,7 +27,9 @@ flate2 = "1"
 # the StoreProvider seam. Kept out of the default build so the offline workspace
 # stays green, mirroring amos-mail's `live` gating of SMTP/IMAP. ureq is the same
 # small blocking HTTP client amos-ai uses; here it runs inside spawn_blocking.
-ureq = { version = "2", optional = true }
+# `socks-proxy` is on so an `ALL_PROXY=socks5://…` environment (common in
+# sandboxed CI) is honored instead of failing every connection.
+ureq = { version = "2", optional = true, features = ["socks-proxy"] }
 
 [features]
 default = []

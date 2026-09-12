@@ -35,6 +35,85 @@ use crate::StoreProvider;
 /// Default per-request timeout for catalog + package downloads.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+/// Hard ceiling on any single downloaded body (index, catalog, or package).
+///
+/// This is a **pre-verification** denial-of-service backstop, not an app-size
+/// policy: the engine can only sha256-check bytes it has finished reading, so a
+/// server that streams forever would otherwise exhaust memory *before* any
+/// integrity check could run. The official F-Droid index is ~61 MB and real
+/// packages are at most a few hundred MB, so 2 GiB sits far above any
+/// legitimate payload while still being *finite*.
+pub(crate) const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// A [`Read`] adapter that **fails** once more than `max` bytes have been
+/// produced, instead of silently truncating. Truncation would be worse than an
+/// error: a hostile oversized body would surface as a confusing mid-document
+/// parse failure rather than an explicit limit violation.
+struct CappedReader<R> {
+    inner: R,
+    remaining: u64,
+    max: u64,
+    url: String,
+}
+
+impl<R: Read> CappedReader<R> {
+    fn new(inner: R, max: u64, url: impl Into<String>) -> Self {
+        Self {
+            inner,
+            remaining: max,
+            max,
+            url: url.into(),
+        }
+    }
+}
+
+impl<R: Read> Read for CappedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            // A body that is exactly `max` bytes long is legal, so probe one
+            // more byte: EOF means it fit, anything else is over the cap.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe) {
+                Ok(0) => Ok(0),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("body from {} exceeds the {} byte limit", self.url, self.max),
+                )),
+                Err(e) => Err(e),
+            };
+        }
+        let want = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Blocking GET of `url` returning the raw body bytes, bounded by
+/// [`MAX_BODY_BYTES`]. Runs on a blocking thread via [`fetch_async`]; never call
+/// from an async context directly.
+pub(crate) fn blocking_get_bytes(url: &str, timeout_secs: u64) -> Result<Vec<u8>> {
+    blocking_get_bytes_capped(url, timeout_secs, MAX_BODY_BYTES)
+}
+
+/// [`blocking_get_bytes`] with an explicit byte ceiling (tests use a tiny one).
+pub(crate) fn blocking_get_bytes_capped(
+    url: &str,
+    timeout_secs: u64,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let resp = live_agent(url, timeout_secs)
+        .get(url)
+        .call()
+        .map_err(|e| StoreError::Provider(format!("GET {url}: {e}")))?;
+    let mut reader = CappedReader::new(resp.into_reader(), max_bytes, url);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| StoreError::Provider(format!("read {url}: {e}")))?;
+    Ok(bytes)
+}
+
 /// A [`StoreProvider`] backed by an HTTP catalog URL + per-package URLs.
 ///
 /// ```text
@@ -68,25 +147,114 @@ impl HttpStoreProvider {
     }
 }
 
-/// Blocking GET of `url` returning the raw body bytes. Runs on a blocking
-/// thread via [`fetch_async`]; never call from an async context directly.
-fn blocking_get_bytes(url: &str, timeout_secs: u64) -> Result<Vec<u8>> {
-    let resp = ureq::get(url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .call()
-        .map_err(|e| StoreError::Provider(format!("GET {url}: {e}")))?;
-    let mut reader = resp.into_reader();
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| StoreError::Provider(format!("read {url}: {e}")))?;
-    Ok(bytes)
+/// Whether `url`'s **host** is a loopback address (`127.0.0.0/8`, `localhost`,
+/// `::1`).
+///
+/// The match is on the parsed host, never on a substring of the whole URL:
+/// `https://proxy.example/127.0.0.1/pkg.tgz` and
+/// `https://localhost.evil.test/repo` merely *contain* the text, and treating
+/// them as loopback would silently bypass a required egress proxy (an explicit
+/// proxy setting must not be defeatable by picking a hostname).
+fn is_loopback_url(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    // The authority runs to the path / query / fragment.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    // Drop any `user:pass@` prefix.
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    // An IPv6 literal is bracketed (`[::1]:8080`); its colons are not a port.
+    let host = match host_port.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// The blocking HTTP client for live fetches, with an explicit proxy policy:
+///
+/// * loopback URLs (`127.0.0.1` / `localhost` / `[::1]` — the tests and local
+///   dev servers) never go through a proxy;
+/// * otherwise `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` are honored (first
+///   hit wins). Explicit beats ureq's implicit env handling on purpose: ureq
+///   parses a `socks5://` `ALL_PROXY` even without its `socks-proxy` feature
+///   and then fails every connection with "SOCKS feature disabled", so a
+///   sandbox with a socks-only `ALL_PROXY` used to break live fetches even
+///   when an HTTP proxy was also exported;
+/// * no proxy env at all → direct connection.
+fn live_agent(url: &str, timeout_secs: u64) -> ureq::Agent {
+    let builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(timeout_secs.max(1)));
+    if is_loopback_url(url) {
+        return builder.build();
+    }
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            if let Ok(proxy) = ureq::Proxy::new(value) {
+                return builder.proxy(proxy).build();
+            }
+        }
+    }
+    builder.build()
 }
 
 /// Fetch `url` off the async context via [`spawn_blocking`](tokio::task).
-async fn fetch_async(url: String, timeout_secs: u64) -> Result<Vec<u8>> {
+/// Crate-shared: the F-Droid repo provider ([`crate::fdroid`]) reuses this for
+/// its index + APK downloads so both live backends time out and error alike.
+pub(crate) async fn fetch_async(url: String, timeout_secs: u64) -> Result<Vec<u8>> {
     let display = url.clone();
     let handle = tokio::task::spawn_blocking(move || blocking_get_bytes(&url, timeout_secs));
+    handle
+        .await
+        .map_err(|e| StoreError::Provider(format!("fetch {display} task failed: {e}")))?
+}
+
+/// Blocking GET whose body is parsed as JSON **streaming off the response
+/// reader**. Large documents (the official F-Droid `index-v1.json` is tens of
+/// MB) never need the whole body buffered before parsing, halving peak memory
+/// versus fetch-then-parse. The stream is bounded by [`MAX_BODY_BYTES`] so an
+/// endless body fails closed instead of exhausting memory.
+pub(crate) fn blocking_get_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    timeout_secs: u64,
+) -> Result<T> {
+    blocking_get_json_capped(url, timeout_secs, MAX_BODY_BYTES)
+}
+
+/// [`blocking_get_json`] with an explicit byte ceiling (tests use a tiny one).
+pub(crate) fn blocking_get_json_capped<T: serde::de::DeserializeOwned>(
+    url: &str,
+    timeout_secs: u64,
+    max_bytes: u64,
+) -> Result<T> {
+    let resp = live_agent(url, timeout_secs)
+        .get(url)
+        .call()
+        .map_err(|e| StoreError::Provider(format!("GET {url}: {e}")))?;
+    serde_json::from_reader(CappedReader::new(resp.into_reader(), max_bytes, url))
+        .map_err(|e| StoreError::Provider(format!("parse JSON from {url}: {e}")))
+}
+
+/// Async wrapper for [`blocking_get_json`], same contract as [`fetch_async`].
+pub(crate) async fn fetch_json_async<T: serde::de::DeserializeOwned + Send + 'static>(
+    url: String,
+    timeout_secs: u64,
+) -> Result<T> {
+    let display = url.clone();
+    let handle = tokio::task::spawn_blocking(move || blocking_get_json(&url, timeout_secs));
     handle
         .await
         .map_err(|e| StoreError::Provider(format!("fetch {display} task failed: {e}")))?
@@ -145,6 +313,33 @@ mod tests {
                 size_bytes: None,
             },
             publisher: None,
+        }
+    }
+
+    // --- Proxy policy: loopback is decided on the host, not a substring ------
+
+    #[test]
+    fn loopback_is_decided_on_the_host_not_a_substring_of_the_url() {
+        // Genuine loopback hosts keep direct-connect (the tests' own servers).
+        for u in [
+            "http://127.0.0.1:8080/pkg.tgz",
+            "http://127.5.6.7:9/x",
+            "https://localhost:3000/index-v1.json",
+            "http://localhost/index-v1.json",
+            "http://[::1]:8080/index-v1.json",
+            "http://user:pass@127.0.0.1/x",
+        ] {
+            assert!(is_loopback_url(u), "{u} must be treated as loopback");
+        }
+        // These merely *contain* the text; calling them loopback would bypass a
+        // proxy that is explicitly configured (an egress policy hole).
+        for u in [
+            "https://localhost.evil.test/repo",
+            "https://127.0.0.1.evil.test/repo",
+            "https://proxy.example/127.0.0.1/pkg.tgz",
+            "https://example.test/index-v1.json?host=localhost",
+        ] {
+            assert!(!is_loopback_url(u), "{u} must NOT be treated as loopback");
         }
     }
 
@@ -279,6 +474,48 @@ mod tests {
         );
         assert!(!store.is_installed("org.amos.evil").unwrap());
 
+        server.await.unwrap();
+    }
+
+    // --- Download byte cap (pre-verification DoS backstop) ------------------
+
+    #[test]
+    fn capped_reader_allows_a_body_exactly_at_the_limit() {
+        let src = vec![b'x'; 16];
+        let mut r = CappedReader::new(std::io::Cursor::new(src.clone()), 16, "mem://");
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, src, "a body exactly at the cap is legal");
+    }
+
+    #[test]
+    fn capped_reader_fails_closed_past_the_limit() {
+        let mut r = CappedReader::new(std::io::Cursor::new(vec![b'x'; 17]), 16, "mem://big");
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the 16 byte limit"),
+            "truncation must be an explicit error, not a silent cut: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_refused_with_a_clear_error_over_loopback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let server = tokio::spawn(async move {
+            serve_loop(listener, 1, Vec::new(), vec![b'x'; 256]).await;
+        });
+        let url = format!("{base}/pkg.tgz");
+        let err = tokio::task::spawn_blocking(move || blocking_get_bytes_capped(&url, 5, 64))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the 64 byte limit"),
+            "a server streaming past the cap must fail closed: {err}"
+        );
         server.await.unwrap();
     }
 }

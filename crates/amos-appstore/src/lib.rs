@@ -49,8 +49,10 @@
 )]
 
 pub mod android;
+pub mod atomic;
 pub mod client;
 pub mod error;
+pub mod fdroid;
 pub mod host;
 pub mod model;
 pub mod provider;
@@ -66,8 +68,13 @@ pub use android::{
     Precondition, Privilege, Session, SideloadOnlyBridge, INSTALL_PACKAGES_PERMISSION,
     STATUS_PENDING_USER_ACTION,
 };
+pub use atomic::write_atomic;
 pub use client::AppStore;
 pub use error::{Result, StoreError};
+pub use fdroid::{
+    catalog_to_fdroid_index_v1, fdroid_index_to_catalog, FdroidApp, FdroidIndexV1, FdroidLocalized,
+    FdroidPackage, FdroidRepoMeta, FdroidRepoProvider, F_DROID_OFFICIAL_REPO,
+};
 pub use host::{is_valid_app_id, parse_bundle_uri, serve_bundle, ServedBundle, SCHEME};
 pub use model::{
     AppCategory, AppManifest, AppStatus, Checksum, HashAlgorithm, InstalledApp, PackageFormat,

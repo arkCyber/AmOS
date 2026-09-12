@@ -22,6 +22,14 @@ use crate::runtime::AndroidRuntime;
 pub struct AndroidManagerConfig {
     /// Maximum time to wait for app launch operation (seconds).
     pub launch_timeout_secs: u64,
+    /// Maximum time to wait for an APK install (seconds).
+    ///
+    /// Deliberately **its own** knob, and deliberately larger than a launch: the
+    /// container runs the package manager *and* dexopt, so an install routinely
+    /// outlives a launch. Sharing the launch timeout would report a
+    /// slow-but-successful install as a failure — a false negative the caller
+    /// cannot distinguish from a real one.
+    pub install_timeout_secs: u64,
     /// Maximum time to wait for list_apps operation (seconds).
     pub list_timeout_secs: u64,
     /// Maximum time to wait for icon fetch (seconds).
@@ -34,6 +42,7 @@ impl Default for AndroidManagerConfig {
     fn default() -> Self {
         Self {
             launch_timeout_secs: 30,
+            install_timeout_secs: 180,
             list_timeout_secs: 10,
             icon_timeout_secs: 5,
             icon_cache_size: 256,
@@ -44,14 +53,16 @@ impl Default for AndroidManagerConfig {
 impl AndroidManagerConfig {
     /// Overlay the documented env knobs on the defaults.
     ///
-    /// `AMOS_ANDROID_LAUNCH_TIMEOUT` / `AMOS_ANDROID_LIST_TIMEOUT` /
-    /// `AMOS_ANDROID_ICON_TIMEOUT` (seconds) and the icon-cache bound — both names
-    /// the docs used, `AMOS_ANDROID_ICON_CACHE_SIZE` (newer) and
-    /// `AMOS_ANDROID_CACHE_SIZE` (older) — were **write-only** before: nothing read
-    /// them. Pure for the values so the parse policy is unit-testable without
-    /// touching the process environment.
+    /// `AMOS_ANDROID_LAUNCH_TIMEOUT` / `AMOS_ANDROID_INSTALL_TIMEOUT` /
+    /// `AMOS_ANDROID_LIST_TIMEOUT` / `AMOS_ANDROID_ICON_TIMEOUT` (seconds) and the
+    /// icon-cache bound — both names the docs used,
+    /// `AMOS_ANDROID_ICON_CACHE_SIZE` (newer) and `AMOS_ANDROID_CACHE_SIZE`
+    /// (older) — were **write-only** before: nothing read them. Pure for the
+    /// values so the parse policy is unit-testable without touching the process
+    /// environment.
     pub fn from_vars(
         launch: Option<&str>,
+        install: Option<&str>,
         list: Option<&str>,
         icon: Option<&str>,
         icon_cache: Option<&str>,
@@ -67,6 +78,9 @@ impl AndroidManagerConfig {
         let mut cfg = Self::default();
         if let Some(n) = secs(launch).filter(|n| *n > 0) {
             cfg.launch_timeout_secs = n;
+        }
+        if let Some(n) = secs(install).filter(|n| *n > 0) {
+            cfg.install_timeout_secs = n;
         }
         if let Some(n) = secs(list).filter(|n| *n > 0) {
             cfg.list_timeout_secs = n;
@@ -87,6 +101,9 @@ impl AndroidManagerConfig {
             .or_else(|| std::env::var("AMOS_ANDROID_CACHE_SIZE").ok());
         Self::from_vars(
             std::env::var("AMOS_ANDROID_LAUNCH_TIMEOUT").ok().as_deref(),
+            std::env::var("AMOS_ANDROID_INSTALL_TIMEOUT")
+                .ok()
+                .as_deref(),
             std::env::var("AMOS_ANDROID_LIST_TIMEOUT").ok().as_deref(),
             std::env::var("AMOS_ANDROID_ICON_TIMEOUT").ok().as_deref(),
             icon_cache.as_deref(),
@@ -163,6 +180,55 @@ impl EnhancedAndroidManager {
                 tracing::error!(
                     "app launch timeout after {}s: {}",
                     self.config.launch_timeout_secs,
+                    package_name
+                );
+                Err(anyhow!("operation timeout"))
+            }
+        }
+    }
+
+    /// Install a local APK into the container with timeout protection.
+    ///
+    /// Uses its **own** timeout (`AMOS_ANDROID_INSTALL_TIMEOUT`, default 180 s),
+    /// not the launch one: installing runs the package manager and dexopt, so a
+    /// slow-but-successful install must not be reported as a timeout failure.
+    ///
+    /// Note the APK bytes are the caller's responsibility: by the time they reach
+    /// here the store has already downloaded *and* sha256-verified them. This
+    /// call only drives the container.
+    pub async fn install_app(&self, apk_path: &str, package_name: &str) -> Result<()> {
+        self.increment_ops().await;
+        let timeout = Duration::from_secs(self.config.install_timeout_secs);
+
+        let path = apk_path.to_string();
+        let pkg = package_name.to_string();
+        let runtime = self.runtime.clone();
+
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || runtime.install(&path, &pkg)),
+        )
+        .await;
+
+        self.decrement_ops().await;
+
+        match result {
+            Ok(Ok(Ok(()))) => {
+                tracing::info!("installed apk: {} -> {}", apk_path, package_name);
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::warn!("app install failed: {}: {}", package_name, e);
+                Err(anyhow!("install failed: {}", e))
+            }
+            Ok(Err(e)) => {
+                tracing::error!("task join error: {}", e);
+                Err(anyhow!("task join error: {}", e))
+            }
+            Err(_) => {
+                tracing::error!(
+                    "app install timeout after {}s: {}",
+                    self.config.install_timeout_secs,
                     package_name
                 );
                 Err(anyhow!("operation timeout"))
@@ -400,25 +466,44 @@ mod tests {
     fn android_manager_config_reads_documented_env_knobs() {
         let d = AndroidManagerConfig::default();
         // Unset / garbage keep the tuned defaults.
-        let none = AndroidManagerConfig::from_vars(None, None, None, None);
+        let none = AndroidManagerConfig::from_vars(None, None, None, None, None);
         assert_eq!(none.launch_timeout_secs, d.launch_timeout_secs);
+        assert_eq!(none.install_timeout_secs, d.install_timeout_secs);
         assert_eq!(none.list_timeout_secs, d.list_timeout_secs);
         assert_eq!(none.icon_timeout_secs, d.icon_timeout_secs);
         assert_eq!(none.icon_cache_size, d.icon_cache_size);
         // A zero timeout would make every op fail instantly -> ignored.
-        let zero = AndroidManagerConfig::from_vars(Some("0"), Some("-1"), Some("x"), None);
+        let zero =
+            AndroidManagerConfig::from_vars(Some("0"), Some("0"), Some("-1"), Some("x"), None);
         assert_eq!(zero.launch_timeout_secs, d.launch_timeout_secs);
+        assert_eq!(zero.install_timeout_secs, d.install_timeout_secs);
         assert_eq!(zero.list_timeout_secs, d.list_timeout_secs);
         assert_eq!(zero.icon_timeout_secs, d.icon_timeout_secs);
         // Valid values are honoured (whitespace tolerated).
-        let cfg = AndroidManagerConfig::from_vars(Some(" 45 "), Some("20"), Some("9"), Some("64"));
+        let cfg = AndroidManagerConfig::from_vars(
+            Some(" 45 "),
+            Some(" 600 "),
+            Some("20"),
+            Some("9"),
+            Some("64"),
+        );
         assert_eq!(cfg.launch_timeout_secs, 45);
+        assert_eq!(cfg.install_timeout_secs, 600);
         assert_eq!(cfg.list_timeout_secs, 20);
         assert_eq!(cfg.icon_timeout_secs, 9);
         assert_eq!(cfg.icon_cache_size, 64);
+        // The install budget is its own knob and starts *above* the launch one:
+        // installing runs the package manager + dexopt, so it must not inherit a
+        // launch-sized deadline.
+        assert!(
+            d.install_timeout_secs > d.launch_timeout_secs,
+            "install default ({}) must exceed launch default ({})",
+            d.install_timeout_secs,
+            d.launch_timeout_secs
+        );
         // `0` for the cache bound is meaningful (caching disabled), not a typo.
         assert_eq!(
-            AndroidManagerConfig::from_vars(None, None, None, Some("0")).icon_cache_size,
+            AndroidManagerConfig::from_vars(None, None, None, None, Some("0")).icon_cache_size,
             0
         );
     }
@@ -440,6 +525,46 @@ mod tests {
         let stats = manager.cache_stats().await;
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.total_accesses, 2);
+    }
+
+    /// Install reads the **install** timeout, not the launch one. The runtime's
+    /// install outlives a 1 s install budget but is far inside the 60 s launch
+    /// budget — so if `install_app` were still reading `launch_timeout_secs` this
+    /// test would get `Ok` and prove nothing.
+    #[tokio::test]
+    async fn install_uses_the_install_timeout_not_the_launch_timeout() {
+        struct SlowInstall;
+        impl AndroidRuntime for SlowInstall {
+            fn name(&self) -> &'static str {
+                "slow-install"
+            }
+            fn list_apps(&self) -> Result<Vec<AndroidApp>, String> {
+                Ok(Vec::new())
+            }
+            fn launch(&self, _package_name: &str) -> Result<String, String> {
+                Ok("waydroid_x".to_string())
+            }
+            fn install(&self, _apk_path: &str, _package_name: &str) -> Result<(), String> {
+                // Dexopt-ish: comfortably longer than the install budget below,
+                // comfortably shorter than the launch budget.
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                Ok(())
+            }
+        }
+        let manager = EnhancedAndroidManager::with_config(
+            Arc::new(SlowInstall),
+            AndroidManagerConfig {
+                install_timeout_secs: 1,
+                launch_timeout_secs: 60,
+                ..Default::default()
+            },
+        );
+
+        let err = manager
+            .install_app("/tmp/a.apk", "com.a.app")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
     }
 
     #[tokio::test]

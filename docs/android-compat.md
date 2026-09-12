@@ -22,7 +22,8 @@ The Tauri System UI never runs an APK directly. Legacy Android apps run inside a
 ## Implemented (`crates/amos-android`)
 
 - **`proto/android_compat.proto`** (compiled into `amos-proto`):
-  `AndroidManager` service with `LaunchAndroidApp` + `GetInstalledApps`.
+  `AndroidManager` service with `LaunchAndroidApp` + `InstallAndroidApp` +
+  `GetInstalledApps` (plus the Activity/LMK-proxy RPCs, see `docs/lmk-proxy.md`).
 - **`AndroidRuntime` driver abstraction** (`runtime.rs`) so the layer works for
   real on any host:
   - `WaydroidRuntime` — drives the real container via its CLI (device default).
@@ -33,8 +34,9 @@ The Tauri System UI never runs an APK directly. Legacy Android apps run inside a
   - `auto()` — picks Waydroid when present on `$PATH`, else Demo.
 - **`AndroidController`** drives the container via an injectable `CommandRunner`
   (real `ShellRunner` for production; fake runner for tests):
-  `launch_apk`, `list_installed_apps`, and **APK icon extraction**
-  (`extract_icon_bytes`).
+  `launch_apk`, `install_apk` (`waydroid app install`, with the installed package
+  reset to deny-by-default in `capability.rs`), `list_installed_apps`, and
+  **APK icon extraction** (`extract_icon_bytes`).
 - **`AndroidManagerService`**: a tonic gRPC server wrapping the runtime
   (`spawn_blocking` so subprocess calls don't stall the executor). Served on the
   same UDS as `AiAgent` by `amos-ai`.

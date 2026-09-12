@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use amos_proto::android_compat::AndroidApp;
 
+use crate::capability::CapabilityLedger;
 use crate::controller::{AndroidController, CommandRunner, ShellRunner};
 
 /// The behaviour the Android-manager gRPC service needs from a runtime.
@@ -28,6 +29,19 @@ pub trait AndroidRuntime: Send + Sync {
     /// kill report `Err` unless overridden.
     fn force_stop(&self, _package_name: &str) -> Result<(), String> {
         Err("this runtime cannot force-stop apps".to_string())
+    }
+    /// Install a local APK into the container (the last mile of
+    /// `docs/fdroid-audit.md` gap 1). Runtimes that cannot install — the demo
+    /// runtime, which is an in-process fixture — report `Err` rather than
+    /// pretending an app appeared.
+    fn install(&self, _apk_path: &str, _package_name: &str) -> Result<(), String> {
+        Err("this runtime cannot install APKs".to_string())
+    }
+    /// The per-package capability ledger, when the runtime has one (see
+    /// `crate::capability`). A policy hook consults it; `None` means the
+    /// runtime carries no container capability state at all (demo).
+    fn capabilities(&self) -> Option<&CapabilityLedger> {
+        None
     }
 }
 
@@ -73,6 +87,14 @@ impl<R: CommandRunner> AndroidRuntime for WaydroidRuntime<R> {
 
     fn force_stop(&self, package_name: &str) -> Result<(), String> {
         self.ctl.force_stop(package_name)
+    }
+
+    fn install(&self, apk_path: &str, package_name: &str) -> Result<(), String> {
+        self.ctl.install_apk(apk_path, package_name)
+    }
+
+    fn capabilities(&self) -> Option<&CapabilityLedger> {
+        Some(self.ctl.ledger())
     }
 }
 
@@ -324,5 +346,44 @@ mod tests {
         let apps = rt.list_apps().unwrap();
         assert_eq!(apps.len(), 2);
         assert_eq!(rt.launch("com.a.app").unwrap(), "waydroid_com.a.app");
+    }
+
+    #[test]
+    fn waydroid_runtime_installs_with_deny_by_default_capabilities() {
+        struct OkRunner;
+        impl CommandRunner for OkRunner {
+            fn run(&self, _p: &str, _a: &[&str]) -> std::io::Result<std::process::Output> {
+                use std::os::unix::process::ExitStatusExt;
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        let rt = WaydroidRuntime::with_runner(OkRunner);
+        let caps = rt
+            .capabilities()
+            .expect("waydroid carries a capability ledger");
+        caps.grant("com.a.app", "camera");
+        assert!(caps.is_granted("com.a.app", "camera"));
+
+        rt.install("/tmp/a.apk", "com.a.app").unwrap();
+
+        assert!(
+            rt.capabilities().unwrap().granted("com.a.app").is_empty(),
+            "an install resets the package to deny-by-default"
+        );
+    }
+
+    #[test]
+    fn demo_runtime_refuses_install_and_has_no_ledger() {
+        let rt = DemoRuntime::new();
+        let err = rt.install("/tmp/a.apk", "com.a.app").unwrap_err();
+        assert!(err.contains("cannot install"), "{err}");
+        assert!(
+            rt.capabilities().is_none(),
+            "the demo runtime carries no container capability state"
+        );
     }
 }

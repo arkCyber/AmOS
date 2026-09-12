@@ -13,6 +13,14 @@ service AndroidManager {
   // Launch a legacy Android app in the container and return its surface id.
   rpc LaunchAndroidApp(AppLaunchRequest) returns (AppLaunchResponse);
 
+  // Install a local APK into the container (`waydroid app install <path>`).
+  // The APK is expected to have been downloaded + sha256-verified by the caller
+  // (the store's download path); this call does not re-verify bytes it cannot see.
+  // On success the package is reset to deny-by-default in the container
+  // capability ledger, so an install/upgrade never inherits an earlier build's
+  // grants. See docs/fdroid-audit.md (gap 1).
+  rpc InstallAndroidApp(AppInstallRequest) returns (AppInstallResponse);
+
   // List installed apps (so the Tauri Launcher can render their icons).
   rpc GetInstalledApps(Empty) returns (AppListResponse);
 
@@ -59,6 +67,17 @@ message AppLaunchResponse {
   bool success = 1;
   string window_id = 2; // Wayland surface / window id of the launched app
   string error = 3;     // non-empty when success is false
+}
+
+message AppInstallRequest {
+  string apk_path = 1;     // host path of the APK to install
+  string package_name = 2; // the app id the caller knows; the container CLI
+                           // does not reliably report it back
+}
+
+message AppInstallResponse {
+  bool success = 1;
+  string error = 2; // non-empty when success is false
 }
 
 message AppListResponse {

@@ -4,7 +4,7 @@
 
 当前交付的是**纯 Rust 领域内核 crate**（`crates/amos-appstore`），不含 UI / CLI / Tauri 桥接——先把**契约**和**下载→校验→安装**的包管理核心钉死，再逐层接壳。这正是仓库一贯的拆分方式（参考 `amos-mail` / `amos-int` / `amos-tts`）。
 
-> 状态：**领域内核 + Tauri 桥接 + CLI + HTTP 后端 + 发布签名 + 动态注册表已实现**（2026-09-03）。Rust 侧：离线领域内核 + provider seam + mock + 测试；`HttpStoreProvider`（`live` 门控）拉真实 HTTP 目录 + 下载包；Ed25519 **发布签名**（`DeveloperKey` 签名 manifest、引擎安装前验签）。已通过 `amos-tauri/src/appstore.rs`（managed `StoreBridge` + `appstore_*` 命令）与前端 `store*` typed 桥接暴露给 WebView；另有 `amos-appstore-cli` 在终端驱动同一引擎。系统 UI 已含「应用商店」应用页（目录/安装/卸载/升级），且**已装第三方应用会作为 tile 动态并入主屏**（`store:<id>`，点击打开占位容器）。剩余：installer（真实运行宿主）见文末[路线图](#路线图)。
+> 状态：**领域内核 + Tauri 桥接 + CLI + HTTP 后端 + 发布签名 + 动态注册表 + F-Droid 兼容层已实现**（2026-09-12）。Rust 侧：离线领域内核 + provider seam + mock + 测试；`HttpStoreProvider`（`live` 门控）拉真实 HTTP 目录 + 下载包；Ed25519 **发布签名**（`DeveloperKey` 签名 manifest、引擎安装前验签）；**F-Droid 仓库兼容**（`FdroidRepoProvider`：官方 `index-v1.json` 双形态解析 → 同一 `AppManifest` 契约，APK 下载 + sha256 校验，已对 f-droid.org 实测）。已通过 `amos-tauri/src/appstore.rs`（managed `StoreBridge` + `appstore_*` 命令）与前端 `store*` typed 桥接暴露给 WebView；另有 `amos-appstore-cli` 在终端驱动同一引擎。系统 UI 已含「应用商店」应用页（目录/安装/卸载/升级），且**已装第三方应用会作为 tile 动态并入主屏**（`store:<id>`，点击打开占位容器）。剩余：installer（真实运行宿主）与 APK 静默安装的设备桥见文末[路线图](#路线图)。
 
 ---
 
@@ -31,7 +31,8 @@
         ▼
 [ StoreProvider trait (provider.rs) ]
         ├── MockStoreProvider     （确定性、内存态、离线可测）✓ 已实现
-        └── HttpStoreProvider     （真实 HTTP 目录/CDN）✓ 已实现（feature `live`，默认不编）
+        ├── HttpStoreProvider     （真实 HTTP 目录/CDN）✓ 已实现（feature `live`，默认不编）
+        └── FdroidRepoProvider    （F-Droid 仓库 index-v1 兼容）✓ 已实现（解析离线可用；联网 fetch 在 `live`）
 ```
 
 - **`model.rs`**：领域模型与**发布契约**（开发者发布一个 app 要满足的字段），见 §4。
@@ -310,6 +311,62 @@ cargo run -p amos-appstore-cli --features live -- \
     --catalog https://example.dev/catalog.json install org.amos.pomodoro
 ```
 
+### 接 F-Droid 仓库（feature `live`，2026-09-12 实测通过）
+
+`FdroidRepoProvider`（`crates/amos-appstore/src/fdroid.rs`）让同一引擎直接消费 **F-Droid 的
+`index-v1.json` 目录**——我们的目录格式与 F-Droid 双向兼容（既可读也可导出，见 `catalog_to_fdroid_index_v1`）：
+
+```bash
+# 浏览 / 搜索官方仓库（拉取 <repo>/index-v1.json，~60MB，已对 f-droid.org 实测）
+cargo run -p amos-appstore-cli --features live -- \
+    --repo https://f-droid.org/repo find org.wikipedia
+cargo run -p amos-appstore-cli --features live -- \
+    --repo https://f-droid.org/repo info org.wikipedia      # 详情：版本/包URL/sha256/大小/描述
+cargo run -p amos-appstore-cli --features live -- \
+    --repo https://f-droid.org/repo search terminal
+
+# 下载一个 APK 并按索引里的 sha256 校验后落盘（不安装）
+cargo run -p amos-appstore-cli --features live -- \
+    --repo https://f-droid.org/repo download org.fdroid.fdroid --out /tmp/fdroid-client.apk
+
+# 把任意当前目录（离线 demo / --catalog / --repo）导出为 F-Droid index-v1 格式
+amos-appstore-cli export index-v1.json --repo-address https://store.amos.local/repo
+```
+
+兼容性与诚实边界：
+
+- **格式双向**：`FdroidIndexV1` ↔ `AppManifest`。官方索引的怪癖都被吸收——`packages`
+  既接受官方的**按包名分组对象**也接受第三方常用的扁平数组（分组行缺省的
+  `packageName` 从字典键回填）；数值字段同时接受数字与字符串编码（官方
+  `suggestedVersionCode` 就是 `"1010200"`）；未知字段忽略。
+- **本地化元数据**：`localized` 字典被消费——顶层 `name`/`summary`/`description`/`icon`
+  缺失或为空时按 `en` → `zh*` → 首个 locale 回填（f-droid.org 大量应用的正文只存在于
+  `localized`，实测 `info org.wikipedia` 直接得到中文描述）。
+- **antiFeatures 显式过滤**：应用级与构建级的 `antiFeatures`（`KnownVuln`/`NSFW`/…）
+  都被模型携带；`FdroidRepoProvider::with_exclude_anti_features(["KnownVuln"])` 按
+  策略剔除（默认**不隐藏任何条目**——过滤是显式选择，被标记构建会退回最高干净构建）。
+- **诚实跳过**：`packageName` 不是合法 Amos slug（含大写）的条目**跳过而非改名**（改名会
+  破坏 PackageInstaller 交接）；没有可用 sha256 摘要的包跳过（联网商店绝不降级为无校验安装）。
+- **版本映射**：`versionName` 能按 semver 解析就用它（两段式 `5.0` 补成 `5.0.0`）；否则按
+  `versionCode` 做千进制拆分，保证升级排序永不因上游命名而断。导出方向对称地写入
+  `suggestedVersionCode`（= semver 的千进制合成码），F-Droid 客户端会选中我们的构建。
+- **大索引省内存**：无 pin 时索引**流式解析**（`serde_json::from_reader` 直接吃响应流），
+  61MB 官方索引不再整块缓冲两份；带 `--pin` 时仍全量缓冲以校验精确字节。
+- **下载体量有上限**：联网下载（索引 / 目录 / 包）都经 `CappedReader` 以
+  `MAX_BODY_BYTES`（2 GiB）封顶，超出即 **fail-closed**（明确报错，绝不静默截断）——
+  防止恶意/误配置的服务器无限流式推送，在 sha256 校验**之前**把内存耗尽。
+- **落盘原子性**：CLI `download`/`export` 先写同目录临时文件、`fsync` 后 `rename`
+  覆盖目标；进程中途被杀只会留下**旧文件或什么都没有**，绝不留半截产物给后续
+  安装/校验步骤误信。
+- **APK 落盘 ≠ 安装**：F-Droid 条目是 APK，引擎把它路由到 `install_apk()`（设备
+  PackageInstaller 桥）。宿主上诚实的动作是 `download`（取字节 + 验摘要，**不装**）；
+  静默安装待 `crates/amos-android` 的真实桥（见 `docs/fdroid-audit.md` 缺口 1）。
+- **索引真实性**：官方用仓库 PGP 密钥签 `index-v1.jar.asc`，OpenPGP 验签**尚未实现**；
+  过渡期用 `--pin <sha256>`（或 `FdroidRepoProvider::fetch` 的
+  `pinned_index_sha256` 参数）钉住索引摘要。每个 APK 的 sha256 校验不受影响。
+- 代理：live 抓取遵循 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`（含 socks5，ureq
+  `socks-proxy` feature）；回环地址（测试/本地服务）永远直连。
+
 ---
 
 ## 6. 安全要点
@@ -337,7 +394,7 @@ cargo run -p amos-appstore-cli --features live -- \
 
 ## 8. 测试
 
-`cargo test -p amos-appstore` —— 覆盖：版本解析与排序、sha256 校验与篡改拒绝、id slug 校验、manifest 校验、mock 目录往返与摘要盖章、**下载→校验→安装**成功路径、**篡改字节被拒**、未知/重复/缺失等干净错误、升级只升不降、卸载、注册表跨进程持久化。质量门禁：`clippy`（含 `deny(clippy::unwrap_used, …)`）与 `rustfmt` 均通过。
+`cargo test -p amos-appstore` —— 覆盖：版本解析与排序、sha256 校验与篡改拒绝、id slug 校验、manifest 校验、mock 目录往返与摘要盖章、**下载→校验→安装**成功路径、**篡改字节被拒**、未知/重复/缺失等干净错误、升级只升不降、卸载、注册表跨进程持久化、**F-Droid 兼容**（index 解析/映射/导出往返/字符串数字/分组形态/引擎拒绝 web 安装 APK/localized 回填/antiFeatures 显式过滤/`author` 回退/分类映射扩展与双向对称（全 8 分类导出→导回不变）/导出 `suggestedVersionCode`；`--features live` 下另有环回端到端：拉索引→目录→APK 下载→pin 校验，以及**下载体量上限 fail-closed**（配额读满即报错、不静默截断；含 256B 环回超限用例）；另有 `#[ignore]` 门控的**真实联网**端到端：对 f-droid.org 拉 61MB 索引 → localized 中文回填 → 下载最小 APK 并校验 sha256）。CLI 侧覆盖 `info`/`export` 解析与离线 dispatch（导出文件被 `FdroidRepoProvider` 回读验证）与**原子落盘**（覆盖写、无临时文件残留）。质量门禁：`clippy`（含 `deny(clippy::unwrap_used, …)`）与 `rustfmt` 均通过。测试数为**实跑值，且命令随数字一并记下**（避免再次成为无人复核的陈旧散文）：`cargo test --workspace` → **1715 passed / 0 failed**；本模块 `live` 口径 `cargo test --workspace --features amos-appstore/live,amos-appstore-cli/live` → **1727 / 0**（= 默认 1715 加上 appstore 两 crate 的 live 增量 +12）；若把 `amos-mail`/`amos-mail-cli` 的 `live` 也一并启用则 → **1741 / 0**（2026-09-12 实跑；此三数均无脚本门禁固定，改测试后需重新实跑。注意 `live` 半边的 `http.rs` 与 CLI 的 `--repo`/`--pin` 路径**不在** `make lint`/`make test` 里——它们由 `make gated-check` 编译并测试，见 `docs/fdroid-audit.md` 第四轮）。
 
 ---
 
@@ -351,4 +408,6 @@ cargo run -p amos-appstore-cli --features live -- \
 - [x] **发布签名**（2026-09-03）：Ed25519 作者签名（`DeveloperKey`/`sign_manifest`）+ 引擎安装前验签（不符 `BadPublisherSignature` 拒绝），钉死「谁发布的」；公钥信任准入（pin/密钥服务器）留给商店层。
 - [x] **installer（web-bundle 后端）**（2026-09-03）：`amos_appstore::webinstall`（`WebInstaller`）——把 `tar.gz` 的 web-bundle（`index.html` + 资源 + `amos-app.json`）解包到 `<root>/<id>/`、校验入口、写 `manifest.json`、可卸载；tar 拒绝 `..` 路径。宿主把解包目录 serve 出来即可运行。
 - [x] **web-bundle 宿主（前端 srcdoc 沙箱）**（2026-09-04）：`components/ExtApp.tsx` 不再只是占位页——若该 app 带可运行的 web 界面，就逐文件经 `storeBundleResource`（base64）取回，用 `lib/bundle.ts` 的纯函数把相对资源内联成**单一自包含文档**，再放进 `sandbox="allow-scripts"` 的 `srcdoc` iframe 运行（无 same-origin → 碰不到 OS 壳）；无 web 界面的仅清单安装回落为清单展示（`extApp.notWeb`），加载失败给错误并可重载。纯内联核心已单测（`bundle.test.ts`）。诚实边界：这是**无自定义协议**路径，适合 classic 单页 demo bundle；多页/ESM/需真 origin 的 bundle 仍待真正 `amos-app://` 协议宿主（Rust `amos_appstore::serve` 已就绪，见 §4.9/4.10）。
+- [x] **F-Droid 仓库兼容层**（2026-09-12）：`amos_appstore::fdroid`——官方 `index-v1.json` 双形态解析（`packages` 分组对象 / 扁平数组、数字/字符串数值）→ 映射为同一 `AppManifest` 契约（`FdroidRepoProvider`，即 `docs/fdroid-audit.md` 缺口 3 的内核半步）；反向 `catalog_to_fdroid_index_v1` 让我们的目录**以 F-Droid 格式发布**。CLI 增加 `--repo`（浏览/搜索/find）与 `download`（取 APK + sha256 验证落盘，不假装安装）。**已对 f-droid.org 实测**：find/search/download 全通；分类映射**双向对称**（导出→导回不变）；联网下载体量**有上限且 fail-closed**，CLI 落盘**原子**（无半截产物）；另有 `#[ignore]` 门控的真实联网端到端用例（`cargo test -p amos-appstore --features live -- --ignored`）。诚实边界：索引 PGP 验签未实现（先以 `--pin` sha256 过渡）；APK **静默安装**仍待设备桥（缺口 1）。**审计轮（同日）**又补掉 3 处真实缺陷：导出 `icon` 由绝对 URL 改为仓库相对文件名（此前「导出→导回」会双前缀成 `icons/https://…`）、代理回环判定由整串子串改为解析 host（此前 `localhost.evil.test` 会绕过出口代理）、悬空的 `--pin` 报错而不再静默变成「无 pin」。
+- [~] **[桥] guest 容器安装通道**（缺口 1，**命令层 + gRPC 面已落地；消费者/接线仍未做**）：`AndroidController::install_apk`（`waydroid app install <path>`）+ `AndroidRuntime::install`，安装成功即把该包在 per-APK 能力账本里**重置为 deny-by-default**（`ledger.revoke_all`，不继承上一版构建的授权）；守护进程侧新增 gRPC `InstallAndroidApp`（`EnhancedAndroidManager::install_app` 有超时保护），已过真实 UDS 端到端验证。**仍未做**：Tauri 命令 / System UI 的消费者（本轮**刻意不**加没有消费者的 UI），以及 F-Droid APK 从商店到该通道的接线——见 `docs/fdroid-audit.md` 缺口 1。
 

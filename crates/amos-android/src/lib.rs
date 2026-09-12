@@ -20,6 +20,7 @@ pub mod png;
 pub mod runtime;
 pub mod service;
 
+pub use capability::CapabilityLedger;
 pub use controller::{
     extract_icon_bytes, parse_app_list, AndroidController, CommandRunner, ShellRunner,
 };

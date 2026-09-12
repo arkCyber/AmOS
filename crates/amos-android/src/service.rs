@@ -9,9 +9,9 @@ use amos_applife::AppState;
 use amos_proto::android_compat::{
     android_manager_server::{AndroidManager, AndroidManagerServer},
     ActivityEvent, ActivityEventRequest, ActivityEventResponse, AppIconRequest, AppIconResponse,
-    AppLaunchRequest, AppLaunchResponse, AppListResponse, Empty, HostAction as ProtoHostAction,
-    HostActionRequest, LmkEvent, LmkEventKind, LmkRequest, LmkResponse, LmkSnapshot, LmkTask,
-    LmkVictim, MemoryPressure as ProtoPressure,
+    AppInstallRequest, AppInstallResponse, AppLaunchRequest, AppLaunchResponse, AppListResponse,
+    Empty, HostAction as ProtoHostAction, HostActionRequest, LmkEvent, LmkEventKind, LmkRequest,
+    LmkResponse, LmkSnapshot, LmkTask, LmkVictim, MemoryPressure as ProtoPressure,
 };
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -290,6 +290,33 @@ impl AndroidManager for AndroidManagerService {
             Ok(apps) => Ok(Response::new(AppListResponse { apps })),
             Err(e) => Err(Status::internal(e.to_string())),
         }
+    }
+
+    async fn install_android_app(
+        &self,
+        request: Request<AppInstallRequest>,
+    ) -> Result<Response<AppInstallResponse>, Status> {
+        let req = request.into_inner();
+        // A refusal is a *result*, not a transport failure: the caller wants to
+        // show "this install failed, here is why" (e.g. no container, bad APK),
+        // exactly like `LaunchAndroidApp`. Returning `Status` would flatten every
+        // distinct container refusal into one gRPC code.
+        Ok(Response::new(
+            match self
+                .manager
+                .install_app(&req.apk_path, &req.package_name)
+                .await
+            {
+                Ok(()) => AppInstallResponse {
+                    success: true,
+                    error: String::new(),
+                },
+                Err(error) => AppInstallResponse {
+                    success: false,
+                    error: error.to_string(),
+                },
+            },
+        ))
     }
 
     async fn get_app_icon(
@@ -576,8 +603,42 @@ pub fn server(runtime: Arc<dyn AndroidRuntime>) -> AndroidManagerServer<AndroidM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::DemoRuntime;
+    use crate::runtime::{DemoRuntime, WaydroidRuntime};
     use std::sync::Mutex;
+
+    /// A Waydroid runner that always succeeds and records each command's argv.
+    struct OkWaydroid {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl crate::CommandRunner for OkWaydroid {
+        fn run(&self, _program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+            use std::os::unix::process::ExitStatusExt;
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|a| a.to_string()).collect());
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// Drive `InstallAndroidApp` and unwrap the transport layer.
+    async fn install_reply(
+        svc: &AndroidManagerService,
+        apk: &str,
+        pkg: &str,
+    ) -> AppInstallResponse {
+        svc.install_android_app(Request::new(AppInstallRequest {
+            apk_path: apk.into(),
+            package_name: pkg.into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+    }
 
     /// Records every host-bridge call so a test can assert what the service
     /// reported up to the (daemon) resource governor.
@@ -685,6 +746,60 @@ mod tests {
             .into_inner();
         assert_eq!(reply.apps.len(), 4);
         assert_eq!(reply.apps[0].package_name, "com.tencent.mm");
+    }
+
+    #[tokio::test]
+    async fn install_android_app_installs_and_resets_capabilities() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let rt = Arc::new(WaydroidRuntime::with_runner(OkWaydroid {
+            calls: calls.clone(),
+        }));
+        // A stray grant from an earlier build must not survive the install.
+        rt.capabilities().unwrap().grant("com.a.app", "camera");
+        let svc = AndroidManagerService::with_runtime(rt.clone());
+
+        let reply = install_reply(&svc, "/tmp/a.apk", "com.a.app").await;
+
+        assert!(reply.success, "{reply:?}");
+        assert!(reply.error.is_empty(), "{reply:?}");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[vec![
+                "app".to_string(),
+                "install".to_string(),
+                "/tmp/a.apk".to_string()
+            ]]
+        );
+        assert!(
+            rt.capabilities().unwrap().granted("com.a.app").is_empty(),
+            "an install leaves the package deny-by-default"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_android_app_on_demo_runtime_is_an_honest_refusal() {
+        let svc = AndroidManagerService::with_runtime(Arc::new(DemoRuntime::new()));
+        let reply = install_reply(&svc, "/tmp/a.apk", "com.a.app").await;
+        assert!(!reply.success, "the demo runtime cannot install");
+        assert!(reply.error.contains("cannot install"), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn install_android_app_refuses_empty_input_without_running_a_command() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let rt = Arc::new(WaydroidRuntime::with_runner(OkWaydroid {
+            calls: calls.clone(),
+        }));
+        let svc = AndroidManagerService::with_runtime(rt);
+
+        let reply = install_reply(&svc, "", "com.a.app").await;
+
+        assert!(!reply.success);
+        assert!(reply.error.contains("empty APK path"), "{reply:?}");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a malformed request must never reach the container"
+        );
     }
 
     #[tokio::test]

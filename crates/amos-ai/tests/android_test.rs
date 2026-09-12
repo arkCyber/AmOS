@@ -4,7 +4,8 @@
 //! host).
 
 use amos_proto::android_compat::{
-    android_manager_client::AndroidManagerClient, AppIconRequest, AppLaunchRequest, Empty,
+    android_manager_client::AndroidManagerClient, AppIconRequest, AppInstallRequest,
+    AppLaunchRequest, Empty,
 };
 use std::path::PathBuf;
 use tokio::net::UnixStream;
@@ -85,6 +86,28 @@ async fn android_manager_reachable_over_shared_uds() {
     assert_eq!(
         &icon.icon_png[..8],
         &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+
+    // InstallAndroidApp is served over the same socket and reaches the runtime.
+    // On the host the daemon runs the demo runtime, which cannot install — so the
+    // *honest* answer is a refusal with a reason, never a fabricated success
+    // (docs/fdroid-audit.md gap 1: the container channel exists, this host has no
+    // container).
+    let install = client
+        .install_android_app(AppInstallRequest {
+            apk_path: "/tmp/does-not-matter.apk".into(),
+            package_name: "com.tencent.mm".into(),
+        })
+        .await
+        .expect("install rpc is served")
+        .into_inner();
+    assert!(
+        !install.success,
+        "the demo runtime must not claim an APK was installed: {install:?}"
+    );
+    assert!(
+        install.error.contains("cannot install"),
+        "the refusal must carry a reason: {install:?}"
     );
 
     server.abort();

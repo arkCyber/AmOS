@@ -139,6 +139,8 @@ enhanced.wait_for_completion(30).await?;
 Via environment variables:
 ```bash
 AMOS_ANDROID_LAUNCH_TIMEOUT=30    # Launch timeout seconds
+AMOS_ANDROID_INSTALL_TIMEOUT=180   # APK install timeout seconds (its own budget:
+                                   # installing runs the package manager + dexopt)
 AMOS_ANDROID_LIST_TIMEOUT=10       # List timeout seconds
 AMOS_ANDROID_ICON_TIMEOUT=5        # Icon fetch timeout
 AMOS_ANDROID_CACHE_SIZE=256        # Cache entries
