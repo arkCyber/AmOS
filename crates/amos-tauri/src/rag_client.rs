@@ -20,7 +20,7 @@ use amos_proto::ai_agent::{
 };
 use serde::Serialize;
 
-async fn build_channel() -> Result<tonic::transport::Channel, String> {
+async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
 

@@ -195,12 +195,41 @@ fn has_command(cmd: &str) -> bool {
     std::env::split_paths(&paths).any(|dir| dir.join(cmd).exists())
 }
 
-/// Pick the best available runtime: real Waydroid when present, else demo.
+/// Which runtime `auto()` should build.
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeChoice {
+    Waydroid,
+    Demo,
+}
+
+/// Pure selection policy for `AMOS_ANDROID_RUNTIME`, so it is unit-testable
+/// without touching the process environment.
+///
+/// `waydroid` / `demo` **force** that runtime (the documented escape hatch in
+/// `docs/android-compat.md`, useful on a host where the probe is wrong — a forced
+/// Waydroid that is not installed fails loudly at call time instead of silently
+/// pretending); anything else (unset / `auto` / unknown) keeps the probe.
+fn choose_runtime(choice: Option<&str>, waydroid_available: bool) -> RuntimeChoice {
+    match choice.map(|c| c.trim().to_ascii_lowercase()).as_deref() {
+        Some("waydroid") => RuntimeChoice::Waydroid,
+        Some("demo") => RuntimeChoice::Demo,
+        _ => {
+            if waydroid_available {
+                RuntimeChoice::Waydroid
+            } else {
+                RuntimeChoice::Demo
+            }
+        }
+    }
+}
+
+/// Pick the best available runtime: `AMOS_ANDROID_RUNTIME` when it forces one,
+/// else real Waydroid when present, else demo.
 pub fn auto() -> Arc<dyn AndroidRuntime> {
-    if has_command("waydroid") {
-        Arc::new(WaydroidRuntime::new())
-    } else {
-        Arc::new(DemoRuntime::new())
+    let choice = std::env::var("AMOS_ANDROID_RUNTIME").ok();
+    match choose_runtime(choice.as_deref(), has_command("waydroid")) {
+        RuntimeChoice::Waydroid => Arc::new(WaydroidRuntime::new()),
+        RuntimeChoice::Demo => Arc::new(DemoRuntime::new()),
     }
 }
 
@@ -215,6 +244,29 @@ mod tests {
         let apps = rt.list_apps().unwrap();
         assert!(apps.len() >= 4);
         assert!(apps.iter().any(|a| a.package_name == "com.tencent.mm"));
+    }
+
+    #[test]
+    fn amos_android_runtime_forces_the_choice_else_probes() {
+        // Forcing overrides the probe — in both directions.
+        assert_eq!(
+            choose_runtime(Some("waydroid"), false),
+            RuntimeChoice::Waydroid
+        );
+        assert_eq!(choose_runtime(Some("demo"), true), RuntimeChoice::Demo);
+        // Case/whitespace tolerant (operators type these).
+        assert_eq!(
+            choose_runtime(Some("  Waydroid "), false),
+            RuntimeChoice::Waydroid
+        );
+        // Unset / "auto" / unknown keep the PATH probe.
+        assert_eq!(choose_runtime(None, true), RuntimeChoice::Waydroid);
+        assert_eq!(choose_runtime(None, false), RuntimeChoice::Demo);
+        assert_eq!(choose_runtime(Some("auto"), false), RuntimeChoice::Demo);
+        assert_eq!(
+            choose_runtime(Some("nonsense"), true),
+            RuntimeChoice::Waydroid
+        );
     }
 
     #[test]

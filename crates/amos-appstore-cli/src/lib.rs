@@ -60,6 +60,7 @@ SUBCOMMANDS:
 
 OPTIONS:
     -h, --help                Show this help
+    -V, --version             Print version and exit
     --store <PATH>            Persist the *installed* registry to this JSON file (can
                               appear anywhere before/after the subcommand). Without it the
                               installed set is ephemeral (reset each run). Also honors
@@ -75,6 +76,8 @@ OPTIONS:
 pub enum Op {
     /// Print `USAGE`.
     Help,
+    /// Print the binary's version (how a deployed artifact is identified).
+    Version,
     /// Print an offline demo session over one ephemeral store.
     Demo,
     /// List the whole catalog.
@@ -147,6 +150,11 @@ pub fn parse_args(args: &[String]) -> Result<Op> {
         out
     };
     let mut rest = filtered.iter();
+    // `-V/--version` is a global flag: it must work without a subcommand (that is
+    // exactly how a deployed artifact is identified).
+    if filtered.iter().any(|a| a == "-V" || a == "--version") {
+        return Ok(Op::Version);
+    }
     let Some(cmd) = rest.next() else {
         return Ok(Op::Help);
     };
@@ -297,6 +305,10 @@ fn installed_line(a: &amos_appstore::InstalledApp) -> String {
 pub async fn dispatch<S: StoreProvider>(store: &AppStore<S>, op: Op) -> Result<Vec<String>> {
     match op {
         Op::Help => Ok(vec![USAGE.to_string()]),
+        Op::Version => Ok(vec![format!(
+            "amos-appstore-cli {}",
+            env!("CARGO_PKG_VERSION")
+        )]),
         Op::Demo => demo_lines().await,
         Op::Catalog => {
             let cat = store.catalog().await?;
@@ -443,6 +455,10 @@ pub async fn run(args: &[String]) -> Result<Vec<String>> {
     match op {
         Op::Demo => demo_lines().await,
         Op::Help => Ok(vec![USAGE.to_string()]),
+        Op::Version => Ok(vec![format!(
+            "amos-appstore-cli {}",
+            env!("CARGO_PKG_VERSION")
+        )]),
         op => {
             let path = store_path(args);
             match catalog_url(args) {
@@ -465,6 +481,17 @@ mod tests {
     fn parse_known_subcommands() {
         assert!(matches!(parse_args(&s(&[])).unwrap(), Op::Help));
         assert!(matches!(parse_args(&s(&["help"])).unwrap(), Op::Help));
+        // `-V/--version` is global: it needs no subcommand (a released artifact must
+        // be able to say what it is), and wins even next to one.
+        assert!(matches!(
+            parse_args(&s(&["--version"])).unwrap(),
+            Op::Version
+        ));
+        assert!(matches!(parse_args(&s(&["-V"])).unwrap(), Op::Version));
+        assert!(matches!(
+            parse_args(&s(&["catalog", "--version"])).unwrap(),
+            Op::Version
+        ));
         assert!(matches!(parse_args(&s(&["catalog"])).unwrap(), Op::Catalog));
         assert!(matches!(
             parse_args(&s(&["installed"])).unwrap(),
@@ -512,6 +539,17 @@ mod tests {
             "--store read back off raw args wherever it appears"
         );
         assert!(store_path(&s(&["catalog"])).is_none());
+    }
+
+    #[tokio::test]
+    async fn version_prints_the_package_version() {
+        // The printed line is what a deployed artifact is identified by — pin it
+        // (scripts/release-artifacts.sh checks it on every staged binary too).
+        let lines = run(&s(&["--version"])).await.unwrap();
+        assert_eq!(
+            lines,
+            vec![format!("amos-appstore-cli {}", env!("CARGO_PKG_VERSION"))]
+        );
     }
 
     #[tokio::test]

@@ -5,9 +5,11 @@
   // a mic. Recording/playback reuse lib/voiceRecorder + lib/mediaStore;
   // real capture needs a microphone (device acceptance), while the
   // list CRUD / seed rows are fully browser-testable.
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { defaultMediaStore } from "../lib/mediaStore";
-  import { capSet, grantCap, loadLedger, saveLedger } from "../lib/permissions";
+  import { capSet, loadLedger } from "../lib/permissions";
+  import { grantCapability } from "./osPermissions";
   import {
     VMEMOS_KEY,
     makeVoiceId,
@@ -36,19 +38,30 @@
   // Mic capability ("microphone") via the OS permission ledger.
   let micGranted = $state(capSet(loadLedger(), "vmemos", "microphone"));
 
-  const seeded = normalizeVoiceMemos(readStoreValue<unknown>(VMEMOS_KEY, []));
-  const initMemos = seeded.length
-    ? seeded
-    : (() => {
-        const s = seedVoiceMemos(Date.now());
-        writeStoreValue(VMEMOS_KEY, s);
-        return s;
-      })();
+  // Demo seed — **only when the key is absent**: deleting every memo must not bring the
+  // demo list back on the next mount.
+  const rawMemos = readStoreValue<unknown>(VMEMOS_KEY, undefined);
+  const seeded = rawMemos === undefined ? [] : normalizeVoiceMemos(rawMemos);
+  const initMemos =
+    rawMemos === undefined
+      ? (() => {
+          const s = seedVoiceMemos(Date.now());
+          writeStoreValue(VMEMOS_KEY, s);
+          return s;
+        })()
+      : seeded;
   let memos = $state<VoiceMemo[]>(initMemos);
-  const persist = (next: VoiceMemo[]) => {
+  // The store refused a write (full/unavailable): say so and keep showing the truth.
+  let storeErr = $state("");
+  const persist = (next: VoiceMemo[]): boolean => {
     const c = normalizeVoiceMemos(next);
-    writeStoreValue(VMEMOS_KEY, c);
+    if (!writeStoreValueChecked(VMEMOS_KEY, c)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     memos = c;
+    return true;
   };
 
   /* ---- recording ---- */
@@ -67,7 +80,7 @@
   const start = async () => {
     error = null;
     if (!micGranted) {
-      saveLedger(grantCap(loadLedger(), "vmemos", "microphone"));
+      grantCapability("vmemos", "microphone");
       micGranted = true;
     }
     try {
@@ -124,7 +137,8 @@
     draftTitle = m.title;
   };
   const endRename = (save: boolean) => {
-    if (save && editingId) persist(renameMemo(memos, editingId, draftTitle));
+    // A rejected rename keeps the row in edit mode, so the new title isn't lost.
+    if (save && editingId && !persist(renameMemo(memos, editingId, draftTitle))) return;
     editingId = null;
   };
 
@@ -180,6 +194,7 @@
 </script>
 
 <div class="flex h-full flex-col px-3 py-3">
+  <StoreErrorBar message={storeErr} />
   <!-- recorder -->
   <div class="flex shrink-0 flex-col items-center gap-1.5 pb-2">
     {#if !recording}

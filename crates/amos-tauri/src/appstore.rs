@@ -219,8 +219,10 @@ impl StoreBridge {
 
     /// The display name of an installed app, if it is installed.
     ///
-    /// Used by the device-care policy command, which needs the inventory to apply
-    /// [`amos_devocare::UninstallGuard`] before anything is removed.
+    /// Inspection API on the bridge registry. The device-care policy path needs the
+    /// **whole** inventory (one `UninstallGuard` verdict per entry) and goes through
+    /// [`Self::installed_inventory`], so this single-name lookup has no
+    /// in-workspace caller today (recorded in `docs/rust-unwired-audit.md`).
     pub fn installed_name(&self, id: &str) -> Result<Option<String>, String> {
         Ok(self
             .installed_inventory()?
@@ -256,8 +258,13 @@ impl StoreBridge {
 
     /// Uninstall one app by id and persist the registry.
     ///
-    /// This is the **only** uninstall path the device-care policy command uses;
-    /// `appstore_uninstall` remains for the store's own UI.
+    /// On the **host** this is the removal path the device-care policy command
+    /// ends up in: `StoreBridge` is the [`PackageSource`] when no device backend
+    /// is attached (`devcare::uninstall_with_policy`). On a **device** that policy
+    /// path goes through the Android backend's `PackageManager` intent instead,
+    /// never here. `appstore_uninstall` remains for the store's own UI.
+    ///
+    /// [`PackageSource`]: crate::devcare::PackageSource
     pub fn uninstall_by_id(&self, id: &str) -> Result<(), String> {
         self.store.uninstall(id).map_err(|e| e.to_string())?;
         self.persist_best_effort();

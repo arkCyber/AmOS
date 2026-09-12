@@ -2,8 +2,11 @@
   // NotificationBanner.svelte — Svelte 5 (runes) port of the React
   // NotificationBanner chrome island. Mounted once in the phone frame, over every
   // screen; when a notification is added and DND is OFF it shows the newest as a
-  // toast (tap to acknowledge → clears the app's badge). Pure island: reads the
-  // shared NOTIF + DND stores, no external props. Same transient logic + timings.
+  // toast (tap to acknowledge → clears the app's badge) and plays the arrival
+  // alert — the synthesized chime (`lib/notifyTone`) and/or a haptic pulse —
+  // gated by the effective sound policy (`lib/sound`: persisted bits × DND).
+  // Pure island: reads the shared NOTIF + DND + SOUND stores, no external props.
+  // Same transient logic + timings.
   import { writeStoreValue } from "../lib/amosStore";
   import {
     NOTIF_KEY,
@@ -14,18 +17,30 @@
     removeAppNotifs,
     type Notif,
   } from "../lib/settings";
+  import {
+    SOUND_KEY,
+    effectiveAlert,
+    normalizeSound,
+    shouldRingOnArrival,
+    shouldVibrateOnArrival,
+  } from "../lib/sound";
+  import { playNotifyTone } from "../lib/notifyTone";
   import { createStoreValue } from "./store";
 
   const SHOW_MS = 4200;
+  /** Haptic pulse length (ms) for one arriving notification. */
+  const HAPTIC_MS = 30;
 
   const notifStore = createStoreValue<Notif[]>(NOTIF_KEY, []);
   const settingsStore = createStoreValue<unknown>(SETTINGS_KEY, {});
+  const soundStore = createStoreValue<unknown>(SOUND_KEY, {});
 
   let notifs = $state<Notif[]>([]);
   let settingsRaw = $state<unknown>({});
+  let soundRaw = $state<unknown>({});
   let banner = $state<Notif | null>(null);
 
-  // Transient, non-reactive mirrors of the React refs (prev list + timer id).
+  // Transient, non-reactive mirrors of the local refs (prev list + timer id).
   let prev: Notif[] = [];
   let timer: number | null = null;
   // Seed `prev` from the FIRST store read so pre-existing notifications at mount
@@ -46,12 +61,27 @@
     const un = settingsStore.subscribe((v) => (settingsRaw = v));
     return un;
   });
+  $effect(() => {
+    const un = soundStore.subscribe((v) => (soundRaw = v));
+    return un;
+  });
   const dnd = $derived(dndActive(normalizeQuick(settingsRaw)));
+  // The policy the *user* chose, folded with DND: DND mutes both bits.
+  const policy = $derived(effectiveAlert(normalizeSound(soundRaw), dnd));
 
   const clearTimer = () => {
     if (timer !== null) {
       window.clearTimeout(timer);
       timer = null;
+    }
+  };
+
+  /** Best-effort haptic pulse; unsupported hosts (desktop/tests) are a no-op. */
+  const haptic = () => {
+    try {
+      navigator.vibrate?.(HAPTIC_MS);
+    } catch {
+      /* no vibration motor / blocked — silent */
     }
   };
 
@@ -71,6 +101,11 @@
         banner = null;
         timer = null;
       }, SHOW_MS);
+      // Audible/haptic arrival alert, gated by the *effective* policy. Both gates
+      // require the unread count to have actually grown, so a dismissal/clear
+      // (or a policy change while idle) never re-alerts.
+      if (shouldRingOnArrival(prev.length, notifs.length, policy)) playNotifyTone();
+      if (shouldVibrateOnArrival(prev.length, notifs.length, policy)) haptic();
     }
     prev = notifs;
   });

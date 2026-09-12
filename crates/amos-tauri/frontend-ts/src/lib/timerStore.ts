@@ -13,6 +13,7 @@
  * exactly once (the caller surfaces it).
  */
 import { readStoreValue, writeStoreValue } from "./amosStore";
+import { timerInit } from "./time";
 
 export const TIMER_KEY = "amos.timer";
 
@@ -94,7 +95,7 @@ export function restoreTimerState(nowMs: number): {
       };
     }
     // Deadline already passed → the OS notifier surfaced it; don't resurrect.
-    return { running: false, totalMs: 0, remainingMs: 0, endAtMs: 0 };
+    return timerInit();
   }
   // Not running, but an armed/paused countdown was persisted → restore it so a
   // set-but-not-started (or paused) timer survives a restart instead of resetting.
@@ -106,7 +107,9 @@ export function restoreTimerState(nowMs: number): {
       endAtMs: 0,
     };
   }
-  return { running: false, totalMs: 0, remainingMs: 0, endAtMs: 0 };
+  // The idle shape is `lib/time.timerInit()` — the domain's single source for it
+  // (the countdown reducer resets to the same value), never a re-typed literal.
+  return timerInit();
 }
 
 /**

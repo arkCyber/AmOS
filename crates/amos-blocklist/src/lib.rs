@@ -24,6 +24,12 @@
 //! The rule list is **bounded** ([`DEFAULT_CAP`]): adding past the cap evicts the
 //! oldest rule (documented, deterministic) rather than growing without limit.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 mod error;
 mod list;
 mod rule;

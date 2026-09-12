@@ -60,16 +60,36 @@ export function wakeHomeDue(
   return nowMs - leaveAtMs >= minMs;
 }
 
-
-
-export function isOn(s: ScreenState): boolean {
-  return s === "on";
+/**
+ * Pure gate for the "return to home on wake" watcher: `onLeave` records when the
+ * shell went away (backgrounded / lost focus), `onReturn` decides — reading the
+ * live preference and using [`wakeHomeDue`] — whether that resume is a real wake
+ * worth sending the user home, then clears the marker. A too-brief / unknown
+ * absence is a no-op (never yanks someone back to the dock), and calling
+ * `onReturn` twice without an intervening `onLeave` fires at most once.
+ *
+ * Kept headless-testable; the DOM plumbing lives in `svelte/osWakeHome.ts`.
+ */
+export function makeWakeHomeGate(opts: {
+  enabled: () => boolean;
+  now: () => number;
+  wakeHome: () => void;
+  minMs?: number;
+}): { onLeave: () => void; onReturn: () => void } {
+  let leftAt: number | null = null;
+  return {
+    onLeave() {
+      leftAt = opts.now();
+    },
+    onReturn() {
+      const due = opts.enabled() && wakeHomeDue(leftAt, opts.now(), opts.minMs);
+      leftAt = null;
+      if (due) opts.wakeHome();
+    },
+  };
 }
 
-/** Tolerant parse of an arbitrary value (store / payload / event) to a state. */
-export function asScreenState(v: unknown): ScreenState {
-  return v === "off" ? "off" : "on";
-}
+
 
 /** Serializable snapshot returned by the Rust commands. */
 export interface ScreenPayload {
@@ -95,23 +115,6 @@ export function idleElapsedSec(lastSec: number, nowSec: number): number {
 export function autoOffDue(lastSec: number, nowSec: number, timeoutSec: number): boolean {
   if (timeoutSec <= 0) return false;
   return idleElapsedSec(lastSec, nowSec) >= timeoutSec;
-}
-
-/**
- * Auto-off decision for a *live* shell, folding in a screen hold (an active
- * call / media). While `inCall` is true the screen must never auto-sleep —
- * phone-accurate keep-awake (the domain equivalent of `ScreenController`'s
- * "call" hold). Returns false whenever idle has not elapsed, the timeout is
- * disabled, or a call is holding the screen.
- */
-export function dueForAutoSleep(
-  lastSec: number,
-  nowSec: number,
-  timeoutSec: number,
-  inCall: boolean,
-): boolean {
-  if (inCall) return false;
-  return autoOffDue(lastSec, nowSec, timeoutSec);
 }
 
 /** Tell the OS the screen is on/off; `null` when not bridged. */

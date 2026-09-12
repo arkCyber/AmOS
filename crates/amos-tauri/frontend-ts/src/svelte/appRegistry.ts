@@ -1,11 +1,9 @@
 /**
- * appRegistry.ts — React-free map of app id → Svelte screen loader.
+ * appRegistry.ts — map of app id → Svelte screen loader.
  *
- * Phase-3 (exit React) foundation: a future Svelte top-level shell must mount an
- * app screen by id (like the React `AppComponent`/`COMPONENTS`), but importing
- * `apps.tsx` would drag React in. This plain module owns that mapping using the
- * same dynamic-import `.svelte` loaders, so it can run without any React on the
- * import graph. Pure TS — usable from Svelte or tests.
+ * The single table `Shell.svelte` uses to mount an app by id. It uses dynamic
+ * `import()` loaders so screens stay code-split and the shell needs no static
+ * reference to every screen. Pure TS — usable from Svelte or tests.
  */
 
 export interface SvelteAppLoaderLike {
@@ -45,9 +43,4 @@ export const SVELTE_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
 /** Resolve the Svelte screen loader for an app id; undefined if unregistered. */
 export function svelteAppLoader(id: string): SvelteAppLoaderLike | undefined {
   return SVELTE_APP_LOADERS[id];
-}
-
-/** All ids the Svelte shell can mount (mirrors the built-in APPS registry). */
-export function svelteAppIds(): string[] {
-  return Object.keys(SVELTE_APP_LOADERS);
 }

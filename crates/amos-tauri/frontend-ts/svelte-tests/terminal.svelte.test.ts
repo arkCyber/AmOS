@@ -33,7 +33,6 @@ afterEach(() => {
   cleanup();
   cleanBridge();
 });
-
 const inputOf = (h: { container: HTMLElement }) =>
   h.container.querySelector('input[aria-label="命令"]') as HTMLInputElement | null;
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
@@ -119,3 +118,77 @@ describe("TerminalApp.svelte (offline demo shell)", () => {
     expect(killed).toBeGreaterThan(0);
   });
 });
+
+describe("TerminalApp.svelte — PTY window size", () => {
+  const rect = HTMLElement.prototype.getBoundingClientRect;
+  const saved: Array<[object, string, PropertyDescriptor | undefined]> = [
+    [Element.prototype, "clientWidth", Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth")],
+    [Element.prototype, "clientHeight", Object.getOwnPropertyDescriptor(Element.prototype, "clientHeight")],
+    [HTMLElement.prototype, "clientWidth", Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth")],
+    [HTMLElement.prototype, "clientHeight", Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight")],
+  ];
+
+  afterEach(() => {
+    HTMLElement.prototype.getBoundingClientRect = rect;
+    for (const [target, key, desc] of saved) {
+      if (desc) Object.defineProperty(target, key, desc);
+      else delete (target as unknown as Record<string, unknown>)[key];
+    }
+  });
+
+  /** Make the character probe + container measurable (happy-dom reports 0). */
+  function stubMetrics(): void {
+    HTMLElement.prototype.getBoundingClientRect = function (): DOMRect {
+      // A 1-line probe of 100 chars → 600px wide, 15px tall ⇒ 6×15 cells.
+      return { width: 600, height: 15, top: 0, left: 0, right: 600, bottom: 15 } as DOMRect;
+    };
+    // `clientWidth/Height` may be defined on either prototype depending on the DOM
+    // implementation, so shadow both.
+    for (const proto of [Element.prototype, HTMLElement.prototype]) {
+      Object.defineProperty(proto, "clientWidth", { get: () => 800, configurable: true });
+      Object.defineProperty(proto, "clientHeight", { get: () => 400, configurable: true });
+    }
+  }
+
+  test("attaching a real session tells the shell the actual grid size", async () => {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as AnyWin).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "term_spawn") return { id: 7, output: null, error: "", running: true };
+        return { id: (args?.session as number) ?? 0, output: null, error: "", running: true };
+      },
+    };
+    stubMetrics();
+    render(TerminalApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    // Without this the PTY stays at the spawn default (120×24) forever, so
+    // wrapping / full-screen programs draw for the wrong grid.
+    const resize = calls.find((c) => c.cmd === "term_resize");
+    expect(resize).toBeTruthy();
+    expect(resize!.args?.session).toBe(7);
+    const cols = resize!.args?.cols as number;
+    const rows = resize!.args?.rows as number;
+    expect(Number.isInteger(cols) && cols >= 20).toBe(true);
+    expect(Number.isInteger(rows) && rows >= 4).toBe(true);
+  });
+
+  test("no resize command in the offline demo (nothing to resize)", async () => {
+    const calls: string[] = [];
+    (window as AnyWin).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        calls.push(cmd);
+        if (cmd === "term_spawn") return { id: 0, output: null, error: "pty off", running: false };
+        return null;
+      },
+    };
+    stubMetrics();
+    render(TerminalApp);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(calls).not.toContain("term_resize");
+  });
+});
+

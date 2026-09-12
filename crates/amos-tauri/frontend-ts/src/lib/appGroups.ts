@@ -95,6 +95,33 @@ export function categorizeApps(available: readonly string[]): CategoryFolder[] {
 }
 
 /**
+ * Reorder `items` by this device's **actual use**: items the user opened most recently
+ * (`recents`, most-recent-first — the same `amos.recents` list the App Library's
+ * "Frequently Used" group reads) come first; everything else keeps its original order.
+ *
+ * An item with no recorded use is **not ranked** — there is no "popularity" to infer, so
+ * it stays where the caller put it. An empty `recents` therefore returns the input
+ * unchanged (the ordering never invents usage), which is what Spotlight shows on a
+ * device where nothing has been opened yet.
+ */
+export function orderByRecency<T>(
+  items: readonly T[],
+  idOf: (item: T) => string,
+  recents: readonly string[],
+): T[] {
+  const rank = new Map<string, number>();
+  recents.forEach((id, i) => {
+    // First occurrence wins: the list is already deduped, but a hand-edited store could
+    // contain duplicates and the more recent position is the true one.
+    if (!rank.has(id)) rank.set(id, i);
+  });
+  return items
+    .map((item, i) => ({ item, i, r: rank.get(idOf(item)) ?? Number.POSITIVE_INFINITY }))
+    .sort((a, b) => (a.r - b.r) || (a.i - b.i))
+    .map((x) => x.item);
+}
+
+/**
  * The top "Frequently Used" group: the most-recently-opened apps (recents order,
  * most recent first) that are still available, capped at `max`. Apps outside
  * `available` (hidden/uninstalled) are dropped so we never show a stale icon.

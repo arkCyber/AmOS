@@ -66,8 +66,3 @@ export function encodeF32le(samples: Float32Array): number[] {
   return bytes;
 }
 
-/** Whole mono frame -> 16k mono -> little-endian f32 bytes for assistant_voice_feed. */
-export function frameToAssistantChunk(samples: Float32Array, fromRate: number): number[] {
-  return encodeF32le(downsample(samples, fromRate));
-}
-

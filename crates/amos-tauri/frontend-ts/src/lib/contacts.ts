@@ -140,28 +140,6 @@ export function addContact(list: Contact[], input: ContactInput): Contact[] {
   return [c, ...list];
 }
 
-/** Upsert by id (replace when it exists, else prepend). */
-export function upsertContact(
-  list: Contact[],
-  input: { id: string } & ContactInput & { fav?: boolean },
-): Contact[] {
-  const name = cleanName(input.name);
-  const phones = cleanPhones(input.phones);
-  if (name === "" || phones.length === 0) return list; // refuse invalid
-  const clean: Contact = {
-    id: input.id,
-    name,
-    phones,
-    note: input.note && input.note.trim() !== "" ? input.note.trim() : undefined,
-    fav: input.fav === true,
-    ts: Date.now(),
-  };
-  if (list.some((c) => c.id === input.id)) {
-    return list.map((c) => (c.id === input.id ? clean : c));
-  }
-  return [clean, ...list];
-}
-
 /** Remove one contact by id. */
 export function removeContact(list: Contact[], id: string): Contact[] {
   return list.filter((c) => c.id !== id);

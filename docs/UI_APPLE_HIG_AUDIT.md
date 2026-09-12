@@ -14,7 +14,7 @@
 - ✅ 底层设计令牌很对：正确 SF 字体栈、自适应 systemBlue/systemRed、iOS 成组列表、11px 圆角卡片、hairline 分隔、iOS 绿开关、分段控件。锁屏 / 计算器 / 来电界面已是相当忠实的 Apple 还原。
 - ❌ 存在**跨界面反复出现的系统性偏差**，将整体观感从“像 iPhone”拉低到“像 iOS 的 Web 仿制”。这些不是零散个案，而是**同一策略重复了上百次**（以 emoji 代替 SF Symbols 为主）。
 
-> ⚠️ 架构说明：应用内屏已是 **Svelte 单一实现**，但系统 chrome（状态栏 / 通知中心 / 主屏）仍是 **React 兜底 + Svelte 新版并存**，由 `src/apps.tsx` 的 `svelteEnabled()` 决定（PROD→Svelte，dev→默认 React）。因此同一 emoji 往往在 `.svelte` 与 `.tsx` 两端重复出现，且两端的 DOM 测试直接断言 emoji 文本——**改造 emoji 属跨双端 + 联动测试更新的一次较大重构**。
+> ⚠️ 架构说明（2026-09 更新）：React 宿主**已彻底移除**（`docs/react-removal-plan.md`），应用内屏与系统 chrome（状态栏 / 通知中心 / 主屏）都是 **Svelte 单一实现**，由 `src/svelte/appRegistry.ts` + `src/svelte/Shell.svelte` 承载；不存在 `.svelte` / `.tsx` 双端并存。因此本报告下表若仍把 `src/svelte/X.svelte` 与某个 `.tsx` 并提，`src/svelte/*` 即当前唯一实现。
 
 ---
 
@@ -34,10 +34,10 @@ Apple 风格核心是**统一、矢量、可随主题着色的 SF Symbols**。�
 | 来电 | `src/svelte/IncomingCall.svelte` L141,167,181,192 | `📞🎙️🔇●⏹✕` |
 | 其它 | `RemindersApp` / `NotesApp` / 通知图标 | `🔍✕⚠`、`💬`、分组图标 emoji 色板 |
 
-> **建议**：引入统一矢量图标层（内嵌 SF Symbols 子集的 SVG，或等宽开源 SVG 集），提供 `icon(name, color)` 供 React/Svelte 共用，替换全部 emoji/字符。沿用 `src/lib/appIcon.ts` 已有的“函数返回 `<svg>` 字符串 + `{@html}`”模式可低成本落地。这是第一优先级。
+> **建议**：引入统一矢量图标层（内嵌 SF Symbols 子集的 SVG，或等宽开源 SVG 集），提供 `icon(name, color)` 供各屏幕共用，替换全部 emoji/字符。沿用 `src/lib/appIcon.ts` 已有的“函数返回 `<svg>` 字符串 + `{@html}`”模式可低成本落地。这是第一优先级。
 
 ### 🔴 P1-1　每个 App 被 OS 外层包裹“‹ 返回主屏 + 标题 + Home 条”——不符合 iOS 呈现
-`src/svelte/Shell.svelte` L212-226（React 端同构于 `src/App.tsx` 的 `AppShell` L182-192）为**每个打开的应用**画：顶部 `border-b` 半透明白标题栏（含 `‹` 返回主屏 + 居中标题），底部再单画一根 Home 指示条。
+`src/svelte/Shell.svelte` L212-226 为**每个打开的应用**画：顶部 `border-b` 半透明白标题栏（含 `‹` 返回主屏 + 居中标题），底部再单画一根 Home 指示条。
 
 iOS 的真相是：**应用全屏、edge-to-edge、分层堆叠**；系统不会在每个 App 顶部再叠“‹ 回主屏 + 标题”的固定栏（那是 Android app bar / 桌面窗口化概念），Home 手势也不应作为独立 UI 条并排画在 App 内。后果：
 - **双重导航堆叠**：设置 →「Wi‑Fi」子页时，先有 Shell 的“‹ 设置”顶栏，再有 `SettingsApp.svelte` L349-358 自己画的“‹ 设置 + 大标题”。

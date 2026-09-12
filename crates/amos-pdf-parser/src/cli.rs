@@ -36,7 +36,8 @@ OPTIONS:
     --token-target N       target tokens per chunk   (default 512)
     --overlap N            tokens of overlap between chunks (default 64)
     --no-tables            skip the best-effort table pass
-    -h, --help             show this help";
+    -h, --help             show this help
+    -V, --version          print version and exit";
 
 /// JSON payload when `--format json` is requested.
 #[derive(Serialize)]
@@ -55,6 +56,7 @@ struct Cli {
     overlap: usize,
     no_tables: bool,
     help: bool,
+    version: bool,
 }
 
 impl Default for Cli {
@@ -67,6 +69,7 @@ impl Default for Cli {
             overlap: 64,
             no_tables: false,
             help: false,
+            version: false,
         }
     }
 }
@@ -86,6 +89,12 @@ fn run() -> Result<(), String> {
     let cli = parse_args(std::env::args().skip(1).collect())?;
     if cli.help {
         println!("{USAGE}");
+        return Ok(());
+    }
+    if cli.version {
+        // Self-describing artifacts: the release bundle's `--version` is how a
+        // deployed binary is identified (scripts/release-artifacts.sh checks it).
+        println!("amos-pdf-parser {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if cli.files.is_empty() {
@@ -168,6 +177,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => cli.help = true,
+            "-V" | "--version" => cli.version = true,
             "--chunks" => cli.chunks = true,
             "--no-tables" => cli.no_tables = true,
             "--format" => {
@@ -188,4 +198,45 @@ fn parse_args(args: Vec<String>) -> Result<Cli, String> {
         }
     }
     Ok(cli)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn version_flag_is_recognised_and_needs_no_input_file() {
+        // A released artifact must be able to say what it is, so `--version` must work
+        // without the <FILE> the parser otherwise requires
+        // (scripts/release-artifacts.sh checks every staged binary).
+        let cli = parse_args(args(&["--version"])).unwrap();
+        assert!(cli.version);
+        assert!(cli.files.is_empty());
+        assert!(parse_args(args(&["-V"])).unwrap().version);
+        assert!(!parse_args(args(&["x.pdf"])).unwrap().version);
+        assert!(
+            !parse_args(args(&["--format", "json", "-"]))
+                .unwrap()
+                .version
+        );
+    }
+
+    #[test]
+    fn help_and_version_are_independent_flags() {
+        let h = parse_args(args(&["-h"])).unwrap();
+        assert!(h.help && !h.version);
+        let v = parse_args(args(&["-V"])).unwrap();
+        assert!(!v.help && v.version);
+        // Both documented in USAGE (honesty: help must describe every flag).
+        assert!(USAGE.contains("-V, --version"));
+    }
+
+    #[test]
+    fn unknown_options_still_fail() {
+        assert!(parse_args(args(&["--nope"])).is_err());
+    }
 }

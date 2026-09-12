@@ -129,8 +129,11 @@ extern "C" {
 }
 
 fn result_to_err(context: &str, code: i32) -> AudioError {
-    // Only fetch the text when safe; on error code the pointer is valid.
     if code != AAUDIO_OK {
+        // SAFETY: `AAudio_convertResultToText` returns either NULL or a pointer to a
+        // NUL-terminated string owned by the AAudio library (static for the process);
+        // the NULL case is handled before `CStr::from_ptr`, so we never dereference an
+        // invalid or unterminated pointer, and the borrow lives only inside this block.
         let msg = unsafe {
             let p = AAudio_convertResultToText(code);
             if p.is_null() {
@@ -147,12 +150,17 @@ fn result_to_err(context: &str, code: i32) -> AudioError {
 /// Open + start a stream with the given direction; returns the raw handle and
 /// its actual (requested) rate.
 fn open_stream(capture: bool, rate: u32) -> Result<(*mut AAudioStream, AudioSpec), AudioError> {
+    // SAFETY: FFI call with no arguments and no aliasing requirements; it returns a
+    // builder handle or NULL, and the NULL case is checked immediately below.
     let b = unsafe { AAudio_createStreamBuilder() };
     if b.is_null() {
         return Err(AudioError::Device(
             "aaudio: createStreamBuilder failed".into(),
         ));
     }
+    // SAFETY: `b` is a live builder just checked for null and owned solely by this
+    // function; the setters only write configuration into it, and nothing else can
+    // observe it concurrently.
     unsafe {
         AAudioStreamBuilder_setDirection(
             b,
@@ -168,14 +176,24 @@ fn open_stream(capture: bool, rate: u32) -> Result<(*mut AAudioStream, AudioSpec
         AAudioStreamBuilder_setPerformanceMode(b, PERF_MODE_NONE);
     }
     let mut stream: *mut AAudioStream = std::ptr::null_mut();
+    // SAFETY: `b` is the live, non-null builder from above and `&mut stream` is a valid
+    // out-pointer for the duration of the call; on success AAudio writes a handle into
+    // it. The builder is not accessed concurrently.
     let open_res = unsafe { AAudioStreamBuilder_openStream(b, &mut stream) };
+    // SAFETY: `b` is consumed exactly once here — the AAudio contract is that a builder
+    // is deleted after the stream is created and never used again, which this function
+    // honours (no later statement touches `b`).
     unsafe { AAudioStreamBuilder_delete(b) };
     if open_res != AAUDIO_OK || stream.is_null() {
         return Err(result_to_err("aaudio: openStream", open_res));
     }
+    // SAFETY: `stream` is non-null (checked on the line above) and is a handle produced
+    // by a successful `openStream` that this function exclusively owns.
     let start = unsafe { AAudioStream_requestStart(stream) };
     if start != AAUDIO_OK {
         let e = result_to_err("aaudio: requestStart", start);
+        // SAFETY: the handle is non-null and not yet closed (we are on the only path
+        // that closes it before returning); it is not used after this call.
         unsafe {
             AAudioStream_close(stream);
         }
@@ -209,6 +227,9 @@ impl AAudioCapture {
 impl Drop for AAudioCapture {
     fn drop(&mut self) {
         if !self.stream.is_null() {
+            // SAFETY: guarded by the null check (so never a double close) and the
+            // handle came from `open_stream` in this type; it is nulled immediately
+            // afterwards so no other path can close it again.
             unsafe {
                 AAudioStream_close(self.stream);
             }
@@ -237,6 +258,9 @@ impl AudioCapture for AAudioCapture {
         }
         let frames = out.len().min(i32::MAX as usize) as i32;
         let mut scratch = vec![0i16; frames as usize];
+        // SAFETY: `self.stream` is non-null (checked above) and solely owned by this
+        // sink/capture; `scratch` holds exactly `frames` i16 elements, which is the
+        // buffer AAudio is allowed to write for `num_frames`.
         let n = unsafe {
             AAudioStream_read(
                 self.stream,
@@ -278,6 +302,8 @@ impl AAudioSink {
 impl Drop for AAudioSink {
     fn drop(&mut self) {
         if !self.stream.is_null() {
+            // SAFETY: same contract as the capture's drop — null-guarded, handle owned
+            // by this type, nulled right after so it cannot be closed twice.
             unsafe {
                 AAudioStream_close(self.stream);
             }
@@ -301,6 +327,9 @@ impl AudioSink for AAudioSink {
         }
         let scratch: Vec<i16> = samples.iter().map(|s| f32_to_i16(*s)).collect();
         let frames = scratch.len().min(i32::MAX as usize) as i32;
+        // SAFETY: `self.stream` is a non-null handle owned by this sink, and `scratch`
+        // has at least `frames` initialized i16 elements — AAudio reads no more than
+        // that many for `num_frames`.
         let n = unsafe {
             AAudioStream_write(
                 self.stream,
@@ -352,23 +381,34 @@ struct CallbackState {
 /// pushes them into the [`CallbackState::ring`]. Must be allocation-light and
 /// non-blocking — the ring and scratch are pre-sized so steady-state never
 /// allocates.
+///
+/// # Safety
+///
+/// Invoked **only** by AAudio, which guarantees a `user_data` pointer that is alive for
+/// as long as the stream stays open (see [`AAudioCallbackCapture`], which keeps the
+/// `Box<CallbackState>` alive until after `AAudioStream_close`) and an `audio_data`
+/// buffer of `num_frames` I16 samples for the duration of the call. It must never be
+/// called directly.
 unsafe extern "C" fn aaudio_capture_cb(
     _stream: *mut AAudioStream,
     user_data: *mut c_void,
     audio_data: *mut c_void,
     num_frames: i32,
 ) -> aaudio_data_callback_result_t {
-    // `user_data` always points at a live CallbackState: the owning capture keeps
-    // it Box'd and only drops it after `AAudioStream_close` (which stops the
-    // callback), so the pointer is valid for the whole lifetime AAudio may invoke
-    // this. This mirrors the same unsafety the seam already documents for its raw
-    // stream handles — the sole-owner + closed-before-drop contract is upheld by
+    // SAFETY: `user_data` always points at a live `CallbackState`: the owning capture
+    // keeps it `Box`'d and only drops it after `AAudioStream_close` (which stops the
+    // callback), so the pointer is valid for the whole lifetime AAudio may invoke this.
+    // This mirrors the same unsafety the seam already documents for its raw stream
+    // handles — the sole-owner + closed-before-drop contract is upheld by
     // `AAudioCallbackCapture`.
     let state = unsafe { &mut *(user_data as *mut CallbackState) };
     let n = num_frames.max(0) as usize;
     if audio_data.is_null() || n == 0 {
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
+    // SAFETY: the AAudio data-callback contract guarantees `audio_data` points at
+    // `num_frames` readable I16 samples when it is non-null (the null/zero case
+    // returned above), and the borrow does not outlive this invocation.
     let src = unsafe { std::slice::from_raw_parts(audio_data as *const i16, n) };
     state.scratch.clear();
     for &s in src {
@@ -380,6 +420,12 @@ unsafe extern "C" fn aaudio_capture_cb(
 
 /// Build + start an AAudio input stream whose samples arrive on the data
 /// callback (registered on the builder before open). Returns the raw handle.
+///
+/// # Safety
+///
+/// `user_data` must point at a value that stays alive (and at a stable address) until
+/// the returned stream has been closed and stopped — AAudio will hand it to
+/// [`aaudio_capture_cb`] on its own thread for as long as the stream is open.
 unsafe fn open_callback_stream(
     rate: u32,
     user_data: *mut c_void,
@@ -452,6 +498,9 @@ impl AAudioCallbackCapture {
         });
         // The Box gives `state` a stable address for the lifetime of the capture.
         let user_data = &*state as *const CallbackState as *mut c_void;
+        // SAFETY: `user_data` is the address of a live `Box<CallbackState>` that the
+        // returned `AAudioCallbackCapture` keeps alive until *after* the stream is
+        // stopped and closed, which satisfies the callee's contract above.
         let stream = unsafe { open_callback_stream(rate, user_data) }?;
         Ok(Self {
             stream,
@@ -464,10 +513,11 @@ impl AAudioCallbackCapture {
 impl Drop for AAudioCallbackCapture {
     fn drop(&mut self) {
         if !self.stream.is_null() {
+            // SAFETY: the handle is non-null and owned by this capture. `requestStop`
+            // lets AAudio wind the callback thread down before `close`; `close` then
+            // guarantees no further invocation, after which `self.state` (dropped after
+            // `stream`) is safe to free.
             unsafe {
-                // requestStop lets AAudio wind the callback thread down before
-                // close; close then guarantees no further invocation, after which
-                // `self.state` (dropped after `stream`) is safe to free.
                 let _ = AAudioStream_requestStop(self.stream);
                 AAudioStream_close(self.stream);
             }

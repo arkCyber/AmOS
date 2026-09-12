@@ -16,6 +16,23 @@ export function clearDial(number: string): string {
 }
 
 /**
+ * The dial string a search/text query really is, or `null` when it is not a number.
+ *
+ * Used by Spotlight's "fill the dialler" action: only a query that **looks like** a
+ * dialable number offers it (digits with `+ * #` and the usual separators, at least two
+ * digits), so a search for "买牛奶" never pretends to be a phone number. The result is
+ * the string with separators removed (what a dialler sends), capped at `MAX_DIAL_LEN`.
+ */
+export function dialableQuery(q: string): string | null {
+  const raw = q.trim();
+  if (raw === "") return null;
+  if (!/^\+?[0-9*#()\-.\s]+$/.test(raw)) return null;
+  const digits = raw.replace(/[^0-9*#+]/g, "");
+  if ((digits.match(/[0-9]/g) ?? []).length < 2) return null;
+  return digits.slice(0, MAX_DIAL_LEN);
+}
+
+/**
  * Format an elapsed call duration in seconds as `m:ss` (or `h:mm:ss` past an hour).
  * Pure + deterministic so the in-call timer is unit-testable offline.
  */

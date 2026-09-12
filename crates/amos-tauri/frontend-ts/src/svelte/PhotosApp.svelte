@@ -1,5 +1,5 @@
 <script lang="ts">
-  // PhotosApp.svelte — Svelte 5 (runes) port of the React `Photos` in apps.tsx.
+  // PhotosApp.svelte — Svelte 5 (runes) implementation of the photo library.
   // Still-photo logic reuses pure lib/photos.ts; camera video tiles use
   // lib/cameraCapture (no React VideoThumb thumbnail here → 🎬 tile with
   // duration/res; playback overlay still streams the MediaStore blob).
@@ -22,18 +22,20 @@
   import type { Photo } from "../lib/photos";
   import { captureBlob, listCaptures, removeVideoCapture, resLabelOf, toggleCaptureFav } from "../lib/cameraCapture";
   import type { VideoCapture } from "../lib/cameraCapture";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { fmtTime } from "../lib/notes";
-  import { hasMediaBridge, mediaList } from "../lib/media";
+  import { hasMediaBridge, mediaList, mediaGrantRead } from "../lib/media";
   import type { MediaItem } from "../lib/media";
   import { nativePhotoFromItem } from "../lib/photoLibrary";
   import type { NativePhoto } from "../lib/photoLibrary";
   import { t } from "./locale.svelte";
 
+  // Demo seed — **only when the key is absent**: an emptied library stays empty.
   const seed = ((): Photo[] => {
-    const existing = normalizePhotos(readStoreValue<unknown>(PHOTOS_KEY, []));
-    if (existing.length) return existing;
+    const raw = readStoreValue<unknown>(PHOTOS_KEY, undefined);
+    if (raw !== undefined) return normalizePhotos(raw);
     const s = seedPhotos(8, Date.now());
     writeStoreValue(PHOTOS_KEY, s);
     return s;
@@ -46,6 +48,8 @@
   let favOnly = $state(false);
   let vidsOnly = $state(false);
   let vids = $state<VideoCapture[]>(listCaptures());
+  // The store refused a write (full/unavailable): say so and keep showing the truth.
+  let storeErr = $state("");
   let playId = $state<string | null>(null);
   let playUrl = $state("");
   let selecting = $state(false);
@@ -55,38 +59,73 @@
   let native = $state<NativePhoto[]>([]);
   const nativeShown = $derived(!favOnly && !vidsOnly && !selecting && native.length > 0);
 
-  // Load real stills from the bridge once (camera + screenshots). Offline (no
-  // bridge) or on a denied/absent backend this stays empty → the strip is hidden
-  // and behaviour is byte-identical to before. Native tiles are read-only.
+  // The two standard collections the gallery reads stills from.
+  const NATIVE_COLLECTIONS = ["camera", "screenshots"] as const;
+  // Load real stills from the bridge. Offline (no bridge) → the strip stays hidden.
+  // A **real** backend error (the Rust `Unauthorized` that `media_list` surfaces as
+  // a rejection) is NOT "no photos": it becomes an honest grant prompt. The pre-fix
+  // code swallowed it in `allSettled`, so a permission denial looked exactly like
+  // an empty gallery. Native tiles are read-only.
   let nativeLoaded = false;
+  let nativeBlocked = $state(false);
+  let nativeBusy = $state(false);
+
+  const loadNative = async () => {
+    if (!hasMediaBridge()) return;
+    nativeBusy = true;
+    const settled = await Promise.allSettled(NATIVE_COLLECTIONS.map((c) => mediaList(c)));
+    const items: MediaItem[] = [];
+    for (const r of settled) {
+      if (r.status === "fulfilled" && Array.isArray(r.value)) items.push(...r.value);
+    }
+    // Any rejection is a daemon-side error (a denial) — never render it as
+    // "you have no photos".
+    nativeBlocked = settled.some((r) => r.status === "rejected");
+    const seen = new Set<string>();
+    const tiles: NativePhoto[] = [];
+    for (const it of items) {
+      if (seen.has(it.uri)) continue;
+      seen.add(it.uri);
+      tiles.push(nativePhotoFromItem(it));
+    }
+    tiles.sort((a, b) => b.ts - a.ts);
+    native = tiles;
+    nativeBusy = false;
+  };
+
+  /** Grant read access to the collections we list, then reload. */
+  const grantNative = async () => {
+    if (!hasMediaBridge() || nativeBusy) return;
+    nativeBusy = true;
+    await Promise.allSettled(NATIVE_COLLECTIONS.map((c) => mediaGrantRead(c)));
+    await loadNative(); // the prompt clears only if the grant actually took
+  };
+
   $effect(() => {
     if (nativeLoaded) return;
     nativeLoaded = true;
     if (!hasMediaBridge()) return;
-    void (async () => {
-      const settled = await Promise.allSettled([
-        mediaList("camera"),
-        mediaList("screenshots"),
-      ]);
-      const items: MediaItem[] = [];
-      for (const r of settled) {
-        if (r.status === "fulfilled" && Array.isArray(r.value)) items.push(...r.value);
-      }
-      const seen = new Set<string>();
-      const tiles: NativePhoto[] = [];
-      for (const it of items) {
-        if (seen.has(it.uri)) continue;
-        seen.add(it.uri);
-        tiles.push(nativePhotoFromItem(it));
-      }
-      tiles.sort((a, b) => b.ts - a.ts);
-      native = tiles;
-    })();
+    void loadNative();
   });
 
-  const persist = (l: Photo[]) => {
-    writeStoreValue(PHOTOS_KEY, l);
+  const persist = (l: Photo[]): boolean => {
+    if (!writeStoreValueChecked(PHOTOS_KEY, l)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     list = l;
+    return true;
+  };
+  /** Favourite a video — only a landed write may move the heart (and `vids`). */
+  const favVideo = (id: string) => {
+    const r = toggleCaptureFav(id);
+    if (!r.ok) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
+    vids = r.list;
   };
   const shown = $derived(favOnly ? favsOf(list) : list);
   const add = () => persist([newPhoto(`p${Date.now()}`, Date.now()), ...list]);
@@ -238,7 +277,7 @@
   };
   const deleteSel = () => {
     if (!sel) return;
-    persist(removePhoto(list, sel.id));
+    if (!persist(removePhoto(list, sel.id))) return;
     sel = null;
   };
 
@@ -259,7 +298,12 @@
     playId = null;
   };
   const deleteVideo = async (id: string) => {
-    await removeVideoCapture(id);
+    // Only claim the delete when the library index really dropped the row.
+    if (!(await removeVideoCapture(id))) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     vids = listCaptures();
     closeVideo();
   };
@@ -286,6 +330,7 @@
     }`;
 </script>
 
+<StoreErrorBar message={storeErr} />
 {#if sel}
   {@const prevP = neighborOf(shown, sel?.id ?? "", -1)}
   {@const nextP = neighborOf(shown, sel?.id ?? "", 1)}
@@ -351,6 +396,23 @@
       {/if}
     </div>
 
+    {#if nativeBlocked}
+      <div
+        role="status"
+        data-testid="native-blocked"
+        class="mb-2 flex flex-wrap items-center gap-2 rounded-xl bg-amber-500/15 px-3 py-2 text-xs text-amber-100 ring-1 ring-amber-400/30"
+      >
+        <span aria-hidden="true">🔒</span>
+        <span class="min-w-0 flex-1">{t("photo.nativeBlocked")}</span>
+        <button
+          onclick={() => void grantNative()}
+          disabled={nativeBusy}
+          aria-label={t("photo.nativeGrant")}
+          class="rounded-full bg-amber-400/90 px-2.5 py-1 font-medium text-neutral-900 active:scale-95 disabled:opacity-50"
+        >{t("photo.nativeGrant")}</button>
+      </div>
+    {/if}
+
     {#if list.length === 0 && !vidsOnly}
       <p class="py-10 text-center text-sm opacity-60">{t("photo.empty")}</p>
     {:else if shown.length === 0 && !vidsOnly}
@@ -391,7 +453,7 @@
                   <span class="absolute bottom-1 left-1 rounded bg-black/60 px-1 text-xs font-medium text-white">{resLabelOf(v)}</span>
                 {/if}
               </button>
-              <button aria-label="favourite video" onclick={() => (vids = toggleCaptureFav(v.id))}
+              <button aria-label="favourite video" onclick={() => favVideo(v.id)}
                 class="absolute right-1 top-1 z-10 grid h-6 w-6 place-items-center rounded-full bg-black/45 text-xs text-white">{v.fav ? "♥" : "♡"}</button>
             </div>
           {:else}

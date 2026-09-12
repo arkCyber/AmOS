@@ -1,5 +1,5 @@
 <script lang="ts">
-  // ClockApp.svelte — Svelte 5 (runes) port of the React `Clock` in src/apps.tsx
+  // ClockApp.svelte — Svelte 5 (runes) implementation of the clock app
   // (world clock / stopwatch / countdown timer / alarms). All logic reuses the
   // pure lib/time.ts reducers + helpers. Timers tick from ONE interval callback
   // (alarm/timer on the 1s clock tick, stopwatch on its own 50ms tick) so no
@@ -30,17 +30,19 @@
     systemTimeZone,
     zoneDiff,
     ALARM_TONES,
+    DEFAULT_SNOOZE_MIN,
     WEEKDAYS,
     WEEKENDS,
   } from "../lib/time";
   import type { Alarm, WorldCity } from "../lib/time";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { locale, t } from "./locale.svelte";
   import { onDestroy, onMount } from "svelte";
-  import { startAlarmRing, stopAlarmRing, previewAlarmTone, setRingtoneFilesEnabled } from "../lib/ringtonePlayer";
+  import { startAlarmRing, stopAlarmRing, previewAlarmTone, setRingtoneFilesEnabled, activeRingtone } from "../lib/ringtonePlayer";
   import { restoreTimerState, persistFromTimer } from "../lib/timerStore";
-  import { CITY_CATALOG } from "../lib/cityIndex";
+  import { CITY_CATALOG, resolveCity, searchCities } from "../lib/cityIndex";
   import { playNotifyTone } from "../lib/notifyTone";
 
   const p2 = (n: number) => String(n).padStart(2, "0");
@@ -80,10 +82,11 @@
   let wcEdit = $state(false);
   /** Zone selected in the world-clock picker (defaults to the first addable city). */
   let wcPick = $state("");
-  /** cityIndex entries → WorldCity (bilingual name). */
-  const wcCityByZone = new Map(
-    CITY_CATALOG.map((c) => [c.zone, { zone: c.zone, labelKey: "", name: { zh: c.zh, en: c.en } }]),
-  );
+  /** A cityIndex catalog entry as a bilingual `WorldCity` (no i18n key needed). */
+  const wcCityOf = (zone: string): WorldCity | null => {
+    const ce = resolveCity(zone);
+    return ce ? { zone: ce.zone, labelKey: "", name: { zh: ce.zh, en: ce.en } } : null;
+  };
   /** Choices offered by the picker: remaining presets + larger cityIndex catalog (dedup). */
   function wcAvail(): WorldCity[] {
     const added = new Set(wc.map((x) => x.zone));
@@ -97,23 +100,36 @@
     for (const ce of CITY_CATALOG) {
       if (added.has(ce.zone) || seen.has(ce.zone)) continue;
       seen.add(ce.zone);
-      const w = wcCityByZone.get(ce.zone);
-      if (w) out.push(w);
+      out.push({ zone: ce.zone, labelKey: "", name: { zh: ce.zh, en: ce.en } });
     }
     return out;
   }
   /** Display label for a world city (bilingual name when present, else i18n key). */
   const wcLabel = (c: WorldCity): string =>
     c.name ? (locale() === "zh" ? c.name.zh : c.name.en) : t(c.labelKey);
-  /** Free-text search narrowing the add-city catalog (localized name or IANA). */
+  /** Free-text search narrowing the add-city list. */ 
   let wcSearch = $state("");
   function wcAvailFiltered(): WorldCity[] {
-    const q = wcSearch.trim().toLowerCase();
+    const q = wcSearch.trim();
     if (!q) return wcAvail();
-    return wcAvail().filter((c) => {
-      const label = wcLabel(c).toLowerCase();
-      return label.includes(q) || c.zone.toLowerCase().includes(q);
-    });
+    const added = new Set(wc.map((x) => x.zone));
+    const seen = new Set<string>();
+    const out: WorldCity[] = [];
+    // Presets carry i18n label keys (they may have no catalog entry), so they are
+    // matched here; the CATALOG is searched by the DOMAIN — `lib/cityIndex.searchCities`
+    // is locale-aware on the display name *and* the IANA zone, excludes the zones we
+    // offer above, and bounds the result.
+    const ql = q.toLowerCase();
+    for (const p of WORLD_CITY_PRESETS) {
+      if (added.has(p.zone) || seen.has(p.zone)) continue;
+      if (!wcLabel(p).toLowerCase().includes(ql) && !p.zone.toLowerCase().includes(ql)) continue;
+      seen.add(p.zone);
+      out.push(p);
+    }
+    for (const ce of searchCities(q, locale(), new Set([...added, ...seen]))) {
+      out.push({ zone: ce.zone, labelKey: "", name: { zh: ce.zh, en: ce.en } });
+    }
+    return out;
   }
   // Keep the selection valid as the list changes (added / removed / capped).
   $effect(() => {
@@ -159,6 +175,8 @@
     normalizeAlarms(rawAl).map((a) => (ringingIds.has(a.id) ? { ...a, ringing: true } : a)),
   );
   let al = $state(initAl);
+  // A rejected `amos.alarms` write (full/unavailable storage): say so.
+  let storeErr = $state("");
   let alH = $state("8");
   let alM = $state("0");
   let alLabel = $state("");
@@ -176,15 +194,25 @@
   // Audible ring: start looping the first ringing alarm's tone once a ring
   // begins; stop when nothing rings. Tracked so the 1 Hz tick doesn't restart it.
   let ringStarted = false;
+  /** The ringtone layer reported it could not start any audio (no AudioContext /
+   *  autoplay blocked) — the banner says so instead of implying a sound. */
+  let ringSilent = $state(false);
   $effect(() => {
     const ringingNow = ringAlarms.length > 0;
     if (ringingNow && !ringStarted) {
       ringStarted = true;
       const first = ringAlarms[0];
-      if (first) startAlarmRing(first.tone);
+      if (first) {
+        startAlarmRing(first.tone);
+        // `activeRingtone()` is the truth about whether audio actually started
+        // (`null` = no AudioContext / autoplay blocked). The banner must never
+        // claim a sound that isn't playing.
+        ringSilent = activeRingtone() === null;
+      }
     } else if (!ringingNow && ringStarted) {
       ringStarted = false;
       stopAlarmRing();
+      ringSilent = false;
     }
   });
   // Timer "time's up": on the rising edge (idle → done) play a chime once. Uses a
@@ -211,7 +239,10 @@
     writeStoreValue("amos.worldclock", wc);
   });
   $effect(() => {
-    writeStoreValue("amos.alarms", al.list);
+    // The alarm list is **content the user set**, so a rejected write is reported
+    // (the reducer state still shows the alarms; that they will not survive a reload
+    // is exactly what the user must be told).
+    storeErr = writeStoreValueChecked("amos.alarms", al.list) ? "" : t("common.storeWriteFailed");
   });
 
   // ONE 1 Hz interval: advance the clock + latch alarms + tick the running timer.
@@ -297,7 +328,7 @@
     alLabel = "";
     alRepeat = [];
     alTone = "🔔";
-    alSnoozeMin = 5;
+    alSnoozeMin = DEFAULT_SNOOZE_MIN;
     editingId = null;
   };
   /** Load an alarm into the editor form (iOS parity: tapping an alarm edits it). */
@@ -308,7 +339,7 @@
     alLabel = a.label;
     alRepeat = a.repeat ? [...a.repeat] : [];
     alTone = a.tone ?? "🔔";
-    alSnoozeMin = a.snoozeMin ?? 5;
+    alSnoozeMin = a.snoozeMin ?? DEFAULT_SNOOZE_MIN;
   };
   const submitAlarm = () => {
     const h = Number.parseInt(alH, 10);
@@ -346,7 +377,7 @@
   const toggleRepeatDay = (day: number) => toggleDay(day);
   const addPickedCity = () => {
     const preset = WORLD_CITY_PRESETS.find((c) => c.zone === wcPick);
-    const city = preset ?? wcCityByZone.get(wcPick);
+    const city = preset ?? wcCityOf(wcPick);
     if (city) wc = addWorldCity(wc, city);
   };
   const removeCityAt = (zone: string) => {
@@ -368,6 +399,7 @@
 </script>
 
 <div class="p-6">
+  <StoreErrorBar message={storeErr} />
   <!-- Tabs (mini Segmented) -->
   <div class="flex justify-center gap-1 pt-1 pb-3" role="tablist" aria-label="clock-tabs">
     <button role="tab" aria-selected={tab === "world"} onclick={() => (tab = "world")} class={seg(tab === "world")}>{t("clock.world")}</button>
@@ -384,6 +416,11 @@
           <div class="alarm-ring-time tabular-nums">{fmtHm(ra.hour, ra.min)}</div>
           {#if ra.label}
             <div class="alarm-ring-label">{ra.label}</div>
+          {/if}
+          {#if ringSilent}
+            <div data-testid="alarm-ring-silent" class="alarm-ring-label opacity-80">
+              {t("clock.ringSilent")}
+            </div>
           {/if}
           <div class="flex items-center justify-center gap-3">
             <button onclick={() => alarmDispatch({ type: "snooze", id: ra.id, now })} class={neutralBtn + " alarm-ring-btn"}>{t("clock.snooze")}</button>

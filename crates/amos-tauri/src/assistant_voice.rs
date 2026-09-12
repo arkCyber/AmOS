@@ -641,9 +641,18 @@ where
                             // stream and the counter would otherwise briefly
                             // disagree — an ordering race, not just test flakiness).
                             submitted2.fetch_add(1, Ordering::Relaxed);
-                            let _ = feeder.blocking_send(ClientMessage {
-                                payload: Some(Payload::AudioEnd(true)),
-                            });
+                            // Same rule as the audio-frame send above: a closed feeder is
+                            // terminal, not something to keep capturing for (REQ-A148 —
+                            // this used to discard the send result and loop on, leaving the
+                            // counter claiming an end the consumer never received).
+                            if feeder
+                                .blocking_send(ClientMessage {
+                                    payload: Some(Payload::AudioEnd(true)),
+                                })
+                                .is_err()
+                            {
+                                return; // stream closed
+                            }
                             heard = false;
                             silent = 0;
                         }
@@ -652,9 +661,20 @@ where
             }
             if heard {
                 submitted2.fetch_add(1, Ordering::Relaxed);
-                let _ = feeder.blocking_send(ClientMessage {
-                    payload: Some(Payload::AudioEnd(true)),
-                });
+                // Same rule as the frame send inside the loop above: a closed feeder is
+                // terminal, never something to keep capturing for. The exit sits at the
+                // closure's tail, so clippy calls the `return` needless — but the counter
+                // above was already incremented, and "stream closed" is the state this
+                // thread is ending on, so the early exit stays explicit.
+                #[allow(clippy::needless_return)]
+                if feeder
+                    .blocking_send(ClientMessage {
+                        payload: Some(Payload::AudioEnd(true)),
+                    })
+                    .is_err()
+                {
+                    return; // stream closed
+                }
             }
         })
         .map_err(|e| e.to_string())?;

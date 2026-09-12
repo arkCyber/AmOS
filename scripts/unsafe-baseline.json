@@ -1,0 +1,31 @@
+{
+  "policy": "Known production unsafe surface, per file. Counts were captured on 2026-09-12 after documenting every site with a '// SAFETY:' note or a '# Safety' doc section (see scripts/unsafe-scan.mjs). This file is a RATCHET: adding an unsafe site to an existing file, or introducing a new file with unsafe, fails the gate until the addition is acknowledged here. Lowering a count is reported as stale so the file cannot rot. The sites are, in practice, FFI/JNI glue for the Android platform APIs plus 'unsafe impl Send/Sync' for handles that must be moved across threads.",
+  "captured": "2026-09-12 (round 78: +peercred.rs)",
+  "total": 110,
+  "files": {
+    "crates/amos-audio/src/android/aaudio.rs": 20,
+    "crates/amos-audio/src/android/tinyalsa.rs": 10,
+    "crates/amos-clipboard/src/android.rs": 7,
+    "crates/amos-flashlight/src/android.rs": 2,
+    "crates/amos-media/src/android.rs": 2,
+    "crates/amos-power/src/android.rs": 2,
+    "crates/amos-profiling/src/android.rs": 2,
+    "crates/amos-radio/src/android.rs": 2,
+    "crates/amos-sensor/src/android.rs": 2,
+    "crates/amos-sms/src/android.rs": 2,
+    "crates/amos-tauri/src/android_glue.rs": 5,
+    "crates/amos-tauri/src/blocklist.rs": 6,
+    "crates/amos-tauri/src/buttons.rs": 2,
+    "crates/amos-tauri/src/clipboard_glue.rs": 6,
+    "crates/amos-tauri/src/devcare_device.rs": 7,
+    "crates/amos-tauri/src/flashlight.rs": 5,
+    "crates/amos-tauri/src/incall.rs": 3,
+    "crates/amos-tauri/src/media.rs": 3,
+    "crates/amos-tauri/src/mic_permission.rs": 6,
+    "crates/amos-tauri/src/real_dial.rs": 5,
+    "crates/amos-tauri/src/sensor_host.rs": 3,
+    "crates/amos-tauri/src/sms.rs": 3,
+    "crates/amos-telephony/src/android.rs": 2,
+    "crates/amos-ai/src/peercred.rs": 3
+  }
+}

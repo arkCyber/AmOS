@@ -1,13 +1,12 @@
 /**
- * Cross-framework UI events — the Svelte → React direction.
+ * Cross-screen UI events — broadcast when the shared theme / locale changes.
  *
- * The React shell owns the app's theme + locale providers (they render the shell
- * chrome + all React screens). A Svelte screen can now be the *switcher* too
- * (e.g. the Svelte Settings screen), so when the Svelte side changes the shared
- * `amos-ui.theme` / `amos-ui.locale` keys it broadcasts a window event here; the
- * React ThemeProvider / I18nProvider listen and re-sync their context live.
+ * The shell owns the reactive theme + locale singletons (`theme.svelte.ts` /
+ * `locale.svelte.ts`), which render the chrome and every screen. When either
+ * changes it broadcasts the matching window event here so any same-window
+ * listener can re-sync live.
  *
- * Plain TS (no runes / no React) so both frameworks can import it.
+ * Plain TS (no runes) so any module can import it.
  */
 export const AMOS_THEME_CHANGED_EVENT = "amos:theme-changed";
 export const AMOS_LOCALE_CHANGED_EVENT = "amos:locale-changed";

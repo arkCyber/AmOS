@@ -8,8 +8,6 @@ export interface Msg {
   quote?: string;
 }
 
-export const MSG_KEY = "amos.messages";
-
 /** Upper bound on stored messages (keeps the conversation from growing unbounded). */
 export const MESSAGE_CAP = 200;
 
@@ -106,12 +104,6 @@ export function isNewDay(prevTs: number, ts: number): boolean {
 /** Number of unread *incoming* messages (from "them"). Outgoing never count. */
 export function unreadCount(list: Msg[]): number {
   return list.filter((m) => m.from === "them" && !m.read).length;
-}
-
-/** Mark exactly one message as read (no-op if id/index unknown). */
-export function markRead(list: Msg[], index: number): Msg[] {
-  if (index < 0 || index >= list.length) return list;
-  return list.map((m, i) => (i === index && m.from === "them" ? { ...m, read: true } : m));
 }
 
 /** Mark every incoming message as read (used when the user opens the chat). */

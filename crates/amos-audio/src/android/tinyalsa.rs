@@ -78,6 +78,8 @@ extern "C" {
 
 /// Safety guard shared by both directions.
 fn ready_or_err(pcm: *mut c_void, what: &str) -> Result<(), AudioError> {
+    // SAFETY: the `||` short-circuits, so the FFI call only runs when `pcm` was already
+    // found non-null; `pcm_is_ready` merely reads the handle's state.
     if pcm.is_null() || unsafe { pcm_is_ready(pcm) } != 1 {
         return Err(AudioError::Device(format!(
             "tinyalsa: {what}: stream is not ready (is /dev/snd accessible?)"
@@ -88,6 +90,12 @@ fn ready_or_err(pcm: *mut c_void, what: &str) -> Result<(), AudioError> {
 
 /// Open a TinyALSA PCM and check it is ready. `capture` selects input vs output;
 /// `card`/`device` default to the primary (`0, 0`).
+///
+/// # Safety
+///
+/// `card`/`device` must name an existing ALSA device and `rate` a rate the kernel
+/// accepts; the returned handle (non-null only when `pcm_is_ready` agrees) must be
+/// closed exactly once with `pcm_close`.
 unsafe fn open(
     card: u32,
     device: u32,
@@ -121,6 +129,9 @@ impl TinyAlsaCapture {
                 "bad capture rate {rate}"
             )));
         }
+        // SAFETY: card 0 / device 0 is the primary PCM and `rate` was validated by
+        // `spec.is_valid()` above; `open` itself checks readiness before returning the
+        // handle, which is then owned by this struct.
         let pcm = unsafe { open(0, 0, true, rate) }?;
         Ok(Self { pcm, spec })
     }
@@ -129,6 +140,8 @@ impl TinyAlsaCapture {
 impl Drop for TinyAlsaCapture {
     fn drop(&mut self) {
         if !self.pcm.is_null() {
+            // SAFETY: null-guarded (never a double close) and the handle came from
+            // `open` in this type; it is nulled right after so no other path can use it.
             unsafe {
                 pcm_close(self.pcm);
             }
@@ -158,6 +171,9 @@ impl AudioCapture for TinyAlsaCapture {
         // Read up to out.len() mono S16 frames, then widen to f32.
         let frames = out.len() as u32;
         let mut scratch = vec![0i16; frames as usize];
+        // SAFETY: `self.pcm` is a non-null handle owned by this capture (checked just
+        // above), and `scratch` holds exactly `frames` initialized i16 elements — the
+        // buffer TinyALSA is allowed to fill.
         let n = unsafe { pcm_read(self.pcm, scratch.as_mut_ptr() as *mut c_void, frames) };
         if n < 0 {
             return Err(device_err("tinyalsa pcm_read", n));
@@ -184,6 +200,8 @@ impl TinyAlsaSink {
                 "bad playback rate {rate}"
             )));
         }
+        // SAFETY: same contract as the capture's open — primary PCM, validated rate,
+        // readiness checked inside `open`, handle owned by this struct.
         let pcm = unsafe { open(0, 0, false, rate) }?;
         Ok(Self { pcm, spec })
     }
@@ -192,6 +210,7 @@ impl TinyAlsaSink {
 impl Drop for TinyAlsaSink {
     fn drop(&mut self) {
         if !self.pcm.is_null() {
+            // SAFETY: null-guarded, handle owned by this type, nulled immediately after.
             unsafe {
                 pcm_close(self.pcm);
             }
@@ -220,6 +239,9 @@ impl AudioSink for TinyAlsaSink {
         }
         let scratch: Vec<i16> = samples.iter().map(|s| f32_to_i16(*s)).collect();
         let frames = scratch.len() as u32;
+        // SAFETY: `self.pcm` is a non-null handle owned by this sink (checked above) and
+        // `scratch` has exactly `frames` initialized i16 elements, the most TinyALSA may
+        // read for this call.
         let n = unsafe { pcm_write(self.pcm, scratch.as_ptr() as *const c_void, frames) };
         if n < 0 {
             return Err(device_err("tinyalsa pcm_write", n));

@@ -1,6 +1,6 @@
 <script lang="ts">
   // RecentsPanel.svelte — Svelte 5 (runes) port of the React `SystemPanels`
-  // RecentsPanel (a CONTROLLED chrome overlay). The React shell owns whether it is
+  // RecentsPanel (a CONTROLLED chrome overlay). The shell owns whether it is
   // open and pushes `{ open }` down over propsBus "recents"; the panel shows the
   // recently-opened apps (reactive over the shared amos.recents store) and emits
   // 'open'/'close' back to the shell. No internal state to preserve across opens.

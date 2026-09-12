@@ -9,11 +9,20 @@
  * missing daemon instead of a silent no-op. Live mic capture + daemon streaming
  * need a real device + amos-interp daemon → device acceptance.
  */
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import InterpApp from "../src/svelte/InterpApp.svelte";
 import { INTERP_PREFS_KEY, INTERP_LOG_KEY } from "../src/lib/interp";
+
+// Read-aloud's shared AudioContext must be released on teardown; spy on the
+// release so the wiring itself is pinned (the close semantics are unit-tested in
+// `src/__tests__/realtimeTts.test.ts`).
+const resetPlayCtxSpy = vi.hoisted(() => vi.fn());
+vi.mock("../src/lib/realtimeTts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/lib/realtimeTts")>();
+  return { ...actual, resetPlayCtx: resetPlayCtxSpy };
+});
 
 afterEach(() => {
   cleanup();
@@ -33,6 +42,31 @@ const inputByPlaceholder = (h: { container: HTMLElement }, p: string) =>
   [...h.container.querySelectorAll("input")].find((i) => i.getAttribute("placeholder") === p) as
     HTMLInputElement | undefined;
 
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 const settle = async () => {
   await tick();
   await new Promise<void>((r) => setTimeout(r, 0));
@@ -40,6 +74,27 @@ const settle = async () => {
 };
 
 describe("InterpApp.svelte (offline shell)", () => {
+  test("a rejected clear keeps the transcript and reports it", async () => {
+    window.localStorage.setItem(
+      INTERP_LOG_KEY,
+      JSON.stringify([{ src: "你好", target: "hello", srcLang: "zh", targetLang: "en" }]),
+    );
+    const restore = failWritesFor(INTERP_LOG_KEY);
+    try {
+      const host = render(InterpApp);
+      await settle();
+      expect(txt(host)).toContain("你好");
+
+      await fireEvent.click(btnText(host, "清空") as HTMLButtonElement);
+      await settle();
+      // The stored transcript is still there, so it must not be shown as cleared.
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(txt(host)).toContain("你好");
+    } finally {
+      restore();
+    }
+  });
+
   test("remembered prefs restore into the selects + auto-speak checkbox", async () => {
     window.localStorage.setItem(
       INTERP_PREFS_KEY,
@@ -113,5 +168,19 @@ describe("InterpApp.svelte (offline shell)", () => {
     await settle();
     expect(input?.value).toBe("你好"); // not cleared into a no-op
     expect(txt(host)).toContain("未连接守护进程");
+  });
+});
+
+describe("InterpApp.svelte — read-aloud teardown", () => {
+  test("leaving the interpreter releases the playback audio context", async () => {
+    resetPlayCtxSpy.mockClear();
+    const host = render(InterpApp);
+    await tick();
+    expect(resetPlayCtxSpy).not.toHaveBeenCalled(); // nothing to release yet
+
+    host.unmount();
+    // Without this the shared AudioContext outlived the screen (the audio session
+    // stayed held), because the lib only dropped its reference.
+    expect(resetPlayCtxSpy).toHaveBeenCalledTimes(1);
   });
 });

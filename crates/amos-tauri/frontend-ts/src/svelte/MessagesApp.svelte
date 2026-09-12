@@ -23,7 +23,8 @@
     unreadCount,
   } from "../lib/messages";
   import type { Conversation, Msg } from "../lib/messages";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { NOTIF_KEY, removeAppNotifs } from "../lib/settings";
   import { iconSvg } from "../lib/sysIcons";
   import type { Notif } from "../lib/settings";
@@ -51,6 +52,7 @@
     SmsThreadOut,
     SmsTrashEntryOut,
   } from "../lib/backend";
+  import { amosWarn } from "../lib/debugLog";
   import {
     DRAFT_KEY,
     draftId,
@@ -63,9 +65,11 @@
   import { t } from "./locale.svelte";
   import { messagesChannel } from "./appLinks";
 
+  // Demo seed — **only when the key is absent**: a user who deleted every thread keeps
+  // an empty inbox (the seed is a first-run affordance, not a recurring fixture).
   const seeded = ((): Conversation[] => {
-    const stored = readStoreValue<unknown>(CONV_KEY, []);
-    if (Array.isArray(stored) && stored.length) return normalizeConversations(stored);
+    const stored = readStoreValue<unknown>(CONV_KEY, undefined);
+    if (stored !== undefined) return normalizeConversations(stored);
     const s = seedConversations(Date.now());
     writeStoreValue(CONV_KEY, s);
     return s;
@@ -75,14 +79,23 @@
   let text = $state("");
   let replyTo = $state<string | null>(null);
   let newName = $state("");
+  // The store refused a write (full/unavailable): say so and keep showing the truth.
+  let storeErr = $state("");
 
   const active = $derived(findConversation(conversations, activeId));
   const msgs = $derived(active?.msgs ?? []);
-  const saveConvs = (next: Conversation[]) => {
+  const saveConvs = (next: Conversation[]): boolean => {
     const norm = normalizeConversations(next);
+    // Nothing is applied when the store refuses it: the thread list would otherwise
+    // show conversations that vanish on reload.
+    if (!writeStoreValueChecked(CONV_KEY, norm)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     conversations = norm;
-    writeStoreValue(CONV_KEY, norm);
     if (!findConversation(norm, activeId)) activeId = norm[0]?.id ?? "";
+    return true;
   };
   // Replace the active thread's message list (pure helper then store).
   const setMsgs = (l: Msg[]) => {
@@ -123,10 +136,15 @@
   // AmOS-local drafts (the platform only lets the *default* SMS app write
   // drafts, so ours are stored locally and labelled as such).
   let drafts = $state<SmsDraft[]>(normalizeDrafts(readStoreValue<unknown>(DRAFT_KEY, [])));
-  const saveDrafts = (next: SmsDraft[]) => {
+  const saveDrafts = (next: SmsDraft[]): boolean => {
     const norm = normalizeDrafts(next);
+    if (!writeStoreValueChecked(DRAFT_KEY, norm)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     drafts = norm;
-    writeStoreValue(DRAFT_KEY, norm);
+    return true;
   };
   const activeReal = $derived(realThreads.find((th) => th.id === realActiveId) ?? null);
   const activeRealName = $derived(
@@ -309,7 +327,7 @@
       if (!rule) {
         blockOk = false;
         blockMsg = t("message.blockSenderFailed");
-        console.warn("[messages] blocklist_add failed", bridgeDiag());
+        amosWarn("messages", "blocklist_add failed", bridgeDiag());
         return;
       }
       blockOk = true;
@@ -341,12 +359,12 @@
     try {
       const r = await smsTrashAdd(realActiveId, m.id, folder);
       if (!r) {
-        console.warn("[messages] sms_trash_add failed", bridgeDiag());
+        amosWarn("messages", "sms_trash_add failed", bridgeDiag());
         noteTrash(false, t("message.trashFailed"));
         return;
       }
       if (!r.trashed) {
-        noteTrash(false, "notFound" in r ? t("message.trashNotFound") : t("message.trashFailed"));
+        noteTrash(false, "not_found" in r ? t("message.trashNotFound") : t("message.trashFailed"));
         return;
       }
       noteTrash(true, t("message.trashDone"));
@@ -360,7 +378,7 @@
     if (trashBusy) return;
     trashBusy = true;
     try {
-      const ok = await smsTrashRestore(e.threadId, e.messageId);
+      const ok = await smsTrashRestore(e.thread_id, e.message_id);
       noteTrash(ok, ok ? t("message.trashRestored") : t("message.trashFailed"));
       if (ok) refreshReal();
     } finally {
@@ -411,12 +429,28 @@
     };
   });
 
+  // Reading a thread marks its incoming messages read (iOS behaviour). Without this
+  // a conversation you are looking at keeps its ● badge (and the "N 未读" banner)
+  // until you happen to send something — and the notification effect below would
+  // publish a notification for a message that is already on screen.
+  // Idempotent: once nothing is unread the guard returns, so it cannot loop.
+  $effect(() => {
+    if (smsMode === "real") return; // the local model is not the visible one
+    const list = msgs;
+    if (!activeId || unreadCount(list) === 0) return;
+    setMsgs(markAllRead(list));
+  });
+
   // Publish unread incoming messages across conversations as app notifications.
   $effect(() => {
     const app = zh["app.messages"];
     const existing = readStoreValue<Notif[]>(NOTIF_KEY, []);
     const hadAppNotifs = existing.some((n) => n.app === app);
-    const all = conversations.flatMap((c) => c.msgs);
+    // A thread the user is actually reading is not a notification.
+    const shownActive = smsMode === "real" ? "" : activeId;
+    const all = conversations
+      .filter((c) => c.id !== shownActive)
+      .flatMap((c) => c.msgs);
     const unread = all.filter((m) => m.from === "them" && !m.read).slice(0, 20);
     if (unread.length === 0 && !hadAppNotifs) return;
     const others = removeAppNotifs(existing, app);
@@ -538,6 +572,7 @@
 </script>
 
 <div class="flex h-full flex-col p-3">
+  <StoreErrorBar message={storeErr} />
   {#if smsMode === "real"}
     <!-- Folder tabs: inbox / sent / drafts (counts are distinct threads) -->
     <div class="mb-1.5 flex items-center gap-1 overflow-x-auto" data-testid="sms-folders">
@@ -575,10 +610,10 @@
           <p class="py-1 text-center text-xs opacity-60">{t("message.trashEmpty")}</p>
         {:else}
           <ul class="max-h-32 space-y-1 overflow-auto">
-            {#each trash as e (e.threadId + "/" + e.messageId)}
-              <li class="flex items-center justify-between gap-2 text-xs">
-                <span class="min-w-0 truncate opacity-80">{trashThreadName(e.threadId)} · {fmtBubbleTime(e.trashedMs)}</span>
-                <button onclick={() => void restoreOne(e)} disabled={trashBusy} data-testid={`trash-restore-${e.messageId}`}
+            {#each trash as e (e.thread_id + "/" + e.message_id)}
+              <li class="flex items-center justify-between gap-2 text-xs" data-testid="trash-row">
+                <span class="min-w-0 truncate opacity-80">{trashThreadName(e.thread_id)} · {fmtBubbleTime(e.trashed_ms)}</span>
+                <button onclick={() => void restoreOne(e)} disabled={trashBusy} data-testid={`trash-restore-${e.message_id}`}
                   class="shrink-0 rounded-full bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent disabled:opacity-40">{t("message.trashRestore")}</button>
               </li>
             {/each}

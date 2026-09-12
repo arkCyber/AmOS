@@ -19,6 +19,7 @@ import { AMOS_LOCALE_CHANGED_EVENT } from "../src/svelte/ui-events";
 import { AUTOOFF_STORE_KEY } from "../src/lib/display";
 import { LOCK_KEY, type LockCfg } from "../src/lib/lock";
 import { SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
+import { settingsChannel } from "../src/svelte/appLinks";
 import { WIFI_KEY } from "../src/lib/wifi";
 import { BT_KEY } from "../src/lib/bluetooth";
 import { FOCUS_KEY } from "../src/lib/focusPrefs";
@@ -301,5 +302,34 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     // An unmatched term shows the empty state.
     await fireEvent.input(input as HTMLInputElement, { target: { value: "zzzqqq" } });
     expect(txt(host)).toContain("没有找到匹配的设置项。");
+  });
+
+  test("a search link prefills the index search, then is consumed", async () => {
+    const host = render(SettingsApp);
+    const find = () =>
+      [...host.container.querySelectorAll("input")].find(
+        (i) => i.getAttribute("aria-label") === "搜索设置",
+      ) as HTMLInputElement | undefined;
+
+    // Start on a sub page so the link has to bring us back to the index.
+    await fireEvent.click(buttonContaining(host, "显示与亮度") as HTMLButtonElement);
+    expect(txt(host)).toContain("自动息屏");
+
+    settingsChannel().set({ query: "brightness", nonce: 7 });
+    await Promise.resolve();
+    expect(find()?.value).toBe("brightness");
+    // We are back on the *index* (the search field only exists there) and the sub page
+    // we had opened is gone — the link navigates, it does not leave the user mid-page.
+    expect(txt(host)).not.toContain("自动息屏");
+    // The index's own alias search decides what that matches (we picked no page).
+    expect(txt(host)).toContain("显示与亮度");
+    // Consumed once: a remount starts clean (nothing pending).
+    expect(settingsChannel().get()?.query).toBe("");
+
+    // Asking a second time with the same text and a new nonce re-triggers it.
+    await fireEvent.input(find() as HTMLInputElement, { target: { value: "" } });
+    settingsChannel().set({ query: "brightness", nonce: 8 });
+    await Promise.resolve();
+    expect(find()?.value).toBe("brightness");
   });
 });

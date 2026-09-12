@@ -23,6 +23,7 @@
 * `ingest_native_text` + `arm_ingest(Arc<GlobalClipboard>)` + `set_notifier`：**容器→共享缓冲**。
 * 读/清仅前台（`require_foreground(&WmState, caller)`，对照 `amos-wm` focused）；写任意窗口可发。
 * 多格式载荷 `ClipboardPayload::{Text,Html,Image,Uris}`、有界历史（`HISTORY_LIMIT=32`）。
+* **UI 消费（2026-09-11）**：System UI 的纯 Svelte Shell 挂 `svelte/ClipboardAnnounce.svelte`——订阅 `clipboard-changed`（`lib/clipboard.onClipboardChanged`）并弹一条**仅元数据**的瞬时提示（`{seq,timestamp_ms,source}`，**绝不显示内容**；内容仍须走前台门控的 `clipboard_read`），好让用户得知容器侧/后台完成了一次复制。
 
 既有实现只有形态 B 的 `ClipboardGlue`（Kotlin/JNI，`android` feature）。**形态 A 的宿主半此前缺失** —— 本轮新增 `clipboard_guest.rs` 补齐，且完全复用上述 seam。
 

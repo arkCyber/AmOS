@@ -1,8 +1,8 @@
 <script lang="ts">
-  // HomeDock.svelte — Svelte 5 (runes) port of the React `HomeDock` (the home
-  // screen: widgets + paged icon grid + single-row bottom dock bar).
+  // HomeDock.svelte — Svelte 5 (runes) implementation of the home screen
+  // (widgets + paged icon grid + single-row bottom dock bar).
   //
-  // It is a CONTROLLED leaf: the React shell owns navigation + the home layout,
+  // It is a CONTROLLED leaf: the shell owns navigation + the home layout,
   // and pushes { layout, ext, pulseId } down reactively through the shared
   // propsBus channel "home" (in-place, no remount → the icon-grid page index is
   // preserved across reorders). One-shot actions (open / move / search) go back
@@ -116,7 +116,7 @@
     if (gridPage > lastIndex) gridPage = lastIndex;
   });
 
-  // Transient gesture state (non-reactive mirrors of the React refs).
+  // Transient gesture state (non-reactive mirrors of the local refs).
   let dragId: string | null = null;
   let panX: number | null = null;
   let panned = false;

@@ -3,7 +3,6 @@ import {
   applySensorLive,
   createSensorLive,
   initialSensorLive,
-  isSensorDataPayload,
   toHostSeed,
   type SensorLiveState,
 } from "../lib/sensorLive";
@@ -98,13 +97,6 @@ describe("lib/sensorLive (real-time System-UI sensor feed accumulator)", () => {
     unsub();
     live.pushRaw(imuEv(6));
     expect(seen.length).toBe(2); // unchanged after unsubscribe (2 sets before it)
-  });
-
-  test("isSensorDataPayload guards well-shaped vs garbage", () => {
-    expect(isSensorDataPayload(imuEv(1))).toBe(true);
-    expect(isSensorDataPayload({ kind: "imu" })).toBe(false);
-    expect(isSensorDataPayload(null)).toBe(false);
-    expect(isSensorDataPayload("nope")).toBe(false);
   });
 
   test("toHostSeed pulls backend/mode from a host snapshot and tolerates junk", () => {

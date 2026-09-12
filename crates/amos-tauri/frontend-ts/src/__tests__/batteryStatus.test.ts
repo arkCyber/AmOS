@@ -2,7 +2,6 @@ import { describe, expect, test, afterEach } from "bun:test";
 import {
   clampPct,
   batteryTone,
-  resolveBattery,
   firstBattery,
   sampleHostBattery,
   normalizeSample,
@@ -55,25 +54,6 @@ describe("batteryStatus", () => {
     );
   });
 
-  test("resolveBattery prefers the daemon (system) reading over the host one", () => {
-    const system = { levelPct: 60, charging: false };
-    const host: BatterySample = { levelPct: 92, charging: true };
-    expect(resolveBattery(system, host)).toEqual({ levelPct: 60, charging: false });
-  });
-
-  test("resolveBattery falls back to the host when the system carries no level", () => {
-    const host: BatterySample = { levelPct: 92, charging: true };
-    expect(resolveBattery({ levelPct: null, charging: null }, host)).toEqual(host);
-    expect(resolveBattery(undefined, host)).toEqual(host);
-  });
-
-  test("resolveBattery is honestly unknown when no source answers", () => {
-    expect(resolveBattery(null, null)).toEqual(EMPTY_BATTERY);
-    expect(resolveBattery({ levelPct: null, charging: null }, EMPTY_BATTERY)).toEqual(
-      EMPTY_BATTERY,
-    );
-  });
-
   test("firstBattery picks the first finite level across an ordered list", () => {
     const none: BatterySample = { levelPct: null, charging: null };
     const host: BatterySample = { levelPct: 75, charging: false };
@@ -83,6 +63,15 @@ describe("batteryStatus", () => {
     expect(firstBattery([none, host])).toEqual(host);
     expect(firstBattery([none, none, host])).toEqual(host);
     expect(firstBattery([none, none, none, undefined, null])).toEqual(EMPTY_BATTERY);
+  });
+
+  test("firstBattery: the daemon (system) reading beats the host one", () => {
+    const system = { levelPct: 60, charging: false };
+    const host: BatterySample = { levelPct: 92, charging: true };
+    expect(firstBattery([system, host])).toEqual({ levelPct: 60, charging: false });
+    // A level-less system block defers to the host; no source → honestly unknown.
+    expect(firstBattery([{ levelPct: null, charging: null }, host])).toEqual(host);
+    expect(firstBattery([null, null])).toEqual(EMPTY_BATTERY);
   });
 
   test("sampleHostBattery maps a BatteryManager level (0..1) onto a 0..100 %", () => {

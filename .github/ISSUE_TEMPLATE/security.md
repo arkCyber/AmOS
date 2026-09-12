@@ -11,6 +11,6 @@ assignees: ''
 
 **DO NOT** disclose security vulnerabilities in public issues. Please email your report to [security@amos-project.dev] instead.
 
-See [SECURITY.md](../../../SECURITY.md) for more information.
+See [SECURITY.md](../../SECURITY.md) for more information.
 
 This template should only be used for non-critical security-related discussions.

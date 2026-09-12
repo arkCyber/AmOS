@@ -418,7 +418,8 @@ impl WmState {
     /// window is moved/resized to its bounds. External or not-yet-created windows
     /// are skipped (their geometry is owned elsewhere / comes later). No-op when
     /// there is no active split. Best-effort — a window that fails to resize is
-    /// ignored rather than aborting the whole layout.
+    /// **reported** rather than aborting the whole layout (REQ-A147): the layout model
+    /// then says the split is in place while the screen shows the old geometry.
     pub fn apply_split_to_real(&self, app: &AppHandle) -> Result<(), String> {
         let snapshot = self.layout_snapshot()?;
         let Some(info) = &snapshot.split else {
@@ -428,11 +429,22 @@ impl WmState {
             let Some(window) = app.get_webview_window(&pane.label) else {
                 continue; // external surface or not created yet
             };
-            let _ = window.set_position(tauri::LogicalPosition::new(pane.x as f64, pane.y as f64));
-            let _ = window.set_size(tauri::LogicalSize::new(
-                pane.width as f64,
-                pane.height as f64,
-            ));
+            let resized = window
+                .set_position(tauri::LogicalPosition::new(pane.x as f64, pane.y as f64))
+                .and_then(|()| {
+                    window.set_size(tauri::LogicalSize::new(
+                        pane.width as f64,
+                        pane.height as f64,
+                    ))
+                });
+            if let Err(e) = resized {
+                tracing::warn!(
+                    pane = %pane.label,
+                    error = %e,
+                    "the split layout could not be applied to this window; \
+                     the screen does not match the layout model"
+                );
+            }
         }
         Ok(())
     }

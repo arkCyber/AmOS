@@ -10,8 +10,13 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import NotesApp from "../src/svelte/NotesApp.svelte";
 import { readStoreValue } from "../src/lib/amosStore";
+import { notesChannel, AI_TARGET_WINDOW } from "../src/svelte/appLinks";
+import { resetPropsChannels } from "../src/svelte/propsBus";
+import { resetShellState, surface } from "../src/svelte/shellState.svelte";
+import { setLocale } from "../src/svelte/locale.svelte";
 
 afterEach(cleanup);
+afterEach(() => setLocale("zh")); // never leak a locale into the next case
 afterEach(() => {
   delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 });
@@ -20,6 +25,31 @@ const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const btnTrim = (h: { container: HTMLElement }, s: string) =>
   [...h.container.querySelectorAll("button")].find((b) => (b.textContent ?? "").trim() === s) as
     HTMLButtonElement | undefined;
+
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
 
 describe("NotesApp.svelte", () => {
   test("starts empty (暂无备忘录)", () => {
@@ -36,6 +66,53 @@ describe("NotesApp.svelte", () => {
     expect(txt(host)).toContain("买牛奶");
     const stored = readStoreValue<{ text: string }[]>("amos.notes", []);
     expect(stored.some((n) => n.text === "买牛奶\n鸡蛋")).toBe(true);
+  });
+
+  test("a rejected store write is visible, applies nothing, and keeps the draft", async () => {
+    const restore = failWritesFor("amos.notes");
+    try {
+      const host = render(NotesApp);
+      const ta = host.container.querySelector(
+        'textarea[aria-label="note-compose"]',
+      ) as HTMLTextAreaElement;
+      await fireEvent.input(ta, { target: { value: "会丢的笔记" } });
+      await fireEvent.click(btnTrim(host, "保存")!);
+      await new Promise<void>((r) => setTimeout(r, 0));
+
+      // The write was rejected, so nothing may be claimed: an honest banner, no row
+      // added, and the typed draft still in the box (never cleared into a lost write).
+      const err = host.container.querySelector('[data-testid="note-store-error"]');
+      expect(err?.textContent ?? "").toContain("本机存储写入失败");
+      expect(txt(host)).toContain("暂无备忘录");
+      expect(ta.value).toBe("会丢的笔记");
+      expect(readStoreValue<{ text: string }[]>("amos.notes", [])).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a successful write clears the store error and applies the note", async () => {
+    const restore = failWritesFor("amos.notes");
+    const host = render(NotesApp);
+    const ta = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    try {
+      await fireEvent.input(ta, { target: { value: "第一次失败" } });
+      await fireEvent.click(btnTrim(host, "保存")!);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      expect(host.container.querySelector('[data-testid="note-store-error"]')).toBeTruthy();
+    } finally {
+      restore();
+    }
+    // Storage works again → the same draft (still in the box) saves and the banner goes.
+    await fireEvent.click(btnTrim(host, "保存")!);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(host.container.querySelector('[data-testid="note-store-error"]')).toBeNull();
+    expect(txt(host)).toContain("第一次失败");
+    expect(readStoreValue<{ text: string }[]>("amos.notes", []).some((n) => n.text === "第一次失败")).toBe(
+      true,
+    );
   });
 
   test("archiving removes it from 备忘录 and it appears in 归档", async () => {
@@ -620,6 +697,221 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     const host = render(NotesApp);
     await new Promise<void>((r) => setTimeout(r, 0));
     expect(host.container.querySelector('[data-testid="note-ai-offline"]')).toBeNull();
+  });
+
+  test("clipboard tray previews entries and can clear the history", async () => {
+    const calls: string[] = [];
+    const entries = [
+      { seq: 2, source: "webview", owner: "notes", timestamp_ms: 2, payload: { kind: "image", mime: "image/png", data_b64: "AA==" } },
+      { seq: 1, source: "webview", owner: "notes", timestamp_ms: 1, payload: { kind: "text", text: "  hello   world  " } },
+    ];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        calls.push(cmd);
+        if (cmd === "clipboard_history") return entries;
+        if (cmd === "clipboard_clear") return 2;
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(NotesApp);
+    // The clipboard tray lives in the note editor toolbar → add a note first
+    // (saving opens it in the editor).
+    const compose = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(compose, { target: { value: "剪辑测试" } });
+    await fireEvent.click(btnTrim(host, "保存")!);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    // The tray lives in the note *editor* toolbar → enter the editor.
+    await fireEvent.click(btnTrim(host, "编辑")!);
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    await fireEvent.click(host.container.querySelector('button[aria-label="Clipboard history"]') as HTMLButtonElement);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    // A binary entry used to render as "—"; it now shows its honest preview, and
+    // whitespace in a text entry is collapsed for the one-line picker.
+    expect(txt(host)).toContain("[image · image/png]");
+    expect(txt(host)).toContain("hello world");
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="清空剪贴板历史"]') as HTMLButtonElement,
+    );
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(calls).toContain("clipboard_clear");
+    // The list is emptied only because the bridge confirmed a count.
+    expect(txt(host)).toContain("剪贴板暂无历史");
+  });
+
+  test("ask-my-notes shows the daemon-confirmed index status (embedder named honestly)", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "rag_status") return { indexed: 7, dimension: 384, embedder: "ollama" };
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(NotesApp);
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="note-ask-toggle"]') as HTMLButtonElement,
+    );
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const status = host.container.querySelector('[data-testid="note-rag-status"]');
+    expect(status).toBeTruthy();
+    // The daemon's real numbers + the embedder label (`mock` vs `ollama`), never
+    // a fabricated index size.
+    expect(status?.textContent ?? "").toContain("7");
+    expect(status?.textContent ?? "").toContain("384");
+    expect(status?.textContent ?? "").toContain("ollama");
+  });
+
+  test("ask-my-notes toggles a panel and reports offline without a daemon", async () => {
+    const host = render(NotesApp);
+    const toggle = host.container.querySelector(
+      'button[aria-label="note-ask-toggle"]',
+    ) as HTMLButtonElement;
+    expect(toggle).toBeTruthy();
+    // Panel is closed until toggled.
+    expect(host.container.querySelector('[data-testid="note-ask"]')).toBeNull();
+    await fireEvent.click(toggle);
+    expect(host.container.querySelector('[data-testid="note-ask"]')).toBeTruthy();
+    // No Tauri bridge → the daemon is unreachable: an honest notice, and the Ask
+    // button is disabled (never a silent no-op).
+    expect(txt(host)).toContain("笔记检索需要守护进程");
+    const run = host.container.querySelector(
+      'button[aria-label="note-ask-run"]',
+    ) as HTMLButtonElement;
+    expect(run.disabled).toBe(true);
+    // Toggling off closes the panel again.
+    await fireEvent.click(toggle);
+    expect(host.container.querySelector('[data-testid="note-ask"]')).toBeNull();
+  });
+});
+
+describe("NotesApp.svelte — Spotlight deep link (appLinks.openNote)", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  afterEach(resetPropsChannels);
+
+  test("opens the linked note in the full-page editor", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([
+        { id: "n1", text: "买菜清单", ts: 1000 },
+        { id: "n2", text: "会议记录", ts: 2000 },
+      ]),
+    );
+    // The chooser sets the channel *before* opening the app, so the payload is there
+    // at mount (same contract as the phone → Messages "回短信" link).
+    notesChannel().set({ noteId: "n2", nonce: 7 });
+    const host = render(NotesApp);
+    await tick();
+    const ta = host.container.querySelector(
+      'textarea[aria-label="note-editor-textarea"]',
+    ) as HTMLTextAreaElement | null;
+    expect(ta).toBeTruthy();
+    expect(ta?.value).toBe("会议记录");
+  });
+
+  test("a link to a note that is gone leaves the list (never a phantom note)", async () => {
+    window.localStorage.setItem(
+      "amos.notes",
+      JSON.stringify([{ id: "n1", text: "买菜清单", ts: 1000 }]),
+    );
+    notesChannel().set({ noteId: "gone", nonce: 8 });
+    const host = render(NotesApp);
+    await tick();
+    expect(host.container.querySelector('textarea[aria-label="note-editor-textarea"]')).toBeNull();
+    expect(txt(host)).toContain("买菜清单");
+  });
+});
+
+describe("NotesApp.svelte — send to AI (wm SystemContext)", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  afterEach(() => {
+    resetPropsChannels();
+    resetShellState();
+  });
+
+  /** Fake bridge recording every command; answers null (nothing to read back). */
+  function bridge() {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
+        calls.push({ cmd, args });
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+
+  /** Add a note, expand its row and enter edit mode so the toolbar shows. */
+  async function editNote(host: { container: HTMLElement }, text: string) {
+    const ta = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(ta, { target: { value: text } });
+    await fireEvent.click(btnTrim(host, "保存")!);
+    // The fresh note may already be expanded; a collapsed row is opened by tapping
+    // it. Either way the "编辑" action (in the expanded view) enters the editor.
+    const row = [...host.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").includes(text) && (b.textContent ?? "").includes("打开"),
+    ) as HTMLButtonElement | undefined;
+    if (row) await fireEvent.click(row);
+    await tick();
+    await fireEvent.click(btnTrim(host, "编辑")!);
+    await tick();
+  }
+
+  test("✦ 发送到 AI attaches the note as system context and opens the AI app", async () => {
+    const calls = bridge();
+    const host = render(NotesApp);
+    await editNote(host, "预算审查 #work");
+
+    const send = host.container.querySelector(
+      'button[aria-label="note-send-ai"]',
+    ) as HTMLButtonElement | null;
+    expect(send).toBeTruthy();
+    await fireEvent.click(send as HTMLButtonElement);
+    await tick();
+
+    // The text is attached to the AI window, addressed from notes — the daemon's
+    // `chat_agent` merges it into the next request as `system_selection`.
+    expect(calls).toContainEqual({
+      cmd: "system_set_context",
+      args: { targetWindow: AI_TARGET_WINDOW, sourceWindow: "notes", text: "预算审查 #work" },
+    });
+    // …and the AI app is opened so the user lands where the context is used.
+    expect(surface()).toEqual({ kind: "app", id: "ai" });
+  });
+
+  test("the list toolbar's copy follows the locale (no hard-coded Chinese)", async () => {
+    setLocale("en");
+    const host = render(NotesApp);
+    // Create a note (the row is expanded afterwards) so the footer + inline toolbar
+    // render — those are the affordances whose copy used to be hard-coded in zh.
+    const compose = host.container.querySelector(
+      'textarea[aria-label="note-compose"]',
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(compose, { target: { value: "Groceries" } });
+    await fireEvent.click(btnTrim(host, "Save")!);
+    await tick();
+
+    const importBtn = host.container.querySelector('[aria-label="note-import-md"]')!;
+    expect(importBtn.getAttribute("title")).toBe("Import the input as Markdown"); // was "把输入内容当作 Markdown 导入"
+    expect(btnTrim(host, "Full page")).toBeTruthy(); // was "整页"
+
+    // Enter the inline editor: its task/preview + clipboard toolbar was the block of
+    // hard-coded Chinese titles this round localised.
+    await fireEvent.click(btnTrim(host, "Edit")!);
+    await tick();
+    expect(host.container.querySelector('[aria-label="note-edit-preview"]')!.getAttribute("title")).toBe(
+      "Rich-text preview", // was "富文本预览"
+    );
+    expect(host.container.querySelector('[aria-label="Clipboard history"]')!.getAttribute("title")).toBe(
+      "Clipboard history", // was "剪贴板历史"
+    );
+    expect(txt(host)).not.toContain("整页");
   });
 });
 

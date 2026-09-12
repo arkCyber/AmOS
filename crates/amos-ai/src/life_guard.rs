@@ -265,6 +265,8 @@ impl<F: ProcFs> LifeGuard<F> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Runs until the daemon shuts down: no exit here; the task is aborted
+            // with the runtime. `tick()` is the wait (never a spin).
             loop {
                 ticker.tick().await;
                 Self::log_one(&guard);

@@ -55,7 +55,8 @@
     type Occurrence,
     type Repeat,
   } from "../lib/calendar";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { locale, t } from "./locale.svelte";
 
@@ -85,25 +86,36 @@
     gray: "text-neutral-400",
   };
 
-  /* ---- seed / init from the shared store (mirrors the other apps) ---- */
+  /* ---- seed / init from the shared store (mirrors the other apps) ----
+   * Demo content is seeded **only when the key is absent**: a user who deleted every
+   * event (or every calendar) must not get the demo fixtures back on the next mount.
+   * A missing *built-in* calendar is still repaired, because events with no calendar
+   * would be unreachable — that is a repair of a broken state, not a re-seed. */
   const now0 = Date.now();
-  let initGroups = normalizeCalendars(readStoreValue<unknown>(CALENDARS_KEY, []));
-  if (!initGroups.some((g) => g.id === DEFAULT_CALENDAR_ID)) {
-    initGroups = initGroups.length ? [seedCalendars(now0)[0]!, ...initGroups] : seedCalendars(now0);
+  const rawGroups = readStoreValue<unknown>(CALENDARS_KEY, undefined);
+  let initGroups = rawGroups === undefined ? seedCalendars(now0) : normalizeCalendars(rawGroups);
+  if (rawGroups === undefined) {
+    writeStoreValue(CALENDARS_KEY, initGroups);
+  } else if (!initGroups.some((g) => g.id === DEFAULT_CALENDAR_ID)) {
+    initGroups = [seedCalendars(now0)[0]!, ...initGroups];
     writeStoreValue(CALENDARS_KEY, initGroups);
   }
-  let initEvents = normalizeEvents(readStoreValue<unknown>(CALENDAR_KEY, []));
-  if (!initEvents.length) {
-    initEvents = seedEvents(now0);
-    writeStoreValue(CALENDAR_KEY, initEvents);
-  }
+  const rawEvents = readStoreValue<unknown>(CALENDAR_KEY, undefined);
+  let initEvents = rawEvents === undefined ? seedEvents(now0) : normalizeEvents(rawEvents);
+  if (rawEvents === undefined) writeStoreValue(CALENDAR_KEY, initEvents);
   let groups = $state<CalendarGroup[]>(initGroups);
   let events = $state<CalendarEvent[]>(initEvents);
 
-  const persistGroups = (l: CalendarGroup[]) => {
+  let storeErr = $state("");
+  const persistGroups = (l: CalendarGroup[]): boolean => {
     const c = normalizeCalendars(l);
-    writeStoreValue(CALENDARS_KEY, c);
+    if (!writeStoreValueChecked(CALENDARS_KEY, c)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     groups = c;
+    return true;
   };
   /**
    * Persist events. Invariant enforced here (single choke point): **every stored
@@ -112,10 +124,15 @@
    * calendar while its event is open in the editor could commit an event whose
    * `calendarId` resolves to nothing.
    */
-  const persistEvents = (l: CalendarEvent[]) => {
+  const persistEvents = (l: CalendarEvent[]): boolean => {
     const c = normalizeEvents(reassignOrphans(l, groups));
-    writeStoreValue(CALENDAR_KEY, c);
+    if (!writeStoreValueChecked(CALENDAR_KEY, c)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     events = c;
+    return true;
   };
 
   /* ---- slow clock (today highlight / agenda window refresh) ---- */
@@ -353,9 +370,9 @@
         payload.startAt = shiftByWallClock(curr.startAt, editOcc.startAt, payload.startAt);
         payload.endAt = shiftByWallClock(curr.endAt, editOcc.endAt, payload.endAt);
       }
-      persistEvents(updateEvent(events, editId, payload));
+      if (!persistEvents(updateEvent(events, editId, payload))) return;
     } else {
-      persistEvents(addEvent(events, payload, Date.now()));
+      if (!persistEvents(addEvent(events, payload, Date.now()))) return;
     }
     closeEditor();
   };
@@ -366,13 +383,18 @@
 
   const createCalendar = () => {
     if (!newCalName.trim()) return;
-    persistGroups(addCalendar(groups, { name: newCalName, color: newCalColor }, Date.now()));
+    // Keep the typed name when the store rejected the new calendar.
+    if (!persistGroups(addCalendar(groups, { name: newCalName, color: newCalColor }, Date.now()))) {
+      return;
+    }
     newCalName = "";
   };
   const deleteCalendar = (id: string) => {
     if (id === DEFAULT_CALENDAR_ID) return;
     const next = removeCalendar(groups, id);
-    persistGroups(next);
+    // Nothing else may move if the calendar itself was not removed: the event
+    // reassignment below is only correct once the new calendar list is stored.
+    if (!persistGroups(next)) return;
     // Events left behind fall back to the built-in calendar (never orphaned) —
     // the same pure helper the kernel tests pin, so the two can't drift. The
     // persistence boundary re-applies it, so an event being edited right now
@@ -464,6 +486,7 @@
 
 
 <div class="flex h-full flex-col">
+  <StoreErrorBar message={storeErr} />
   <!-- month / title navigation -->
   <div class="flex shrink-0 items-center gap-1 px-2 pt-2">
     <button

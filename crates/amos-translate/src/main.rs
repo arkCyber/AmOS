@@ -4,6 +4,12 @@
 //! `amos-ai`, it is fully headless: all configuration comes from flags/env, and
 //! it is intended to be launched and supervised by `amos-supervisor`.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;

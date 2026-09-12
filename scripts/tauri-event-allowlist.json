@@ -1,0 +1,6 @@
+[
+  {
+    "name": "hardware-button",
+    "reason": "Deliberate third delivery path, recorded in `crates/amos-tauri/src/buttons.rs` and `docs/hardware-buttons.md`: the shell consumes a press through (a) the pull command `take_pending_hardware_button` (the reliable on-device path, polled by `svelte/osInputBridge.startOsHardwarePoll`) and (b) a DOM `CustomEvent(\"hardware-button\")` that `buttons::dispatch_dom` evaluates into every webview (caught by `startOsInputBridge`). The Tauri `emit` stays as the desktop/plugin path for a host that *does* deliver `plugin:event|listen`; no Svelte screen subscribes to it, and adding a third handler would double-fire navigation. Removing the emit is a device-behaviour change that cannot be verified here (Round 48)."
+  }
+]

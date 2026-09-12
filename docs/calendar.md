@@ -18,7 +18,7 @@
 | 注册（三处单源） | `src/lib/appMeta.ts`（id→标题键/图标）、`src/svelte/appRegistry.ts`（id→Svelte 屏）、`src/lib/appGroups.ts`（分类） | 图标/标题/加载器/分组 |
 | 文案 | `src/i18n/locales/{zh,en}.ts` | `app.calendar` + `calendar.*`（中英键奇偶由 `i18n.test.ts` 强制） |
 
-**持久化契约**（经共享 `amos.*` store：localStorage + `window.Amos` 桥 + 跨窗口广播）：
+**持久化契约**（经共享 `amos.*` store：localStorage + `store_set` 透写到 Rust `SharedStore` + `store-updated` 广播）：
 
 | key | 内容 |
 |---|---|

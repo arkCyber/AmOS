@@ -28,7 +28,7 @@
    ├─ 终止帧含 card → 发事件 "ai-card-received" (CardPayload)
    └─ done → 发 "ai-session-complete" / "ai-chat-complete"
    ▼  Tauri 事件
-[frontend-ts App.tsx / AiApp 订阅]  →  [AiApp: onAiCard → patchCur]
+[frontend-ts svelte/AiApp.svelte 订阅]  →  [AiApp: onAiCard → patchCur]
    ▼
 [AiCardView(card)]  →  动态渲染交互卡片
 ```

@@ -34,6 +34,49 @@ describe("createStoreValue (Svelte persisted store)", () => {
     window.localStorage.removeItem(key);
   });
 
+  test("save() reports whether the write landed", () => {
+    const key = "amos.test.svelte.store.save." + Math.random();
+    const sv = createStoreValue<string[]>(key, []);
+    const unsub = sv.subscribe(() => {});
+    expect(sv.save(["x"])).toBe(true);
+    expect(readStoreValue<string[]>(key, [])).toEqual(["x"]);
+    unsub();
+    window.localStorage.removeItem(key);
+  });
+
+  test("save() reports a rejected write and the store value does not move", () => {
+    const key = "amos.test.svelte.store.reject." + Math.random();
+    writeStoreValue(key, ["keep"]);
+    const sv = createStoreValue<string[]>(key, []);
+    const seen: string[][] = [];
+    const unsub = sv.subscribe((v) => seen.push(v));
+
+    const fake = {
+      getItem: (k: string) => window.localStorage.getItem(k),
+      setItem: (k: string) => {
+        if (k === key) throw new Error("QuotaExceededError");
+      },
+      removeItem: (k: string) => window.localStorage.removeItem(k),
+      clear: () => window.localStorage.clear(),
+      key: (i: number) => window.localStorage.key(i),
+      get length() {
+        return window.localStorage.length;
+      },
+    } as unknown as Storage;
+    const real = window.localStorage;
+    Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+    try {
+      expect(sv.save(["dropped"])).toBe(false);
+    } finally {
+      Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+    }
+    // No change event is dispatched for a rejected write, so subscribers never saw it.
+    expect(seen.every((v) => v[0] === "keep")).toBe(true);
+    expect(readStoreValue<string[]>(key, [])).toEqual(["keep"]);
+    unsub();
+    window.localStorage.removeItem(key);
+  });
+
   test("isolated keys don't cross-talk", () => {
     const ka = "amos.test.svelte.store.a." + Math.random();
     const kb = "amos.test.svelte.store.b." + Math.random();

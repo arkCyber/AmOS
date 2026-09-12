@@ -246,6 +246,8 @@ impl SessionManager {
     pub fn spawn_cleanup_task(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            // Runs until the daemon shuts down: no exit here; the task is aborted
+            // with the runtime. `tick()` is the wait (never a spin).
             loop {
                 ticker.tick().await;
                 self.cleanup_stale().await;
@@ -271,8 +273,20 @@ impl SessionManager {
         drop(sessions);
 
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+        let target = path.to_path_buf();
+        // Write-to-temp + rename is an atomic replace, but both calls are **blocking**
+        // filesystem work — and this method is `async`, so it must not run them on the
+        // tokio worker (today the only caller is the daemon's shutdown path; the split
+        // keeps that true if a hot-path caller ever appears). `json` and the paths are
+        // moved in, so nothing is borrowed across the thread boundary.
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+            std::fs::rename(&tmp, &target)
+                .map_err(|e| format!("rename to {}: {e}", target.display()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("persist task failed: {e}"))??;
         tracing::info!("persisted {} sessions to {}", stored.len(), path.display());
         Ok(())
     }

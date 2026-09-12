@@ -2,9 +2,8 @@
   // CalculatorApp.svelte — Svelte 5 (runes) implementation of the iOS-style
   // calculator. The reduction logic is NOT reimplemented: it reuses the single
   // pure reducer in src/lib/calculator.ts (single source of truth, already
-  // unit-tested there). The former React body (src/apps.tsx) was removed in the
-  // "subtraction" phase — this Svelte screen is now the only implementation and
-  // is mounted directly by apps.tsx CalculatorEntry (no React fallback).
+  // unit-tested there). The former React body was removed in the "subtraction"
+  // phase — this Svelte screen is the only implementation, mounted by `appRegistry`.
 
   // Shared, non-reactive constants + colour map (iOS palette). Recreated per
   // component instance — cheap and dependency-free.
@@ -39,6 +38,7 @@
   import type { CalcEntry } from "../lib/calculator";
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   // Persisted history — createStoreValue keeps it live (src/svelte/store.ts).
   const HISTORY_KEY = "amos.calculator.history";
@@ -52,12 +52,14 @@
 
 
   // No props needed: `t` comes from the shared reactive i18n singleton
-  // (locale.svelte.ts), which the React shell keeps in sync via setLocale — so a
+  // (locale.svelte.ts), which the shell keeps in sync via setLocale — so a
   // mid-calculation locale switch re-renders text in place without losing state.
 
   // --- State (runes) ---
   let st = $state(calcInit());
   let history = $state<CalcEntry[]>([]);
+  // A rejected history write (full/unavailable storage) must not look like it landed.
+  let storeErr = $state("");
   let showHist = $state(false);
 
   // Bridge the reactive store into component state (idiomatic runes↔store:
@@ -87,15 +89,22 @@
       st = calcPress(st, k);
       if (entry) {
         const next = addHistory(history, entry);
-        history = next;
-        historyStore.save(next); // persist via the shared store (real consumer)
+        // The subscription above mirrors the store, so only a landed write may set the
+        // local list — otherwise a rejected write would leave a phantom entry (no change
+        // event is dispatched, so nothing would correct it).
+        if (historyStore.save(next)) {
+          history = next;
+          storeErr = "";
+        } else {
+          storeErr = t("common.storeWriteFailed");
+        }
       }
     } else {
       st = calcPress(st, k);
     }
   }
 
-  // Physical keyboard support (mirrors the React ref listener): installed once,
+  // Physical keyboard support (mirrors the previous ref listener): installed once,
   // never rebound; $effect owns add/remove lifecycle.
   $effect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -122,6 +131,7 @@
       {t("calc.history")}{history.length > 0 ? ` (${history.length})` : ""}
     </button>
   </div>
+  <StoreErrorBar message={storeErr} />
 
   <!-- Big iOS-style display region (a fixed band above the keypad, so the number
        sits higher and the whole keypad moves up — not bottom-docked with a huge
@@ -138,8 +148,12 @@
           {/each}
           <button
             onclick={() => {
-              history = [];
-              historyStore.save([]);
+              if (historyStore.save([])) {
+                history = [];
+                storeErr = "";
+              } else {
+                storeErr = t("common.storeWriteFailed");
+              }
             }}
             class="mt-1 w-full rounded-md py-0.5 text-xs text-white/60 hover:text-white"
           >

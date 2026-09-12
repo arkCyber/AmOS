@@ -135,7 +135,8 @@ impl AndroidManagerService {
     /// (`report_host_state` / `report_host_killed`), so a host that drives the
     /// container over the wire (e.g. `ApplyHostDecision` RPC) without having
     /// acted on its own registry first stays in sync. Best effort — failures are
-    /// logged upstream and never panic.
+    /// **reported** (REQ-A148), never silently dropped and never announced as if
+    /// they had succeeded.
     pub async fn apply_host_action(&self, package_name: &str, action: HostAction) {
         match action {
             HostAction::Freeze => {
@@ -146,14 +147,26 @@ impl AndroidManagerService {
                     .freeze(package_name);
                 // Report what actually happened (e.g. the container may refuse to
                 // freeze a protected task → stays non-Cached on the host too).
-                if let Ok(st) = st {
-                    self.report_host_state(package_name, st);
+                match st {
+                    Ok(st) => {
+                        self.report_host_state(package_name, st);
+                        self.emit_event(
+                            package_name,
+                            self.task_window(package_name),
+                            LmkEventKind::Frozen,
+                        );
+                    }
+                    // The container refused (it does not track this package — the wire
+                    // asked for a freeze that did not happen). Announcing `Frozen` here
+                    // would tell every `WatchLmk` subscriber that an app is tombstoned
+                    // while it keeps running, so the event is dropped and the refusal is
+                    // logged instead.
+                    Err(e) => tracing::warn!(
+                        package = package_name,
+                        error = %e,
+                        "container refused the host's freeze; no tier change, no event emitted"
+                    ),
                 }
-                self.emit_event(
-                    package_name,
-                    self.task_window(package_name),
-                    LmkEventKind::Frozen,
-                );
             }
             HostAction::Thaw => {
                 let st = self
@@ -161,23 +174,47 @@ impl AndroidManagerService {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .thaw(package_name);
-                if let Ok(st) = st {
-                    self.report_host_state(package_name, st);
+                match st {
+                    Ok(st) => {
+                        self.report_host_state(package_name, st);
+                        self.emit_event(
+                            package_name,
+                            self.task_window(package_name),
+                            LmkEventKind::Thawed,
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        package = package_name,
+                        error = %e,
+                        "container refused the host's thaw; no tier change, no event emitted"
+                    ),
                 }
-                self.emit_event(
-                    package_name,
-                    self.task_window(package_name),
-                    LmkEventKind::Thawed,
-                );
             }
             HostAction::Reclaim => {
                 let window = self.task_window(package_name);
-                let _ = self.manager.force_stop_app(package_name).await;
-                let _ = self
+                // The host has already decided this app is gone; if the container does
+                // not follow, the process survives an app both registries just dropped,
+                // which is exactly what an operator needs to be told.
+                let stopped = self.manager.force_stop_app(package_name).await;
+                if let Err(e) = stopped {
+                    tracing::warn!(
+                        package = package_name,
+                        error = %e,
+                        "force-stop failed during reclaim; the container process may still be running"
+                    );
+                }
+                let destroyed = self
                     .lmk
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .destroy(package_name);
+                if let Err(e) = destroyed {
+                    tracing::warn!(
+                        package = package_name,
+                        error = %e,
+                        "the container task could not be dropped after reclaim"
+                    );
+                }
                 self.report_host_killed(package_name);
                 self.emit_event(package_name, window, LmkEventKind::Reclaimed);
             }
@@ -569,6 +606,73 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .join("\n")
         }
+    }
+
+    /// A wire-driven host decision the container refuses must not be *announced* as if it
+    /// had happened (REQ-A148). Before this, `apply_host_action(Freeze)` emitted `Frozen`
+    /// unconditionally — even when the container had no such task and the freeze failed —
+    /// so every `WatchLmk` subscriber was told an app was tombstoned while it kept running.
+    #[tokio::test]
+    async fn a_refused_freeze_is_not_announced_as_frozen() {
+        let host = Arc::new(RecordingHost::default());
+        let svc = AndroidManagerService::with_runtime_and_host(
+            Arc::new(DemoRuntime::new()),
+            host.clone(),
+        );
+        let mut rx = svc.events().subscribe();
+
+        // Nothing drove the container's lifecycle for this package ⇒ the freeze is refused.
+        svc.apply_host_action("com.example.ghost", HostAction::Freeze)
+            .await;
+
+        assert!(
+            host.joined().is_empty(),
+            "a refused freeze has no resulting tier to report: {}",
+            host.joined()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused freeze must not be broadcast as `Frozen`"
+        );
+    }
+
+    /// …and the applied case still reports the resulting tier *and* announces it (the fix
+    /// must not turn a real freeze into a silent one).
+    #[tokio::test]
+    async fn an_applied_freeze_is_reported_and_announced() {
+        let host = Arc::new(RecordingHost::default());
+        let svc = AndroidManagerService::with_runtime_and_host(
+            Arc::new(DemoRuntime::new()),
+            host.clone(),
+        );
+        let mut rx = svc.events().subscribe();
+        // The container launches the app, then it loses the foreground (⇒ Background, the
+        // only tier `freeze` tombstones).
+        svc.launch_android_app(Request::new(AppLaunchRequest {
+            package_name: "com.tencent.mm".into(),
+        }))
+        .await
+        .unwrap();
+        svc.on_activity(Request::new(ActivityEventRequest {
+            package_name: "com.tencent.mm".into(),
+            event: ActivityEvent::Stop as i32,
+            activity_id: String::new(),
+        }))
+        .await
+        .unwrap();
+        while rx.try_recv().is_ok() {} // drop the launch/stop events
+
+        svc.apply_host_action("com.tencent.mm", HostAction::Freeze)
+            .await;
+
+        assert!(
+            host.joined().contains("state:com.tencent.mm=cached"),
+            "the resulting tier must be reported to the host: {}",
+            host.joined()
+        );
+        let ev = rx.try_recv().expect("an applied freeze is announced");
+        assert_eq!(ev.kind, LmkEventKind::Frozen as i32);
+        assert_eq!(ev.package_name, "com.tencent.mm");
     }
 
     #[tokio::test]

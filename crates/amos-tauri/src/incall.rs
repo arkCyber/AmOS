@@ -71,6 +71,10 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_AmosInCallService_nativeStat
     state: jstring,
     peer: jstring,
 ) {
+    // SAFETY: called from the Java glue with the real `JNIEnv*` of this (already
+    // attached) thread; `from_raw` only wraps it for the duration of this function, and
+    // the pointer is never used after the env value is dropped. A null/garbage env is
+    // rejected by the `Ok(...)` check instead of being dereferenced.
     let Ok(mut env) = (unsafe { jni::JNIEnv::from_raw(env) }) else {
         return;
     };

@@ -9,15 +9,19 @@
   import { EMERGENCY_NUMBERS, EMERGENCY_QUICK_NUMBER } from "../lib/emergency";
   import {
     onTelephonyEvent, telephonyDial, telephonyEnd, telephonySimulateIncoming,
-    telephonyStartRecording, telephonyStopRecording,
-    blocklistAdd, blocklistRemove, blocklistSetUnknown, blocklistSnapshot,
-    blocklistStatus, blocklistRequestRole,
+    telephonyStartRecording, telephonyStopRecording, telephonyStatus,
+    blocklistAdd, blocklistClear, blocklistCheck, blocklistRemove, blocklistSetUnknown,
+    blocklistSnapshot, blocklistStatus, blocklistRequestRole,
     bridged, bridgeDiag,
   } from "../lib/backend";
-  import type { BlockRuleOut, BlocklistStatusOut } from "../lib/backend";
+  import type { BlockReasonOut, BlockRuleOut, BlocklistStatusOut } from "../lib/backend";
+  import { amosWarn } from "../lib/debugLog";
+  // Svelte's own `get` (NOT `../svelte/store`, the shared-store wrapper): the flush needs a
+  // non-reactive read of the call-log store.
+  import { get } from "svelte/store";
   import { CONTACTS_KEY, contactNameFor, normalizeContacts } from "../lib/contacts";
   import type { Contact } from "../lib/contacts";
-  import { CALLLOG_KEY, callDateStamp, callHistory, callWhenLabel, clearCallHistory, filterHistory, fmtCallClock, frequentNumbers, missedCalls, normalizeCallLog, recordCall } from "../lib/calllog";
+  import { CALLLOG_KEY, callDateStamp, callHistory, callWhenLabel, clearCallHistory, filterHistory, flushPendingCalls, fmtCallClock, frequentNumbers, logNameFor, missedCalls, normalizeCallLog, pendingCallCount, recordCall } from "../lib/calllog";
   import type { CallFilter, CallRecord } from "../lib/calllog";
   import { composeSmsTo } from "./appLinks";
   import { NOTIF_KEY, addNotif } from "../lib/settings";
@@ -27,6 +31,8 @@
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
+  import { phoneChannel } from "./appLinks";
   import { onMount } from "svelte";
 
   type PhoneTab = "keys" | "recent" | "frequent" | "emergency" | "block";
@@ -51,12 +57,33 @@
   let recording = $state<"Off" | "On" | "Failed">("Off");
   let dialError = $state<string | null>(null);
   let tab = $state<PhoneTab>("keys");
+  // Phone dial deep link (Spotlight's "fill the dialler" action): **prefill only** —
+  // placing the call stays the user's decision, so a link never starts one. The link is
+  // a request and is consumed once (a later remount starts clean), exactly like the
+  // Messages compose link.
+  let dialNonce = 0;
+  $effect(() => {
+    return phoneChannel().subscribe((v) => {
+      if (!v || v.number.trim() === "" || v.nonce === dialNonce) return;
+      dialNonce = v.nonce;
+      num = v.number;
+      tab = "keys";
+      dialError = null;
+      phoneChannel().set({ number: "", nonce: dialNonce });
+    });
+  });
   let muted = $state(false);
   let padOpen = $state(false);
   let dtmf = $state("");
   let elapsedSec = $state(0);
   let activeRef: string | null = null;
   let activeAtRef: number | null = null;
+  /**
+   * Call ids we ended locally. The daemon can report a call as still live for a
+   * beat after `telephony_end`, so this stops a resume/recheck from re-adopting a
+   * call the user just hung up (which would make the in-call screen reappear).
+   */
+  const endedIds = new Set<string>();
 
   // ---- Spam blocking (calls + SMS) -------------------------------------------
   // Rules live in Rust (shared with the SMS filter and the Android call-screening
@@ -72,6 +99,14 @@
   let blockChannel = $state<BlockRuleOut["channel"]>("both");
   let blockErr = $state("");
   let blockBusy = $state(false);
+  /**
+   * Live "would this be blocked?" preview for the address being typed. Only a
+   * POSITIVE answer is kept: `blocklistCheck` returns `null` both for "allowed"
+   * and for "bridge unavailable", so a null is never rendered as a promise that
+   * the number is safe.
+   */
+  let blockPreview = $state<BlockReasonOut | null>(null);
+  let confirmClearRules = $state(false);
 
   const loadBlocklist = async () => {
     const b = await blocklistSnapshot();
@@ -108,10 +143,55 @@
     if (tab !== "block" || !bridged()) return;
     void loadBlockStatus();
   });
+  // Live preview: ask the DAEMON whether the address being typed is already
+  // covered (debounced). Only a positive match is kept — see `blockPreview`.
+  $effect(() => {
+    const addr = blockNum.trim();
+    const channel = blockChannel;
+    if (tab !== "block" || !bridged() || addr === "") {
+      blockPreview = null;
+      return;
+    }
+    const id = window.setTimeout(() => {
+      void blocklistCheck(addr, channel).then((r) => {
+        blockPreview = r;
+      });
+    }, 250);
+    return () => window.clearTimeout(id);
+  });
+  /**
+   * Adopt a call the daemon is ALREADY running. The call UI is component-local, so
+   * reopening the Phone app during a live call used to show a bare keypad with no
+   * way to hang up; `onTelephonyEvent` also ignores events for a call it never
+   * adopted (`activeRef` null), so an inbound call answered elsewhere stayed
+   * invisible. Reads the daemon's list (never invents a call) and ignores an
+   * `Ended` snapshot.
+   */
+  const adoptLiveCall = async () => {
+    if (!bridged() || calling) return;
+    const live = await telephonyStatus();
+    if (!live || live.length === 0 || calling) return; // a local call won the race
+    // Ignore calls we already ended locally, and never adopt an `Ended` snapshot.
+    const live1 = live.filter((c) => c.state !== "Ended" && !endedIds.has(c.id));
+    const call = live1.find((c) => c.state === "Active") ?? live1[0];
+    if (!call) return;
+    num = call.peer || num;
+    calling = true;
+    activeId = call.id;
+    activeRef = call.id;
+    talking = call.state === "Active";
+    recording = (call.recording as "Off" | "On" | "Failed") ?? "Off";
+    activeAtRef = talking ? Date.now() : null;
+  };
+
   onMount(() => {
     const recheck = () => {
-      if (document.visibilityState === "visible" && bridged()) void loadBlockStatus();
+      if (document.visibilityState !== "visible" || !bridged()) return;
+      void loadBlockStatus();
+      void adoptLiveCall();
     };
+    // Returning to the app mid-call must restore the in-call UI.
+    void adoptLiveCall();
     document.addEventListener("visibilitychange", recheck);
     window.addEventListener("focus", recheck);
     return () => {
@@ -119,6 +199,18 @@
       window.removeEventListener("focus", recheck);
     };
   });
+
+  /** Two-step "clear every rule" (rules alone never reject calls — the role does). */
+  const clearAllRules = async () => {
+    if (!confirmClearRules) {
+      confirmClearRules = true;
+      return;
+    }
+    confirmClearRules = false;
+    blockErr = "";
+    await blocklistClear();
+    await refreshBlock();
+  };
 
   const addBlockRule = async (
     raw: string = blockNum,
@@ -134,7 +226,7 @@
       // error surfaces as a `null` result (see `invoke`), not a thrown promise.
       const rule = await blocklistAdd(pattern, kind, channel);
       if (!rule) {
-        console.warn("[blocklist] add rejected", bridgeDiag());
+        amosWarn("blocklist", "add rejected", bridgeDiag());
         blockErr = t("phone.blockInvalid");
         return false;
       }
@@ -150,10 +242,10 @@
     const removed = await blocklistRemove(id);
     if (!bridgeDiag().ok) {
       blockErr = t("phone.blockRemoveFailed");
-      console.warn("[blocklist] remove failed", bridgeDiag());
+      amosWarn("blocklist", "remove failed", bridgeDiag());
     } else if (!removed) {
       // Not an error: the rule was already gone (e.g. removed elsewhere).
-      console.warn("[blocklist] remove: rule not found", id);
+      amosWarn("blocklist", "remove: rule not found", id);
     }
     await refreshBlock();
   };
@@ -165,7 +257,7 @@
     if (!bridgeDiag().ok) {
       blockUnknown = !next;
       blockErr = t("phone.blockSaveFailed");
-      console.warn("[blocklist] set_unknown failed", bridgeDiag());
+      amosWarn("blocklist", "set_unknown failed", bridgeDiag());
     }
   };
   const requestBlockRole = async () => {
@@ -175,7 +267,7 @@
       const ok = await blocklistRequestRole();
       if (!ok && bridged()) {
         blockErr = t("phone.blockRoleFailed");
-        console.warn("[blocklist] role request failed", bridgeDiag());
+        amosWarn("blocklist", "role request failed", bridgeDiag());
       }
     } finally {
       blockBusy = false;
@@ -201,13 +293,56 @@
 
   // recents / frequent from the shared call log (like useOutgoingCalls).
   const callLogStore = createStoreValue<unknown>(CALLLOG_KEY, []);
+  // A rejected call-log write (full/unavailable storage) must be visible: the log is
+  // content the user expects to still be there next time.
+  let storeErr = $state("");
   let callLog = $state<CallRecord[]>([]);
+  let flushing = false;
+  // A call that ended while storage was unavailable is kept in memory by
+  // `lib/calllog` (see `queuePendingCall`); the history screen is the place that can both
+  // write it and tell the user, so it retries here and admits to what has not landed
+  // (REQ-A150). A successful flush clears the notice.
+  const flushPendingCallsNow = () => {
+    if (flushing || pendingCallCount() === 0) return;
+    flushing = true;
+    try {
+      // `get(callLogStore)` and **not** the `callLog` state: reading the state here would
+      // make it a dependency of the subscribing effect below, and the store's synchronous
+      // first callback (which assigns a fresh normalized array) would then re-enter this
+      // effect forever — `effect_update_depth_exceeded`.
+      const landed = flushPendingCalls(normalizeCallLog(get(callLogStore)), (next) =>
+        callLogStore.save(next),
+      );
+      storeErr =
+        landed > 0 || pendingCallCount() === 0
+          ? ""
+          : t("phone.pendingCalls", { n: pendingCallCount() });
+    } finally {
+      flushing = false;
+    }
+  };
   $effect(() => {
-    const unsub = callLogStore.subscribe((v) => (callLog = normalizeCallLog(v)));
+    // `subscribe` invokes its callback **synchronously** with the current value, so this
+    // one subscription also *is* the flush-on-mount: a pending call left over by a finished
+    // call is retried here, where a screen exists to report the outcome. (An extra
+    // `flushPendingCallsNow()` after subscribing was removed as dead code — a negative
+    // control showed it changed nothing.)
+    const unsub = callLogStore.subscribe((v) => {
+      callLog = normalizeCallLog(v);
+      flushPendingCallsNow();
+    });
     return unsub;
   });
   const frequent = $derived(
     frequentNumbers(callLog, 3).map((n) => ({ num: n, label: contactNameFor(contacts, n) ?? n })),
+  );
+
+  // Known name for the number currently being dialed: the address book first, then
+  // the best name the call log remembers for it (`lib/calllog.logNameFor`, which
+  // uses the SAME digit-normalised equality as the recents list) — so a number you
+  // have called before shows who it was *before* you dial again.
+  const dialName = $derived(
+    num ? (contactNameFor(contacts, num) ?? logNameFor(callLog, num) ?? "") : "",
   );
 
   // ---- Call history page ------------------------------------------------------
@@ -262,7 +397,12 @@
   // Clear the whole history (two-step: the first tap arms, the second commits so a
   // stray tap cannot wipe the log). Resets the filter, since an empty log has none.
   const clearLog = () => {
-    callLogStore.save(clearCallHistory());
+    // Wiping the history is destructive: only claim it when the write landed.
+    if (!callLogStore.save(clearCallHistory())) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     confirmClear = false;
     logFilter = "all";
   };
@@ -271,7 +411,8 @@
 
   const recordOutgoing = (number: string, name?: string, body?: string) => {
     const next = recordCall(callLog, number, name, Date.now(), "outgoing");
-    callLogStore.save(next);
+    // The entry may not reach the log — say so rather than losing it silently.
+    storeErr = callLogStore.save(next) ? "" : t("common.storeWriteFailed");
     const label = name && name.trim() !== "" ? name.trim() : number;
     const entry: Notif = {
       id: `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
@@ -323,6 +464,8 @@
   const emergencyDial = (n: string) => void startCall(n, true);
 
   const endCall = async () => {
+    // Remember the id BEFORE ending: a resume/recheck may still see it live.
+    if (activeId) endedIds.add(activeId);
     if (activeId) await telephonyEnd(activeId);
     calling = false;
     talking = false;
@@ -359,6 +502,7 @@
         talking = true;
         activeAtRef = Date.now();
       } else if (call.state === "Ended") {
+        endedIds.add(call.id);
         calling = false;
         talking = false;
         activeId = null;
@@ -391,6 +535,7 @@
 </script>
 
 <div class="flex h-full w-full flex-col items-center p-3">
+  <StoreErrorBar message={storeErr} />
   {#if !calling}
     <div role="tablist" aria-label={t("phone.tabs")} class="mb-1 flex w-full max-w-xs gap-1 rounded-full bg-neutral-200/80 p-1 dark:bg-white/10">
       {#each [
@@ -474,6 +619,9 @@
       <div class="flex w-full max-w-xs items-center justify-center px-3 pb-1 pt-2">
         <span class="block max-w-full truncate font-medium tabular-nums leading-none {num.length > 9 ? 'text-[26px] tracking-[0.02em]' : num.length > 5 ? 'text-[32px] tracking-[0.04em]' : 'text-[40px] tracking-[0.05em]'}">{num}</span>
       </div>
+      {#if dialName}
+        <div data-testid="dial-known-name" class="max-w-full truncate px-3 text-xs opacity-60">{dialName}</div>
+      {/if}
       <div class="grid w-full max-w-xs grid-cols-3 justify-items-center gap-x-1 gap-y-3">
         {#each KEYS as k (k)}
           <button onclick={() => tap(k)} aria-label={k}
@@ -645,12 +793,31 @@
           <button onclick={() => void addBlockRule()} disabled={blockBusy} aria-label="block-add" class="shrink-0 rounded-full bg-accent px-4 py-2 text-xs text-white active:scale-95 disabled:opacity-50">{t("phone.blockAdd")}</button>
         </div>
       </div>
+      {#if blockPreview}
+        <p
+          data-testid="block-preview"
+          class="mb-1 w-full max-w-sm rounded-lg bg-amber-500/15 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {blockPreview.kind === "rule"
+            ? t("phone.blockPreviewRule", { pattern: blockPreview.pattern })
+            : t("phone.blockPreviewUnknown")}
+        </p>
+      {/if}
       {#if blockErr}
         <p class="mb-1 text-xs text-red-500" role="alert">{blockErr}</p>
       {/if}
       <button onclick={() => void toggleBlockUnknown()} aria-pressed={blockUnknown} aria-label="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/15 text-accent" : "bg-black/5 dark:bg-white/10")}>
         {t("phone.blockUnknown")} · {blockUnknown ? t("phone.on") : t("phone.off")}
       </button>
+      {#if blockRules.length > 0}
+        <button
+          onclick={() => void clearAllRules()}
+          aria-label="block-clear"
+          class="mb-2 w-full max-w-sm rounded-2xl bg-black/5 px-4 py-2 text-sm text-danger dark:bg-white/10"
+        >
+          {confirmClearRules ? t("phone.blockClearConfirm") : t("phone.blockClear")}
+        </button>
+      {/if}
       {#if blockRules.length === 0}
         <p class="py-6 text-center text-sm opacity-60">{t("phone.blockEmpty")}</p>
       {:else}

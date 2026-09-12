@@ -1,9 +1,9 @@
 # React → Svelte 全量移除计划（“不应该有 React”）
 
-> 审计日期：2026-09-07
-> 结论先行：**应用屏已 100% Svelte**；仍含 React 的是**宿主 `App.tsx` + 系统 chrome + React providers**，由生产 `index.html → src/main.tsx → App.tsx` 挂载（`SvelteAppHost` 负责把每个 Svelte 屏挂进 React）。已存在纯 Svelte `Shell.svelte`（Phase-3，经 `src/shell-entry.ts` 走 `shell.html` 预览）但**尚未成为生产宿主**。彻底移除 React = 先把 `Shell.svelte` 补全到能替代 React 宿主，再切入口、删 React 与相关测试。本文给出分步清单与“每一步可验证”的门槛。
+> 审计日期：2026-09-07 ｜ **状态更新：2026-09-11 — 已完成（本文保留作追溯）**
+> 结论：应用屏 100% Svelte；**React 宿主已彻底移除**——生产入口 `index.html → src/shell-entry.ts → mount(Shell.svelte)`，`App.tsx`/`main.tsx`/React chrome/providers 与 `react`/`react-dom` 依赖均已删除；`tsconfig` 已去掉 `jsx`，仓库内最后两个 `.tsx` 测试也改名为 `.ts`（**`.tsx` 归零**）。P1 的系统层亦全部落在 Svelte：硬件按钮→home/AI、`telephony-event`→`IncomingCall`、clipboard ingest/announce、display（`screen_state_set`/auto screen-off/**wakeHome resume→home**）、**edge-swipe（顶部下拉 NC / 底部上滑 Recents / 主屏下拉 Spotlight）**、**开机 `hydrateFromSystemStore`**、OS 到点 watcher（alarm/reminder/timer）。下文为历史计划文本。
 
-## 1. 现状盘点（审计结果）
+## 1. 现状盘点（审计结果；2026-09-07 时点）
 - **生产宿主**：`index.html` → `src/main.tsx`（ReactDOM）→ `src/App.tsx`（React `Shell()` 状态机：home/dock/lock/edit/library/app + overlays NC/Recents/Spotlight + chrome islands）。
 - **应用屏**：全部为 Svelte，React 侧只剩 loader 壳 `src/apps.tsx`（`SvelteAppHost` 挂载 Svelte）+ `src/components/SvelteAppHost.tsx`/`SveltePropsHost.tsx`。
 - **仍为 React 的文件（非测试）** 约 20 个：`App.tsx / apps.tsx / main.tsx / i18n/index.tsx / theme/index.tsx / ui.tsx` + chrome 组件（`StatusBar / NotificationBanner / NotificationCenter / HomeDock / HomeWidgets / IncomingCall / SystemPanels / EditHome / Wallpaper / ExtApp / SplitDemoButton / SplitFrame / CapabilityGate / AppIcon`）。

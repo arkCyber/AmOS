@@ -7,8 +7,9 @@
   // live mic capture + daemon streaming need a real device + amos-interp daemon.
   import { bridged, subscribe, interpretStart, interpretStop, interpretPause, interpretResume, interpretAudio, interpretText } from "../lib/backend";
   import { frameToInterpChunk } from "../lib/audio";
-  import { speakText } from "../lib/realtimeTts";
+  import { speakText, resetPlayCtx } from "../lib/realtimeTts";
   import { capTail } from "../lib/bounded";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import {
     LANGS,
     langNative,
@@ -24,12 +25,20 @@
     type InterpPrefs,
     type InterpSeg,
   } from "../lib/interp";
-  import { loadLedger, saveLedger, grantCap, capSet, type Capability } from "../lib/permissions";
+  import { loadLedger, capSet, type Capability } from "../lib/permissions";
+  import { grantCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
+  import { onDestroy } from "svelte";
 
   const APP_ID = "interpreter";
   const MIC_CAP: Capability = "microphone";
   const SEG_CAP = 200; // interpreter transcript segments kept in memory
+
+  // Read-aloud plays through one shared AudioContext (lib/realtimeTts). Leaving
+  // the screen must release it: a stopped-but-open context keeps the audio session
+  // held, so the next spoken segment would inherit a session from a screen the
+  // user had left. `playPcm` recreates it lazily on the next final segment.
+  onDestroy(() => resetPlayCtx());
 
   // Bridge presence is fixed per mount (matches the React `bridged()` read).
   const online = $state(bridged());
@@ -42,6 +51,8 @@
   let rec = $state(false);
   let askMic = $state(false);
   let segs = $state<InterpSeg[]>(loadSegs());
+  // The store refused a write (full/unavailable): the history must not claim it was saved.
+  let storeErr = $state("");
   let partial = $state("");
   let text = $state("");
   let status = $state("");
@@ -49,7 +60,9 @@
   let bilingual = $state(false);
 
   // Live-capture plumbing (kept in plain refs so callbacks stay stable).
-  let sid: string | null = null;
+  /** The live session id — a **number** (the daemon answers `u64`); see
+   *  `lib/backend.ts` / scripts/tauri-reply-scan.mjs. */
+  let sid: number | null = null;
   let ctxRef: AudioContext | null = null;
   let srcRef: MediaStreamAudioSourceNode | null = null;
   let procRef: ScriptProcessorNode | null = null;
@@ -70,7 +83,7 @@
   };
 
   const allowMic = () => {
-    saveLedger(grantCap(loadLedger(), APP_ID, MIC_CAP));
+    grantCapability(APP_ID, MIC_CAP);
     micGranted = true;
   };
 
@@ -204,7 +217,11 @@
             const seg = segOf(payload);
             if (seg) {
               segs = capTail([...segs, seg], SEG_CAP);
-              saveSegs(segs);
+              // The transcript is an auto-captured log: the *session* view may keep
+              // showing what was interpreted, but the history must not pretend it was
+              // stored when the write was rejected.
+              if (!saveSegs(segs)) storeErr = t("common.storeWriteFailed");
+              else storeErr = "";
               if (prefs.autospeak && seg.target) {
                 void speakText(seg.target, seg.targetLang || "zh");
               }
@@ -260,8 +277,13 @@
   };
 
   const clearHistory = () => {
+    // A rejected clear keeps the list: the stored transcript would come back on reload.
+    if (!clearSegs()) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     segs = [];
-    clearSegs();
   };
 
   async function copyAll(): Promise<void> {
@@ -295,6 +317,7 @@
 </script>
 
 <div class="flex h-full flex-col p-3">
+  <StoreErrorBar message={storeErr} />
   {#if !online}
     <p class="mb-2 text-sm opacity-70">{t("backend.inBrowser")}</p>
   {/if}
@@ -394,7 +417,7 @@
       {#each segs as seg, i (i)}
         <div class="rounded-xl bg-neutral-200/60 p-2 dark:bg-neutral-800/60">
           <div class="flex items-center gap-1 text-[10px] opacity-50">
-            <span>{seg.srcLang ? langLabel(seg.srcLang) : "源"}</span>
+            <span>{seg.srcLang ? langLabel(seg.srcLang) : t("interp.srcUnknown")}</span>
             <span class="truncate">{seg.src}</span>
           </div>
           <div class="text-sm font-medium text-accent">{seg.target}</div>

@@ -7,7 +7,6 @@ import {
   nextZoom,
   zoomCrop,
   fitCrop,
-  needsCrop,
   resOf,
   nextRes,
   cycleAfter,
@@ -76,12 +75,10 @@ describe("camera fit/aspect crop", () => {
   test("square output from a 16:9 source is a centred square, never stretched", () => {
     const out = fitCrop(1280, 720, { w: 640, h: 640 });
     expect(out).toEqual({ x: 280, y: 0, w: 720, h: 720 });
-    expect(needsCrop(1280, 720, { w: 640, h: 640 })).toBe(true);
   });
 
   test("matching aspect needs no crop", () => {
     expect(fitCrop(640, 480, { w: 640, h: 480 })).toEqual({ x: 0, y: 0, w: 640, h: 480 });
-    expect(needsCrop(640, 480, { w: 640, h: 480 })).toBe(false);
   });
 
   test("fitCrop returns null without video dimensions", () => {

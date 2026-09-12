@@ -118,6 +118,8 @@ impl EnergyStore {
         let store = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            // Runs until the daemon shuts down: this task has no exit and is aborted
+            // with the runtime (or the process stopping). `tick()` is the wait.
             loop {
                 ticker.tick().await;
                 let s = store.tick_once();

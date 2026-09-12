@@ -18,20 +18,24 @@
     stepIndex,
   } from "../lib/music";
   import type { RepeatMode, Track } from "../lib/music";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
   const DURATION = 24; // demo seconds per track
 
+  // Demo seed — **only when the key is absent**: an emptied playlist stays empty.
   const seeded = ((): Track[] => {
-    const l = normalizeTracks(readStoreValue<unknown>(MUSIC_KEY, []));
-    if (l.length) return l;
+    const raw = readStoreValue<unknown>(MUSIC_KEY, undefined);
+    if (raw !== undefined) return normalizeTracks(raw);
     const s = seedTracks();
     writeStoreValue(MUSIC_KEY, s);
     return s;
   })();
   let tracks = $state<Track[]>(seeded);
+  // The store refused a write (full/unavailable): say so and keep showing the truth.
+  let storeErr = $state("");
   let idx = $state(0);
   let playing = $state(false);
   let sec = $state(0);
@@ -73,7 +77,13 @@
     const removedIndex = tracks.findIndex((tr) => tr.id === id);
     if (removedIndex < 0) return;
     const list = removeTrack(tracks, id);
-    writeStoreValue(MUSIC_KEY, list);
+    // A rejected write keeps the track: it is still in the store, so removing it from
+    // the view would show a playlist that comes back on reload.
+    if (!writeStoreValueChecked(MUSIC_KEY, list)) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     tracks = list;
     idx = nextIndexAfterRemoval(idx, removedIndex, list.length);
     sec = 0;
@@ -115,6 +125,7 @@
   </div>
 {:else}
   <div class="p-4">
+    <StoreErrorBar message={storeErr} />
     <p class="text-center text-xs uppercase tracking-widest opacity-50">{playing ? t("music.playing") : "—"}</p>
     <div class="my-2 grid place-items-center rounded-3xl bg-gradient-to-br from-orange-400 to-pink-500 py-10 text-white/90">{@html iconSvg("headphones", "h-16 w-16")}</div>
 

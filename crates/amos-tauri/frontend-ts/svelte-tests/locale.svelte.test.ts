@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { setLocale, locale, t, setLocaleSafe } from "../src/svelte/locale.svelte";
 import { LOCALE_KEY } from "../src/svelte/i18n";
+import { SVELTE_LOCALE_EVENT } from "../src/svelte/locale-events";
 
 afterEach(() => {
   setLocale("zh");
@@ -38,6 +39,20 @@ describe("locale.svelte — reactive i18n persistence", () => {
     setLocaleSafe("xx");
     expect(locale()).toBe("zh");
     setLocaleSafe("en");
+    expect(locale()).toBe("en");
+  });
+
+  test("the host locale event applies a valid value and ignores garbage (setLocaleSafe)", () => {
+    // The window listener is how a host switches the locale of already-mounted
+    // screens; it must go through the SAME guarded setter (so a raw string is
+    // validated once, not re-implemented at the listener).
+    window.dispatchEvent(new CustomEvent(SVELTE_LOCALE_EVENT, { detail: "en" }));
+    expect(locale()).toBe("en");
+
+    window.dispatchEvent(new CustomEvent(SVELTE_LOCALE_EVENT, { detail: "fr" }));
+    expect(locale()).toBe("en"); // unknown → ignored, never a broken locale
+
+    window.dispatchEvent(new CustomEvent(SVELTE_LOCALE_EVENT, { detail: null }));
     expect(locale()).toBe("en");
   });
 });

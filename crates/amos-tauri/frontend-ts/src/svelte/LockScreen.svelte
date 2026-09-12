@@ -2,7 +2,7 @@
   // LockScreen.svelte — Svelte 5 (runes) port of the React `SystemPanels.LockScreen`
   // (the whole-screen surface the shell shows while locked). Reads amos.lock /
   // amos.settings, shows clock/date, PIN pad (or tap-to-unlock when no PIN), and
-  // the always-reachable emergency quick-dial. Emits 'unlock' to the React shell.
+  // the always-reachable emergency quick-dial. Emits 'unlock' to the shell.
   import { t, locale } from "./locale.svelte";
   import { fmtClock } from "../lib/time";
   import { telephonyDial } from "../lib/backend";

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import {
   CALLLOG_CAP,
   CALLLOG_KEY,
@@ -7,13 +7,17 @@ import {
   callHistory,
   callWhenLabel,
   clearCallHistory,
+  resetPendingCallsForTest,
   filterHistory,
+  flushPendingCalls,
   fmtCallClock,
   frequentNumbers,
   logNameFor,
   missedCalls,
   normalizeCallLog,
   normalizeDirection,
+  pendingCallCount,
+  queuePendingCall,
   recentNumbers,
   recordCall,
   sameCallNumber,
@@ -233,6 +237,85 @@ describe("call history: direction + time labels", () => {
     expect(callHistory(cleared)).toEqual([]);
     expect(missedCalls(cleared)).toBe(0);
     expect(filterHistory(cleared, "missed")).toEqual([]);
+  });
+});
+
+/**
+ * REQ-A150 — a rejected call-log write must not lose the row.
+ *
+ * The incoming-call overlay appends its row as the call ends, i.e. when no screen is up to
+ * report a failure; before this, a rejected write cost that history row silently. The
+ * queue below is what makes it recoverable, and its boundary (in-memory, so a reload
+ * before a successful flush still loses it) is stated in `lib/calllog`.
+ */
+describe("pending calls (a rejected write is queued, not lost)", () => {
+  beforeEach(() => resetPendingCallsForTest());
+
+  test("a rejected append is queued with its direction and timestamp intact", () => {
+    queuePendingCall(recordCall([], "13800000000", undefined, 1000, "incoming")[0]);
+
+    expect(pendingCallCount()).toBe(1);
+    // Assert through the real path (a flush), not through an inspection-only export.
+    let saved: CallRecord[] = [];
+    flushPendingCalls([], (next) => {
+      saved = next;
+      return true;
+    });
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.number).toBe("13800000000");
+    expect(saved[0]?.direction).toBe("incoming");
+    expect(saved[0]?.ts).toBe(1000);
+  });
+
+  test("a repeated Ended event does not queue the same row twice", () => {
+    const rec = recordCall([], "13800000000", undefined, 1000, "missed")[0];
+    queuePendingCall(rec);
+    queuePendingCall(rec);
+
+    let flushes = 0;
+    flushPendingCalls([], () => {
+      flushes += 1;
+      return true;
+    });
+    expect(flushes).toBe(1);
+    expect(pendingCallCount()).toBe(0);
+  });
+
+  test("a record with no usable number is never queued", () => {
+    queuePendingCall({ number: "   ", ts: 1 });
+    queuePendingCall(undefined);
+    expect(pendingCallCount()).toBe(0);
+  });
+
+  test("a successful flush lands the queued call newest-first and empties the queue", () => {
+    const existing = recordCall([], "100", undefined, 500, "outgoing");
+    queuePendingCall(recordCall([], "200", undefined, 1000, "incoming")[0]);
+
+    let saved: CallRecord[] = [];
+    const landed = flushPendingCalls(existing, (next) => {
+      saved = next;
+      return true;
+    });
+
+    expect(landed).toBe(1);
+    expect(saved.map((r) => r.number)).toEqual(["200", "100"]);
+    expect(pendingCallCount()).toBe(0);
+  });
+
+  test("a still-failing flush keeps everything queued and claims nothing", () => {
+    queuePendingCall(recordCall([], "200", undefined, 1000, "incoming")[0]);
+
+    const landed = flushPendingCalls([], () => false);
+
+    expect(landed).toBe(0);
+    expect(pendingCallCount()).toBe(1);
+  });
+
+  test("the queue is bounded exactly like the log", () => {
+    for (let i = 0; i < CALLLOG_CAP + 5; i++) {
+      queuePendingCall({ number: `1380000${String(i).padStart(4, "0")}`, ts: 1000 + i });
+    }
+    expect(pendingCallCount()).toBe(CALLLOG_CAP);
   });
 });
 

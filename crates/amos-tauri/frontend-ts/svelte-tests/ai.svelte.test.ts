@@ -161,3 +161,161 @@ describe("AiApp.svelte (bridged: single assistant-voice sink)", () => {
     expect(txt(host)).toContain("原生语音答复-唯一");
   });
 });
+
+/**
+ * Bridged: "📚 问我的笔记" grounds a chat turn in retrieved note passages
+ * (retrieve → `buildRagPrompt` → chat). Retrieval is a separate daemon service,
+ * so an offline index is reported honestly and the question is still asked.
+ */
+describe("AiApp.svelte (bridged: ask-my-notes grounding)", () => {
+  afterEach(() => {
+    cleanup();
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = undefined;
+  });
+
+  const waitUntil = async (cond: () => boolean, timeoutMs = 3000) => {
+    const t0 = Date.now();
+    while (!cond()) {
+      if (Date.now() - t0 > timeoutMs) throw new Error("timeout");
+      await new Promise<void>((r) => setTimeout(r, 5));
+    }
+  };
+
+  function installBridge(opts: { query: unknown }) {
+    const calls: string[] = [];
+    const chatArgs: { prompt?: string }[] = [];
+    const fake = {
+      invoke: async (cmd: string, args?: { prompt?: string }) => {
+        calls.push(cmd);
+        if (cmd === "get_status") {
+          return { model: "amos", engine: "api", engine_model: "m", degraded: false, active_sessions: 0 };
+        }
+        if (cmd === "rag_index") return { indexed: true, dimension: 3 };
+        if (cmd === "rag_query") return opts.query;
+        if (cmd === "chat_agent") {
+          chatArgs.push(args ?? {});
+          return null; // chat itself may not stream in this stub
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = fake;
+    return { calls, chatArgs };
+  }
+
+  test("grounds the prompt in retrieved passages and reports the citation", async () => {
+    const { calls, chatArgs } = installBridge({
+      query: { hits: [{ id: "note:n1", score: 0.9, passage: "预算表：本月结余 1200 元" }], count: 1 },
+    });
+    const host = render(AiApp);
+    await settle();
+
+    const toggle = btnByAria(host, "ai-cite-toggle");
+    expect(toggle).toBeTruthy();
+    await fireEvent.click(toggle as HTMLButtonElement);
+    expect((toggle as HTMLButtonElement).getAttribute("aria-pressed")).toBe("true");
+
+    const input = textareaByPlaceholder(host, "输入指令");
+    await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "我这个月还剩多少钱？" } });
+    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+
+    await waitUntil(() => host.container.querySelector('[data-testid="ai-cite-status"]') !== null);
+    // The retrieval service was actually used…
+    expect(calls).toContain("rag_query");
+    // …and the chat prompt was augmented with the cited passage + the question.
+    expect(chatArgs.length).toBeGreaterThan(0);
+    expect(chatArgs[0].prompt).toContain("预算表：本月结余 1200 元");
+    expect(chatArgs[0].prompt).toContain("我这个月还剩多少钱？");
+    // The user bubble still shows the ORIGINAL question, not the augmented prompt.
+    expect(txt(host)).toContain("我这个月还剩多少钱？");
+    expect(txt(host)).not.toContain("我的笔记片段");
+  });
+
+  test("an offline retrieval is reported honestly and the turn still answers", async () => {
+    const { calls, chatArgs } = installBridge({ query: null });
+    const host = render(AiApp);
+    await settle();
+
+    await fireEvent.click(btnByAria(host, "ai-cite-toggle") as HTMLButtonElement);
+    const input = textareaByPlaceholder(host, "输入指令");
+    await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "随便问问" } });
+    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+
+    await waitUntil(() => host.container.querySelector('[data-testid="ai-cite-status"]') !== null);
+    expect(txt(host)).toContain("笔记检索离线");
+    // The question was still sent to the model (without note context).
+    expect(calls).toContain("chat_agent");
+    expect(chatArgs[0]?.prompt).toBe("随便问问");
+  });
+});
+
+describe("AiApp.svelte — attached system context (wm SystemContext)", () => {
+  afterEach(cleanup);
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  /** Fake bridge answering `system_peek_context` from `entry` (mutable). */
+  function installBridge(entry: unknown) {
+    let current = entry;
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
+        calls.push({ cmd, args });
+        if (cmd === "system_peek_context") return current;
+        if (cmd === "system_clear_context") {
+          current = null;
+          return null;
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+
+  const banner = (h: { container: HTMLElement }) =>
+    h.container.querySelector('[data-testid="ai-context"]');
+
+  test("shows what another screen attached (with its source and a preview)", async () => {
+    installBridge({
+      source_window: "notes",
+      text: "预算审查\n明细 1200",
+      timestamp_ms: 1,
+    });
+    const host = render(AiApp);
+    await settle();
+    const el = banner(host);
+    expect(el).toBeTruthy();
+    expect(el?.textContent ?? "").toContain("已附加系统上下文（来自 notes）");
+    // Whitespace is collapsed so a multi-line note stays one readable line.
+    expect(el?.textContent ?? "").toContain("预算审查 明细 1200");
+  });
+
+  test("✕ drops the attached context at the daemon and the hint goes away", async () => {
+    const calls = installBridge({ source_window: "notes", text: "预算审查", timestamp_ms: 1 });
+    const host = render(AiApp);
+    await settle();
+    expect(banner(host)).toBeTruthy();
+
+    await fireEvent.click(btnByAria(host, "ai-context-clear") as HTMLButtonElement);
+    await settle();
+
+    expect(calls).toContainEqual({
+      cmd: "system_clear_context",
+      args: { targetWindow: "ai" },
+    });
+    expect(banner(host)).toBeNull();
+  });
+
+  test("says nothing when no context is attached (never claims there is none)", async () => {
+    // `system_peek_context` returns null both for "nothing attached" and for
+    // "could not ask", so the screen must stay silent — no reassuring message.
+    installBridge(null);
+    const host = render(AiApp);
+    await settle();
+    expect(banner(host)).toBeNull();
+    expect(txt(host)).not.toContain("已附加系统上下文");
+  });
+});

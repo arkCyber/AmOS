@@ -570,7 +570,8 @@ pub mod ffi {
     }
 
     /// `repr(C)` commit result mirroring a `PackageInstaller.STATUS_*` code plus
-    /// a UTF-8 message. `code` matches the public constants in the parent module.
+    /// a UTF-8 message. `status` matches the public `STATUS_*` constants in the
+    /// parent module.
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct CCommitResult {

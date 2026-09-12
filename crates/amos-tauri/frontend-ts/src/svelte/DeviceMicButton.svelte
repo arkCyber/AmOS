@@ -26,9 +26,12 @@
     deviceMicStatus,
     deviceMicStop,
     micPermissionRequest,
+    micPermissionState,
   } from "../lib/backend";
+  import type { MicPermissionState } from "../lib/backend";
   import { isNativeMicBackend } from "../lib/deviceMic";
-  import { loadLedger, saveLedger, grantCap, revokeCap, capSet, type Capability } from "../lib/permissions";
+  import { loadLedger, capSet, type Capability } from "../lib/permissions";
+  import { grantCapability, revokeCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
 
   const MIC: Capability = "microphone";
@@ -49,6 +52,21 @@
   let note = $state("");
   let micGranted = $state(capSet(loadLedger(), "ai", MIC));
   let ask = $state(false);
+  /**
+   * The OS's own `RECORD_AUDIO` state, read ONCE when bridged. The button's gate
+   * above reads the LOCAL ledger; if the grant was revoked outside AmOS the two
+   * disagree, and the user should learn that from the title BEFORE pressing
+   * (otherwise a press looks like a no-op). This is the **dialog-free** read — it
+   * never prompts; only a user-initiated `start()` calls `micPermissionRequest`.
+   */
+  let osMic = $state<MicPermissionState | null>(null);
+  $effect(() => {
+    if (!online) return;
+    void micPermissionState().then((s) => {
+      osMic = s;
+    });
+  });
+  const osDenied = $derived(!!osMic && osMic.native && !osMic.granted);
   /** Utterances submitted (`AudioEnd`) by the running worker — live proof that the
    * AAudio capture → resident-worker → daemon path is actually delivering. */
   let submitted = $state(0);
@@ -135,13 +153,13 @@
   const toggle = () => (running ? void stop() : void start());
 
   const allowMic = () => {
-    saveLedger(grantCap(loadLedger(), "ai", MIC));
+    grantCapability("ai", MIC);
     micGranted = true;
     ask = false;
     void start();
   };
   const denyMic = () => {
-    saveLedger(revokeCap(loadLedger(), "ai", MIC));
+    revokeCapability("ai", MIC);
     micGranted = false;
     ask = false;
   };
@@ -152,7 +170,7 @@
       ? t("ai.deviceMicOffline")
       : running
         ? `${t("ai.deviceMicListening")} · ${t("ai.deviceMicSubmitted", { n: submitted })}`
-        : note || t("ai.deviceMicTitle"),
+        : note || (osDenied ? t("ai.deviceMicDenied") : t("ai.deviceMicTitle")),
   );
 </script>
 

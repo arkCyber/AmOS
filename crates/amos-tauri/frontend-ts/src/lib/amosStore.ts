@@ -1,7 +1,9 @@
 /** Typed access to the *same* `amos.*` shared-store keys the legacy vanilla UI
- * uses (amos.home.layout / amos.recents / …), so both UIs interoperate and, in
- * the Tauri shell, sync across windows via window.Amos (if present). */
-import { bridged, systemStoreSnapshot } from "./backend";
+ * uses (amos.home.layout / amos.recents / …), so both UIs interoperate and, in the
+ * Tauri shell, the value is mirrored to the Rust `SharedStore` — the durable copy
+ * and cross-window bus (`store_set` / `store_snapshot`). */
+import { bridged, systemStoreSet, systemStoreSnapshot } from "./backend";
+import { amosError } from "./debugLog";
 export interface HomeLayout {
   page: string[];
   dock: string[];
@@ -15,19 +17,9 @@ export const RECENTS_KEY = "amos.recents";
 // AI assistant, and 语音翻译/同传 Interpreter.
 export const DEFAULT_DOCK = ["phone", "ai", "interpreter"];
 
-declare global {
-  interface Window {
-    Amos?: {
-      safeGet?(k: string, d: string): string;
-      storeWrite?(k: string, v: string): void;
-      applyTheme?(): void;
-    };
-  }
-}
-
-/** Quarantine key that keeps the raw bytes of a corrupt value so a later
- * "seed + write" cannot silently destroy them. Bounded: one slot per key. */
-const CORRUPT_SUFFIX = ".corrupt";
+/** Quarantine key suffix that keeps the raw bytes of a corrupt value so a later
+ *  "seed + write" cannot silently destroy them. Bounded: one slot per key. */
+export const CORRUPT_SUFFIX = ".corrupt";
 
 /**
  * Window event fired after a store value is written, so same-window components
@@ -63,24 +55,90 @@ function readJson<T>(key: string, fallback: T): T {
 function quarantineCorrupt(key: string, raw: string): void {
   const backupKey = `${key}${CORRUPT_SUFFIX}`;
   try {
+    // One bounded slot per key: if a copy is already there it is about to be replaced,
+    // and *that* is a further loss of the user's bytes — say so instead of doing it
+    // silently.
+    const previous = window.localStorage.getItem(backupKey);
     window.localStorage.setItem(backupKey, raw);
-    console.warn(
-      `[amos-store] corrupt value for "${key}"; original preserved at "${backupKey}"`,
+    // Data loss is an **error**, not a warning: the user's stored value is gone and
+    // the shell must be able to show that (audit P1-3).
+    amosError(
+      "store",
+      previous === null
+        ? `corrupt value for "${key}"; original preserved at "${backupKey}"`
+        : `corrupt value for "${key}"; replaced an earlier quarantine at "${backupKey}" ` +
+            `(${previous.length} byte(s) dropped)`,
     );
   } catch {
-    console.warn(`[amos-store] corrupt value for "${key}" (and it could not be backed up)`);
+    amosError("store", `corrupt value for "${key}" (and it could not be backed up)`);
   }
 }
 
-function writeJson(key: string, value: unknown): void {
+/**
+ * The quarantined (corrupt) values the shell has preserved, newest-first by key:
+ * `{ key, bytes }` where `key` is the **original** store key. The read side of the
+ * P1-1 quarantine — without it the preserved bytes were a dead end nobody could reach.
+ */
+export function listQuarantined(): Array<{ key: string; bytes: number }> {
+  const out: Array<{ key: string; bytes: number }> = [];
   try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-    window.Amos?.storeWrite?.(key, JSON.stringify(value));
-    // Notify same-window consumers that this store key changed.
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (!k || !k.endsWith(CORRUPT_SUFFIX)) continue;
+      const raw = window.localStorage.getItem(k) ?? "";
+      out.push({ key: k.slice(0, -CORRUPT_SUFFIX.length), bytes: raw.length });
+    }
+  } catch {
+    return []; // storage unavailable — report nothing rather than invent entries
+  }
+  return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+/** The raw preserved bytes for an original store key, or `null` when none. */
+export function readQuarantine(key: string): string | null {
+  try {
+    return window.localStorage.getItem(`${key}${CORRUPT_SUFFIX}`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist `value` under `key`. Returns `true` only when the value actually landed
+ * in `localStorage` — the same JSON string the Rust `store_set` mirror receives.
+ *
+ * Failures are deliberately **not** silent: a full or unavailable localStorage
+ * means the value the user acted on is not stored (data loss, audit P1-3 — the same
+ * rule the corrupt-value quarantine follows), so it is logged as a `store` **error**
+ * and reported to the caller instead of being swallowed.
+ */
+function writeJson(key: string, value: unknown): boolean {
+  let json: string;
+  try {
+    json = JSON.stringify(value);
+  } catch {
+    return false; // unencodable value (e.g. circular) — nothing was written
+  }
+  // Write through to the Rust `SharedStore` (durable copy + cross-window bus).
+  // Fire-and-forget: localStorage is this window's immediate source of truth, and a
+  // bridge failure must never break a settings write.
+  void systemStoreSet(key, json);
+  try {
+    window.localStorage.setItem(key, json);
+  } catch {
+    amosError("store", `write failed for "${key}" (storage unavailable or full)`);
+    return false;
+  }
+  // Notify same-window consumers that this store key changed. Only after the write
+  // landed: a failed write changed nothing, so nothing may be announced. Best-effort
+  // — announcing a change must never break the write itself, and some hosts expose a
+  // `window` without an event bus.
+  try {
     window.dispatchEvent(new CustomEvent(STORE_CHANGED_EVENT, { detail: { key } }));
   } catch {
-    /* ignore */
+    /* no event bus in this host */
   }
+  return true;
 }
 
 /** Default layout: dock apps first-class, everything else on a page. */
@@ -111,9 +169,9 @@ export function saveLayout(layout: HomeLayout): void {
 }
 
 /**
- * On boot, pull the durable Rust system store into localStorage. The Rust side
- * is authoritative after every write-through (see amos-tauri/src/store.rs), so
- * this recovers settings/notifications/layout from disk even if localStorage
+ * On boot, pull the durable Rust system store into localStorage. Every write goes
+ * through `systemStoreSet` (`store_set`), so the Rust side holds the same values
+ * and this recovers settings/notifications/layout from disk even if localStorage
  * was cleared. Best-effort: no-ops outside the Tauri shell.
  */
 export async function hydrateFromSystemStore(): Promise<void> {
@@ -200,13 +258,25 @@ export function getRecents(): string[] {
   return readJson<string[]>(RECENTS_KEY, []);
 }
 
-/** Generic typed read/write against the shared amos.* store (localStorage +
- * window.Amos bridge). Reused by ported apps for their own `amos.<app>` keys. */
+/** Generic typed read/write against the shared amos.* store. Writes go through
+ * `writeJson` (localStorage + `store_set` write-through to the Rust `SharedStore`).
+ * Reused by ported apps for their own `amos.<app>` keys. */
 export function readStoreValue<T>(key: string, fallback: T): T {
   return readJson<T>(key, fallback);
 }
 export function writeStoreValue(key: string, value: unknown): void {
   writeJson(key, value);
+}
+
+/**
+ * Like `writeStoreValue`, but **reports whether the value actually landed** in the
+ * local store. Callers that must not over-claim use this: the Settings backup shows a
+ * summary and a "last synced" time, so a rejected write (full/unavailable storage)
+ * has to be visible rather than leaving the page describing a backup that was never
+ * stored.
+ */
+export function writeStoreValueChecked(key: string, value: unknown): boolean {
+  return writeJson(key, value);
 }
 
 export function pushRecent(id: string): void {

@@ -28,7 +28,45 @@ const inputByAria = (h: { container: HTMLElement }, aria: string) =>
   [...h.container.querySelectorAll("input")].find((i) => i.getAttribute("aria-label") === aria) as
     HTMLInputElement | undefined;
 
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 describe("ClockApp.svelte", () => {
+  test("a rejected alarm write is reported (the alarms are the user's content)", async () => {
+    const restore = failWritesFor("amos.alarms");
+    try {
+      const host = render(ClockApp);
+      await tick();
+      // The alarms tab state is on screen; the store rejected it, so say so rather than
+      // letting the user believe the alarms survive a reload.
+      expect(txt(host)).toContain("本机存储写入失败");
+    } finally {
+      restore();
+    }
+  });
+
   test("world-clock rows carry an iOS-style offset / day subtitle", async () => {
     const host = render(ClockApp);
     const rows = host.container.querySelectorAll('[data-city]');
@@ -59,6 +97,17 @@ describe("ClockApp.svelte", () => {
     expect((add as HTMLButtonElement).disabled).toBe(false);
     await fireEvent.click(add);
     expect(host.container.querySelector('[data-city="Europe/Rome"]')).toBeTruthy();
+  });
+
+  test("a query matching no city offers nothing and disables + (domain search)", async () => {
+    const host = render(ClockApp);
+    await fireEvent.input(inputByAria(host, "搜索城市")!, {
+      target: { value: "zzzz-not-a-city" },
+    });
+    const sel = host.container.querySelector('select[aria-label="城市"]') as HTMLSelectElement;
+    expect([...sel.querySelectorAll("option")]).toHaveLength(0);
+    const add = host.container.querySelector('button[data-role="add-city"]') as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
   });
 
   test("adds a larger-catalog city (Hong Kong) with its bilingual name", async () => {
@@ -342,6 +391,39 @@ describe("ClockApp.svelte", () => {
     }[];
     expect(stored).toHaveLength(1);
     expect(stored[0]!.repeat).toEqual([1, 2, 3, 4, 5]); // Mon..Fri
+  });
+
+  test("a ring with no audio at all says so instead of implying a sound", async () => {
+    // No Audio / AudioContext in this environment → the ringtone layer cannot
+    // start anything, `activeRingtone()` is null, and the banner must not imply a
+    // sound that isn't playing.
+    const w = window as unknown as Record<string, unknown>;
+    const saved = {
+      Audio: w.Audio,
+      AudioContext: w.AudioContext,
+      webkitAudioContext: w.webkitAudioContext,
+    };
+    delete w.Audio;
+    delete w.AudioContext;
+    delete w.webkitAudioContext;
+    try {
+      window.localStorage.setItem(
+        "amos.alarms",
+        JSON.stringify([
+          { id: "r2", hour: 8, min: 0, enabled: true, ringing: true, tone: "🔔" },
+        ]),
+      );
+      const host = render(ClockApp);
+      await tick();
+      expect(host.container.querySelector('[data-testid="alarm-ring"]')).toBeTruthy();
+      const silent = host.container.querySelector('[data-testid="alarm-ring-silent"]');
+      expect(silent).toBeTruthy();
+      expect(silent?.textContent ?? "").toContain("无法播放声音");
+    } finally {
+      w.Audio = saved.Audio;
+      w.AudioContext = saved.AudioContext;
+      w.webkitAudioContext = saved.webkitAudioContext;
+    }
   });
 
   test("a persisted ringing alarm shows the animated ring and can be dismissed", async () => {

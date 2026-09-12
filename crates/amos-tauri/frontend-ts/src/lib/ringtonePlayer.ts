@@ -39,9 +39,6 @@ let _fileEnabled = false;
 export function setRingtoneFilesEnabled(v: boolean): void {
   _fileEnabled = v;
 }
-export function ringtoneFilesEnabled(): boolean {
-  return _fileEnabled;
-}
 
 /** Which ringtone (if any) is currently sounding. */
 export function activeRingtone(): RingtoneId | null {

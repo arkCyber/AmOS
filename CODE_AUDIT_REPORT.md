@@ -1,5 +1,45 @@
 # AmOS 代码审计报告
 
+> ⚠️ **这是一份 2026-09-01 的快照，不是当前状态。** 本文件的检查项（尤其 §「需要改进的部分」的
+> 20 个 `[ ]` 与 §「立即需要补全的文件」）**大多是当时的清单**，后续轮次已把其中多项做掉，
+> 但**本文件未逐条回填**。判断当前状态请看 `docs/TRACEABILITY_MATRIX.md`（每个 REQ 行末列写明
+> 结论与边界）与 `CHANGELOG.md`。
+>
+> **2026-09-12 已知的两处过期/矛盾结论（本轮修正）：**
+> - 「`crates/amos-ai/src/config.rs` 需要创建」**与事实相反**：该文件已于 **REQ-A97（第 36 轮）被
+>   故意删除**——它是无人构造的死代码（10 个 env 旋钮里 3 个全 daemon 无实现点），删掉才是修复。
+> - `[ ] 实现断路器模式` **已于 REQ-A131（第 70 轮）实现**：`crates/amos-ai/src/breaker.rs`
+>   （三态 + 装饰器 + `get_status.breaker`），见 `docs/daemon-resource-gate.md` §5。
+>
+> 其余条目**未在本轮核实**，因此保持原样（宁可留着已知的过期，也不假装已经回填）。
+> 下面这张表只列出**本轮实际核对过**的项：
+
+| 2026-09-01 的检查项 | 现在（2026-09-12 核实） | 证据 |
+|---|---|---|
+| `[ ] 实现结构化日志系统` | ✅ 已做 | `crates/amos-ai/src/logfile.rs` + `AMOS_LOG_DIR`（REQ-A87）+ `get_status.log_sink` |
+| `[ ] 添加性能指标收集` | ✅ 已做 | `src/monitoring.rs` + `ProfileStore`（`get_status.profile`） |
+| `[ ] 实现定期健康检查` | ✅ 已做 | daemon 存活探针 + `GetStatus` 心跳（见 `docs/AEROSPACE_SOFTWARE_AUDIT.md` REQ-A82） |
+| `[ ] 添加连接池健康状态` | ✅ 已做 | `src/pool.rs` 的 `snapshot()`（`in_flight + available == capacity` 不变量）+ `get_status.generation_pool` |
+| `[ ] 实现断路器模式` | ✅ **已完成** | `src/breaker.rs`（**REQ-A131**，2026-09-12） |
+| `[ ] 添加警告和告警机制` | ✅ **本轮完成** | `src/alerts.rs` + `get_status.alerts`（**REQ-A133**，2026-09-12） |
+| `[ ] 实现负载测试` | ✅ 已做（**部分**） | `crates/amos-ai/tests/load_test.rs`（有界并发 + 池不变量 + 恢复检查；**非** benchmark 框架） |
+| `[ ] 实现语音输入（ASR）` | ✅ 已做 | `amos-asr` + `transcribe_audio` 命令（`docs/bidi-voice-asr.md`） |
+| `[ ] 添加流式令牌渲染` | ✅ 已做 | 语义 UI/流式渲染链路（本文件 §「已完成的部分」已记录） |
+| `[ ] 完成 `controller.rs` 中的实现细节` | ✅ 已做 | `crates/amos-android/src/controller.rs`（260 行，**0 个** `todo!`/`unimplemented!`） |
+| `[ ] 添加应用启动超时处理` | ✅ 已做 | `crates/amos-android/src/manager.rs`：`launch_timeout_secs`（默认 30，`AMOS_ANDROID_LAUNCH_TIMEOUT`） |
+| `[ ] 实现图标缓存机制` | ✅ 已做 | `manager.rs` 的 LRU 图标缓存（有测试 `icon_cache_evicts_lru_not_oldest_inserted`） |
+| 「`controller.rs` 错误恢复流程」/「增强 `AiBridge` 错误恢复机制」 | ⚠️ **未逐条核实** | 本轮只确认"无 `todo!`/无 panic"；恢复策略的**完备性**没有基线，无法用机器判定 ⇒ 不写结论 |
+| `[ ] 添加更详细的 gRPC 错误响应` | ✅ **本轮完成（RAG 侧）** | `rag_service.rs`：域错误按责任方分类（`InvalidArgument`/`Unavailable`/`Internal`），见 **REQ-A134**；拒绝类早已类型化（`resource_exhausted`/`not_found`/`permission_denied`/`invalid_argument`）。**流式生成按设计不走 Status**（错误经 `AgentChunk.error` 上报），这一点**未改**，只在文档写明 |
+| `[ ] 添加性能基准测试 (benchmarks)` | ❌ **仍未做** | 全仓无 `benches/`、无 `criterion`（`load_test.rs` 自述"非 benchmark 框架"） |
+| `[ ] 添加混沌工程测试` | ❌ **仍未做** | 仅 `load_test.rs` 注释提及"风暴后恢复"，无故障注入框架 |
+| `[ ] 优化移动 UI` | ⚠️ **不可判定** | 主观项，无客观基线（帧率采样在真机验收清单里，见 `ON_DEVICE_ACCEPTANCE.md` §3） |
+
+**2026-09-12 复核结论**：12 项里 **5 项确认已完成**、**1 项本轮补完（告警）**、2 项部分/未逐条核实、2 项确实未做（基准、混沌）、1 项不可判定。
+未做的两项**不假装已做**：基准需要 `criterion` 依赖与基线目标，混沌需要故障注入框架——都属于独立工程，
+不属于"照着清单补一行"。
+
+---
+
 **审计日期**: 2026-09-01  
 **审计员**: GitHub Copilot  
 **项目**: Amos - AI-First Mobile OS  
@@ -119,7 +159,8 @@
 **建议**:
 - [ ] 实现定期健康检查
 - [ ] 添加连接池健康状态
-- [ ] 实现断路器模式
+- [x] 实现断路器模式（**REQ-A131，2026-09-12**：`crates/amos-ai/src/breaker.rs`）
+- [x] 添加警告和告警机制（**REQ-A133，2026-09-12**：`crates/amos-ai/src/alerts.rs` + `get_status.alerts`）
 - [ ] 添加警告和告警机制
 
 **优先级**: 🟠 中
@@ -132,7 +173,7 @@
 
 **建议**:
 ```rust
-// crates/amos-ai/src/config.rs - 需要创建
+// crates/amos-ai/src/config.rs - 【已作废：REQ-A97 故意删除该文件（死代码），不要再创建】
 pub struct Config {
     pub socket_path: PathBuf,
     pub inference_model: String,
@@ -303,7 +344,7 @@ pub struct ConnectionPool {
 
 ### 优先级 🔴 (生产必需)
 
-#### 1. `crates/amos-ai/src/config.rs` - 配置管理
+#### 1. ~~`crates/amos-ai/src/config.rs` - 配置管理~~ **【已作废】**
 ```rust
 // 支持配置文件和环境变量
 // 管理所有可配置参数
@@ -470,9 +511,9 @@ pub struct ConnectionPool {
 
 ## 📚 相关文档
 
-- [ARCHITECTURE.md](../docs/ARCHITECTURE.md) - 系统架构
-- [CONTRIBUTING.md](../CONTRIBUTING.md) - 贡献指南
-- [proto/ai_agent.proto](../proto/ai_agent.proto) - API 定义
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - 系统架构
+- [CONTRIBUTING.md](CONTRIBUTING.md) - 贡献指南
+- [proto/ai_agent.proto](proto/ai_agent.proto) - API 定义
 
 ---
 

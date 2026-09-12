@@ -173,7 +173,8 @@ export function normalizeWifi(v: unknown): WifiCfg {
     }
     return { current, saved: [...new Set(saved)], passwords };
   }
-  return { current: null, saved: [], passwords: {} };
+  return wifiInit();
 }
 
+/** The default, untouched Wi‑Fi config (single source — mirrors `bluetooth.btInit`). */
 export const wifiInit = (): WifiCfg => ({ current: null, saved: [], passwords: {} });

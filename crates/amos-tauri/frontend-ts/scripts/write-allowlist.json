@@ -1,0 +1,90 @@
+{
+  "kinds": {
+    "demo-seed": "First-run demo fixtures (a starter file tree, playlist, photo set, threads, calendars, reminders, voice memos, contacts). Written **only when the store key is absent**, so an intentionally emptied store stays empty (each app pins that with a 'not re-seeded' test). Two of these files (Calendar, Reminders) also carry a second, different write on the same key: repairing a *missing built-in* calendar/list, because rows under it would otherwise be unreachable — that happens while the key exists and inserts only the built-in entry, never re-seeding demo content. A rejected seed write costs nothing lasting: the app re-derives the fixture on the next mount and no screen claims it was stored.",
+    "system-event-removed": "RETIRED (REQ-A150, round 86). This kind used to classify the incoming-call append in `src/svelte/IncomingCall.svelte` as an accepted *residual gap* ('a rejected write costs that one history row, silently'), because the call overlay is closing and no screen is left to report a failure. That is no longer true of the code: the append is now a checked write whose rejected row is queued in memory (`queuePendingCall`) and flushed by the Phone screen's history — which is also where the user would look for it — with an honest notice while it is still pending. The gate reported this entry stale (`shrink with a reason`), which is how the retirement became visible. Recorded here (not deleted silently) because the *reason* a classification disappears is part of the audit trail. The retired reason was: \"Content appended when the *platform* reports an event (a finished incoming call is appended to the call log). There is n…\"",
+    "derived-tick": "Derived, self-healing state written by a background tick (marking alarms as `ringing`). It is not a user edit and no screen claims it was stored; a rejected write only degrades the ring UI until the next tick recomputes it.",
+    "store-seam": "The store seam itself (`lib/amosStore.ts`): the single place that owns the localStorage write, the Rust `store_set` write-through, the failure report and the `amos-store-changed` event.",
+    "raw-string-store": "A raw-string store that deliberately does **not** use the JSON seam: `theme`/`locale`/AI-session-id values are plain strings read at boot (before the JSON layer exists) and written by non-JS consumers, so encoding them as JSON would break the readers. Each mirrors to the Rust `store_set` like the seam does.",
+    "host-mirror": "The cross-window mirror inside `svelte/store.ts`: it applies a payload the **host** declared authoritative (`store-updated`), so it must not write back through the seam (that would echo the host's own value) — it writes localStorage and updates its own writable.",
+    "session-id": "The AI conversation id (`lib/backend.ts`): a plain-string pointer to the current multi-turn session, read/written as a raw string for the same reason as the other raw stores. Classified `derived` in `scripts/store-allowlist.json`, so it is intentionally not part of a backup."
+  },
+  "sites": [
+    {
+      "file": "src/svelte/CalendarApp.svelte",
+      "key": "amos.calendars",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/CalendarApp.svelte",
+      "key": "amos.calendar",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/FilesApp.svelte",
+      "key": "amos.files",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/MessagesApp.svelte",
+      "key": "amos.messages.convs",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/MusicApp.svelte",
+      "key": "amos.music",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/PhotosApp.svelte",
+      "key": "amos.photos",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/RemindersApp.svelte",
+      "key": "amos.reminderLists",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/RemindersApp.svelte",
+      "key": "amos.reminders",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/Shell.svelte",
+      "key": "amos.contacts",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/svelte/VoiceMemosApp.svelte",
+      "key": "amos.vmemos",
+      "kind": "demo-seed"
+    },
+    {
+      "file": "src/lib/alarmCore.ts",
+      "key": "amos.alarms",
+      "kind": "derived-tick"
+    }
+  ],
+  "localWrites": [
+    {
+      "file": "src/lib/amosStore.ts",
+      "kind": "store-seam"
+    },
+    {
+      "file": "src/lib/themeCore.ts",
+      "kind": "raw-string-store"
+    },
+    {
+      "file": "src/svelte/locale.svelte.ts",
+      "kind": "raw-string-store"
+    },
+    {
+      "file": "src/svelte/store.ts",
+      "kind": "host-mirror"
+    },
+    {
+      "file": "src/lib/backend.ts",
+      "kind": "session-id"
+    }
+  ]
+}

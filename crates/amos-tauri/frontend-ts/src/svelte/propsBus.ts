@@ -1,24 +1,23 @@
 /**
- * propsBus.ts — General React ⇄ Svelte external-props + events channel.
+ * propsBus.ts — General shell ⇄ Svelte screen external-props + events channel.
  *
  * WHY: Svelte 5's imperative `mount()` returns only the component's exports —
- * there is NO public `$setProps`, so a React shell cannot push updated props to
+ * there is NO public `$setProps`, so the shell cannot push updated props to
  * an already-mounted runes component without unmounting it (which would reset
  * its internal $state, e.g. the home icon-grid page). For screens that are
- * CONTROLLED by the React shell (like the home HomeDock, whose layout/ext/pulse
+ * CONTROLLED by the shell (like the home HomeDock, whose layout/ext/pulse
  * the shell owns), we need in-place, reactive prop updates.
  *
  * This is the general, framework-agnostic primitive (option C). A named
  * "channel" carries TWO independent directions:
- *   • DOWN (React → Svelte): a reactive `svelte/store` writable of the screen's
- *     external props. The Svelte screen subscribes and re-renders in place.
- *   • UP   (Svelte → React): a tiny event emitter the screen uses to signal
+ *   • DOWN (shell → screen): a reactive `svelte/store` writable of the screen's
+ *     external props. The screen subscribes and re-renders in place.
+ *   • UP   (screen → shell): a tiny event emitter the screen uses to signal
  *     one-shot actions (open/move/search) back to the shell.
  *
- * It is plain TS + `svelte/store` (no runes, no React), so BOTH the React shell
- * (even under `bun`, which has no .svelte loader) and any Svelte component can
- * import it. Screens are keyed by a stable `name`, so host and component never
- * need to import each other's instances.
+ * It is plain TS + `svelte/store` (no runes), so both the shell and any Svelte
+ * component can import it. Screens are keyed by a stable `name`, so host and
+ * component never need to import each other's instances.
  */
 import { writable, type Readable } from "svelte/store";
 
@@ -35,12 +34,16 @@ export interface ChannelDown<T> extends Readable<T> {
   get(): T | undefined;
 }
 
-export interface PropsChannel<T> extends ChannelDown<T> {
-  /** UP direction (Svelte → React). */
-  emit(event: string, detail?: unknown): void;
-  /** Register an UP listener; returns an unsubscribe fn. */
-  on(listener: (event: string, detail: unknown) => void): () => void;
-}
+/**
+ * A full two-way channel: the DOWN props store plus the UP event surface.
+ *
+ * Extends [`ChannelUp`] rather than re-declaring `emit`/`on`: this is the
+ * interface every screen actually consumes, so the UP contract must have **one**
+ * definition — a hand-copied pair here would silently not track a change to
+ * `ChannelUp` (the exact "declared seam duplicated at its call site" drift the
+ * unwired audit looks for).
+ */
+export interface PropsChannel<T> extends ChannelDown<T>, ChannelUp {}
 
 interface BusEntry<T> {
   down: ReturnType<typeof writable<T>>;
@@ -94,7 +97,7 @@ export function resetPropsChannels(): void {
 
 /**
  * Tear down one named channel (drop its DOWN state + any residual UP listeners)
- * so a screen that left can start from a clean slate on remount. The React host
+ * so a screen that left can start from a clean slate on remount. The shell
  * calls this on unmount.
  */
 export function disposePropsChannel(name: string): void {

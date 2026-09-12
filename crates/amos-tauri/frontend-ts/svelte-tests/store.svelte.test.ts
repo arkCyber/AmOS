@@ -15,6 +15,9 @@ afterEach(() => {
   window.localStorage.clear();
 });
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
+/** The "Update" *buttons* (the tagline also contains the word 更新). */
+const updateButtons = (h: { container: HTMLElement }) =>
+  [...h.container.querySelectorAll("button")].filter((b) => (b.textContent ?? "").trim() === "更新");
 const settle = () => new Promise((r) => setTimeout(r, 40));
 
 function mk(id: string, name: string, major: number, minor: number, patch: number): AppManifest {
@@ -30,11 +33,18 @@ function mk(id: string, name: string, major: number, minor: number, patch: numbe
   };
 }
 
-function installBridge(catalog: AppManifest[], installedInit: InstalledApp[]) {
+function installBridge(
+  catalog: AppManifest[],
+  installedInit: InstalledApp[],
+  updatableIds: string[] | undefined = undefined,
+) {
   const installed = [...installedInit];
   const invoke = async (cmd: string, args?: Record<string, unknown>) => {
     if (cmd === "appstore_catalog") return catalog;
     if (cmd === "appstore_installed") return installed;
+    // `undefined` ⇒ this (older) host cannot answer → the UI's own comparison is
+    // the documented fallback.
+    if (cmd === "appstore_updatable") return updatableIds === undefined ? null : updatableIds;
     if (cmd === "appstore_install" || cmd === "appstore_upgrade") {
       const id = String(args?.id);
       const m = catalog.find((a) => a.id === id);
@@ -79,5 +89,41 @@ describe("StoreApp.svelte", () => {
     expect(txt(host)).toContain("已安装"); // alpha is installed
     expect(txt(host)).toContain("获取"); // beta is available to install
     expect(txt(host)).toContain("v1.0.0");
+  });
+
+  test("the host's updatable list decides (not the UI's own version compare)", async () => {
+    // The catalog carries the SAME version as the installed manifest, so any local
+    // comparison says "not updatable" — but the host (which owns the semantic
+    // comparison, docs/appstore.md) reports alpha as updatable.
+    const a = mk("alpha", "Alpha App", 1, 0, 0);
+    const b = mk("beta", "Beta App", 2, 0, 0);
+    installBridge([a, b], [{ manifest: a, installed_at: 1_700_000_000 }], ["alpha"]);
+    const host = render(StoreApp);
+    await settle();
+    await settle();
+    expect(updateButtons(host)).toHaveLength(1); // store.update — host says so
+  });
+
+  test("a host that reports nothing updatable is believed over the local compare", async () => {
+    // Catalog is newer than the installed manifest, so the UI's fallback would
+    // offer an update — but the host (authoritative) says there is none.
+    const a = mk("alpha", "Alpha App", 1, 0, 0);
+    const newer = mk("alpha", "Alpha App", 9, 9, 9);
+    installBridge([newer], [{ manifest: a, installed_at: 1_700_000_000 }], []);
+    const host = render(StoreApp);
+    await settle();
+    await settle();
+    expect(updateButtons(host)).toHaveLength(0);
+    expect(txt(host)).toContain("已安装");
+  });
+
+  test("falls back to the local compare when the host cannot answer", async () => {
+    const a = mk("alpha", "Alpha App", 1, 0, 0);
+    const newer = mk("alpha", "Alpha App", 2, 0, 0);
+    installBridge([newer], [{ manifest: a, installed_at: 1_700_000_000 }]); // updatable → null
+    const host = render(StoreApp);
+    await settle();
+    await settle();
+    expect(updateButtons(host)).toHaveLength(1);
   });
 });

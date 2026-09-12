@@ -212,10 +212,13 @@ mod device {
     pub(crate) static DEVICE: OnceLock<Arc<dyn MediaProvider>> = OnceLock::new();
 
     /// Wrap the Kotlin glue instance in an Android provider and install it.
+    ///
+    /// Uses [`android_backend`] so the Kotlin-glue → provider conversion has one
+    /// implementation shared with the documented attach seam; this path only adds
+    /// the exactly-once process-global install.
     fn install(vm: JavaVM, env: &JNIEnv<'_>, glue: JObject<'_>) {
-        use amos_media::AndroidMediaProvider;
-        if let Ok(p) = AndroidMediaProvider::new(vm, env, glue) {
-            let _ = DEVICE.set(Arc::new(p)); // first attach wins (exactly-once)
+        if let Ok(p) = android_backend(vm, env, glue) {
+            let _ = DEVICE.set(p); // first attach wins (exactly-once)
         }
     }
 

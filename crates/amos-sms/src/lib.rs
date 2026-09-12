@@ -10,6 +10,12 @@
 //! Real SMS read/send is **device + permission dependent** (READ_SMS /
 //! SEND_SMS). This crate validates every shape without faking a message.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod error;
 pub mod folder;
 pub mod provider;

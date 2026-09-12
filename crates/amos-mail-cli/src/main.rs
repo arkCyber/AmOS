@@ -4,6 +4,12 @@
 //! offline `MailClient` engine and prints the resulting lines. Logic lives in
 //! the lib so it is unit-testable headlessly.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::process::ExitCode;
 
 use amos_mail_cli::run;

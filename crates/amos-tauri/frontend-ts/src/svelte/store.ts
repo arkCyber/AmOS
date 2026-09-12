@@ -13,12 +13,16 @@
  * read `$store` in legacy-mode components). `save(v)` persists + broadcasts.
  */
 import { writable, type Readable } from "svelte/store";
-import { readStoreValue, writeStoreValue, STORE_CHANGED_EVENT } from "../lib/amosStore";
+import { readStoreValue, writeStoreValueChecked, STORE_CHANGED_EVENT } from "../lib/amosStore";
 import { bridged, subscribe } from "../lib/backend";
 
 export interface StoreValue<T> extends Readable<T> {
-  /** Persist `v` through the shared store (localStorage + bridge + broadcast). */
-  save: (v: T) => void;
+  /**
+   * Persist `v` through the shared store (localStorage + bridge + broadcast), and
+   * report whether it **landed**. Callers that write user content must act on the
+   * answer: the wrapper's key is a parameter, so no lint gate can see through it.
+   */
+  save: (v: T) => boolean;
 }
 
 /**
@@ -75,6 +79,6 @@ export function createStoreValue<T>(key: string, fallback: T): StoreValue<T> {
 
   return {
     subscribe: store.subscribe,
-    save: (v) => writeStoreValue(key, v),
+    save: (v) => writeStoreValueChecked(key, v),
   };
 }

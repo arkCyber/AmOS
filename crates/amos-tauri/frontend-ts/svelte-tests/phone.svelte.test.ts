@@ -5,19 +5,32 @@
  * test keypad entry/backspace/clear, tab switching, the emergency page, and that
  * dialing WITHOUT a daemon shows a localized error (never a phantom "calling").
  */
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import PhoneApp from "../src/svelte/PhoneApp.svelte";
 import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
-import { CALLLOG_KEY } from "../src/lib/calllog";
-import { messagesChannel } from "../src/svelte/appLinks";
+import {
+  CALLLOG_KEY,
+  resetPendingCallsForTest,
+  pendingCallCount,
+  queuePendingCall,
+  type CallRecord,
+} from "../src/lib/calllog";
+import { zh } from "../src/i18n/locales/zh";
+import { messagesChannel, phoneChannel } from "../src/svelte/appLinks";
 import { resetPropsChannels } from "../src/svelte/propsBus";
 import { resetShellState, surface } from "../src/svelte/shellState.svelte";
+
+beforeEach(() => {
+  // The pending-call queue is module state: start every case from a known state.
+  resetPendingCallsForTest();
+});
 
 afterEach(() => {
   cleanup();
   delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   window.localStorage.clear();
+  resetPendingCallsForTest();
   resetPropsChannels();
   resetShellState();
 });
@@ -26,6 +39,31 @@ const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const key = (h: { container: HTMLElement }, aria: string) =>
   h.container.querySelector(`button[aria-label="${aria}"]`) as HTMLButtonElement | null;
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
 
 /** Open the 「拦截」 tab (matched by its label, not by index). */
 const openBlockTab = (h: { container: HTMLElement }) => {
@@ -65,6 +103,33 @@ const NO_STATUS = {
 };
 
 describe("PhoneApp.svelte (offline UI)", () => {
+  test("a rejected history-clear is reported and the log stays", async () => {
+    // A real entry so the two-step clear affordance is on screen.
+    window.localStorage.setItem(
+      "amos.calllog",
+      JSON.stringify([{ number: "10086", name: "客服热线", ts: Date.now(), count: 1 }]),
+    );
+    const restore = failWritesFor("amos.calllog");
+    try {
+      const host = render(PhoneApp);
+      await openHistoryTab(host);
+      await flush();
+      expect(txt(host)).toContain("客服热线");
+
+      await fireEvent.click(key(host, "history-clear")!);
+      await fireEvent.click(key(host, "history-clear-confirm")!);
+      await flush();
+
+      // Wiping the log was rejected: the banner shows and the entry is still there.
+      expect(
+        host.container.querySelector('[data-testid="store-write-error"]')?.textContent ?? "",
+      ).toContain("本机存储写入失败");
+      expect(txt(host)).toContain("客服热线");
+    } finally {
+      restore();
+    }
+  });
+
   test("keypad digits append; backspace and clear work", async () => {
     const host = render(PhoneApp);
     await fireEvent.click(key(host, "1")!);
@@ -75,6 +140,17 @@ describe("PhoneApp.svelte (offline UI)", () => {
     expect(txt(host)).toContain("12");
     await fireEvent.click(key(host, "clear")!);
     expect(txt(host)).not.toContain("12");
+  });
+
+  test("the dialer shows the name the call log knows for the typed number", async () => {
+    // No address book entry → the hint must come from the call log's own history
+    // (`lib/calllog.logNameFor`), so a number you called before is named again.
+    writeStoreValue(CALLLOG_KEY, [{ number: "10086", name: "客服热线", ts: Date.now() }]);
+    const host = render(PhoneApp);
+    for (const d of ["1", "0", "0", "8", "6"]) await fireEvent.click(key(host, d)!);
+    const known = host.container.querySelector('[data-testid="dial-known-name"]');
+    expect(known).toBeTruthy();
+    expect(known?.textContent ?? "").toContain("客服热线");
   });
 
   test("tabs switch between pages", async () => {
@@ -104,6 +180,68 @@ describe("PhoneApp.svelte (offline UI)", () => {
     // offline: no in-call UI, but a role=alert with the localized dial error
     expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
     expect(host.container.querySelector('[role="alert"]')).toBeTruthy();
+  });
+
+  test("reopening the app mid-call adopts the live call (telephony_status)", async () => {
+    const calls = fakeBridge((cmd) => {
+      if (cmd === "telephony_status") {
+        return [
+          {
+            id: "call-77",
+            peer: "13800000001",
+            state: "Active",
+            direction: "Outgoing",
+            emergency: false,
+            recording: "Off",
+          },
+        ];
+      }
+      return null;
+    });
+    const host = render(PhoneApp);
+    await new Promise((r) => setTimeout(r, 10));
+    // The live call is adopted → the peer is named and the user can hang up,
+    // instead of a bare keypad over a call they cannot end.
+    expect(calls.some((c) => c.cmd === "telephony_status")).toBe(true);
+    expect(host.container.querySelector('button[aria-label="end"]')).toBeTruthy();
+    expect(txt(host)).toContain("13800000001");
+  });
+
+  test("a call ended locally is never re-adopted by a resume recheck", async () => {
+    fakeBridge((cmd) => {
+      if (cmd === "telephony_status") {
+        // The daemon keeps reporting it for a beat after `telephony_end`.
+        return [
+          {
+            id: "call-88",
+            peer: "13900000002",
+            state: "Active",
+            direction: "Outgoing",
+            emergency: false,
+            recording: "Off",
+          },
+        ];
+      }
+      return null;
+    });
+    const host = render(PhoneApp);
+    await new Promise((r) => setTimeout(r, 10));
+    await fireEvent.click(host.container.querySelector('button[aria-label="end"]')!);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
+
+    // A resume recheck must not resurrect the call the user just hung up.
+    window.dispatchEvent(new Event("focus"));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
+  });
+
+  test("no live call on the daemon → the keypad shows (nothing invented)", async () => {
+    fakeBridge(() => null);
+    const host = render(PhoneApp);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
+    expect(host.container.querySelector('button[aria-label="call"]')).toBeTruthy();
   });
 
   test("blocklist tab adds, lists and removes rules through the bridge", async () => {
@@ -155,6 +293,76 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await fireEvent.click(host.container.querySelector('button[aria-label="block-remove-1069"]') as HTMLButtonElement);
     await flush();
     expect(rules.length).toBe(0);
+  });
+
+  test("the block field previews a match the daemon already covers (blocklist_check)", async () => {
+    const calls = fakeBridge((cmd, args) => {
+      if (cmd === "blocklist_snapshot") return { block_unknown: false, rules: [] };
+      if (cmd === "blocklist_status") return NO_STATUS;
+      if (cmd === "blocklist_check") {
+        return String(args?.address).startsWith("10086")
+          ? { kind: "rule", id: "r1", pattern: "10086*", label: "", channel: "both" }
+          : null;
+      }
+      return null;
+    });
+    const host = render(PhoneApp);
+    await openBlockTab(host);
+    await flush();
+    await fireEvent.input(
+      host.container.querySelector('input[aria-label="block-number"]') as HTMLInputElement,
+      { target: { value: "1008611" } },
+    );
+    await new Promise((r) => setTimeout(r, 300)); // preview is debounced (250 ms)
+    expect(calls.some((c) => c.cmd === "blocklist_check")).toBe(true);
+    const preview = host.container.querySelector('[data-testid="block-preview"]');
+    expect(preview).toBeTruthy();
+    expect(preview?.textContent ?? "").toContain("10086*");
+  });
+
+  test("no match → no preview (a null reply is never shown as \"safe\")", async () => {
+    fakeBridge((cmd) => {
+      if (cmd === "blocklist_snapshot") return { block_unknown: false, rules: [] };
+      if (cmd === "blocklist_status") return NO_STATUS;
+      return null; // blocklist_check → null (allowed OR unavailable — claim nothing)
+    });
+    const host = render(PhoneApp);
+    await openBlockTab(host);
+    await flush();
+    await fireEvent.input(
+      host.container.querySelector('input[aria-label="block-number"]') as HTMLInputElement,
+      { target: { value: "12345678" } },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    expect(host.container.querySelector('[data-testid="block-preview"]')).toBeNull();
+  });
+
+  test("clear-all wipes every rule after a confirm tap (blocklist_clear)", async () => {
+    let rules: Record<string, unknown>[] = [
+      { id: "r1", pattern: "10086", kind: "exact", channel: "both", label: "", created_ms: 1 },
+    ];
+    const calls = fakeBridge((cmd) => {
+      if (cmd === "blocklist_snapshot") return { block_unknown: false, rules };
+      if (cmd === "blocklist_status") return NO_STATUS;
+      if (cmd === "blocklist_clear") {
+        rules = [];
+        return null;
+      }
+      return null;
+    });
+    const host = render(PhoneApp);
+    await openBlockTab(host);
+    await flush();
+    const clearBtn = () =>
+      host.container.querySelector('button[aria-label="block-clear"]') as HTMLButtonElement | null;
+    expect(clearBtn()).toBeTruthy();
+    await fireEvent.click(clearBtn()!); // arms the confirm
+    expect(calls.some((c) => c.cmd === "blocklist_clear")).toBe(false);
+    await fireEvent.click(clearBtn()!); // confirms
+    await flush();
+    expect(calls.some((c) => c.cmd === "blocklist_clear")).toBe(true);
+    expect(rules.length).toBe(0);
+    expect(txt(host)).toContain("黑名单为空");
   });
 
   test("the 拦截 tab shows ONLY the block panel (never the emergency page)", async () => {
@@ -499,5 +707,70 @@ describe("PhoneApp.svelte (offline UI)", () => {
     const s = surface();
     expect(s.kind).toBe("app");
     if (s.kind === "app") expect(s.id).toBe("messages");
+  });
+
+  test("a dial link prefills the dialler — it never places the call itself", async () => {
+    const calls = fakeBridge((cmd) => {
+      if (cmd === "blocklist_snapshot") return { block_unknown: false, rules: [] };
+      if (cmd === "blocklist_status") return NO_STATUS;
+      return null;
+    });
+    const host = render(PhoneApp);
+    await flush();
+    // Start elsewhere so the prefill has to switch the tab back to the dialler.
+    await openHistoryTab(host);
+    await flush();
+
+    phoneChannel().set({ number: "10086", nonce: 42 });
+    await flush();
+    expect(txt(host)).toContain("10086");
+    // The link is consumed once: a remount starts clean (nothing pending).
+    expect(phoneChannel().get()?.number).toBe("");
+    // ...and no call was started: a prefill is a request, not a call the user never placed.
+    expect(calls.map((c) => c.cmd)).not.toContain("telephony_dial");
+  });
+
+  /**
+   * REQ-A150 — the Phone screen's history is where a call that could not be written is
+   * retried (it is the screen that can both write and speak). Two cases: the retry lands,
+   * and the retry still cannot land.
+   */
+  test("the history screen flushes a pending call, which then really appears", async () => {
+    queuePendingCall({
+      number: "13900000000",
+      ts: Date.now(),
+      direction: "incoming",
+    });
+
+    const host = render(PhoneApp);
+    await flush();
+    await flush();
+
+    expect(pendingCallCount()).toBe(0);
+    const log = readStoreValue<CallRecord[]>(CALLLOG_KEY, []);
+    expect(log.some((r) => r.number === "13900000000")).toBe(true);
+  });
+
+  test("while storage still rejects, the screen admits the call is not recorded yet", async () => {
+    queuePendingCall({
+      number: "13900000001",
+      ts: Date.now(),
+      direction: "missed",
+    });
+    const original = window.localStorage.setItem.bind(window.localStorage);
+    vi.spyOn(window.localStorage, "setItem").mockImplementation((k: string, v: string) => {
+      if (k === CALLLOG_KEY) throw new Error("QuotaExceededError");
+      original(k, v);
+    });
+
+    const host = render(PhoneApp);
+    await flush();
+    await flush();
+
+    expect(pendingCallCount()).toBe(1); // still waiting — nothing was dropped
+    expect(txt(host)).toContain(zh["phone.pendingCalls"].replace("{n}", "1"));
+    // …and no phantom row was drawn for a call the store does not have.
+    const log = readStoreValue<CallRecord[]>(CALLLOG_KEY, []);
+    expect(log).toEqual([]);
   });
 });

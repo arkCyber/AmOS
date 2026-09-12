@@ -153,9 +153,18 @@ export function mediaAvailableCollections(): Promise<StandardDir[] | null> {
   return call<StandardDir[]>("media_available_collections");
 }
 
-/** Current grant set (null offline). */
-export function mediaGrants(): Promise<Grant[] | null> {
-  return call<Grant[]>("media_grants");
+/**
+ * Current grant set (null offline). The raw reply is run through
+ * `normalizeGrant`: a row that is not an `{access, collection}` pair this build
+ * understands is **dropped** (an unknown/evolved daemon grant must never reach
+ * the privacy UI as if it were a real typed grant), and a reply that is not an
+ * array is treated as **"could not read"** (`null`) rather than a fabricated
+ * empty set.
+ */
+export async function mediaGrants(): Promise<Grant[] | null> {
+  const raw = await call<unknown>("media_grants");
+  if (!Array.isArray(raw)) return null;
+  return raw.map(normalizeGrant).filter((g): g is Grant => g !== null);
 }
 
 /** Authorize reading a collection (no-op offline). */

@@ -4,6 +4,12 @@
 **状态**: 📋 设计评审稿 → ✅ Phase A（`crates/amos-media` 领域内核）、Phase B（`amos-tauri` `media_*` 命令层 + TS `lib/media.ts` 桥 + `AMOS_MEDIA_ROOT`→HostFs 运行时选择）、Phase D-核心（`lib/photoLibrary.ts` 合并模型）、Phase C-host（`load` seam）、Phase C-prep（`mapping` + manifest）、Phase C-device 骨架（`AndroidMediaProvider` + Kotlin `MediaStoreGlue.kt` + REQ_MEDIA）、Phase E 装置（`HostFsProvider` + `scan_dir`）以及**设备 boot 接线（`SwitchableProvider` 运行期替换 + `attach(android_backend)`，`--features android` 编译验证）**已落地（2026-09-08）；真机接线（Kotlin `ContentResolver` 实装 + 设备层调用 `android_backend`+`attach` + 授权/10ms 实测）、Phase D 渲染（PhotosApp/FilesApp mount）、Phase E 真机 bring-up 未实现。
 本文件仍是**审计与补码清单**（不含已落地上线的完整实现）。
 
+> **命名更正（2026-09-12）**：本文 §4/§5/§6 里的 `media_list_images` / `media_list_files` /
+> `media_save_to_gallery` 是**提议形状**（当时未实现）。实际落地的命令面是
+> `media_list` / `media_save` / `media_load` / `media_read_range` 等（`crates/amos-tauri/src/media.rs`，
+> 已注册进 `invoke_handler`）——以 [`docs/media.md`](./media.md) 与 `media_provider_name` 的实际返回为准；
+> 本文其余提议名（如 `list_images`/`load_thumbnail`）同理，均未按此名实现。
+
 > 一句话结论：**AmOS 目前并【没有】与安卓真机的文件目录树（`/sdcard`、`/storage/emulated/0`、
 > `DCIM/`、`Pictures/`、`Download/`）统一**。Files / Photos / Camera / 语音备忘录都是"应用内
 > 虚拟存储"，彼此不打通、也不读真机媒体。真正的统一应走 **MediaStore / SAF（系统标准资源）**，

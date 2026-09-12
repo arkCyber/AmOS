@@ -1,10 +1,8 @@
 <script lang="ts">
-  // StatusBar.svelte — Svelte 5 (runes) port of the React `StatusBar` shell
-  // chrome. It is a pure "island": no external props/events — it reads the SAME
-  // shared stores (quick settings / flashlight / sound / wifi) and live
-  // time/online that the React StatusBar reads, so it can be hosted by the React
-  // shell with the generic SvelteAppHost (className="") and must never drift from
-  // the original.
+  // StatusBar.svelte — Svelte 5 (runes) shell chrome. It is a pure "island": no
+  // external props/events — it reads the shared stores (quick settings /
+  // flashlight / sound / wifi) and live time/online, and is mounted by
+  // Shell.svelte.
   //
   // Battery & network here are REAL, not cosmetic:
   //  • Level/charging come from `system_health` (daemon → amos-monitor, the

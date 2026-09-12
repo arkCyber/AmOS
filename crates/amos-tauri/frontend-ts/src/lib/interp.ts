@@ -6,7 +6,7 @@
  * reopening the app (mirroring the legacy vanilla interpreter app's `amos.interp`
  * / `amos.interp.log` keys so both UIs interoperate in the shared store).
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "./amosStore";
 
 export const INTERP_PREFS_KEY = "amos.interp";
 export const INTERP_LOG_KEY = "amos.interp.log";
@@ -87,12 +87,12 @@ export function loadSegs(): InterpSeg[] {
   return readStoreValue<InterpSeg[]>(INTERP_LOG_KEY, []);
 }
 
-export function saveSegs(segs: InterpSeg[]): void {
-  writeStoreValue(INTERP_LOG_KEY, segs);
+export function saveSegs(segs: InterpSeg[]): boolean {
+  return writeStoreValueChecked(INTERP_LOG_KEY, segs);
 }
 
-export function clearSegs(): void {
-  saveSegs([]);
+export function clearSegs(): boolean {
+  return saveSegs([]);
 }
 
 /** Build a persisted transcript record from a `segment_final` payload (or null). */
@@ -115,15 +115,6 @@ export function partialTextOf(payload: unknown): string {
   if (!payload || typeof payload !== "object") return "";
   const p = payload as Record<string, unknown>;
   return p.kind === "partial" ? String(p.text ?? "") : "";
-}
-
-/** True when the payload announces the session ended. */
-export function sessionEndedOf(payload: unknown): boolean {
-  return (
-    !!payload &&
-    typeof payload === "object" &&
-    (payload as { kind?: string }).kind === "session_ended"
-  );
 }
 
 /** Extract an error message from an `error` payload ("" otherwise). */

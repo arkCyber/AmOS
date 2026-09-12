@@ -1,9 +1,9 @@
 //! Daemon-wide generation admission gate (`pool.rs`).
 //!
 //! Bounds the number of **concurrent in-flight inference generations** across
-//! the whole daemon. This is the enforcement half of `Config::max_concurrent_sessions`
-//! (`AMOS_MAX_SESSIONS`), which existed and was validated but was never read by
-//! the server: the per-client [`crate::security::RateLimiter`] bounds request
+//! the whole daemon. This is the enforcement half of `AMOS_MAX_SESSIONS`, which
+//! existed and was validated but was never read by the server: the per-client
+//! [`crate::security::RateLimiter`] bounds request
 //! *rate* and hourly token *quota*, while this pool bounds simultaneous
 //! *executing* generations. On a battery device an unbounded fan-out of NPU/GPU
 //! generations is a resource-exhaustion failure mode, so admission is:
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-/// Default generation-pool capacity — mirrors `Config::default().max_concurrent_sessions`.
+/// Default generation-pool capacity — the documented `AMOS_MAX_SESSIONS` default.
 pub const DEFAULT_POOL_CAPACITY: usize = 16;
 
 /// Why an acquire did not get a generation slot.
@@ -99,8 +99,8 @@ impl GenerationPool {
     }
 
     /// Build from the `AMOS_MAX_SESSIONS` env var, falling back to
-    /// [`DEFAULT_POOL_CAPACITY`]. Values `< 1` fall back too (same rule as
-    /// `Config::from_env`, which only accepts `>= 1`).
+    /// [`DEFAULT_POOL_CAPACITY`]. Values `< 1` fall back too (a zero-slot pool is
+    /// unrepresentable — capacity is a `NonZeroUsize`).
     pub fn from_env() -> Self {
         let capacity = std::env::var("AMOS_MAX_SESSIONS")
             .ok()
@@ -117,14 +117,26 @@ impl GenerationPool {
         self.capacity.get()
     }
 
+    /// One consistent view of the pool's free/busy split: `(in_flight, available)`.
+    ///
+    /// Both values come from a **single** `available_permits()` read, so they
+    /// always sum to [`Self::capacity`]. Reading them via two separate calls
+    /// could straddle a concurrent acquire/release and momentarily report an
+    /// impossible split (e.g. `in_flight + available > capacity`), which would
+    /// make the honest `get_status` snapshot lie.
+    pub fn snapshot(&self) -> (usize, usize) {
+        let available = self.semaphore.available_permits();
+        (self.capacity.get() - available, available)
+    }
+
     /// Slots currently in flight (held permits).
     pub async fn in_flight(&self) -> usize {
-        self.capacity.get() - self.semaphore.available_permits()
+        self.snapshot().0
     }
 
     /// Free slots right now.
     pub async fn available(&self) -> usize {
-        self.semaphore.available_permits()
+        self.snapshot().1
     }
 
     /// Monotonic counters: `(acquired, rejected_saturated, rejected_timeout)`.
@@ -191,6 +203,58 @@ mod tests {
         );
         assert!(GenerationPool::try_new(1).is_ok());
         assert!(GenerationPool::try_new(DEFAULT_POOL_CAPACITY).is_ok());
+    }
+
+    #[tokio::test]
+    async fn snapshot_split_always_sums_to_capacity() {
+        // A single snapshot read must never report an impossible split. This is
+        // the invariant the wire `generation_pool` block relies on.
+        let pool = GenerationPool::try_new(3).unwrap();
+        let p1 = pool.acquire(Duration::ZERO).await.expect("first");
+        let _p2 = pool.acquire(Duration::ZERO).await.expect("second");
+        let (in_flight, available) = pool.snapshot();
+        assert_eq!((in_flight, available), (2, 1));
+        assert_eq!(in_flight + available, pool.capacity());
+        assert_eq!(pool.in_flight().await, in_flight);
+        assert_eq!(pool.available().await, available);
+        drop(p1);
+        let (in_flight, available) = pool.snapshot();
+        assert_eq!(in_flight + available, pool.capacity());
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_methods_agree_under_concurrency() {
+        // Hammer the pool from many tasks while continuously sampling the
+        // snapshot: every sample must satisfy in_flight + available == capacity.
+        let pool = Arc::new(GenerationPool::try_new(4).unwrap());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let stop = stop.clone();
+            workers.push(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(permit) = pool.acquire(Duration::ZERO).await {
+                        tokio::task::yield_now().await;
+                        drop(permit);
+                    }
+                }
+            }));
+        }
+        for _ in 0..5000 {
+            let (in_flight, available) = pool.snapshot();
+            assert!(in_flight <= pool.capacity());
+            assert_eq!(
+                in_flight + available,
+                pool.capacity(),
+                "a snapshot must never report an impossible split"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.await.expect("worker joins");
+        }
+        assert_eq!(pool.in_flight().await, 0, "all permits released");
     }
 
     #[tokio::test]
@@ -314,14 +378,10 @@ mod tests {
     }
 
     #[test]
-    fn capacity_default_stays_in_lockstep_with_config() {
-        // Keep the pool default and Config::default().max_concurrent_sessions
-        // aligned on purpose; a divergence is a documentation lie.
+    fn capacity_default_is_the_documented_value() {
+        // `DEFAULT_POOL_CAPACITY` is the documented `AMOS_MAX_SESSIONS` default;
+        // changing it silently would make cli.rs USAGE / the docs a lie.
         assert_eq!(DEFAULT_POOL_CAPACITY, 16);
-        assert_eq!(
-            crate::config::Config::default().max_concurrent_sessions,
-            DEFAULT_POOL_CAPACITY
-        );
     }
 
     #[tokio::test]

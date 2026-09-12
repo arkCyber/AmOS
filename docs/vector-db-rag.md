@@ -121,15 +121,29 @@ Landed (2026-09-09):
   `amos-tauri/src/rag_client.rs` (`rag_status` / `rag_query` / `rag_index` /
   `rag_remove`, each opening a `RagClient` over the daemon UDS), plus
   `frontend-ts/src/lib/notesRag.ts` (UI-agnostic: stable `note:<id>` naming,
-  bulk upsert / removal decisions, cited-context + prompt assembly, and a
-  busy/error state machine a Notes/Ai component can mount). Headless tests:
-  23 (`rag.test.ts` 11 + `notesRag.test.ts` 12) + 3 bridge mapping tests;
-  `tsc` / clippy / fmt clean.
+  bulk upsert / removal decisions, cited-context + prompt assembly, a busy/error
+  state machine, and a citation label `hitSourceLabel`) and
+  `frontend-ts/src/lib/notesRagRun.ts` (the IO glue: `syncNotesIndex` upsert +
+  prune recording **only daemon-confirmed** outcomes, `askNotes`). **Wired into
+  the Notes UI** — `svelte/NotesApp.svelte` "🔍 问笔记" panel: toggle → index the
+  active notes → ask → cited passages, with an honest offline notice (never a
+  confident-looking empty answer) — **and the Ai UI** — `svelte/AiApp.svelte`
+  "📚 问我的笔记" toggle grounds a chat turn (retrieve → `buildRagPrompt` → chat):
+  the user bubble keeps the original question while the model gets the cited
+  prompt, and an offline retrieval is reported honestly (the turn still answers).
+  Headless tests: 33 (`rag.test.ts` 11 +
+  `notesRag.test.ts` 15 + `notesRagRun.test.ts` 7) + 3 bridge mapping tests;
+  `tsc` / clippy / fmt clean. `make cov` ≥ 90% still green.
+  *Wire keys*: Tauri resolves a command argument by its Rust name in
+  **lowerCamelCase**, so the client must send `{ query, topK }` — a `top_k` key
+  matches no parameter and the command fails with `missing required key topK`
+  *before* any gRPC call (it did, for every retrieval, until REQ-A107). Pinned by
+  `scripts/tauri-args-scan.mjs` + the two `rag.test.ts` wire-key cases; `topK`, not
+  the proto's `top_k`, is what the wire wants.
 
 Still open (live wiring — only verifiable in a running app / on device):
-* Wire **`AiApp` / `NotesApp`** to `lib/rag.ts` + `notesRag.ts` so "index this
-  note / ask my files" is reachable from the UI; that is also where the real ARM
-  numbers get measured on-device.
+* On-device ARM throughput numbers — the retrieval + grounding path is now
+  reachable from both Notes and Ai, so a running app can measure it.
 
 
 
@@ -173,12 +187,24 @@ SELinux block when the daemon binds a **Unix socket** in `/data/local/tmp`
 `shell` context:
 
 ```bash
-adb shell 'cd /data/local/tmp && nohup env AMOS_TCP_ADDR=127.0.0.1:19090 AMOS_RAG_EMBEDDER=mock AMOS_BACKEND=mock ./amos-ai-rag >amos-rag.log 2>&1 </dev/null &'
-adb shell /data/local/tmp/rag_once http://127.0.0.1:19090
+# Optional but recommended: a shared secret for the TCP transport. The daemon then
+# refuses any request without the matching `x-amos-token` header (rag_once reads the
+# same variable). Without it the daemon still serves — and warns loudly at startup.
+TOKEN=dev-only-secret
+adb shell "cd /data/local/tmp && nohup env AMOS_TCP_ADDR=127.0.0.1:19090 AMOS_TCP_TOKEN=$TOKEN AMOS_RAG_EMBEDDER=mock AMOS_BACKEND=mock ./amos-ai-rag >amos-rag.log 2>&1 </dev/null &"
+adb shell "AMOS_TCP_TOKEN=$TOKEN /data/local/tmp/rag_once http://127.0.0.1:19090"
 ```
 
-`rag_once` accepts either a UDS path or an `http://host:port` (h2c). Observed
-on-device round-trip (mock embedder, no model): `indexed note:a dim=384` →
+`AMOS_TCP_ADDR` must be a **loopback** address: a non-loopback bind is refused at
+startup (`AMOS_TCP_ALLOW_REMOTE=1` is the explicit, warned override, and this transport
+has no TLS). `rag_once` accepts either a UDS path or an `http://host:port` (h2c).
+
+The **System UI** does not need any of this threaded through by hand: when it talks to the
+daemon over TCP it attaches the same header at its channel factory
+(`amos-tauri::daemon::TokenChannel`, REQ-A144), so every one of its RPCs presents the
+secret — and its UDS path deliberately does not, matching the daemon, which ignores the
+variable on that transport.
+Observed on-device round-trip (mock embedder, no model): `indexed note:a dim=384` →
 self-matching `query` returns the passage `score≈1.0` → `remove` → `indexed=0`.
 A real device deployment (AOSP `init.rc` service as system/root) can still use
 the Unix socket; the TCP mode is the adb-shell bring-up path.

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { batteryPercent, fmtClock, zoneClock, stopwatchReducer, stopwatchInit, fmtStopwatch, timerReducer, timerInit, fmtCountdown, alarmsReducer, alarmInit, ringingAlarms, alarmKey, dayAllowed, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, WORLD_CITY_MAX, defaultWorldCities, lapDeltas, fastestLap, slowestLap, moveWorldCity, alarmsByTime, nextAlarmAtMs, risingEdge, type Alarm } from "../lib/time";
+import { fmtClock, zoneClock, stopwatchReducer, stopwatchInit, fmtStopwatch, timerReducer, timerInit, fmtCountdown, DEFAULT_SNOOZE_MIN, alarmsReducer, alarmInit, ringingAlarms, alarmKey, dayAllowed, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, WORLD_CITY_MAX, defaultWorldCities, lapDeltas, fastestLap, slowestLap, moveWorldCity, alarmsByTime, nextAlarmAtMs, risingEdge, type Alarm } from "../lib/time";
 describe("time / status bar", () => {
   test("fmtClock pads hours/minutes", () => {
     expect(fmtClock(new Date(2024, 0, 1, 9, 5))).toBe("09:05");
@@ -25,11 +25,6 @@ describe("time / status bar", () => {
     expect(zoneClock(d1, "Asia/Tokyo")).toBe("09:00");
     expect(zoneClock(d2, "Asia/Tokyo")).toBe("09:05");
     expect(zoneClock(d1, "Asia/Tokyo")).toBe("09:00"); // repeats stay correct
-  });
-
-  test("batteryPercent counts down with the seconds", () => {
-    expect(batteryPercent(new Date(2024, 0, 1, 0, 0, 0))).toBe(100);
-    expect(batteryPercent(new Date(2024, 0, 1, 0, 0, 30))).toBe(70);
   });
 
   test("stopwatch reducer runs/pauses/resets and formats time", () => {
@@ -467,15 +462,18 @@ describe("risingEdge (one-shot transient cues)", () => {
 describe("alarm snoozeMin — per-alarm snooze length", () => {
   const at = (h: number, m: number) => new Date(2024, 0, 1, h, m, 0);
 
-  test("snooze uses the alarm's snoozeMin; absent falls back to 5", () => {
-    // Default (no snoozeMin) → +5 minutes (8:05).
+  test("snooze uses the alarm's snoozeMin; absent falls back to DEFAULT_SNOOZE_MIN", () => {
+    // The fallback is the exported constant, not a magic number — assert the tie
+    // so the reducer and the Clock editor can never drift apart.
+    expect(DEFAULT_SNOOZE_MIN).toBe(5);
+    // Default (no snoozeMin) → +DEFAULT_SNOOZE_MIN minutes (8:05).
     let s = alarmInit();
     s = alarmsReducer(s, { type: "add", hour: 8, min: 0, label: "" });
     const id = s.list[0]!.id;
     s = alarmsReducer(s, { type: "tick", now: at(7, 59) });
     s = alarmsReducer(s, { type: "tick", now: at(8, 0) });
     s = alarmsReducer(s, { type: "snooze", id, now: at(8, 0) });
-    expect(s.list[0]).toMatchObject({ hour: 8, min: 5 });
+    expect(s.list[0]).toMatchObject({ hour: 8, min: 0 + DEFAULT_SNOOZE_MIN });
 
     // snoozeMin 9 → +9 minutes (8:09).
     let s2 = alarmInit();

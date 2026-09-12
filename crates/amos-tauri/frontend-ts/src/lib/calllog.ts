@@ -100,6 +100,61 @@ export function recordCall(
   return [entry, ...list].slice(0, CALLLOG_CAP);
 }
 
+/**
+ * Calls that could not be **persisted yet** (REQ-A150).
+ *
+ * Why this exists: the incoming-call overlay appends its row at the moment the call ends,
+ * which is exactly when no screen is up to report a failure — so a rejected write used to
+ * cost that history row **silently**. A row that did not land is now kept here and
+ * retried by the next screen that can both write and speak (the Phone screen's history),
+ * and while it is still pending that screen says so.
+ *
+ * Honest boundary: this survives a *transient* failure (storage full then freed, store
+ * temporarily unavailable), **not** a reload — persisting the pending marker would need
+ * the very storage that just failed. A queued call is therefore also capped like the log.
+ */
+let pendingCalls: CallRecord[] = [];
+
+/** Queue a record whose write was rejected (bounded; invalid records are ignored). */
+export function queuePendingCall(rec: CallRecord | undefined): void {
+  if (!rec) return;
+  const clean = normalizeCallLog([rec]);
+  const first = clean[0];
+  if (!first) return; // no usable number ⇒ nothing to recover
+  // A repeated Ended event for the same call must not queue the row twice.
+  if (pendingCalls.some((p) => p.number === first.number && p.ts === first.ts)) return;
+  pendingCalls = [first, ...pendingCalls].slice(0, CALLLOG_CAP);
+}
+
+/** How many calls are still waiting to be written. */
+export function pendingCallCount(): number {
+  return pendingCalls.length;
+}
+
+/** Drop every pending call — test-only reset (production clears it through a flush). */
+export function resetPendingCallsForTest(): void {
+  pendingCalls = [];
+}
+
+/**
+ * Merge the pending calls into `list` and try to persist the result through `save`
+ * (the caller's checked write). Returns how many records **landed**: on success the queue
+ * is emptied, on failure it is left exactly as it was (nothing is dropped, nothing is
+ * claimed).
+ */
+export function flushPendingCalls(
+  list: CallRecord[],
+  save: (next: CallRecord[]) => boolean,
+): number {
+  if (pendingCalls.length === 0) return 0;
+  const queue = pendingCalls;
+  const next = normalizeCallLog([...queue, ...list]);
+  if (!save(next)) return 0;
+  // Only remove what we actually wrote (a concurrent queue() during the write stays).
+  pendingCalls = pendingCalls.filter((p) => !queue.includes(p));
+  return queue.length;
+}
+
 /** The most recent `n` *distinct* numbers (newest first), for a quick-dial strip.
  * `+CC` and bare forms of the same number count as one. */
 export function recentNumbers(list: CallRecord[], n: number): string[] {

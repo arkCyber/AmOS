@@ -3,6 +3,12 @@
 //! Thin wrapper over [`amos_int_cli::run`] that wires stdin/stdout and maps the
 //! session-driving logic (kept in the lib for testability) onto the process.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::process::ExitCode;
 
 use amos_int_cli::{run, USAGE};
@@ -19,6 +25,12 @@ async fn main() -> ExitCode {
     };
     if opts.help {
         println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if opts.version {
+        // Self-describing artifacts: the release bundle's `--version` is how a
+        // deployed binary is identified (scripts/release-artifacts.sh checks it).
+        println!("amos-int-cli {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
     match run(opts).await {

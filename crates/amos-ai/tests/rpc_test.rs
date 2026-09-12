@@ -172,6 +172,30 @@ async fn get_status_exposes_live_monitoring_metrics() {
     assert!(sys.battery.is_some(), "battery sub-block present");
     assert!(sys.processes.is_some(), "process sub-block present");
 
+    // Resource-gate + cache observability ride the same reply (REQ-A43/A44):
+    // the pool's capacity is a static nonzero bound with `available + in_flight
+    // == capacity` (never an over-admission), and the cache is off by default —
+    // reported honestly as enabled=false with zero counters, not a fake block.
+    let gp = s1
+        .generation_pool
+        .expect("generation_pool block present on get_status");
+    assert!(gp.capacity >= 1, "pool capacity is a static nonzero bound");
+    assert!(
+        gp.in_flight <= gp.capacity,
+        "in_flight must never exceed capacity"
+    );
+    assert_eq!(
+        gp.available + gp.in_flight,
+        gp.capacity,
+        "available + in_flight must equal capacity"
+    );
+    let rc = s1
+        .response_cache
+        .expect("response_cache block present on get_status");
+    assert!(!rc.enabled, "response cache is opt-in (off by default)");
+    assert_eq!((rc.hits, rc.misses, rc.stores), (0, 0, 0));
+    assert_eq!(rc.capacity, 0, "a disabled cache has no entries bound");
+
     let s2 = client
         .get_status(StatusRequest {})
         .await
@@ -267,4 +291,62 @@ async fn sensor_service_mounted_and_profile_exposed() {
 
     server.abort();
     let _ = std::fs::remove_file(&path);
+}
+
+/// The on-disk log sink is reported over the wire (REQ-A87): an operator must be able
+/// to see from `get_status` that the persisted trail exists — and how much of it went
+/// missing — without reading the daemon's stderr.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_status_reports_a_live_log_sink_over_uds() {
+    use std::io::Write;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    let dir: PathBuf = std::env::temp_dir().join(format!("amos-log-sink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let sink = amos_ai::logfile::TeeWriter::new(Some(amos_ai::logfile::LogFileConfig {
+        dir: dir.clone(),
+        max_bytes: 4096,
+        keep: 2,
+    }));
+    // The same writer the daemon's tracing subscriber uses.
+    {
+        let mut w = sink.make_writer();
+        w.write_all(b"daemon started\n").unwrap();
+        w.flush().unwrap();
+    }
+    let handle = sink.handle();
+
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-logsink-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        let _ = amos_ai::server::serve_with_log_sink(server_path, Some(handle)).await;
+    });
+    wait_for_socket(&path).await;
+    let mut client = connect(&path).await.expect("connect");
+
+    let status = client
+        .get_status(StatusRequest {})
+        .await
+        .expect("get_status")
+        .into_inner();
+    let ls = status.log_sink.expect("log_sink block present");
+    assert!(ls.enabled, "a live sink must be reported as enabled");
+    assert!(ls.path.ends_with("amos-ai.log"), "path: {}", ls.path);
+    assert!(
+        ls.bytes_written >= 15,
+        "bytes that really landed must be counted (got {})",
+        ls.bytes_written
+    );
+    assert_eq!(
+        (ls.lost_bytes, ls.write_failures),
+        (0, 0),
+        "nothing lost yet"
+    );
+    assert_eq!(ls.rotations, 0);
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
 }

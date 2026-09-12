@@ -123,7 +123,7 @@ pub async fn ask_daemon(
 /// re-handshaking per call; on an RPC failure the cache is invalidated and the
 /// next call reconnects, so daemon restarts are handled gracefully.
 pub struct AiBridge {
-    channel: Arc<Mutex<Option<tonic::transport::Channel>>>,
+    channel: Arc<Mutex<Option<crate::daemon::DaemonChannel>>>,
     /// Outbound sender of the currently-active bidirectional `Chat` stream, if
     /// any, so `cancel_ai_session` can push a `Cancel` mid-conversation.
     active_bidi: Arc<Mutex<Option<mpsc::Sender<ClientMessage>>>>,
@@ -159,6 +159,61 @@ fn creds_path() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".amos").join("ai.key"))
 }
 
+/// Persist the cloud API key to `path` with `0600`.
+///
+/// The key file is a **secret**, and its write used to be three silent discards
+/// (`create_dir_all`, `write`, `set_permissions`). Both failure modes matter to the user:
+/// a write that did not happen means the UI claimed the key was saved and it is gone after
+/// a restart ("switching cloud later needs no re-entry"), and a `chmod` that did not happen
+/// leaves the key readable by other users on the device. So both are errors here — and a
+/// file that could not be restricted is **removed** rather than left on disk (REQ-A147).
+pub fn persist_cloud_key(path: &std::path::Path, key: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+    }
+    std::fs::write(path, key.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            let removed = std::fs::remove_file(path);
+            return Err(match removed {
+                Ok(()) => format!(
+                    "cannot restrict {} to 0600 ({e}); the key was NOT persisted (the file was removed)",
+                    path.display()
+                ),
+                Err(rm) => format!(
+                    "cannot restrict {} to 0600 ({e}) and it could not be removed ({rm}) — \
+                     the key may be readable by other users; fix its permissions",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Persist the caller-provided cloud key and return a **user-visible** warning when that
+/// failed, or `None` on success. The backend switch itself is not blocked by a persistence
+/// failure (the key still reaches the daemon through the environment for this run), but the
+/// user is told — which is the whole point: the failure used to be invisible, and a
+/// `Result::Err` would have been invisible too, because the UI caller has no `.catch`.
+fn persist_cloud_key_reporting(path: Option<&std::path::Path>, key: &str) -> Option<String> {
+    match path {
+        // No credential path at all (no `AMOS_CRED_FILE`, no `HOME`): the key cannot be
+        // saved, which is exactly the claim the UI would otherwise make.
+        None => Some(
+            "⚠ no credential path configured (AMOS_CRED_FILE/HOME unset) — the API key was NOT persisted"
+                .to_string(),
+        ),
+        Some(path) => persist_cloud_key(path, key).err().map(|e| format!("⚠ {e}")),
+    }
+}
+
 /// One-click backend switch: runs `scripts/ai-backend.sh` which stops the current
 /// amos-ai and starts it with the selected provider (local Ollama | OpenAI |
 /// DeepSeek | custom OpenAI-compatible endpoint). `model`/`endpoint` carry the
@@ -185,16 +240,12 @@ pub async fn ai_backend_switch(
         // otherwise fall back to the 0600 key file (so switching cloud later,
         // or resuming after a restart, needs no re-entry).
         let mut effective = api_key;
+        // A credential that failed to persist (or could not be restricted to 0600) must be
+        // visible in the command's report; see `persist_cloud_key_reporting`.
+        let mut persist_warning: Option<String> = None;
         if cloud {
             if !effective.is_empty() {
-                if let Some(path) = cred.clone() {
-                    if let Some(dir) = path.parent() {
-                        let _ = std::fs::create_dir_all(dir);
-                    }
-                    let _ = std::fs::write(&path, effective.as_bytes());
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
+                persist_warning = persist_cloud_key_reporting(cred.as_deref(), &effective);
             } else if let Some(path) = cred {
                 if let Ok(s) = std::fs::read_to_string(&path) {
                     effective = s.trim().to_string();
@@ -219,17 +270,26 @@ pub async fn ai_backend_switch(
             }
         }
         let out = cmd.output();
+        // `persist_warning` is folded into whichever report the command returns: the user
+        // sees the daemon launch report *and* the fact that the key was not saved (or not
+        // restricted), instead of a success message that is quietly wrong.
+        let with_warning = |report: String| match &persist_warning {
+            Some(w) => format!("{report}\n{w}"),
+            None => report,
+        };
         match out {
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&o.stderr).to_string();
                 if o.status.success() {
-                    Ok(stdout.trim().to_string())
+                    Ok(with_warning(stdout.trim().to_string()))
                 } else {
-                    Err(format!("{stdout}\n{stderr}").trim().to_string())
+                    Err(with_warning(
+                        format!("{stdout}\n{stderr}").trim().to_string(),
+                    ))
                 }
             }
-            Err(e) => Err(format!("failed to run {script_s}: {e}")),
+            Err(e) => Err(with_warning(format!("failed to run {script_s}: {e}"))),
         }
     })
     .await
@@ -251,7 +311,7 @@ impl AiBridge {
     }
 
     /// Return the cached gRPC channel (shared by the AI and Android clients).
-    async fn connect_channel(&self) -> Result<tonic::transport::Channel, String> {
+    async fn connect_channel(&self) -> Result<crate::daemon::DaemonChannel, String> {
         if let Some(c) = self
             .channel
             .lock()
@@ -268,14 +328,16 @@ impl AiBridge {
     }
 
     /// Return an AI agent client, reusing the cached channel when healthy.
-    pub(crate) async fn connect(&self) -> Result<AiAgentClient<tonic::transport::Channel>, String> {
+    pub(crate) async fn connect(
+        &self,
+    ) -> Result<AiAgentClient<crate::daemon::DaemonChannel>, String> {
         Ok(AiAgentClient::new(self.connect_channel().await?))
     }
 
     /// Return an Android-manager client over the same shared channel.
     async fn connect_android(
         &self,
-    ) -> Result<AndroidManagerClient<tonic::transport::Channel>, String> {
+    ) -> Result<AndroidManagerClient<crate::daemon::DaemonChannel>, String> {
         Ok(AndroidManagerClient::new(self.connect_channel().await?))
     }
 
@@ -288,7 +350,7 @@ impl AiBridge {
 }
 
 /// Open a gRPC channel routed over the amos Unix Domain Socket.
-async fn build_channel() -> Result<tonic::transport::Channel, String> {
+async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
 
@@ -311,6 +373,91 @@ pub struct DaemonStatus {
     /// Resolved device-acceleration target of the local GGML engine, e.g.
     /// "android/nnapi" (empty when a non-local engine is serving).
     pub accelerator: String,
+    /// Generation admission pool live state + counters (REQ-A43); `None` on a
+    /// daemon too old to report it.
+    pub generation_pool: Option<GenerationPoolStatus>,
+    /// Inference-response cache counters (REQ-A44); `None` on an older daemon.
+    /// `enabled=false` when the cache is off (the default).
+    pub response_cache: Option<ResponseCacheStatus>,
+    /// On-disk log sink health (REQ-A87); `None` on a daemon too old to report it,
+    /// `enabled=false` when the daemon logs to stdout only.
+    pub log_sink: Option<LogSinkStatus>,
+    /// Backend circuit breaker state + decision counters (REQ-A131); `None` on a
+    /// daemon too old to report it. `enabled=false` means it is **not** in the
+    /// serving path — then `state` is empty rather than a fabricated "closed".
+    pub breaker: Option<BreakerStatus>,
+    /// Active threshold alerts (REQ-A133); `None` on an older daemon. An **empty**
+    /// list is the healthy state — absence of the block means "not reported", which is
+    /// why the two are not the same thing to a caller.
+    pub alerts: Option<Vec<AlertStatus>>,
+}
+
+/// Serializable mirror of one daemon `Alert` (REQ-A133): what is wrong, how bad, and
+/// how long *this daemon* has seen it (not how long the problem existed).
+#[derive(Clone, Debug, Serialize)]
+pub struct AlertStatus {
+    pub id: String,
+    pub severity: String,
+    pub detail: String,
+    pub active_for_seconds: u64,
+}
+
+/// Serializable mirror of the daemon `BreakerMetrics` (REQ-A131), so the AI page can
+/// show that the backend is being skipped *on purpose* — and how often.
+#[derive(Clone, Debug, Serialize)]
+pub struct BreakerStatus {
+    pub enabled: bool,
+    /// "closed" | "open" | "half_open"; "" when not in the serving path.
+    pub state: String,
+    pub fail_threshold: u32,
+    pub cooldown_seconds: u64,
+    pub consecutive_failures: u32,
+    pub openings: u64,
+    pub rejections: u64,
+    pub failures: u64,
+    pub successes: u64,
+}
+
+/// Serializable mirror of the daemon `LogSinkMetrics` (REQ-A87): whether the
+/// persisted log trail exists, where, and how much of it failed to land.
+#[derive(Clone, Debug, Serialize)]
+pub struct LogSinkStatus {
+    pub enabled: bool,
+    pub path: String,
+    pub bytes_written: u64,
+    pub lost_bytes: u64,
+    pub write_failures: u64,
+    pub rotations: u64,
+    pub active_bytes: u64,
+}
+
+/// Serializable mirror of the daemon `GenerationPoolMetrics` (REQ-A43), so the
+/// diagnostics UI can show concurrent-generation headroom + rejection reasons.
+#[derive(Clone, Debug, Serialize)]
+pub struct GenerationPoolStatus {
+    pub capacity: u32,
+    pub in_flight: u32,
+    pub available: u32,
+    pub acquired_total: u64,
+    pub rejected_saturated: u64,
+    pub rejected_timeout: u64,
+    pub wait_ms: u64,
+}
+
+/// Serializable mirror of the daemon `ResponseCacheMetrics` (REQ-A44). When the
+/// cache is disabled every counter is an honest zero (never fabricated).
+#[derive(Clone, Debug, Serialize)]
+pub struct ResponseCacheStatus {
+    pub enabled: bool,
+    pub capacity: u32,
+    pub ttl_seconds: u64,
+    pub entries: u32,
+    pub hits: u64,
+    pub misses: u64,
+    pub stores: u64,
+    pub evicted: u64,
+    pub expired: u64,
+    pub oversized: u64,
 }
 
 /// Serializable mirror of the daemon `SessionInfo` so the frontend can render a
@@ -434,6 +581,58 @@ pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, String> {
                     degraded: r.degraded,
                     asr: r.asr,
                     accelerator: r.accelerator,
+                    generation_pool: r.generation_pool.map(|g| GenerationPoolStatus {
+                        capacity: g.capacity,
+                        in_flight: g.in_flight,
+                        available: g.available,
+                        acquired_total: g.acquired_total,
+                        rejected_saturated: g.rejected_saturated,
+                        rejected_timeout: g.rejected_timeout,
+                        wait_ms: g.wait_ms,
+                    }),
+                    response_cache: r.response_cache.map(|c| ResponseCacheStatus {
+                        enabled: c.enabled,
+                        capacity: c.capacity,
+                        ttl_seconds: c.ttl_seconds,
+                        entries: c.entries,
+                        hits: c.hits,
+                        misses: c.misses,
+                        stores: c.stores,
+                        evicted: c.evicted,
+                        expired: c.expired,
+                        oversized: c.oversized,
+                    }),
+                    log_sink: r.log_sink.map(|l| LogSinkStatus {
+                        enabled: l.enabled,
+                        path: l.path,
+                        bytes_written: l.bytes_written,
+                        lost_bytes: l.lost_bytes,
+                        write_failures: l.write_failures,
+                        rotations: l.rotations,
+                        active_bytes: l.active_bytes,
+                    }),
+                    breaker: r.breaker.map(|b| BreakerStatus {
+                        enabled: b.enabled,
+                        state: b.state,
+                        fail_threshold: b.fail_threshold,
+                        cooldown_seconds: b.cooldown_seconds,
+                        consecutive_failures: b.consecutive_failures,
+                        openings: b.openings,
+                        rejections: b.rejections,
+                        failures: b.failures,
+                        successes: b.successes,
+                    }),
+                    alerts: r.alerts.map(|a| {
+                        a.alerts
+                            .into_iter()
+                            .map(|x| AlertStatus {
+                                id: x.id,
+                                severity: x.severity,
+                                detail: x.detail,
+                                active_for_seconds: x.active_for_seconds,
+                            })
+                            .collect()
+                    }),
                 });
             }
             Err(e) => {
@@ -797,7 +996,17 @@ pub async fn launch_android_app(
                 // System window behind.
                 let label = legacy_surface_label(r.success, &r.window_id).unwrap_or_default();
                 if !label.is_empty() {
-                    let _ = wm.open_surface(&label);
+                    // The launch succeeded in the container; if the window manager cannot
+                    // take the surface, the app is running with nothing on screen — say so
+                    // instead of returning a result that looks complete (REQ-A147).
+                    if let Err(e) = wm.open_surface(&label) {
+                        tracing::warn!(
+                            label = %label,
+                            error = %e,
+                            "the launched container surface could not be registered with \
+                             the window manager; the app is running but not shown"
+                        );
+                    }
                 }
                 return Ok(AndroidLaunchResult {
                     success: r.success,
@@ -896,7 +1105,10 @@ pub async fn android_lmk_tasks(
 
 #[cfg(test)]
 mod tests {
-    use super::{legacy_surface_label, merge_system_selection};
+    use super::{
+        legacy_surface_label, merge_system_selection, persist_cloud_key,
+        persist_cloud_key_reporting,
+    };
     use crate::clipboard::GlobalClipboard;
     use crate::wm::SystemContext;
     use std::collections::HashMap;
@@ -960,5 +1172,53 @@ mod tests {
         // Defensive: a success that somehow carried no window id must not map to
         // the degenerate `legacy:` label either.
         assert_eq!(legacy_surface_label(true, ""), None);
+    }
+
+    /// The cloud API key is a secret kept in a 0600 file (REQ-A147). Its write used to be
+    /// three silent discards, so a file that was never written — or written but left
+    /// readable by other users — was indistinguishable from success.
+    #[test]
+    fn a_persisted_cloud_key_is_written_and_restricted_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("amos-creds-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("ai.key"); // parent must be created too
+
+        persist_cloud_key(&path, "sk-secret").expect("persist");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sk-secret");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the key file must not be group/other readable");
+
+        // …and a successful persist raises no user-visible warning.
+        assert!(persist_cloud_key_reporting(Some(&path), "sk-secret").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cloud_key_that_cannot_be_persisted_is_reported_not_swallowed() {
+        let dir = std::env::temp_dir().join(format!("amos-creds-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory where the key file should be: `fs::write` fails.
+        let path = dir.join("as-a-directory");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = persist_cloud_key(&path, "sk-secret").expect_err("write must fail");
+        assert!(
+            err.contains(&path.display().to_string()),
+            "the error must name the file: {err}"
+        );
+        let warned = persist_cloud_key_reporting(Some(&path), "sk-secret")
+            .expect("a failed persist must produce a user-visible warning");
+        assert!(
+            warned.starts_with('⚠') && warned.contains("cannot write"),
+            "{warned}"
+        );
+
+        // No credential path configured is *also* a silence worth breaking: the UI would
+        // otherwise claim the key was saved.
+        let none = persist_cloud_key_reporting(None, "sk-secret").expect("warning");
+        assert!(none.contains("NOT persisted"), "{none}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

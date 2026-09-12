@@ -27,6 +27,20 @@ export function screenHeld(): boolean {
   return reasons.size > 0;
 }
 
+/**
+ * Whether an active media playback should keep the screen on.
+ *
+ * **Video yes, music no**: a foreground video must not blank mid-scene, while a
+ * playing audio track is deliberately *not* a hold — a music player letting the
+ * display sleep is the expected behaviour (see docs/display-idle.md §6).
+ */
+export function videoHoldActive(
+  playing: boolean,
+  kind: string | null | undefined,
+): boolean {
+  return playing === true && kind === "video";
+}
+
 /** Active hold reasons, ascending (diagnostics / logging). */
 export function heldReasons(): string[] {
   return [...reasons].sort();

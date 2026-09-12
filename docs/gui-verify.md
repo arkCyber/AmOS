@@ -43,9 +43,9 @@ scripts/dev.sh
 
 | # | 操作 | 预期结果 |
 |---|---|---|
-| D1 | 打开「备忘录」,写一条笔记,点该笔记的「发送到 AI」 | 笔记文本经 `system_set_context` 注入到 AI 窗口,并 `wm_open('ai')` 聚焦 AI 窗口 |
-| D2 | 观察 AI 窗口顶部提示 | 显示「已附加系统上下文(来自 notes)：…」(`system_peek_context`) |
-| D3 | 在 AI 助手发送消息 | `AgentRequest.context["system_selection"]` 带上该文本(可在 `amos-ai` 侧日志确认) |
+| D1 | 打开「备忘录」，写/点开一条笔记，展开后在编辑工具条点「✦ 发送到 AI」（`appLinks.sendToAi`） | 笔记文本经 `system_set_context(target="ai", source="notes", text)` 附加到 AI 窗口，并切到 AI 屏（`shellState.open("ai")`）。**离线**（无桥）则不附加任何东西，AI 屏也不会显示提示 |
+| D2 | 观察 AI 屏消息区上方的提示条 | 显示「已附加系统上下文（来自 notes）：…」（`system_peek_context`，多行笔记折叠成一行预览）；点 ✕ 调 `system_clear_context` 并立即消失。**没有附加上下文时不显示任何东西**（`null` 既可能是「没附加」也可能是「问不到」，故不作任何声明） |
+| D3 | 在 AI 助手发送消息 | `chat_agent` 把该项 merge 进 `AgentRequest.context["system_selection"]` 并**消费**它；发送后提示条自行消失（前端重新 peek）。若从未附加过任何 per-window 项，`chat_agent` 会回退到**全局剪贴板最新文本**（此时屏上不显示任何提示——前端不对该回退做声明） |
 
 > Waydroid/安卓侧的多窗口核对见 `docs/android-compat.md` 末尾「验证：Waydroid 侧的多窗口行为」。
 
@@ -53,6 +53,8 @@ scripts/dev.sh
 
 - 建窗/聚焦不对 → 查 `amos-wm` 状态机(运行 `cargo test -p amos-wm`);适配层在
   `crates/amos-tauri/src/wm.rs` 的 `apply(&WmEvent)`。
-- 跨窗口不同步 → 确认两端都调用过 `listenStore()`(frontend-ts `lib/amosStore`);写路径是否走
-  `storeWrite`(settings/nc 已迁移);Rust 侧 `store.rs` 是否广播。
+- 跨窗口不同步 → 确认写路径真的调了 `store_set`（`lib/amosStore.writeStoreValue` →
+  `lib/backend.systemStoreSet`；历史上这里走的是**从未被注入**的 `window.Amos.storeWrite`，
+  于是透写静默失效，REQ-A101）；读回确认 `svelte/store.ts` 的 `createStoreValue` 订阅了
+  `store-updated`；Rust 侧 `store.rs` 是否广播。
 - 每次改完代码重新跑 `make lint` + `make test`。

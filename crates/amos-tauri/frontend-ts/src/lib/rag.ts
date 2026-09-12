@@ -117,8 +117,14 @@ export async function ragStatus(): Promise<RagStatus | null> {
   return parseRagStatus(await invoke("rag_status", {}));
 }
 
+/** Retrieve the nearest indexed passages; `topK` is the wire key Tauri looks up. */
 export async function ragQuery(query: string, topK = RAG_DEFAULT_TOP_K): Promise<RagQueryResult | null> {
-  return parseRagQuery(await invoke("rag_query", { query, top_k: normalizeTopK(topK) }));
+  // `topK`, not `top_k`: the Rust parameter is `top_k: u32` and Tauri resolves a
+  // command argument by its lowerCamelCase name, so a `top_k` key was a plain
+  // `missing required key topK` error — every retrieval returned `null` ("search
+  // offline") while the UI, the unit tests (they only saw the command name) and
+  // every gate stayed green. Pinned by scripts/tauri-args-scan.mjs + rag.test.ts.
+  return parseRagQuery(await invoke("rag_query", { query, topK: normalizeTopK(topK) }));
 }
 
 export async function ragIndex(id: string, text: string): Promise<RagIndexReply | null> {

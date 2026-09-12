@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildCitedSnippet,
   buildRagPrompt,
+  hitSourceLabel,
   initialRagUi,
   noteIdFromRagId,
   noteRagId,
@@ -100,5 +101,21 @@ describe("ragUiReducer state machine", () => {
 
   test("ask_done returns to idle only from asking", () => {
     expect(ragUiReducer(initialRagUi, { type: "ask_done" })).toBe(initialRagUi);
+  });
+});
+
+describe("hitSourceLabel (citation label)", () => {
+  test("uses the note's title when the hit maps to a present note", () => {
+    expect(hitSourceLabel("note:a", [note("a", "预算清单\n详细内容")])).toBe("预算清单");
+  });
+
+  test("falls back to the note id when the note is gone (stale index entry)", () => {
+    expect(hitSourceLabel("note:gone", [note("a", "x")])).toBe("gone");
+  });
+
+  test("returns the raw id for a non-note source (e.g. a future pdf:) and for a titleless note", () => {
+    expect(hitSourceLabel("pdf:doc#p1", [])).toBe("pdf:doc#p1");
+    // A note whose title is empty falls back to its id (never an empty label).
+    expect(hitSourceLabel("note:b", [note("b", "   ")])).toBe("b");
   });
 });

@@ -130,9 +130,11 @@ cargo build -p amos-audio --features aaudio  --target aarch64-linux-android --re
   `AudioEnd` 时计数仍可能是 0——一个真实的一致性竞态，也表现为该路径单测在负载下偶发失败）。
   设备 AAudio seam 只需把 `AAudioCapture::open(16000)` 传入。已纳入 `gated-check`
   （`cargo test -p amos-tauri --test assistant_voice_e2e`）。
-- 前端（打通桥层）：`lib/audio.ts` `encodeF32le`/`frameToAssistantChunk`，
-  `lib/voice.ts` `pcmToAssistantChunk`/`parseVoiceEvent`，`lib/backend.ts`
-  `assistantVoiceStart/Feed/End/Stop`；`voice.test.ts` 新增单测。
+- 前端（打通桥层）：`lib/audio.ts` `encodeF32le`（16k 下采样 + LE f32 字节，供
+  `lib/voice.ts::pcmToAssistantChunk` 使用——这是**唯一**喂 `assistant_voice_feed` 的
+  路径，`frameToAssistantChunk` 已随重复实现删除），`lib/voice.ts`
+  `pcmToAssistantChunk`/`parseVoiceEvent`，`lib/backend.ts`
+  `assistantVoiceStart/Feed/End/Stop`；`voice.test.ts` 有新单测。
 
 ## 下一步（超出本次）
 

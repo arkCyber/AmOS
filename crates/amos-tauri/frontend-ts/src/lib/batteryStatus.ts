@@ -83,18 +83,6 @@ export function firstBattery(
   return EMPTY_BATTERY;
 }
 
-/**
- * Resolve the single best reading with explicit precedence: the daemon's
- * system-health block is authoritative when it carries a level; otherwise fall
- * back to the host sample. Pure + deterministic.
- */
-export function resolveBattery(
-  system: BatteryLike | null | undefined,
-  host: BatterySample | null | undefined,
-): BatterySample {
-  return firstBattery([system, host]);
-}
-
 /* ---- host Battery API (navigator.getBattery) — REAL OS battery, guarded ---- */
 
 interface HostBatteryManager {

@@ -35,7 +35,8 @@ pub struct LmkSurfacePayload {
     pub close_surface: bool,
 }
 
-async fn build_android_client() -> Result<AndroidManagerClient<tonic::transport::Channel>, String> {
+async fn build_android_client() -> Result<AndroidManagerClient<crate::daemon::DaemonChannel>, String>
+{
     Ok(AndroidManagerClient::new(crate::daemon::channel().await?))
 }
 
@@ -85,6 +86,8 @@ async fn lmk_round(app: AppHandle) -> Result<(), String> {
 pub fn spawn_lmk_watch(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut backoff_ms: u64 = WATCH_BACKOFF_BASE_MS;
+        // Runs for the lifetime of the app: the loop has no exit and is aborted with
+        // the Tauri runtime when the app stops. `sleep()` is the wait (never a spin).
         loop {
             // `Ok` means the round opened a live stream (daemon reachable) before
             // it ended — reset the backoff so the next reconnect is immediate.

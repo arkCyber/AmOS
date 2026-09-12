@@ -2,7 +2,7 @@
  * Pure unit tests for the offline-safe AmOS terminal line model (lib/terminal.ts).
  */
 import { describe, expect, test } from "bun:test";
-import { runTermLine, pushHistory, capLines, termBanner } from "../lib/terminal";
+import { runTermLine, pushHistory, capLines, termBanner, ptySizeFor } from "../lib/terminal";
 
 const last = (ls: unknown[]): unknown => ls[ls.length - 1];
 const lastText = (ls: readonly { text: string }[]): string | undefined =>
@@ -78,5 +78,37 @@ describe("terminal scrollback", () => {
     expect(capped[0]).toEqual({ text: "L10", kind: "out" });
     expect(capped[9]).toEqual({ text: "L19", kind: "out" });
     expect(capLines([], 5)).toEqual([]);
+  });
+});
+
+describe("terminal PTY window size", () => {
+  test("converts the content box + cell metrics to cols/rows", () => {
+    // 800×400 content box, 8×16 cells → 100 cols / 25 rows.
+    expect(ptySizeFor({ width: 800, height: 400, charW: 8, charH: 16 })).toEqual({
+      cols: 100,
+      rows: 25,
+    });
+    // Partial cells are dropped (a terminal can't use half a cell).
+    expect(ptySizeFor({ width: 807, height: 415, charW: 8, charH: 16 })).toEqual({
+      cols: 100,
+      rows: 25,
+    });
+  });
+
+  test("clamps to sane minimums instead of reporting a degenerate grid", () => {
+    expect(ptySizeFor({ width: 40, height: 20, charW: 8, charH: 16 })).toEqual({
+      cols: 20,
+      rows: 4,
+    });
+    expect(
+      ptySizeFor({ width: 800, height: 400, charW: 8, charH: 16, minCols: 40, minRows: 10 }),
+    ).toEqual({ cols: 100, rows: 25 });
+  });
+
+  test("returns null when the geometry is not measurable (never invents a size)", () => {
+    // happy-dom / a detached node measures 0 → the host keeps its 120×24 default.
+    expect(ptySizeFor({ width: 0, height: 400, charW: 8, charH: 16 })).toBeNull();
+    expect(ptySizeFor({ width: 800, height: 400, charW: 0, charH: 16 })).toBeNull();
+    expect(ptySizeFor({ width: 800, height: NaN, charW: 8, charH: 16 })).toBeNull();
   });
 });

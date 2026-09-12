@@ -1,0 +1,32 @@
+[
+  {
+    "path": "src/lib/wm.ts",
+    "module": true,
+    "reason": "Multi-window split-layout bridge for the Rust `wm_*` commands. The bridge + its pure placement helpers are complete and unit-tested, but no Svelte surface renders a split yet (the shell is single-surface). Wiring is the split-screen UI work tracked in docs/multi-window.md; keep until that surface lands."
+  },
+  {
+    "path": "src/lib/bundle.ts",
+    "module": true,
+    "reason": "Pure helpers that inline a store web-bundle into one `srcdoc` document. Needs a real web-bundle runtime host (the `amos-app://` / appstore serve seam) which does not exist yet; deliberately pure and host-free (docs/appstore.md)."
+  },
+  {
+    "path": "src/lib/sandboxBridge.ts",
+    "module": true,
+    "reason": "Deny-by-default capability decision seam for sandboxed web-bundles. Its own docs state that wiring it into a real postMessage listener / origin host is device/ecosystem work (docs/permissions-sandbox-audit-plan.md Phase 3) and intentionally not faked."
+  },
+  {
+    "path": "src/lib/externalFiles.ts",
+    "module": true,
+    "reason": "Read-only view model for standard Android collections served by the media_* bridge. Awaits the Files screen's external-collection section; until then it is a documented, tested library surface ('Wire: crates/amos-media -> media_list -> this lib')."
+  },
+  {
+    "path": "src/svelte/cellularRadio.ts",
+    "name": "setCellularRadio",
+    "reason": "Install a REAL cellular radio+signal reading into the Notification Center store. There is no host yet: amos-tauri exposes no cellular-signal command, so the store stays at the honest `absent` default ('no modem' → no bars). This is device bring-up (Android TelephonyManager/RadioSignal on the Rust side); wiring it now would fabricate a signal source."
+  },
+  {
+    "path": "src/svelte/cellularRadio.ts",
+    "name": "clearCellularRadio",
+    "reason": "Teardown half of setCellularRadio: restore the honest `absent` default. Same missing host as setCellularRadio — it becomes reachable only once a device radio source installs one."
+  }
+]

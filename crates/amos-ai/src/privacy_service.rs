@@ -287,9 +287,22 @@ pub fn server(
 
 /// Bootstrap the authoritative manager + persistence from the environment:
 /// `AMOS_PRIVACY_PATH` (if set) is loaded if present (else a fresh deny-by-default
-/// manager) and every decision is mirrored to the durable unified audit file at
-/// `<path>.jsonl`. Unset ⇒ fresh in-memory manager, no persistence.
+/// manager) and every decision is mirrored to the daemon's **shared** durable
+/// audit trail (see [`crate::audit::shared_trail_from_env`]): `AMOS_AUDIT_PATH`,
+/// else `<AMOS_PRIVACY_PATH>.jsonl`. Unset ⇒ fresh in-memory manager, no
+/// persistence and no audit trail.
 pub fn bootstrap() -> (Arc<PrivacyManager>, Option<PathBuf>) {
+    bootstrap_with_sink(crate::audit::shared_trail_from_env())
+}
+
+/// Same as [`bootstrap`], but takes the daemon's shared durable audit sink from
+/// the caller instead of resolving it here, so the **same** sink instance is
+/// handed to the security layer too — one trail, one read-back.
+///
+/// `None` ⇒ the manager is memory-only (no trail): callers must surface that
+/// honestly (`RecordAudit` answers `ok = false`, `RecentTrail` answers
+/// `durable = false`) rather than implying a trail exists.
+pub fn bootstrap_with_sink(shared: Option<AuditFile>) -> (Arc<PrivacyManager>, Option<PathBuf>) {
     match std::env::var_os("AMOS_PRIVACY_PATH").map(PathBuf::from) {
         Some(p) => {
             let mut manager = match PrivacyManager::load(&p) {
@@ -302,21 +315,26 @@ pub fn bootstrap() -> (Arc<PrivacyManager>, Option<PathBuf>) {
                     PrivacyManager::new(2048)
                 }
             };
-            let audit_path = p.with_extension("jsonl");
-            let sink = match AuditFile::open(&audit_path, 2048) {
-                Ok(s) => s,
-                Err(e) => {
+            manager = match shared {
+                Some(sink) => manager.with_durable_audit(sink),
+                None => {
                     tracing::warn!(
-                        "could not open privacy audit {}: {e:#}; memory-only",
-                        audit_path.display()
+                        "no shared audit trail configured; privacy audit is memory-only"
                     );
-                    AuditFile::memory(2048)
+                    manager
                 }
             };
-            manager = manager.with_durable_audit(sink);
             (Arc::new(manager), Some(p))
         }
-        None => (Arc::new(PrivacyManager::new(2048)), None),
+        None => {
+            // No privacy-state file: grants are ephemeral, but the audit trail can
+            // still be durable when `AMOS_AUDIT_PATH` is set.
+            let manager = match shared {
+                Some(sink) => PrivacyManager::with_audit_file(2048, sink),
+                None => PrivacyManager::new(2048),
+            };
+            (Arc::new(manager), None)
+        }
     }
 }
 #[cfg(test)]

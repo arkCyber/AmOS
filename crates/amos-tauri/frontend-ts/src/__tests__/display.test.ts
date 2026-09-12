@@ -1,14 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
-  asScreenState,
   autoOffDue,
   clampAutoOffSec,
-  dueForAutoSleep,
   idleElapsedSec,
-  isOn,
   AUTOOFF_STORE_KEY,
   WAKE_HOME_KEY,
   WAKE_HOME_MIN_MS,
+  makeWakeHomeGate,
   wakeHomeDue,
   wakeHomeEnabled,
 } from "../lib/display";
@@ -55,17 +53,75 @@ describe("wakeHomeEnabled (wake → dock policy)", () => {
   });
 });
 
-describe("display screen-state helpers", () => {
-  it("isOn / asScreenState round-trip the canonical on/off", () => {
-    expect(isOn("on")).toBe(true);
-    expect(isOn("off")).toBe(false);
-    expect(asScreenState("off")).toBe("off");
-    expect(asScreenState("on")).toBe("on");
-    // Unknown values degrade conservatively to "on" (never claim it's off).
-    expect(asScreenState(undefined)).toBe("on");
-    expect(asScreenState("")).toBe("on");
+describe("makeWakeHomeGate (live wake → dock gate)", () => {
+  function gateAt(now: { t: number }) {
+    let fired = 0;
+    const gate = makeWakeHomeGate({
+      enabled: () => true,
+      now: () => now.t,
+      wakeHome: () => (fired += 1),
+    });
+    return { gate, fired: () => fired };
+  }
+
+  it("does not fire a return without a preceding leave", () => {
+    const now = { t: 1000 };
+    const { gate, fired } = gateAt(now);
+    gate.onReturn();
+    expect(fired()).toBe(0);
   });
 
+  it("fires home after an absence long enough to be a real wake", () => {
+    const now = { t: 1000 };
+    const { gate, fired } = gateAt(now);
+    gate.onLeave();
+    now.t = 1000 + WAKE_HOME_MIN_MS;
+    gate.onReturn();
+    expect(fired()).toBe(1);
+  });
+
+  it("ignores a brief absence (notification peek / focus steal)", () => {
+    const now = { t: 1000 };
+    const { gate, fired } = gateAt(now);
+    gate.onLeave();
+    now.t = 1000 + (WAKE_HOME_MIN_MS - 1);
+    gate.onReturn();
+    expect(fired()).toBe(0);
+  });
+
+  it("fires at most once per leave (double return is a no-op)", () => {
+    const now = { t: 1000 };
+    const { gate, fired } = gateAt(now);
+    gate.onLeave();
+    now.t = 5000;
+    gate.onReturn();
+    gate.onReturn(); // e.g. both visibilitychange and focus fire
+    expect(fired()).toBe(1);
+  });
+
+  it("respects the live preference: disabled never fires, even after a long absence", () => {
+    let enabled = false;
+    let fired = 0;
+    let t = 1000;
+    const gate = makeWakeHomeGate({
+      enabled: () => enabled,
+      now: () => t,
+      wakeHome: () => (fired += 1),
+    });
+    gate.onLeave();
+    t = 5000;
+    gate.onReturn(); // disabled → no fire despite the long absence
+    expect(fired).toBe(0);
+    // Toggling on then doing leave/return fires.
+    enabled = true;
+    gate.onLeave();
+    t = 9000;
+    gate.onReturn();
+    expect(fired).toBe(1);
+  });
+});
+
+describe("display screen-state helpers", () => {
   it("clamps the idle timeout and treats <=0 as disabled", () => {
     expect(clampAutoOffSec(0)).toBe(0);
     expect(clampAutoOffSec(-5)).toBe(0);
@@ -97,24 +153,5 @@ describe("display screen-state helpers", () => {
 
   it("exports the durable auto-off store key", () => {
     expect(AUTOOFF_STORE_KEY).toBe("amos.displayAutoOffSec");
-  });
-});
-
-describe("dueForAutoSleep (live shell auto-off)", () => {
-  it("is due only when idle elapses and no call holds the screen", () => {
-    // Disabled / not yet idle → not due.
-    expect(dueForAutoSleep(0, 999, 0, false)).toBe(false);
-    expect(dueForAutoSleep(0, 9, 10, false)).toBe(false);
-    // Idle elapses → due.
-    expect(dueForAutoSleep(0, 10, 10, false)).toBe(true);
-  });
-
-  it("an active call holds the screen no matter how long idle", () => {
-    expect(dueForAutoSleep(0, 10, 10, true)).toBe(false);
-    expect(dueForAutoSleep(0, 60_000, 1, true)).toBe(false);
-  });
-
-  it("releases the hold when the call ends", () => {
-    expect(dueForAutoSleep(0, 10, 10, false)).toBe(true);
   });
 });

@@ -7,6 +7,7 @@ import {
   releaseHold,
   resetHoldBusForTest,
   screenHeld,
+  videoHoldActive,
 } from "../lib/keepAwakeCore";
 
 describe("keep-awake reason bus", () => {
@@ -49,5 +50,16 @@ describe("keep-awake reason bus", () => {
     expect(count).toBe(2); // unsubscribed → not notified
     clearAllHolds();
     resetHoldBusForTest();
+  });
+
+  test("videoHoldActive: playing video holds, music/paused/unknown does not", () => {
+    expect(videoHoldActive(true, "video")).toBe(true);
+    // Music must never hold the screen (a music player should let it sleep).
+    expect(videoHoldActive(true, "audio")).toBe(false);
+    // Paused video does not hold.
+    expect(videoHoldActive(false, "video")).toBe(false);
+    // No active track / unknown kind is honest "no hold".
+    expect(videoHoldActive(true, null)).toBe(false);
+    expect(videoHoldActive(true, undefined)).toBe(false);
   });
 });

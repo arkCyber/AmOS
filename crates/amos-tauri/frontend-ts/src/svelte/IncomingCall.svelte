@@ -14,9 +14,14 @@
     telephonyStopRecording,
     type TelephonyCall,
   } from "../lib/backend";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import { iconSvg } from "../lib/sysIcons";
-  import { CALLLOG_KEY, normalizeCallLog, recordCall } from "../lib/calllog";
+  import {
+    CALLLOG_KEY,
+    normalizeCallLog,
+    queuePendingCall,
+    recordCall,
+  } from "../lib/calllog";
   import { CONTACTS_KEY, contactNameFor, normalizeContacts, type Contact } from "../lib/contacts";
   import { callerDisplayLabel, hasPeerNumber } from "../lib/callDisplay";
 
@@ -56,10 +61,14 @@
         if (surfacedId === c.id && c.peer) {
           const prev = normalizeCallLog(readStoreValue<unknown>(CALLLOG_KEY, []));
           const label = contactNameFor(contacts, c.peer) ?? c.peer;
-          writeStoreValue(
-            CALLLOG_KEY,
-            recordCall(prev, c.peer, label, Date.now(), answered ? "incoming" : "missed"),
-          );
+          const next = recordCall(prev, c.peer, label, Date.now(), answered ? "incoming" : "missed");
+          // The overlay is closing, so this is the one place with nobody to tell — and the
+          // reason a rejected write used to lose the row for good. It is now queued in
+          // memory and flushed (with an honest notice) by the Phone screen's history, which
+          // is where the user would look for it (REQ-A150).
+          if (!writeStoreValueChecked(CALLLOG_KEY, next)) {
+            queuePendingCall(next[0]);
+          }
         }
         surfacedId = null;
         answered = false;

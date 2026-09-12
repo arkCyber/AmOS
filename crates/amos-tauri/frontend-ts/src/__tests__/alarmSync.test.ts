@@ -13,7 +13,7 @@ import {
   pruneRung,
   ringsToNotifs,
   syncDueAlarmAlerts,
-} from "../lib/alarmNotify";
+} from "../lib/alarmCore";
 import { NOTIF_KEY } from "../lib/settings";
 import type { Alarm } from "../lib/time";
 
@@ -38,7 +38,7 @@ afterEach(() => {
   window.localStorage.removeItem(NOTIF_KEY);
 });
 
-describe("alarmNotify — OS-level due alarms", () => {
+describe("alarmCore — OS-level due alarms", () => {
   test("collectDueRings returns exactly the enabled alarms whose HH:MM just arrived", () => {
     const alarms = [
       al({ id: "due", hour: 8, min: 0, label: "起床" }), // 08:00 now → rings

@@ -295,6 +295,64 @@ impl From<&TrashEntry> for TrashOut {
     }
 }
 
+/// Outcome of one trash request — the **three honest states** the UI renders
+/// (docs/sms.md §13): the row is hidden now, the provider refused (blocked sender
+/// / storage error), or the id is no longer in the folder the user was looking at
+/// (their list went stale). Refusals are **not** errors: nothing is broken and
+/// nothing was stored, so the UI must be able to say which of the three happened.
+///
+/// Wire shape (snake_case; the only key Tauri does not touch is the *value*):
+/// `{"trashed":true}` · `{"trashed":false,"reason":"…"}` ·
+/// `{"trashed":false,"not_found":true}`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum TrashAddOut {
+    /// Hidden from every AmOS surface from now on (the platform store is untouched).
+    Trashed { trashed: bool },
+    /// The provider refused; `reason` is the domain's own message (for the UI/log).
+    Refused { trashed: bool, reason: String },
+    /// The message id was not in the folder read — the list the user tapped is stale.
+    NotFound { trashed: bool, not_found: bool },
+}
+
+impl TrashAddOut {
+    fn trashed() -> Self {
+        Self::Trashed { trashed: true }
+    }
+    fn refused(reason: String) -> Self {
+        Self::Refused {
+            trashed: false,
+            reason,
+        }
+    }
+    fn not_found() -> Self {
+        Self::NotFound {
+            trashed: false,
+            not_found: true,
+        }
+    }
+}
+
+/// Why trashing changed nothing. Kept apart from [`TrashOut`] so the *command* can
+/// answer the three-state contract above, while the core stays a pure function
+/// whose success value is the stored entry (the bridge's tests assert on it).
+#[derive(Clone, Debug, PartialEq)]
+enum TrashReject {
+    /// The id is not in the folder read (the user's list went stale).
+    NotFound,
+    /// The provider/domain refused — a human-readable reason for the UI and logs.
+    Refused(String),
+}
+
+/// Map a core outcome to the wire contract (pure, so it is directly testable).
+fn trash_outcome(result: Result<TrashOut, TrashReject>) -> TrashAddOut {
+    match result {
+        Ok(_) => TrashAddOut::trashed(),
+        Err(TrashReject::NotFound) => TrashAddOut::not_found(),
+        Err(TrashReject::Refused(reason)) => TrashAddOut::refused(reason),
+    }
+}
+
 /// Process-global trash state (shared by the four `sms_trash_*` commands and
 /// the two read commands that must honor it).
 pub struct SmsTrashState {
@@ -448,14 +506,14 @@ fn trash_message(
     message_id: &str,
     folder: Option<SmsFolder>,
     trashed_ms: i64,
-) -> Result<TrashOut, String> {
+) -> Result<TrashOut, TrashReject> {
     let msgs = provider
         .messages(thread_id, folder)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| TrashReject::Refused(e.to_string()))?;
     let m = msgs
         .iter()
         .find(|m| m.id == message_id)
-        .ok_or_else(|| format!("message {message_id} not found in thread {thread_id}"))?
+        .ok_or(TrashReject::NotFound)?
         .clone();
     // "Latest" means latest *still visible* row: a second trash in the same
     // thread must refresh the preview even though the provider's newest row is
@@ -471,7 +529,7 @@ fn trash_message(
     let newly = trash
         .write()
         .add(thread_id, &m.id, m.ts_ms, trashed_ms)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| TrashReject::Refused(e.to_string()))?;
     if newly {
         tracing::info!(
             target: "amos::sms",
@@ -492,7 +550,9 @@ fn trash_message(
         .iter()
         .find(|e| e.thread_id == thread_id && e.message_id == message_id)
         .map(TrashOut::from);
-    entry.ok_or_else(|| "trash entry vanished unexpectedly".to_string())
+    entry.ok_or(TrashReject::Refused(
+        "trash entry vanished unexpectedly".to_string(),
+    ))
 }
 
 /// Recompute the preview override for `thread_id` after trashing `trashed`
@@ -597,6 +657,11 @@ fn apply_trash(threads: Vec<SmsThread>, trash: &SmsTrash) -> (Vec<SmsThread>, us
 /// Trash a message (hide it from every AmOS surface; restorable). `folder`
 /// scopes the read exactly like `sms_messages`; an omitted `trashed_ms` uses
 /// the bridge clock. The platform SMS store is never written.
+///
+/// Answers the **three-state contract** documented in docs/sms.md §13
+/// ([`TrashAddOut`]): `{"trashed":true}` / `{"trashed":false,"reason":…}` /
+/// `{"trashed":false,"not_found":true}`. Blank ids stay a hard `Err` (a malformed
+/// request is not a user-visible outcome); storage/worker failures are `Err` too.
 #[tauri::command]
 pub async fn sms_trash_add(
     state: State<'_, SmsBridge>,
@@ -604,7 +669,7 @@ pub async fn sms_trash_add(
     message_id: String,
     folder: Option<String>,
     trashed_ms: Option<i64>,
-) -> Result<TrashOut, String> {
+) -> Result<TrashAddOut, String> {
     if thread_id.trim().is_empty() || message_id.trim().is_empty() {
         return Err("invalid SMS payload: blank thread/message id".to_string());
     }
@@ -616,15 +681,16 @@ pub async fn sms_trash_add(
     let trash = trash_shared();
     let at = trashed_ms.unwrap_or_else(now_ms);
     blocking(move || {
-        trash_message(
+        // Refusals are outcomes, not errors: the UI must be able to tell "the
+        // provider refused" from "your list was stale" (docs/sms.md §13).
+        Ok(trash_outcome(trash_message(
             &trash,
             provider.as_ref(),
             &thread_id,
             &message_id,
             folder,
             at,
-        )
-        .map_err(amos_sms::SmsError::Failed)
+        )))
     })
     .await
     .map_err(|e| e.to_string())
@@ -1415,12 +1481,85 @@ mod tests {
     }
 
     #[test]
-    fn trashing_an_unknown_message_id_is_an_honest_error() {
+    fn trashing_an_unknown_message_id_is_a_not_found_outcome() {
         let p = MockSms::seeded();
         let state = SmsTrashState::empty();
-        let err = trash_message(&state, &p, "1", "nope", None, 0).unwrap_err();
-        assert!(err.contains("not found"), "got: {err}");
+        // The core reports "not found" as its own rejection (never a fabricated
+        // entry), and the command maps it to the `not_found` wire state.
+        let rejected = trash_message(&state, &p, "1", "nope", None, 0).unwrap_err();
+        assert_eq!(rejected, TrashReject::NotFound);
+        assert_eq!(trash_outcome(Err(rejected)), TrashAddOut::not_found());
         assert!(state.list().is_empty(), "no fabricated trash entries");
+    }
+
+    #[test]
+    fn the_three_trash_states_serialize_to_the_documented_wire_shape() {
+        // docs/sms.md §13 + backend.ts `SmsTrashAddResult`: these exact keys are
+        // what the Svelte screen discriminates on (`r.trashed`, `"reason" in r`,
+        // `"not_found" in r`) — snake_case, because serde's default is what Tauri
+        // serializes and nothing here sets `rename_all`.
+        let trashed = serde_json::to_value(TrashAddOut::trashed()).unwrap();
+        assert_eq!(trashed, serde_json::json!({ "trashed": true }));
+
+        let refused = serde_json::to_value(TrashAddOut::refused("blocked sender".into())).unwrap();
+        assert_eq!(
+            refused,
+            serde_json::json!({ "trashed": false, "reason": "blocked sender" })
+        );
+
+        let not_found = serde_json::to_value(TrashAddOut::not_found()).unwrap();
+        assert_eq!(
+            not_found,
+            serde_json::json!({ "trashed": false, "not_found": true })
+        );
+        // The UI keys off `trashed` first: only the success state may be truthy.
+        assert!(trashed["trashed"].as_bool().unwrap());
+        assert!(!refused["trashed"].as_bool().unwrap());
+        assert!(!not_found["trashed"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn a_provider_read_failure_is_refused_never_a_fabricated_success() {
+        /// A provider whose reads fail (no device backend / permission revoked).
+        struct UnreadableSms;
+        impl SmsProvider for UnreadableSms {
+            fn name(&self) -> &'static str {
+                "unreadable-test"
+            }
+            fn snapshot(&self, _f: amos_sms::SmsFolder) -> Result<Vec<SmsThread>, SmsError> {
+                Err(SmsError::Unavailable("no device SMS backend".into()))
+            }
+            fn messages(
+                &self,
+                _t: &str,
+                _f: Option<amos_sms::SmsFolder>,
+            ) -> Result<Vec<SmsMessage>, SmsError> {
+                Err(SmsError::Unavailable("no device SMS backend".into()))
+            }
+            fn counts(&self) -> Result<amos_sms::SmsFolderCounts, SmsError> {
+                Err(SmsError::Unavailable("no device SMS backend".into()))
+            }
+            fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
+                let _ = (normalize_address(address), validate_text(text));
+                Err(SmsError::Unavailable("no device SMS backend".into()))
+            }
+        }
+
+        // The provider errors (permission/native failure): the core must reject with
+        // the provider's own message and the wire state must stay `trashed:false`.
+        let p = UnreadableSms;
+        let state = SmsTrashState::empty();
+        let rejected = trash_message(&state, &p, "1", "m1", None, 0).unwrap_err();
+        match &rejected {
+            TrashReject::Refused(reason) => assert!(
+                reason.contains("no device SMS backend"),
+                "carries the provider's reason: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let out = serde_json::to_value(trash_outcome(Err(rejected))).unwrap();
+        assert_eq!(out["trashed"], serde_json::json!(false));
+        assert!(state.list().is_empty(), "nothing was stored");
     }
 
     #[test]

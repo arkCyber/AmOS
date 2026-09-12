@@ -4,8 +4,10 @@
  * The legacy React `src/theme/index.tsx` re-exports these for its provider; the
  * Svelte shell and pure tests import this directly, so removing React later
  * never loses the logic. `readStored`/`writeStored` touch the DOM only through a
- * safe try/catch and a no-op-friendly `window.Amos?` seam.
+ * safe try/catch, and a write is mirrored to the Rust shared store (durable copy)
+ * exactly like `lib/amosStore` does — one write-through, no second mechanism.
  */
+import { systemStoreSet } from "./backend";
 
 export type ThemeMode = "light" | "dark" | "auto";
 export const THEME_KEY = "amos-ui.theme";
@@ -21,7 +23,8 @@ export function readStored(key: string, fallback: string): string {
 export function writeStored(key: string, value: string): void {
   try {
     window.localStorage.setItem(key, value);
-    window.Amos?.storeWrite?.(key, value);
+    // Mirror to the Rust shared store (same write-through as amosStore writes).
+    void systemStoreSet(key, value);
   } catch {
     /* ignore */
   }

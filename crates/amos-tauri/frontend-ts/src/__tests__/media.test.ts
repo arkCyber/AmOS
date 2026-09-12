@@ -3,6 +3,7 @@ import {
   bytesFromNumbers,
   canonicalPath,
   hasMediaBridge,
+  mediaGrants,
   mediaList,
   mediaLoad,
   mediaSave,
@@ -89,6 +90,37 @@ describe("normalizeGrant", () => {
     expect(normalizeGrant({ access: "bogus", collection: "camera" })).toBeNull();
     expect(normalizeGrant({ access: "read", collection: "bogus" })).toBeNull();
     expect(normalizeGrant(null)).toBeNull();
+  });
+});
+
+describe("mediaGrants (reply normalization)", () => {
+  it("offline (no bridge) → null, never a fabricated empty set", async () => {
+    expect(await mediaGrants()).toBeNull();
+  });
+
+  it("drops malformed rows instead of trusting the wire", async () => {
+    const grants = await withBridge(
+      async (cmd) =>
+        cmd === "media_grants"
+          ? [
+              { access: "read", collection: "camera" },
+              { access: "bogus", collection: "camera" },
+              { access: "read", collection: "bogus" },
+              null,
+              { access: "write", collection: "download" },
+            ]
+          : null,
+      () => mediaGrants(),
+    );
+    expect(grants).toEqual([
+      { access: "read", collection: "camera" },
+      { access: "write", collection: "download" },
+    ]);
+  });
+
+  it("a non-array reply is 'could not read' (null), not 'nothing granted'", async () => {
+    const grants = await withBridge(async () => ({ nope: true }), () => mediaGrants());
+    expect(grants).toBeNull();
   });
 });
 

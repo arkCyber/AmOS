@@ -120,10 +120,6 @@ export interface SensorLiveHandle {
   reset(): void;
 }
 
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
-
 /**
  * Create an independent live-sensor accumulator. `start()` opens the Tauri
  * `sensor-data` subscription (a quiet no-op off-device / when unbridged) and
@@ -192,12 +188,5 @@ export function createSensorLive(): SensorLiveHandle {
       });
     },
   };
-}
-
-/** Whether a raw payload is a well-shaped `sensor-data` event (guard helper). */
-export function isSensorDataPayload(
-  raw: unknown,
-): raw is Record<string, unknown> & { kind: string } {
-  return isObj(raw) && toSensorData(raw) !== null;
 }
 

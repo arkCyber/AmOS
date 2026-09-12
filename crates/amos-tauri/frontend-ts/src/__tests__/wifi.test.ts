@@ -14,6 +14,7 @@ import {
   hasPassword,
   isSaved,
   normalizeWifi,
+  wifiInit,
   NEIGHBORHOOD,
   type WifiCfg,
 } from "../lib/wifi";
@@ -163,8 +164,10 @@ describe("wifi persistence guard", () => {
     expect(g.current).toBe("Home-2.4G");
     expect(g.saved).toEqual(["Home-2.4G", "x"]);
     expect(g.passwords).toEqual({ "Home-2.4G": "pw" });
-    expect(normalizeWifi(null)).toEqual({ current: null, saved: [], passwords: {} });
-    expect(normalizeWifi("x")).toEqual({ current: null, saved: [], passwords: {} });
+    // Junk falls back to the ONE default config (`wifiInit()`), not a re-typed
+    // literal — so the default can never drift between the guard and the factory.
+    expect(normalizeWifi(null)).toEqual(wifiInit());
+    expect(normalizeWifi("x")).toEqual(wifiInit());
     expect(normalizeWifi({ current: "" }).saved).toEqual([]);
     expect(normalizeWifi({ current: 5 }).current).toBeNull();
   });

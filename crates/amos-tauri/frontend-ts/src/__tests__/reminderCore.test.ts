@@ -9,7 +9,7 @@ import {
   normalizeFired,
   pruneFired,
   syncDueReminderAlerts,
-} from "../lib/reminderNotify";
+} from "../lib/reminderCore";
 import { REMINDERS_KEY, type Reminder } from "../lib/reminders";
 import { NOTIF_KEY } from "../lib/settings";
 
@@ -37,7 +37,7 @@ afterEach(() => {
   window.localStorage.removeItem(NOTIF_KEY);
 });
 
-describe("reminderNotify — OS-level due alerts", () => {
+describe("reminderCore — OS-level due alerts", () => {
   test("collectDueAlerts only returns new, reached, pending reminders (earliest first)", () => {
     const reminders = [
       r("future", NOW + 3_600_000), // not due yet

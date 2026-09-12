@@ -36,6 +36,7 @@
   } from "../lib/player";
   import type { PlayerTrack, RepeatMode } from "../lib/player";
   import { applyMediaSession, clearMediaSession, defaultMediaSession } from "../lib/mediaSession";
+  import { assertHold, releaseHold, videoHoldActive } from "../lib/keepAwakeCore";
   import { loadPlayerPrefs, savePlayerPrefs, shouldSavePosition } from "../lib/playerPrefs";
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
@@ -294,6 +295,19 @@
     el.volume = volume;
     el.muted = muted;
     el.playbackRate = rate;
+  });
+
+  // ---- keep-awake: a playing VIDEO holds the screen on (music must not) ----
+  // Video must not blank mid-scene; audio deliberately lets the display sleep
+  // (docs/display-idle.md §6). The hold is released on pause, track change, or
+  // unmount via the effect cleanup.
+  $effect(() => {
+    if (!videoHoldActive(playing, track?.kind)) {
+      releaseHold("video");
+      return;
+    }
+    assertHold("video");
+    return () => releaseHold("video");
   });
 
   // ---- OS media session (lock screen / notification / headset controls) ----

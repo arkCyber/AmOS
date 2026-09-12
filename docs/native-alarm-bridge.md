@@ -4,7 +4,7 @@
 > 状态：**原生纯核心已落地并测试**（`amos-scheduler` 新增 `ExactAlarmClock`）；Tauri 命令与设备侧 `AlarmManager` 绑定是待办（见「边界」）。
 
 ## 现状与动机
-- 时钟 App 与 OS 级到点提醒（`frontend-ts/src/lib/alarmNotify.ts`）都靠 WebView 里 `setInterval` 轮询 `amos.alarms` 计时——只要 **WebView 活着**，切到别处也会到点提醒（前几轮已落地）。
+- 时钟 App 与 OS 级到点提醒（`frontend-ts/src/lib/alarmCore.ts` 的 `syncDueAlarmAlerts`，由 `svelte/osAlarmWatcher.ts` 每 2s 驱动）都靠 WebView 里 `setInterval` 轮询 `amos.alarms` 计时——只要 **WebView 活着**，切到别处也会到点提醒（前几轮已落地）。
 - 但若 **WebView 被节流 / 进程被杀 / 整机息屏**，JS 定时器不可靠；这时需要**原生**用绝对墙钟在精确时刻醒来。
 
 ## 已落地：`amos-scheduler::ExactAlarmClock`（纯 `std`）
@@ -20,12 +20,13 @@
 - 时钟可注入（调用方传 `now_ms`）→ 确定性单测（+4，`cargo test -p amos-scheduler` 现 12+1 全绿；clippy `-D warnings`、fmt 干净）。
 - 导出：`pub use amos_scheduler::ExactAlarmClock;`。
 
-## 桥的接线（计划，未在本环境落地）
-1. **前端**（`lib/alarmNotify.ts` / ClockApp）：算出每个启用闹钟的**下次发生 epoch-ms**，经 Tauri `invoke` 推给原生。
+## 桥的接线
+1. **前端**（`svelte/osAlarmArm.ts`，由 `svelte/osAlarmWatcher.ts` 驱动）：用纯 `lib/alarmCore.nextArmments` 算出每个**启用**闹钟的**下次发生 epoch-ms**，经 Tauri `invoke` 推给原生；**并在每次闹钟列表变化时对齐**——新增/重新启用 → `register`，停用/删除 → `cancel`（否则被关掉的闹钟仍会被原生调度器唤醒）。启动时也先对账一次，因为开机后可能根本不打开时钟 App。
+   - 纯逻辑 `nextArmments` 亦被 `syncDueAlarmAlerts` 复用：**刚刚响过**的每日闹钟立刻 `register` 下一次（fire-once 核心 + 调用方循环）。
 2. **宿主**（`amos-tauri`，**已落地** `crates/amos-tauri/src/alarm_sched.rs`，进程共享态 `AlarmSchedState` 包 `ExactAlarmClock`）：
    - `scheduler_alarm_register { id, atMs }`
-   - `scheduler_alarm_cancel { id }`
-   - `scheduler_alarm_poll { nowMs? } -> { due: [id, …] }`（到点一次性返回并移除）
+   - `scheduler_alarm_cancel { id }`（前端已接线：`svelte/osAlarmArm` 在停用/删除时调用）
+   - `scheduler_alarm_poll { nowMs? } -> { due: [id, …] }`（到点一次性返回并移除）——**前端刻意未接**：WebView 存活时的到点判定已由 `syncDueAlarmAlerts` 的墙钟对账覆盖，接上 poll 只会多一条可能重复的路径；等真机验证「进程被节流后恢复」再决定是否改走它。
    - 到点后由调用方把 id 抛给 WebView（触发既有响铃动画/横幅）；每日闹钟到点后再 `register` 下一天。
    - 已注册到 `invoke_handler` 与 `.manage`；`cargo test -p amos-tauri --lib alarm_sched::` 3 通过、clippy `-D warnings` 0。
 3. 一个原生线程/`AlarmManager` 回调：`sleep_until(next_at)` → `due(now)` → 把到点 id 抛给 WebView。
@@ -38,7 +39,7 @@
 ## 设备步骤（Android，已接真机时）
 仓库已提供 **AlarmManager 绑定模板**（`crates/amos-tauri/android-glue/com/amos/ai/glue/`）：
 - `AlarmGlue.kt`：`schedule(ctx,id,atMs)` 用 `setExactAndAllowWhileIdle`（API 31 先查 `canScheduleExactAlarms`，被禁则诚实跳过）；`cancel`。在 Rust `scheduler_alarm_register/cancel` 成功后各调用一次（注意线程：Android 主线程 / Handler）。
-- `AlarmReceiver.kt`：到点广播 → 把 System UI 提到前台（`FLAG_ACTIVITY_NEW_TASK|SINGLE_TOP|REORDER_TO_FRONT`）→ WebView 既有 `alarmNotify` 轮询即显示响铃动画。
+- `AlarmReceiver.kt`：到点广播 → 把 System UI 提到前台（`FLAG_ACTIVITY_NEW_TASK|SINGLE_TOP|REORDER_TO_FRONT`）→ WebView 既有的 `osAlarmWatcher` → `syncDueAlarmAlerts` 轮询即显示响铃动画。
 - 需在 Manifest 声明 `<receiver AlarmReceiver/>` 并授予 `SCHEDULE_EXACT_ALARM`（Android 12+）、`POST_NOTIFICATIONS`。
 
 仓库内可先行验证的“宿主循环契约”已加为集成测试 `crates/amos-scheduler/tests/alarm_host_cycle.rs`（arm → next_at 唤醒 → due 一次性触发 → 每日再武装；`cargo test -p amos-scheduler` 通过）。Kotlin 端按仓库约定为**结构交付**，需在生成 Android 工程/真机上编译验证。

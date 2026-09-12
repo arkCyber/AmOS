@@ -7,6 +7,7 @@
     BACKGROUND_MODES,
     DEFAULT_BG_MODE,
     WALLPAPER_PRESETS,
+    isBgMode,
     isCustomWallpaper,
     type BgModeId,
   } from "../lib/wallpaper";
@@ -41,11 +42,13 @@
     typeof initial.wallpaper === "string" ? (initial.wallpaper as string) : undefined;
   let wall = $state<string | undefined>(initialWall);
   let url = $state(initialWall && isCustomWallpaper(initialWall) ? initialWall : "");
-  let bgSel = $state<BgModeId>(
-    (initial.background !== undefined && (initial.background as string) in MODE_LABEL
-      ? (initial.background as string)
-      : DEFAULT_BG_MODE) as BgModeId,
-  );
+  // The domain owns "is this a known background mode" (`lib/wallpaper.isBgMode`).
+  // The card must not re-derive it from its own label map with a cast: a mode added
+  // to the domain but not mirrored here would silently fall back to the default.
+  const storedBg = initial.background;
+  const initialBg: BgModeId =
+    typeof storedBg === "string" && isBgMode(storedBg) ? storedBg : DEFAULT_BG_MODE;
+  let bgSel = $state<BgModeId>(initialBg);
 
   const writePref = (patch: Record<string, unknown>) => {
     writeStoreValue("amos.settings", { ...readPrefs(), ...patch });

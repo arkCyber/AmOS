@@ -1,13 +1,14 @@
 /**
  * Dynamic home-screen apps from the app store.
  *
- * Built-in apps are a compile-time const (`APPS` in apps.tsx). Store-installed
- * apps are runtime data, so this module gives them a stable tile identity and
- * lets the shell resolve name/icon + merge them into the persisted home layout.
+ * Built-in apps are a compile-time Svelte registry (`src/svelte/appRegistry.ts`).
+ * Store-installed apps are runtime data, so this module gives them a stable tile
+ * identity and lets the shell resolve name/icon + merge them into the persisted
+ * home layout.
  *
  * Installed store apps get an id `store:<manifest.id>` so they can never collide
- * with a built-in app id. `HomeDock`/`AppComponent`/the shell read tiles through
- * the small cache here (populated by `loadStoreTiles`), and the Store page pokes
+ * with a built-in app id. `HomeDock`/the shell read tiles through the small cache
+ * here (populated by `loadStoreTiles`), and the Store page pokes
  * `notifyStoreTilesChanged()` after install/uninstall/upgrade so the home screen
  * refreshes live.
  */

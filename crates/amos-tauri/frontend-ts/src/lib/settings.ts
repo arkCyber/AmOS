@@ -80,30 +80,6 @@ export function flipRadio(s: QuickSettings, key: RadioKey): QuickSettings {
   return { ...s, [key]: !s[key] };
 }
 
-/** A visible status-bar indicator derived from quick-settings radio bits.
- * Airplane mode supersedes the wifi/bluetooth indicators (they're forced off). */
-export function radioIcons(s: QuickSettings): { kind: RadioKey; on: boolean }[] {
-  if (s.airplane) return [{ kind: "airplane", on: true }];
-  return [
-    { kind: "wifi", on: !!s.wifi },
-    { kind: "bluetooth", on: !!s.bluetooth },
-  ];
-}
-
-/**
- * Combine the radio toggle bits with the browser's real connectivity report: a
- * Wi-Fi glyph only reads as "on" when Wi-Fi is enabled *and* the host is actually
- * online (airplane/bluetooth are unaffected). Pure + testable.
- */
-export function applyConnectivity(
-  icons: { kind: RadioKey; on: boolean }[],
-  online: boolean,
-): { kind: RadioKey; on: boolean }[] {
-  return icons.map((ic) =>
-    ic.kind === "wifi" ? { kind: ic.kind, on: ic.on && online } : ic,
-  );
-}
-
 /** Seed a handful of notifications (same spirit as the legacy NC). */
 export function seedNotifs(now: number): Notif[] {
   return [

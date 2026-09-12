@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   osAutoOffDecision,
+  osAutoOffDecisionHeld,
   osAutoOffTimeout,
   AUTO_OFF_DEFAULT_SEC,
 } from "../svelte/osAutoOff";
@@ -31,5 +32,14 @@ describe("osAutoOff — pure decisions for the Svelte-shell auto screen-off", ()
     expect(AUTO_OFF_DEFAULT_SEC).toBe(0);
     // An "off" default must never trigger the idle watcher, whatever the idle time.
     expect(osAutoOffDecision(1000, 1000 + 10_000, osAutoOffTimeout(AUTO_OFF_DEFAULT_SEC))).toBe(false);
+  });
+
+  test("a keep-awake hold never auto-sleeps, however long the idle", () => {
+    const timeout = 30;
+    // Idle far beyond the timeout, but a held screen (call / video) stays on.
+    expect(osAutoOffDecisionHeld(1000, 1000 + 9_999, timeout, true)).toBe(false);
+    // No hold → the normal idle decision applies.
+    expect(osAutoOffDecisionHeld(1000, 1000 + 9_999, timeout, false)).toBe(true);
+    expect(osAutoOffDecisionHeld(1000, 1000 + 10, timeout, false)).toBe(false);
   });
 });

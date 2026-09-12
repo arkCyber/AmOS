@@ -83,6 +83,8 @@ impl Monitor {
         let monitor = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            // Runs until the daemon shuts down: no exit here; the task is aborted
+            // with the runtime. `tick()` is the wait (never a spin).
             loop {
                 ticker.tick().await;
                 monitor.heartbeat();

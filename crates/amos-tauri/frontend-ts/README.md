@@ -1,122 +1,73 @@
-# amos-ui-ts (migration target)
+# amos-ui-ts — Amos System UI
 
-Next-generation System UI: **Vite + React + TypeScript + Tailwind CSS**.
-A staged migration that **replaces** `../frontend` (vanilla JS) module-by-module —
-nothing here is wired into the running Tauri app yet (the old UI keeps working
-until feature parity, then `tauri.conf.json` is repointed to this package).
+The production System UI: **bun + Vite + Svelte 5 (runes) + TypeScript + Tailwind**.
+React was removed (`../docs/react-removal-plan.md`); every built-in screen is a
+Svelte component and the shell mounts them directly — there is no React fallback.
 
-## What exists now (stage 1 + 2)
-
-- **System requirements (first-class, tested):**
-  - Light / dark **theme** with `light | dark | auto` (auto = follow OS via
-    `prefers-color-scheme`; Tailwind `darkMode: "class"`), persisted + bridgeable
-    to the legacy shared store (`window.Amos`).
-  - **i18n (zh/en)** dictionaries with typed keys, `{param}` interpolation, and a
-    `useI18n()` hook; locale persisted + sets `<html lang>`.
-- A tiny demo `App` proving both (appearance + language segmented controls and a
-  home/dock grid whose labels localize), to be replaced by the real launcher.
+- Entry: `index.html → src/shell-entry.ts → mount(Shell.svelte)`.
+- Multi-window behaviour is documented in `../docs/multi-window.md`.
 
 ## Layout
 
 ```
 frontend-ts/
 ├── index.html
-├── vite.config.ts
-├── tsconfig.json
-├── tailwind.config.js     # darkMode:'class', content=./src
-├── postcss.config.js
+├── vite.config.ts / vitest.config.ts / svelte.config.js
+├── tailwind.config.js / postcss.config.js
+├── scripts/            # unwired/i18n scans, coverage + smoke runners
+├── svelte-tests/       # Svelte DOM tests (vitest)
 └── src/
-    ├── main.tsx           # mounts <App/> (+ optional window.Amos bridge typing)
-    ├── App.tsx            # demo shell (theme + i18n toggles, home/dock sample)
-    ├── index.css          # @tailwind directives
-    ├── theme/             # ThemeProvider/useTheme + pure resolveDark/applyDarkClass
-    ├── i18n/              # I18nProvider/useI18n + locales/zh.ts en.ts + types
-    ├── components/Segmented.tsx
-    └── __tests__/         # vitest unit tests (theme, i18n)
+    ├── shell-entry.ts  # boot: hydrate shared store → apply OS chrome → mount(Shell)
+    ├── index.css
+    ├── i18n/           # locales/{zh,en}.ts + typed t()
+    ├── lib/            # pure domain modules + Tauri backend bridges
+    ├── svelte/         # Shell.svelte, app screens, system panels, appRegistry.ts
+    ├── types/          # ambient d.ts for the Svelte/runes build
+    └── __tests__/      # pure + DOM tests (bun, via scripts/bun-iso-test.mjs)
 ```
 
-## Commands (run from this directory; requires network once)
+## Shared state
+
+Settings / notifications / home layout live in the shared `amos.*` store. Writes go
+through `src/lib/amosStore.writeStoreValue` → `src/lib/backend.systemStoreSet`
+(`store_set`) to the Rust `SharedStore`; boot pulls the durable copy back with
+`hydrateFromSystemStore()` (`store_snapshot`), and `src/svelte/store.ts`
+`createStoreValue` subscribes to the `store-updated` event. See
+`../docs/multi-window.md` §5.
+
+## Commands (run from this directory)
 
 ```bash
-npm install          # first time (react, vite, typescript, tailwind, vitest…)
-npm run dev          # http://localhost:1420 (matches Tauri devUrl convention)
-npm run typecheck    # tsc --noEmit
-npm test             # vitest run
-npm run build        # vite build → dist/
+bun install              # first time (Vite, Svelte 5, Tailwind, vitest…)
+bun run dev              # http://localhost:1420 (matches the Tauri devUrl)
+bun run build            # vite build → dist/
+bun run test             # pure + DOM tests (bun)
+bun run test:svelte      # Svelte DOM tests (vitest, svelte-tests/)
+bun run typecheck        # tsc --noEmit
+bun run typecheck:svelte # svelte-check
+bun run check            # test + typecheck + typecheck:svelte + test:svelte + scans
+bun run coverage:gate    # src/lib line coverage ≥ threshold (scripts/lib-coverage-gate.mjs)
+bun run smoke:ui         # build + preview + headless Chrome home-render smoke
 ```
 
-## Svelte single-source (React → Svelte migration complete)
+## Migration history
 
-Every built-in app screen is implemented **once in Svelte 5 (runes)** and mounted by
-a thin React host. The React reference bodies and the `*-parity.test.ts`
-dual-implementation suites have been removed, so `apps.tsx` is now only Svelte-host
-wiring (~149 lines) and `svelte-tests/` has no parity files left. `src/components`
-retains only the React shell-chrome leaves + hosts that `App.tsx` still uses on its
-`!svelteEnabled()` path. See **`SVELTE5_PILOT.md`** / **`DOCK_MIGRATION_ROADMAP.md`**
-(historical migration records) and **`SVELTE_MIGRATION_DATA.md`** for the measured
-bundle-size data.
+The React → Svelte migration is complete and React is gone from the production
+build (`../docs/react-removal-plan.md`); there are no `*-parity.test.ts` dual-
+implementation suites left. Historical records: `SVELTE5_PILOT.md`,
+`DOCK_MIGRATION_ROADMAP.md`, `SVELTE_MIGRATION_AUDIT.md`,
+`SVELTE_MIGRATION_DATA.md` (bundle-size data).
 
-TL;DR of the seam:
-- `src/svelte/<App>.svelte` — React-free Svelte 5 ports reusing the same pure libs
-  (`lib/*.ts`) and the shared persisted store (`store.ts`), plus reactive i18n
-  (`locale.svelte.ts`) and theme (`theme.svelte.ts`).
-- `src/components/SvelteAppHost.tsx` — generic React host that `mount()`s a Svelte
-  app (dynamic import) and keeps Svelte i18n in sync with the shell.
-- `src/apps.tsx` — every entry is `<XEntry = () => <SvelteAppHost load={loadX} />`
-  (`X` ∈ all built-in apps); no React app fallback remains.
+Screens reuse the shared pure libs (`lib/*.ts`), the persisted store (`store.ts`)
+and the reactive i18n / theme singletons (`locale.svelte.ts` /
+`theme.svelte.ts`); `appRegistry.ts` is the single id → screen table.
 
-New commands (Svelte-specific; the rest of the repo still tests under bun):
+## Notes
 
-```bash
-npm run typecheck:svelte  # svelte-check --tsconfig ./tsconfig.json
-npm run test:svelte       # vitest run (DOM tests for .svelte, in svelte-tests/)
-bun run smoke:ui          # local UI smoke (bun): build + vite preview + headless Chrome asserts the Svelte home renders (exit 0/1; scripts/smoke-ui.mjs)
-bun run smoke:ui --skip-build   # reuse an existing build
-UI_SMOKE_STRICT=1 bun run smoke:ui # also require bespoke <svg> tile art
-```
-
-## Wires to Tauri (do AFTER feature parity)
-
-In `crates/amos-tauri/tauri.conf.json` point the shell at this package and add
-`devUrl`/`frontendDist`:
-
-- `build.devUrl` → `http://localhost:1420`
-- `build.frontendDist` → `../frontend-ts/dist`
-- dev server: `npm run dev` (port 1420) before `cargo tauri dev`.
-
-## Run in Tauri (reversible)
-
-The new UI is **not** wired by default (the legacy vanilla UI keeps working). To
-preview the TS shell inside the Tauri window and switch back later:
-
-```bash
-# point Tauri at this package, and build it
-cd crates/amos-tauri && ./switch-frontend.sh ts     # frontendDist -> frontend-ts/dist, devUrl -> :1420
-cd ../amos-tauri/frontend-ts && bun run build       # produce dist/
-cd .. && cargo run -p amos-tauri                    # or: cargo tauri dev
-
-# revert to the legacy UI whenever needed
-cd crates/amos-tauri && ./switch-frontend.sh legacy
-```
-
-> Real chat/translation for **AI** and **同传(interpreter)** requires the TS shell
-> running inside Tauri **and** a local daemon (`AMOS_BACKEND=ggml/ollama … amos-ai`,
-> translate stack). Without it those two apps show a localized "daemon not
-> connected" fallback. Everything else (15 apps + lock/recents/spotlight, light/dark,
-> zh/en) works standalone via `bun run dev`.
-
-## Status (as of last update)
-- Apps ported: clock, settings, calculator, weather, notes, photos, files,
-  messages, phone, music, maps, camera, ai, interpreter, mail (15 apps; mail is a
-  React UI over the `amos-mail` bridge with its own list/read/compose).
-- System: theme (light|dark|auto), i18n (zh/en), lock, Recents, Spotlight, Home/Dock,
-  shared `amos.*` store bridge, SSR mount smoke.
-- Test/build: `bun test`, `bun run typecheck`, `bun run build`.
-
-## Next steps
-
-1. Port the core shell (router / home / dock / lock / recents / Spotlight) as
-   React components consuming the same `amos.*` shared-store keys.
-2. Move app-localization strings into `locales/` as each app is ported.
-3. Port apps one-by-one, replacing the vanilla copy after each lands; retire
-   `../frontend` last.
+- **AI / 同传(interpreter)** need a local daemon (`AMOS_BACKEND=… amos-ai` + the
+  translate stack) when running inside Tauri; without it those screens show a
+  localized "daemon not connected" fallback. Everything else works standalone via
+  `bun run dev`.
+- The Tauri config already points at this package (`build.devUrl` → `:1420`,
+  `build.frontendDist` → `../frontend-ts/dist`); there is no legacy vanilla UI to
+  switch back to.

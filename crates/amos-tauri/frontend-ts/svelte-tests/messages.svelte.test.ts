@@ -8,8 +8,9 @@
 import { describe, expect, test } from "vitest";
 import { fireEvent, render } from "@testing-library/svelte";
 import MessagesApp from "../src/svelte/MessagesApp.svelte";
-import { writeStoreValue } from "../src/lib/amosStore";
+import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
 import { CONV_KEY, seedConversations } from "../src/lib/messages";
+import { NOTIF_KEY } from "../src/lib/settings";
 import { DRAFT_KEY } from "../src/lib/smsDrafts";
 import { beforeEach } from "vitest";
 import { afterEach } from "vitest";
@@ -34,10 +35,43 @@ afterEach(() => {
 });
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
+
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
 const input = (h: { container: HTMLElement }) =>
   h.container.querySelector('input[aria-label="message-input"]') as HTMLInputElement | null;
 
 describe("MessagesApp.svelte", () => {
+  test("an intentionally emptied store is not re-seeded with the demo thread", () => {
+    window.localStorage.setItem("amos.messages.convs", "[]");
+    const host = render(MessagesApp);
+    expect(txt(host)).toContain("暂无会话");
+    expect(txt(host)).not.toContain("小安");
+    expect(readStoreValue<unknown>("amos.messages.convs", null)).toEqual([]);
+  });
+
   test("shows the seeded thread + contact header", () => {
     const host = render(MessagesApp);
     expect(txt(host)).toContain("小安");
@@ -60,6 +94,35 @@ describe("MessagesApp.svelte", () => {
     expect(before.length).toBeGreaterThan(0);
   });
 
+  test("reading a thread marks its incoming messages read (badge clears)", async () => {
+    // The seeded thread's newest incoming message is unread (`read: false`).
+    const host = render(MessagesApp);
+    await tick();
+    await new Promise((r) => setTimeout(r, 0));
+    const saved = readStoreValue<{ msgs: { from: string; read?: boolean }[] }[]>(CONV_KEY, []);
+    const incoming = saved.flatMap((c) => c.msgs).filter((m) => m.from === "them");
+    expect(incoming.length).toBeGreaterThan(0);
+    // Opening the thread reads it — the ● badge / "N 未读" banner must not linger
+    // until the user happens to send something.
+    expect(incoming.every((m) => m.read === true)).toBe(true);
+    expect(txt(host)).not.toContain("未读");
+  });
+
+  test("the open thread raises no notification; another thread's unread still does", async () => {
+    const now = Date.now();
+    writeStoreValue(CONV_KEY, [
+      { id: "c:a", name: "小安", msgs: [{ from: "them", text: "在读的", ts: now - 10, read: false }] },
+      { id: "c:b", name: "小李", msgs: [{ from: "them", text: "别人的未读", ts: now - 5, read: false }] },
+    ]);
+    writeStoreValue(NOTIF_KEY, []);
+    render(MessagesApp);
+    await tick();
+    await new Promise((r) => setTimeout(r, 0));
+    const titles = readStoreValue<{ title: string }[]>(NOTIF_KEY, []).map((n) => n.title);
+    expect(titles.some((t) => t.includes("别人的未读"))).toBe(true);
+    expect(titles.some((t) => t.includes("在读的"))).toBe(false);
+  });
+
   test("clear empties the thread", async () => {
     const host = render(MessagesApp);
     const clearBtn = [...host.container.querySelectorAll("button")].find((b) =>
@@ -68,6 +131,29 @@ describe("MessagesApp.svelte", () => {
     expect(clearBtn).toBeTruthy();
     await fireEvent.click(clearBtn as HTMLButtonElement);
     expect(txt(host)).toContain("暂无消息");
+  });
+
+  test("a rejected write is reported and the new thread is not added", async () => {
+    const restore = failWritesFor(CONV_KEY);
+    try {
+      const host = render(MessagesApp);
+      const ni = host.container.querySelector(
+        'input[aria-label="new-contact"]',
+      ) as HTMLInputElement;
+      await fireEvent.input(ni, { target: { value: "李四" } });
+      await fireEvent.click(
+        host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement,
+      );
+      await tick();
+      // Nothing was stored, so the thread list must not show it.
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(txt(host)).not.toContain("李四");
+      expect(readStoreValue<{ name: string }[]>(CONV_KEY, []).some((c) => c.name === "李四")).toBe(
+        false,
+      );
+    } finally {
+      restore();
+    }
   });
 
   test("adding a new contact opens an empty thread and switches to it", async () => {
@@ -583,5 +669,143 @@ describe("MessagesApp.svelte", () => {
     expect(note.getAttribute("data-ok")).toBe("false");
     expect(note.getAttribute("role")).toBe("alert");
     expect(note.textContent).toContain("屏蔽失败");
+  });
+
+  // ---- View-layer trash (REQ-A42) -------------------------------------------
+  /**
+   * A device bridge answering exactly what the trash panel reads. The list is the
+   * **raw wire payload** (snake_case — serde's default), and `sms_trash_add`
+   * answers the bridge's three-state contract. This is the coverage that was
+   * missing when the panel shipped broken (Round 47, REQ-A108).
+   */
+  function deviceBridge(
+    opts: {
+      trashList?: unknown[];
+      addReply?: unknown;
+      restoreReply?: unknown;
+      purgeReply?: unknown;
+    } = {},
+  ) {
+    const seen: Record<string, unknown>[] = [];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        seen.push({ cmd, ...(args ?? {}) });
+        if (cmd === "sms_status") return { provider: "android-sms", device: true };
+        if (cmd === "sms_counts") return { inbox: 1, sent: 0, draft: 0 };
+        if (cmd === "sms_snapshot")
+          return [
+            {
+              id: "1",
+              address: "13800138000",
+              display_name: "家人",
+              last_text: "回吗",
+              last_ts_ms: 1_700_000_000_000,
+              unread: 0,
+            },
+          ];
+        if (cmd === "sms_messages")
+          return [
+            {
+              thread_id: "1",
+              id: "m1",
+              from_me: false,
+              text: "晚上回家吃饭吗？",
+              ts_ms: 1_700_000_000_000,
+              read: true,
+            },
+          ];
+        if (cmd === "sms_trash_list") return opts.trashList ?? [];
+        if (cmd === "sms_trash_add") return opts.addReply ?? { trashed: true };
+        if (cmd === "sms_trash_restore") return opts.restoreReply ?? true;
+        if (cmd === "sms_trash_purge") return opts.purgeReply ?? 2;
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return seen;
+  }
+  const settle = async () => {
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+  };
+  const clickTestId = async (c: HTMLElement, id: string) => {
+    const el = c.querySelector(`[data-testid="${id}"]`);
+    expect(el).toBeTruthy();
+    await fireEvent.click(el as HTMLElement);
+    await settle();
+  };
+
+  test("the trash panel reads the wire's snake_case rows (name, time, per-row target)", async () => {
+    deviceBridge({
+      trashList: [
+        { thread_id: "1", message_id: "m1", ts_ms: 1_700_000_000_000, trashed_ms: 1_700_000_000_000 },
+      ],
+    });
+    const host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-toggle");
+    const row = host.container.querySelector('[data-testid="trash-row"]');
+    expect(row).toBeTruthy();
+    // A camelCase read of the wire (`e.threadId`/`e.trashedMs`) yields `undefined`:
+    // the row would carry no name/time and the restore button no target id.
+    expect(row!.textContent).toContain("家人");
+    expect(row!.textContent).toMatch(/\d{2}:\d{2}|今天|昨天|\d{4}-\d{2}-\d{2}/);
+    expect(host.container.querySelector('[data-testid="trash-restore-m1"]')).toBeTruthy();
+    expect(host.container.querySelector('[data-testid="trash-restore-undefined"]')).toBeNull();
+  });
+
+  test("restoring a trashed message reports success and re-reads the thread", async () => {
+    const seen = deviceBridge({
+      trashList: [
+        { thread_id: "1", message_id: "m1", ts_ms: 1_700_000_000_000, trashed_ms: 1_700_000_000_000 },
+      ],
+      restoreReply: true,
+    });
+    const host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-toggle");
+    const readsBefore = seen.filter((c) => c.cmd === "sms_messages").length;
+    await clickTestId(host.container, "trash-restore-m1");
+    const call = seen.find((c) => c.cmd === "sms_trash_restore")!;
+    expect(call.threadId).toBe("1");
+    expect(call.messageId).toBe("m1");
+    // The command answers a **bool**; comparing it to a string would report failure.
+    const note = host.container.querySelector('[data-testid="trash-msg"]')!;
+    expect(note.getAttribute("data-ok")).toBe("true");
+    expect(note.textContent).toContain("已恢复显示");
+    expect(seen.filter((c) => c.cmd === "sms_messages").length).toBeGreaterThan(readsBefore);
+
+    // "Purge" answers the number restored: a successful call is a success.
+    await clickTestId(host.container, "trash-purge");
+    expect(seen.some((c) => c.cmd === "sms_trash_purge")).toBe(true);
+    expect(host.container.querySelector('[data-testid="trash-msg"]')!.textContent).toContain("回收站已清空");
+  });
+
+  test("trashing a message reports the bridge's three honest outcomes", async () => {
+    // (1) trashed → the success copy (and the honest "platform keeps it" wording).
+    deviceBridge({ addReply: { trashed: true } });
+    let host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-msg-btn-m1");
+    expect(host.container.querySelector('[data-testid="trash-msg"]')!.textContent).toContain("已移入回收站");
+
+    // (2) not_found → "the message is no longer in this folder", never a generic failure.
+    deviceBridge({ addReply: { trashed: false, not_found: true } });
+    host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-msg-btn-m1");
+    expect(host.container.querySelector('[data-testid="trash-msg"]')!.textContent).toContain(
+      "该短信已不在当前文件夹中",
+    );
+
+    // (3) refused (blocked sender / storage) → the generic failure, and `data-ok=false`.
+    deviceBridge({ addReply: { trashed: false, reason: "blocked sender" } });
+    host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-msg-btn-m1");
+    const note = host.container.querySelector('[data-testid="trash-msg"]')!;
+    expect(note.getAttribute("data-ok")).toBe("false");
+    expect(note.textContent).toContain("移入回收站失败");
   });
 });

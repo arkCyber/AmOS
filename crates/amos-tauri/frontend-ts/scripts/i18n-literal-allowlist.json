@@ -1,0 +1,6 @@
+[
+  {
+    "literal": "中文",
+    "reason": "The language picker lists every language by its **own** name (中文, English, 日本語 …), which is the correct localisation behaviour — translating a language's self-name would make the list unreadable to a speaker who cannot read the current UI locale. See `settings/LanguagePage.svelte`."
+  }
+]

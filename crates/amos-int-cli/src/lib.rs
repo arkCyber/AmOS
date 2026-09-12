@@ -16,6 +16,12 @@
 //! The line-processing core is exposed as [`exec_line`] so it can be unit-tested
 //! with a [`MockPipeline`] — no daemon required.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::path::PathBuf;
 
 use amos_int::event::InterpretationOutput;
@@ -36,6 +42,7 @@ OPTIONS:
         --source <LANG>   Source language tag, or \"auto\" (default auto)
         --target <LANG>   Target language tag (default zh)
     -h, --help            Print this help and exit
+    -V, --version         Print version and exit
 
 COMMANDS (stdin):
     <text>                Translate a line of source text
@@ -54,6 +61,7 @@ pub struct Opts {
     pub source: String,
     pub target: String,
     pub help: bool,
+    pub version: bool,
 }
 
 /// Resolve the socket path: `--socket`, then `AMOS_TRANSLATE_SOCKET`, else the
@@ -72,19 +80,30 @@ pub fn resolve_socket(cli: Option<PathBuf>) -> PathBuf {
 
 /// Parse CLI args (manual, no clap dependency).
 pub fn parse_args() -> Result<Opts, String> {
+    parse_from(std::env::args().skip(1))
+}
+
+/// Parse an explicit argument list (env-free, so it is unit-testable — the binary
+/// uses [`parse_args`], which reads the process arguments).
+pub fn parse_from<I, S>(args: I) -> Result<Opts, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut socket: Option<PathBuf> = None;
     let mut source = "auto".to_string();
     let mut target = "zh".to_string();
     let mut help = false;
+    let mut version = false;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut it = args.iter();
+    let mut it = args.into_iter().map(Into::into);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-s" | "--socket" => socket = it.next().map(PathBuf::from),
-            "--source" => source = it.next().cloned().unwrap_or_else(|| "auto".into()),
-            "--target" => target = it.next().cloned().unwrap_or_else(|| "zh".into()),
+            "--source" => source = it.next().unwrap_or_else(|| "auto".into()),
+            "--target" => target = it.next().unwrap_or_else(|| "zh".into()),
             "-h" | "--help" => help = true,
+            "-V" | "--version" => version = true,
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -93,6 +112,7 @@ pub fn parse_args() -> Result<Opts, String> {
         source,
         target,
         help,
+        version,
     })
 }
 
@@ -231,6 +251,18 @@ mod tests {
         let cfg = SessionConfig::one_way("en", "zh");
         let (s, rx) = Session::new(cfg, Box::new(MockPipeline::new("ignored", "en")));
         (s, rx)
+    }
+
+    #[test]
+    fn version_flag_is_parsed_without_starting_a_session() {
+        // A released artifact must be able to say what it is, so `--version` parses on
+        // its own (scripts/release-artifacts.sh checks every staged binary).
+        assert!(parse_from(["--version"]).unwrap().version);
+        assert!(parse_from(["-V"]).unwrap().version);
+        assert!(parse_from(["--version", "--source", "en"]).unwrap().version);
+        let plain = parse_from(["--source", "en"]).unwrap();
+        assert!(!plain.version);
+        assert!(!plain.help);
     }
 
     #[tokio::test]

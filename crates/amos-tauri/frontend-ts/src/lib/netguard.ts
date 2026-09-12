@@ -64,8 +64,3 @@ export function guardLevel(s: NetGuardStatus | null): GuardLevel {
   if (!s.enabled) return "disarmed";
   return s.enforced ? "armed-enforced" : "armed-intent";
 }
-
-/** True only when a real enforcement backend reports it is enforcing. */
-export function isEnforcing(s: NetGuardStatus | null): boolean {
-  return guardLevel(s) === "armed-enforced";
-}

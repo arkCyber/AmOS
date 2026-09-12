@@ -4,7 +4,7 @@
   // policy as the control center, see lib/settings.ts flipRadio / airplane gating).
   import { t } from "../locale.svelte";
   import type { QuickSettings, RadioKey } from "../../lib/settings";
-  import { readStoreValue, writeStoreValue } from "../../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../../lib/amosStore";
   import {
     WIFI_KEY,
     NEIGHBORHOOD,
@@ -13,6 +13,7 @@
     connectWithPassword,
     forgetNetwork,
     hasPassword,
+    isSaved,
     normalizeWifi,
     signalBars,
     sortNetworks,
@@ -23,6 +24,7 @@
     DEMO_DEVICES,
     btGlyph,
     normalizeBt,
+    renameDevice,
     setDiscoverable,
     type BtCfg,
   } from "../../lib/bluetooth";
@@ -44,9 +46,17 @@
   // passworded join).
   let cfg = $state<WifiCfg>(normalizeWifi(readStoreValue<unknown>(WIFI_KEY, undefined)));
   let scanning = $state(false);
+  // A rejected config write must be visible: the "已保存" label describes the store.
+  let radioErr = $state("");
   const saveCfg = (next: WifiCfg) => {
+    // The "已保存" label is a claim about the store, so the in-memory config only
+    // moves when the write landed.
+    if (!writeStoreValueChecked(WIFI_KEY, next)) {
+      radioErr = t("settings.radioSaveFailed");
+      return;
+    }
+    radioErr = "";
     cfg = next;
-    writeStoreValue(WIFI_KEY, next);
   };
   const runScan = () => {
     scanning = true;
@@ -93,12 +103,25 @@
   // ---- Bluetooth "this device + discoverable" config (same RadioPage) ----
   let btCfg = $state<BtCfg>(normalizeBt(readStoreValue<unknown>(BT_KEY, undefined)));
   const saveBt = (next: BtCfg) => {
+    if (!writeStoreValueChecked(BT_KEY, next)) {
+      radioErr = t("settings.radioSaveFailed");
+      return;
+    }
+    radioErr = "";
     btCfg = next;
-    writeStoreValue(BT_KEY, next);
   };
 </script>
 
 <div class="space-y-5">
+  {#if radioErr}
+    <p
+      role="status"
+      data-testid="radio-store-error"
+      class="rounded-lg bg-black/5 px-3 py-1.5 text-[11px] text-danger dark:bg-white/10"
+    >
+      {radioErr}
+    </p>
+  {/if}
   <section class={GROUP}>
     <div class={ROW}>
       <span class={LABEL}>{title}</span>
@@ -163,6 +186,9 @@
               {#if net.secure && !hasPassword(cfg, net.ssid)}
                 <span class="shrink-0 text-[11px] opacity-50">{t("settings.wifiNeedsPw")}</span>
               {/if}
+              {#if isSaved(cfg, net.ssid)}
+                <span class="shrink-0 text-[11px] opacity-50">{t("settings.wifiSaved")}</span>
+              {/if}
             </span>
             <span class="flex shrink-0 items-end gap-0.5" aria-hidden="true">
               {#each [1, 2, 3] as i (i)}
@@ -208,7 +234,14 @@
     <section class={GROUP}>
       <div class="flex items-center justify-between gap-3 px-4 py-3">
         <span class={LABEL}>{t("settings.btDeviceName")}</span>
-        <span class="truncate text-[15px] opacity-60">{btCfg.name}</span>
+        <input
+          value={btCfg.name}
+          aria-label={t("settings.btRename")}
+          placeholder={t("settings.btDeviceName")}
+          onchange={(e) =>
+            saveBt(renameDevice(btCfg, (e.currentTarget as HTMLInputElement).value))}
+          class="min-w-0 flex-1 rounded-lg bg-black/5 px-2.5 py-1.5 text-right text-[15px] outline-none dark:bg-white/10"
+        />
       </div>
       <div class={SUB}></div>
       <div class={ROW}>

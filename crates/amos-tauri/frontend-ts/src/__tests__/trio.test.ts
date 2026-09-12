@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { appendMessage, appendQuote, clearMessages, normalizeMessages, removeMessageAt, seedMessages } from "../lib/messages";
 import { fmtBubbleTime, isNewDay, messageDayLabel } from "../lib/messages";
-import { unreadCount, markAllRead, markRead } from "../lib/messages";
+import { unreadCount, markAllRead } from "../lib/messages";
 import { backspace, clearDial, pushKey, KEYS, MAX_DIAL_LEN } from "../lib/phone";
 import { seedTracks, normalizeTracks, stepIndex, wrap, removeTrack, nextIndexAfterRemoval, nextIndex, pctProgress, seekSeconds, DEMO_LYRICS, lyricIndex } from "../lib/music";
 
@@ -71,11 +71,7 @@ describe("messages", () => {
     const all = markAllRead(seed);
     expect(unreadCount(all)).toBe(0);
     expect(markAllRead(all)).toBe(all);
-
-    // markRead on the specific unread incoming clears it; outgoing are ignored
-    const one = markRead(seed, 2);
-    expect(unreadCount(one)).toBe(0);
-    expect(unreadCount(markRead(seed, 1))).toBe(1); // me is never counted/cleared
+    expect(all.filter((m) => m.from === "them").every((m) => m.read === true)).toBe(true);
   });
 });
 

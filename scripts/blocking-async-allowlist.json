@@ -1,0 +1,9 @@
+{
+  "policy": "Blocking calls inside `async fn` that are accepted, keyed by `file::fn`. Every entry must state the *phase* that makes it safe: these functions run before the listener accepts connections or after it stops serving, so the blocking call cannot delay a request. A new blocking call inside an allow-listed function is still accepted (the reason describes the function, not one line) — keep such functions strictly phase-bound. Remove an entry when the site disappears; the gate reports stale entries.",
+  "sites": {
+    "crates/amos-ai/src/main.rs::main": "Daemon startup: removes a stale unix-socket file before `serve` binds. Runs before a single connection is accepted.",
+    "crates/amos-ai/src/server.rs::serve_with_log_sink": "Bind-time socket permission hardening (0700) and post-shutdown socket removal. The first runs before the listener accepts; the second after the accept loop has ended. Both are phases of this single function.",
+    "crates/amos-translate/src/lib.rs::serve": "Same startup/shutdown pair as the AI daemon: socket hardening while binding, socket removal after the loop exits.",
+    "crates/amos-translate/src/main.rs::main": "Translate-daemon startup: stale socket cleanup before binding."
+  }
+}

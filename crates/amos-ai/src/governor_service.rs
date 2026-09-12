@@ -88,13 +88,37 @@ impl LmkHost for GovernorLmkHost {
         }
         if g.app_state(&id).is_none() {
             // register creates at Foreground; subsequent move lands the target tier.
-            let _ = g.register_app(id.clone());
+            if let Err(e) = g.register_app(id.clone()) {
+                // The container already believes this app exists. If the host refuses it,
+                // the two registries diverge for the rest of the session (the daemon will
+                // not manage an app it never admitted), so say so instead of discarding.
+                tracing::warn!(
+                    package = package_name,
+                    error = %e,
+                    "container reported an app the host governor refused to register; \
+                     host and container state now diverge"
+                );
+                return;
+            }
             self.managed
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(package_name.to_string());
         }
-        let _ = g.move_app(id, state);
+        if let Err(e) = g.move_app(id, state) {
+            // Not every container tier has a host representative — `Visible` has no
+            // `AppState` at all, and a transition the lifecycle rejects (e.g. a
+            // `Stopped` app being moved straight to `Foreground`) fails here. The host
+            // keeps its previous tier, which is *not* what the container just reported,
+            // so the divergence is logged rather than swallowed (REQ-A146).
+            tracing::warn!(
+                package = package_name,
+                reported = ?state,
+                error = %e,
+                "host governor could not adopt the container's reported tier; \
+                 the host keeps its previous state for this app"
+            );
+        }
     }
 
     fn report_killed(&self, package_name: &str) {
@@ -108,12 +132,26 @@ impl LmkHost for GovernorLmkHost {
     }
 }
 
+/// Log one failed container mirror op: the host decided something and the container did
+/// not follow, so the two sides no longer agree (REQ-A146). Best-effort semantics are
+/// unchanged — this only makes the divergence visible instead of silent.
+fn mirror_failed(op: &str, package: &str, err: &dyn std::fmt::Display) {
+    tracing::warn!(
+        op,
+        package,
+        error = %err,
+        "the container did not apply the host's lifecycle decision; \
+         host and container state now diverge"
+    );
+}
+
 /// The reverse half of the container↔host bridge: after the daemon's shared
 /// `ResourceGovernor` has run one `observe` tick (freeze/thaw/reclaim on its own
 /// registry), drive those decisions **back into the container** so the two sides
 /// stay coherent. Only apps this host adopted from the container (`host.managed`)
 /// are touched; a `reclaim` force-stops the container process and drops the
-/// task, while `frozen`/`thawed` mirror the container tier. Best effort.
+/// task, while `frozen`/`thawed` mirror the container tier. Best effort — but a
+/// failure is reported (`mirror_failed`), never swallowed.
 pub async fn drive_host_decisions(
     outcome: &GovernorOutcome,
     host: &GovernorLmkHost,
@@ -135,11 +173,17 @@ pub async fn drive_host_decisions(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .window_id(&id.0);
-            let _ = manager.force_stop_app(&id.0).await;
-            let _ = proxy
+            let stopped = manager.force_stop_app(&id.0).await;
+            if let Err(e) = stopped {
+                mirror_failed("force_stop_app", &id.0, &e);
+            }
+            let destroyed = proxy
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .destroy(&id.0);
+            if let Err(e) = destroyed {
+                mirror_failed("destroy", &id.0, &e);
+            }
             host.managed
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -151,10 +195,16 @@ pub async fn drive_host_decisions(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .window_id(&id.0);
-            let _ = proxy
+            let frozen = proxy
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .freeze(&id.0);
+            if let Err(e) = frozen {
+                // The host now believes the app is tombstoned while the container keeps
+                // running it — the governor will not retry (its own state says Cached),
+                // so this is the only chance to say so.
+                mirror_failed("freeze", &id.0, &e);
+            }
             emit_lmk(events, &id.0, window, LmkEventKind::Frozen);
         }
     }
@@ -164,7 +214,10 @@ pub async fn drive_host_decisions(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .window_id(&id.0);
-            let _ = proxy.lock().unwrap_or_else(|p| p.into_inner()).thaw(&id.0);
+            let thawed = proxy.lock().unwrap_or_else(|p| p.into_inner()).thaw(&id.0);
+            if let Err(e) = thawed {
+                mirror_failed("thaw", &id.0, &e);
+            }
             emit_lmk(events, &id.0, window, LmkEventKind::Thawed);
         }
     }

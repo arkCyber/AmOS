@@ -1,54 +1,45 @@
 /**
  * Reactive theme singleton for Svelte 5 apps — the Svelte counterpart of the
- * React `useTheme` context (`src/theme/index.tsx`).
+ * React `useTheme` context.
  *
  * Implemented as a runes module so `mode`/`osDark` are shared `$state`: Svelte
  * components call `themeMode()`/`themeDark()` in markup and update reactively.
  *
- * Why the logic is duplicated (not imported from `src/theme`): that module is a
- * React context file (`createContext(...)` runs at import) — importing it would
- * drag React into the Svelte chunk. These few pure helpers are tiny and stable.
- *
- * Cross-framework: the React ThemeProvider already toggles Tailwind's `dark`
- * class on <html> and owns the OS-preference listener. This store is for Svelte
- * UI that needs to *render* from the theme (a toggle, an icon, a color choice),
- * and keeps itself in sync by reading the same `amos-ui.theme` key + matchMedia.
+ * The *pure* decisions + persistence live in `lib/themeCore` (the single, unit-
+ * tested source of truth); this module only adds the reactive runes state and the
+ * OS-preference listener on top of them, so there is no duplicated logic.
  */
 import { AMOS_THEME_CHANGED_EVENT } from "./ui-events";
+import {
+  THEME_KEY,
+  applyDarkClass,
+  isThemeMode,
+  readStored,
+  resolveDark,
+  writeStored,
+  type ThemeMode,
+} from "../lib/themeCore";
 
-export type ThemeMode = "light" | "dark" | "auto";
-
-const THEME_KEY = "amos-ui.theme";
+export type { ThemeMode };
 
 function readMode(): ThemeMode {
-  try {
-    const s =
-      typeof localStorage !== "undefined" ? localStorage.getItem(THEME_KEY) : null;
-    return s === "light" || s === "dark" || s === "auto" ? s : "auto";
-  } catch {
-    return "auto";
-  }
+  const s = readStored(THEME_KEY, "auto");
+  return isThemeMode(s) ? s : "auto";
 }
 function persistMode(m: ThemeMode): void {
+  writeStored(THEME_KEY, m);
+}
+/** Effective dark decision for a mode + the current OS preference. */
+function dark(mode: ThemeMode, osDark: boolean): boolean {
+  return resolveDark(mode, new Date().getHours(), osDark);
+}
+/** Reflect the decision on <html>, tolerating a DOM-less (SSR) environment. */
+function applyDarkClassSafe(isDark: boolean): void {
   try {
-    localStorage.setItem(THEME_KEY, m);
-    (window as { Amos?: { storeWrite?(k: string, v: string): void } }).Amos?.storeWrite?.(
-      THEME_KEY,
-      m,
-    );
+    applyDarkClass(isDark);
   } catch {
     /* ignore */
   }
-}
-function applyDarkClass(dark: boolean): void {
-  try {
-    document.documentElement.classList.toggle("dark", dark);
-  } catch {
-    /* ignore */
-  }
-}
-function resolveDark(mode: ThemeMode, osDark: boolean): boolean {
-  return mode === "dark" ? true : mode === "light" ? false : osDark;
 }
 function osPrefersDark(): boolean {
   try {
@@ -71,7 +62,7 @@ export function themeMode(): ThemeMode {
 }
 /** Reactive read of the *effective* dark boolean (mode auto → OS pref). */
 export function themeDark(): boolean {
-  return resolveDark(mode, osDark);
+  return dark(mode, osDark);
 }
 
 /** Set + persist the mode and reflect it on <html> immediately. */
@@ -79,7 +70,7 @@ export function setThemeMode(m: ThemeMode): void {
   const changed = m !== mode;
   mode = m;
   persistMode(m);
-  applyDarkClass(resolveDark(mode, osDark));
+  applyDarkClassSafe(dark(mode, osDark));
   if (changed) {
     try {
       window.dispatchEvent(new CustomEvent(AMOS_THEME_CHANGED_EVENT, { detail: m }));
@@ -101,6 +92,6 @@ if (osPrefersDark() && typeof window !== "undefined" && typeof window.matchMedia
     .matchMedia("(prefers-color-scheme: dark)")
     .addEventListener("change", (e: MediaQueryListEvent) => {
       osDark = e.matches;
-      applyDarkClass(resolveDark(mode, osDark));
+      applyDarkClassSafe(dark(mode, osDark));
     });
 }

@@ -15,6 +15,12 @@
 //! The command logic lives here (testable with temp state + the offline host
 //! clock); `src/main.rs` is a thin wrapper over [`run`].
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +44,7 @@ OPTIONS:
         --server <HOST>  NTP server for `sync` (needs the `ntp` feature; else
                          $AMOS_NTP_SERVER; otherwise the offline host clock)
     -h, --help           Print this help and exit
+    -V, --version        Print version and exit
 ";
 
 /// Which operation to run.
@@ -59,6 +66,7 @@ pub struct Opts {
     /// Optional `--server` NTP address (host or host:port).
     pub server: Option<String>,
     pub help: bool,
+    pub version: bool,
 }
 
 /// Resolve the state file: `--state`, then `$AMOS_TIMESYNC_STATE`, else the
@@ -88,11 +96,13 @@ where
     let mut server: Option<String> = None;
     let mut cmd = Cmd::Now;
     let mut help = false;
+    let mut version = false;
 
     let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => help = true,
+            "-V" | "--version" => version = true,
             "--state" => {
                 state = Some(
                     args.next()
@@ -123,6 +133,7 @@ where
         state: resolve_state(state),
         server,
         help,
+        version,
     })
 }
 
@@ -215,6 +226,16 @@ mod tests {
     }
 
     #[test]
+    fn version_flag_is_global_and_needs_no_command() {
+        // A released artifact must be able to say what it is (scripts/release-artifacts.sh
+        // checks `--version` on every staged binary), so it must not require a subcommand.
+        assert!(parse_from(["--version"]).unwrap().version);
+        assert!(parse_from(["-V"]).unwrap().version);
+        assert!(parse_from(["sync", "-V"]).unwrap().version);
+        assert!(!parse_from(["now"]).unwrap().version);
+    }
+
+    #[test]
     fn help_and_unknown_reject() {
         assert!(parse_from(["-h"]).unwrap().help);
         assert!(
@@ -242,6 +263,7 @@ mod tests {
             state: state.clone(),
             server: None,
             help: false,
+            version: false,
         })
         .await
         .expect("offline sync ok");
@@ -253,6 +275,7 @@ mod tests {
             state: state.clone(),
             server: None,
             help: false,
+            version: false,
         })
         .await
         .expect("now ok");

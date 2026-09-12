@@ -24,9 +24,10 @@
 //! > **GPU offload** rather than a real NNAPI runtime. Making this target-accurate
 //! > conflicts with the repo's deliberate host `--features qnn,neuropilot`
 //! > cross-compile checks, so it stays a device-bring-up decision.
-//! > (2) `Config.enable_acceleration` (`AMOS_ACCELERATION`) and this module's
-//! > `AMOS_ACCEL` are two independent knobs; wiring the former into `AccelProfile`
-//! > is pending. Both are surfaced here so nobody mistakes them for one flag.
+//! > (2) The legacy `AMOS_ACCELERATION` flag lived on a `Config` struct nothing
+//! > constructed; that dead module was removed, so **`AMOS_ACCEL` is the only
+//! > strategy knob** and `AMOS_ACCELERATION` is not honoured anywhere (it remains
+//! > only in the historical CODE_COMPLETION_SUMMARY.md table).
 
 /// Env var naming the accelerator strategy: `auto|cpu|vulkan|metal|nnapi|qnn|neuropilot|off`.
 pub const AMOS_ACCEL_ENV: &str = "AMOS_ACCEL";
@@ -170,14 +171,13 @@ pub struct AccelProfile {
     pub vendor: SoCVendor,
     /// The operator's requested strategy (may be `Auto` before [`Self::effective`]).
     pub accel: Accel,
-    /// Whether acceleration is enabled at all (`Config.enable_acceleration` /
-    /// `AMOS_ACCEL=off`); when false the effective runtime is CPU.
+    /// Whether acceleration is enabled at all (`AMOS_ACCEL=off`); when false the
+    /// effective runtime is CPU.
     pub enabled: bool,
 }
 
 impl AccelProfile {
-    /// Resolve a profile from the environment (the way `Config.enable_acceleration`
-    /// and the daemon's `AMOS_*` knobs do).
+    /// Resolve a profile from the environment (`AMOS_ACCEL` / `AMOS_SOC_VENDOR`).
     pub fn from_env() -> Self {
         let vendor = SoCVendor::detect();
         let accel = match std::env::var(AMOS_ACCEL_ENV) {
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn disabled_profile_never_offloads() {
-        // `enabled: false` is what `Config.enable_acceleration=false` must map to;
+        // `enabled: false` is what `AMOS_ACCEL=off` must map to;
         // the effective runtime is CPU with an explicit zero offload.
         let p = AccelProfile {
             vendor: SoCVendor::Qualcomm,

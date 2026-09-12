@@ -1,6 +1,6 @@
 <script lang="ts">
   // LanguagePage.svelte — 「语言」sub page. Switches zh / en through the shared
-  // reactive locale singleton (which also broadcasts to the React shell).
+  // reactive locale singleton (which also broadcasts to the shell).
   import { t, locale, setLocale } from "../locale.svelte";
   import { GROUP, ROW, LABEL, HINT } from "./kit";
   import Segmented from "./Segmented.svelte";

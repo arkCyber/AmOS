@@ -11,11 +11,15 @@
  */
 
 import type { RagHit } from "./rag";
-import type { Note } from "./notes";
+import { noteTitle, type Note } from "./notes";
 
 /** Namespace prefix put in front of a note id so a note's passage is addressable
  *  in the daemon index without colliding with other sources (e.g. `pdf:…`). */
 export const NOTES_RAG_PREFIX = "note:";
+
+/** Durable-store key holding the ids the UI last told the daemon it indexed
+ *  (the daemon has no list RPC, so this is the UI's own bookkeeping for prune). */
+export const NOTES_RAG_INDEXED_KEY = "amos.notesRagIndexed";
 
 /** The stable daemon index id for a note (upsert by this id on edit is idempotent). */
 export function noteRagId(noteId: string): string {
@@ -64,6 +68,19 @@ export function notesToRemove(
     if (noteId !== null && !active.has(noteId)) out.push(ragId);
   }
   return out;
+}
+
+/**
+ * Human, citation-style label for one retrieval hit: the source note's title
+ * when the hit is a (still-present) note, else the raw id (e.g. a future
+ * `pdf:` source, or a note deleted since indexing). Never invents a title.
+ */
+export function hitSourceLabel(hitId: string, notes: readonly Note[]): string {
+  const noteId = noteIdFromRagId(hitId);
+  if (noteId === null) return hitId;
+  const n = notes.find((x) => x.id === noteId);
+  if (!n) return noteId;
+  return noteTitle(n.text) || noteId;
 }
 
 /**

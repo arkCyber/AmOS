@@ -23,6 +23,7 @@ amos-supervisor — launch & supervise Amos CLI daemons from a JSON config
 USAGE:
     amos-supervisor check <config.json>
     amos-supervisor run   <config.json>
+    amos-supervisor -V | --version
 
 The config is a JSON file: { \"daemons\": [ { \"name\", \"program\", \"args\",
 \"env\", \"restart\": { \"max_restarts\", \"backoff_secs\", \"backoff_factor\" } } ] }
@@ -31,6 +32,12 @@ The config is a JSON file: { \"daemons\": [ { \"name\", \"program\", \"args\",
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Self-describing artifacts: the release bundle's `--version` is how a deployed
+    // binary is identified (scripts/release-artifacts.sh checks it).
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("amos-supervisor {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if args.len() < 2 || (args[0] != "run" && args[0] != "check") {
         print!("{USAGE}");
         return ExitCode::FAILURE;

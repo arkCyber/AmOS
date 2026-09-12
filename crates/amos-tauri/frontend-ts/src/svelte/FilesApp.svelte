@@ -2,9 +2,8 @@
   // FilesApp.svelte — Svelte 5 (runes) implementation of the file manager. All
   // logic reuses pure lib/files.ts. Feature-complete (create folder/file, rename,
   // move, single + multi-select batch delete/move, favorites, search, sort,
-  // all/fav/recent views). The former React body (src/components/FilesApp.tsx)
-  // was removed in the subtraction phase — this is now the only implementation,
-  // mounted directly by apps.tsx FilesEntry (no React fallback).
+  // all/fav/recent views). The former React body was removed in the subtraction
+  // phase — this is the only implementation, mounted by `appRegistry`.
   import {
     FILES_FAV_KEY,
     FILES_KEY,
@@ -28,18 +27,46 @@
     toggleFav,
   } from "../lib/files";
   import type { FEntry, SortKey } from "../lib/files";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { fmtTime } from "../lib/notes";
+  import { canonicalPath, hasMediaBridge, mediaGrantRead, mediaList, type StandardDir } from "../lib/media";
+  import {
+    buildExternalFileView,
+    externalGlyph,
+    filterExternalByName,
+    formatBytes,
+    groupByCollection,
+    recentExternalFiles,
+    sortExternalFiles,
+    type ExternalSort,
+  } from "../lib/externalFiles";
   import { t } from "./locale.svelte";
+  import { filesChannel } from "./appLinks";
+
+  /**
+   * External collections this screen lists, read-only. The `media_*` bridge is the
+   * source; a collection it cannot serve simply fails and is skipped (see
+   * `loadExternal`), so the list is honest about what exists rather than assumed.
+   */
+  const EXTERNAL_COLLECTIONS: readonly StandardDir[] = [
+    "download",
+    "pictures",
+    "movies",
+    "music",
+    "recordings",
+  ];
 
   const FOLDER = "📁";
   const FILE = "📄";
   const GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
 
+  // Demo seed — **only when the key is absent**, so an intentionally emptied store
+  // stays empty (the rule `Shell.seedContactsOnce` documents for contacts).
   const seed = ((): FEntry[] => {
-    const l = normalizeFiles(readStoreValue<unknown>(FILES_KEY, []));
-    if (l.length) return l;
+    const raw = readStoreValue<unknown>(FILES_KEY, undefined);
+    if (raw !== undefined) return normalizeFiles(raw);
     const now = Date.now();
     const s: FEntry[] = [
       { id: "doc", type: "folder", name: "文档", ts: now },
@@ -55,6 +82,8 @@
   let name = $state("");
   let content = $state("");
   let err = $state("");
+  // The store refused a write (full/unavailable): say so and keep showing the truth.
+  let storeErr = $state("");
   let renameId = $state<string | null>(null);
   let renameVal = $state("");
   let cutId = $state<string | null>(null);
@@ -66,15 +95,27 @@
   let favs = $state<string[]>(initFavs);
   let selecting = $state(false);
   let selIds = $state<ReadonlySet<string>>(new Set());
+  /** Entry a Spotlight link asked to reveal (marked while on screen; `null` = none). */
+  let spotId = $state<string | null>(null);
+  let linkNonce = 0;
 
-  const persist = (l: FEntry[]) => {
-    writeStoreValue(FILES_KEY, l);
+  const persist = (l: FEntry[]): boolean => {
+    if (!writeStoreValueChecked(FILES_KEY, l)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     list = l;
+    return true;
   };
   const fav = (id: string) => {
     const next = toggleFav(favs, id);
+    if (!writeStoreValueChecked(FILES_FAV_KEY, next)) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     favs = next;
-    writeStoreValue(FILES_FAV_KEY, next);
   };
   const toggleSel = (id: string) => {
     const next = new Set(selIds);
@@ -114,11 +155,35 @@
   );
   const path = $derived(pathOf(list, cwd));
 
+  // ---- Deep link: Spotlight → one entry ------------------------------------------
+  // Spotlight sets the `files` channel and opens this app. This screen has no
+  // single-file viewer, so the honest reveal is: drop any filter/search that would
+  // hide it, go to the folder the entry lives in, and **mark** that row. The link is
+  // consumed (channel cleared) so re-opening Files never re-fires it, and an id that
+  // no longer exists is ignored — no phantom row is invented.
+  $effect(() => {
+    return filesChannel().subscribe((v) => {
+      if (!v || v.id.trim() === "" || v.nonce === linkNonce) return;
+      linkNonce = v.nonce;
+      const target = list.find((e) => e.id === v.id);
+      if (target) {
+        mode = "all";
+        globalSearch = false;
+        query = "";
+        exitSelect();
+        cwd = target.parent; // show the entry where it actually lives
+        spotId = target.id;
+      }
+      filesChannel().set({ id: "", nonce: linkNonce });
+    });
+  });
+
   const openFolder = (id: string) => {
     if (globalSearch) {
       globalSearch = false;
       query = "";
     }
+    spotId = null; // navigating away ends the "here it is" mark
     cwd = id;
   };
   const cycleSort = () =>
@@ -138,7 +203,8 @@
     }
     const entry = makeEntry(creating ?? "folder", v, cwd, Date.now());
     if (creating === "file") entry.content = content;
-    persist(addEntry(list, entry));
+    // Keep the create form (and its typed name/content) if the store rejected it.
+    if (!persist(addEntry(list, entry))) return;
     creating = null;
   };
   const beginRename = (id: string, oldName: string) => {
@@ -153,7 +219,8 @@
       err = t("files.conflict");
       return;
     }
-    persist(renameEntry(list, renameId, v));
+    // A rejected rename keeps the inline input open with the typed name.
+    if (!persist(renameEntry(list, renameId, v))) return;
     renameId = null;
   };
   const doCut = (id: string) => (cutId = id);
@@ -173,9 +240,90 @@
           ? "bg-danger text-white"
           : "bg-neutral-300 text-neutral-900 dark:bg-neutral-700 dark:text-neutral-100"
     } transition active:scale-95`;
+
+  // ---- External collections (read-only, from the media bridge) --------------
+  // Deliberately isolated from the `amos.files` store above: these are real device
+  // files we may only *look* at (lib/externalFiles documents the reason). Nothing is
+  // rendered until the bridge answers — an offline shell must not claim "no files".
+  let extAvailable = $state(false);
+  let extOpen = $state(false);
+  let extItems = $state<unknown[]>([]);
+  let extBlocked = $state(false);
+  let extBusy = $state(false);
+  let extQuery = $state("");
+  // UI view mode: the three lib sorts plus "recent" (the newest 20, which is a
+  // filter-and-order helper rather than a sort — hence a separate union here
+  // instead of widening `ExternalSort`).
+  type ExtSortMode = ExternalSort | "recent";
+  let extSort = $state<ExtSortMode>("name");
+
+  async function loadExternal(): Promise<void> {
+    if (!hasMediaBridge()) return;
+    extAvailable = true;
+    extBusy = true;
+    const settled = await Promise.allSettled(EXTERNAL_COLLECTIONS.map((c) => mediaList(c)));
+    const items: unknown[] = [];
+    let served = 0;
+    let failed = 0;
+    for (const r of settled) {
+      if (r.status === "fulfilled") {
+        served += 1;
+        if (Array.isArray(r.value)) items.push(...r.value);
+      } else {
+        failed += 1;
+      }
+    }
+    extItems = items;
+    // "Blocked" only when *nothing* could be read while something failed — a
+    // backend that serves just some collections is not an authorization problem.
+    extBlocked = served === 0 && failed > 0;
+    extBusy = false;
+  }
+
+  const grantExternal = async (): Promise<void> => {
+    if (extBusy) return;
+    extBusy = true;
+    await Promise.allSettled(EXTERNAL_COLLECTIONS.map((c) => mediaGrantRead(c)));
+    extBusy = false;
+    await loadExternal(); // the notice clears only if reading really works now
+  };
+
+  let extLoaded = false;
+  $effect(() => {
+    if (extLoaded) return;
+    extLoaded = true;
+    void loadExternal();
+  });
+
+  const extView = $derived(extItems.length > 0 ? buildExternalFileView(extItems) : null);
+  const extFlat = $derived(extView ? extView.groups.flatMap((g) => g.files) : []);
+  // "recent" is the newest 20 (unknown mtime sorts last — see recentExternalFiles),
+  // the other three are stable sorts over whatever the name filter left.
+  const extShown = $derived(
+    groupByCollection(
+      extSort === "recent"
+        ? recentExternalFiles(filterExternalByName(extFlat, extQuery), 20)
+        : sortExternalFiles(filterExternalByName(extFlat, extQuery), extSort),
+    ),
+  );
+  const cycleExtSort = () => {
+    extSort =
+      extSort === "name" ? "date" : extSort === "date" ? "size" : extSort === "size" ? "recent" : "name";
+  };
+  const extSortLabel = $derived(
+    extSort === "name"
+      ? t("files.sortName")
+      : extSort === "date"
+        ? t("files.sortTime")
+        : extSort === "size"
+          ? t("files.externalSortSize")
+          : t("files.recent"),
+  );
+  const collectionLabel = (c: StandardDir): string => canonicalPath(c) || c;
 </script>
 
 <div class="p-3">
+  <StoreErrorBar message={storeErr} />
   <!-- toolbar -->
   <div class="flex flex-wrap gap-2">
     <button onclick={() => beginCreate("folder")} class={btnCls("accent")}>{t("files.addFolder")}</button>
@@ -304,7 +452,7 @@
         {@const isFolder = e.type === "folder"}
         {@const isSel = selecting && selIds.has(e.id)}
         {@const actionable = selecting || isFolder}
-        <div class="flex items-center gap-2 {isSel ? 'bg-accent/15' : ''}">
+        <div class="flex items-center gap-2 {isSel || spotId === e.id ? 'bg-accent/15' : ''}" data-spotlight={spotId === e.id ? "hit" : undefined}>
           <button
             type="button"
             onclick={actionable ? (selecting ? () => toggleSel(e.id) : () => openFolder(e.id)) : undefined}
@@ -334,6 +482,79 @@
         </div>
       {/each}
     </div>
+  {/if}
+
+  <!-- External collections (read-only). Rendered only once the media bridge has
+       answered, so an offline shell never claims the device has no files. -->
+  {#if extAvailable}
+    <section class="mt-4" aria-label={t("files.external")}>
+      <div class="flex items-center justify-between px-1">
+        <button
+          onclick={() => (extOpen = !extOpen)}
+          aria-pressed={extOpen}
+          class="text-sm font-semibold text-neutral-800 dark:text-neutral-200"
+        >📱 {t("files.external")}</button>
+        {#if extView}
+          <span class="text-xs opacity-50">
+            {extView.fileCount} · {formatBytes(extView.totalBytes)}
+          </span>
+        {/if}
+      </div>
+
+      {#if extOpen}
+        {#if extBlocked}
+          <div
+            data-testid="external-blocked"
+            role="status"
+            class="mt-2 flex flex-wrap items-center gap-2 rounded-xl bg-amber-500/15 px-3 py-2 text-xs text-amber-700 ring-1 ring-amber-400/30 dark:text-amber-200"
+          >
+            <span aria-hidden="true">🔒</span>
+            <span class="min-w-0 flex-1">{t("files.externalBlocked")}</span>
+            <button
+              onclick={() => void grantExternal()}
+              disabled={extBusy}
+              aria-label={t("files.externalGrant")}
+              class={btnCls("accent", "sm") + " disabled:opacity-50"}
+            >{t("files.externalGrant")}</button>
+          </div>
+        {:else}
+          <div class="mt-2 flex items-center gap-2">
+            <input
+              bind:value={extQuery}
+              placeholder={t("files.externalSearch")}
+              aria-label="external-search"
+              class="min-w-0 flex-1 rounded-full bg-neutral-200 px-3 py-1 text-sm outline-none dark:bg-neutral-800"
+            />
+            <button onclick={cycleExtSort} title={t("files.sort")} class="shrink-0 rounded-full bg-neutral-300 px-3 py-1 text-xs dark:bg-neutral-700">
+              {extSortLabel}
+            </button>
+          </div>
+
+          {#if extShown.length === 0}
+            <p class="mt-2 text-center text-xs opacity-60">
+              {extQuery.trim() ? t("files.noMatch") : t("files.externalEmpty")}
+            </p>
+          {:else}
+            {#each extShown as g (g.collection)}
+              <div class="mt-2 px-1 text-xs font-semibold opacity-70">{collectionLabel(g.collection)}</div>
+              <div class="mt-1 {GROUP} divide-y divide-black/5 dark:divide-white/10">
+                {#each g.files as f (f.id)}
+                  <div class="flex items-center gap-2 px-3.5 py-2" data-testid="external-file">
+                    <span class="text-xl" aria-hidden="true">{externalGlyph(f.kind)}</span>
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-sm">{f.name}</span>
+                      <span class="block text-xs opacity-50">
+                        {formatBytes(f.sizeBytes)} · {f.ts ? fmtTime(f.ts) : "—"} · {t("files.externalReadOnly")}
+                      </span>
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            {/each}
+          {/if}
+        {/if}
+      {/if}
+    </section>
   {/if}
 </div>
 

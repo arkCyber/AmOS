@@ -245,9 +245,12 @@ Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就�
 - 容量上限 `DEFAULT_TRASH_CAP = 256`，**回收最旧**（FIFO 淘汰 = 该条自动恢复显示，绝不静默吞掉可见性之外的任何东西），淘汰时同步清理孤儿预览。
 - 持久化 `to_json`/`from_json`（版本化 `v1`）：**只存 id 与时间戳，绝不存正文**；条目与预览各自有界、超限拒绝、逐条带序号报错。
 
-**桥与命令（`crates/amos-tauri/src/sms.rs`）**：进程级共享 `SmsTrash`（`RwLock`，锁内仅毫秒级内存操作，同 §3 的不阻塞纪律）；四个命令 `sms_trash_add(folder?)`（三态结果 `{trashed:true} | {trashed:false, reason} | {trashed:false, notFound:true}`，包装域错误经 `SmsError::Failed` 单层映射）、`sms_trash_list`、`sms_trash_restore`、`sms_trash_purge`；**三条读取路径统一过滤**——`sms_snapshot` 走 `apply_trash`、`sms_messages` 按回收站逐条剔除、`sms_counts`/徽标走纯函数 `filtered_counts`（块名单 + 回收站一起扣，**徽标与可见列表由构造保证一致**）；数据目录 `sms-trash.json`，启动时加载、每次变更落盘（同块名单的模式）。
+**桥与命令（`crates/amos-tauri/src/sms.rs`）**：进程级共享 `SmsTrash`（`RwLock`，锁内仅毫秒级内存操作，同 §3 的不阻塞纪律）；四个命令 `sms_trash_add(folder?)`（**三态结果** `TrashAddOut`：`{trashed:true}` / `{trashed:false, reason}` / `{trashed:false, not_found:true}`——「未找到」与「被拒」是**结果而非错误**，`TrashReject{NotFound,Refused}` → `trash_outcome` 单一映射；空 id 这种**畸形请求**仍是 `Err`）、`sms_trash_list`、`sms_trash_restore`（`bool`）、`sms_trash_purge`（`usize`）；**三条读取路径统一过滤**——`sms_snapshot` 走 `apply_trash`、`sms_messages` 按回收站逐条剔除、`sms_counts`/徽标走纯函数 `filtered_counts`（块名单 + 回收站一起扣，**徽标与可见列表由构造保证一致**）；数据目录 `sms-trash.json`，启动时加载、每次变更落盘（同块名单的模式）。
 
-**前端（`backend.ts` + `MessagesApp.svelte` + i18n 中英）**：真机模式气泡悬停出现「移入回收站」按钮；工具栏「回收站 (n)」切换面板，列出隐藏条目（线程名 + 时间），支持单条**恢复**与**清空**；三态结果以状态条明示——成功文案写明「系统短信应用中仍保留」，陈旧 id 报「该短信已不在当前文件夹中」，失败报「移入回收站失败」。`sms_trash_add` 对 Tauri v2 的 camelCase 参数（`threadId`/`messageId`）与 `sms_messages` 同一约定。
+> **2026-09-12（REQ-A108）修正**：上面这条三态契约是本轮才**真正实现**的——此前文档与前端按三态写、桥却返回裸 `TrashOut`（「未找到」只是一句错误字符串），于是成功回收会被前端读成「失败/已不在当前文件夹」。同轮修掉回收站面板的三处**只读契约**缺陷：① `SmsTrashEntryOut` 写的是 camelCase（`threadId`/`tsMs`…），而 `TrashOut` 序列化出来是 snake_case（`thread_id`/`ts_ms`…）⇒ 面板行无名字无时间、`each` 的 key 变成 `"undefined/undefined"`、恢复发出**空 id**；② `smsTrashRestore` 把 `bool` 回复与字符串 `"restored"` 比较 ⇒ **成功也报失败**；③ `smsTrashPurge` 把 `usize` 与 `"purged"` 比较 ⇒ 同上。根因是没有 DOM 测试覆盖回收站面板、Rust 测试只到纯域（`trash_message`）而没到命令的序列化契约；现补 `messages.svelte.test.ts` **+3**（面板按 snake_case 真实回包渲染、恢复/清空成功且重读线程、三态文案）与 `sms::tests` **+2**（三态 wire 形状、provider 读失败＝拒收而非伪造成功），并由新门 `scripts/tauri-reply-scan.mjs` 守住（见 `docs/tauri-reply-audit.md`）。
+
+**前端（`backend.ts` + `MessagesApp.svelte` + i18n 中英）**：真机模式气泡悬停出现「移入回收站」按钮；工具栏「回收站 (n)」切换面板，列出隐藏条目（线程名 + 时间），支持单条**恢复**与**清空**；三态结果以状态条明示——成功文案写明「系统短信应用中仍保留」，陈旧 id 报「该短信已不在当前文件夹中」，被拒报「移入回收站失败」。参数走 Tauri v2 的 camelCase（`threadId`/`messageId`，与 `sms_messages` 同一约定），**回复**则按 serde 原样读（snake_case 字段、`bool`/`number` 原类型）。
+
 
 **本节验证（本机）**：`cargo test -p amos-tauri --lib` **237 例**（`sms::` +6：预览换到上一条可见消息、整线程隐藏、未知 id 诚实报错、恢复出自然预览 + 未读徽标、新消息到来后预览覆盖失效、落盘/重载 round-trip）；`cargo test -p amos-sms` **55 例**（`trash::` 纯域用例）；`clippy --all-targets -D warnings`（host 与 `--features android`）、`fmt --check`、`cargo check -p amos-sms --features android` 全干净；前端 `tsc --noEmit` 与 `svelte-check` 0 错 0 警、vitest **471 例**全绿。
 

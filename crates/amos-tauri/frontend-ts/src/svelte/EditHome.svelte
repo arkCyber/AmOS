@@ -1,16 +1,15 @@
 <script lang="ts">
-  // EditHome.svelte — Svelte 5 (runes) port of the React `EditHome`: the home
-  // layout EDITOR shown by the React shell in edit mode.
+  // EditHome.svelte — Svelte 5 (runes) implementation of the home layout editor.
   //
   // This is a CONTROLLED screen (the second consumer of the shared controlled-
-  // screen infra after HomeDock): the React shell owns the layout and pushes it
+  // screen infra after HomeDock): the shell owns the layout and pushes it
   // down over propsBus channel "editHome". On each edit the screen does NOT
   // mutate local state — it computes the next layout via the shared pure
   // lib/amosStore helpers (hideFromHome/restoreToHome) and emits it back up
   // ('change'); the shell persists it and re-pushes the new layout in place.
   //
   // Pure logic + icons are REUSED: same lib/amosStore helpers and the same
-  // lib/appIcon single source the React EditHome uses.
+  // lib/appIcon single source every home surface renders from.
   import { t } from "./locale.svelte";
   import { appIcon, appTitleKey } from "../lib/appMeta";
   import type { HomeLayout } from "../lib/amosStore";

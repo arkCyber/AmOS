@@ -1,20 +1,30 @@
 <script lang="ts">
   // NoteEditor.svelte — a full-bleed, auto-saving editor for ONE note.
-  // Design: docs/notes-editor.md. Standalone (not yet wired into NotesApp):
-  // receives an existing `note`, edits its whole body, and auto-saves back to the
-  // shared `amos.notes` store (preserving `created`, bumping `ts`). No destructive
-  // "discard": ‹ back flushes any pending save, so leaving never loses work.
+  // Design: docs/notes-editor.md. Mounted by `NotesApp.svelte` (the "整页 / full
+  // page" button swaps the list for this editor — see `openEditor`): it receives an
+  // existing `note`, edits its whole body, and auto-saves back to the shared
+  // `amos.notes` store (preserving `created`, bumping `ts`). No destructive
+  // "discard": ‹ back flushes any pending save, so leaving loses no work **that the
+  // store accepted** — a rejected write (full/unavailable storage) is reported as a
+  // failed save rather than silently claimed as "saved".
   import { onDestroy } from "svelte";
   import type { Note } from "../lib/notes";
   import { NOTES_KEY, editNote, fmtInline } from "../lib/notes";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
-  import { clockLabel, createDebouncer } from "../lib/autoSave";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import {
+    clockLabel,
+    createDebouncer,
+    initialSaveState,
+    saveStateReducer,
+    type SaveState,
+  } from "../lib/autoSave";
   import {
     enterContinuesTask,
     prefixTaskAtLine,
     shiftLineIndent,
     toggleTaskLineAt,
   } from "../lib/noteEditing";
+  import { t } from "./locale.svelte";
 
   let { note, onClose }: { note: Note; onClose: () => void } = $props();
   // Read the (immutable-for-this-editor) identity once through a closure so svelte
@@ -26,7 +36,11 @@
   let previewOn = $state(false);
   let lastSaved = $state(initial.ts);
   let saveErr = $state("");
-  let dirty = $state(false);
+  // The dirty/saving/saved/error machine lives in the tested `lib/autoSave`
+  // reducer — the editor must not re-implement it with ad-hoc booleans (see
+  // docs/unwired-exports-audit.md Round 15). `{ ...initialSaveState }` keeps the
+  // shared module constant out of Svelte's deep `$state` proxy.
+  let save = $state<SaveState>({ ...initialSaveState });
   let el = $state<HTMLTextAreaElement | null>(null);
 
   const commit = () => {
@@ -34,27 +48,39 @@
     // The note may have been archived/removed (e.g. in another window). Never
     // silently claim a save we didn't make — surface it honestly.
     if (!cur.some((n) => n.id === initial.id)) {
-      saveErr = "笔记已被删除，改动未保存";
-      dirty = true;
+      saveErr = t("note.editorDeleted");
+      save = saveStateReducer(save, { type: "save_failed" });
       return;
     }
     const now = Date.now();
     const next = editNote(cur, initial.id, editVal, now);
-    writeStoreValue(NOTES_KEY, next);
+    // The write is **verified**: reporting "保存于 HH:MM:SS" for a draft the store
+    // rejected would claim a save that did not happen (the edits would be gone on
+    // leaving). A rejected write is surfaced as a failed save instead.
+    if (!writeStoreValueChecked(NOTES_KEY, next)) {
+      saveErr = t("note.saveFailed");
+      save = saveStateReducer(save, { type: "save_failed" });
+      return;
+    }
     lastSaved = now;
-    dirty = false;
     saveErr = "";
+    save = saveStateReducer(save, { type: "saved" });
   };
   const deb = createDebouncer(() => commit(), 600);
   // Flush (not cancel) on unmount: however the editor is closed — not just via
   // ‹ back — pending keystrokes are saved, never lost.
   onDestroy(() => deb.flush());
 
-  const onInput = () => {
-    dirty = true;
+  /** One "the draft changed" event → `edit` (dirty + saving) + (re)arm the debounce. */
+  const markEdit = () => {
+    save = saveStateReducer(save, { type: "edit" });
     deb.schedule();
   };
+  const onInput = () => {
+    markEdit();
+  };
   const back = () => {
+    save = saveStateReducer(save, { type: "flush_started" });
     deb.flush(); // never lose the last keystrokes
     onClose();
   };
@@ -79,8 +105,7 @@
         e.preventDefault();
         editVal = r.text;
         queueCaret(ta, r.cursor);
-        dirty = true;
-        deb.schedule();
+        markEdit();
       }
     } else if (e.key === "Tab") {
       e.preventDefault();
@@ -88,8 +113,7 @@
       if (r.changed) {
         editVal = r.text;
         queueCaret(ta, r.cursor);
-        dirty = true;
-        deb.schedule();
+        markEdit();
       }
     }
   };
@@ -98,16 +122,14 @@
     const r = toggleTaskLineAt(editVal, caret());
     if (r && r.changed) {
       editVal = r.text;
-      dirty = true;
-      deb.schedule();
+      markEdit();
     }
   };
   const prefixAtCaret = () => {
     const r = prefixTaskAtLine(editVal, caret());
     if (r && r.changed) {
       editVal = r.text;
-      dirty = true;
-      deb.schedule();
+      markEdit();
     }
   };
 </script>
@@ -120,9 +142,10 @@
       class="shrink-0 rounded-full px-2 py-0.5 text-sm opacity-70 hover:opacity-100"
     >‹</button>
     <span class="truncate text-[15px] font-semibold">{editVal.split("\n")[0]?.trim() || "…"}</span>
-    <span class="ml-auto shrink-0 text-xs opacity-60">
-      {#if saveErr}<span class="text-danger">{saveErr}</span>
-      {:else}{dirty ? "正在保存…" : `保存于 ${clockLabel(new Date(lastSaved))}`}{/if}
+    <span data-testid="note-editor-status" class="ml-auto shrink-0 text-xs opacity-60">
+      {#if save.status === "error"}<span class="text-danger">{saveErr || t("note.saveFailed")}</span>
+      {:else if save.status === "saving"}{t("note.saving")}
+      {:else}{t("note.savedAt", { time: clockLabel(new Date(lastSaved)) })}{/if}
     </span>
   </div>
 
@@ -132,7 +155,7 @@
     oninput={onInput}
     onkeydown={onKey}
     aria-label="note-editor-textarea"
-    placeholder="开始输入…"
+    placeholder={t("note.editorPlaceholder")}
     class="w-full flex-1 resize-none bg-transparent p-3 text-sm leading-relaxed outline-none"
   ></textarea>
 
@@ -140,19 +163,22 @@
     <button
       onclick={toggleAtCaret}
       aria-label="note-editor-toggle-task"
+      title={t("note.editorToggleTaskHint")}
       class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
-    >☑ 勾选</button>
+    >☑ {t("note.editorToggleTask")}</button>
     <button
       onclick={prefixAtCaret}
       aria-label="note-editor-prefix-task"
+      title={t("note.editorPrefixTaskHint")}
       class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
-    >＋ 任务</button>
+    >＋ {t("note.editorPrefixTask")}</button>
     <button
       onclick={() => (previewOn = !previewOn)}
       aria-pressed={previewOn}
       aria-label="note-editor-preview"
+      title={t("note.editorPreviewHint")}
       class={"rounded-full px-2.5 py-1 " + (previewOn ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
-    >预览</button>
+    >{t("note.editorPreview")}</button>
   </div>
 
   {#if previewOn && editVal.trim()}

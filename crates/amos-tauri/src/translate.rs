@@ -11,7 +11,7 @@ use amos_proto::translate::{
 };
 use serde::Serialize;
 use tokio::net::UnixStream;
-use tonic::transport::{Endpoint, Uri};
+use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 /// Serializable transcription result (prost structs are not `Serialize`).
@@ -28,7 +28,10 @@ fn translate_socket_path() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/amos-translate.sock"))
 }
 
-async fn build_channel() -> Result<tonic::transport::Channel, String> {
+/// The translate daemon is **not** amos-ai: it lives on its own socket and has no shared
+/// secret (the `x-amos-token` transport belongs to amos-ai alone), so this stays a plain
+/// `Channel` — no token is attached to requests for it.
+async fn build_channel() -> Result<Channel, String> {
     let socket = translate_socket_path();
     let owned = socket.clone();
     let endpoint = Endpoint::try_from("http://[::1]:50051").map_err(|e| e.to_string())?;

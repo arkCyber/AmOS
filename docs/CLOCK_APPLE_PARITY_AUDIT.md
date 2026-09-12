@@ -1,3 +1,9 @@
+> **注（迁移，2026-09）**：React 宿主已彻底移除（`docs/react-removal-plan.md`）。本文下文提到的
+> `lib/alarmNotify.ts` / `useDueAlarmAlerts(active)` / `src/App.tsx` 为**当时**的实现记录：
+> `alarmNotify` 早期已删除（它是 `lib/alarmCore` 的 `export *` 死壳），当前到点提醒的判定在
+> `lib/alarmCore.ts`，Shell 级轮询由 `svelte/osAlarmWatcher.ts` 承载；`src/App.tsx` 已不存在，
+> 生产入口是 `src/shell-entry.ts → mount(Shell.svelte)`。下文保留为历史审计记录。
+
 # AmOS 时钟应用 — 与 iOS「时钟」App 对齐审计 + 补全报告
 
 > 审计日期：2026-09-07

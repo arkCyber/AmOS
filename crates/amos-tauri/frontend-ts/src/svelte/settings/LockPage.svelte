@@ -1,7 +1,7 @@
 <script lang="ts">
   // LockPage.svelte — 「锁屏密码」sub page (the old LockSettings group relocated).
   // Enabling only succeeds with a valid 4–6 digit numeric passcode (lib/lock).
-  import { readStoreValue, writeStoreValue } from "../../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../../lib/amosStore";
   import { LOCK_KEY, makeLock, sanitizePin, type LockCfg } from "../../lib/lock";
   import { t } from "../locale.svelte";
   import { GROUP, ROW, LABEL, SUB, FIELD, HINT } from "./kit";
@@ -17,11 +17,29 @@
     if (clean !== lockPin) lockPin = clean;
   });
   const saveLock = () => {
-    const next = makeLock(lockOn, lockPin, lockCfg);
+    // What the user *asked for*, captured before the policy has its say: `makeLock` may
+    // refuse the enable (no usable 4–6 digit passcode), and in that case the page must not
+    // say "Saved" (REQ-A149). This is the whole difference from the previous code, whose
+    // condition `lockOn && !next.enabled` compared the *already updated* `lockOn` with
+    // `next.enabled` — always false, so its `lock.pin` branch was dead and an enable that
+    // the policy refused was reported as a successful save.
+    const wanted = lockOn;
+    const typed = sanitizePin(lockPin);
+    const next = makeLock(wanted, lockPin, lockCfg);
+    // A passcode that only *looks* saved is a security claim, not a cosmetic one: the
+    // state changes only if the store really accepted the new config.
+    if (!writeStoreValueChecked(LOCK_KEY, next)) {
+      lockMsg = t("lock.saveFailed");
+      return;
+    }
     lockCfg = next;
     lockOn = next.enabled;
-    writeStoreValue(LOCK_KEY, next);
-    lockMsg = lockOn && !next.enabled ? t("lock.pin") : t("lock.saved");
+    const refusedEnable = wanted && !next.enabled;
+    // Refused a *changed* passcode while keeping the previous one: the enable stands, so
+    // only the "Saved" claim was wrong — the user has to hear that the new digits did not
+    // take either way.
+    const refusedPin = wanted && typed !== "" && next.pin !== typed;
+    lockMsg = refusedEnable || refusedPin ? t("lock.pin") : t("lock.saved");
   };
 </script>
 

@@ -85,7 +85,7 @@ cargo run -p amos-asr --example sherpa_asr --features sherpa -- /tmp/piper_out.w
 
 `amos-tauri` 提供可选 feature `sherpa-asr`（门控 + 编译 sherpa-onnx 原生库）。
 开启时 `interpret_start` 会自动用**本地 sherpa 流式 ASR**（经 daemon 翻译委托）代替 daemon 的 mock ASR，
-其余（`interpret_feed_audio`/事件流/落库）完全不变。
+其余（`interpret_audio` 喂音频/事件流/落库）完全不变。
 
 构建并运行（需先用 `bash scripts/fetch-models.sh` 下载模型）：
 

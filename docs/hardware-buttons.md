@@ -9,13 +9,19 @@
         │  平台驱动调用 HardwareButtons::press(button)
         ▼
 [ amos-tauri buttons.rs ]
-        │  emit "hardware-button" 事件
+        │  emit "hardware-button" 事件 (+ 记入 take_pending_hardware_button)
         ▼
-[ 前端 frontend-ts/App.tsx 订阅 hardware-button ]
-        ├─ home  → systemHome()
-        ├─ voice → openApp("ai")  (AI app 内可经 backend.transcribeAudio 接 ASR)
-        └─ ai    → openApp("ai")
+[ 前端 svelte/osInputBridge.ts (React-free) ]
+        │  startOsInputBridge: window "hardware-button" 事件 + keydown(H/V/A)
+        │  startOsHardwarePoll: 轮询 take_pending_hardware_button (真机更可靠)
+        ├─ home  → shellState.home()        (回 dock)
+        ├─ voice → shellState.open("ai")
+        └─ ai    → shellState.open("ai")
 ```
+
+> 说明：真机实测（本页末尾）表明 Rust→JS **事件**在移动 WebView 上不保证送达，
+> 因此 Shell 同时启动 `startOsHardwarePoll`（经普通 `invoke` 拉取待处理按键），
+> 两条路径都归结到 `mapHardwareAction` 的同一映射。
 
 ## 代码结构
 
@@ -23,8 +29,8 @@
 |------|------|
 | `crates/amos-tauri/src/buttons.rs` | `HardwareButton` 枚举 + `ButtonAction` 映射 + `HardwareButtons` 状态 + `simulate_button` 命令 |
 | `crates/amos-tauri/src/lib.rs` | 注册 state + 命令 |
-| `frontend-ts/src/App.tsx` | 订阅 `hardware-button` 事件并路由（Home/Voice/AI） |
-| `frontend-ts/src/lib/systemButtons.ts` | 解析 payload + 桌面键盘快捷键 H/V/A |
+| `frontend-ts/src/svelte/osInputBridge.ts` | Shell 级接线：`hardware-button` 事件 / `keydown` / 轮询 → Home/AI 导航（React-free） |
+| `frontend-ts/src/lib/systemButtons.ts` | 解析 payload + 桌面键盘快捷键 H/V/A（纯映射，供上面复用） |
 
 ## 真实驱动接入（平台侧）
 
@@ -71,5 +77,5 @@ AI 助手改为**双击音量+**：`MainActivity.onKeyDown` 在 450 ms 内**双�
 ## 语音按钮 → ASR
 
 Voice 按钮打开 AI 应用；AI 应用内可经 `backend.ts` 的 `transcribeAudio`
-（+ `components/VoiceMicButton.tsx`）把麦克风音频发到 `amos-translate` 的 `Transcribe` RPC（`SpeechRecognizer` 转写），
+（+ `svelte/VoiceMicButton.svelte` / `svelte/DeviceMicButton.svelte`）把麦克风音频发到 `amos-translate` 的 `Transcribe` RPC（`SpeechRecognizer` 转写），
 实现"语音 → 转写 → 文本/意图"。详见 `docs/translate-daemon.md`。

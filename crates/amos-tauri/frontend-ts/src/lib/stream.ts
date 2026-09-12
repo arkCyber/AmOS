@@ -1,30 +1,18 @@
 /**
- * Pure reducers for backend event streams (ai-token-received / interpret-output),
- * so streaming behaviour can be unit-tested with "fake events" (no DOM/bridge).
+ * Pure parsers for backend event streams (`ai-token-received` / `ai-card-received`
+ * / `ai-session-complete` / `interpret-output`), so each live surface's event
+ * handling can be unit-tested with "fake events" (no DOM / no bridge).
+ *
+ * The *accumulation* lives with its consumer: `AiApp` keeps its own message model
+ * (text + cards + busy state) and the interpreter transcript is the persisted
+ * segment store in `lib/interp`. The older `ChatLog` / `InterpOutput` reducer
+ * models that used to live here had no production consumer left, so they were
+ * removed rather than kept as a second, parallel transcript model.
  */
-export interface ChatLog {
-  text: string;
-  busy: boolean;
-  complete: boolean;
-}
-export function chatLogInit(): ChatLog {
-  return { text: "", busy: false, complete: false };
-}
-/** Extract a token string from an ai-token-received payload. */
 export function tokenOf(payload: unknown): string {
   if (typeof payload === "string") return payload;
   if (payload && typeof payload === "object" && "token" in payload) return String((payload as { token: string }).token);
   return "";
-}
-export function onAiToken(log: ChatLog, payload: unknown): ChatLog {
-  const token = tokenOf(payload);
-  return token ? { ...log, text: log.text + token, busy: true, complete: false } : log;
-}
-export function onAiComplete(log: ChatLog): ChatLog {
-  return { ...log, busy: false, complete: true };
-}
-export function chatLogReset(): ChatLog {
-  return chatLogInit();
 }
 
 /** A semantic UiCard delivered via the `ai-card-received` event. */
@@ -76,19 +64,6 @@ export function sessionMetaOf(payload: unknown): { sid: string; full: string } |
   return { sid, full };
 }
 
-export interface InterpLine {
-  src: string;
-  target: string;
-}
-export interface InterpOutput {
-  lines: InterpLine[];
-}
-export function interpInit(): InterpOutput {
-  return { lines: [] };
-}
-/** Cap on in-memory transcript lines: a long live session must not grow
- * unboundedly (mirrors the `capTail` policy used by chat/filed stores). */
-export const INTERP_LINE_CAP = 200;
 /**
  * Extract the speakable final translation from an `interpret-output` payload, or
  * null when it is not a `segment_final` (partials/state change are never spoken,
@@ -101,25 +76,4 @@ export function finalSegmentOf(payload: unknown): { text: string; lang: string }
   const text = String(p.target_text ?? "");
   const lang = String(p.target_lang ?? "") || "zh";
   return text ? { text, lang } : null;
-}
-/** Feed an `interpret-output` event (segment_final) into the transcript. */
-export function onInterpOutput(state: InterpOutput, payload: unknown): InterpOutput {
-  if (!payload || typeof payload !== "object") return state;
-  const p = payload as Record<string, unknown>;
-  if (p.kind === "segment_final") {
-    const line: InterpLine = {
-      src: String(p.source_text ?? ""),
-      target: String(p.target_text ?? ""),
-    };
-    if (line.src || line.target) {
-      const lines = [...state.lines, line];
-      // Long live sessions must stay memory-bounded: drop the oldest beyond cap.
-      const bounded = lines.length > INTERP_LINE_CAP ? lines.slice(lines.length - INTERP_LINE_CAP) : lines;
-      return { lines: bounded };
-    }
-  }
-  return state;
-}
-export function interpClear(): InterpOutput {
-  return interpInit();
 }

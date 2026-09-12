@@ -5,7 +5,7 @@
   // camera is default-allowed (no in-app gate) and granted to the shared ledger
   // on mount. The live feed path is gated on navigator.mediaDevices?.getUserMedia
   // exactly like React, so headless runs take the demo viewfinder (🏔️) path.
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import {
     startVideoRecording,
     persistVideoCapture,
@@ -16,13 +16,19 @@
     type ActiveVideoRecording,
     type VideoCapture,
   } from "../lib/cameraCapture";
-  import { grantCap, loadLedger, saveLedger, type Capability } from "../lib/permissions";
+  import type { Capability } from "../lib/permissions";
+  import { grantCapability } from "./osPermissions";
   import { PHOTOS_KEY, newPhoto, newCapturePhoto, type Photo } from "../lib/photos";
   import {
     ZOOM_STEPS,
     ZOOM_MIN,
     ZOOM_MAX,
     ZOOM_SLIDER_STEP,
+    FACING_ORDER,
+    FLASH_ORDER,
+    RATIO_ORDER,
+    TIMER_PRESETS,
+    cycleAfter,
     resOf,
     nextRes,
     facingMode,
@@ -43,6 +49,7 @@
     type CamResId,
   } from "../lib/camera";
   import { t } from "./locale.svelte";
+  import { amosWarn } from "../lib/debugLog";
 
   // Monotonic counter: burst / rapid captures get unique ids even if two frames
   // land in the same millisecond (photo ids are timestamp-based).
@@ -56,9 +63,11 @@
 
   // Default-allowed camera: there is no in-app permission gate or confirmation
   // screen — always granted so the app opens straight into the live viewfinder.
+  // Goes through the capability seam so the *daemon* (authoritative, audited) is
+  // told too, not just the local ledger.
   const APP_ID = "camera";
   const CAMERA_CAP: Capability = "camera";
-  saveLedger(grantCap(loadLedger(), APP_ID, CAMERA_CAP));
+  grantCapability(APP_ID, CAMERA_CAP);
 
   // DOM / stream refs (non-reactive mutable locals).
   let videoEl = $state<HTMLVideoElement | null>(null);
@@ -205,6 +214,8 @@
         hint = t("camera.noCamera");
       }
       retriable = true;
+      // The user sees a hint; the ledger keeps *which* error it was, for diagnosis.
+      amosWarn("camera", "acquire failed", { name: String(name ?? "") });
     }
   }
 
@@ -309,7 +320,12 @@
     } else {
       photo = newPhoto(cid, now);
     }
-    writeStoreValue(PHOTOS_KEY, [photo, ...list]);
+    // The claim follows the write: "已保存到相册" for a photo the store rejected would
+    // be data loss the user never notices until the album is empty.
+    if (!writeStoreValueChecked(PHOTOS_KEY, [photo, ...list])) {
+      hint = t("camera.saveFailed");
+      return;
+    }
     if (photo.data) last = photo;
     hint = t("camera.saved");
     flashFx = true;
@@ -508,8 +524,13 @@
         w: settings?.width || videoEl?.videoWidth || undefined,
         h: settings?.height || videoEl?.videoHeight || undefined,
       };
-      await persistVideoCapture(meta, blob);
+      const saved = await persistVideoCapture(meta, blob);
       captures = listCaptures();
+      if (!saved) {
+        // The library index rejected the capture, so it is not in the album.
+        recErr = t("camera.saveFailed");
+        return;
+      }
       recErr = "";
       hint = t("camera.recSaved");
     } catch {
@@ -551,7 +572,11 @@
     viewerId = null;
   }
   async function delCapture(id: string): Promise<void> {
-    await removeVideoCapture(id);
+    // A rejected index write keeps the capture listed (and its bytes), so say so.
+    if (!(await removeVideoCapture(id))) {
+      hint = t("camera.saveFailed");
+      return;
+    }
     captures = listCaptures();
     closeViewer();
   }
@@ -560,7 +585,7 @@
   const flipCam = () => {
     if (!live) return;
     if (recState === "recording") return; // re-acquiring would cancel the take
-    facing = facing === "back" ? "front" : "back";
+    facing = cycleAfter(FACING_ORDER, facing);
     flash = "auto"; // iOS resets flash when flipping lenses
     af = afInit(); // focus/point no longer applies to the other lens
     void acquire();
@@ -732,19 +757,19 @@
           <button
             aria-label={t("camera.flash")}
             title={t("camera.flash")}
-            onclick={() => setFlashState(flash === "auto" ? "on" : flash === "on" ? "off" : "auto")}
+            onclick={() => setFlashState(cycleAfter(FLASH_ORDER, flash))}
             class={controlCls(flash === "on")}
           >{flashLabel[flash]}</button>
           <button
             aria-label={t("camera.timer")}
             title={t("camera.timer")}
-            onclick={() => (timer = timer === 0 ? 3 : timer === 3 ? 10 : 0)}
+            onclick={() => (timer = cycleAfter(TIMER_PRESETS, timer))}
             class={controlCls(timer > 0)}
           >⏱{timer > 0 ? timer : ""}</button>
           <button
             aria-label={t("camera.aspect")}
             title={t("camera.aspect")}
-            onclick={() => (ratio = ratio === "4:3" ? "square" : ratio === "square" ? "16:9" : "4:3")}
+            onclick={() => (ratio = cycleAfter(RATIO_ORDER, ratio))}
             class={controlCls(false)}
           >{ratioLabel[ratio]}</button>
           <button

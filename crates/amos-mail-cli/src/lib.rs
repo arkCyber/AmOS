@@ -64,6 +64,7 @@ SUBCOMMANDS:
 
 OPTIONS:
     -h, --help                Show this help
+    -V, --version             Print version and exit
     --store <PATH>            Persist the mailbox store to this JSON file (can appear
                               anywhere before/after the subcommand). Without it mail is
                               ephemeral (reset each run). Also honors $AMOS_MAIL_STORE.
@@ -74,6 +75,8 @@ OPTIONS:
 pub enum Op {
     /// Print `USAGE`.
     Help,
+    /// Print the binary's version (how a deployed artifact is identified).
+    Version,
     /// Print an offline demo session (seed + read + send) over one mock store.
     Demo,
     /// List mailbox names.
@@ -379,6 +382,11 @@ pub fn parse_args(args: &[String]) -> Result<Op> {
         out
     };
     let mut rest = filtered.iter();
+    // `-V/--version` is a global flag: it must work without a subcommand (that is
+    // exactly how a deployed artifact is identified).
+    if filtered.iter().any(|a| a == "-V" || a == "--version") {
+        return Ok(Op::Version);
+    }
     let Some(cmd) = rest.next() else {
         return Ok(Op::Help);
     };
@@ -500,6 +508,7 @@ fn message_block(e: &amos_mail::Email) -> String {
 pub async fn dispatch<P: MailProvider>(client: &MailClient<P>, op: Op) -> Result<Vec<String>> {
     match op {
         Op::Help => Ok(vec![USAGE.to_string()]),
+        Op::Version => Ok(vec![format!("amos-mail-cli {}", env!("CARGO_PKG_VERSION"))]),
         Op::Demo => Ok(vec![
             "(run `amos-mail-cli demo` — it seeds and plays its own offline session)".to_string(),
         ]),
@@ -766,6 +775,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>> {
     match op {
         Op::Demo => demo_lines().await,
         Op::Help => Ok(vec![USAGE.to_string()]),
+        Op::Version => Ok(vec![format!("amos-mail-cli {}", env!("CARGO_PKG_VERSION"))]),
         op => {
             #[cfg(feature = "live")]
             if let Op::ImapUnseen {
@@ -817,6 +827,17 @@ mod tests {
     #[test]
     fn parse_known_subcommands() {
         assert!(matches!(parse_args(&s(&[])).unwrap(), Op::Help));
+        // `-V/--version` is global: it needs no subcommand (a released artifact must
+        // be able to say what it is), and wins even next to one.
+        assert!(matches!(
+            parse_args(&s(&["--version"])).unwrap(),
+            Op::Version
+        ));
+        assert!(matches!(parse_args(&s(&["-V"])).unwrap(), Op::Version));
+        assert!(matches!(
+            parse_args(&s(&["list", "--version"])).unwrap(),
+            Op::Version
+        ));
         assert!(matches!(
             parse_args(&s(&["mailboxes"])).unwrap(),
             Op::Mailboxes
@@ -852,6 +873,17 @@ mod tests {
         let p = MockMailProvider::new();
         seed_demo(&p).unwrap();
         MailClient::new(p, default_account().unwrap())
+    }
+
+    #[tokio::test]
+    async fn version_prints_the_package_version() {
+        // The printed line is what a deployed artifact is identified by — pin it
+        // (scripts/release-artifacts.sh checks it on every staged binary too).
+        let lines = run(&s(&["--version"])).await.unwrap();
+        assert_eq!(
+            lines,
+            vec![format!("amos-mail-cli {}", env!("CARGO_PKG_VERSION"))]
+        );
     }
 
     #[tokio::test]

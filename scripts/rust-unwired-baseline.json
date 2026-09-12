@@ -1,0 +1,23 @@
+{
+  "values": [
+    "crates/amos-ai/src/life_guard.rs::with_path",
+    "crates/amos-android/src/manager.rs::clear_cache",
+    "crates/amos-appstore/src/client.rs::android_bridge",
+    "crates/amos-appstore/src/model.rs::with_checksum",
+    "crates/amos-asr/src/recognizer.rs::with_lang",
+    "crates/amos-audio/src/android/tinyalsa.rs::header_layout_notes",
+    "crates/amos-devocare/src/spec.rs::with_owner",
+    "crates/amos-monitor/src/monitor.rs::sampler_name",
+    "crates/amos-network-guard/src/audit.rs::dns",
+    "crates/amos-pdf-parser/src/model.rs::refresh_metrics",
+    "crates/amos-power/src/freq.rs::applied_plan",
+    "crates/amos-power/src/policy.rs::with_high_temp",
+    "crates/amos-profiling/src/android.rs::with_voltage_mv",
+    "crates/amos-sms/src/trash.rs::trashed_in",
+    "crates/amos-tauri/src/android_glue.rs::is_armed",
+    "crates/amos-tauri/src/appstore.rs::installed_name",
+    "crates/amos-tauri/src/incall.rs::is_default_dialer_bound",
+    "crates/amos-timesync/src/timekeeper.rs::with_name",
+    "crates/amos-web3/src/secp.rs::to_uncompressed_bytes"
+  ]
+}

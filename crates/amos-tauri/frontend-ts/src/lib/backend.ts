@@ -4,6 +4,7 @@
  * the UI can show a localized "daemon not connected" state instead of crashing.
  */
 import type { AiProviderId } from "./providers";
+import { amosWarn } from "./debugLog";
 
 interface TauriBridge {
   invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
@@ -112,7 +113,9 @@ export async function invoke<T = unknown>(command: string, args?: Record<string,
     return result;
   } catch (err) {
     lastDiag = { ok: false, kind: "command-failed", command, detail: err };
-    console.warn(`[backend] ${command} failed`, err);
+    // Routed through the diagnostic ledger (P1-3) so a failed bridge call is
+    // retrievable from the UI, not just visible in logcat while it scrolls away.
+    amosWarn("backend", `${command} failed`, err);
     return null;
   }
 }
@@ -148,6 +151,58 @@ export type AiStatus = {
   asr?: string;
   /** Resolved device-acceleration target of a local engine ("" when remote/mock). */
   accelerator?: string;
+  /** Generation admission pool live state (REQ-A43); absent on an older daemon. */
+  generation_pool?: {
+    capacity: number;
+    in_flight: number;
+    available: number;
+    acquired_total: number;
+    rejected_saturated: number;
+    rejected_timeout: number;
+    wait_ms: number;
+  } | null;
+  /** Inference-response cache counters (REQ-A44); absent on an older daemon.
+   * `enabled=false` is the honest default-off state. */
+  response_cache?: {
+    enabled: boolean;
+    capacity: number;
+    ttl_seconds: number;
+    entries: number;
+    hits: number;
+    misses: number;
+    stores: number;
+    evicted: number;
+    expired: number;
+    oversized: number;
+  } | null;
+  /** On-disk log sink health (REQ-A87); absent on an older daemon.
+   * `enabled=false` = stdout only; non-zero `lost_bytes`/`write_failures` means the
+   * persisted trail is incomplete. */
+  log_sink?: {
+    enabled: boolean;
+    path: string;
+    bytes_written: number;
+    lost_bytes: number;
+    write_failures: number;
+    rotations: number;
+    active_bytes: number;
+  } | null;
+  /** Backend circuit breaker (REQ-A131); absent on an older daemon.
+   * `enabled=false` = not in the serving path (and then `state` is ""). */
+  breaker?: {
+    enabled: boolean;
+    state: string;
+    fail_threshold: number;
+    cooldown_seconds: number;
+    consecutive_failures: number;
+    openings: number;
+    rejections: number;
+    failures: number;
+    successes: number;
+  } | null;
+  /** Active threshold alerts (REQ-A133); absent on an older daemon. An empty array is
+   * the healthy state; `null`/absent means "not reported". */
+  alerts?: { alerts: { id: string; severity: string; detail: string; active_for_seconds: number }[] } | null;
 } | null;
 
 /** Probe the AI daemon via the same get_status the legacy AI app uses. */
@@ -248,6 +303,10 @@ function readStored(key: string, fb: string): string {
 function writeStored(key: string, v: string): void {
   try {
     window.localStorage.setItem(key, v);
+    // Mirror to the Rust shared store, exactly like `lib/themeCore` and the locale do:
+    // the session pointer is a raw string (read before the JSON layer exists), but it
+    // still gets the durable copy + cross-window bus.
+    void systemStoreSet(key, v);
   } catch {
     /* ignore */
   }
@@ -350,37 +409,92 @@ export async function micPermissionRequest(): Promise<MicPermissionState | null>
   return invoke<MicPermissionState>("mic_permission_request");
 }
 
-/* ---- 同传 / interpret RPC (degrade to null outside Tauri) ---- */
+/* ---- 同传 / interpret RPC (degrade to null outside Tauri) ----
+ * The session id is a **number** on the wire: `interpret_start` answers `u64` and
+ * the `interpret_*` commands take `session_id: Option<u64>`. Typing it `string`
+ * here (as an earlier revision did) is a type lie — the value is a JS number, and a
+ * comparison written against the declared type (`sid === "7"`, `String(sid)`)
+ * would silently never match. See scripts/tauri-reply-scan.mjs. */
 export interface InterpOpts {
   source?: string;
   target?: string;
 }
 
-export async function interpretStart(opts: InterpOpts = {}): Promise<string | null> {
-  return invoke<string>("interpret_start", {
-    source_lang: opts.source ?? "auto",
-    target_lang: opts.target ?? "zh",
+export async function interpretStart(opts: InterpOpts = {}): Promise<number | null> {
+  // Wire keys must be the Rust parameter names in lowerCamelCase — Tauri looks
+  // each argument up by that exact key (`CommandItem::deserialize_json` does a
+  // plain `get`). `source_lang`/`target_lang` therefore matched nothing and, since
+  // both parameters are `Option<String>`, the interpreter **silently** ran its
+  // `auto`/`zh` defaults no matter what the user picked. Pinned by
+  // `scripts/tauri-args-scan.mjs` + `backend.test.ts`.
+  return invoke<number>("interpret_start", {
+    sourceLang: opts.source ?? "auto",
+    targetLang: opts.target ?? "zh",
   });
 }
 
-export async function interpretAudio(sessionId: string, chunk: ArrayLike<number>): Promise<unknown> {
+export async function interpretAudio(sessionId: number, chunk: ArrayLike<number>): Promise<unknown> {
   return invoke("interpret_audio", { sessionId, chunk: Array.from(chunk) });
 }
 
-export async function interpretText(sessionId: string, text: string): Promise<unknown> {
+export async function interpretText(sessionId: number, text: string): Promise<unknown> {
   return invoke("interpret_text", { sessionId, text });
 }
 
-export async function interpretStop(sessionId: string): Promise<unknown> {
+export async function interpretStop(sessionId: number): Promise<unknown> {
   return invoke("interpret_stop", { sessionId });
 }
 
-export async function interpretPause(sessionId: string): Promise<unknown> {
+export async function interpretPause(sessionId: number): Promise<unknown> {
   return invoke("interpret_pause", { sessionId });
 }
 
-export async function interpretResume(sessionId: string): Promise<unknown> {
+export async function interpretResume(sessionId: number): Promise<unknown> {
   return invoke("interpret_resume", { sessionId });
+}
+
+/* ---- Cross-window system context (wm.rs `SystemContext`) --------------------
+ * A per-window entry that `chat_agent` merges into the next AI request as
+ * `system_selection` (consuming it). `system_peek_context` lets the target app
+ * show what is attached *before* sending; `system_clear_context` drops it. */
+
+/** One attached context entry (mirrors `wm::SystemContextEntry`). */
+export interface SystemContextEntry {
+  /** The app that attached it (e.g. `"notes"`). */
+  source_window: string;
+  text: string;
+  timestamp_ms: number;
+}
+
+/**
+ * Attach `text` (from the app `sourceWindow`) to `targetWindow` for its next AI
+ * request. Offline → `null` and nothing is attached (the app must not claim
+ * otherwise).
+ */
+export async function systemSetContext(
+  targetWindow: string,
+  sourceWindow: string,
+  text: string,
+): Promise<void | null> {
+  return invoke<void>("system_set_context", { targetWindow, sourceWindow, text });
+}
+
+/** Drop any context attached to `targetWindow`. Offline → `null`. */
+export async function systemClearContext(targetWindow: string): Promise<void | null> {
+  return invoke<void>("system_clear_context", { targetWindow });
+}
+
+/**
+ * Peek (without consuming) the context attached to `targetWindow`.
+ *
+ * `null` means **either** "nothing attached" **or** "could not ask" (offline /
+ * command failed) — the two are indistinguishable on the wire, so a caller must
+ * only render something when an entry comes back and stay silent otherwise.
+ */
+export async function systemPeekContext(
+  targetWindow: string,
+): Promise<SystemContextEntry | null> {
+  return invoke<SystemContextEntry>("system_peek_context", { targetWindow });
 }
 
 /* ---- TTS bridge (final translation segments -> local Piper / mock PCM) ---- */
@@ -658,11 +772,6 @@ export async function mailSearch(mailbox: string, query: string): Promise<MailSu
   return invoke<MailSummary[]>("mail_search", { mailbox, query });
 }
 
-/** The INBOX summaries (the mail app's default view). */
-export async function mailInbox(limit?: number | null): Promise<MailSummary[] | null> {
-  return invoke<MailSummary[]>("mail_inbox", { limit: limit ?? null });
-}
-
 /** Fetch a message and mark it read. */
 export async function mailRead(mailbox: string, id: string): Promise<MailMessage | null> {
   return invoke<MailMessage>("mail_read", { mailbox, id });
@@ -796,6 +905,20 @@ export async function storeUpgrade(id: string): Promise<InstalledApp | null> {
 /** Uninstall `id`. Resolves (null) on success. */
 export async function storeUninstall(id: string): Promise<null> {
   return invoke<null>("appstore_uninstall", { id });
+}
+
+/**
+ * Write `value` (the raw string a caller would put in `localStorage`) through to
+ * the Rust `SharedStore`. Offline → `null` (the local write still stands).
+ *
+ * This is the **write-through** half of the shared store: the Rust store is the
+ * durable copy plus the cross-window bus (`store-updated`). It replaces the old
+ * `window.Amos.storeWrite` shim, which nothing ever injected — so every
+ * `writeStoreValue` silently stopped mirroring (and boot's hydrate could only
+ * ever pull stale data back).
+ */
+export async function systemStoreSet(key: string, value: string): Promise<void | null> {
+  return invoke<void>("store_set", { key, value });
 }
 
 /** Snapshot of the durable Rust system store (boot hydration into localStorage). */
@@ -1056,22 +1179,25 @@ export async function smsSend(address: string, text: string): Promise<boolean> {
 // the system SMS app keeps the originals. The backend stores ids + timestamps
 // (never bodies) and persists them across restarts.
 
-/** One trash entry (mirrors `amos-tauri::sms::TrashEntryOut`): ids and times
- *  only — the hidden message body is deliberately not here. */
+/** One trash entry (mirrors `amos-tauri::sms::TrashOut`): ids and times only —
+ *  the hidden message body is deliberately not here. The fields are the wire's
+ *  **snake_case** names (serde's default; nothing in `sms.rs` renames them), so a
+ *  camelCase read here would silently be `undefined`. */
 export interface SmsTrashEntryOut {
-  threadId: string;
-  messageId: string;
-  tsMs: number;
-  trashedMs: number;
+  thread_id: string;
+  message_id: string;
+  ts_ms: number;
+  trashed_ms: number;
 }
 
 /** Outcome of a trash request, keeping the honest cases apart: trashed, refused
  *  (blocked sender / storage error — `reason`), or the message was not found in
- *  the given folder (e.g. the list went stale). */
+ *  the given folder (e.g. the list went stale). Mirrors `sms::TrashAddOut` — the
+ *  bridge's three-state contract, keys snake_case on the wire. */
 export type SmsTrashAddResult =
   | { trashed: true }
   | { trashed: false; reason: string }
-  | { trashed: false; notFound: true };
+  | { trashed: false; not_found: true };
 
 /** Hide one message in the AmOS UI. `folder` scopes the request to the folder
  *  the user is viewing (the whole thread when omitted). `null` outside Tauri. */
@@ -1093,14 +1219,20 @@ export async function smsTrashList(): Promise<SmsTrashEntryOut[] | null> {
   return invoke<SmsTrashEntryOut[]>("sms_trash_list");
 }
 
-/** Put a trashed message back (undo). `true` only when an entry was removed. */
+/** Put a trashed message back (undo). `true` only when an entry was removed.
+ *  The command answers a **boolean** (serde `true`/`false`); an earlier revision of
+ *  this wrapper compared it to the string `"restored"`, so a successful restore was
+ *  reported as a failure and the list never refreshed. */
 export async function smsTrashRestore(threadId: string, messageId: string): Promise<boolean> {
-  return (await invoke<string>("sms_trash_restore", { threadId, messageId })) === "restored";
+  return (await invoke<boolean>("sms_trash_restore", { threadId, messageId })) === true;
 }
 
 /** Empty the trash: every hidden message becomes visible again (an honest
- *  "restore all" — nothing is destroyed). */
+ *  "restore all" — nothing is destroyed). Returns whether the call itself
+ *  succeeded (the command answers the number purged; `0` is a successful no-op,
+ *  never an error). */
 export async function smsTrashPurge(): Promise<boolean> {
-  return (await invoke<string>("sms_trash_purge")) === "purged";
+  const purged = await invoke<number>("sms_trash_purge");
+  return typeof purged === "number";
 }
 

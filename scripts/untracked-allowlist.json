@@ -1,0 +1,6 @@
+[
+  {
+    "path": ".github/workflows/release.yml",
+    "reason": "Deliberately untracked since R75: committing a release workflow arms the publish path, which is a release decision for the maintainer, not a side effect of an audit round. docs/release-artifacts.md names it; the file is present in the working tree and is staged for the maintainer's decision."
+  }
+]

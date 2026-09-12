@@ -87,12 +87,6 @@ export function fitCrop(
   return { x: (vw - w) / 2, y: (vh - h) / 2, w, h };
 }
 
-/** True when the video source is not 1:1 with the target aspect (needs crop). */
-export function needsCrop(vw: number, vh: number, out: { w: number; h: number }): boolean {
-  const crop = fitCrop(vw, vh, out);
-  return crop ? Math.abs(crop.w - vw) > 1 || Math.abs(crop.h - vh) > 1 : false;
-}
-
 /**
  * The centre-crop rectangle (in *video* pixels) that corresponds to `zoom` at 1 =
  * full frame. Returns null when zoom ≤ 1 (capture the whole frame) or when the

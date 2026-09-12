@@ -64,8 +64,8 @@ pub struct SpyHitPayload {
     pub confidence: String,
 }
 
-async fn build_spy_client() -> Result<TelemetrySpyServiceClient<tonic::transport::Channel>, String>
-{
+async fn build_spy_client(
+) -> Result<TelemetrySpyServiceClient<crate::daemon::DaemonChannel>, String> {
     Ok(TelemetrySpyServiceClient::new(daemon::channel().await?))
 }
 
@@ -153,6 +153,8 @@ pub fn spawn_telemetry_spy_watch(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         use crate::watch_backoff::{next_backoff_ms, WATCH_BACKOFF_BASE_MS};
         let mut backoff_ms: u64 = WATCH_BACKOFF_BASE_MS;
+        // Runs for the lifetime of the app: the loop has no exit and is aborted with
+        // the Tauri runtime when the app stops. `sleep()` is the wait (never a spin).
         loop {
             // `Ok` means the round opened a live stream (daemon reachable) before
             // it ended — reset the backoff so the next reconnect is immediate.

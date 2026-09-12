@@ -100,9 +100,11 @@
 
 - `Permission` 枚举：`Deny=0 / Limited=1 / Standard=2 / Admin=3` —— 按**客户端级别**授权，不区分资源。
 - `PermissionManager`（client → 级别）+ `RateLimiter`（令牌桶：RPS + 每小时 token）+ `AuditLogger`
-  （内存有界 Vec，`export_json()`，**无落盘**）。
+  （内存有界 Vec，`export_json()`，**可选落盘**——2026-09-12 起 daemon 经
+  `crate::audit::shared_trail_from_env()` 把安全层与隐私层接到**同一份**有轮转上限的 JSON-lines trail；
+  见 `docs/permissions-sandbox-audit-plan.md` P4.2）。
 - `server.rs` 只给默认客户端 `DEFAULT_CLIENT_ID` 授予 `Standard`，用于 AI 推理方法的准入/限流/审计。
-- `SECURITY_LAYER_SUMMARY.md` 自列 TODO：审计落盘、权限数据库（替换内存 HashMap）。
+- `SECURITY_LAYER_SUMMARY.md` 自列 TODO：~~审计落盘~~（已完成，见 P4.2）、权限数据库（替换内存 HashMap，仍待办）。
 
 > 定位：这是「**守护进程 API 调用者**」的粗粒度 ACL，**不是**「**应用对敏感资产**」的细粒度授权。
 > 两者应分工互补，不应合并。
@@ -118,8 +120,8 @@
 - 纯函数 `capSet/grantedCaps/grantedApps/grantCap/revokeCap` + `loadLedger/saveLedger`。
 
 **执行点**：
-- `components/CapabilityGate.tsx`：`useCapability(appId, cap)` + 全屏 allow/deny 覆盖层，用于**内置**相机/麦克风/定位。
-- `components/PermissionsApp.tsx`：隐私仪表盘（grant/revoke 每个 cap × app），候选 app 是**内置**应用的写死表
+- `svelte/osPermissions.ts`：`useCapability(appId, cap)` 等能力门缝（React-free），用于**内置**相机/麦克风/定位。
+- `svelte/PermissionsApp.svelte`：隐私仪表盘（grant/revoke 每个 cap × app），候选 app 是**内置**应用的写死表
   （camera/ai/interpreter/phone/maps/weather/messages/mail），仅提到未来三方由 host 自行列举。
 - 调用点：`CameraApp`（相机）、`StreamVoiceButton`/`VoiceMicButton`（麦克风）、`MapsApp`（定位）等。
 
@@ -220,9 +222,23 @@
 - **P2.3 补齐 `contacts`/`storage`** 到前端 `Capability`/`PermissionsApp` 候选（与 Rust `Resource` 对齐），
   相关 i18n 键补齐。
 - 落点：`amos-tauri/src/lib.rs`（注册命令）、`frontend-ts/src/lib/backend.ts`、`lib/permissions.ts`、
-  `components/CapabilityGate.tsx`、`components/PermissionsApp.tsx`、`i18n/locales/{zh,en}.ts`。
+  `svelte/osPermissions.ts`、`svelte/PermissionsApp.svelte`、`i18n/locales/{zh,en}.ts`。
 - 验收：Rust 编译/clippy clean；前端 `tsc --noEmit` clean；`CapabilityGate`/`permissions`/`PermissionsApp`
   测试更新后全绿；e2e 断言「gate 允许 → daemon `authorize()` 返回 Granted 且 audit 出现 Success」。
+
+> **✅ 补充落地（2026-09-12，REQ-A99）——「审阅必须以权威为准」**：Phase 2 之后前端各**闸门**与**镜像**
+> 都走 daemon（`lib/privacyBackend` / `svelte/osPermissions`），但 `PermissionsApp` 的**审阅视图**
+> （能力分区 / 「按应用」）**只读本机账本** `amos.permissions`。于是守护进程的权威存储（它从
+> `AMOS_PRIVACY_PATH` 重载，**能活过 WebView 存储被清空/重装**，也可能被别的调用面写）里持有的授权
+> **在这页上完全不可见**——相机/麦克风仍被允许，用户却看不到、也无从撤销。相反方向（本机有、daemon 拒）
+> 早有 ⚠ drift 标记，所以页面**看起来**对称，实际不对称。而 `perm_grants_all`
+> （`PrivacyManager::grants_snapshot`，文档写明「权限**审阅**必须读的权威，一次往返而非 N 次」）
+> 既无前端包装也无 UI 消费者。现：`lib/privacyBackend` 新增 `daemonGrantsAll()`（`perm_grants_all`，
+> 离线/失败 ⇒ `null`）与纯映射 `capForWire(resource)`（未知 wire key ⇒ `null`，**绝不**编成能力标签）；
+> `PermissionsApp` 新增「守护进程已授权（本机账本未列出）」区：只列 **本地账本没有**的 daemon 授权
+> （本机已有的走上方原分区，含 drift 标记），给出来源说明与**向权威撤销**按钮；点击后**重读权威**
+> 而不是假设写成功。daemon 不答（`null`）⇒ **整区不渲染**，绝不把「问不到」说成「没有授权」。
+
 
 ### Phase 3 —— 三方 web-bundle 沙箱桥（改动 amos-tauri 宿主 + bundle/lib；honest seam）
 
@@ -245,6 +261,33 @@
   新增按 app/resource/result 过滤查询；补全 `SECURITY_LAYER_SUMMARY.md` 里既有的「审计落盘」TODO。
 - 落点：`crates/amos-ai/src/security.rs`、`privacy.rs`（或抽 `audit.rs`）。
 - 验收：单测覆盖「granted/denied 都落审计、重启可读、轮转有界、导出合法 JSON」；clippy/fmt clean。
+
+> **✅ 已落地（2026-09-12，REQ-A98）**——原先只完成了「模型统一」（`audit.rs`）与
+> 「隐私侧可选落盘」：`security.rs::AuditLogger::new_persistent` **在生产无调用点**、也不存在任何
+> 环境旋钮，于是安全层（每一次 RPC 的限流/权限/探针裁决）**只存内存、重启即失**，且**永远不可能**
+> 出现在 `RecentTrail` 里——尽管 `PrivacyManager::recent_trail` 的文档写着它读的正是「安全层也在写的那份
+> `AuditFile`」。现在：
+>
+> - **一份共享 trail**：`serve()` 只解析并打开**一次** sink
+>   （`crate::audit::shared_trail_from_env()`），把同一个 `AuditFile`（`Clone` 共享同一内存环与同一文件）
+>   交给**安全层**（`AiAgentService::new_with_audit` → `SecurityManager::with_audit_sink`）与
+>   **隐私层**（`privacy_service::bootstrap_with_sink`）。因此一次 `RecentTrail` 读回同时包含
+>   操作结果（`success/rejected/error`）与访问决策（`granted/denied`），且**重启可读**。
+> - **配置面**（新，全部有真实读取点）：`AMOS_AUDIT_PATH`（显式路径，优先）；
+>   未设则沿用历史位置 `<AMOS_PRIVACY_PATH>.jsonl`，**不迁移、不丢旧 trail**；
+>   两者都未设 ⇒ 内存态，如实回报（`RecordAudit` → `ok=false`，`RecentTrail` → `durable=false`）。
+> - **有界增长**：`AuditFile::open_rotating`（daemon 走这条）在活动文件达到
+>   `AMOS_AUDIT_MAX_BYTES`（默认 5 MiB）后轮转为 `<path>.1`（`.1→.2`…，最多保留
+>   `AMOS_AUDIT_KEEP` 个，默认 3、硬上限 64；**空白/非法/`0` 一律回落默认**——上界是安全属性，
+>   拼错不能把它关掉）。轮转只在**整行写入完成**后发生，故每个文件都以换行结尾、不含半条记录；
+>   重启读取 `.keep`→`.1`→活动文件，跨轮转窗口仍能看到最近窗口。`AMOS_AUDIT_MAX_ENTRIES`
+>   继续作为内存环上界（默认 10000），由 `audit::audit_max_entries_from` 单点解析。
+> - **验证**：`cargo test -p amos-ai --lib`（`audit::` **10**、`security::` **13**）、新增集成
+>   `--test security_audit_e2e`（真 UDS + 真 daemon + 真 JSONL：未授权客户端被拒 → 拒绝记录既有磁盘字节
+>   又能被 `RecentTrail` 读回）；**负控**：把 `serve()` 换回 `AiAgentService::new()`（不接 sink）⇒ 该 e2e
+>   **失败**，换回即过。**诚实边界**：轮转按**字节**而非时间，且被丢弃的最旧文件**不再**可从内存环读回
+>   （trail 有界 ⇒ 远端历史只能从 `.k` 文件本身导出）；权限**数据库**（替换内存 HashMap）仍是 TODO。
+
 
 ### Phase 5 —— 真机/容器 APK 拦截（honest seam，设备工作；改动 amos-android 仅留 seam + 文档）
 

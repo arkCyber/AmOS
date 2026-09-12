@@ -47,6 +47,10 @@ mod android_impl {
     // SAFETY: a JNI global ref is VM-global and outlives the creating env; every use
     // re-attaches the calling thread. Dropping is handled by `GlobalRef`.
     unsafe impl Send for AndroidContext {}
+    // SAFETY: `Sync` is what lets the process-wide `OnceLock<(JavaVM, AndroidContext)>`
+    // be shared by any thread. That is sound because JNI guarantees thread safety for a
+    // global ref as long as the calling thread is attached (which `with_env` does before
+    // every use) — no thread ever touches another thread's JNI env or local refs.
     unsafe impl Sync for AndroidContext {}
 
     static CTX: OnceLock<(JavaVM, AndroidContext)> = OnceLock::new();

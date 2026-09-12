@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::ai_bridge::with_client_id;
 
-async fn build_channel() -> Result<tonic::transport::Channel, String> {
+async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
 

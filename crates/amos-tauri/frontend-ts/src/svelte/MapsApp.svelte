@@ -9,16 +9,18 @@
   import { SETTINGS_KEY, locationEnabled, normalizeQuick } from "../lib/settings";
   import {
     PLACES,
-    clampZoom,
     latLonToTile,
     tileUrl,
     panTiles,
     shiftCenter,
     cityLabel,
     cityKey,
+    zoomIn,
+    zoomOut,
     type LatLon,
   } from "../lib/maps";
-  import { capSet, grantCap, loadLedger, saveLedger } from "../lib/permissions";
+  import { capSet, loadLedger } from "../lib/permissions";
+  import { grantCapability } from "./osPermissions";
   import { t, locale } from "./locale.svelte";
 
   const PX = 256;
@@ -72,7 +74,7 @@
     }
   };
   const allowLoc = () => {
-    saveLedger(grantCap(loadLedger(), "maps", "location"));
+    grantCapability("maps", "location");
     granted = true;
     askLoc = false;
     locate();
@@ -196,10 +198,10 @@
     >
       {t("maps.locate")}
     </button>
-    <button onclick={() => (zoom = clampZoom(zoom - 1))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label="zoom out">
+    <button onclick={() => (zoom = zoomOut(zoom))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label="zoom out">
       −
     </button>
-    <button onclick={() => (zoom = clampZoom(zoom + 1))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label="zoom in">
+    <button onclick={() => (zoom = zoomIn(zoom))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label="zoom in">
       +
     </button>
     <div class="flex items-center gap-1">

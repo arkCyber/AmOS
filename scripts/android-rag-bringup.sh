@@ -33,6 +33,9 @@ BENCH="target/aarch64-linux-android/release/examples/bench_arm"
 DEV_DIR="/data/local/tmp"
 DEV_BIN="amos-ai-rag"
 TCP="127.0.0.1:19090"
+# Shared secret for the TCP transport (REQ-A142). Sent by the daemon *and* rag_once, so
+# the on-device smoke exercises the authenticated path; override with AMOS_TCP_TOKEN.
+TOKEN="${AMOS_TCP_TOKEN:-dev-only-secret}"
 COUNT="20000"
 DIM="384"
 MODE="dry-run"
@@ -140,7 +143,7 @@ echo "3) Start the daemon (TCP-loopback, mock embedder), run the round-trip, the
 echo "   NOTE: AMOS_RAG_STATE unset => in-memory. For persistence add: AMOS_RAG_STATE=<base>"
 # One blocking adb shell does all three so it always returns cleanly — a bare
 # backgrounded daemon would otherwise keep the adb shell session open until killed.
-device shell "cd $DEV_DIR && { env AMOS_TCP_ADDR=$TCP AMOS_RAG_EMBEDDER=mock AMOS_BACKEND=mock ./$DEV_BIN >rag_daemon.log 2>&1 & } && sleep 3 && echo '--- rag_once round-trip ---' && ./rag_once http://$TCP; pkill -f $DEV_BIN 2>/dev/null; true"
+device shell "cd $DEV_DIR && { env AMOS_TCP_ADDR=$TCP AMOS_TCP_TOKEN=$TOKEN AMOS_RAG_EMBEDDER=mock AMOS_BACKEND=mock ./$DEV_BIN >rag_daemon.log 2>&1 & } && sleep 3 && echo '--- rag_once round-trip ---' && AMOS_TCP_TOKEN=$TOKEN ./rag_once http://$TCP; pkill -f $DEV_BIN 2>/dev/null; true"
 
 echo
 echo "=== Verdict (only what --apply can honestly claim) ==="

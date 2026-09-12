@@ -138,20 +138,6 @@ export function normalizeVoiceMemos(v: unknown): VoiceMemo[] {
 }
 
 /* ---- pure WAV generator (demo seeds + headless tests) ---- */
-const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function toBase64(bytes: Uint8Array): string {
-  let out = "";
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b0 = bytes[i]!;
-    const b1 = i + 1 < bytes.length ? bytes[i + 1]! : 0;
-    const b2 = i + 2 < bytes.length ? bytes[i + 2]! : 0;
-    out += B64[b0 >> 2];
-    out += B64[((b0 & 3) << 4) | (b1 >> 4)];
-    out += i + 1 < bytes.length ? B64[((b1 & 15) << 2) | (b2 >> 6)] : "=";
-    out += i + 2 < bytes.length ? B64[b2 & 63] : "=";
-  }
-  return out;
-}
 
 /** Build a mono 16-bit PCM WAV as a byte array. `toneHz` adds a soft sine so demo
  *  clips are audible; `amplitude` 0..1. Pure + deterministic. */
@@ -188,17 +174,6 @@ export function buildWavBytes(opts: {
     dv.setInt16(44 + i * 2, int, true);
   }
   return data;
-}
-
-/** Encode WAV bytes as a playable `data:audio/wav;base64,…` URL. */
-export function wavBytesToDataUrl(bytes: Uint8Array): string {
-  return `data:audio/wav;base64,${toBase64(bytes)}`;
-}
-
-/** Convenience: a demo/short clip ready to play. */
-export function buildWavDataUrl(seconds: number, toneHz = 440): { src: string; bytes: number; mime: string } {
-  const bytes = buildWavBytes({ seconds, sampleRate: 8000, toneHz, amplitude: 0.3 });
-  return { src: wavBytesToDataUrl(bytes), bytes: bytes.length, mime: "audio/wav" };
 }
 
 /** Demo clips so the app isn't empty on first launch. Seeds are tiny regenerable

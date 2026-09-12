@@ -7,7 +7,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import WallpaperCard from "../src/svelte/WallpaperCard.svelte";
 import LockWallpaperCard from "../src/svelte/LockWallpaperCard.svelte";
-import { readStoreValue } from "../src/lib/amosStore";
+import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
 
 afterEach(cleanup);
 
@@ -34,6 +34,19 @@ describe("WallpaperCard.svelte", () => {
     await fireEvent.click(buttonContaining(host, "自设图片 URL") as HTMLButtonElement);
     const prefs = readStoreValue<{ wallpaper?: string }>("amos.settings", {});
     expect(prefs.wallpaper).toBe("https://a.io/bg.jpg");
+  });
+
+  test("a stored background mode is validated by the domain guard (lib/wallpaper.isBgMode)", async () => {
+    writeStoreValue("amos.settings", { background: "vivid" });
+    const host = render(WallpaperCard);
+    // The matching pill is the active one — the guard accepted a real mode.
+    expect(buttonContaining(host, "明快 · 清晰")?.className ?? "").toContain("bg-accent");
+  });
+
+  test("an unknown stored background falls back to the default mode", async () => {
+    writeStoreValue("amos.settings", { background: "nope" });
+    const host = render(WallpaperCard);
+    expect(buttonContaining(host, "若隐若现")?.className ?? "").toContain("bg-accent");
   });
 });
 

@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor
+.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs
 
 all: build
 
@@ -92,11 +92,174 @@ gated-check:
 	cargo test -p amos-monitor --features linux --lib
 	cargo check -p amos-monitor --features android
 
-# Production gate: formatting + clippy must be clean; TS shells must typecheck.
+# Production gate: formatting + clippy must be clean; TS shells must typecheck and
+# no `src/lib` export may lose its production call site (dead-export regression).
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cd crates/amos-tauri/frontend-ts && bun run typecheck
+	# Lint-input integrity (see scripts/lint-inputs-scan.mjs): every file the steps
+	# below invoke (`node scripts/*.mjs` plus the allow-lists/baselines they read) must
+	# exist **and be tracked by git** — a gate that lives only in one working tree makes
+	# `make lint` pass locally while a clean checkout runs nothing. Runs first because
+	# it guards the gates that follow. `--selftest` pins the parser/resolver first.
+	node scripts/lint-inputs-scan.mjs --selftest
+	node scripts/lint-inputs-scan.mjs
+	# Deliverable integrity (see scripts/untracked-source-scan.mjs): no untracked,
+	# non-ignored file may sit in the working tree, and no deletion may be left unstaged —
+	# the deliverable is the index, and this repository's recurring defect is exactly a
+	# mismatch with it (untracked gate layer R74, 34 untracked sources R75, an untracked
+	# new e2e test R81 — all three found by hand; plus `config.rs`, deleted on disk while
+	# the index still shipped it, found by this gate the moment it existed). An excuse
+	# needs a reason in scripts/untracked-allowlist.json and is reported stale once the
+	# file it excused stops being untracked.
+	node scripts/untracked-source-scan.mjs --selftest
+	node scripts/untracked-source-scan.mjs
+	# Dangling-source integrity (see scripts/dangling-source-scan.mjs): no tracked file
+	# may `mod`/import a source that is not tracked — otherwise a clean clone cannot
+	# build it. Catches "committed the importer, forgot the module" (e.g. `git commit -a`
+	# after adding a module). `--selftest` pins the parsers first.
+	node scripts/dangling-source-scan.mjs --selftest
+	node scripts/dangling-source-scan.mjs
+	# Unsafe surface (see scripts/unsafe-scan.mjs): every production `unsafe` site must
+	# carry a `// SAFETY:` note or a `# Safety` doc section (the invariant, written at the
+	# site — this is where the compiler stopped checking), and the per-file count is
+	# ratcheted by scripts/unsafe-baseline.json so the surface only grows deliberately.
+	node scripts/unsafe-scan.mjs --selftest
+	node scripts/unsafe-scan.mjs
+	# Async-runtime hygiene (see scripts/blocking-in-async-scan.mjs): no blocking call
+	# (std::fs / std::process / std::thread::sleep / std::net) may sit directly in an
+	# `async fn` — it would occupy a tokio worker. Work goes to `spawn_blocking`; the
+	# accepted startup/shutdown sites carry a reason in scripts/blocking-async-allowlist.json.
+	node scripts/blocking-in-async-scan.mjs --selftest
+	node scripts/blocking-in-async-scan.mjs
+	# Lock-guard hygiene (see scripts/lock-across-await-scan.mjs): a `std` lock guard must
+	# not be used after an `.await` inside its own scope — holding a synchronous lock across
+	# a suspension point serializes unrelated tasks and risks deadlock. Scope-tracked, so a
+	# guard dropped before the await (the shape used in the governor loop) is not a finding.
+	node scripts/lock-across-await-scan.mjs --selftest
+	node scripts/lock-across-await-scan.mjs
+	# Discarded results, type-checked (see scripts/rust-discard-scan.mjs): reads `cargo
+	# clippy` diagnostics for `clippy::let_underscore_must_use` (a `let _ =` on a
+	# `#[must_use]` value — the explicit way to throw away a `Result`/`JoinHandle`) plus
+	# the type-aware `await_holding_lock`/`await_holding_refcell_ref`, which R80's
+	# syntactic scan could not decide. Per-file counts are ratcheted by
+	# scripts/rust-discard-baseline.json (165 sites across 35 files, recorded as debt —
+	# the ratchet stops growth, it does not certify what is already there); a file above
+	# its count, or a new file with a discard, fails.
+	node scripts/rust-discard-scan.mjs --selftest
+	node scripts/rust-discard-scan.mjs
+	# Static "defined + tested but never wired" scan (see scripts/unwired-scan.mjs):
+	# fails when a src/lib module becomes unreachable from production, when a new
+	# value export appears with no production call site, or when a .svelte component
+	# is never mounted. Baseline-ratcheted. `--selftest` first proves the import-edge
+	# extractor still recognises every edge form (a missed one = false failure).
+	cd crates/amos-tauri/frontend-ts && node scripts/unwired-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/unwired-scan.mjs
+	# UI dictionary audit (see scripts/i18n-scan.mjs): en/zh must expose the same
+	# keys AND the same {param} sets per key, and no dictionary key may be dead
+	# (excluding Rust-emitted contract keys and dynamic `t(\`prefix.${…}\`)`
+	# namespaces). `--selftest` pins its parser/classifier first.
+	cd crates/amos-tauri/frontend-ts && node scripts/i18n-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/i18n-scan.mjs
+	# Store-key *classification* (see scripts/store-scan.mjs): every `amos.*` store
+	# key must be either in `SYNC_STORES` (content the user created) or listed in
+	# scripts/store-allowlist.json under a kind whose reason says why losing it is
+	# acceptable — so a new store can never silently miss every backup, and a stale
+	# `SYNC_STORES` entry cannot lie about the snapshot.
+	cd crates/amos-tauri/frontend-ts && node scripts/store-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/store-scan.mjs
+	# Content *write* honesty (see scripts/write-scan.mjs): every production write of a
+	# user-content store must either ask whether it landed (`writeStoreValueChecked` and
+	# act on the answer) or be listed in scripts/write-allowlist.json under a kind whose
+	# reason says why the unverified write is acceptable — so a screen can never quietly
+	# show a change the store rejected. `--selftest` pins the extractor first.
+	cd crates/amos-tauri/frontend-ts && node scripts/write-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/write-scan.mjs
+	# Rust loop hygiene (see scripts/hot-loop-scan.mjs): no `loop` may be a busy wait
+	# (neither waiting nor able to exit), and a long-running loop must say who ends
+	# it. `--selftest` first proves the classifier itself still fails when it should.
+	node scripts/hot-loop-scan.mjs --selftest
+	node scripts/hot-loop-scan.mjs
+	# The gRPC API reference is generated (scripts/proto-doc.mjs): its parser must
+	# still work, and the checked-in docs/api-grpc.md must match proto/*.proto.
+	node scripts/proto-doc.mjs --selftest
+	node scripts/proto-doc.mjs --check
+	# Markdown link integrity (see scripts/docs-link-scan.mjs): every *relative*
+	# link in every *.md must resolve (root docs lifted out of docs/ kept `../`
+	# links and 404'd). `--selftest` pins the strip/extract/classify logic first.
+	node scripts/docs-link-scan.mjs --selftest
+	node scripts/docs-link-scan.mjs
+	# Rust "pub fn defined but never referenced" scan (see scripts/rust-unwired-scan.mjs):
+	# the Rust counterpart of the TS gate — a `pub` item in a library crate is
+	# treated as reachable by the compiler, so `dead_code` never fires on it.
+	# Baseline-ratcheted; FFI entry points (JNI / `#[no_mangle]` / `extern` ABI) are
+	# deliberately out of scope. `--selftest` pins the extractor first.
+	node scripts/rust-unwired-scan.mjs --selftest
+	node scripts/rust-unwired-scan.mjs
+	# P0-1 coverage (see scripts/rust-panic-scan.mjs): **every** crate root must carry
+	# the `deny(clippy::unwrap_used, expect_used, panic)` gate, so a new crate cannot be
+	# missed the way five were before this scan existed. `--selftest` pins the parser.
+	node scripts/rust-panic-scan.mjs --selftest
+	node scripts/rust-panic-scan.mjs
+	# Registered Tauri command with no frontend consumer (see
+	# scripts/tauri-command-scan.mjs): the reverse of the unwired-scan — a command
+	# the host exposes but no screen asks for is a capability the UI cannot reach
+	# (that is how the documented "selection → AI" flow sat dead). Also checks that
+	# every registered name really is a `#[tauri::command]` fn. Deliberate
+	# non-wirings are listed in scripts/tauri-command-allowlist.json **with a
+	# reason**; `--selftest` pins the extractors first.
+	node scripts/tauri-command-scan.mjs --selftest
+	node scripts/tauri-command-scan.mjs
+	# Command *arguments* on the wire (see scripts/tauri-args-scan.mjs): Tauri looks
+	# each argument up by its lowerCamelCase name, so a payload key no Rust parameter
+	# matches is silently ignored for `Option<T>` and a hard `missing required key`
+	# error otherwise — how `rag_query`'s `top_k` killed every retrieval and
+	# `interpret_start`'s `source_lang` silently ignored the chosen languages.
+	# `--selftest` pins the extractors first.
+	node scripts/tauri-args-scan.mjs --selftest
+	node scripts/tauri-args-scan.mjs
+	# Command *replies* on the wire (see scripts/tauri-reply-scan.mjs): Tauri
+	# serializes a return value with serde's own rules, so a struct's fields keep
+	# their Rust spelling (no `rename_all` in this workspace) and a `bool`/`usize`
+	# stays a boolean/number. How the SMS trash panel read camelCase fields off
+	# snake_case rows and compared a bool to a string — dead on device, green in CI.
+	# `--selftest` pins the extractors first.
+	node scripts/tauri-reply-scan.mjs --selftest
+	node scripts/tauri-reply-scan.mjs
+	# Host→UI *events* (see scripts/tauri-event-scan.mjs): the fourth wire
+	# direction. Every emitted event must reach a screen (or be allow-listed with a
+	# reason in scripts/tauri-event-allowlist.json), every subscription must have an
+	# emitter, and for the events whose payload is a plain struct the TS type that
+	# mirrors it must name fields the struct actually serializes (the reviewed table
+	# in the script; tagged enums/tuples are documented as out of scope).
+	node scripts/tauri-event-scan.mjs --selftest
+	node scripts/tauri-event-scan.mjs
+	# Documented configuration (see scripts/env-doc-scan.mjs): every AMOS_* env var
+	# named in the current docs must actually be READ by the code (a knob that
+	# silently does nothing is worse than an undocumented one). Forward-looking
+	# mentions are allow-listed with a reason. `--selftest` pins the read-site
+	# detection first (a comment or an `export` is not a read).
+	node scripts/env-doc-scan.mjs --selftest
+	node scripts/env-doc-scan.mjs
+
+# Regenerate the gRPC API reference after touching proto/*.proto (then commit it):
+# `make api-docs`. The doc is generated, never hand-edited.
+api-docs:
+	node scripts/proto-doc.mjs
+
+# Rust loop hygiene only (same scanner as `lint`, without the cargo/bun phases) —
+# handy when changing a `loop`/event-task: `make hot-loop`.
+hot-loop:
+	node scripts/hot-loop-scan.mjs --selftest
+	node scripts/hot-loop-scan.mjs
+
+# Release bundle (FUNCTIONAL_GAP_ANALYSIS #39): build the headless daemon + CLI
+# binaries, stage them with VERSION/README, tar them and write dist/SHA256SUMS.
+# The SAME script is what .github/workflows/release.yml publishes on a `v*` tag, and
+# it refuses to package a binary that cannot report its own version.
+release-artifacts:
+	bash scripts/release-artifacts.sh
 
 run-ai:
 	cargo run -p amos-ai

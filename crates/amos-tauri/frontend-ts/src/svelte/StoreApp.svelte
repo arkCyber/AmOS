@@ -10,6 +10,7 @@
     storeInstall,
     storeInstalled,
     storeUninstall,
+    storeUpdatable,
     storeUpgrade,
     type AppManifest,
     type AppVersion,
@@ -24,9 +25,15 @@
   let acting = $state<string | null>(null);
 
   const load = async () => {
-    const [cat, inst] = await Promise.all([storeCatalog(), storeInstalled()]);
+    const [cat, inst, up] = await Promise.all([
+      storeCatalog(),
+      storeInstalled(),
+      storeUpdatable(),
+    ]);
     if (cat !== null) catalog = cat;
     if (inst !== null) installed = inst;
+    // `null` = the host could not answer (offline / bridge error) → fall back below.
+    updatableIds = up !== null ? new Set(up) : null;
   };
   $effect(() => {
     if (!online) return;
@@ -34,6 +41,15 @@
   });
 
   const installedMap = $derived(new Map((installed ?? []).map((a) => [a.manifest.id, a])));
+
+  /**
+   * Ids the **host** reports as updatable (`appstore_updatable`), or `null` when it
+   * could not answer. The semantic-version comparison — numeric, with pre-release
+   * ordering — is owned by the `amos-appstore` domain (docs/appstore.md §"状态机"),
+   * and the host is the one that actually knows the published releases, so its
+   * answer is authoritative here.
+   */
+  let updatableIds = $state<Set<string> | null>(null);
 
   const run = async (action: () => Promise<unknown>, id: string) => {
     acting = id;
@@ -46,7 +62,12 @@
     notifyStoreTilesChanged();
   };
 
-  /** Compare two semantic versions; true when `a` is strictly older than `b`. */
+  /**
+   * Fallback comparison used **only** when the host could not answer
+   * (`updatableIds === null`): true when `a` is strictly older than `b`. Kept so an
+   * older/partially-bridged host still shows the right affordance, but it must not
+   * override the domain's own answer.
+   */
   function verLt(a: AppVersion, b: AppVersion): boolean {
     if (a.major !== b.major) return a.major < b.major;
     if (a.minor !== b.minor) return a.minor < b.minor;
@@ -77,7 +98,10 @@
     <div class="space-y-2">
       {#each catalog as app (app.id)}
         {@const own = installedMap.get(app.id)}
-        {@const updatable = own !== undefined && verLt(own.manifest.version, app.version)}
+        {@const updatable =
+          updatableIds !== null
+            ? updatableIds.has(app.id)
+            : own !== undefined && verLt(own.manifest.version, app.version)}
         {@const busy = acting === app.id}
         {@const verLabel = fmtVer(app.version)}
         <div class="rounded-2xl bg-white/60 p-3 shadow-sm ring-1 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10">

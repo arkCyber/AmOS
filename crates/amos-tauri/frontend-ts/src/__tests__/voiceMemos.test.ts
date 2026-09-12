@@ -11,7 +11,6 @@ import {
   removeMemo,
   renameMemo,
   seedVoiceMemos,
-  wavBytesToDataUrl,
   type VoiceMemo,
 } from "../lib/voiceMemos";
 
@@ -33,8 +32,6 @@ describe("voice memos domain", () => {
     expect(bytes.length).toBe(44 + 8000 * 2); // header + mono 16-bit samples
     expect(bytes[0]).toBe(0x52); // R
     expect(String.fromCharCode(bytes[8]!, bytes[9]!, bytes[10]!, bytes[11]!)).toBe("WAVE");
-    const url = wavBytesToDataUrl(bytes);
-    expect(url.startsWith("data:audio/wav;base64,")).toBe(true);
   });
 
   test("duration/clock/date formatting", () => {

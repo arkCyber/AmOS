@@ -4,21 +4,17 @@ import {
   RINGTONE_BY_TOKEN,
   RINGTONE_DIR,
   RINGTONE_FILE_BY_ID,
-  makeAlarmSamples,
   makeToneSamples,
   ringtoneFileUrl,
   ringtoneIdFor,
-  ringtoneIdForAlarm,
 } from "../lib/ringtone";
 import {
   activeRingtone,
   previewAlarmTone,
-  ringtoneFilesEnabled,
   setRingtoneFilesEnabled,
   startAlarmRing,
   stopAlarmRing,
 } from "../lib/ringtonePlayer";
-import type { Alarm } from "../lib/time";
 
 try {
   GlobalRegistrator.register();
@@ -46,8 +42,6 @@ describe("ringtone — tokens → audible ids, default dir, and synthesis", () =
     expect(ringtoneIdFor("🎶")).toBe("melody");
     expect(ringtoneIdFor(undefined)).toBe("bell");
     expect(ringtoneIdFor("???")).toBe("bell");
-    const alarm: Pick<Alarm, "tone"> = { tone: "📯" };
-    expect(ringtoneIdForAlarm(alarm)).toBe("bugle");
   });
 
   test("ringtone files resolve under the documented default directory", () => {
@@ -73,8 +67,6 @@ describe("ringtone — tokens → audible ids, default dir, and synthesis", () =
     // Unknown/empty token falls back to the bell motif.
     expect(samplesEqual(makeToneSamples("???"), bell)).toBe(true);
     expect(samplesEqual(makeToneSamples(undefined), bell)).toBe(true);
-    // makeAlarmSamples honours the alarm's stored token.
-    expect(samplesEqual(makeAlarmSamples({ tone: "⏰" }), alarm)).toBe(true);
   });
 });
 
@@ -153,14 +145,6 @@ describe("preview + file engine", () => {
     delete (window as unknown as Record<string, unknown>).Audio;
     delete (window as unknown as Record<string, unknown>).webkitAudioContext;
     delete (window as unknown as Record<string, unknown>).AudioContext;
-  });
-
-  test("file-engine toggle is off by default and can be enabled", () => {
-    expect(ringtoneFilesEnabled()).toBe(false);
-    setRingtoneFilesEnabled(true);
-    expect(ringtoneFilesEnabled()).toBe(true);
-    setRingtoneFilesEnabled(false);
-    expect(ringtoneFilesEnabled()).toBe(false);
   });
 
   test("preview is a safe no-op when no audio is available", () => {

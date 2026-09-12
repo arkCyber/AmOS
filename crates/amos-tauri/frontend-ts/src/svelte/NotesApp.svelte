@@ -1,5 +1,5 @@
 <script lang="ts">
-  // NotesApp.svelte — Svelte 5 (runes) port of the React `Notes` in src/apps.tsx.
+  // NotesApp.svelte — Svelte 5 (runes) implementation of the notes app.
   // All note logic reuses pure lib/notes.ts; rich-text segments (fmtInline) are
   // rendered reactively; copy/paste go through lib/clipboard (offline no-op), and
   // the ClipboardTray history is rendered inline from clipboardHistory(). Store
@@ -39,19 +39,29 @@
     toggleTaskInText,
     stripInlineMarkers,
     tagsOf,
-    hasTag,
+    filterByTag,
   } from "../lib/notes";
   import type { Note } from "../lib/notes";
+  import {
+    hitSourceLabel,
+    initialRagUi,
+    NOTES_RAG_INDEXED_KEY,
+    ragUiReducer,
+    type RagUiState,
+  } from "../lib/notesRag";
+  import { askNotes, liveRagClient, syncNotesIndex } from "../lib/notesRagRun";
+  import { ragStatus, type RagHit, type RagStatus } from "../lib/rag";
   import {
     enterContinuesTask,
     prefixTaskAtLine,
     shiftLineIndent,
     toggleTaskLineAt,
   } from "../lib/noteEditing";
-  import { clipboardHistory, clipboardRead, clipboardWrite, entryText } from "../lib/clipboard";
+  import { clipboardHistory, clipboardRead, clipboardClear, copySelection, entryText, previewClipboard } from "../lib/clipboard";
+  import { notesChannel, sendToAi } from "./appLinks";
   import type { ClipboardEntry } from "../lib/clipboard";
   import { iconSvg } from "../lib/sysIcons";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import { bridged, exportTxtFile, getAiStatus } from "../lib/backend";
   import {
     aiIsUnavailable,
@@ -69,6 +79,10 @@
   const seeded = normalizeNotes(readStoreValue<unknown>(NOTES_KEY, []));
   let notes = $state<Note[]>(seeded);
   let text = $state("");
+  // A rejected store write (full/unavailable storage) must be visible: the list is
+  // rendered from this in-memory copy, so applying a change the store never accepted
+  // would show data that silently vanishes on reload.
+  let notesErr = $state("");
   let editingId = $state<string | null>(null);
   // Editor affordances: caret-based task ops + a live rich-text preview toggle.
   let editEl = $state<HTMLTextAreaElement | null>(null);
@@ -87,6 +101,29 @@
   let editor = $state<Note | null>(null);
   // Notes preference: tap a collapsed row to open the full-page editor directly.
   let prefs = $state<NotesPrefs>(loadNotesPrefs());
+
+  // ---- "Ask my notes": local RAG retrieval (docs/offline-rag-pdf.md) ----
+  // The daemon holds the vector index; this panel indexes the active notes
+  // (idempotent upsert) then retrieves the passages nearest to a question.
+  let askOpen = $state(false);
+  let askQ = $state("");
+  let askHits = $state<RagHit[] | null>(null);
+  let askOffline = $state(false);
+  let ragUi = $state<RagUiState>(initialRagUi);
+  const ragBusy = $derived(ragUi.phase !== "idle");
+
+  // Daemon-confirmed index state (indexed chunks / dimension / embedder label),
+  // read once when the panel opens. `null` (no daemon) renders NOTHING — the panel
+  // already shows an honest offline notice, and we never invent an index size.
+  let ragState = $state<RagStatus | null>(null);
+  let ragProbed = false;
+  $effect(() => {
+    if (!askOpen || ragProbed || !bridged()) return;
+    ragProbed = true;
+    void ragStatus().then((s) => {
+      ragState = s;
+    });
+  });
 
   // AI is NOT required for Notes to work — this is only an honest, non-blocking
   // indicator. Probe once in the background; never gate note CRUD/search on it.
@@ -113,9 +150,20 @@
   const aiHintKey = $derived(aiAvail === "mock" ? "note.aiMock" : "note.aiOffline");
 
 
-  const persist = (list: Note[]) => {
-    writeStoreValue(NOTES_KEY, list);
+  /**
+   * Persist the note list and report whether the store accepted it. `false` means
+   * nothing was written (full/unavailable storage): the caller must **not** apply the
+   * change to the in-memory list or discard a draft, or the UI would show/shed data
+   * that will not survive a reload.
+   */
+  const persist = (list: Note[]): boolean => {
+    if (!writeStoreValueChecked(NOTES_KEY, list)) {
+      notesErr = t("note.saveFailed");
+      return false;
+    }
+    notesErr = "";
     notes = list;
+    return true;
   };
 
   const openEditor = (n: Note) => {
@@ -137,12 +185,41 @@
     openId = n.id;
   };
 
+  // ---- Deep link: Spotlight → one note ------------------------------------------
+  // The Spotlight chooser sets the `notes` channel and opens this app; we then reveal
+  // that note (full-page editor for an active note, else its own tab expanded inline).
+  // The link is *consumed* (channel cleared) so re-opening Notes never re-fires it,
+  // and an id that no longer exists is honestly ignored (the list is what's shown).
+  let linkNonce = 0;
+  $effect(() => {
+    return notesChannel().subscribe((v) => {
+      if (!v || v.noteId.trim() === "" || v.nonce === linkNonce) return;
+      linkNonce = v.nonce;
+      const target = notes.find((n) => n.id === v.noteId);
+      if (target) {
+        if (target.state === "archived") {
+          mode = "archived";
+          openId = target.id;
+        } else if (target.state === "trash") {
+          mode = "trash";
+          openId = target.id;
+        } else {
+          mode = "all";
+          openEditor(target);
+        }
+      }
+      notesChannel().set({ noteId: "", nonce: linkNonce });
+    });
+  });
+
   const add = () => {
     const v = text.trim();
     if (!v) return;
     const now = Date.now();
     const next = prependNote(notes, v, now);
-    persist(next);
+    // The draft stays in the box (and unexpanded) when the store rejected it — the
+    // user's typed text must never be cleared into a write that did not happen.
+    if (!persist(next)) return;
     openId = next[0]?.id ?? null;
     text = "";
   };
@@ -158,12 +235,14 @@
   };
   const saveEdit = () => {
     if (!editingId) return;
-    persist(editNote(notes, editingId, editVal, Date.now()));
+    // Keep the inline editor open with the draft when the write was rejected, instead
+    // of closing over edits that were never stored.
+    if (!persist(editNote(notes, editingId, editVal, Date.now()))) return;
     cancelEdit();
   };
   const copyEditing = async () => {
     if (!editingId) return;
-    await clipboardWrite({ kind: "text", text: editVal });
+    await copySelection(editVal);
   };
   const pasteEditing = async () => {
     const e = await clipboardRead();
@@ -240,7 +319,10 @@
   });
   const active = $derived.by(() => {
     const tag = selTag;
-    return tag ? activeAll.filter((n) => hasTag(n.text, tag)) : activeAll;
+    // The domain owns the tag rule (`lib/notes.filterByTag`); never re-filter at
+    // the call site (a tested rule copied inline is how a future tag syntax change
+    // silently diverges — see docs/unwired-exports-audit.md Round 15).
+    return tag ? filterByTag(activeAll, tag) : activeAll;
   });
   const archived = $derived(notesOf(notes, "archived"));
   const trashed = $derived(notesOf(notes, "trash"));
@@ -271,7 +353,7 @@
     if (res?.path) exportMsg = `${t("note.exportedTo")} ${res.name}`;
     else {
       try {
-        await clipboardWrite({ kind: "text", text });
+        await copySelection(text);
       } catch {
         /* clipboard unavailable — message still informs */
       }
@@ -303,11 +385,48 @@
       modified: n.ts,
     });
     try {
-      await clipboardWrite({ kind: "text", text: fileText });
+      await copySelection(fileText);
     } catch {
       /* clipboard unavailable — message still informs */
     }
     exportMsg = "已复制 .md 到剪贴板（未连接后端）";
+  };
+
+  // "Ask my notes": index (upsert) the active notes, prune stale ids, then
+  // query. Only daemon-confirmed outcomes are recorded; an offline (null) reply
+  // is surfaced honestly instead of looking like an empty result.
+  const runAsk = async () => {
+    const q = askQ.trim();
+    if (!q || ragBusy) return;
+    askHits = null;
+    askOffline = false;
+    ragUi = ragUiReducer(ragUi, { type: "index_started" });
+    try {
+      const known = readStoreValue<string[]>(NOTES_RAG_INDEXED_KEY, []);
+      const res = await syncNotesIndex(liveRagClient, notesOf(notes, undefined), known);
+      writeStoreValue(NOTES_RAG_INDEXED_KEY, res.indexed);
+      ragUi = ragUiReducer(ragUi, { type: "index_done" });
+    } catch (e) {
+      ragUi = ragUiReducer(ragUi, { type: "index_failed", error: String(e) });
+      return;
+    }
+    ragUi = ragUiReducer(ragUi, { type: "ask_started" });
+    try {
+      const res = await askNotes(liveRagClient, q);
+      askOffline = res === null;
+      askHits = res ? res.hits : null;
+      ragUi = ragUiReducer(ragUi, { type: "ask_done" });
+    } catch (e) {
+      ragUi = ragUiReducer(ragUi, { type: "ask_failed", error: String(e) });
+    }
+  };
+  const toggleAsk = () => {
+    askOpen = !askOpen;
+    if (!askOpen) {
+      askHits = null;
+      askOffline = false;
+      ragUi = ragUiReducer(ragUi, { type: "reset" });
+    }
   };
 
   const collapsed = (n: Note) =>
@@ -317,6 +436,16 @@
     persist(setNoteState(notes, id, st));
 
   const dupeOf = (id: string) => persist(duplicateNote(notes, id, Date.now()));
+
+  /**
+   * Empty the system clipboard history (foreground-gated on the Rust side). Only
+   * clears the on-screen list when the bridge confirms a count — an offline `null`
+   * must not look like a successful wipe.
+   */
+  const clearTray = async () => {
+    const removed = await clipboardClear();
+    if (removed !== null) trayItems = [];
+  };
 
   // Fetch the inline clipboard-history tray only while open.
   $effect(() => {
@@ -366,6 +495,15 @@
       {t(aiHintKey)}
     </p>
   {/if}
+  {#if notesErr}
+    <p
+      role="status"
+      data-testid="note-store-error"
+      class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-[11px] text-danger dark:bg-white/10"
+    >
+      {notesErr}
+    </p>
+  {/if}
   {#if editor}
     <NoteEditor note={editor} onClose={closeEditor} />
   {:else}
@@ -382,20 +520,68 @@
   <div class="flex items-center justify-between">
     <span class="flex items-center gap-2">
       <button onclick={add} class="rounded-full bg-accent px-4 py-1.5 text-sm text-white active:scale-95">{t("note.add")}</button>
-      <button onclick={importMd} aria-label="note-import-md" title="把输入内容当作 Markdown 导入" class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">⇪ md</button>
+      <button onclick={importMd} aria-label="note-import-md" title={t("note.importMdHint")} class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">⇪ md</button>
+      <button onclick={toggleAsk} aria-label="note-ask-toggle" aria-pressed={askOpen} class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">🔍 {t("note.ask")}</button>
     </span>
     <span class="text-xs opacity-50">{t("note.stats", { chars: String(composeStats.chars), lines: String(composeStats.lines) })}</span>
   </div>
+
+  {#if askOpen}
+    <div class="mt-2 rounded-2xl bg-black/5 p-3 text-sm dark:bg-white/10" data-testid="note-ask">
+      <div class="flex items-center gap-2">
+        <input
+          bind:value={askQ}
+          onkeydown={(e) => e.key === "Enter" && runAsk()}
+          placeholder={t("note.askPlaceholder")}
+          aria-label="note-ask-q"
+          class="min-w-0 flex-1 rounded-full bg-white/70 px-3.5 py-1.5 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-black/20 dark:text-neutral-100 dark:ring-white/10 dark:placeholder:text-white/30"
+        />
+        <button onclick={runAsk} disabled={ragBusy || !bridged()} aria-label="note-ask-run" class="rounded-full bg-accent px-4 py-1.5 text-sm text-white disabled:opacity-50">{t("note.askRun")}</button>
+      </div>
+      {#if ragState}
+        <p data-testid="note-rag-status" class="mt-1 text-[11px] opacity-60">
+          {t("note.ragStatus", {
+            n: String(ragState.indexed),
+            dim: String(ragState.dimension),
+            embedder: ragState.embedder,
+          })}
+        </p>
+      {/if}
+      {#if !bridged()}
+        <p role="status" class="mt-2 text-[11px] opacity-70">{t("note.askOffline")}</p>
+      {:else if ragUi.phase === "indexing"}
+        <p role="status" class="mt-2 text-[11px] opacity-70">{t("note.askIndexing")}</p>
+      {:else if ragUi.phase === "asking"}
+        <p role="status" class="mt-2 text-[11px] opacity-70">{t("note.askAsking")}</p>
+      {:else if ragUi.phase === "error"}
+        <p role="status" class="mt-2 text-[11px] text-danger">{ragUi.error}</p>
+      {:else if askOffline}
+        <p role="status" class="mt-2 text-[11px] opacity-70">{t("note.askOffline")}</p>
+      {:else if askHits && askHits.length === 0}
+        <p role="status" class="mt-2 text-[11px] opacity-70">{t("note.askEmpty")}</p>
+      {:else if askHits}
+        <p class="mt-2 text-[11px] opacity-60">{t("note.askHits", { n: String(askHits.length) })}</p>
+        <ul class="mt-1 flex flex-col gap-1">
+          {#each askHits as h (h.id + "\u0000" + h.passage)}
+            <li class="rounded-xl bg-white/60 p-2 text-xs dark:bg-black/20">
+              <div class="text-[10px] opacity-60">{t("note.askFrom", { title: hitSourceLabel(h.id, notes) })}</div>
+              <div class="whitespace-pre-wrap">{h.passage}</div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
 
   {#if mode === "all"}
     <div class="mt-2 flex flex-col gap-1 text-xs opacity-70">
       <label class="flex items-center gap-2">
         <input type="checkbox" bind:checked={prefs.openInEditor} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-open-in-editor" />
-        点按笔记直接进入整页编辑
+        {t("note.tapToEditHint")}
       </label>
       <label class="flex items-center gap-2">
         <input type="checkbox" bind:checked={prefs.sortByModified} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-sort-by-modified" />
-        列表按修改时间排序（置顶优先）
+        {t("note.sortHint")}
       </label>
     </div>
   {/if}
@@ -543,23 +729,23 @@
                 <div class="mt-2 flex items-center gap-1.5 text-xs">
                   <button
                     onclick={toggleAtCaret}
-                    title="勾选 / 取消光标所在任务行"
+                    title={t("note.editorToggleTaskHint")}
                     aria-label="note-edit-toggle-task"
                     class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
-                  >☑ 勾选</button>
+                  >☑ {t("note.editorToggleTask")}</button>
                   <button
                     onclick={prefixAtCaret}
-                    title="把光标所在行变成任务"
+                    title={t("note.editorPrefixTaskHint")}
                     aria-label="note-edit-prefix-task"
                     class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
-                  >＋ 任务</button>
+                  >＋ {t("note.editorPrefixTask")}</button>
                   <button
                     onclick={() => (previewOn = !previewOn)}
                     aria-pressed={previewOn}
                     aria-label="note-edit-preview"
-                    title="富文本预览"
+                    title={t("note.editorPreviewHint")}
                     class={"rounded-full px-2.5 py-1 " + (previewOn ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
-                  >预览</button>
+                  >{t("note.editorPreview")}</button>
                 </div>
 
                 {#if previewOn && editVal.trim()}
@@ -578,9 +764,15 @@
                 <div class="mt-2 flex items-center justify-between text-xs">
                   <span class="opacity-60">{fmtTime(n.ts)}</span>
                   <div class="flex gap-2">
-                    <button onclick={() => void copyEditing()} aria-label="Copy to AmOS clipboard" title="复制到系统剪贴板" class="opacity-70 hover:opacity-100">⧉</button>
-                    <button onclick={() => void pasteEditing()} aria-label="Paste from AmOS clipboard" title="从系统剪贴板粘贴" class="opacity-70 hover:opacity-100">📋</button>
-                    <button onclick={() => (trayOpen = !trayOpen)} aria-label="Clipboard history" aria-pressed={trayOpen} title="剪贴板历史" class="opacity-70 hover:opacity-100">🕘</button>
+                    <button onclick={() => void copyEditing()} aria-label="Copy to AmOS clipboard" title={t("note.copyHint")} class="opacity-70 hover:opacity-100">⧉</button>
+                    <button onclick={() => void pasteEditing()} aria-label="Paste from AmOS clipboard" title={t("note.pasteHint")} class="opacity-70 hover:opacity-100">📋</button>
+                    <button onclick={() => (trayOpen = !trayOpen)} aria-label="Clipboard history" aria-pressed={trayOpen} title={t("note.clipHistoryHint")} class="opacity-70 hover:opacity-100">🕘</button>
+                    <button
+                      onclick={() => sendToAi("notes", editVal)}
+                      aria-label="note-send-ai"
+                      title={t("note.sendToAi")}
+                      class="opacity-70 hover:opacity-100"
+                    >✦ {t("note.sendToAi")}</button>
                     <button onclick={cancelEdit} class="opacity-70 hover:underline">{t("note.cancel")}</button>
                     <button onclick={saveEdit} class="font-semibold text-accent hover:underline">{t("note.save")}</button>
                   </div>
@@ -588,10 +780,18 @@
                 {#if trayOpen}
                   <div class="mt-2 rounded-xl bg-neutral-200/60 p-2 text-xs dark:bg-neutral-800/60">
                     {#if trayItems.length === 0}
-                      <p class="opacity-50">（剪贴板暂无历史 / 离线）</p>
+                      <p class="opacity-50">{t("clipboard.empty")}</p>
                     {:else}
+                      <div class="mb-1 flex justify-end">
+                        <button
+                          onclick={() => void clearTray()}
+                          aria-label={t("clipboard.clearHistory")}
+                          title={t("clipboard.clearHistory")}
+                          class="rounded px-1.5 py-0.5 opacity-60 hover:bg-white/40 hover:opacity-100"
+                        >{t("clipboard.clearHistory")}</button>
+                      </div>
                       {#each trayItems as e, i (i)}
-                        <button onclick={() => pickFromTray(e)} class="block w-full truncate rounded px-1 py-0.5 text-left hover:bg-white/40">{entryText(e) || "—"}</button>
+                        <button onclick={() => pickFromTray(e)} class="block w-full truncate rounded px-1 py-0.5 text-left hover:bg-white/40">{previewClipboard(e)}</button>
                       {/each}
                     {/if}
                   </div>
@@ -635,13 +835,13 @@
                 </span>
                 <div class="flex flex-wrap gap-2">
                   <button onclick={() => void doExportOne(n)} title={t("note.export")} class="hover:underline">↧ {t("note.export")}</button>
-                  <button onclick={() => void doExportMd(n)} aria-label="note-export-md" title="导出为 Markdown（复制到剪贴板）" class="hover:underline">⇩ .md</button>
+                  <button onclick={() => void doExportMd(n)} aria-label="note-export-md" title={t("note.exportMdHint")} class="hover:underline">⇩ .md</button>
                   {#if mode === "all"}
                     <button onclick={() => persist(togglePin(notes, n.id))} title={t("note.pin")} class={"hover:underline " + (n.pinned ? "text-amber-500" : "opacity-70")}>{n.pinned ? "★" : "☆"}</button>
                     <button onclick={() => setStateOf(n.id, "archived")} class="hover:underline">{t("note.archive")}</button>
                     <button onclick={() => dupeOf(n.id)} aria-label="note-duplicate" title={t("note.duplicate")} class="hover:underline">⧉ {t("note.duplicate")}</button>
                     <button onclick={() => beginEdit(n)} class="text-accent hover:underline">{t("note.edit")}</button>
-                    <button onclick={() => openEditor(n)} class="text-accent hover:underline">整页</button>
+                    <button onclick={() => openEditor(n)} class="text-accent hover:underline">{t("note.fullPage")}</button>
                   {/if}
                   {#if mode === "all" || mode === "archived"}
                     <button onclick={() => setStateOf(n.id, "trash")} class="text-danger hover:underline">{t("note.delete")}</button>

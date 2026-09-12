@@ -18,9 +18,10 @@
     type TermLine,
   } from "../lib/terminal";
   import { parseAnsi, decodeOutput } from "../lib/ansi";
-  import { termSpawn, termWrite, termRead, termKill } from "../lib/backend";
+  import { termSpawn, termWrite, termRead, termKill, termResize } from "../lib/backend";
   import { t } from "./locale.svelte";
   import { onDestroy } from "svelte";
+  import { ptySizeFor } from "../lib/terminal";
 
   let lines = $state<TermLine[]>(termBanner(t("terminal.demo")));
   let draft = $state("");
@@ -38,9 +39,67 @@
     lines = capLines([...lines, ...add]);
   };
 
+  // ---- PTY window size ----
+  // `term_spawn` starts the session at a fixed 120×24; without telling the shell
+  // the real grid, wrapping and full-screen programs (vim/htop) draw for the wrong
+  // width. Measure one character cell in the scroller's own font, convert the
+  // content box to cols/rows, and push it with `term_resize` on attach + on every
+  // container resize. Unmeasurable geometry is skipped (host default left alone).
+  let lastSize = { cols: 0, rows: 0 };
+
+  function charMetrics(el: HTMLElement): { w: number; h: number } | null {
+    try {
+      const cs = getComputedStyle(el);
+      const probe = document.createElement("pre");
+      probe.style.cssText =
+        "position:absolute;visibility:hidden;white-space:pre;margin:0;padding:0;border:0;";
+      probe.style.font = cs.font;
+      probe.style.lineHeight = cs.lineHeight;
+      probe.textContent = "M".repeat(100);
+      el.appendChild(probe);
+      const rect = probe.getBoundingClientRect();
+      el.removeChild(probe);
+      const w = rect.width / 100;
+      const h = rect.height;
+      return w > 0 && h > 0 ? { w, h } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function syncPtySize(): Promise<void> {
+    if (!live || sess <= 0 || !scroller) return;
+    const cell = charMetrics(scroller);
+    if (!cell) return;
+    let boxPadX = 0;
+    let boxPadY = 0;
+    try {
+      const cs = getComputedStyle(scroller);
+      boxPadX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+      boxPadY = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    } catch {
+      /* unmeasurable padding → treat as 0 */
+    }
+    const size = ptySizeFor({
+      width: scroller.clientWidth - boxPadX,
+      height: scroller.clientHeight - boxPadY,
+      charW: cell.w,
+      charH: cell.h,
+    });
+    if (!size || (size.cols === lastSize.cols && size.rows === lastSize.rows)) return;
+    lastSize = size;
+    try {
+      await termResize(sess, size.cols, size.rows);
+    } catch {
+      /* offline / feature off — the session keeps its default grid */
+    }
+  }
+
   // Live (real-PTY) session state.
   let live = $state(false);
   let sess = $state(0);
+  /** Watches the terminal box so a real session tracks the actual grid size. */
+  let ro: ResizeObserver | null = null;
 
   // Try to open a real PTY session once. Offline (no backend / feature off)
   // term_spawn rejects or returns id 0 → we stay in the offline demo.
@@ -54,6 +113,12 @@
           live = true;
           sess = r.id;
           appendLines([{ text: "(real PTY shell attached)", kind: "muted" }]);
+          // Tell the shell how big the terminal actually is (spawn used 120×24).
+          void syncPtySize();
+          if (typeof ResizeObserver !== "undefined" && scroller) {
+            ro = new ResizeObserver(() => void syncPtySize());
+            ro.observe(scroller);
+          }
         }
       })
       .catch(() => {
@@ -63,6 +128,8 @@
 
   // Leave cleanly: kill the PTY session when the app unmounts (no orphan child).
   onDestroy(() => {
+    ro?.disconnect();
+    ro = null;
     if (live && sess > 0) {
       void termKill(sess).catch(() => {});
     }

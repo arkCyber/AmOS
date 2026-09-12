@@ -258,7 +258,15 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
                 d.status = DaemonStatus::Starting;
             }
             terminate(child).await;
-            if spawn_child(&name, &daemon).await.is_err() {
+            if let Err(e) = spawn_child(&name, &daemon).await {
+                // The recycle the caller asked for did not happen. Parking the daemon in
+                // `Crashed` is the state; *saying so* is what makes `restart_all()` (or a
+                // UI "restart" button) not look like it worked (REQ-A147).
+                tracing::error!(
+                    daemon = %name,
+                    error = %e,
+                    "explicit restart could not spawn the process; the daemon is NOT running"
+                );
                 let mut d = daemon.lock().await;
                 d.status = DaemonStatus::Crashed {
                     restarts: d.restarts,
@@ -326,7 +334,15 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
             }
         }
 
-        if spawn_child(&name, &daemon).await.is_err() {
+        if let Err(e) = spawn_child(&name, &daemon).await {
+            // The crash-restart budget is exhausted only after this failure; without the
+            // log the daemon would simply stop existing in the UI with no reason given.
+            tracing::error!(
+                daemon = %name,
+                error = %e,
+                "restart after backoff could not spawn the process; \
+                 the daemon is giving up (Crashed)"
+            );
             let mut d = daemon.lock().await;
             d.status = DaemonStatus::Crashed {
                 restarts: d.restarts,
@@ -363,6 +379,9 @@ impl Supervisor {
         };
         // Directly terminate a child that hasn't been claimed by the monitor yet.
         if let Some(mut c) = child.take() {
+            // Deliberate: `kill` on an already-exited child returns `ESRCH`, and `wait`
+            // reaps a status nobody acts on — both are expected in this path, and the
+            // bounded wait below is what actually decides whether the child is gone.
             let _ = c.kill().await;
             let _ = c.wait().await;
         }
@@ -372,9 +391,22 @@ impl Supervisor {
         // Wait (bounded) for the monitor to kill + reap the child it owns, so
         // `stop()` / `shutdown_all()` return only after the process is actually
         // gone. Aborting the monitor task right away would orphan the child.
+        //
+        // If the bound expires the child may still be alive, which contradicts what this
+        // function promises its caller, so say so (REQ-A147). Still a bounded wait: a
+        // shutdown path must not hang forever on a process that refuses to die.
         let task = self.tasks.lock().await.remove(name);
         if let Some(t) = task {
-            let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
+            if tokio::time::timeout(Duration::from_secs(5), t)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    daemon = %name,
+                    "the monitor did not finish terminating the child within 5s; \
+                     the process may still be running"
+                );
+            }
         }
         Ok(())
     }
@@ -421,7 +453,24 @@ impl Supervisor {
     pub async fn restart_all(&self) {
         let names: Vec<String> = self.daemons.read().await.keys().cloned().collect();
         for name in names {
-            let _ = self.restart(&name).await;
+            // Only running/backing-off daemons have a monitor to signal; for a stopped or
+            // crashed one `restart` answers "not running", which is the documented,
+            // expected case (`start` is the way back) and not a failure to report —
+            // warning there would flood the log on every recycle.
+            let alive = matches!(
+                self.status(&name).await,
+                Some(DaemonStatus::Running | DaemonStatus::Restarting { .. })
+            );
+            if !alive {
+                continue;
+            }
+            if let Err(e) = self.restart(&name).await {
+                tracing::warn!(
+                    daemon = %name,
+                    error = %e,
+                    "restart_all could not signal this daemon to recycle"
+                );
+            }
         }
     }
 
@@ -447,7 +496,15 @@ impl Supervisor {
     pub async fn shutdown_all(&self) {
         let names: Vec<String> = self.daemons.read().await.keys().cloned().collect();
         for name in names {
-            let _ = self.stop(&name).await;
+            // A daemon that failed to stop during shutdown keeps running after the
+            // supervisor is gone — the worst kind of silent failure, so name it.
+            if let Err(e) = self.stop(&name).await {
+                tracing::warn!(
+                    daemon = %name,
+                    error = %e,
+                    "shutdown_all could not stop this daemon; it may still be running"
+                );
+            }
         }
         let tasks = self.tasks.lock().await;
         for t in tasks.values() {

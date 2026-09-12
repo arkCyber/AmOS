@@ -145,11 +145,6 @@ export function systemTimeZone(): string {
   }
 }
 
-/** Cosmetic battery % (mirrors the legacy status bar countdown). */
-export function batteryPercent(d: Date): number {
-  return 100 - d.getSeconds();
-}
-
 /* ---- Stopwatch (pure reducer so it's headlessly testable) ---- */
 export interface StopwatchState {
   running: boolean;
@@ -285,9 +280,11 @@ export function fmtCountdown(ms: number): string {
 /* ---- Alarms (pure reducer; headless-testable) ---- */
 export const ALARM_TONES = ["🔔", "⏰", "📯", "🎶"] as const;
 
-/** Standard snooze interval (minutes). */
-export const SNOOZE_MS = 5 * 60 * 1000;
-/** Default snooze length (minutes) when an alarm has no explicit snoozeMin. */
+/**
+ * Default snooze length (minutes) when an alarm has no explicit `snoozeMin`.
+ * The single source of truth for the default — the Clock app's editor and the
+ * `snooze` reducer action both read it (no magic `5` at the call sites).
+ */
 export const DEFAULT_SNOOZE_MIN = 5;
 
 /** Clamp a snooze length to a sane 1–120 minute integer (or undefined). */

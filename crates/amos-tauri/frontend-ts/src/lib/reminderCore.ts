@@ -17,6 +17,7 @@ import { readStoreValue, writeStoreValue } from "./amosStore";
 import { NOTIF_KEY, NOTIF_CAP, normalizeNotifs, type Notif } from "./settings";
 import {
   REMINDERS_KEY,
+  isOverdueNow,
   normalizeReminders,
   type Reminder,
 } from "./reminders";
@@ -25,7 +26,7 @@ import { zh } from "../i18n/locales/zh";
 export { REMINDERS_KEY };
 
 export const FIRED_KEY = "amos.reminderFired";
-/** Internal app id of the Reminders app (apps.tsx APPS entry). While the user
+/** Internal app id of the Reminders app (`svelte/appRegistry.ts`). While the user
  *  is focused there, due alerts are not published (the items are on screen). */
 export const REMINDERS_APP_ID = "reminders";
 /** How often the OS re-checks due times (a coarse background scheduler). */
@@ -54,10 +55,9 @@ export function collectDueAlerts(
   return reminders
     .filter(
       (r) =>
-        !r.completed &&
-        typeof r.dueAt === "number" &&
-        r.dueAt <= now &&
-        fired[r.id] !== r.dueAt,
+        // The "due and still pending" rule lives in `lib/reminders` (and is
+        // unit-tested there); the notifier must not keep a second copy of it.
+        isOverdueNow(r, now) && fired[r.id] !== r.dueAt,
     )
     .sort((a, b) => (a.dueAt ?? 0) - (b.dueAt ?? 0))
     .slice(0, cap);

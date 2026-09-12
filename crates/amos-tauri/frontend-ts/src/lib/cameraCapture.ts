@@ -7,7 +7,7 @@
  * the hard parts are injectable (MediaRecorder / a MediaStore), which keeps the
  * headless tests honest without driving real hardware. */
 
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 import { defaultMediaStore, type MediaStore } from "./mediaStore";
 
 export class RecordingUnavailableError extends Error {}
@@ -44,13 +44,14 @@ export function mediaId(captureId: string): string {
   return `${MEDIA_PREFIX}${captureId}`;
 }
 
-/** Toggle a capture's favourite flag and persist the metadata list. */
-export function toggleCaptureFav(id: string): VideoCapture[] {
+/** Toggle a capture's favourite flag and persist the metadata list. Returns whether
+ *  the flag really landed — a rejected write leaves the stored row untouched, so the
+ *  caller must not show a heart the library does not have. */
+export function toggleCaptureFav(id: string): { ok: boolean; list: VideoCapture[] } {
   const next = normalizeCaptures(readStoreValue<unknown>(CAPTURES_KEY, [])).map((c) =>
     c.id === id ? { ...c, fav: !c.fav } : c,
   );
-  writeStoreValue(CAPTURES_KEY, next);
-  return next;
+  return { ok: writeStoreValueChecked(CAPTURES_KEY, next), list: next };
 }
 
 /** Coerce any stored value into a valid `VideoCapture[]` (defensive). */
@@ -69,26 +70,47 @@ export function listCaptures(): VideoCapture[] {
   return normalizeCaptures(readStoreValue<unknown>(CAPTURES_KEY, []));
 }
 
-/** Persist a finished capture's metadata + move its bytes into the MediaStore. */
+/**
+ * Persist a finished capture's metadata + move its bytes into the MediaStore.
+ *
+ * Returns whether the capture is **really in the library**: a video whose metadata
+ * write was rejected (full/unavailable storage) would never be listed, so the bytes
+ * are removed again (best effort) and the caller must not claim it was saved.
+ */
 export async function persistVideoCapture(
   meta: VideoCapture,
   blob: Blob,
   store: MediaStore = defaultMediaStore(),
-): Promise<void> {
+): Promise<boolean> {
   await store.put(mediaId(meta.id), blob);
-  writeStoreValue(CAPTURES_KEY, [meta, ...normalizeCaptures(readStoreValue<unknown>(CAPTURES_KEY, []))].slice(0, 100));
+  const next = [
+    meta,
+    ...normalizeCaptures(readStoreValue<unknown>(CAPTURES_KEY, [])),
+  ].slice(0, 100);
+  if (writeStoreValueChecked(CAPTURES_KEY, next)) return true;
+  // The library index could not be written, so the capture is invisible: don't leak
+  // its bytes as an orphaned blob.
+  try {
+    await store.del(mediaId(meta.id));
+  } catch {
+    /* best-effort cleanup — the index is authoritative either way */
+  }
+  return false;
 }
 
-/** Remove a capture's metadata + bytes (library delete). */
+/** Remove a capture's metadata + bytes (library delete). Returns whether the row is
+ *  really gone: the bytes are only deleted once the index no longer lists them, so a
+ *  rejected write cannot leave a listed-but-unplayable video. */
 export async function removeVideoCapture(
   id: string,
   store: MediaStore = defaultMediaStore(),
-): Promise<void> {
-  writeStoreValue(
-    CAPTURES_KEY,
-    normalizeCaptures(readStoreValue<unknown>(CAPTURES_KEY, [])).filter((c) => c.id !== id),
+): Promise<boolean> {
+  const next = normalizeCaptures(readStoreValue<unknown>(CAPTURES_KEY, [])).filter(
+    (c) => c.id !== id,
   );
+  if (!writeStoreValueChecked(CAPTURES_KEY, next)) return false;
   await store.del(mediaId(id));
+  return true;
 }
 
 /** Fetch the bytes for a capture (for playback). */

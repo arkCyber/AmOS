@@ -1,6 +1,7 @@
 <script lang="ts">
-  // StreamVoiceButton.svelte — Svelte 5 (runes) port of components/StreamVoiceButton.tsx.
-  // No React. Hold-to-talk **streaming** assistant voice: on hold it opens the
+  // StreamVoiceButton.svelte — Svelte 5 (runes) port of the former React
+  // StreamVoiceButton (removed with the React shell; this is the only implementation).
+  // Hold-to-talk **streaming** assistant voice: on hold it opens the
   // resident daemon Chat via `assistant_voice_start`, streams 16 kHz f32-le frames
   // via `assistant_voice_feed`, and on release force-finalizes with
   // `assistant_voice_end`.
@@ -11,10 +12,12 @@
   // from this push-to-talk mic or from the always-on native device mic — renders
   // exactly once (no double bubbles), and DeviceMicButton never has to depend on
   // this button being mounted.
-  import { assistantVoiceEnd, assistantVoiceFeed, assistantVoiceStart } from "../lib/backend";
+  import { assistantVoiceEnd, assistantVoiceFeed, assistantVoiceStart, assistantVoiceStop } from "../lib/backend";
   import { pcmToAssistantChunk } from "../lib/voice";
-  import { loadLedger, saveLedger, grantCap, revokeCap, capSet, type Capability } from "../lib/permissions";
+  import { loadLedger, capSet, type Capability } from "../lib/permissions";
+  import { grantCapability, revokeCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
+  import { onDestroy } from "svelte";
 
   const MIC: Capability = "microphone";
   let {
@@ -34,6 +37,8 @@
   let recording = $state(false);
   let micGranted = $state(capSet(loadLedger(), "ai", MIC));
   let ask = $state(false);
+  /** True once the host opened a resident listener we must later cancel. */
+  let sessionOpen = false;
 
   // Live-capture plumbing (plain refs).
   let ctxRef: AudioContext | null = null;
@@ -90,6 +95,9 @@
     try {
       const sid = session();
       await assistantVoiceStart(sid);
+      // From here on the daemon holds a resident listener: even if the local
+      // capture fails below, teardown must cancel it.
+      sessionOpen = true;
       const stream = await media.getUserMedia({ audio: { channelCount: 1 } });
       if (!stream.getTracks().length) {
         cleanup();
@@ -134,14 +142,33 @@
     await assistantVoiceEnd();
   }
 
+  // `assistant_voice_start` opens a **resident** daemon listener (a long-lived
+  // `Chat` stream that keeps relaying replies), while `assistant_voice_end` only
+  // finalizes the current utterance. So releasing the button must NOT cancel the
+  // listener (that would cut off the answer) — but it has to be torn down when
+  // this button goes away, or the mic session outlives the UI forever: nothing
+  // ever called `assistant_voice_stop`, so every press leaked a resident
+  // listener. Cancel is a no-op on the host when nothing is active.
+  onDestroy(() => {
+    if (!sessionOpen) return; // never opened one → nothing to cancel
+    sessionOpen = false;
+    try {
+      void assistantVoiceStop().catch(() => {
+        /* offline / already stopped */
+      });
+    } catch {
+      /* ignore */
+    }
+  });
+
   const allowMic = () => {
-    saveLedger(grantCap(loadLedger(), "ai", MIC));
+    grantCapability("ai", MIC);
     micGranted = true;
     ask = false;
     void start();
   };
   const denyMic = () => {
-    saveLedger(revokeCap(loadLedger(), "ai", MIC));
+    revokeCapability("ai", MIC);
     micGranted = false;
     ask = false;
   };

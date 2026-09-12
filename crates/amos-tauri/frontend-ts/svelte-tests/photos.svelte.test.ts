@@ -9,6 +9,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import PhotosApp from "../src/svelte/PhotosApp.svelte";
+import { readStoreValue } from "../src/lib/amosStore";
 import { setLocale } from "../src/svelte/locale.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import { PHOTOS_KEY } from "../src/lib/photos";
@@ -21,6 +22,30 @@ afterEach(() => {
 });
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
 const btnAria = (h: { container: HTMLElement }, aria: string) =>
   [...h.container.querySelectorAll("button")].find((b) => b.getAttribute("aria-label") === aria) as
     HTMLButtonElement | undefined;
@@ -28,6 +53,14 @@ const firstTile = (h: { container: HTMLElement }) =>
   h.container.querySelector(".grid button") as HTMLButtonElement | null;
 
 describe("PhotosApp.svelte", () => {
+  test("an intentionally emptied store is not re-seeded with demo photos", () => {
+    window.localStorage.setItem("amos.photos", "[]");
+    const host = render(PhotosApp);
+    // No demo photo glyphs, and the store stays empty.
+    expect(txt(host)).not.toContain("🏔️");
+    expect(readStoreValue<unknown>("amos.photos", null)).toEqual([]);
+  });
+
   test("seeded gallery is non-empty", () => {
     const host = render(PhotosApp);
     expect(txt(host)).not.toContain("暂无照片");
@@ -93,6 +126,24 @@ describe("PhotosApp.svelte", () => {
     await fireEvent.click(del as HTMLButtonElement);
     expect(btnAria(host, "上一张")).toBeFalsy(); // back to gallery
     expect(txt(host)).toContain("＋ 拍照");
+  });
+
+  test("a rejected write is reported and the deleted photo stays", async () => {
+    const restore = failWritesFor("amos.photos");
+    try {
+      const host = render(PhotosApp);
+      await fireEvent.click(firstTile(host)!);
+      const del = [...host.container.querySelectorAll("button")].find(
+        (b) => (b.textContent ?? "").trim() === "删除",
+      );
+      await fireEvent.click(del as HTMLButtonElement);
+      // The photo is still stored, so it must not be reported as deleted: the banner
+      // shows and the viewer stays open.
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(btnAria(host, "上一张")).toBeTruthy();
+    } finally {
+      restore();
+    }
   });
 
   test("multi-select can batch-delete", async () => {
@@ -199,6 +250,60 @@ describe("PhotosApp.svelte", () => {
         expect(host.container.querySelector('[aria-label="native photos"]')).toBeTruthy();
       });
       expect(host.container.querySelector('[title="IMG_native.jpg"]')).toBeTruthy();
+    } finally {
+      if (stub === undefined) delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+      else (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = stub;
+    }
+  });
+
+  test("a denied media list prompts for access; granting loads the stills", async () => {
+    // The Rust side surfaces an Unauthorized list as a *rejection* — the gallery
+    // must say "not authorized", never render it as an empty library.
+    let granted = false;
+    const calls: string[] = [];
+    const stub = (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: { collection?: string }) => {
+        calls.push(cmd);
+        if (cmd === "media_list") {
+          if (!granted) throw new Error("camera: not authorized (call media_grant_read)");
+          return args?.collection === "camera"
+            ? [
+                {
+                  id: "content://cam/9",
+                  kind: "image",
+                  collection: "camera",
+                  name: "IMG_granted.jpg",
+                  uri: "content://cam/9",
+                  mime: "image/jpeg",
+                  size_bytes: 10,
+                  ts: 900,
+                },
+              ]
+            : [];
+        }
+        if (cmd === "media_grant_read") {
+          granted = true;
+          return null;
+        }
+        return null;
+      },
+    };
+    try {
+      const host = render(PhotosApp);
+      await vi.waitFor(() => {
+        expect(host.container.querySelector('[data-testid="native-blocked"]')).toBeTruthy();
+      });
+      // No fabricated native strip while the read is denied.
+      expect(host.container.querySelector('[aria-label="native photos"]')).toBeNull();
+
+      await fireEvent.click(btnAria(host, "授权读取")!);
+      await vi.waitFor(() => {
+        expect(host.container.querySelector('[title="IMG_granted.jpg"]')).toBeTruthy();
+      });
+      // Both listed collections were granted read access (camera + screenshots).
+      expect(calls.filter((c) => c === "media_grant_read")).toHaveLength(2);
+      expect(host.container.querySelector('[data-testid="native-blocked"]')).toBeNull();
     } finally {
       if (stub === undefined) delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
       else (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = stub;

@@ -5,6 +5,11 @@
  * reconcile itself. All real logic lives in `lib/alarmCore.ts`; this module is
  * the timer/scheduler that calls `syncDueAlarmAlerts` unless the Clock app is
  * the focused surface (its own in-app ring is on screen).
+ *
+ * It also drives `osAlarmArm.reconcileNativeAlarms` — once at start (so persisted
+ * alarms are registered after a boot) and on every alarm-list change (so a new
+ * alarm is armed and a disabled/deleted one is cancelled), which
+ * `syncDueAlarmAlerts` alone cannot do.
  */
 import {
   ALARM_ALERT_INTERVAL_MS,
@@ -14,6 +19,7 @@ import {
   syncDueAlarmAlerts,
 } from "../lib/alarmCore";
 import { STORE_CHANGED_EVENT } from "../lib/amosStore";
+import { reconcileNativeAlarms } from "./osAlarmArm";
 
 /** One reconcile decision: runs the alarm sync unless the Clock app is focused. */
 export function alarmWatcherTick(
@@ -31,6 +37,9 @@ export function alarmWatcherTick(
 
 /** Start a background alarm watcher. Returns a stop function (call on unmount). */
 export function startAlarmWatcher(getActive: () => string | null): () => void {
+  // Register the persisted alarms with the host scheduler up-front (a boot may
+  // never open the Clock screen), then keep them in step on every change.
+  void reconcileNativeAlarms();
   const interval = window.setInterval(() => {
     try {
       alarmWatcherTick(getActive());
@@ -46,6 +55,9 @@ export function startAlarmWatcher(getActive: () => string | null): () => void {
       } catch {
         /* ignore */
       }
+      // An alarm was added / edited / enabled / disabled / deleted → make the
+      // native registrations match (arm the new next occurrence, cancel the rest).
+      if (key === ALARM_KEY) void reconcileNativeAlarms();
     }
   };
   window.addEventListener(STORE_CHANGED_EVENT, onStore);

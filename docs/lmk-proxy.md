@@ -190,6 +190,13 @@ cd crates/amos-tauri/frontend-ts && bun run typecheck && bun run test   # lmk.te
 - `GovernorLmkHost` 维护「容器管理」包集合（首次 `register_app` 时加入、`kill`/反向回收时移除），
   因此只有**真实容器 app** 会被反向驱动；host-native app（如 System UI 自注册的 "notes"）**不误杀**。
 - `reclaimed` → 真 `am force-stop` + proxy 移除；`frozen`/`thawed` → `proxy.freeze`/`thaw` 镜像 tier。
+- **反向驱动的失败不再被吞掉（REQ-A146）**：`proxy.freeze/thaw/destroy` 与 `manager.force_stop_app`
+  的 `Err` 以前是 `let _ =`（既没有重试、也没有日志），于是「host 认为已墓碑 / 容器仍在跑」这种**双方状态
+  分叉**对任何观察者都不可见。现在每个失败的镜像操作都按 `op`/`package`/`error` 记 `warn`
+  （`mirror_failed`），best-effort 语义不变（照旧继续，不阻断 tick）；正向的 `report_state` 同理：
+  容器报的 tier 若 host 无法表示（`Visible` 没有对应 host 状态，`move_app` 返回 `InvalidTransition`），
+  或 `register_app` 被拒，都会记 `warn` 并说明「host 保留上一状态」。测试见
+  `crates/amos-ai/tests/lmk_reverse_drive.rs`（捕获日志断言，非仅断言行为）。
 
 **LMK 事件推送（`WatchLmk`，daemon 侧已建）**
 

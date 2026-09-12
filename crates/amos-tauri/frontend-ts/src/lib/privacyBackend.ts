@@ -44,7 +44,25 @@ export function daemonResource(cap: Capability): WireResource | null {
   }
 }
 
-/** True when the app holds the capability per the daemon. Null offline. */
+/** Map a daemon resource wire key back to the UI capability (null = unknown key). */
+export function capForWire(resource: string): Capability | null {
+  switch (resource) {
+    case "camera":
+    case "microphone":
+    case "location":
+    case "contacts":
+    case "storage":
+      return resource;
+    default:
+      // An unknown wire key (a resource added daemon-side before the UI knows it)
+      // must NOT be rendered as a capability label — the caller skips it.
+      return null;
+  }
+}
+
+/**
+ * True when the app holds the capability per the daemon. Null offline.
+ */
 export async function daemonAuthorize(
   appId: string,
   cap: Capability,
@@ -81,6 +99,28 @@ export async function daemonRevoke(
   if (!bridged()) return null;
   await invoke<null>("perm_revoke", { appId, resource });
   return true;
+}
+
+/** One app and the resources the daemon says it holds (mirrors `GrantRow`). */
+export interface DaemonGrantRow {
+  /** Rust `GrantRow.app_id` (serde keeps the snake_case field name). */
+  app_id: string;
+  /** Raw daemon wire keys (`camera` / `microphone` / …). */
+  resources: string[];
+}
+
+/**
+ * Every app the **daemon** says holds at least one grant — the authority a
+ * permission *review* must read (one round-trip, not N per-app calls).
+ *
+ * Distinct from the local ledger: the daemon store survives a fresh/cleared
+ * WebView profile (it is reloaded from `AMOS_PRIVACY_PATH`), so an app can hold
+ * a capability the local ledger never saw. Returns `null` offline / when the
+ * command fails, so a caller can say "unknown" instead of "nothing granted".
+ */
+export async function daemonGrantsAll(): Promise<DaemonGrantRow[] | null> {
+  if (!bridged()) return null;
+  return invoke<DaemonGrantRow[]>("perm_grants_all");
 }
 
 /** One normalized daemon audit record (mirrors `permission_client::PermissionAudit`). */

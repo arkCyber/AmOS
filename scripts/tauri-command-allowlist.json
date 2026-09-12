@@ -1,0 +1,82 @@
+[
+  {
+    "name": "ask_ai_agent",
+    "reason": "Non-streaming AI path (one Ask RPC, tokens coalesced). The AI screen streams through `chat_agent`; this stays as the headless/*library* form of the same request (it also carries the `inject_context` unit tests). Wire it if a screen ever wants a single-shot answer."
+  },
+  {
+    "name": "simulate_button",
+    "reason": "Developer/test seam for the hardware-button path (`buttons.rs` doc: \"lets desktop dev / tests drive the same path\"). No screen simulates a physical key."
+  },
+  {
+    "name": "wm_open",
+    "reason": "Multi-window host (`windows`). The Svelte shell is single-surface and `lib/wm.ts` is allow-listed until the split-screen UI lands (docs/multi-window.md)."
+  },
+  {
+    "name": "wm_focus",
+    "reason": "Multi-window host; same missing surface as `wm_open` (docs/multi-window.md)."
+  },
+  {
+    "name": "wm_hide",
+    "reason": "Multi-window host; same missing surface as `wm_open` (docs/multi-window.md)."
+  },
+  {
+    "name": "wm_home",
+    "reason": "Multi-window host; the Svelte shell owns its own surface state (`shellState`), so nothing asks the WM to go home (docs/multi-window.md)."
+  },
+  {
+    "name": "clipboard_guest_status",
+    "reason": "Diagnostic counter snapshot for the host↔guest clipboard link. The guest agent + real socket/vsock channel are device work (docs/clipboard-container-sync.md P2/P3); nothing in the shell consumes the counters yet."
+  },
+  {
+    "name": "store_get",
+    "reason": "Single-key read of the Rust shared store. Boot hydration pulls the whole snapshot (`store_snapshot`) and every other read goes through localStorage, so no caller needs one key."
+  },
+  {
+    "name": "store_remove",
+    "reason": "Removal half of the shared store. No screen removes a whole key today (every action writes a new value); the command stays so the cross-window `{value:null}` removal path in `svelte/store.ts` has a symmetric producer."
+  },
+  {
+    "name": "media_read_range",
+    "reason": "Bounded-window read for large media (the streaming counterpart of `media_load`, docs/media-player.md). The player resolves tracks with `media_load` today; range reads are the custom-protocol/streaming path (device work)."
+  },
+  {
+    "name": "interpret_end_of_speech",
+    "reason": "Manual/VAD utterance boundary for the interpreter session. The screen drives start/audio/pause/resume/stop; a \"finish this sentence\" affordance does not exist yet."
+  },
+  {
+    "name": "interpret_restart",
+    "reason": "Reset an ended session for reuse. The screen starts a fresh session instead (`interpret_start` replaces the active one), so a restart affordance is not needed yet."
+  },
+  {
+    "name": "interpret_abort",
+    "reason": "Hard-end + clear the session. `interpret_stop` (wired) ends it gracefully and the next `interpret_start` replaces it, so no screen aborts."
+  },
+  {
+    "name": "interpret_status",
+    "reason": "Read back the daemon-side session state. The screen keeps its own session id/state and starts fresh on mount, so nothing adopts a live session yet."
+  },
+  {
+    "name": "mail_inbox",
+    "reason": "Deliberate convenience alias of `mail_list` for the selected mailbox (recorded in docs/unwired-exports-audit.md); `MailApp` lists through `mail_list`."
+  },
+  {
+    "name": "sensor_host_set_mode",
+    "reason": "In-process sensor-host developer seam (`sensor_host.rs`): drives the host-side simulator/energy mode. The Settings card reads the daemon's `sensor_*` snapshot instead (docs/sensors.md)."
+  },
+  {
+    "name": "sensor_host_record_imu",
+    "reason": "Developer seam: feeds a synthetic IMU sample into the in-process sensor host (host/dev + tests)."
+  },
+  {
+    "name": "sensor_host_record_frame",
+    "reason": "Developer seam: feeds a synthetic camera frame into the in-process sensor host (host/dev + tests)."
+  },
+  {
+    "name": "sensor_host_acquire",
+    "reason": "The in-process host's stream gate. Recorded in docs/unwired-exports-audit.md Round 10: exposing it would ask a *different* manager than the one producing the Settings card's stream."
+  },
+  {
+    "name": "perm_granted",
+    "reason": "Per-app grant list from the daemon authority. The privacy dashboard reviews with `perm_grants_all` (one round-trip for every app) and gates with `perm_authorize`, so the per-app call has no consumer."
+  }
+]

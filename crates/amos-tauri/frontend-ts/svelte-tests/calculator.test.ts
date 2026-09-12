@@ -24,6 +24,31 @@ function renderCalc() {
 const status = (host: ReturnType<typeof renderCalc>) =>
   host.container.querySelector('[role="status"]')?.textContent ?? "";
 
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 async function tap(host: ReturnType<typeof renderCalc>, aria: string) {
   const btn = host.container.querySelector(
     `button[aria-label="${aria}"]`,
@@ -101,6 +126,35 @@ describe("CalculatorApp.svelte — physical keyboard", () => {
 });
 
 describe("CalculatorApp.svelte — persisted history via createStoreValue", () => {
+  test("a rejected history write is reported and leaves no phantom entry", async () => {
+    const restore = failWritesFor("amos.calculator.history");
+    try {
+      const host = renderCalc();
+      await tap(host, "9");
+      await tap(host, "+");
+      await tap(host, "3");
+      await tap(host, "=");
+      // The result is still shown (it was computed), but the history must not gain an
+      // entry the store rejected — and the failure is stated. (`status()` would match
+      // the banner's live region too, so read the calculator's own display.)
+      const display = [
+        ...host.container.querySelectorAll('[role="status"]'),
+      ].find((el) => el.textContent?.trim() === "12");
+      expect(display, "the computed result is still displayed").toBeTruthy();
+      expect(
+        host.container.querySelector('[data-testid="store-write-error"]')?.textContent ?? "",
+      ).toContain("本机存储写入失败");
+      const histBtn = [...host.container.querySelectorAll("button")].find((b) =>
+        (b.textContent ?? "").includes("历史"),
+      );
+      await fireEvent.click(histBtn as HTMLButtonElement);
+      expect(host.container.textContent ?? "").not.toContain("9 + 3");
+      expect(readStoreValue<unknown>("amos.calculator.history", [])).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
   test("a completed '=' is persisted to the shared store and shown in the panel", async () => {
     const host = renderCalc();
     await tap(host, "9");

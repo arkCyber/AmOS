@@ -184,7 +184,7 @@ amos/
    git push origin feature/your-feature
    ```
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for detailed guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
 ## Troubleshooting
 
@@ -222,21 +222,21 @@ rm /tmp/amos-ai.sock
 
 ## Documentation
 
-- [README.md](../README.md) — Project overview
-- [ARCHITECTURE.md](../docs/ARCHITECTURE.md) — System design
-- [CONTRIBUTING.md](../CONTRIBUTING.md) — Contribution guidelines
-- [proto/ai_agent.proto](../proto/ai_agent.proto) — API definitions
+- [README.md](README.md) — Project overview
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — System design
+- [CONTRIBUTING.md](CONTRIBUTING.md) — Contribution guidelines
+- [proto/ai_agent.proto](proto/ai_agent.proto) — API definitions
 
 ## Next Steps
 
-- Read [ARCHITECTURE.md](../docs/ARCHITECTURE.md) to understand the system design
-- Check [docs/](../docs/) for detailed documentation
-- Start coding by following [CONTRIBUTING.md](../CONTRIBUTING.md)
-- Review the [gRPC contract](../proto/ai_agent.proto)
+- Read [ARCHITECTURE.md](docs/ARCHITECTURE.md) to understand the system design
+- Check [docs/](docs/) for detailed documentation
+- Start coding by following [CONTRIBUTING.md](CONTRIBUTING.md)
+- Review the [gRPC contract](proto/ai_agent.proto)
 
 ## Getting Help
 
-- 📖 Read the [documentation](../docs/)
+- 📖 Read the [documentation](docs/)
 - 🐛 Check [existing issues](https://github.com/arkCyber/AmOS/issues)
 - 💬 Open a [discussion](https://github.com/arkCyber/AmOS/discussions)
 - 📧 Email: arksong2018@gmail.com

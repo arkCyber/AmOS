@@ -123,6 +123,118 @@ message StatusReply {
   // not available. Present on every reply; absent Optionals mean "unknown", never
   // a fabricated reading. Backing sampler named in `sampler`.
   SystemHealth system = 16;
+
+  // Daemon-wide generation admission gate (REQ-A43), added 2026-09-11: live
+  // concurrency bounded by AMOS_MAX_SESSIONS. `in_flight` never exceeds
+  // `capacity` (the pool enforces it structurally). Present on every reply from
+  // this daemon version; a pre-this-field daemon leaves it absent (= unknown).
+  GenerationPoolMetrics generation_pool = 17;
+
+  // Inference-response cache (REQ-A44), added 2026-09-11: opt-in via
+  // AMOS_RESPONSE_CACHE=1. When disabled (`enabled=false`) every counter is the
+  // honest zero of a cache that stored/looked up nothing — never fabricated.
+  ResponseCacheMetrics response_cache = 18;
+
+  // On-disk log sink health (REQ-A87), added 2026-09-11: the daemon persists its
+  // tracing output to a bounded, self-rotating file when AMOS_LOG_DIR is set
+  // (default ~/.amos/logs). `enabled=false` means stdout only — the counters are
+  // then the honest zeros of a sink that never persisted anything. A non-zero
+  // `lost_bytes`/`write_failures` is how an operator learns the on-disk trail is
+  // *incomplete* instead of assuming it is complete.
+  LogSinkMetrics log_sink = 19;
+
+  // Backend circuit breaker (REQ-A131), added 2026-09-12: while a backend is down,
+  // generations fail fast with a stated reason instead of every caller walking the
+  // full backend timeout. `enabled=false` (AMOS_BREAKER=0) means the decorator is not
+  // in the serving path at all — the counters are then the honest zeros of a breaker
+  // that never made a decision. `state` is "closed" | "open" | "half_open"; a
+  // non-zero `rejections` is how an operator learns calls were *skipped on purpose*
+  // rather than lost. See docs/daemon-resource-gate.md.
+  BreakerMetrics breaker = 20;
+
+  // Threshold alerts derived from the counters above (REQ-A133), added 2026-09-12:
+  // one place that says what is *wrong right now* instead of making an operator read
+  // eight blocks. `alerts` is EMPTY for a healthy daemon — absence means "no rule
+  // fired", never "checked and all good by some other authority". Nothing is
+  // delivered anywhere: this is a report, not a notification channel.
+  Alerts alerts = 21;
+}
+
+// The active alerts at the moment of this reply (amos_ai::alerts). Recomputed on
+// every call, so a recovered condition disappears rather than sticking as a stale
+// alarm. `active_for_seconds` counts from when *this daemon process* first observed
+// the condition — a restart resets it, so it must not be read as "how long the
+// problem has existed".
+message Alerts {
+  repeated Alert alerts = 1;  // ordered: errors first, then by id (stable)
+}
+
+message Alert {
+  string id = 1;                    // breaker_open | engine_degraded | log_trail_incomplete |
+                                    // generations_rejected | power_throttled | dvfs_write_failures
+  string severity = 2;              // warn | error
+  string detail = 3;                // the numbers behind it, e.g. "12 generation(s) were rejected…"
+  uint64 active_for_seconds = 4;    // since this process first saw it (0 on first sight)
+}
+
+// Live state + counters of the backend circuit breaker (amos_ai::breaker). Every
+// number is a decision that actually happened: `openings` counts transitions *into*
+// Open, `rejections` counts calls skipped without touching the backend, and
+// `successes`/`failures` count observed generation outcomes (a completed stream is a
+// success; a start error or a mid-stream error is a failure).
+message BreakerMetrics {
+  bool enabled = 1;             // AMOS_BREAKER != 0 (false => not in the path)
+  string state = 2;             // closed | open | half_open
+  uint32 fail_threshold = 3;    // consecutive failures that open it (AMOS_BREAKER_FAILS)
+  uint64 cooldown_seconds = 4;  // open duration before a probe (AMOS_BREAKER_COOLDOWN_SECS)
+  uint32 consecutive_failures = 5;  // current run while closed
+  uint64 openings = 6;          // transitions into Open
+  uint64 rejections = 7;        // calls skipped (backend untouched)
+  uint64 failures = 8;          // observed generation failures
+  uint64 successes = 9;         // observed completed generations
+}
+
+// Live state + counters of the daemon's bounded on-disk log sink
+// (amos_ai::logfile). `bytes_written` counts what was appended; `lost_bytes`
+// counts what a failed write/rotation could not persist, so the two together say
+// how much of the trail exists and how much went missing.
+message LogSinkMetrics {
+  bool enabled = 1;             // a file sink is open (false => stdout only)
+  string path = 2;              // the active file ("" when disabled)
+  uint64 bytes_written = 3;     // bytes appended since start-up
+  uint64 lost_bytes = 4;        // bytes a failed write could not persist
+  uint64 write_failures = 5;    // failed write/flush/rotation attempts
+  uint64 rotations = 6;         // completed roll-overs (older lines moved to .1…)
+  uint64 active_bytes = 7;      // size of the active file right now
+}
+
+// Live state + monotonic counters of the daemon's generation admission pool
+// (amos_ai::pool::GenerationPool). `in_flight <= capacity` is an invariant, not
+// a hope: the semaphore cannot hand out more permits than it holds.
+message GenerationPoolMetrics {
+  uint32 capacity = 1;            // fixed slots (AMOS_MAX_SESSIONS; never 0)
+  uint32 in_flight = 2;           // slots held right now (<= capacity)
+  uint32 available = 3;           // free slots right now (capacity - in_flight)
+  uint64 acquired_total = 4;      // generations admitted since daemon start
+  uint64 rejected_saturated = 5;  // fail-fast rejections (all slots busy)
+  uint64 rejected_timeout = 6;    // bounded-wait timeouts (AMOS_GEN_POOL_WAIT_MS)
+  uint64 wait_ms = 7;             // configured bounded wait (0 = fail-fast)
+}
+
+// Live state + honest counters of the inference-response cache
+// (amos_ai::cache::ResponseCache). `entries <= capacity`; hits + misses equals
+// the number of lookups performed. Disabled => enabled=false, all counters 0.
+message ResponseCacheMetrics {
+  bool enabled = 1;               // AMOS_RESPONSE_CACHE=1
+  uint32 capacity = 2;            // max entries held (LRU bound)
+  uint64 ttl_seconds = 3;         // entry time-to-live
+  uint32 entries = 4;             // entries held right now
+  uint64 hits = 5;                // lookups served from cache
+  uint64 misses = 6;              // lookups not in cache (incl. expired)
+  uint64 stores = 7;              // completed generations written
+  uint64 evicted = 8;             // entries dropped by the LRU bound
+  uint64 expired = 9;             // entries dropped by TTL
+  uint64 oversized = 10;          // store attempts rejected as too large
 }
 
 // Unified "system working status" folded from amos-monitor (docs/system-monitor.md).

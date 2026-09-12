@@ -6,7 +6,7 @@
  * use to mount a screen by id (the React-free counterpart of apps.tsx COMPONENTS).
  */
 import { describe, expect, test } from "vitest";
-import { svelteAppIds, svelteAppLoader } from "../src/svelte/appRegistry";
+import { SVELTE_APP_LOADERS, svelteAppLoader } from "../src/svelte/appRegistry";
 
 const EXPECTED: string[] = [
   "clock", "settings", "calculator", "weather", "notes", "reminders", "calendar",
@@ -17,7 +17,7 @@ const EXPECTED: string[] = [
 
 describe("svelte/appRegistry.ts", () => {
   test("covers exactly the 27 built-in app ids", () => {
-    expect(svelteAppIds().sort()).toEqual([...EXPECTED].sort());
+    expect(Object.keys(SVELTE_APP_LOADERS).sort()).toEqual([...EXPECTED].sort());
   });
 
   test("every id resolves to a Svelte component module", async () => {

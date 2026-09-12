@@ -32,7 +32,7 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 | `amos-ai` | AI daemon (gRPC server) + CLI args; headless, socket `0700`, graceful shutdown |
 | `amos-wm` | transport-agnostic window-manager state machine (z-order/focus) |
 | `amos-android` | Waydroid / demo runtime + icon extraction + PNG generation |
-| `amos-tauri` | System UI: launcher, 14 apps, notification center, gRPC bridge, Android commands |
+| `amos-tauri` | System UI: launcher, built-in Svelte app screens, notification center, gRPC bridge, Android commands |
 | `amos-translate` | simultaneous-interpretation daemon (gRPC) with pluggable translation + ASR providers |
 | `amos-int` | transport-agnostic interpretation session engine (state machine, utterance assembly, `Pipeline` trait) |
 | `amos-asr` | streaming speech recognition: `StreamingRecognizer` abstraction + `AsrPipeline` (Partial/Final) + gated sherpa-onnx backend |
@@ -55,15 +55,24 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 `amos-ai` serves both services on one UDS; `amos-tauri` uses one cached channel
 for both clients.
 
-## Frontend (React + TypeScript, Vite + Tailwind, run by bun)
+## Frontend (Svelte 5 + TypeScript, Vite + Tailwind, run by bun)
 
-* `frontend-ts/src/App.tsx` — shell: router (home ⇄ apps), lock/recents/spotlight/NC,
-  and hardware-button (Home/Voice/AI) handling.
-* `frontend-ts/src/apps.tsx` — app registry (`APPS`) → per-app React component.
-* `frontend-ts/src/components/` — HomeDock, StatusBar, per-app views, system panels.
+React was removed (`docs/react-removal-plan.md`): the production entry is
+`index.html → src/shell-entry.ts → mount(Shell.svelte)`, and every built-in screen
+is a Svelte 5 (runes) component. There is no React fallback.
+
+* `frontend-ts/src/shell-entry.ts` — boot: hydrate the shared Rust store, apply OS
+  chrome (theme/locale), then mount `Shell.svelte`.
+* `frontend-ts/src/svelte/Shell.svelte` — shell: home ⇄ apps routing (`shellState`),
+  lock/recents/spotlight/NC, and hardware-button (Home/Voice/AI) handling.
+* `frontend-ts/src/svelte/appRegistry.ts` — app registry → per-app Svelte screen
+  (lazy `import()` loaders; the single mount table).
+* `frontend-ts/src/svelte/` — app screens + system panels (StatusBar, HomeDock,
+  IncomingCall, …).
 * `frontend-ts/src/lib/` — typed `amos.*` store + Tauri backend bridges + pure logic.
 * `frontend-ts/src/i18n/` — zh / en dictionaries.
-* `frontend-ts/src/__tests__/` — headless bun test suite.
+* `frontend-ts/src/__tests__/` + `frontend-ts/svelte-tests/` — headless bun suite
+  (pure/DOM) plus Svelte DOM tests.
 
 ## Boot (no-UI Android)
 
@@ -76,7 +85,7 @@ the headless binaries with `scripts/build-android.sh`.
 ```bash
 make lint   # cargo fmt --check + clippy -D warnings
 make test   # cargo test --workspace + bun run test (frontend-ts)
-make check  # React/TS check: bun test + typecheck (frontend-ts)
+make check  # TS/Svelte check: bun test + typecheck + svelte-check (frontend-ts)
 ```
 
 Rust tests include real UDS + gRPC round trips (AI streaming, Android list /

@@ -13,6 +13,7 @@ import {
   bridgeDiag,
   cancelAiSession,
   conversationId,
+  newConversation,
   getAiStatus,
   listSessions,
   clearSessions,
@@ -29,7 +30,6 @@ import {
   invoke,
   launchAndroidApp,
   mailDelete,
-  mailInbox,
   mailList,
   mailMailboxes,
   mailMove,
@@ -55,7 +55,11 @@ import {
   storeUpdatable,
   storeUpgrade,
   subscribe,
+  systemStoreSet,
   systemStoreSnapshot,
+  systemClearContext,
+  systemPeekContext,
+  systemSetContext,
   flashlightSet,
   flashlightStatus,
   radioSet,
@@ -127,6 +131,44 @@ describe("backend bridge", () => {
     const un = await subscribe("ai-token-received", () => {});
     un();
     expect(typeof handlers["ai-token-received"]).toBe("function");
+  });
+
+  test("the session id is a raw store that still mirrors to the Rust store", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    const fake = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
+        calls.push({ cmd, args });
+        return null;
+      },
+      listen: async () => async () => {},
+    };
+    const store = new Map<string, string>();
+    setWindow({
+      __TAURI_INTERNALS__: fake,
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => void store.set(k, v),
+      } as unknown as Storage,
+    });
+
+    const id = conversationId();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    // Stored raw (a plain string, not JSON) — and the durable copy gets the same bytes.
+    expect(store.get("amos.ai.session")).toBe(id);
+    expect(calls).toContainEqual({
+      cmd: "store_set",
+      args: { key: "amos.ai.session", value: id },
+    });
+
+    // Rotating clears it in both places (so the next call generates a fresh id).
+    newConversation();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    expect(store.get("amos.ai.session")).toBe("");
+    expect(calls).toContainEqual({
+      cmd: "store_set",
+      args: { key: "amos.ai.session", value: "" },
+    });
+    expect(conversationId()).not.toBe(id);
   });
 
   test("subscribes through the event plugin when the host has no listen helper", async () => {
@@ -217,18 +259,27 @@ describe("backend bridge", () => {
     const fake = {
       invoke: async (cmd: string, args?: Record<string, unknown>) => {
         calls.push({ cmd, args: args ?? {} });
-        return cmd === "interpret_start" ? "sess-9" : { ok: true };
+        // `interpret_start` answers a **u64** (a JS number) — the earlier fake
+        // returned "sess-9" (a string), which is what let the wrong `string` type
+        // survive; see scripts/tauri-reply-scan.mjs.
+        return cmd === "interpret_start" ? 9 : { ok: true };
       },
       listen: async () => async () => {},
     };
     setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
     const sid = await interpretStart({ source: "auto", target: "zh" });
-    expect(sid).toBe("sess-9");
-    await interpretAudio("sess-9", [1, 2, 3]);
-    await interpretStop("sess-9");
+    expect(sid).toBe(9);
+    await interpretAudio(sid as number, [1, 2, 3]);
+    await interpretStop(sid as number);
     expect(calls.map((c) => c.cmd)).toEqual(["interpret_start", "interpret_audio", "interpret_stop"]);
-    expect(calls[0]!.args.source_lang).toBe("auto");
-    expect(calls[1]!.args.sessionId).toBe("sess-9");
+    // The wire keys are the Rust parameters in lowerCamelCase — `source_lang` was
+    // silently dropped (Option<String> → None → the `auto`/`zh` defaults ran
+    // regardless of the user's pick). See scripts/tauri-args-scan.mjs.
+    expect(calls[0]!.args.sourceLang).toBe("auto");
+    expect(calls[0]!.args.targetLang).toBe("zh");
+    expect(calls[0]!.args.source_lang).toBeUndefined();
+    expect(calls[0]!.args.target_lang).toBeUndefined();
+    expect(calls[1]!.args.sessionId).toBe(9);
     expect(calls[1]!.args.chunk).toEqual([1, 2, 3]);
   });
 
@@ -253,9 +304,9 @@ describe("backend bridge", () => {
     await clearSessions();
     await removeSession("s1");
     await getSessionHistory("s1");
-    await interpretText("s1", "hi");
-    await interpretPause("s1");
-    await interpretResume("s1");
+    await interpretText(7, "hi");
+    await interpretPause(7);
+    await interpretResume(7);
     await ttsSynthesize("你好", "zh");
     await transcribeAudio([0, 1, 2], { language: "zh" });
     await translateText("hi", { sourceLang: "en", targetLang: "zh" });
@@ -303,7 +354,6 @@ describe("backend bridge", () => {
     await mailMailboxes();
     await mailList("INBOX", 10);
     await mailSearch("INBOX", "hello");
-    await mailInbox();
     await mailRead("INBOX", "m1");
     await mailSend({ to: ["a@x.com"], subject: "s", body: "b" });
     await mailSend({ to: ["a@x.com"], subject: "s", body: "b", cc: ["c@x.com"] });
@@ -352,14 +402,15 @@ describe("backend bridge", () => {
     await termRead(1);
     await termKill(1);
     await termResize(1, 120, 24);
+    await systemStoreSet("amos.k", "1");
 
     for (const cmd of [
-      "mail_mailboxes", "mail_list", "mail_search", "mail_inbox", "mail_read",
+      "mail_mailboxes", "mail_list", "mail_search", "mail_read",
       "mail_send", "mail_set_flagged", "mail_set_seen", "mail_delete", "mail_move",
       "appstore_catalog", "appstore_search", "appstore_find", "appstore_installed",
       "appstore_updatable", "appstore_status", "appstore_install", "appstore_upgrade",
       "appstore_uninstall", "appstore_bundle_resource", "appstore_bundle_uri",
-      "store_snapshot", "notes_export_txt",
+      "store_snapshot", "store_set", "notes_export_txt",
       "scheduler_alarm_register", "scheduler_alarm_cancel", "scheduler_alarm_poll",
       "telephony_dial", "real_dial", "telephony_end", "telephony_answer",
       "telephony_simulate_incoming", "telephony_status", "telephony_start_recording",
@@ -369,6 +420,33 @@ describe("backend bridge", () => {
     ]) {
       expect(calls, `expected ${cmd} to be routed`).toContain(cmd);
     }
+  });
+
+  test("system-context wrappers route to set/clear/peek with the window labels", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    const fake = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args: args ?? {} });
+        return cmd === "system_peek_context"
+          ? { source_window: "notes", text: "预算", timestamp_ms: 7 }
+          : null;
+      },
+      listen: async () => async () => {},
+    };
+    setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
+
+    await systemSetContext("ai", "notes", "预算");
+    await systemClearContext("ai");
+    const peeked = await systemPeekContext("ai");
+
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "system_set_context",
+      "system_clear_context",
+      "system_peek_context",
+    ]);
+    expect(calls[0]!.args).toEqual({ targetWindow: "ai", sourceWindow: "notes", text: "预算" });
+    expect(calls[1]!.args).toEqual({ targetWindow: "ai" });
+    expect(peeked).toEqual({ source_window: "notes", text: "预算", timestamp_ms: 7 });
   });
 
   test("assistant voice wrappers route to start/feed/end/stop with correct args", async () => {

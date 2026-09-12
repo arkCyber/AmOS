@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::audit::AuditFile;
+use crate::audit::{audit_max_entries_from, AuditFile};
 
 /// Audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +50,14 @@ impl std::fmt::Display for AuditResult {
 pub struct RateLimitConfig {
     /// Maximum requests per second per client.
     pub requests_per_second: usize,
+    /// Maximum read-only **liveness probes** per second per client.
+    ///
+    /// Deliberately a *separate* bucket: probes and generations must not be able to
+    /// starve each other. With one shared bucket, a generation burst pushed the
+    /// daemon's own health channel (`GetStatus`, the System UI's liveness probe) into
+    /// `ResourceExhausted` — the operator lost sight of a **healthy** daemon exactly
+    /// while it was busy. This lane is bounded too, so probe-driven abuse is capped.
+    pub probe_requests_per_second: usize,
     /// Maximum tokens per hour per client.
     pub tokens_per_hour: usize,
     /// Cleanup interval for stale entries.
@@ -60,9 +68,42 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             requests_per_second: 10,
+            probe_requests_per_second: 50,
             tokens_per_hour: 100_000,
             cleanup_interval_secs: 3600,
         }
+    }
+}
+
+impl RateLimitConfig {
+    /// Overlay the documented env knobs on the defaults.
+    ///
+    /// `AMOS_RATE_LIMIT_RPS` / `AMOS_RATE_LIMIT_TPH` (documented in
+    /// `SECURITY_LAYER_SUMMARY.md` / `PHASE2_COMPLETION_REPORT.md`) used to be
+    /// **write-only**: nothing read them, so an operator tuning the limit saw no
+    /// effect. Pure for the values, so the "garbage/zero is ignored" policy is
+    /// unit-testable without touching the process environment.
+    pub fn from_vars(rps: Option<&str>, tph: Option<&str>) -> Self {
+        fn positive(v: Option<&str>) -> Option<usize> {
+            v.and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+        }
+        let mut cfg = Self::default();
+        if let Some(n) = positive(rps) {
+            cfg.requests_per_second = n;
+        }
+        if let Some(n) = positive(tph) {
+            cfg.tokens_per_hour = n;
+        }
+        cfg
+    }
+
+    /// [`Self::from_vars`] with the values read from the environment.
+    pub fn from_env() -> Self {
+        Self::from_vars(
+            std::env::var("AMOS_RATE_LIMIT_RPS").ok().as_deref(),
+            std::env::var("AMOS_RATE_LIMIT_TPH").ok().as_deref(),
+        )
     }
 }
 
@@ -113,16 +154,20 @@ impl TokenBucket {
 /// Per-client state for the rate limiter.
 #[derive(Debug)]
 struct ClientBuckets {
+    /// Generation/management requests (the "expensive" lane).
     request: TokenBucket,
+    /// Read-only liveness probes (the "watchdog" lane, see `probe_requests_per_second`).
+    probe: TokenBucket,
     tokens: TokenBucket,
     /// Unix timestamp (secs) of the last request/token check from this client.
     last_activity: u64,
 }
 
 impl ClientBuckets {
-    fn new(rps: usize, tokens_per_hour: usize) -> Self {
+    fn new(rps: usize, probe_rps: usize, tokens_per_hour: usize) -> Self {
         Self {
             request: TokenBucket::new(rps, rps),
+            probe: TokenBucket::new(probe_rps, probe_rps),
             tokens: TokenBucket::new(tokens_per_hour, tokens_per_hour / 3600),
             last_activity: current_timestamp(),
         }
@@ -150,7 +195,11 @@ impl RateLimiter {
     pub async fn check_request(&self, client_id: &str) -> Result<()> {
         let mut buckets = self.buckets.write().await;
         let entry = buckets.entry(client_id.to_string()).or_insert_with(|| {
-            ClientBuckets::new(self.config.requests_per_second, self.config.tokens_per_hour)
+            ClientBuckets::new(
+                self.config.requests_per_second,
+                self.config.probe_requests_per_second,
+                self.config.tokens_per_hour,
+            )
         });
         entry.last_activity = current_timestamp();
 
@@ -161,11 +210,39 @@ impl RateLimiter {
         }
     }
 
+    /// Check if a client can make a **read-only liveness probe**.
+    ///
+    /// Uses its own bucket so a generation burst cannot blind the operator's health
+    /// channel (and vice versa). Still bounded, so probing is not free.
+    pub async fn check_probe(&self, client_id: &str) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let entry = buckets.entry(client_id.to_string()).or_insert_with(|| {
+            ClientBuckets::new(
+                self.config.requests_per_second,
+                self.config.probe_requests_per_second,
+                self.config.tokens_per_hour,
+            )
+        });
+        entry.last_activity = current_timestamp();
+
+        if entry.probe.consume(1) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "rate limit exceeded: liveness probes per second"
+            ))
+        }
+    }
+
     /// Check if a client can generate tokens.
     pub async fn check_tokens(&self, client_id: &str, count: usize) -> Result<()> {
         let mut buckets = self.buckets.write().await;
         let entry = buckets.entry(client_id.to_string()).or_insert_with(|| {
-            ClientBuckets::new(self.config.requests_per_second, self.config.tokens_per_hour)
+            ClientBuckets::new(
+                self.config.requests_per_second,
+                self.config.probe_requests_per_second,
+                self.config.tokens_per_hour,
+            )
         });
         entry.last_activity = current_timestamp();
 
@@ -209,7 +286,7 @@ pub struct AuditLogger {
 
 impl Default for AuditLogger {
     fn default() -> Self {
-        Self::new(10_000)
+        Self::new(crate::audit::DEFAULT_AUDIT_MAX_ENTRIES)
     }
 }
 
@@ -223,15 +300,23 @@ impl AuditLogger {
         }
     }
 
+    /// Attach (or replace) the durable sink this logger mirrors every entry to.
+    ///
+    /// Passing the daemon's **shared** trail (`crate::audit::shared_trail_from_env`)
+    /// is what makes the security layer's operations (rate-limit rejections,
+    /// permission denials, probe outcomes) show up in the same `RecentTrail` as
+    /// the privacy decisions — and survive a restart.
+    pub fn attach_sink(&mut self, sink: AuditFile) {
+        self.sink = Some(sink);
+    }
+
     /// Create a durable audit logger that appends to a JSON-lines [`AuditFile`]
     /// at `path` (created if absent) in addition to the in-memory ring.
     pub fn new_persistent(max_entries: usize, path: impl AsRef<std::path::Path>) -> Result<Self> {
         let sink = AuditFile::open(path, max_entries)?;
-        Ok(Self {
-            entries: Arc::new(RwLock::new(Vec::with_capacity(max_entries))),
-            max_entries,
-            sink: Some(sink),
-        })
+        let mut logger = Self::new(max_entries);
+        logger.attach_sink(sink);
+        Ok(logger)
     }
 
     /// The path of the durable sink, if one was configured.
@@ -384,6 +469,31 @@ impl SecurityManager {
         }
     }
 
+    /// Build the manager the **daemon** runs with, honouring the documented knobs
+    /// `AMOS_RATE_LIMIT_RPS` / `AMOS_RATE_LIMIT_TPH` / `AMOS_AUDIT_MAX_ENTRIES`.
+    /// Unset/garbage/zero values fall back to the defaults, so the bounds are never
+    /// silently disabled by a typo.
+    pub fn from_env() -> Self {
+        Self {
+            rate_limiter: RateLimiter::new(RateLimitConfig::from_env()),
+            audit_logger: AuditLogger::new(audit_max_entries_from(
+                std::env::var("AMOS_AUDIT_MAX_ENTRIES").ok().as_deref(),
+            )),
+            permission_manager: PermissionManager::default(),
+        }
+    }
+
+    /// Attach the daemon's durable audit sink (builder).
+    ///
+    /// Passing the **shared** trail (`crate::audit::shared_trail_from_env`) is what
+    /// makes this layer's operations — rate-limit rejections, permission denials,
+    /// liveness-probe outcomes — land in the same trail the privacy manager writes
+    /// to, so `RecentTrail` can read both back and the record survives a restart.
+    pub fn with_audit_sink(mut self, sink: AuditFile) -> Self {
+        self.audit_logger.attach_sink(sink);
+        self
+    }
+
     /// Validate a client request (rate limit + permission check).
     pub async fn validate_request(&self, client_id: &str) -> Result<()> {
         // Check permission first.
@@ -433,6 +543,60 @@ impl SecurityManager {
         }
     }
 
+    /// Validate a **read-only liveness probe** (`GetStatus`) — permission + audit on
+    /// the same terms as [`Self::validate_request`], but metered on the *probe* lane.
+    ///
+    /// Why a separate lane: generation traffic and the health channel must not be able
+    /// to starve one another. Sharing one bucket meant a burst of generations made the
+    /// daemon report "request rejected by security layer" for its own `GetStatus`, so
+    /// the operator (and the System UI) lost sight of a healthy daemon. Probes stay
+    /// audited and bounded, so this is not an exemption from the security layer.
+    pub async fn validate_probe(&self, client_id: &str) -> Result<()> {
+        if !self
+            .permission_manager
+            .check(client_id, Permission::Standard)
+            .await
+        {
+            self.audit_logger
+                .log(
+                    client_id.to_string(),
+                    "probe".to_string(),
+                    "global".to_string(),
+                    AuditResult::Rejected,
+                    "permission denied".to_string(),
+                )
+                .await;
+            return Err(anyhow::anyhow!("permission denied"));
+        }
+
+        match self.rate_limiter.check_probe(client_id).await {
+            Ok(()) => {
+                self.audit_logger
+                    .log(
+                        client_id.to_string(),
+                        "probe".to_string(),
+                        "global".to_string(),
+                        AuditResult::Success,
+                        "liveness probe validated".to_string(),
+                    )
+                    .await;
+                Ok(())
+            }
+            Err(e) => {
+                self.audit_logger
+                    .log(
+                        client_id.to_string(),
+                        "probe".to_string(),
+                        "global".to_string(),
+                        AuditResult::Rejected,
+                        format!("probe rate limit: {}", e),
+                    )
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
     /// Log token consumption and its outcome. Over-quota generation is recorded as
     /// [`AuditResult::Rejected`], never as a success.
     pub async fn log_tokens(&self, client_id: &str, count: usize) {
@@ -468,6 +632,8 @@ impl SecurityManager {
         let idle_secs = self.rate_limiter.config.cleanup_interval_secs.max(1);
         let limiter = self.rate_limiter.clone();
         tokio::spawn(async move {
+            // Runs until the daemon shuts down: no exit here; the task is aborted
+            // with the runtime. `sleep()` is the wait (never a spin).
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(idle_secs)).await;
                 limiter.cleanup_stale(idle_secs).await;
@@ -487,6 +653,44 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_config_reads_documented_env_knobs() {
+        let d = RateLimitConfig::default();
+        // Unset / garbage / zero keep the defaults (a typo must not disable the bound).
+        assert_eq!(
+            RateLimitConfig::from_vars(None, None).requests_per_second,
+            d.requests_per_second
+        );
+        assert_eq!(
+            RateLimitConfig::from_vars(Some("nope"), None).requests_per_second,
+            d.requests_per_second
+        );
+        assert_eq!(
+            RateLimitConfig::from_vars(Some("0"), None).requests_per_second,
+            d.requests_per_second
+        );
+        assert_eq!(
+            RateLimitConfig::from_vars(None, Some("-5")).tokens_per_hour,
+            d.tokens_per_hour
+        );
+        // Valid values are honoured (whitespace tolerated).
+        let cfg = RateLimitConfig::from_vars(Some(" 25 "), Some("5000"));
+        assert_eq!(cfg.requests_per_second, 25);
+        assert_eq!(cfg.tokens_per_hour, 5_000);
+        // Untouched fields keep their tuned defaults.
+        assert_eq!(cfg.probe_requests_per_second, d.probe_requests_per_second);
+        assert_eq!(cfg.cleanup_interval_secs, d.cleanup_interval_secs);
+    }
+
+    #[test]
+    fn audit_max_entries_env_defaults_and_ignores_garbage() {
+        assert_eq!(audit_max_entries_from(None), 10_000);
+        assert_eq!(audit_max_entries_from(Some("")), 10_000);
+        assert_eq!(audit_max_entries_from(Some("junk")), 10_000);
+        assert_eq!(audit_max_entries_from(Some("0")), 10_000);
+        assert_eq!(audit_max_entries_from(Some(" 250 ")), 250);
+    }
 
     #[tokio::test]
     async fn rate_limiter_blocks_excessive_requests() {
@@ -658,5 +862,91 @@ mod tests {
         assert_eq!(rec[0].outcome, crate::audit::Outcome::Success);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_shared_sink_receives_the_security_layers_own_decisions() {
+        // The daemon hands the SAME sink to this layer and the privacy manager. The
+        // point of this test is that the security half really writes into it: a
+        // rejected request must appear in the unified trail (and on disk), not only
+        // in this process's memory ring — otherwise `RecentTrail` could never show
+        // why a request was refused.
+        let sink = AuditFile::memory(16);
+        let sm = SecurityManager::default().with_audit_sink(sink.clone());
+
+        // An ungranted client is refused (deny-by-default) and audited.
+        assert!(sm.validate_request("nobody").await.is_err());
+
+        let recent = sink.recent(4).await;
+        assert_eq!(recent.len(), 1, "the refusal reached the shared trail");
+        assert_eq!(recent[0].principal, "nobody");
+        assert_eq!(recent[0].resource, "global");
+        assert_eq!(recent[0].outcome, crate::audit::Outcome::Rejected);
+
+        // Without a sink the same call is only in memory — the honest no-trail state.
+        let bare = SecurityManager::default();
+        assert!(bare.validate_request("nobody").await.is_err());
+        assert!(bare.audit_logger.durable_path().is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_lane_is_independent_of_the_generation_lane() {
+        // 1 generation-request/sec but 3 probes/sec: a generation burst must not be
+        // able to exhaust the liveness lane, and probes must not eat generation budget.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            requests_per_second: 1,
+            probe_requests_per_second: 3,
+            ..Default::default()
+        });
+
+        assert!(limiter.check_probe("c").await.is_ok());
+        assert!(limiter.check_probe("c").await.is_ok());
+        assert!(limiter.check_probe("c").await.is_ok());
+        // Probe lane is bounded too — not an exemption from the security layer.
+        assert!(limiter.check_probe("c").await.is_err());
+
+        // The generation lane is untouched by the probes above…
+        assert!(limiter.check_request("c").await.is_ok());
+        assert!(limiter.check_request("c").await.is_err());
+
+        // …and a fresh client gets its own, independent probe allowance.
+        assert!(limiter.check_probe("fresh").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_probe_audits_and_keeps_the_health_channel_alive_under_load() {
+        let security = SecurityManager::new(RateLimitConfig {
+            requests_per_second: 1,
+            probe_requests_per_second: 2,
+            ..Default::default()
+        });
+        security
+            .permission_manager
+            .grant("ui".to_string(), Permission::Standard)
+            .await;
+
+        // Saturate the generation lane.
+        assert!(security.validate_request("ui").await.is_ok());
+        assert!(security.validate_request("ui").await.is_err());
+
+        // The health channel still answers, and both outcomes are audited.
+        assert!(security.validate_probe("ui").await.is_ok());
+        assert!(security.validate_probe("ui").await.is_ok());
+        assert!(security.validate_probe("ui").await.is_err());
+
+        let log = security.audit_logger.get_recent(20).await;
+        assert!(
+            log.iter()
+                .any(|e| e.operation == "probe" && e.result == AuditResult::Success),
+            "successful probes must be audited"
+        );
+        assert!(
+            log.iter()
+                .any(|e| e.operation == "probe" && e.result == AuditResult::Rejected),
+            "rejected probes must be audited (no silent drops)"
+        );
+
+        // An unauthorised client cannot probe either.
+        assert!(security.validate_probe("stranger").await.is_err());
     }
 }

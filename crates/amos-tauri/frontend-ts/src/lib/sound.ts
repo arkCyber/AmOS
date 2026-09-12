@@ -1,10 +1,17 @@
 /**
- * Notification sound / vibration policy (the "策略位" behind the quick toggles).
+ * Notification sound / vibration policy (the "策略位" behind the quick toggles) —
+ * the **single owner** of the durable `amos.sound` key.
  *
- * Two persisted policy bits under `amos.sound`: whether audible alerts ("ring")
- * and haptics ("vibrate") are allowed for notifications. Both default ON. Do-Not-
- * Disturb is a higher-level gate: when it is active, both are muted regardless
- * of the persisted bits (see `effectiveAlert`).
+ * Two persisted policy bits: whether audible alerts ("ring") and haptics
+ * ("vibrate") are allowed for notifications. Both default ON. Do-Not-Disturb is a
+ * higher-level gate: when active, both are muted regardless of the persisted bits
+ * (see `effectiveAlert`).
+ *
+ * `normalizeSound` is deliberately **migration-tolerant**: the Settings
+ * 「声音与触感」page once persisted `{notify, haptics}` under this same key, so a
+ * legacy record is read through (`notify → ring`, `haptics → vibrate`) instead of
+ * being silently reset to defaults. There is exactly one schema now; both the
+ * Settings page and the status bar / arrival path go through this module.
  */
 import { readStoreValue, writeStoreValue } from "./amosStore";
 
@@ -19,15 +26,20 @@ export interface SoundPolicy {
   vibrate: boolean;
 }
 
-/** Keep only well-formed policy bits; anything else falls back to ON. */
+/**
+ * Keep only well-formed policy bits; anything else falls back to ON. A legacy
+ * `{notify, haptics}` record (written by the older Settings sound page under the
+ * same key) is read through, so a user's choice survives the schema unification.
+ */
 export function normalizeSound(raw: unknown): SoundPolicy {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ring: true, vibrate: true };
   }
   const o = raw as Record<string, unknown>;
   return {
-    ring: typeof o.ring === "boolean" ? o.ring : true,
-    vibrate: typeof o.vibrate === "boolean" ? o.vibrate : true,
+    ring: typeof o.ring === "boolean" ? o.ring : typeof o.notify === "boolean" ? o.notify : true,
+    vibrate:
+      typeof o.vibrate === "boolean" ? o.vibrate : typeof o.haptics === "boolean" ? o.haptics : true,
   };
 }
 
@@ -36,12 +48,18 @@ export const DEFAULT_SOUND: SoundPolicy = { ring: true, vibrate: true };
 
 /** Load the policy from the (durable) shared store. */
 export function loadSound(): SoundPolicy {
-  return normalizeSound(readStoreValue<unknown>(SOUND_KEY, {}));
+  return normalizeSound(readStoreValue<unknown>(SOUND_KEY, DEFAULT_SOUND));
 }
 
 /** Persist the policy to the (durable) shared store. */
 export function saveSound(policy: SoundPolicy): void {
   writeStoreValue(SOUND_KEY, normalizeSound(policy));
+}
+
+/** Pure: flip one policy bit (immutable) — the Settings page's toggle. */
+export function flipSound(policy: SoundPolicy, key: keyof SoundPolicy): SoundPolicy {
+  const base = normalizeSound(policy);
+  return { ...base, [key]: !base[key] };
 }
 
 /** Effective alerts under DND: DND mutes both ring and vibration. */

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 // NOTE: this file intentionally does NOT register happy-dom, so it is classed as a
-// pure (non-DOM) test and its coverage of reminderNotify's window-free cores counts
-// toward the src/lib pure coverage gate (reminderNotify.test.ts covers the same
+// pure (non-DOM) test and its coverage of reminderCore's window-free cores counts
+// toward the src/lib pure coverage gate (reminderCore.test.ts covers the same
 // functions but registers happy-dom, which the P2-1 pure-batch gate excludes).
 import {
   alertsToNotifs,
@@ -9,9 +9,9 @@ import {
   markFired,
   normalizeFired,
   pruneFired,
-} from "../lib/reminderNotify";
+} from "../lib/reminderCore";
 import { zh } from "../i18n/locales/zh";
-import type { Reminder } from "../lib/reminders";
+import { isOverdueNow, type Reminder } from "../lib/reminders";
 
 const NOW = new Date(2026, 8, 4, 14, 0, 0, 0).getTime();
 const r = (id: string, dueAt?: number, over: Partial<Reminder> = {}): Reminder => ({
@@ -25,7 +25,7 @@ const r = (id: string, dueAt?: number, over: Partial<Reminder> = {}): Reminder =
   ...over,
 });
 
-describe("reminderNotify pure cores (window-free, counted by pure coverage gate)", () => {
+describe("reminderCore pure cores (window-free, counted by pure coverage gate)", () => {
   test("normalizeFired tolerates garbage and keeps only finite timestamps", () => {
     expect(normalizeFired(null)).toEqual({});
     expect(normalizeFired(undefined)).toEqual({});
@@ -57,6 +57,22 @@ describe("reminderNotify pure cores (window-free, counted by pure coverage gate)
     // No cap given → default 40; a large set is sliced.
     const huge = Array.from({ length: 50 }, (_, i) => r(`h${i}`, NOW - i));
     expect(collectDueAlerts(huge, {}, NOW).length).toBe(40);
+  });
+
+  test("the notifier's due rule is the domain's isOverdueNow (single source of truth)", () => {
+    // Guards the dedupe: `collectDueAlerts` used to inline its own copy of
+    // "pending AND due at/before now". If the two ever drift, this fails.
+    const cases = [
+      r("due", NOW - 1),
+      r("exactly-now", NOW),
+      r("future", NOW + 1),
+      r("noDue"),
+      r("done", NOW - 1, { completed: true }),
+    ];
+    for (const c of cases) {
+      const alerted = collectDueAlerts([c], {}, NOW).length > 0;
+      expect(alerted).toBe(isOverdueNow(c, NOW));
+    }
   });
 
   test("markFired records the dueAt for each alerting reminder (immutable)", () => {

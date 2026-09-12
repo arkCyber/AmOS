@@ -71,7 +71,7 @@
 |---|---|---|
 | 标准目录映射（DCIM/Camera…路径） | `canonical_paths_match_the_android_external_layout` | `tests/media_core.rs` |
 | `StandardDir::tag` 稳定、互异（glue wire tag） | `standard_dir_tags_are_stable_wire_tags` | 同上 |
-| `MediaItem` serde 往返 + 构造校验 | `media_item_new_validates_and_round_trips` / `media_item_roundtrips_serde` | 同上 |
+| `MediaItem` serde 往返 + 构造校验 | `media_item_new_validates_and_round_trips` | 同上 |
 | 类型化错误（可显示、可比较） | `errors_are_displayable_and_comparable` | `src/error.rs` |
 | Mock 确定性 + 按集合过滤 + 新→旧 | `seeded_mock_is_deterministic_and_correctly_filtered` | `tests/media_core.rs` |
 | 空集合=空非错 | `empty_collection_lists_empty_not_error` | 同上 |

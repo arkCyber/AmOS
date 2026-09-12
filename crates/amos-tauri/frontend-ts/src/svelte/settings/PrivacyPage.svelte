@@ -3,15 +3,18 @@
   // permission ledger (lib/permissions, durable amos.permissions) to show which
   // apps hold each sensitive capability and let the user revoke them; each revoke
   // also mirrors to the daemon via lib/privacyBackend (best-effort, offline-safe).
-  import {
-    CAPABILITIES,
-    grantedApps,
-    loadLedger,
-    revokeCap,
-    saveLedger,
-  } from "../../lib/permissions";
+  import { CAPABILITIES, grantedApps, loadLedger } from "../../lib/permissions";
   import type { Capability, PermissionLedger } from "../../lib/permissions";
-  import { daemonRevoke } from "../../lib/privacyBackend";
+  import { revokeCapability } from "../osPermissions";
+  import {
+    canonicalPath,
+    mediaAvailableCollections,
+    mediaGrants,
+    mediaProviderName,
+    mediaRevoke,
+    type Grant,
+    type StandardDir,
+  } from "../../lib/media";
   import { isExtId, tileById } from "../../lib/storeApps";
   import { t } from "../locale.svelte";
   import { GROUP, LABEL } from "./kit";
@@ -56,10 +59,43 @@
 
   let ledger = $state<PermissionLedger>(loadLedger());
   const revoke = (app: string, cap: Capability) => {
-    void daemonRevoke(app, cap); // authoritative daemon side (offline no-op)
-    const next = revokeCap(ledger, app, cap);
-    saveLedger(next);
-    ledger = next;
+    // One seam for both sides (local ledger + daemon mirror), same as the other
+    // capability prompts — see `svelte/osPermissions`.
+    ledger = revokeCapability(app, cap);
+  };
+
+  // ---- System media access ------------------------------------------------
+  // The media bridge (crates/amos-tauri/src/media.rs) holds its own grant set for
+  // the standard Android collections. It is *separate* from the app-capability
+  // ledger above, so it gets its own section: what the OS actually lets us read /
+  // write, with a revoke per grant. `null` from a call means "could not read" —
+  // never rendered as "nothing granted".
+  let mediaProvider = $state<string | null>(null);
+  let mediaCollectionList = $state<StandardDir[] | null>(null);
+  let mediaGrantList = $state<Grant[] | null>(null);
+
+  const loadMedia = async () => {
+    const [prov, grants, cols] = await Promise.all([
+      mediaProviderName(),
+      mediaGrants(),
+      mediaAvailableCollections(),
+    ]);
+    mediaProvider = prov;
+    mediaGrantList = grants;
+    mediaCollectionList = cols;
+  };
+  $effect(() => {
+    void loadMedia();
+  });
+
+  /** True when the media bridge answered at all (otherwise: no section, no claims). */
+  const mediaKnown = $derived(
+    mediaProvider !== null || mediaCollectionList !== null || mediaGrantList !== null,
+  );
+
+  const revokeMedia = async (g: Grant) => {
+    await mediaRevoke(g.access, g.collection);
+    await loadMedia(); // reflect the real state again (never assume the revoke took)
   };
 
   const held = $derived(
@@ -96,6 +132,43 @@
         </div>
       </section>
     {/each}
+  {/if}
+  {#if mediaKnown}
+    <section class={GROUP} aria-label={t("settings.mediaAccess")}>
+      <div class="flex items-center justify-between px-4 py-3">
+        <span class={LABEL}>🗂️ {t("settings.mediaAccess")}</span>
+        <span class="text-xs opacity-60">
+          {#if mediaProvider}{t("settings.mediaProvider", { name: mediaProvider })}{/if}
+        </span>
+      </div>
+      <div class="border-t border-black/5 px-4 py-3 dark:border-white/10">
+        {#if mediaGrantList === null}
+          <p class="text-xs opacity-60">{t("settings.mediaUnreadable")}</p>
+        {:else if mediaGrantList.length === 0}
+          <p class="text-xs opacity-60">{t("settings.mediaNone")}</p>
+        {:else}
+          <div class="flex flex-wrap gap-1.5">
+            {#each mediaGrantList as g (g.access + ":" + g.collection)}
+              <button
+                onclick={() => void revokeMedia(g)}
+                title={t("settings.mediaRevoke")}
+                aria-label={`${canonicalPath(g.collection)} ${g.access}`}
+                class="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2.5 py-1 text-xs text-green-600 active:scale-95 dark:text-green-400"
+              >
+                {canonicalPath(g.collection)} · {g.access}
+                <span data-icon="x" class="grid h-3 w-3 place-items-center">{@html iconSvg("x", "h-3 w-3")}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+        <p class="mt-2 text-xs opacity-50">
+          {t("settings.mediaAccessHint")}
+          {#if mediaCollectionList !== null}
+            · {t("settings.mediaCollections", { n: mediaCollectionList.length })}
+          {/if}
+        </p>
+      </div>
+    </section>
   {/if}
   <p class="px-1 text-xs opacity-50">{t("settings.privacyHint")}</p>
 </div>

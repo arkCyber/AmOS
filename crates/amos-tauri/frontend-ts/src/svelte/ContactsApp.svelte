@@ -1,6 +1,6 @@
 <script lang="ts">
-  // ContactsApp.svelte — Svelte 5 (runes) port of the React ContactsApp
-  // (src/components/ContactsApp.tsx). All data logic reuses the pure helpers in
+  // ContactsApp.svelte — Svelte 5 (runes) implementation of the contacts app.
+  // All data logic reuses the pure helpers in
   // lib/contacts.ts; persistence goes through the shared amos.* store; the quick
   // "Frequent / Recent" call chips are derived from the shared call log via
   // createStoreValue (lib/calllog.ts) — never reimplemented.
@@ -8,6 +8,7 @@
     CONTACTS_KEY,
     addContact,
     avatarHue,
+    contactById,
     contactNameFor,
     contactsWithPhone,
     contactsWithPhoneExcept,
@@ -21,7 +22,8 @@
     sortContacts,
   } from "../lib/contacts";
   import type { Contact } from "../lib/contacts";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { bridged, telephonyDial } from "../lib/backend";
   import {
@@ -37,6 +39,7 @@
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
+  import { contactsChannel } from "./appLinks";
 
   /** First visible glyph of a name for the avatar (uppercased), else "?". */
   function contactInitial(name: string): string {
@@ -48,9 +51,17 @@
   // NOTE: $state does NOT lazily invoke a function initializer — compute first.
   const initialContacts = normalizeContacts(readStoreValue<unknown>(CONTACTS_KEY, []));
   let contacts = $state<Contact[]>(initialContacts);
-  const persist = (next: Contact[]) => {
+  // The store refused a write (full/unavailable): say so and keep showing the truth.
+  let storeErr = $state("");
+  const persist = (next: Contact[]): boolean => {
+    // Verified: a rejected write must not be applied (the row would vanish on reload).
+    if (!writeStoreValueChecked(CONTACTS_KEY, next)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     contacts = next;
-    writeStoreValue(CONTACTS_KEY, next);
+    return true;
   };
 
   // ---- composer / search / row-local UI state ----
@@ -82,6 +93,26 @@
   const shown = $derived(searchContacts(sortContacts(contacts), q));
   const groups = $derived(groupContacts(shown));
 
+  // ---- Deep link: Spotlight → one contact -----------------------------------------
+  // Spotlight sets the `contacts` channel and opens this app. This screen has no
+  // single-contact page, so the honest reveal is: clear the filter that would hide the
+  // contact and **mark** its row. The link is consumed (channel cleared) so re-opening
+  // Contacts never re-fires it, and an id that no longer exists is ignored.
+  let spotId = $state<string | null>(null);
+  let linkNonce = 0;
+  $effect(() => {
+    return contactsChannel().subscribe((v) => {
+      if (!v || v.id.trim() === "" || v.nonce === linkNonce) return;
+      linkNonce = v.nonce;
+      const target = contactById(contacts, v.id);
+      if (target) {
+        q = ""; // a filtered list would hide the very contact we were asked to show
+        spotId = target.id;
+      }
+      contactsChannel().set({ id: "", nonce: linkNonce });
+    });
+  });
+
   function submit(): void {
     const ph = phones
       .split(/[,，\n]/)
@@ -102,7 +133,8 @@
       status = t("contacts.required");
       return;
     }
-    persist(next);
+    // The typed name/number stays in the form when the store rejected the save.
+    if (!persist(next)) return;
     editing = null;
     adding = false;
     name = "";
@@ -147,7 +179,13 @@
 
   function recordOutgoing(num: string, name?: string, body?: string): void {
     const next = recordCall(callLog, num, name);
-    callLogStore.save(next); // persists + reloads the reactive store above
+    // The entry may not reach the log — reuse the page's own error line rather than
+    // losing the call silently.
+    if (!callLogStore.save(next)) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     const label = name && name.trim() !== "" ? name.trim() : num;
     const entry: Notif = {
       id: `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
@@ -162,6 +200,7 @@
 </script>
 
 <div class="p-3">
+  <StoreErrorBar message={storeErr} />
   <div class="flex items-center gap-2">
     <input
       bind:value={q}
@@ -242,7 +281,7 @@
             {grp.letter}
           </div>
           {#each grp.items as c (c.id)}
-            <div class="flex items-center gap-3 rounded-2xl bg-white/60 px-3 py-2 ring-1 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10">
+            <div class="flex items-center gap-3 rounded-2xl px-3 py-2 ring-1 transition {spotId === c.id ? 'bg-accent/15 ring-accent dark:bg-accent/20' : 'bg-white/60 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10'}" data-spotlight={spotId === c.id ? "hit" : undefined}>
               <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full text-sm font-bold text-white"
                 style:background-color={`hsl(${avatarHue(c.name)} 55% 55%)`}>
                 {contactInitial(c.name)}

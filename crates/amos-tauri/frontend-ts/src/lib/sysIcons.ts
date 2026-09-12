@@ -63,7 +63,7 @@ const RADIO_TO_ICON: Record<string, SysIconName> = {
   bluetooth: "bluetooth",
 };
 
-/** Map a radio kind from `radioIcons()` to its vector glyph name. */
+/** Map a radio kind from `netStatus.statusIcons()` to its vector glyph name. */
 export function radioIcon(kind: string): SysIconName {
   return RADIO_TO_ICON[kind] ?? "wifi";
 }

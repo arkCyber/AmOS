@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  MSG_KEY,
   MESSAGE_CAP,
   seedMessages,
   appendMessage,
@@ -13,7 +12,6 @@ import {
   messageDayLabel,
   isNewDay,
   unreadCount,
-  markRead,
   markAllRead,
   seedConversations,
   normalizeConversations,
@@ -94,7 +92,7 @@ describe("messages", () => {
     expect(isNewDay(noon - 86400000, noon)).toBe(true);
   });
 
-  test("unread is incoming-only; markRead / markAllRead", () => {
+  test("unread is incoming-only; markAllRead clears them", () => {
     const list = [
       { from: "them" as const, text: "a", ts: 1 }, // unread
       { from: "them" as const, text: "b", ts: 2, read: true },
@@ -102,16 +100,13 @@ describe("messages", () => {
       { from: "me" as const, text: "d", ts: 4 }, // outgoing never unread
     ];
     expect(unreadCount(list)).toBe(2);
-    const one = markRead(list, 0);
-    expect(unreadCount(one)).toBe(1);
     const all = markAllRead(list);
     expect(unreadCount(all)).toBe(0);
+    expect(all.filter((m) => m.from === "them").every((m) => m.read === true)).toBe(true);
     expect(markAllRead(all)).toBe(all); // nothing unread -> no-op (same ref)
-    expect(markRead(list, 99)).toBe(list);
   });
 
   test("constants are sane", () => {
-    expect(MSG_KEY).toBe("amos.messages");
     expect(MESSAGE_CAP).toBeGreaterThan(0);
     expect(MESSAGE_CAP).toBe(200);
   });

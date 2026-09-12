@@ -89,10 +89,33 @@ and any transform glue — reused only by `NoteEditor.svelte`.
 
 ### Audit outcomes folded in (2026-09-09)
 - **Leave never loses work**: `onDestroy` flushes (not cancels) the debouncer, so
-  any close path — not only ‹ back — persists pending keystrokes.
+  any close path — not only ‹ back — persists pending keystrokes. (Boundary: this
+  holds for work the **store accepted** — see Round 54 below for the rejected write.)
 - **No silent save of a removed note**: `commit` first checks the note still
   exists in the store; if not it surfaces an honest error and writes nothing
   (never claims a save it didn't make).
 - Verified: `note-editor.svelte.test.ts` 3, `notes.svelte.test.ts` 12 (15 DOM),
   `tsc` + `svelte-check` 0/0.
+
+### Audit outcomes folded in (Round 54 — a rejected write is not a save)
+
+`commit()` wrote through `writeStoreValue` and then unconditionally claimed
+"保存于 HH:MM:SS" — so with a full/unavailable `localStorage` the editor said the
+draft was saved while the store still held the *old* text (and the draft was gone on
+leaving). The same choke point in the list (`NotesApp.persist`) applied changes the
+store never accepted, and clearing the compose box/`cancelEdit()` over them.
+
+- **Verified writes**: both paths use `writeStoreValueChecked` and act on the answer.
+  A rejected write sets the tested reducer to `save_failed` (`dirty: true`) with an
+  honest message (`note.saveFailed`) — the status line can no longer fall through to
+  "保存于 …", and `lastSaved` is not touched (it stays the last *successful* save).
+- **Nothing is applied on failure**: the list keeps rendering the store's truth, the
+  compose draft stays in the box, and the inline editor stays open with `editVal`
+  instead of closing over edits that were never stored.
+- **The banner is honest and recoverable**: `data-testid="note-store-error"` appears
+  while the store refuses writes and clears on the next successful one.
+- **Boundary**: the Rust `store_set` write-through is still fire-and-forget, so this
+  reports the **local** store's outcome; `back()` still closes (the user is never
+  trapped by a full disk) — the failure is visible *while editing*, not after.
+- Verified: `note-editor.svelte.test.ts` 6, `notes.svelte.test.ts` 40.
 

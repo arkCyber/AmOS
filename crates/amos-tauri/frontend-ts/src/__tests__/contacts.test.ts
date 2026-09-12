@@ -23,7 +23,6 @@ import {
   contactLetter,
   avatarHue,
   groupContacts,
-  upsertContact,
   type Contact,
 } from "../lib/contacts";
 
@@ -98,14 +97,6 @@ describe("contacts: list operations", () => {
     expect(added[0]!.fav).toBe(false);
     expect(list).toHaveLength(2); // immutable
     expect(addContact(list, { name: "  ", phones: ["1"] })).toBe(list);
-  });
-
-  test("upsertContact replaces by id or prepends", () => {
-    const updated = upsertContact(list, { ...a, name: "Alice2", phones: ["999"] });
-    expect(contactById(updated, a.id)?.name).toBe("Alice2");
-    expect(contactById(updated, a.id)?.phones).toEqual(["999"]);
-    const fresh = upsertContact(list, { id: "new", name: "New", phones: ["7"] });
-    expect(contactById(fresh, "new")).toBeDefined();
   });
 
   test("removeContact / setContactFav / editContact", () => {

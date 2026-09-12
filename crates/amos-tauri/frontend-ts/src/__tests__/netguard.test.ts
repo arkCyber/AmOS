@@ -1,9 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  guardLevel,
-  isEnforcing,
-  type NetGuardStatus,
-} from "../lib/netguard";
+import { guardLevel, type NetGuardStatus } from "../lib/netguard";
 
 /** A realistic disarmed/mock host-build status: never `enforced` on the mock. */
 const MOCK_OFF: NetGuardStatus = {
@@ -17,18 +13,15 @@ const MOCK_OFF: NetGuardStatus = {
 describe("network-guard client (pure helpers)", () => {
   test("disarmed mock status is not enforcing", () => {
     expect(guardLevel(MOCK_OFF)).toBe("disarmed");
-    expect(isEnforcing(MOCK_OFF)).toBe(false);
   });
 
   test("null status is offline", () => {
     expect(guardLevel(null)).toBe("offline");
-    expect(isEnforcing(null)).toBe(false);
   });
 
   test("armed intent (mock backend) is honest: not enforced", () => {
     const armedIntent: NetGuardStatus = { ...MOCK_OFF, enabled: true };
     expect(guardLevel(armedIntent)).toBe("armed-intent");
-    expect(isEnforcing(armedIntent)).toBe(false);
   });
 
   test("only a real enforcing backend reports armed-enforced", () => {
@@ -40,7 +33,6 @@ describe("network-guard client (pure helpers)", () => {
       top_egress: [{ domain: "tracker.example", bytes: 900 }],
     };
     expect(guardLevel(enforcing)).toBe("armed-enforced");
-    expect(isEnforcing(enforcing)).toBe(true);
     // status mirror keeps the audit sample intact
     expect(enforcing.top_egress[0]!.bytes).toBe(900);
   });

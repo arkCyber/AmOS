@@ -3,7 +3,8 @@
   // reminders screen. All domain logic reuses pure lib/reminders.ts;
   // data is persisted through the shared amos.* store under amos.reminders /
   // amos.reminderLists, exactly like the retired React screen, so the shell-mounted
-  // OS notifier (lib/reminderNotify.ts) keeps firing on the same markers.
+  // OS notifier (lib/reminderCore.ts, driven by svelte/osReminderWatcher) keeps
+  // firing on the same markers.
   import {
     COLOR_NAMES,
     DEFAULT_LIST_ID,
@@ -20,6 +21,7 @@
     normalizeLists,
     normalizeReminders,
     pendingOf,
+    PRIORITIES,
     removeList,
     removeReminder,
     remindersInSmart,
@@ -34,7 +36,8 @@
     type ReminderList,
     type SmartView,
   } from "../lib/reminders";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
@@ -72,31 +75,46 @@
   }
 
   /* ---- seed / init from the shared store (mirrors React mount read) ---- */
+  /* ---- seed / init from the shared store (mirrors the other apps) ----
+   * Demo content is seeded **only when the key is absent**: deleting every reminder
+   * must not resurrect the demo list on the next mount. The built-in list is still
+   * repaired when it is missing (a reminder with no list would be unreachable) — that
+   * is a repair, not a re-seed. */
   const now0 = Date.now();
-  let initLists = normalizeLists(readStoreValue<unknown>(LISTS_KEY, []));
-  if (!initLists.some((x) => x.id === DEFAULT_LIST_ID)) {
-    initLists = initLists.length
-      ? [seedLists(now0)[0]!, ...initLists]
-      : seedLists(now0);
+  const rawLists = readStoreValue<unknown>(LISTS_KEY, undefined);
+  let initLists = rawLists === undefined ? seedLists(now0) : normalizeLists(rawLists);
+  if (rawLists === undefined) {
+    writeStoreValue(LISTS_KEY, initLists);
+  } else if (!initLists.some((x) => x.id === DEFAULT_LIST_ID)) {
+    initLists = [seedLists(now0)[0]!, ...initLists];
     writeStoreValue(LISTS_KEY, initLists);
   }
-  let initRem = normalizeReminders(readStoreValue<unknown>(REMINDERS_KEY, []));
-  if (!initRem.length) {
-    initRem = seedReminders(now0);
-    writeStoreValue(REMINDERS_KEY, initRem);
-  }
+  const rawRem = readStoreValue<unknown>(REMINDERS_KEY, undefined);
+  let initRem = rawRem === undefined ? seedReminders(now0) : normalizeReminders(rawRem);
+  if (rawRem === undefined) writeStoreValue(REMINDERS_KEY, initRem);
   let lists = $state<ReminderList[]>(initLists);
   let reminders = $state<Reminder[]>(initRem);
 
-  const persistLists = (l: ReminderList[]) => {
+  let storeErr = $state("");
+  const persistLists = (l: ReminderList[]): boolean => {
     const c = normalizeLists(l);
-    writeStoreValue(LISTS_KEY, c);
+    if (!writeStoreValueChecked(LISTS_KEY, c)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     lists = c;
+    return true;
   };
-  const persistReminders = (l: Reminder[]) => {
+  const persistReminders = (l: Reminder[]): boolean => {
     const c = normalizeReminders(l);
-    writeStoreValue(REMINDERS_KEY, c);
+    if (!writeStoreValueChecked(REMINDERS_KEY, c)) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
     reminders = c;
+    return true;
   };
 
   /* ---- overdue refresh tick ---- */
@@ -184,8 +202,11 @@
         : { dueAt, allDay: draft.allDay }),
     };
     const n = Date.now();
-    if (editId) persistReminders(updateReminder(reminders, editId, next));
-    else persistReminders(addReminder(reminders, next, n));
+    // A rejected write keeps the form open with the draft (nothing is discarded).
+    const ok = editId
+      ? persistReminders(updateReminder(reminders, editId, next))
+      : persistReminders(addReminder(reminders, next, n));
+    if (!ok) return;
     closeForm();
   };
 
@@ -196,7 +217,7 @@
   const snooze = () => {
     if (!editId) return;
     const later = Date.now() + 3_600_000;
-    persistReminders(updateReminder(reminders, editId, { dueAt: later, allDay: false }));
+    if (!persistReminders(updateReminder(reminders, editId, { dueAt: later, allDay: false }))) return;
     closeForm();
   };
 
@@ -206,7 +227,8 @@
   let newListColor = $state<ColorName>("blue");
   const createList = () => {
     if (!newListName.trim()) return;
-    persistLists(addList(lists, { name: newListName, color: newListColor }, Date.now()));
+    // Keep the typed list name if the store rejected it.
+    if (!persistLists(addList(lists, { name: newListName, color: newListColor }, Date.now()))) return;
     newListName = "";
     newListOpen = false;
   };
@@ -308,6 +330,7 @@
 </script>
 
 <div class="flex h-full flex-col">
+  <StoreErrorBar message={storeErr} />
   <!-- list chips -->
   <div class="flex shrink-0 gap-1.5 overflow-x-auto px-3 py-2">
     {#each SMART_VIEWS as v (v)}
@@ -659,16 +682,16 @@
                 <div class="flex items-center justify-between gap-2">
                   <span class="shrink-0 text-xs opacity-60">{t("reminder.priority")}</span>
                   <div class="flex flex-wrap justify-end gap-1">
-                    {#each PRIORITY_LABELS as k, p (k)}
+                    {#each PRIORITIES as p (p)}
                       <button
-                        onclick={() => (draft.priority = p as Priority)}
+                        onclick={() => (draft.priority = p)}
                         aria-pressed={draft.priority === p}
                         class={"rounded-full px-2 py-0.5 text-[10px] " +
                           (draft.priority === p
                             ? "bg-accent text-white"
                             : "bg-neutral-200 dark:bg-neutral-700")}
                       >
-                        {t(k)}
+                        {t(PRIORITY_LABELS[p])}
                       </button>
                     {/each}
                   </div>

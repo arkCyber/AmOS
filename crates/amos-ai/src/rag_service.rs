@@ -280,9 +280,35 @@ pub fn server(svc: RagSvc) -> RagServer<RagSvc> {
     RagServer::new(svc)
 }
 
-/// Map a domain error onto a tonic internal status (never a crash).
+/// Map a vector-db domain error onto a gRPC status (CODE_AUDIT_REPORT
+/// §「需要改进的部分」 → 「添加更详细的 gRPC 错误响应」; the other services already do
+/// this — `privacy_service` uses `InvalidArgument`, `netguard` `PermissionDenied`).
+///
+/// Policy — the same one the rest of the daemon follows:
+///  - the **caller's** input being unusable ⇒ `InvalidArgument` (sending the same
+///    request again cannot help);
+///  - a **backend seam** failing (the embedder) ⇒ `Unavailable` (it may come back —
+///    the same class of failure the circuit breaker guards);
+///  - **our own** stored state being wrong (I/O, a corrupt snapshot) ⇒ `Internal`.
+///
+/// Before this, every variant was `Internal`, so a client could not tell "you sent a
+/// 3-element vector to a 384-d index" from "the embedder is down" — the first is its
+/// bug, the second is ours.
 fn rag_status(e: VectorDbError) -> Status {
-    Status::internal(e.to_string())
+    match &e {
+        VectorDbError::DimMismatch { expected, got } => Status::invalid_argument(format!(
+            "vector dimension mismatch: index expects {expected}, got {got}"
+        )),
+        VectorDbError::ZeroDimension => {
+            Status::invalid_argument("vector dimension must be greater than zero")
+        }
+        VectorDbError::Invalid(msg) => Status::invalid_argument(msg.clone()),
+        VectorDbError::Embed(msg) => {
+            Status::unavailable(format!("embedder backend unavailable: {msg}"))
+        }
+        // I/O and corruption are our state, not the caller's mistake.
+        VectorDbError::Io(_) | VectorDbError::Corrupt(_) => Status::internal(e.to_string()),
+    }
 }
 
 /// Map a blocking-worker join error onto a tonic status.
@@ -341,13 +367,43 @@ fn label_from_env() -> &'static str {
     }
 }
 
-/// Load the persisted passage map — empty on missing / corrupt (never a crash).
-fn load_passages(path: &Path) -> BTreeMap<String, String> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<PassagesFile>(&bytes).ok())
+/// Parse a persisted passage map. A payload that cannot be parsed is an **error**: "this
+/// daemon has no passages file" and "its passages file is corrupt" are different states, and
+/// only one of them means a re-index is needed (REQ-A148).
+fn passages_from(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    serde_json::from_slice::<PassagesFile>(bytes)
         .map(|f| f.passages)
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())
+}
+
+/// Load the persisted passage map — empty on missing / unreadable / corrupt (never a crash),
+/// but an unreadable-or-corrupt file is **reported**: silently serving no passages looks
+/// identical to an empty index, so a broken snapshot would otherwise be invisible.
+fn load_passages(path: &Path) -> BTreeMap<String, String> {
+    match std::fs::read(path) {
+        // The normal "nothing indexed yet" case: no file, nothing to say.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "rag passages file could not be read; serving no passages"
+            );
+            BTreeMap::new()
+        }
+        Ok(bytes) => match passages_from(&bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "rag passages file is corrupt; serving no passages \
+                     (this is not the same as an empty index — re-index to repair it)"
+                );
+                BTreeMap::new()
+            }
+        },
+    }
 }
 
 /// Versioned on-disk form of the passage map.
@@ -385,6 +441,59 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The audit item was "更详细的 gRPC 错误响应": each domain variant must land on
+    /// the code that says *whose* problem it is.
+    #[test]
+    fn domain_errors_map_to_codes_that_name_the_guilty_party() {
+        // Caller's fault ⇒ InvalidArgument, and the numbers survive.
+        let dim = rag_status(VectorDbError::DimMismatch {
+            expected: 384,
+            got: 3,
+        });
+        assert_eq!(dim.code(), tonic::Code::InvalidArgument);
+        assert!(dim.message().contains("384"), "{}", dim.message());
+        assert!(dim.message().contains("3"), "{}", dim.message());
+
+        assert_eq!(
+            rag_status(VectorDbError::ZeroDimension).code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            rag_status(VectorDbError::Invalid("id must not be empty".into())).code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            rag_status(VectorDbError::Invalid("bad".into())).message(),
+            "bad"
+        );
+
+        // Backend seam ⇒ Unavailable (it may come back; this is our problem, not the
+        // caller's — retrying later is the right move).
+        let embed = rag_status(VectorDbError::Embed("connection refused".into()));
+        assert_eq!(embed.code(), tonic::Code::Unavailable);
+        assert!(embed.message().contains("connection refused"));
+
+        // Our stored state ⇒ Internal, keeping the original detail.
+        let io = rag_status(VectorDbError::Io(std::io::Error::other("disk gone")));
+        assert_eq!(io.code(), tonic::Code::Internal);
+        assert!(io.message().contains("disk gone"), "{}", io.message());
+        let corrupt = rag_status(VectorDbError::Corrupt("bad snapshot".into()));
+        assert_eq!(corrupt.code(), tonic::Code::Internal);
+        assert!(corrupt.message().contains("bad snapshot"));
+    }
+
+    /// A worker that panicked is **not** the caller's fault — it must not be reported
+    /// as InvalidArgument.
+    #[tokio::test]
+    async fn a_dead_worker_is_reported_as_internal_never_invalid_argument() {
+        let joined = tokio::spawn(async { panic!("worker exploded") })
+            .await
+            .expect_err("the worker panicked");
+        let st = join_status(joined);
+        assert_eq!(st.code(), tonic::Code::Internal);
+        assert!(st.message().contains("rag worker join"), "{}", st.message());
+    }
 
     #[tokio::test]
     async fn index_reports_dimension_and_status_label() {
@@ -555,6 +664,17 @@ mod tests {
         // Corrupt file → empty (never a crash) — an index can start fresh.
         std::fs::write(&path, "{ not json").unwrap();
         assert!(load_passages(&path).is_empty());
+        // …but "corrupt" must stay **distinguishable** from "missing", so the daemon can
+        // report it instead of silently serving an empty index (REQ-A148): the parser is
+        // the piece that says Err, and `load_passages` is what logs it.
+        let err = passages_from(b"{ not json").expect_err("a corrupt payload is an error");
+        assert!(
+            !err.is_empty(),
+            "the parse error must explain itself: {err}"
+        );
+        let ok = passages_from(br#"{"version":1,"passages":{"note:a":"text"}}"#)
+            .expect("a valid payload parses");
+        assert_eq!(ok.get("note:a").map(String::as_str), Some("text"));
 
         let _ = std::fs::remove_file(&path);
     }

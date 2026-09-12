@@ -26,6 +26,31 @@ afterEach(() => {
 });
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 const btnAria = (h: { container: HTMLElement }, aria: string) =>
   [...h.container.querySelectorAll("button")].find(
     (b) => b.getAttribute("aria-label") === aria,
@@ -94,6 +119,21 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     const stored = JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]") as unknown[];
     expect(stored.length).toBe(1);
     expect(txt(host)).toContain("已保存到相册"); // camera.saved
+  });
+
+  test("a rejected photo write is reported, never claimed as \"已保存到相册\"", async () => {
+    const restore = failWritesFor(PHOTOS_KEY);
+    try {
+      const host = await renderLive();
+      await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+      await settle();
+      // The photo is not in the album, so the UI must not say it is.
+      expect(txt(host)).toContain("写入失败"); // camera.saveFailed
+      expect(txt(host)).not.toContain("已保存到相册");
+      expect(JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]").length).toBe(0);
+    } finally {
+      restore();
+    }
   });
 
   test("grid toggle overlays the rule-of-thirds lines (live)", async () => {

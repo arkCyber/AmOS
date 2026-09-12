@@ -10,9 +10,15 @@
 //!
 //! Usage:
 //!   cargo run -p amos-ai --example rag_once -- /data/local/tmp/amos-ai.sock
+//!   cargo run -p amos-ai --example rag_once -- http://127.0.0.1:19090
+//!
+//! Over TCP, set `AMOS_TCP_TOKEN` to the same value the daemon was started with; the
+//! token is attached to every request as `x-amos-token` (the daemon refuses requests
+//! without it when it was configured with one). See `docs/vector-db-rag.md`.
 
 use std::path::PathBuf;
 
+use amos_ai::tcp_auth::TOKEN_HEADER;
 use amos_proto::ai_agent::rag_client::RagClient;
 use amos_proto::ai_agent::{RagIndexRequest, RagQueryRequest, RagRemoveRequest, RagStatusRequest};
 use anyhow::{anyhow, Result};
@@ -20,6 +26,19 @@ use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
+
+/// Attach the shared secret when one is configured (`AMOS_TCP_TOKEN`). Absent/empty ⇒
+/// the request goes out unchanged, which the daemon only accepts in its open policy.
+fn with_token<T>(mut req: tonic::Request<T>) -> tonic::Request<T> {
+    if let Ok(tok) = std::env::var("AMOS_TCP_TOKEN") {
+        if !tok.trim().is_empty() {
+            if let Ok(v) = tok.parse() {
+                req.metadata_mut().insert(TOKEN_HEADER, v);
+            }
+        }
+    }
+    req
+}
 
 async fn uds_channel(socket: PathBuf) -> Result<tonic::transport::Channel> {
     let endpoint = Endpoint::try_from("http://[::1]:50051").map_err(|e| anyhow!(e.to_string()))?;
@@ -55,7 +74,10 @@ async fn main() -> Result<()> {
     };
     let mut rag = rag;
 
-    let before = rag.status(RagStatusRequest {}).await?.into_inner();
+    let before = rag
+        .status(with_token(tonic::Request::new(RagStatusRequest {})))
+        .await?
+        .into_inner();
     println!(
         "before: indexed={} dim={} embedder={}",
         before.indexed, before.dimension, before.embedder
@@ -63,19 +85,19 @@ async fn main() -> Result<()> {
 
     let text = "设备真机离线检索的独份预算正文".to_string();
     let idx = rag
-        .index(RagIndexRequest {
+        .index(with_token(tonic::Request::new(RagIndexRequest {
             id: "note:a".into(),
             text: text.clone(),
-        })
+        })))
         .await?
         .into_inner();
     println!("indexed note:a dim={}", idx.dimension);
 
     let q = rag
-        .query(RagQueryRequest {
+        .query(with_token(tonic::Request::new(RagQueryRequest {
             query: text,
             top_k: 3,
-        })
+        })))
         .await?
         .into_inner();
     println!("query hits={}", q.hits.len());
@@ -92,14 +114,17 @@ async fn main() -> Result<()> {
     }
 
     let removed = rag
-        .remove(RagRemoveRequest {
+        .remove(with_token(tonic::Request::new(RagRemoveRequest {
             id: "note:a".into(),
-        })
+        })))
         .await?
         .into_inner();
     println!("remove note:a removed={}", removed.removed);
 
-    let after = rag.status(RagStatusRequest {}).await?.into_inner();
+    let after = rag
+        .status(with_token(tonic::Request::new(RagStatusRequest {})))
+        .await?
+        .into_inner();
     println!(
         "after: indexed={} dim={} embedder={}",
         after.indexed, after.dimension, after.embedder

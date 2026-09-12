@@ -1,8 +1,10 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
+  capForWire,
   daemonAuthorize,
   daemonGrant,
+  daemonGrantsAll,
   daemonRecentAudit,
   daemonResource,
   daemonRevoke,
@@ -76,6 +78,30 @@ describe("privacyBackend (daemon OS-permission bridge)", () => {
       { cmd: "perm_grant", args: { appId: "com.x", resource: "storage" } },
       { cmd: "perm_revoke", args: { appId: "com.x", resource: "storage" } },
     ]);
+  });
+
+  test("capForWire is the inverse of daemonResource; an unknown key is null", () => {
+    // Round-trip: every wire key daemonResource produces maps back to its capability.
+    for (const cap of ALL) {
+      const wire = daemonResource(cap);
+      if (wire) expect(capForWire(wire)).toBe(cap);
+    }
+    // notifications is local-only, so it has no wire key at all.
+    expect(capForWire("notifications")).toBeNull();
+    // A resource the UI does not know yet must never be labelled as a capability.
+    expect(capForWire("nfc")).toBeNull();
+    expect(capForWire("")).toBeNull();
+  });
+
+  test("daemonGrantsAll is null offline and reads the authority online", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
+    expect(await daemonGrantsAll()).toBeNull();
+
+    // `GrantRow` serializes with its snake_case field name `app_id`.
+    const rows = [{ app_id: "com.other", resources: ["camera", "storage"] }];
+    installBridge({ perm_grants_all: rows });
+    expect(await daemonGrantsAll()).toEqual(rows);
+    expect(calls).toContainEqual({ cmd: "perm_grants_all", args: {} });
   });
 
   test("toAuditViews maps raw daemon records to display views (order preserved)", () => {

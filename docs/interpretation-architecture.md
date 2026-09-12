@@ -185,6 +185,10 @@ cargo build -p amos-asr --features sherpa    # 下载并链接 sherpa-onnx 预�
 - ✅ **Tauri 桥接**（`crates/amos-tauri/src/interpret.rs`）：`interpret_*` 命令
   （start/text/audio/end_of_speech/pause/resume/stop/abort/status）+ `interpret-output`
   事件；前端 `window.AmosInterp` 封装 + main.js 监听。System UI 可开同传会话。
+  *参数名*：按 Tauri 约定走 **lowerCamelCase**（`interpretStart` 发 `sourceLang`/
+  `targetLang`）；`source_lang`/`target_lang` 曾因两参数都是 `Option<String>` 被
+  **静默当 `None`**——用户在 `InterpApp` 选的语种从不生效，解释器一直跑 `auto → zh`
+  默认值（REQ-A107，门 `scripts/tauri-args-scan.mjs`）。
 
 ### 阶段 2：真 ASR（流式，2–3 周）
 - ✅ **`amos-asr`**（`crates/amos-asr`）：流式识别框架。

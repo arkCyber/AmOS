@@ -19,9 +19,36 @@ let playCtx: AudioContext | null = null;
 /** The most recently started BufferSource. When a newer final segment arrives we
  * stop the previous one so read-aloud never overlaps (latest utterance wins). */
 let activeSrc: { stop: () => void } | null = null;
+
+/**
+ * Stop any in-flight read-aloud and **release** the playback context.
+ *
+ * Called when the interpreter screen goes away: merely dropping the reference
+ * leaves the `AudioContext` running, so the audio session stayed held by a screen
+ * the user had already left. Closing it is best-effort (already-closed / no
+ * `close` in a test double → ignored). Idempotent, never throws.
+ */
 export function resetPlayCtx(): void {
-  playCtx = null;
+  const src = activeSrc;
   activeSrc = null;
+  if (src) {
+    try {
+      src.stop();
+    } catch {
+      /* already stopped */
+    }
+  }
+  const ctx = playCtx;
+  playCtx = null;
+  if (ctx) {
+    try {
+      void ctx.close()?.catch?.(() => {
+        /* already closed */
+      });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /** Play a synthesized PCM payload out of the speakers. No-op when unavailable. */

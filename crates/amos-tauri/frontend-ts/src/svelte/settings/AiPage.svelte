@@ -8,39 +8,138 @@
   import {
     cloudDefaultEndpoint,
     cloudDefaultModel,
+    envFor,
+    isCloudProvider,
     readAiConfig,
     setAiConfig,
     type AiConfig,
     type AiProviderId,
   } from "../../lib/providers";
-  import { describeEngine, type EngineView } from "../../lib/aiEngine";
+  import { describeEngine, isRealEngine, type EngineView } from "../../lib/aiEngine";
   import { bridged, getAiStatus, switchAiBackend } from "../../lib/backend";
+  import {
+    clearDiag,
+    diagStats,
+    recentDiag,
+    setDiagMinLevel,
+    subscribeDiag,
+    type DiagEntry,
+    type DiagLevel,
+  } from "../../lib/debugLog";
   import { t } from "../locale.svelte";
   import { GROUP, LABEL, FIELD } from "./kit";
+
+  /**
+   * Localized circuit-breaker state (REQ-A131). An unknown/empty state is reported
+   * as-is rather than mapped to a friendly default: a label we cannot translate must
+   * not be silently replaced by "closed", which would hide that the backend is being
+   * skipped.
+   */
+  const breakerStateLabel = (state: string): string => {
+    if (state === "closed") return t("settings.aiBreakerClosed");
+    if (state === "open") return t("settings.aiBreakerOpen");
+    if (state === "half_open") return t("settings.aiBreakerHalfOpen");
+    return state;
+  };
+
+  /**
+   * Localized name of an alert rule (REQ-A133). Unknown ids are shown verbatim: a rule
+   * we cannot name must not be hidden behind a generic "problem" label (the daemon's
+   * `detail` still carries the numbers).
+   */
+  const alertRuleLabel = (id: string): string => {
+    if (id === "breaker_open") return t("settings.alertBreakerOpen");
+    if (id === "engine_degraded") return t("settings.alertEngineDegraded");
+    if (id === "log_trail_incomplete") return t("settings.alertLogTrailIncomplete");
+    if (id === "generations_rejected") return t("settings.alertGenerationsRejected");
+    if (id === "power_throttled") return t("settings.alertPowerThrottled");
+    if (id === "dvfs_write_failures") return t("settings.alertDvfsWriteFailures");
+    return id;
+  };
 
   const initialCfg = readAiConfig(readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {}));
   let aiEdits = $state({
     provider: initialCfg.provider as AiProviderId,
     model:
       initialCfg.model ??
-      (initialCfg.provider !== "local" ? cloudDefaultModel(initialCfg.provider) : ""),
+      (isCloudProvider(initialCfg.provider) ? cloudDefaultModel(initialCfg.provider) : ""),
     endpoint:
       initialCfg.endpoint ??
-      (initialCfg.provider !== "local" ? cloudDefaultEndpoint(initialCfg.provider) : ""),
+      (isCloudProvider(initialCfg.provider) ? cloudDefaultEndpoint(initialCfg.provider) : ""),
     apiKey: initialCfg.apiKey ?? "",
   });
   let aiMsg = $state("");
   let aiLive = $state<string | null>(null);
   let aiView = $state<EngineView>(describeEngine(null));
-  const isCloud = $derived(aiEdits.provider !== "local");
 
+  // ---- Client-side diagnostics ledger (audit P1-3) -------------------------------
+  // The shell's failures (failed bridge calls, corrupt stores, rejected rules) are
+  // recorded in lib/debugLog's bounded ring instead of vanishing into logcat. This
+  // block shows the most recent ones *together with what the ring dropped*, so a
+  // short list can never be mistaken for "nothing else happened".
+  let diagEntries = $state<DiagEntry[]>(recentDiag(5));
+  let diagInfo = $state(diagStats());
+  const refreshDiag = () => {
+    diagEntries = recentDiag(5);
+    diagInfo = diagStats();
+  };
+  $effect(() => subscribeDiag(refreshDiag));
+  const onClearDiag = () => {
+    clearDiag();
+    refreshDiag();
+  };
+  const isCloud = $derived(isCloudProvider(aiEdits.provider));
+
+  // The env the daemon must be (re)started with for the SELECTED provider.
+  // `lib/providers.envFor` is the single owner of that mapping — the launcher
+  // (`scripts/ai-backend.sh`) uses it too — so showing it here cannot drift from
+  // what actually applies. The API key is shown as a presence marker, never the
+  // secret itself.
+  const aiEnv = $derived.by(() => {
+    const env = envFor({
+      provider: aiEdits.provider,
+      model: aiEdits.model || undefined,
+      endpoint: aiEdits.endpoint || undefined,
+      apiKey: aiEdits.apiKey || undefined,
+    });
+    return Object.entries(env).map(
+      ([k, v]) => [k, k === "AMOS_API_KEY" ? "••••" : v] as const,
+    );
+  });
+
+  // Client-side periodic probe (gap-analysis #33): the daemon heartbeats *itself*,
+  // but nobody was asking it on a schedule — this page read the engine once and kept
+  // a stale snapshot forever. While the page is open we re-read `ai_status` every
+  // 10 s, so a daemon that died, degraded or swapped engines shows up here; a hidden
+  // tab stops asking (never a background poll).
+  const AI_PROBE_MS = 10_000;
+  let lastProbe = $state(0);
   $effect(() => {
     if (!bridged()) return;
-    getAiStatus().then((s) => {
+    let alive = true;
+    const probe = async () => {
+      const s = await getAiStatus();
+      if (!alive) return;
       const m = s?.model && s.model.trim() ? s.model : "offline";
       aiLive = m;
       aiView = describeEngine(s);
-    });
+      lastProbe = Date.now();
+    };
+    void probe();
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") void probe();
+    }, AI_PROBE_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  });
+  /** Local wall-clock of the last successful probe ("" before the first one). */
+  const probeStamp = $derived.by(() => {
+    if (!lastProbe) return "";
+    const d = new Date(lastProbe);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   });
   const pickProvider = (p: AiProviderId) => {
     // A key is per-provider and lives only in transient UI state (never in
@@ -153,9 +252,14 @@
     <p role="status" class="mt-2 text-[11px] text-accent">{aiMsg}</p>
   {/if}
   <p class="mt-1 text-[11px] opacity-60">{t("settings.aiCurrent", { model: aiLive ?? "—" })}</p>
+  {#if probeStamp}
+    <p data-testid="ai-probe" class="mt-0.5 text-[11px] opacity-40">
+      {t("settings.aiProbe", { time: probeStamp })}
+    </p>
+  {/if}
   {#if aiView.engine}
-    <p class="mt-0.5 text-[11px] opacity-70">
-      {aiView.engine === "mock"
+    <p class="mt-0.5 text-[11px] opacity-70" data-testid="ai-engine-line">
+      {!isRealEngine(aiView)
         ? t("settings.aiMockEngine")
         : t("settings.aiRealEngine", { engine: aiView.engine, model: aiView.engine_model || aiView.engine })}
     </p>
@@ -179,4 +283,136 @@
       <span class="ml-2">{t("settings.aiProfileTokens", { v: String(aiView.profile.decode_tokens_total) })}</span>
     </div>
   {/if}
+  {#if aiView.pool}
+    <div class="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+      <span class="font-medium opacity-70">{t("settings.aiGate")}</span>
+      <span class="ml-2">{t("settings.aiGateSlots", { busy: String(aiView.pool.in_flight), total: String(aiView.pool.capacity) })}</span>
+      {#if aiView.pool.rejected_saturated + aiView.pool.rejected_timeout > 0}
+        <span class="ml-2 text-amber-700 dark:text-amber-300">
+          {t("settings.aiGateRejected", { n: String(aiView.pool.rejected_saturated + aiView.pool.rejected_timeout) })}
+        </span>
+      {/if}
+    </div>
+  {/if}
+  {#if aiView.cache}
+    <div class="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+      <span class="font-medium opacity-70">{t("settings.aiCache")}</span>
+      {#if aiView.cache.enabled}
+        <span class="ml-2">{t("settings.aiCacheStats", { hits: String(aiView.cache.hits), misses: String(aiView.cache.misses) })}</span>
+      {:else}
+        <span class="ml-2 opacity-70">{t("settings.aiCacheOff")}</span>
+      {/if}
+    </div>
+  {/if}
+  {#if aiView.breaker}
+    <div class="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+      <span class="font-medium opacity-70">{t("settings.aiBreaker")}</span>
+      {#if aiView.breaker.enabled}
+        <span
+          class="ml-2"
+          class:text-amber-700={aiView.breaker.state !== "closed"}
+          class:dark:text-amber-300={aiView.breaker.state !== "closed"}
+          data-testid="ai-breaker-state"
+        >{breakerStateLabel(aiView.breaker.state)}</span>
+        {#if aiView.breaker.rejections > 0}
+          <!-- Calls were *skipped on purpose* while the backend was down: say so,
+               instead of letting a short list look like nothing happened. -->
+          <span class="ml-2 text-amber-700 dark:text-amber-300" data-testid="ai-breaker-skipped">
+            {t("settings.aiBreakerSkipped", { n: String(aiView.breaker.rejections) })}
+          </span>
+        {/if}
+      {:else}
+        <span class="ml-2 opacity-70" data-testid="ai-breaker-state">{t("settings.aiBreakerOff")}</span>
+      {/if}
+    </div>
+  {/if}
+  {#if aiView.alerts && aiView.alerts.length > 0}
+    <div class="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+      <span class="font-medium opacity-70">{t("settings.aiAlerts")}</span>
+      <ul data-testid="ai-alerts" class="mt-1 space-y-1">
+        {#each aiView.alerts as a (a.id)}
+          <li data-testid={`ai-alert-${a.id}`} class={a.severity === "error" ? "text-red-700 dark:text-red-300" : "text-amber-700 dark:text-amber-300"}>
+            <span class="font-medium">{alertRuleLabel(a.id)}</span>
+            <span class="opacity-80"> — {a.detail}</span>
+            <span class="opacity-60">（{t("settings.aiAlertActiveFor", { n: String(a.active_for_seconds) })}）</span>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
+  {#if aiView.logSink}
+    <div class="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+      <span class="font-medium opacity-70">{t("settings.aiLogSink")}</span>
+      {#if aiView.logSink.enabled}
+        <span class="ml-2" data-testid="ai-log-sink">{t("settings.aiLogSinkBytes", { n: String(aiView.logSink.bytes_written) })}</span>
+        {#if aiView.logSink.lost_bytes > 0 || aiView.logSink.write_failures > 0}
+          <!-- The trail is incomplete: say so instead of implying the log is intact. -->
+          <span class="ml-2 text-amber-700 dark:text-amber-300" data-testid="ai-log-sink-loss">
+            {t("settings.aiLogSinkLoss", {
+              lost: String(aiView.logSink.lost_bytes),
+              fails: String(aiView.logSink.write_failures),
+            })}
+          </span>
+        {/if}
+      {:else}
+        <span class="ml-2 opacity-70" data-testid="ai-log-sink">{t("settings.aiLogSinkOff")}</span>
+      {/if}
+    </div>
+  {/if}
+  <div class="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+    <div class="flex items-center justify-between gap-2">
+      <span class="font-medium opacity-70">{t("settings.aiClientDiag")}</span>
+      <div class="flex items-center gap-1">
+        <!-- The level knob is real (not a code-only constant): raising it to `debug`
+             records the noisy paths too. Persisted by setDiagMinLevel. -->
+        <select
+          data-testid="ai-diag-level"
+          aria-label={t("settings.aiClientDiagLevel")}
+          value={diagInfo.minLevel}
+          onchange={(e) => {
+            setDiagMinLevel((e.currentTarget as HTMLSelectElement).value as DiagLevel);
+            refreshDiag();
+          }}
+          class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-[10px] dark:bg-neutral-700/70"
+        >
+          <option value="debug">debug</option>
+          <option value="info">info</option>
+          <option value="warn">warn</option>
+          <option value="error">error</option>
+        </select>
+        <button
+          type="button"
+          onclick={onClearDiag}
+          data-testid="ai-diag-clear"
+          class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-[10px] dark:bg-neutral-700/70"
+        >{t("settings.aiClientClear")}</button>
+      </div>
+    </div>
+    <!-- What is shown vs. what the ledger dropped: never a silently truncated list. -->
+    <div data-testid="ai-diag-counts" class="mt-1 opacity-70">
+      {t("settings.aiClientDiagCounts", {
+        n: String(diagInfo.recorded),
+        cap: String(diagInfo.cap),
+        evicted: String(diagInfo.evicted),
+        suppressed: String(diagInfo.suppressed),
+      })}
+    </div>
+    {#if diagEntries.length === 0}
+      <p data-testid="ai-diag-empty" class="mt-1 opacity-60">{t("settings.aiClientDiagEmpty")}</p>
+    {:else}
+      <ul data-testid="ai-diag" class="mt-1 space-y-0.5 font-mono text-[10px]">
+        {#each diagEntries as e (e.seq)}
+          <li data-testid="ai-diag-item" class="truncate">{e.level} · {e.area} · {e.msg}</li>
+        {/each}
+      </ul>
+    {/if}
+  </div>
+  <div class="mt-2 rounded-md bg-black/5 px-2 py-1.5 text-[11px] opacity-80 dark:bg-white/10">
+    <span class="font-medium opacity-70">{t("settings.aiEnvHint")}</span>
+    <div data-testid="ai-env" class="mt-1 space-y-0.5 font-mono text-[10px] leading-relaxed">
+      {#each aiEnv as [k, v] (k)}
+        <div class="truncate">{k}={v}</div>
+      {/each}
+    </div>
+  </div>
 </section>

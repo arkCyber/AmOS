@@ -58,13 +58,3 @@ export async function startVoiceRecording(): Promise<ActiveRecording> {
     });
   return { stop };
 }
-
-/** Read a Blob as a `data:` URL (what the amos store persists). */
-export function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(typeof fr.result === "string" ? fr.result : "");
-    fr.onerror = () => reject(fr.error ?? new Error("could not read audio"));
-    fr.readAsDataURL(blob);
-  });
-}

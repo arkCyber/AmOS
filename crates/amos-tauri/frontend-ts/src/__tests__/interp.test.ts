@@ -10,7 +10,6 @@ import {
   readPrefs,
   saveSegs,
   segOf,
-  sessionEndedOf,
   writePrefs,
 } from "../lib/interp";
 
@@ -81,11 +80,9 @@ describe("interp helpers", () => {
     ).toEqual({ src: "x", target: "y" });
   });
 
-  test("partialTextOf / sessionEndedOf / errorOf classify events", () => {
+  test("partialTextOf / errorOf classify events", () => {
     expect(partialTextOf({ kind: "partial", text: "你好" })).toBe("你好");
     expect(partialTextOf({ kind: "segment_final" })).toBe("");
-    expect(sessionEndedOf({ kind: "session_ended" })).toBe(true);
-    expect(sessionEndedOf({ kind: "segment_final" })).toBe(false);
     expect(errorOf({ kind: "error", message: "boom" })).toBe("boom");
     expect(errorOf({ kind: "partial" })).toBe("");
   });
@@ -114,9 +111,7 @@ describe("interp event fault-injection", () => {
     expect(partialTextOf({ kind: "segment_final", text: "ignored" })).toBe("");
   });
 
-  test("sessionEndedOf / errorOf are immune to malformed kinds", () => {
-    expect(sessionEndedOf("session_ended")).toBe(false);
-    expect(sessionEndedOf(null)).toBe(false);
+  test("errorOf is immune to malformed kinds", () => {
     expect(errorOf({ kind: "error" })).toBe("");
     expect(errorOf({ kind: "error", message: 0 })).toBe("0");
     expect(errorOf(undefined)).toBe("");

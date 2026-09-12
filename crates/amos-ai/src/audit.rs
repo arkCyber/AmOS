@@ -20,9 +20,10 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -139,20 +140,179 @@ impl From<AccessRecord> for AuditRecord {
     }
 }
 
+/// In-memory audit bound used when `AMOS_AUDIT_MAX_ENTRIES` is unset.
+pub const DEFAULT_AUDIT_MAX_ENTRIES: usize = 10_000;
+
+/// Rotation size for the durable audit trail when `AMOS_AUDIT_MAX_BYTES` is unset.
+pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Rotated audit files kept when `AMOS_AUDIT_KEEP` is unset.
+pub const DEFAULT_AUDIT_KEEP: usize = 3;
+
+/// Hard cap on `AMOS_AUDIT_KEEP`, so a typo cannot keep unlimited files.
+pub const MAX_AUDIT_KEEP: usize = 64;
+
+/// Parse `AMOS_AUDIT_MAX_ENTRIES`. A blank / non-numeric / **zero** value is
+/// ignored: the bound is a safety property, so a typo must not remove it.
+pub fn audit_max_entries_from(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_AUDIT_MAX_ENTRIES)
+}
+
+/// Parse `AMOS_AUDIT_MAX_BYTES`. `None` (blank / non-numeric / **zero**) means
+/// "use the default": a missing bound must never be read as "unbounded".
+pub fn parse_audit_max_bytes(v: Option<&str>) -> Option<u64> {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Parse `AMOS_AUDIT_KEEP` (bounded by [`MAX_AUDIT_KEEP`]). `None` for blank /
+/// non-numeric / **zero** — same "a typo cannot remove the bound" rule.
+pub fn parse_audit_keep(v: Option<&str>) -> Option<usize> {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(MAX_AUDIT_KEEP))
+}
+
+/// Where the daemon's **shared** durable audit trail lives and how it is bounded.
+///
+/// Resolved from already-read environment values, so the rule is a pure function
+/// (the process environment is global; `security.rs` splits `from_env` the same way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedTrailConfig {
+    /// The JSON-lines trail file.
+    pub path: PathBuf,
+    /// Bounded in-memory window kept for cheap queries.
+    pub max_mem: usize,
+    /// Rotate the active file once it reaches this many bytes.
+    pub max_bytes: u64,
+    /// Rotated siblings kept (`<path>.1` newest … `<path>.<keep>` oldest).
+    pub keep: usize,
+}
+
+/// Resolve the shared trail from already-read env values.
+///
+/// * `audit_path` (`AMOS_AUDIT_PATH`, explicit) wins;
+/// * else `<privacy_path>.jsonl` (`AMOS_PRIVACY_PATH`), the historical location
+///   the privacy service already wrote — so an existing deployment keeps, and
+///   now **shares**, its trail instead of losing it;
+/// * neither set ⇒ `None` (memory-only; the caller reports that honestly).
+pub fn shared_trail_config_from_values(
+    audit_path: Option<&str>,
+    privacy_path: Option<&str>,
+    max_entries: Option<&str>,
+    max_bytes: Option<&str>,
+    keep: Option<&str>,
+) -> Option<SharedTrailConfig> {
+    let path = match audit_path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let privacy = privacy_path.map(str::trim).filter(|s| !s.is_empty())?;
+            PathBuf::from(privacy).with_extension("jsonl")
+        }
+    };
+    Some(SharedTrailConfig {
+        path,
+        max_mem: audit_max_entries_from(max_entries),
+        max_bytes: parse_audit_max_bytes(max_bytes).unwrap_or(DEFAULT_AUDIT_MAX_BYTES),
+        keep: parse_audit_keep(keep).unwrap_or(DEFAULT_AUDIT_KEEP),
+    })
+}
+
+/// Open the daemon's shared durable trail from the environment (`None` when
+/// neither `AMOS_AUDIT_PATH` nor `AMOS_PRIVACY_PATH` is set).
+///
+/// The single sink handed to **both** the security layer and the privacy
+/// manager, so one `RecentTrail` read-back shows operation results *and* access
+/// decisions. A trail that cannot be opened degrades to memory-only with a
+/// warning — the daemon keeps serving, exactly like the log-file sink.
+pub fn shared_trail_from_env() -> Option<AuditFile> {
+    let cfg = shared_trail_config_from_values(
+        std::env::var("AMOS_AUDIT_PATH").ok().as_deref(),
+        std::env::var("AMOS_PRIVACY_PATH").ok().as_deref(),
+        std::env::var("AMOS_AUDIT_MAX_ENTRIES").ok().as_deref(),
+        std::env::var("AMOS_AUDIT_MAX_BYTES").ok().as_deref(),
+        std::env::var("AMOS_AUDIT_KEEP").ok().as_deref(),
+    )?;
+    match AuditFile::open_rotating(&cfg.path, cfg.max_mem, cfg.max_bytes, cfg.keep) {
+        Ok(file) => {
+            tracing::info!(
+                path = %cfg.path.display(),
+                max_bytes = cfg.max_bytes,
+                keep = cfg.keep,
+                "shared audit trail active"
+            );
+            Some(file)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %cfg.path.display(),
+                "audit trail unavailable ({e:#}); the audit is memory-only"
+            );
+            None
+        }
+    }
+}
+
+/// Path of the `k`-th rotated file (`k >= 1`): `<path>.1`, `<path>.2`, …
+///
+/// Same naming as the daemon log sink (`crate::logfile`), so an operator has one
+/// rotation convention to remember.
+fn rotated_path(path: &Path, k: usize) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".{k}"));
+    PathBuf::from(s)
+}
+
+/// Append every **valid** JSON line of `path` to `ring`, keeping it at most `cap`
+/// records (newest last). A missing file, a torn tail line or a line that is not
+/// an [`AuditRecord`] is skipped — never fatal.
+fn load_valid_lines(path: &Path, ring: &mut VecDeque<AuditRecord>, cap: usize) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<AuditRecord>(line) {
+            ring.push_back(rec);
+            if ring.len() > cap {
+                let _ = ring.pop_front();
+            }
+        }
+    }
+}
+
 /// A durable, bounded, JSON-lines audit sink.
 ///
 /// * `path = Some(..)` → every [`AuditRecord`] is appended to that file (created
 ///   on first write) **and** kept in a bounded in-memory ring.
 /// * `path = None` → memory-only (the default for tests / ephemeral managers).
 ///
-/// Concurrency: mutations happen under a `tokio::RwLock` on the ring; file
-/// appends are best-effort single-line writes so a torn tail line on crash is
-/// simply skipped when the log is re-read (see [`AuditFile::open`]).
+/// **Bounded growth**: with `max_bytes > 0` the active file rotates to `<path>.1`
+/// once it reaches that size (`.1` → `.2` … up to `keep`, oldest dropped), so a
+/// long-running daemon cannot fill the disk with its own audit trail. Each write
+/// is one complete line, so a rotation boundary is always a record boundary.
+///
+/// Concurrency: mutations happen under a `tokio::RwLock` on the ring; the
+/// size-check + rotate + append is serialized by a `std::sync::Mutex` (the
+/// shared trail has two producers, the security layer and the privacy manager).
+/// File appends are best-effort single-line writes so a torn tail line on crash
+/// is simply skipped when the log is re-read (see [`AuditFile::open`]).
 #[derive(Debug, Clone)]
 pub struct AuditFile {
     path: Option<PathBuf>,
     max_mem: usize,
+    /// Rotate the active file once it reaches this many bytes (`0` = never).
+    max_bytes: u64,
+    /// Rotated siblings to keep (`<path>.1` newest … `<path>.<keep>` oldest).
+    keep: usize,
     mem: Arc<RwLock<VecDeque<AuditRecord>>>,
+    /// Serializes the size-check + rotate + append (never held across an `await`).
+    io: Arc<Mutex<()>>,
+    rotations: Arc<AtomicU64>,
 }
 
 impl AuditFile {
@@ -161,40 +321,64 @@ impl AuditFile {
         Self {
             path: None,
             max_mem: max_mem.max(1),
+            max_bytes: 0,
+            keep: 0,
             mem: Arc::new(RwLock::new(VecDeque::with_capacity(max_mem.max(1)))),
+            io: Arc::new(Mutex::new(())),
+            rotations: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Open (creating if absent) a durable sink at `path`, pre-loading any
     /// previously appended **valid** records into the bounded ring. Malformed /
     /// torn lines are skipped, never fatal — the log is best-effort by design.
+    ///
+    /// No rotation: the file grows unbounded. Prefer [`AuditFile::open_rotating`]
+    /// (what the daemon uses) for a trail that must stay bounded.
     pub fn open(path: impl AsRef<Path>, max_mem: usize) -> Result<Self> {
+        Self::open_rotating(path, max_mem, 0, 0)
+    }
+
+    /// Open a durable sink that **rotates itself** once the active file reaches
+    /// `max_bytes`, keeping at most `keep` rotated siblings (`max_bytes == 0` ⇒
+    /// never rotate, same as [`AuditFile::open`]).
+    ///
+    /// On open, the rotated siblings (`.<keep>` oldest → `.1`) are read first,
+    /// then the active file, so a restart still sees the recent window across a
+    /// roll-over. Malformed / torn lines are skipped.
+    pub fn open_rotating(
+        path: impl AsRef<Path>,
+        max_mem: usize,
+        max_bytes: u64,
+        keep: usize,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let cap = max_mem.max(1);
         let mut ring = VecDeque::with_capacity(cap);
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            for line in raw.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(rec) = serde_json::from_str::<AuditRecord>(line) {
-                    ring.push_back(rec);
-                    if ring.len() > cap {
-                        let _ = ring.pop_front();
-                    }
-                }
-            }
+        // Oldest file first, so the ring's `pop_front` keeps the newest records.
+        for k in (1..=keep).rev() {
+            load_valid_lines(&rotated_path(&path, k), &mut ring, cap);
         }
+        load_valid_lines(&path, &mut ring, cap);
         Ok(Self {
             path: Some(path),
             max_mem: cap,
+            max_bytes,
+            keep,
             mem: Arc::new(RwLock::new(ring)),
+            io: Arc::new(Mutex::new(())),
+            rotations: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// The on-disk path, if durable.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Completed roll-overs since this sink was opened (diagnostics / tests).
+    pub fn rotations(&self) -> u64 {
+        self.rotations.load(Ordering::Relaxed)
     }
 
     /// Record one event: append to disk (if durable) and keep in the ring.
@@ -207,6 +391,27 @@ impl AuditFile {
             }
         }
 
+        if self.path.is_none() {
+            return Ok(());
+        }
+        // The durable half is **synchronous**: it takes the `std::sync::Mutex` and does
+        // open/append/metadata/rotate, so it runs on a blocking thread. `log` is awaited
+        // by every security and privacy decision on the request path — a slow or contended
+        // disk must not stall the tokio worker. The clone is cheap (every heavy field is an
+        // `Arc`; the rest are `Copy`/`PathBuf`).
+        let me = self.clone();
+        tokio::task::spawn_blocking(move || me.append_blocking(rec))
+            .await
+            .map_err(|e| anyhow!("audit append task failed: {e}"))?
+    }
+
+    /// The synchronous half of [`AuditFile::log`]: create the directory, append one line,
+    /// then rotate once the active file passed the bound.
+    ///
+    /// Must run on a **blocking thread** (see `log`): it takes the `std::sync::Mutex` and
+    /// touches the filesystem. Split out so the async caller can hand it to
+    /// `spawn_blocking` without borrowing `&self` across threads.
+    fn append_blocking(&self, rec: AuditRecord) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -217,12 +422,59 @@ impl AuditFile {
             }
         }
         let line = serde_json::to_string(&rec).context("serialize audit record")?;
-        let mut f = std::fs::OpenOptions::new()
+        // Serialize size-check + rotate + append: the shared trail has two
+        // producers, and an interleaved roll-over would split a record.
+        let _guard = self.io.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open audit file {}", path.display()))?;
+            writeln!(f, "{line}")
+                .with_context(|| format!("append audit file {}", path.display()))?;
+        }
+        // Rotate only once the write is complete, so the active file always ends
+        // on a record boundary (never a half line).
+        if self.max_bytes > 0 {
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if size >= self.max_bytes {
+                self.rotate(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shift `.<k>` → `.<k+1>`, drop the oldest, then `path` → `.1` and restart empty.
+    fn rotate(&self, path: &Path) -> Result<()> {
+        if self.keep == 0 {
+            // Keep no history: start the active file over.
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .with_context(|| format!("truncate audit file {}", path.display()))?;
+            self.rotations.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(rotated_path(path, self.keep));
+        for k in (1..self.keep).rev() {
+            let from = rotated_path(path, k);
+            if from.exists() {
+                let _ = std::fs::rename(&from, rotated_path(path, k + 1));
+            }
+        }
+        std::fs::rename(path, rotated_path(path, 1))
+            .with_context(|| format!("rotate audit file {}", path.display()))?;
+        // Recreate the active file so the trail path always exists (a concurrent
+        // reader must not see a vanished file mid-roll-over).
+        std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-            .with_context(|| format!("open audit file {}", path.display()))?;
-        writeln!(f, "{line}").with_context(|| format!("append audit file {}", path.display()))?;
+            .with_context(|| format!("reopen audit file {}", path.display()))?;
+        self.rotations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -424,6 +676,161 @@ mod tests {
         let sink = AuditFile::open(&path, 64).unwrap();
         let ring = sink.mem.blocking_read();
         assert_eq!(ring.len(), 1, "only the valid line is kept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn audit_bounds_are_a_safety_property_not_a_knob_to_switch_off() {
+        // A blank / garbage / zero value must never remove a bound.
+        assert_eq!(audit_max_entries_from(None), DEFAULT_AUDIT_MAX_ENTRIES);
+        assert_eq!(audit_max_entries_from(Some("")), DEFAULT_AUDIT_MAX_ENTRIES);
+        assert_eq!(
+            audit_max_entries_from(Some("junk")),
+            DEFAULT_AUDIT_MAX_ENTRIES
+        );
+        assert_eq!(audit_max_entries_from(Some("0")), DEFAULT_AUDIT_MAX_ENTRIES);
+        assert_eq!(audit_max_entries_from(Some(" 250 ")), 250);
+
+        assert_eq!(parse_audit_max_bytes(None), None);
+        assert_eq!(parse_audit_max_bytes(Some("0")), None);
+        assert_eq!(parse_audit_max_bytes(Some("4096")), Some(4096));
+
+        assert_eq!(parse_audit_keep(Some("0")), None);
+        assert_eq!(parse_audit_keep(Some("2")), Some(2));
+        assert_eq!(parse_audit_keep(Some("9999")), Some(MAX_AUDIT_KEEP));
+    }
+
+    #[test]
+    fn shared_trail_prefers_the_explicit_path_and_keeps_the_legacy_one() {
+        // An explicit AMOS_AUDIT_PATH wins.
+        let c = shared_trail_config_from_values(
+            Some("/var/log/amos/audit.jsonl"),
+            Some("/data/privacy.json"),
+            Some("500"),
+            Some("1024"),
+            Some("2"),
+        )
+        .expect("configured");
+        assert_eq!(c.path, PathBuf::from("/var/log/amos/audit.jsonl"));
+        assert_eq!((c.max_mem, c.max_bytes, c.keep), (500, 1024, 2));
+
+        // No explicit path ⇒ the historical `<AMOS_PRIVACY_PATH>.jsonl` is reused,
+        // so an existing deployment keeps — and now shares — its trail.
+        let c = shared_trail_config_from_values(None, Some("/data/privacy.json"), None, None, None)
+            .expect("legacy path");
+        assert_eq!(c.path, PathBuf::from("/data/privacy.jsonl"));
+        assert_eq!(c.max_mem, DEFAULT_AUDIT_MAX_ENTRIES);
+        assert_eq!(c.max_bytes, DEFAULT_AUDIT_MAX_BYTES);
+        assert_eq!(c.keep, DEFAULT_AUDIT_KEEP);
+
+        // Blank counts as unset; with neither path there is no trail at all.
+        assert!(shared_trail_config_from_values(Some("  "), Some(""), None, None, None).is_none());
+        assert!(shared_trail_config_from_values(None, None, None, None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn rotating_sink_stays_bounded_and_keeps_the_newest_records() {
+        let dir = std::env::temp_dir().join(format!("amos-audit-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trail.jsonl");
+
+        // Wide records + a small cap ⇒ several roll-overs, keeping 2 files. The
+        // count is deliberately odd so the active file holds a record at the end.
+        let sink = AuditFile::open_rotating(&path, 64, 200, 2).unwrap();
+        for i in 0..13u64 {
+            sink.log(AuditRecord {
+                ts: i,
+                principal: "cli".into(),
+                op: "generate".into(),
+                resource: format!("r{i}"),
+                outcome: Outcome::Success,
+                details: "x".repeat(40),
+            })
+            .await
+            .unwrap();
+        }
+        assert!(sink.rotations() >= 1, "it really rolled over");
+
+        // Only `keep` siblings (plus the active file) may exist.
+        assert!(dir.join("trail.jsonl").exists(), "the active file exists");
+        assert!(dir.join("trail.jsonl.1").exists());
+        assert!(dir.join("trail.jsonl.2").exists());
+        assert!(!dir.join("trail.jsonl.3").exists(), "the oldest is dropped");
+
+        // Rotation happens on a record boundary, so every file is whole JSON lines.
+        for f in ["trail.jsonl", "trail.jsonl.1", "trail.jsonl.2"] {
+            let raw = std::fs::read_to_string(dir.join(f)).unwrap();
+            if f != "trail.jsonl" {
+                assert!(!raw.is_empty(), "{f} is a completed roll-over");
+                assert!(raw.ends_with('\n'), "{f} ends on a record boundary");
+            }
+            for line in raw.lines() {
+                serde_json::from_str::<AuditRecord>(line).unwrap_or_else(|e| panic!("{f}: {e}"));
+            }
+        }
+
+        // A restart reads across the rotation window: the newest record is there,
+        // the oldest is not (bounded ⇒ the far past is honestly gone, not implied).
+        let reopened = AuditFile::open_rotating(&path, 64, 200, 2).unwrap();
+        let recent = reopened.recent(64).await;
+        assert_eq!(recent[0].ts, 12, "newest first");
+        assert!(recent.iter().all(|r| r.ts < 13));
+        assert!(!recent.iter().any(|r| r.ts == 0), "the oldest rolled away");
+        assert!(recent.len() < 13, "the trail really is bounded");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn one_shared_sink_carries_security_operations_and_privacy_decisions() {
+        use crate::privacy::PrivacyManager;
+        use crate::security::AuditLogger;
+
+        let dir = std::env::temp_dir().join(format!("amos-audit-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trail.jsonl");
+
+        // The daemon opens ONE sink and hands a clone to both domains (a clone
+        // shares the ring + the file) — this is what makes `RecentTrail` unified.
+        let sink = AuditFile::open_rotating(&path, 64, 0, 0).unwrap();
+        let privacy = PrivacyManager::with_audit_file(16, sink.clone());
+        let mut logger = AuditLogger::new(16);
+        logger.attach_sink(sink.clone());
+
+        privacy.grant("com.amos.phone", Resource::Microphone).await;
+        assert_eq!(
+            privacy
+                .authorize("com.amos.phone", Resource::Microphone)
+                .await,
+            AccessDecision::Granted
+        );
+        logger
+            .log(
+                "client-1".into(),
+                "generate".into(),
+                "tokens".into(),
+                AuditResult::Rejected,
+                "rate limit exceeded".into(),
+            )
+            .await;
+
+        // One read-back shows BOTH an access decision and an operation result —
+        // exactly what the trail RPC needs and could never show before.
+        let (trail, durable) = privacy.recent_trail(10, None, None).await;
+        assert!(durable, "a trail is attached");
+        assert_eq!(trail.len(), 2, "both domains land in ONE trail");
+        assert_eq!(trail[0].op, "generate");
+        assert_eq!(trail[0].principal, "client-1");
+        assert_eq!(trail[0].outcome, Outcome::Rejected);
+        assert_eq!(trail[1].op, "perm.authorize");
+        assert_eq!(trail[1].principal, "com.amos.phone");
+        assert_eq!(trail[1].outcome, Outcome::Granted);
+
+        // ... and it is durable: a restart (re-open) still has both records.
+        let reopened = AuditFile::open(&path, 64).unwrap();
+        assert_eq!(reopened.count().await, 2, "persisted, not just in memory");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

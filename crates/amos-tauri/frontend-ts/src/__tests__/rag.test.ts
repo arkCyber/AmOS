@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   parseRagHit,
   parseRagIndex,
@@ -105,5 +105,47 @@ describe("offline degradation (no Tauri bridge)", () => {
     expect(await ragQuery("q", 5)).toBeNull();
     expect(await ragIndex("note:a", "body")).toBeNull();
     expect(await ragRemove("note:a")).toBeNull();
+  });
+});
+
+describe("wire keys (Tauri resolves an argument by its lowerCamelCase name)", () => {
+  let realWindow: unknown;
+  beforeEach(() => {
+    realWindow = (globalThis as { window?: unknown }).window;
+  });
+  afterEach(() => {
+    (globalThis as { window?: unknown }).window = realWindow;
+  });
+  function bridge(recorder: { cmd: string; args: Record<string, unknown> }[]) {
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          recorder.push({ cmd, args: args ?? {} });
+          if (cmd === "rag_query") return { hits: [], count: 0 };
+          return null;
+        },
+        listen: async () => async () => {},
+      },
+      localStorage: new Map() as unknown as Storage,
+    };
+  }
+
+  test("rag_query sends `topK` (the key the command declares), never `top_k`", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    bridge(calls);
+    await ragQuery("hello", 3);
+    const query = calls.find((c) => c.cmd === "rag_query");
+    expect(query).toBeDefined();
+    expect(query!.args).toEqual({ query: "hello", topK: 3 });
+    // `top_k` matched no Rust parameter → the command failed with
+    // `missing required key topK` and the UI showed "search offline".
+    expect(query!.args.top_k).toBeUndefined();
+  });
+
+  test("rag_query clamps top-k through the same normaliser on the wire", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    bridge(calls);
+    await ragQuery("hello", 1_000_000);
+    expect(calls.find((c) => c.cmd === "rag_query")!.args.topK).toBe(RAG_MAX_TOP_K);
   });
 });

@@ -12,17 +12,17 @@
     LENS_R,
     MIN_ZOOM,
     MAX_ZOOM,
-    DEFAULT_ZOOM,
-    DEFAULT_TONE,
     MAGNIFIER_SETTINGS_KEY,
     clampCenter,
     centredLens,
+    defaultMagnifierSettings,
     lensSourceRadius,
     normalizeMagnifierSettings,
     toneFilter,
   } from "../lib/magnifier";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
-  import { capSet, grantCap, loadLedger, saveLedger } from "../lib/permissions";
+  import { capSet, loadLedger } from "../lib/permissions";
+  import { grantCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
 
   const LENS_SIZE = LENS_R * 2;
@@ -37,15 +37,17 @@
     writeStoreValue(MAGNIFIER_SETTINGS_KEY, normalizeMagnifierSettings({ zoom, brightness: bright, contrast }));
   });
   const reset = () => {
-    zoom = DEFAULT_ZOOM;
-    bright = DEFAULT_TONE;
-    contrast = DEFAULT_TONE;
+    // One source of truth for the defaults (also used by the persisted normalizer).
+    const d = defaultMagnifierSettings();
+    zoom = d.zoom;
+    bright = d.brightness;
+    contrast = d.contrast;
   };
 
   // ---- camera permission gate (OS ledger, like the Camera app) ----
   let granted = $state(capSet(loadLedger(), "magnifier", "camera"));
   const allowCamera = () => {
-    saveLedger(grantCap(loadLedger(), "magnifier", "camera"));
+    grantCapability("magnifier", "camera");
     granted = true;
   };
 

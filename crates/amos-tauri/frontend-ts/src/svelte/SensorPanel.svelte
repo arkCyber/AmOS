@@ -6,6 +6,7 @@
   // Settings page never renders a broken card.
   import {
     normalizeSnapshot,
+    sensorCameraCount,
     sensorSetMode,
     sensorSnapshot,
     type SensorMode,
@@ -52,14 +53,15 @@
       .catch(() => (busy = false));
   };
 
+  const cameraCount = $derived(sensorCameraCount(snap));
   const visible = $derived(
-    snap.cameras.length > 0 || !!snap.gnss || !!snap.imu || snap.mode !== "unknown",
+    cameraCount > 0 || !!snap.gnss || !!snap.imu || snap.mode !== "unknown",
   );
   const firstCam = $derived(snap.cameras[0]);
   const camLabel = $derived(
-    snap.cameras.length === 0
+    cameraCount === 0
       ? "—"
-      : `${snap.cameras.length}${firstCam ? ` · ${firstCam.width}×${firstCam.height}` : ""}`,
+      : `${cameraCount}${firstCam ? ` · ${firstCam.width}×${firstCam.height}` : ""}`,
   );
   const gnssLabel = $derived(
     !snap.gnss

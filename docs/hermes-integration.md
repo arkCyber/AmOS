@@ -25,8 +25,8 @@
 ## 二、AmOS 侧接线（✅ 已完成 2026-09-01）
 
 新增 `HermesAgentBackend`（`amos-ai/src/inference/real.rs`）：
-- `infer()` → `POST {endpoint}/v1/chat/completions`（stream），用 `parse_hermes_sse_chunk` 解析
-  原生 `type:"token"` 帧 → **真实逐 token 流式**；同时兼容 OpenAI delta 兜底
+- `infer()` → `POST {endpoint}/v1/chat/completions`（stream）：原生 `type:"token"` 帧由 `parse_hermes_token` 解析
+  → **真实逐 token 流式**；OpenAI delta 兜底走 `parse_sse_chunk`（均在 `src/inference/real.rs`）
 - `health_check()` → `GET {endpoint}/health`
 - `metadata()` → `supports_function_calling: true`（hermes 有 tools/agent）
 - `AMOS_BACKEND=hermes` + `AMOS_HERMES_ENDPOINT`（默认 `http://127.0.0.1:11438`）+ `AMOS_MODEL`

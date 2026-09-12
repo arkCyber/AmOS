@@ -5,6 +5,12 @@
 //! Both the daemon (`amos-ai`) and the System UI (`amos-tauri`) depend on
 //! this crate so the wire contract can never drift between the two sides.
 
+// P0-1 gate: production code must not panic on programmer error (tests exempt).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod ai_agent {
     //! Generated types: `ai_agent_client` (client), `ai_agent_server` (server),
     //! and all message structs (`AgentRequest`, `AgentChunk`, ...).

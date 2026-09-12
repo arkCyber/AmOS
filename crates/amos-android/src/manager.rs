@@ -41,6 +41,59 @@ impl Default for AndroidManagerConfig {
     }
 }
 
+impl AndroidManagerConfig {
+    /// Overlay the documented env knobs on the defaults.
+    ///
+    /// `AMOS_ANDROID_LAUNCH_TIMEOUT` / `AMOS_ANDROID_LIST_TIMEOUT` /
+    /// `AMOS_ANDROID_ICON_TIMEOUT` (seconds) and the icon-cache bound — both names
+    /// the docs used, `AMOS_ANDROID_ICON_CACHE_SIZE` (newer) and
+    /// `AMOS_ANDROID_CACHE_SIZE` (older) — were **write-only** before: nothing read
+    /// them. Pure for the values so the parse policy is unit-testable without
+    /// touching the process environment.
+    pub fn from_vars(
+        launch: Option<&str>,
+        list: Option<&str>,
+        icon: Option<&str>,
+        icon_cache: Option<&str>,
+    ) -> Self {
+        fn secs(v: Option<&str>) -> Option<u64> {
+            v.and_then(|s| s.trim().parse::<u64>().ok())
+        }
+        // `0` is meaningful for the cache bound (disable caching), but a timeout of
+        // 0 would make every operation fail instantly, so only accept `> 0` there.
+        fn entries(v: Option<&str>) -> Option<usize> {
+            v.and_then(|s| s.trim().parse::<usize>().ok())
+        }
+        let mut cfg = Self::default();
+        if let Some(n) = secs(launch).filter(|n| *n > 0) {
+            cfg.launch_timeout_secs = n;
+        }
+        if let Some(n) = secs(list).filter(|n| *n > 0) {
+            cfg.list_timeout_secs = n;
+        }
+        if let Some(n) = secs(icon).filter(|n| *n > 0) {
+            cfg.icon_timeout_secs = n;
+        }
+        if let Some(n) = entries(icon_cache) {
+            cfg.icon_cache_size = n;
+        }
+        cfg
+    }
+
+    /// [`Self::from_vars`] with the values read from the environment.
+    pub fn from_env() -> Self {
+        let icon_cache = std::env::var("AMOS_ANDROID_ICON_CACHE_SIZE")
+            .ok()
+            .or_else(|| std::env::var("AMOS_ANDROID_CACHE_SIZE").ok());
+        Self::from_vars(
+            std::env::var("AMOS_ANDROID_LAUNCH_TIMEOUT").ok().as_deref(),
+            std::env::var("AMOS_ANDROID_LIST_TIMEOUT").ok().as_deref(),
+            std::env::var("AMOS_ANDROID_ICON_TIMEOUT").ok().as_deref(),
+            icon_cache.as_deref(),
+        )
+    }
+}
+
 /// Icon cache entry with metadata. `last_used` is touched on every hit so the
 /// eviction policy is a genuine LRU (least-recently-used by access), not FIFO by
 /// insertion — a hot icon is never evicted just because it was cached first.
@@ -342,6 +395,33 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::runtime::DemoRuntime;
+
+    #[test]
+    fn android_manager_config_reads_documented_env_knobs() {
+        let d = AndroidManagerConfig::default();
+        // Unset / garbage keep the tuned defaults.
+        let none = AndroidManagerConfig::from_vars(None, None, None, None);
+        assert_eq!(none.launch_timeout_secs, d.launch_timeout_secs);
+        assert_eq!(none.list_timeout_secs, d.list_timeout_secs);
+        assert_eq!(none.icon_timeout_secs, d.icon_timeout_secs);
+        assert_eq!(none.icon_cache_size, d.icon_cache_size);
+        // A zero timeout would make every op fail instantly -> ignored.
+        let zero = AndroidManagerConfig::from_vars(Some("0"), Some("-1"), Some("x"), None);
+        assert_eq!(zero.launch_timeout_secs, d.launch_timeout_secs);
+        assert_eq!(zero.list_timeout_secs, d.list_timeout_secs);
+        assert_eq!(zero.icon_timeout_secs, d.icon_timeout_secs);
+        // Valid values are honoured (whitespace tolerated).
+        let cfg = AndroidManagerConfig::from_vars(Some(" 45 "), Some("20"), Some("9"), Some("64"));
+        assert_eq!(cfg.launch_timeout_secs, 45);
+        assert_eq!(cfg.list_timeout_secs, 20);
+        assert_eq!(cfg.icon_timeout_secs, 9);
+        assert_eq!(cfg.icon_cache_size, 64);
+        // `0` for the cache bound is meaningful (caching disabled), not a typo.
+        assert_eq!(
+            AndroidManagerConfig::from_vars(None, None, None, Some("0")).icon_cache_size,
+            0
+        );
+    }
 
     #[tokio::test]
     async fn enhanced_manager_caches_icons() {

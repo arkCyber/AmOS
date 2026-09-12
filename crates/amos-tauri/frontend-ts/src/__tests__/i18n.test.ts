@@ -9,8 +9,8 @@ describe("i18n", () => {
   test("translates known keys per locale", () => {
     expect(translate(zh, "app.phone")).toBe("电话");
     expect(translate(en, "app.phone")).toBe("Phone");
-    expect(translate(zh, "home.greeting")).toBe("你好，Amos");
-    expect(translate(en, "home.greeting")).toBe("Hello, Amos");
+    expect(translate(zh, "clock.world")).toBe("世界时钟");
+    expect(translate(en, "clock.world")).toBe("World clock");
   });
 
   test("falls back to the key when a dictionary entry is missing", () => {
@@ -18,8 +18,8 @@ describe("i18n", () => {
   });
 
   test("interpolates {params}", () => {
-    expect(translate(zh, "count.notifications", { n: 3 })).toBe("3 条通知");
-    expect(translate(en, "count.notifications", { n: 7 })).toBe("7 notifications");
+    expect(translate(zh, "care.items", { n: 3 })).toBe("3 项");
+    expect(translate(en, "care.items", { n: 7 })).toBe("7 items");
   });
 
   test("zh and en dictionaries expose the same keys", () => {

@@ -191,12 +191,15 @@ AMOS_AUDIT_MAX_ENTRIES=10000     # Max audit log entries
 - ✅ Comprehensive testing
 - ✅ Configurable limits
 - ✅ JSON export for SIEM integration
-- ⚠️ Audit log file persistence (TODO: integrate with external log storage)
+- ✅ Audit log file persistence — the daemon mirrors this layer's operations into the **shared**
+  JSON-lines trail (`AMOS_AUDIT_PATH`, else `<AMOS_PRIVACY_PATH>.jsonl`), bounded by rotation
+  (`AMOS_AUDIT_MAX_BYTES` / `AMOS_AUDIT_KEEP`); unset ⇒ memory-only, reported honestly.
+  See `docs/permissions-sandbox-audit-plan.md` P4.2.
 
 ## Next Steps (Post-Security Layer)
 
-1. **Integrate with gRPC server** - Call security manager in service methods
-2. **Implement file-based audit logging** - Persist logs to disk
+1. **Integrate with gRPC server** - Call security manager in service methods ✅ (every RPC is gated)
+2. ~~**Implement file-based audit logging** - Persist logs to disk~~ ✅ (`crate::audit::AuditFile`, REQ-A98)
 3. **Add security event webhooks** - Alert on suspicious patterns
 4. **Implement permission database** - Replace in-memory HashMap
 5. **Add encryption support** - Protect sensitive audit data

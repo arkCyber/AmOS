@@ -1,9 +1,9 @@
 /**
  * appMeta.ts — React-free built-in app metadata (single source of truth).
  *
- * id → { titleKey, icon } for the 27 built-in apps. This used to live inside the
- * React `apps.tsx`; extracting it here lets a Svelte shell / registry consume the
- * same data without pulling React, and `apps.tsx` re-exports it so nothing drifts.
+ * id → { titleKey, icon } for the built-in apps. It was extracted out of the
+ * (now removed) React registry so a Svelte shell / `svelte/appRegistry.ts` can
+ * consume the same data without pulling React in.
  */
 import type { MessageKey } from "../i18n/locales/zh";
 

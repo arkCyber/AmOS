@@ -8,15 +8,17 @@ use std::time::{Duration, Instant};
 
 use amos_proto::ai_agent::{
     ai_agent_server::{AiAgent, AiAgentServer},
-    AgentChunk, AgentRequest, ClearSessionsReply, ClearSessionsRequest, ClientMessage,
-    EnergyPolicy, GetHistoryReply, GetHistoryRequest, GovernorMetrics, HistoryTurn,
-    ListSessionsReply, ListSessionsRequest, ProfileMetrics, RemoveSessionReply,
-    RemoveSessionRequest, SessionInfo, StatusReply, StatusRequest,
+    AgentChunk, AgentRequest, Alert, Alerts, BreakerMetrics, ClearSessionsReply,
+    ClearSessionsRequest, ClientMessage, EnergyPolicy, GenerationPoolMetrics, GetHistoryReply,
+    GetHistoryRequest, GovernorMetrics, HistoryTurn, ListSessionsReply, ListSessionsRequest,
+    LogSinkMetrics, ProfileMetrics, RemoveSessionReply, RemoveSessionRequest, ResponseCacheMetrics,
+    SessionInfo, StatusReply, StatusRequest,
 };
 use amos_proto::{CLIENT_ID_HEADER, DEFAULT_CLIENT_ID};
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use std::pin::Pin;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::energy::{EnergySnapshot, EnergyStore};
@@ -48,6 +50,24 @@ pub struct AiAgentService {
     /// How long a generation may wait for a pool slot before an honest
     /// rejection (`AMOS_GEN_POOL_WAIT_MS`; zero = fail-fast, the default).
     pool_wait: Duration,
+    /// The live response cache handle when `AMOS_RESPONSE_CACHE=1` wrapped the
+    /// backend, so `get_status` can report honest hit/miss/store counters.
+    /// `None` = caching disabled (the default) — the wire block says
+    /// `enabled=false` rather than fabricating a cache that does not exist.
+    response_cache: Option<Arc<crate::cache::ResponseCache>>,
+    /// Live handle to the backend circuit breaker (REQ-A131), so `get_status` can
+    /// report its state and honest decision counters. `Some` even when
+    /// `AMOS_BREAKER=0` — then the snapshot's `enabled=false` says it is *not* in the
+    /// serving path rather than pretending it is absent.
+    breaker: Option<crate::breaker::SharedBreaker>,
+    /// Threshold alerts derived from the counters above (REQ-A133). Holds only the
+    /// "first seen at" bookkeeping — the alert *list* is recomputed on every status.
+    alerts: Arc<std::sync::Mutex<crate::alerts::AlertTracker>>,
+    /// Live handle to the on-disk log sink when `AMOS_LOG_DIR` opened one, so
+    /// `get_status` can report whether the persisted trail is intact (and how much
+    /// of it went missing). `None` = stdout-only logging: the wire block says
+    /// `enabled=false` with honest zeros rather than pretending a sink exists.
+    log_sink: Option<crate::logfile::LogSinkHandle>,
     /// Startup snapshot of the effective engine + ASR, so `get_status` can tell a
     /// caller which real engine is serving and whether it degraded to mock.
     engine: EngineState,
@@ -77,11 +97,27 @@ pub struct AiAgentService {
 }
 
 impl AiAgentService {
-    /// Build a service with the default security manager (grants `Standard` to
-    /// the default client), the backend selected from the environment, and
-    /// sessions loaded from `AMOS_SESSIONS_PATH` (if set).
+    /// Build a service with the security manager configured from the environment
+    /// (documented knobs `AMOS_RATE_LIMIT_RPS` / `AMOS_RATE_LIMIT_TPH` /
+    /// `AMOS_AUDIT_MAX_ENTRIES`, else defaults). It grants `Standard` to the
+    /// default client, selects the backend from the environment, and loads
+    /// sessions from `AMOS_SESSIONS_PATH` (if set).
     pub async fn new() -> Self {
-        let security = SecurityManager::default();
+        Self::new_with_audit(None).await
+    }
+
+    /// Same as [`AiAgentService::new`], but attaches `audit_sink` as the daemon's
+    /// shared durable audit trail: every security-layer operation (rate-limit
+    /// rejection / permission denial / liveness-probe outcome) is mirrored into it
+    /// — the **same** trail the privacy manager appends to, so `RecentTrail` reads
+    /// both domains back and neither is lost to a restart. `None` keeps the audit
+    /// memory-only, the honest "no trail configured" state.
+    pub async fn new_with_audit(audit_sink: Option<crate::audit::AuditFile>) -> Self {
+        let security = SecurityManager::from_env();
+        let security = match audit_sink {
+            Some(sink) => security.with_audit_sink(sink),
+            None => security,
+        };
         security
             .permission_manager
             .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
@@ -93,20 +129,40 @@ impl AiAgentService {
         // Snapshot the wrapped-to-be backend name BEFORE optional cache
         // decoration, so EngineState still matches the real engine kind.
         let inner_engine_name = backend.metadata().name;
+        // Backend circuit breaker (REQ-A131): **inside** the cache, so a cache hit is
+        // still served while the backend is open and only real (uncached) generations
+        // are gated. Default ON — a flapping/hung backend must fail fast with a stated
+        // reason instead of making every caller walk the full backend timeout;
+        // `AMOS_BREAKER=0` removes it from the serving path entirely.
+        let breaker_cfg = crate::breaker::BreakerConfig::from_env();
+        let breaker = crate::breaker::shared(breaker_cfg);
+        let backend: Arc<dyn InferenceBackend> = if breaker_cfg.enabled {
+            Arc::new(crate::breaker::BreakerBackend::new(
+                backend,
+                breaker.clone(),
+            ))
+        } else {
+            backend
+        };
         // Opt-in response cache (`AMOS_RESPONSE_CACHE=1`): identical
         // (model, prompt, context, max_tokens) generations replay from a
         // bounded LRU+TTL cache. Default OFF — caching changes observable
         // latency (a hit has near-zero TTFT), so it must be a deliberate
-        // operator choice; `get_status` shows it via the `+cache` name.
-        let backend: Arc<dyn InferenceBackend> = if std::env::var("AMOS_RESPONSE_CACHE")
+        // operator choice; `get_status` shows it via the `+cache` name and the
+        // `response_cache` metrics block.
+        let (backend, response_cache): (
+            Arc<dyn InferenceBackend>,
+            Option<Arc<crate::cache::ResponseCache>>,
+        ) = if std::env::var("AMOS_RESPONSE_CACHE")
             .is_ok_and(|v| v == "1" || v.to_lowercase() == "true")
         {
-            Arc::new(crate::cache::CachingBackend::new(
-                backend,
-                Arc::new(crate::cache::ResponseCache::with_defaults()),
-            ))
+            let cache = Arc::new(crate::cache::ResponseCache::with_defaults());
+            (
+                Arc::new(crate::cache::CachingBackend::new(backend, cache.clone())),
+                Some(cache),
+            )
         } else {
-            backend
+            (backend, None)
         };
         // Daemon-wide generation gate (REQ-A43): `AMOS_MAX_SESSIONS` finally
         // enforced; bounded wait defaults to fail-fast (deterministic).
@@ -146,6 +202,13 @@ impl AiAgentService {
             backend,
             generation_pool,
             pool_wait,
+            response_cache,
+            breaker: Some(breaker),
+            alerts: Arc::new(std::sync::Mutex::new(crate::alerts::AlertTracker::new())),
+            // The on-disk log sink belongs to the process (it is the tracing
+            // subscriber's writer); the serving entry point attaches its handle via
+            // [`Self::with_log_sink`], so `get_status` can report its health.
+            log_sink: None,
             engine,
             sessions,
             sessions_path,
@@ -177,6 +240,10 @@ impl AiAgentService {
             backend,
             generation_pool: Arc::new(GenerationPool::from_env()),
             pool_wait: Duration::ZERO,
+            response_cache: None,
+            breaker: None,
+            alerts: Arc::new(std::sync::Mutex::new(crate::alerts::AlertTracker::new())),
+            log_sink: None,
             engine: EngineState::non_degraded(),
             sessions: Arc::new(SessionManager::default()),
             sessions_path: None,
@@ -201,6 +268,120 @@ impl AiAgentService {
         svc.generation_pool = generation_pool;
         svc.pool_wait = pool_wait;
         svc
+    }
+
+    /// Attach a live response-cache handle so `get_status` reports its honest
+    /// counters. Call this when the backend handed to the service is wrapped in
+    /// [`crate::cache::CachingBackend`] around `cache`; without it the
+    /// `response_cache` wire block honestly reports `enabled=false`.
+    pub fn with_response_cache(mut self, cache: Arc<crate::cache::ResponseCache>) -> Self {
+        self.response_cache = Some(cache);
+        self
+    }
+
+    /// Fold the circuit breaker's state and honest counters into the wire
+    /// `BreakerMetrics` (REQ-A131). With no breaker attached (a custom embedding) or
+    /// with `AMOS_BREAKER=0`, `enabled=false` — and then `state` is the empty string:
+    /// "not in the serving path", never a fabricated "closed".
+    fn breaker_metrics(&self) -> BreakerMetrics {
+        match &self.breaker {
+            Some(b) => {
+                let s = crate::breaker::lock(b).snapshot();
+                BreakerMetrics {
+                    enabled: s.enabled,
+                    state: if s.enabled {
+                        s.state.label().to_string()
+                    } else {
+                        String::new()
+                    },
+                    fail_threshold: s.fail_threshold,
+                    cooldown_seconds: s.cooldown.as_secs(),
+                    consecutive_failures: s.consecutive_failures,
+                    openings: s.openings,
+                    rejections: s.rejections,
+                    failures: s.failures,
+                    successes: s.successes,
+                }
+            }
+            None => BreakerMetrics::default(),
+        }
+    }
+
+    /// Gather the alert rules' input from the blocks this reply already reports, then
+    /// evaluate them (REQ-A133). A rule that newly appears is logged **once** at its
+    /// own level: the list is a report, so the log is the only "delivery" — and it must
+    /// not fire on every poll of a condition that is simply still true.
+    fn alerts_now(&self) -> Alerts {
+        let breaker_state = match &self.breaker {
+            Some(b) => {
+                let s = crate::breaker::lock(b).snapshot();
+                s.enabled.then(|| s.state.label().to_string())
+            }
+            None => None,
+        };
+        let (_, pool_rejected_saturated, pool_rejected_timeout) = self.generation_pool.counters();
+        let log = match &self.log_sink {
+            Some(h) => h.report(),
+            None => crate::logfile::LogSinkReport::disabled(),
+        };
+        let (_, dvfs_failed) = match &self.dvfs {
+            Some(d) => {
+                let d = d.lock().unwrap_or_else(|p| p.into_inner());
+                (d.applied_total(), d.failed_total())
+            }
+            None => (0, 0),
+        };
+        let energy = self.energy.snapshot();
+        let obs = crate::alerts::Observations {
+            breaker_state,
+            pool_rejections: pool_rejected_saturated + pool_rejected_timeout,
+            log_lost_bytes: log.lost_bytes,
+            log_write_failures: log.write_failures,
+            degraded: self.engine.degraded,
+            throttled: energy.cap_inference || energy.throttle_background,
+            dvfs_failures: dvfs_failed,
+        };
+        let mut tracker = self.alerts.lock().unwrap_or_else(|p| p.into_inner());
+        let before = tracker.active_ids();
+        let active = tracker.evaluate(&obs, std::time::Instant::now());
+        for a in &active {
+            if !before.contains(&a.id) {
+                match a.severity {
+                    crate::alerts::Severity::Error => {
+                        tracing::error!(alert = a.id, detail = %a.detail, "alert raised")
+                    }
+                    crate::alerts::Severity::Warn => {
+                        tracing::warn!(alert = a.id, detail = %a.detail, "alert raised")
+                    }
+                }
+            }
+        }
+        Alerts {
+            alerts: active
+                .into_iter()
+                .map(|a| Alert {
+                    id: a.id.to_string(),
+                    severity: a.severity.label().to_string(),
+                    detail: a.detail,
+                    active_for_seconds: a.active_for.as_secs(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Attach a live breaker handle so `get_status` reports its state (tests /
+    /// custom embeddings). The serving path sets this in [`AiAgentService::new`].
+    pub fn with_breaker(mut self, breaker: crate::breaker::SharedBreaker) -> Self {
+        self.breaker = Some(breaker);
+        self
+    }
+
+    /// Attach the live on-disk log sink so `get_status` reports its health (bytes
+    /// persisted, bytes lost, failed writes, rotations). Without it the `log_sink`
+    /// wire block honestly reports `enabled=false`.
+    pub fn with_log_sink(mut self, sink: crate::logfile::LogSinkHandle) -> Self {
+        self.log_sink = Some(sink);
+        self
     }
 
     /// Attach a session manager and a persistence path (used by tests / custom
@@ -284,6 +465,75 @@ impl AiAgentService {
             cap_inference: s.cap_inference,
             throttle_background: s.throttle_background,
             ticks: s.ticks,
+        }
+    }
+
+    /// Fold the on-disk log sink's health into the wire `LogSinkMetrics` (REQ-A87).
+    /// With no sink the block is the honest zero of "stdout only" — never a
+    /// fabricated reading, and never a silent one either (`lost_bytes > 0` is visible
+    /// on the operator's status surface, not only on the daemon's stderr).
+    fn log_sink_metrics(&self) -> LogSinkMetrics {
+        let r = match &self.log_sink {
+            Some(h) => h.report(),
+            None => crate::logfile::LogSinkReport::disabled(),
+        };
+        LogSinkMetrics {
+            enabled: r.enabled,
+            path: r.path,
+            bytes_written: r.bytes_written,
+            lost_bytes: r.lost_bytes,
+            write_failures: r.write_failures,
+            rotations: r.rotations,
+            active_bytes: r.active_bytes,
+        }
+    }
+
+    /// Fold the generation admission pool's live state + monotonic counters into
+    /// the wire `GenerationPoolMetrics` (REQ-A43). `in_flight <= capacity` holds
+    /// by construction; reporting `available` alongside lets a UI show both
+    /// without arithmetic (and without inventing a value when busy).
+    async fn generation_pool_metrics(&self) -> GenerationPoolMetrics {
+        let (acquired, rejected_saturated, rejected_timeout) = self.generation_pool.counters();
+        // One consistent read for the free/busy split so `available + in_flight
+        // == capacity` always holds on the wire (two separate reads could
+        // straddle a concurrent acquire/release and lie).
+        let (in_flight, available) = self.generation_pool.snapshot();
+        GenerationPoolMetrics {
+            capacity: self.generation_pool.capacity() as u32,
+            in_flight: in_flight as u32,
+            available: available as u32,
+            acquired_total: acquired,
+            rejected_saturated,
+            rejected_timeout,
+            wait_ms: self.pool_wait.as_millis() as u64,
+        }
+    }
+
+    /// Fold the response cache's honest counters into the wire
+    /// `ResponseCacheMetrics` (REQ-A44). When the cache is disabled (default) the
+    /// block says `enabled=false` with all-zero counters — never a fabricated
+    /// cache, matching the P0-3 "no placeholder pretending to be a reading" rule.
+    fn response_cache_metrics(&self) -> ResponseCacheMetrics {
+        match &self.response_cache {
+            Some(cache) => {
+                let s = cache.stats();
+                ResponseCacheMetrics {
+                    enabled: true,
+                    capacity: cache.capacity() as u32,
+                    ttl_seconds: cache.ttl().as_secs(),
+                    entries: s.entries as u32,
+                    hits: s.hits,
+                    misses: s.misses,
+                    stores: s.stores,
+                    evicted: s.evicted,
+                    expired: s.expired,
+                    oversized: s.oversized,
+                }
+            }
+            None => ResponseCacheMetrics {
+                enabled: false,
+                ..Default::default()
+            },
         }
     }
 
@@ -801,7 +1051,19 @@ impl AiAgent for AiAgentService {
         let backend = self.backend.clone();
         let sessions = self.sessions.clone();
         let profile = self.profile.clone();
-        let session_key = sessions.create(self.model.to_string()).await;
+        // Key the daemon's OWN session by the client-supplied id, so a conversation
+        // accumulates metadata/token totals across turns (and, with
+        // `AMOS_SESSIONS_PATH` set, those survive a restart) instead of minting a
+        // fresh throwaway session per turn. `get_or_create` exists for exactly this
+        // and was previously unused; an empty id keeps the generated-id behaviour.
+        let session_key = if session_id.is_empty() {
+            sessions.create(self.model.to_string()).await
+        } else {
+            sessions
+                .get_or_create(&session_id, self.model.to_string())
+                .await;
+            session_id.clone()
+        };
 
         tokio::spawn(async move {
             // Hold the generation-gate permit for the whole task: dropping it on
@@ -1230,9 +1492,10 @@ impl AiAgent for AiAgentService {
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusReply>, Status> {
         let client_id = self.client_id(&request);
-        // Consistency: even a liveness probe is a request the caller must be
-        // permitted + within rate limit to make (prevents probe-driven abuse).
-        if let Err(e) = self.security.validate_request(&client_id).await {
+        // A liveness probe is still permission-checked and audited, but it is metered
+        // on its own bucket: generation traffic must not make the daemon's health
+        // channel look dead (`security::validate_probe`, REQ-A82).
+        if let Err(e) = self.security.validate_probe(&client_id).await {
             return Err(Status::resource_exhausted(format!(
                 "request rejected by security layer: {e}"
             )));
@@ -1240,6 +1503,7 @@ impl AiAgent for AiAgentService {
         // Single snapshot so the reply's metrics are mutually consistent.
         let snap = self.monitor.snapshot();
         let meta = self.backend.metadata();
+        let generation_pool = self.generation_pool_metrics().await;
         Ok(Response::new(StatusReply {
             running: true,
             model: self.model.to_string(),
@@ -1257,6 +1521,11 @@ impl AiAgent for AiAgentService {
             energy: Some(self.energy_metrics()),
             governor: Some(self.governor_metrics()),
             system: Some(self.system_metrics()),
+            generation_pool: Some(generation_pool),
+            response_cache: Some(self.response_cache_metrics()),
+            breaker: Some(self.breaker_metrics()),
+            log_sink: Some(self.log_sink_metrics()),
+            alerts: Some(self.alerts_now()),
         }))
     }
 
@@ -1366,13 +1635,52 @@ impl AiAgent for AiAgentService {
 /// there cannot create a Unix socket file (`avc: denied … tclass=sock_file`), but it
 /// can bind loopback TCP — so the daemon can run with no root, and a System UI on the
 /// same device (or on the host, via `adb forward`) reaches it over TCP.
-fn resolve_tcp_addr() -> Option<std::net::SocketAddr> {
-    let raw = std::env::var("AMOS_TCP_ADDR").ok()?;
+fn resolve_tcp_addr() -> anyhow::Result<Option<std::net::SocketAddr>> {
+    match std::env::var("AMOS_TCP_ADDR") {
+        Ok(raw) => parse_tcp_addr(&raw),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Parse `AMOS_TCP_ADDR`, **strictly**.
+///
+/// Two things this must not do, both of which the previous version did:
+///  - silently fall back to the Unix socket when the value is malformed (a typo turned
+///    "serve on TCP" into "serve on a socket file") — a parse error is an error now;
+///  - accept a non-loopback address. This transport exists for on-device / `adb` IPC, so
+///    a LAN-reachable bind is never what was meant; `AMOS_TCP_ALLOW_REMOTE=1` is the
+///    explicit, warned override for someone who really means it.
+fn parse_tcp_addr(raw: &str) -> anyhow::Result<Option<std::net::SocketAddr>> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return None;
+        return Ok(None);
     }
-    raw.parse().ok()
+    let addr: std::net::SocketAddr = raw
+        .parse()
+        .map_err(|e| anyhow!("AMOS_TCP_ADDR={raw:?} is not a host:port address: {e}"))?;
+    if !addr.ip().is_loopback() {
+        if !allow_remote_tcp() {
+            anyhow::bail!(
+                "AMOS_TCP_ADDR={raw:?} is not a loopback address; this transport is for \
+                 on-device IPC and has no authentication for remote peers — use 127.0.0.1, \
+                 or set AMOS_TCP_ALLOW_REMOTE=1 to accept the exposure"
+            );
+        }
+        tracing::warn!(
+            %addr,
+            "AMOS_TCP_ALLOW_REMOTE=1: serving the daemon on a non-loopback address \
+             (unauthenticated unless AMOS_TCP_TOKEN is set)"
+        );
+    }
+    Ok(Some(addr))
+}
+
+/// Explicit opt-in for a non-loopback TCP bind (`AMOS_TCP_ALLOW_REMOTE=1`).
+fn allow_remote_tcp() -> bool {
+    matches!(
+        std::env::var("AMOS_TCP_ALLOW_REMOTE").ok().as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 /// Run the tonic gRPC stack until a shutdown signal arrives.
@@ -1381,12 +1689,57 @@ fn resolve_tcp_addr() -> Option<std::net::SocketAddr> {
 /// [`resolve_tcp_addr`]); otherwise we bind the Unix socket at `path`, harden it to
 /// `0700`, and clean it up on shutdown.
 pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
-    let tcp_addr = resolve_tcp_addr();
+    serve_with_log_sink(path, None).await
+}
+
+/// The accepted-connection stream handed to tonic in UDS mode: each item is a
+/// peer-checked `UnixStream` (or the accept error). Factored out because clippy rejects
+/// the inline `Pin<Box<dyn Stream<…> + Send>>` shape.
+type UnixIncoming = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<tokio::net::UnixStream, std::io::Error>> + Send>,
+>;
+
+/// Same as [`serve`], but attaches the daemon's live on-disk log sink so
+/// `get_status` can report whether the persisted trail is intact and how much of it
+/// went missing (REQ-A87). The binary passes the sink it installed as the tracing
+/// writer; tests and embedders that do not persist logs pass `None`, and the wire
+/// block then honestly says `enabled=false`.
+pub async fn serve_with_log_sink(
+    path: std::path::PathBuf,
+    log_sink: Option<crate::logfile::LogSinkHandle>,
+) -> anyhow::Result<()> {
+    let tcp_addr = resolve_tcp_addr()?;
+    // TCP has neither the socket's 0700 mode nor the kernel peer check, and loopback TCP
+    // is reachable by every process on the device — so the transport states its policy
+    // (and warns when it has none) instead of pretending the socket hardening applies.
+    // On the UDS transport the token is deliberately **not** consulted (the peer check
+    // already covers it), which is why an unrelated AMOS_TCP_TOKEN cannot lock the shell
+    // out of its own socket.
+    let tcp_policy = if tcp_addr.is_some() {
+        crate::tcp_auth::TcpPolicy::from_env()
+    } else {
+        crate::tcp_auth::TcpPolicy::Open
+    };
+    let tcp_gate = crate::tcp_auth::TokenGate::new(tcp_policy);
+    if tcp_addr.is_some() {
+        tcp_gate.policy().announce();
+    }
 
     // Bind the Unix socket only in the UDS transport. In TCP mode a shell process on
     // a retail Android device cannot create a socket file under SELinux, so we skip
     // binding entirely (loopback TCP needs no root).
-    let incoming: Option<UnixListenerStream> = if tcp_addr.is_some() {
+    // Peer-credential gate for the UDS transport (gap #28 / REQ-A141): the 0700 mode
+    // keeps *other* users out, but that is a filesystem property — this asks the kernel
+    // who connected (SO_PEERCRED / getpeereid). A refused connection is dropped before
+    // tonic ever sees it, and `PeerGuard` logs every refusal (plus the "could not
+    // verify" case), so the policy actually in force is never silent.
+    let peer_guard = crate::peercred::PeerGuard::from_env();
+    tracing::info!(
+        our_uid = crate::peercred::our_uid(),
+        policy = %std::env::var("AMOS_UDS_PEER").unwrap_or_else(|_| "enforce".into()),
+        "unix-socket peer-credential policy"
+    );
+    let incoming: Option<UnixIncoming> = if tcp_addr.is_some() {
         None
     } else {
         let listener = tokio::net::UnixListener::bind(&path)?;
@@ -1399,13 +1752,46 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
                 .context("failed to harden socket permissions")?;
         }
 
-        Some(UnixListenerStream::new(listener))
+        let (tx, rx) = mpsc::channel::<Result<tokio::net::UnixStream, std::io::Error>>(16);
+        // Accept in its own task so the peer check runs **before** tonic ever sees the
+        // connection (a refused one is simply never forwarded). The task ends when the
+        // receiver is dropped at shutdown, which is exactly when the server stops.
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        if !peer_guard.admits(&stream) {
+                            continue; // logged by the guard; the socket is closed on drop
+                        }
+                        if tx.send(Ok(stream)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if tx.send(Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Some(Box::pin(ReceiverStream::new(rx)))
     };
     // The single UDS serves BOTH gRPC services: the AI agent and the Android
     // compat layer, so Tauri talks to the whole OS backend over one connection.
     // The runtime is auto-selected: real Waydroid on device, in-process demo
     // elsewhere (so the whole pipeline works on any host).
-    let mut ai_service = AiAgentService::new().await;
+    // The daemon's **single, durable audit trail**. Resolved once and handed to
+    // BOTH the security layer and the privacy manager, so one `RecentTrail` read
+    // shows operation results (rate-limit / permission / probe) *and* access
+    // decisions, and both survive a restart. Path: `AMOS_AUDIT_PATH`, else
+    // `<AMOS_PRIVACY_PATH>.jsonl` (the historical location); neither set ⇒
+    // memory-only, honestly reported as no-trail.
+    let audit_sink = crate::audit::shared_trail_from_env();
+    let mut ai_service = AiAgentService::new_with_audit(audit_sink.clone()).await;
+    if let Some(handle) = log_sink {
+        ai_service = ai_service.with_log_sink(handle);
+    }
     // monitor counts requests to the *AiAgent* gRPC service (the AI daemon's own
     // RPCs); the Android-compat service sharing the same socket is separate.
     let monitor = ai_service.monitor();
@@ -1441,9 +1827,13 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     let android_runtime = amos_android::auto();
     let android_proxy: Arc<std::sync::Mutex<amos_android::lmk::LmkProxy>> =
         Arc::new(std::sync::Mutex::new(amos_android::lmk::LmkProxy::new()));
-    let android_manager: Arc<amos_android::manager::EnhancedAndroidManager> = Arc::new(
-        amos_android::manager::EnhancedAndroidManager::new(android_runtime),
-    );
+    // Android manager knobs come from the environment (documented
+    // AMOS_ANDROID_*_TIMEOUT / *_CACHE_SIZE), defaulting to the tuned values.
+    let android_manager: Arc<amos_android::manager::EnhancedAndroidManager> =
+        Arc::new(amos_android::manager::EnhancedAndroidManager::with_config(
+            android_runtime,
+            amos_android::manager::AndroidManagerConfig::from_env(),
+        ));
     let android_host: Arc<crate::governor_service::GovernorLmkHost> = Arc::new(
         crate::governor_service::GovernorLmkHost::new(Arc::clone(&governor)),
     );
@@ -1502,6 +1892,8 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             let mut now = 0u64;
+            // Runs until the daemon shuts down (the task is aborted when `serve`
+            // returns). `tick()` is the wait; the loop has no exit of its own.
             loop {
                 ticker.tick().await;
                 now += 1;
@@ -1587,6 +1979,8 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     let system_beat = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(sys_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Runs until the daemon shuts down (the task is aborted when `serve`
+        // returns, "Aborted on shutdown below"). `tick()` is the wait.
         loop {
             ticker.tick().await;
             let health = fold_system_health(
@@ -1623,6 +2017,10 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
     );
 
     let server = tonic::transport::Server::builder()
+        // Applied to **every** service: on the TCP transport a request without the right
+        // `x-amos-token` is refused before routing (see `tcp_auth.rs`); on UDS the gate's
+        // policy is `Open`, so this layer costs one metadata read.
+        .layer(tonic::service::interceptor::InterceptorLayer::new(tcp_gate))
         .add_service(AiAgentServer::with_interceptor(
             ai_service,
             move |req: tonic::Request<()>| {
@@ -1666,7 +2064,8 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         // (grants JSON + durable unified audit) is enabled by AMOS_PRIVACY_PATH;
         // unset ⇒ fresh deny-by-default, in-memory (docs/permissions-sandbox-audit-plan.md).
         .add_service({
-            let (privacy, persist) = crate::privacy_service::bootstrap();
+            let (privacy, persist) =
+                crate::privacy_service::bootstrap_with_sink(audit_sink.clone());
             crate::privacy_service::server(privacy, persist)
         })
         // Egress network-guard service (amos-network-guard + proto netguard.proto):
@@ -1870,6 +2269,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_reports_the_breaker_honestly_and_never_a_fake_closed() {
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        // A backend that always fails, behind a threshold-2 breaker.
+        struct Failing;
+        #[async_trait::async_trait]
+        impl crate::inference::real::InferenceBackend for Failing {
+            async fn infer(
+                &self,
+                _p: &str,
+                _c: &std::collections::HashMap<String, String>,
+                _m: usize,
+            ) -> anyhow::Result<Box<dyn crate::inference::real::TokenStream>> {
+                anyhow::bail!("backend is down")
+            }
+            fn metadata(&self) -> crate::inference::real::BackendMetadata {
+                MockBackend::new().metadata()
+            }
+            async fn health_check(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get_stats(&self) -> crate::inference::real::BackendStats {
+                crate::inference::real::BackendStats::default()
+            }
+        }
+        let br = crate::breaker::shared(crate::breaker::BreakerConfig {
+            enabled: true,
+            fail_threshold: 2,
+            cooldown: Duration::from_secs(30),
+        });
+        let backend: Arc<dyn InferenceBackend> = Arc::new(crate::breaker::BreakerBackend::new(
+            Arc::new(Failing),
+            br.clone(),
+        ));
+        let svc = AiAgentService::with_security_and_backend(security, backend).with_breaker(br);
+
+        // Healthy-looking at first: closed, enabled, and no invented counter movement.
+        let st = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        let b = st.breaker.expect("the breaker block is present");
+        assert!(b.enabled);
+        assert_eq!(b.state, "closed");
+        assert_eq!(b.fail_threshold, 2);
+        assert_eq!(b.cooldown_seconds, 30);
+        assert_eq!(b.openings, 0);
+        assert_eq!(b.rejections, 0);
+
+        // Two real failures open it; the third call is skipped (rejections moves).
+        for _ in 0..2 {
+            let mut s = svc
+                .stream_chat(stream_req(DEFAULT_CLIENT_ID, "sess"))
+                .await
+                .expect("stream opens")
+                .into_inner();
+            while s.next().await.is_some() {}
+        }
+        let mut s = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "sess"))
+            .await
+            .expect("stream opens")
+            .into_inner();
+        let mut saw_err = false;
+        while let Some(chunk) = s.next().await {
+            if let Ok(c) = chunk {
+                if c.error.contains("circuit breaker open") {
+                    saw_err = true;
+                }
+            }
+        }
+        assert!(saw_err, "the skipped call must say *why* it was skipped");
+
+        let st = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        let b = st.breaker.expect("the breaker block is present");
+        assert_eq!(b.state, "open");
+        assert_eq!(b.openings, 1);
+        assert_eq!(b.failures, 2);
+        assert_eq!(
+            b.rejections, 1,
+            "one call was skipped without touching the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn alerts_are_empty_when_healthy_and_list_what_is_wrong_when_not() {
+        // Healthy: a mock daemon with no breaker/stats attached ⇒ no rules fire. The
+        // reply must not carry an "all clear" object, just the empty list.
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let svc = AiAgentService::with_security(security);
+        let st = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        let alerts = st.alerts.expect("the alerts block is present").alerts;
+        assert!(
+            alerts.is_empty(),
+            "a healthy daemon reports no alerts: {alerts:?}"
+        );
+
+        // Degraded engine + an open breaker: two rules must fire, error first.
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let br = crate::breaker::shared(crate::breaker::BreakerConfig {
+            enabled: true,
+            fail_threshold: 1,
+            cooldown: Duration::from_secs(30),
+        });
+        // Open it for real (one failure at threshold 1) so the alert is not synthetic.
+        crate::breaker::lock(&br).on_failure(std::time::Instant::now());
+        let mut svc = AiAgentService::with_security(security).with_breaker(br);
+        svc.engine.degraded = true;
+        let st = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        let alerts = st.alerts.expect("the alerts block is present").alerts;
+        let ids: Vec<&str> = alerts.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"breaker_open"), "{ids:?}");
+        assert!(ids.contains(&"engine_degraded"), "{ids:?}");
+        assert_eq!(alerts[0].severity, "error", "errors come first: {ids:?}");
+        assert_eq!(alerts[0].id, "breaker_open");
+        // `active_for` is honest about the process-local history: first sight is 0s.
+        assert_eq!(alerts[0].active_for_seconds, 0);
+
+        // Polling again does not invent history, and clearing the condition clears the
+        // alert (no sticky alarm).
+        let st2 = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        let ids2: Vec<String> = st2
+            .alerts
+            .expect("alerts")
+            .alerts
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids2.len(), 2);
+        svc.engine.degraded = false;
+        let st3 = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        let ids3: Vec<String> = st3
+            .alerts
+            .expect("alerts")
+            .alerts
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids3, vec!["breaker_open".to_string()], "degraded cleared");
+    }
+
+    #[test]
+    fn tcp_addr_is_parsed_strictly_and_must_be_loopback() {
+        // Unset / empty ⇒ no TCP (the UDS path is used).
+        assert_eq!(parse_tcp_addr("").unwrap(), None);
+        assert_eq!(parse_tcp_addr("   ").unwrap(), None);
+
+        // A malformed value is an **error**, not a silent fallback to the socket: the
+        // old code returned None here, so a typo turned "serve on TCP" into "serve on a
+        // socket file" with nothing said.
+        assert!(parse_tcp_addr("127.0.0.1").is_err(), "missing port");
+        assert!(parse_tcp_addr("nonsense:99999").is_err(), "bad port");
+        assert!(
+            parse_tcp_addr("127.0.0.1:70000").is_err(),
+            "out-of-range port"
+        );
+
+        // Loopback is accepted (v4 and v6).
+        assert_eq!(
+            parse_tcp_addr("127.0.0.1:19090").unwrap().map(|a| a.port()),
+            Some(19090)
+        );
+        assert!(parse_tcp_addr("[::1]:19090").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_non_loopback_tcp_bind_needs_the_explicit_override() {
+        std::env::remove_var("AMOS_TCP_ALLOW_REMOTE");
+        let err = parse_tcp_addr("0.0.0.0:19090").expect_err("must refuse a LAN bind");
+        assert!(
+            err.to_string().contains("AMOS_TCP_ALLOW_REMOTE"),
+            "the message must name the override: {err}"
+        );
+        assert!(parse_tcp_addr("192.168.1.10:19090").is_err());
+
+        // …and the override is honoured (with a warning, which the server emits).
+        std::env::set_var("AMOS_TCP_ALLOW_REMOTE", "1");
+        assert!(parse_tcp_addr("0.0.0.0:19090").unwrap().is_some());
+        std::env::remove_var("AMOS_TCP_ALLOW_REMOTE");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_breaker_reports_enabled_false_and_no_state() {
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let br = crate::breaker::shared(crate::breaker::BreakerConfig {
+            enabled: false,
+            fail_threshold: 3,
+            cooldown: Duration::from_secs(30),
+        });
+        let svc = AiAgentService::with_security(security).with_breaker(br);
+        let st = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        let b = st.breaker.expect("the breaker block is present");
+        assert!(!b.enabled);
+        // Not in the serving path ⇒ no state at all, never a fabricated "closed".
+        assert_eq!(b.state, "");
+        assert_eq!(b.successes, 0);
+        assert_eq!(b.failures, 0);
+        assert_eq!(b.rejections, 0);
+    }
+
+    #[tokio::test]
     async fn status_reports_engine_and_degradation_honestly() {
         // Default build boots with the deterministic mock engine; it must be
         // reported as such (not as a real model), and never "degraded" (mock was
@@ -1882,7 +2522,24 @@ mod tests {
             .expect("get_status")
             .into_inner();
         assert!(reply.running);
-        assert_eq!(reply.engine, "mock", "mock backend reports itself as mock");
+        // The mock engine must not be passed off as a real model. The reported name is
+        // the *serving path*: the backend circuit breaker (REQ-A131) is on by default,
+        // so it appears as an honest `+breaker` suffix — the kind is still plainly
+        // `mock`. Only known decorators may ever appear here.
+        assert!(
+            reply.engine == "mock" || reply.engine == "mock+breaker",
+            "mock backend reports itself as mock, decorated only by known paths (got {:?})",
+            reply.engine
+        );
+        assert!(
+            reply
+                .engine
+                .rsplit('+')
+                .next()
+                .is_some_and(|k| k == "mock" || k == "breaker"),
+            "unexpected decorator in the engine name (got {:?})",
+            reply.engine
+        );
         assert!(!reply.engine_model.is_empty(), "mock still names its model");
         assert!(!reply.degraded, "mock-as-default is not a degradation");
         assert!(
@@ -2111,6 +2768,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_status_reports_the_log_sink_honestly() {
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let svc = AiAgentService::with_security(Arc::clone(&security));
+
+        // 1) No sink attached ⇒ the honest zero of "stdout only" (not a fake reading).
+        let reply = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("get_status")
+            .into_inner();
+        let ls = reply.log_sink.expect("log_sink block");
+        assert!(!ls.enabled, "absent sink must report enabled=false");
+        assert!(ls.path.is_empty(), "no path may be invented");
+        assert_eq!(
+            (
+                ls.bytes_written,
+                ls.lost_bytes,
+                ls.write_failures,
+                ls.rotations,
+                ls.active_bytes
+            ),
+            (0, 0, 0, 0, 0)
+        );
+
+        // 2) A live sink is reported: which file, and how much actually landed.
+        let dir = std::env::temp_dir().join(format!("amos-ai-logsink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sink = crate::logfile::TeeWriter::new(Some(crate::logfile::LogFileConfig {
+            dir: dir.clone(),
+            max_bytes: 1024,
+            keep: 2,
+        }));
+        {
+            use std::io::Write;
+            use tracing_subscriber::fmt::MakeWriter;
+            let mut w = sink.make_writer();
+            w.write_all(b"persisted\n").unwrap();
+        }
+        let svc = svc.with_log_sink(sink.handle());
+        let reply = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("get_status")
+            .into_inner();
+        let ls = reply.log_sink.expect("log_sink block");
+        assert!(ls.enabled);
+        assert!(ls.path.ends_with("amos-ai.log"), "path: {}", ls.path);
+        assert_eq!(ls.bytes_written, 10, "the bytes that really landed on disk");
+        assert_eq!((ls.lost_bytes, ls.write_failures), (0, 0));
+        assert_eq!(ls.active_bytes, 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn get_status_is_not_starved_by_generation_rate_limits() {
+        // Regression (found by the load test, REQ-A82): a generation burst used to
+        // exhaust the *shared* per-client bucket, so the daemon answered its own
+        // liveness probe with "request rejected by security layer" — the operator and
+        // the System UI lost sight of a healthy, busy daemon.
+        let config = RateLimitConfig {
+            requests_per_second: 1,
+            probe_requests_per_second: 2,
+            ..Default::default()
+        };
+        let security = Arc::new(SecurityManager::new(config));
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let svc = AiAgentService::with_security(security);
+
+        // Generation lane: first call admitted, second honestly rejected.
+        assert!(svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "burst-1"))
+            .await
+            .is_ok());
+        let err = svc
+            .stream_chat(stream_req(DEFAULT_CLIENT_ID, "burst-2"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        // Health channel: still answers while the generation lane is exhausted.
+        let status = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("a liveness probe must not be starved by generation traffic")
+            .into_inner();
+        assert!(status.running);
+
+        // …and the probe lane is itself bounded (audited, not silently dropped).
+        assert!(svc.get_status(Request::new(StatusRequest {})).await.is_ok());
+        let err = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        let entries = svc.security.audit_logger.get_recent(30).await;
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.operation == "probe" && e.result == AuditResult::Success),
+            "successful liveness probes must be audited"
+        );
+        assert!(
+            entries.iter().any(|e| e.operation == "probe"
+                && e.result == AuditResult::Rejected
+                && e.details.contains("probe rate limit")),
+            "over-limit probes must be audited as rejected"
+        );
+    }
+
+    #[tokio::test]
     async fn generation_gate_rejects_when_saturated_then_serves_after_release() {
         // Capacity 1, fail-fast: the second in-flight stream_chat must be
         // rejected honestly (ResourceExhausted + audited), must not allocate a
@@ -2274,6 +3049,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_status_reports_honest_generation_pool_metrics() {
+        // get_status must carry the live pool state, not a fabricated one:
+        // capacity is the configured slot count, in_flight mirrors held permits,
+        // and a disabled cache is reported as enabled=false (never a fake cache).
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let pool = Arc::new(GenerationPool::try_new(3).unwrap());
+        let svc = AiAgentService::with_generation_gate(
+            security,
+            Arc::new(MockBackend::new()),
+            pool.clone(),
+            Duration::from_millis(250),
+        );
+
+        let st = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("get_status")
+            .into_inner();
+        let gp = st.generation_pool.expect("generation_pool block present");
+        assert_eq!(gp.capacity, 3, "capacity is the configured slot count");
+        assert_eq!(gp.in_flight, 0);
+        assert_eq!(gp.available, 3);
+        assert_eq!(gp.wait_ms, 250, "bounded wait is reported in ms");
+        assert_eq!(
+            (
+                gp.acquired_total,
+                gp.rejected_saturated,
+                gp.rejected_timeout
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(gp.available + gp.in_flight, gp.capacity);
+
+        // Hold a slot: in_flight must rise and available must fall in lockstep.
+        let permit = pool.acquire(Duration::ZERO).await.expect("slot");
+        let st = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("get_status")
+            .into_inner();
+        let gp = st.generation_pool.expect("generation_pool block present");
+        assert_eq!((gp.in_flight, gp.available), (1, 2));
+        assert_eq!(gp.acquired_total, 1);
+        assert_eq!(gp.available + gp.in_flight, gp.capacity);
+        drop(permit);
+
+        // Default service (no cache wired) truthfully reports a disabled cache.
+        let rc = st.response_cache.expect("response_cache block present");
+        assert!(!rc.enabled, "caching is off by default");
+        assert_eq!(rc.capacity, 0);
+        assert_eq!((rc.hits, rc.misses, rc.stores), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn get_status_reports_response_cache_counters_when_enabled() {
+        // With a live cache handle attached, get_status must show the real
+        // hit/miss/store counters after an identical-prompt replay.
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let cache = Arc::new(crate::cache::ResponseCache::with_defaults());
+        let backend = Arc::new(crate::cache::CachingBackend::new(
+            Arc::new(MockBackend::new()),
+            cache.clone(),
+        ));
+        let svc = AiAgentService::with_generation_gate(
+            security,
+            backend,
+            Arc::new(GenerationPool::try_new(4).unwrap()),
+            Duration::ZERO,
+        )
+        .with_response_cache(cache.clone());
+
+        let rc = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("get_status")
+            .into_inner()
+            .response_cache
+            .expect("response_cache block present");
+        assert!(rc.enabled);
+        assert_eq!(rc.capacity, 32);
+        assert_eq!(rc.ttl_seconds, 300);
+        assert_eq!(rc.entries, 0);
+
+        // Two identical prompts: one miss+store, then one hit.
+        for _ in 0..2 {
+            let mut s = svc
+                .stream_chat(stream_req(DEFAULT_CLIENT_ID, "same"))
+                .await
+                .expect("stream opens")
+                .into_inner();
+            while let Some(chunk) = s.next().await {
+                if let Ok(c) = chunk {
+                    if c.done {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let rc = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("get_status")
+            .into_inner()
+            .response_cache
+            .expect("response_cache block present");
+        assert!(rc.enabled);
+        assert_eq!((rc.misses, rc.hits, rc.stores), (1, 1, 1));
+        assert_eq!(rc.entries, 1);
+        assert!(
+            rc.hits + rc.misses >= 2,
+            "invariant: hits + misses equals lookups performed"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_client_is_rejected() {
         // A fresh SecurityManager grants nothing, so any caller is denied.
         let security = Arc::new(SecurityManager::default());
@@ -2384,6 +3283,65 @@ mod tests {
         svc.save_sessions().await;
         assert!(path.exists(), "sessions persisted to disk on shutdown");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_keys_the_session_by_the_client_id() {
+        let security = Arc::new(SecurityManager::default());
+        security
+            .permission_manager
+            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+            .await;
+        let sessions = Arc::new(SessionManager::default());
+        let svc = AiAgentService::with_security(security).with_sessions(sessions.clone(), None);
+
+        // Two turns of the SAME conversation, then one of a different conversation.
+        for sid in ["conv-1", "conv-1", "conv-2"] {
+            let mut stream = svc
+                .stream_chat(stream_req(DEFAULT_CLIENT_ID, sid))
+                .await
+                .unwrap()
+                .into_inner();
+            while let Some(chunk) = stream.next().await {
+                if let Ok(c) = chunk {
+                    if c.done {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Token updates land just after each terminal frame; poll briefly.
+        let mut list = sessions.list_active().await;
+        for _ in 0..50 {
+            if list.iter().any(|s| s.tokens_generated >= 2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            list = sessions.list_active().await;
+        }
+
+        // Regression: the daemon used to mint a fresh session per turn and ignore the
+        // client id, so two turns of "conv-1" were two throwaway sessions and the
+        // conversation's usage never accumulated.
+        assert_eq!(
+            list.len(),
+            2,
+            "one daemon session per client conversation id"
+        );
+        let conv1 = list
+            .iter()
+            .find(|s| s.id == "conv-1")
+            .expect("conv-1 tracked under the client-supplied id");
+        assert!(
+            conv1.tokens_generated >= 2,
+            "both turns counted on one session (got {})",
+            conv1.tokens_generated
+        );
+        assert!(
+            list.iter().any(|s| s.id == "conv-2"),
+            "conv-2 has its own session"
+        );
     }
 
     #[test]

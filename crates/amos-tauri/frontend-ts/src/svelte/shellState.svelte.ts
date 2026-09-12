@@ -74,7 +74,7 @@ function clearOverlays() {
 
 /** Open an app screen (from dock/grid/recents/library). Records a recent (built-ins
  * only — third-party ids don't pollute the frequently-used set) so the App Library
- * "Frequently Used" group stays live, mirroring the React shell's `open`. */
+ * "Frequently Used" group stays live, mirroring the shell's `open`. */
 export function open(id: string): void {
   if (appTitleKey(id) !== null) pushRecent(id);
   clearOverlays();

@@ -1,6 +1,7 @@
 <script lang="ts">
-  // VoiceMicButton.svelte — Svelte 5 (runes) port of components/VoiceMicButton.tsx.
-  // No React. Voice → ASR one-shot mic button: tap to record, tap again to
+  // VoiceMicButton.svelte — Svelte 5 (runes) port of the former React
+  // VoiceMicButton (removed with the React shell; this is the only implementation).
+  // Voice → ASR one-shot mic button: tap to record, tap again to
   // transcribe the clip via the translate daemon (`transcribe_audio`, WAV) and
   // surface the text through `onTranscript`. The voice state machine + PCM→WAV
   // logic reuse lib/voice.ts; mic capture degrades silently when unavailable.
@@ -12,7 +13,8 @@
     voiceReducer,
     type VoiceStatus,
   } from "../lib/voice";
-  import { loadLedger, saveLedger, grantCap, revokeCap, capSet, type Capability } from "../lib/permissions";
+  import { loadLedger, capSet, type Capability } from "../lib/permissions";
+  import { grantCapability, revokeCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
 
   const MIC: Capability = "microphone";
@@ -165,13 +167,13 @@
   }
 
   const allowMic = () => {
-    saveLedger(grantCap(loadLedger(), appId, MIC));
+    grantCapability(appId, MIC);
     micGranted = true;
     ask = false;
     void start();
   };
   const denyMic = () => {
-    saveLedger(revokeCap(loadLedger(), appId, MIC));
+    revokeCapability(appId, MIC);
     micGranted = false;
     ask = false;
   };

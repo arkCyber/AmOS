@@ -88,8 +88,8 @@ export function toSpyHit(raw: unknown): SpyHitPayload | null {
 
 /**
  * Shape of the app i18n `t(key, params)` used to localize notification copy at
- * write-time. The React shell (`useI18n`) and the Svelte `t` both agree on this
- * `{param}` interpolation contract.
+ * write-time. The shell's `t` (`svelte/locale.svelte.ts`) fixes this `{param}`
+ * interpolation contract.
  */
 export type SpyTranslate = (key: string, params?: Record<string, string | number>) => string;
 

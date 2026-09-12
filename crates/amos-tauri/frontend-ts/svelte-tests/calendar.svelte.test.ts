@@ -33,6 +33,31 @@ type Host = { container: HTMLElement };
 
 const txt = (h: Host) => h.container.textContent ?? "";
 const el = <T extends Element>(h: Host, sel: string) => h.container.querySelector(sel) as T | null;
+
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
 const rows = (h: Host) =>
   [...h.container.querySelectorAll("[data-event]")].map((r) => r.getAttribute("data-event"));
 
@@ -63,6 +88,15 @@ const storedEvents = () => readStoreValue<CalendarEvent[]>(CALENDAR_KEY, []);
 const storedGroups = () => readStoreValue<CalendarGroup[]>(CALENDARS_KEY, []);
 
 describe("CalendarApp.svelte — month grid", () => {
+  test("an intentionally emptied store is not re-seeded with demo events", () => {
+    window.localStorage.setItem("amos.calendar", "[]");
+    window.localStorage.setItem("amos.calendars", "[]");
+    const host = render(CalendarApp);
+    // The built-in default calendar is repaired, but the demo events must not return.
+    expect(txt(host)).not.toContain("团队同步");
+    expect(readStoreValue<unknown>("amos.calendar", null)).toEqual([]);
+  });
+
   test("renders a 6×7 grid and marks exactly one 'today' cell", () => {
     const { d0 } = seed();
     const host = render(CalendarApp);
@@ -153,6 +187,26 @@ describe("CalendarApp.svelte — create / edit / delete", () => {
     expect(saved).toBeTruthy();
     expect(saved!.startAt).toBe(d0 + 11 * 3_600_000 + 30 * 60_000);
     expect(rows(host)).toContain(saved!.id);
+  });
+
+  test("a rejected write is reported and the event is not applied", async () => {
+    seed();
+    const restore = failWritesFor(CALENDAR_KEY);
+    try {
+      const host = render(CalendarApp);
+      await fireEvent.click(el(host, '[data-testid="cal-new"]')!);
+      await fireEvent.input(el<HTMLInputElement>(host, '[data-testid="cal-title-input"]')!, {
+        target: { value: "牙医" },
+      });
+      await fireEvent.click(el(host, '[data-testid="cal-save"]')!);
+      // Not stored ⇒ not claimed: banner, the editor stays open with the draft, and no
+      // phantom row (it would vanish on reload).
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(el(host, '[data-testid="cal-editor"]')).toBeTruthy();
+      expect(storedEvents().some((e) => e.title === "牙医")).toBe(false);
+    } finally {
+      restore();
+    }
   });
 
   test("a blank title cannot be saved (no phantom event)", async () => {

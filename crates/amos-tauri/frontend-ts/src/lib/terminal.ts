@@ -97,3 +97,32 @@ export function capLines(lines: readonly TermLine[], cap = 1000): TermLine[] {
   if (lines.length <= cap) return lines as TermLine[];
   return lines.slice(lines.length - cap);
 }
+
+/**
+ * Terminal cell geometry → the PTY window size (`term_resize` cols/rows).
+ *
+ * The host `term_spawn` starts a session at a fixed default (120×24); a real
+ * terminal must tell the shell how big it actually is, or interactive programs
+ * (wrapping, `vim`/`htop` layout) draw for the wrong grid. Returns `null` when the
+ * geometry is not measurable — the honest answer there is to leave the host's
+ * default alone rather than invent a size.
+ */
+export function ptySizeFor(opts: {
+  /** Content box (CSS px) available to the character grid. */
+  width: number;
+  height: number;
+  /** One character cell (CSS px). */
+  charW: number;
+  charH: number;
+  minCols?: number;
+  minRows?: number;
+}): { cols: number; rows: number } | null {
+  const { width, height, charW, charH } = opts;
+  if (![width, height, charW, charH].every((n) => Number.isFinite(n) && n > 0)) return null;
+  const minCols = opts.minCols ?? 20;
+  const minRows = opts.minRows ?? 4;
+  return {
+    cols: Math.max(minCols, Math.floor(width / charW)),
+    rows: Math.max(minRows, Math.floor(height / charH)),
+  };
+}

@@ -18,9 +18,6 @@
  *    unit-testable headlessly: it returns a mono Float32Array of a short, looping
  *    motif that is audibly distinct per token.
  */
-import type { Alarm } from "./time";
-
-/** Reserved default directory (relative to the served root) for ringtone files. */
 export const RINGTONE_DIR = "sounds/ringtones";
 
 /** Stable ids — each is a distinct synthesis motif and a file name. */
@@ -51,11 +48,6 @@ export function ringtoneIdFor(toneToken?: string): RingtoneId {
 /** Relative URL a real ringtone file WOULD live at under the default dir. */
 export function ringtoneFileUrl(id: RingtoneId): string {
   return `${RINGTONE_DIR}/${RINGTONE_FILE_BY_ID[id]}`;
-}
-
-/** The tone an alarm should ring with (tone token, defaulting to the first). */
-export function ringtoneIdForAlarm(alarm: Pick<Alarm, "tone">): RingtoneId {
-  return ringtoneIdFor(alarm.tone);
 }
 
 /* -------------------------------------------------------------------------- *
@@ -141,10 +133,5 @@ export function makeToneSamples(token: string | undefined, rate = 16_000): Float
     }
   }
   return out;
-}
-
-/** Convenience: make samples for an Alarm's stored tone token. */
-export function makeAlarmSamples(alarm: Pick<Alarm, "tone">, rate = 16_000): Float32Array {
-  return makeToneSamples(alarm.tone, rate);
 }
 

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "AMOS_VAD_TIMEOUT",
+    "reason": "docs/bidi-voice-asr.md names this as a FUTURE knob (\"静音超时（后续可加 AMOS_VAD_TIMEOUT）\"): the ASR silence/endpoint timeout is a constant today. Allow-listed so the doc may keep describing the intended escape hatch; wire it (or reword the doc) when the silence path is reworked."
+  },
+  {
+    "name": "AMOS_MAX_TOKENS",
+    "reason": "Only claimed by the historical CODE_COMPLETION_SUMMARY.md table (mapping it to a `Config.max_tokens` field). That `Config` module was dead — nothing constructed it and the daemon has no implementation point for a global token cap (requests carry their own) — so it was removed (Round 36). Not a supported knob; re-add this entry only if a real cap is implemented."
+  },
+  {
+    "name": "AMOS_TIMEOUT_SECS",
+    "reason": "Same as AMOS_MAX_TOKENS: a claim in the historical CODE_COMPLETION_SUMMARY.md for the removed dead `Config.request_timeout` field. The real timeouts are per-backend (ureq timeouts) and `AMOS_TIMEOUT_SECS` is honoured nowhere."
+  },
+  {
+    "name": "AMOS_MEMORY_LIMIT_MB",
+    "reason": "Same as AMOS_MAX_TOKENS: a claim in the historical CODE_COMPLETION_SUMMARY.md for the removed dead `Config.memory_limit_mb` field; no daemon code path enforces a memory limit."
+  },
+  {
+    "name": "AMOS_ACCELERATION",
+    "reason": "Legacy boolean on the removed dead `Config` struct (CLAIMS table in CODE_COMPLETION_SUMMARY.md). The accelerator strategy is configured by `AMOS_ACCEL` (accel.rs) and reported via `AccelProfile::from_env`; `AMOS_ACCELERATION` is honoured nowhere."
+  }
+]

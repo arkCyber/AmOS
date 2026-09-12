@@ -8,13 +8,26 @@ interface FakeSrc {
   start: () => void;
   stop: () => void;
 }
-/** Install a fake window.AudioContext and return the recorded sources. */
-function fakeAudio(): { sources: FakeSrc[]; restore: () => void } {
+/** Install a fake window.AudioContext and return the recorded sources + contexts. */
+function fakeAudio(): {
+  sources: FakeSrc[];
+  contexts: Array<{ closed: number }>;
+  restore: () => void;
+} {
   const sources: FakeSrc[] = [];
+  const contexts: Array<{ closed: number }> = [];
   const prevWindow = (globalThis as Record<string, unknown>).window as unknown;
   (globalThis as Record<string, unknown>).window = {
     AudioContext: class {
       destination = {};
+      closed = 0;
+      constructor() {
+        contexts.push(this as unknown as { closed: number });
+      }
+      close() {
+        this.closed += 1;
+        return Promise.resolve();
+      }
       createBuffer(_ch: number, _len: number, _rate: number) {
         return { copyToChannel() {} };
       }
@@ -38,7 +51,7 @@ function fakeAudio(): { sources: FakeSrc[]; restore: () => void } {
     else (globalThis as Record<string, unknown>).window = prevWindow;
     resetPlayCtx();
   };
-  return { sources, restore };
+  return { sources, contexts, restore };
 }
 
 const pcm = (n: number): TtsPayload => ({ samples: [n, 0], sample_rate: 16000, channels: 1 });
@@ -57,13 +70,25 @@ describe("realtimeTts playback (latest-segment wins)", () => {
     }
   });
 
-  test("resetPlayCtx clears the active source so the next play is not stopped early", () => {
-    const { sources, restore } = fakeAudio();
+  test("resetPlayCtx silences the active source and closes the audio context", async () => {
+    const { sources, contexts, restore } = fakeAudio();
     try {
       playPcm(pcm(1));
+      expect(contexts).toHaveLength(1);
       resetPlayCtx();
+      // Leaving the screen must actually silence read-aloud…
+      expect(sources[0]!.stopped).toBe(true);
+      // …and release the AudioContext (dropping the reference left it running).
+      expect(contexts[0]!.closed).toBe(1);
+
+      // Idempotent: a second reset neither throws nor double-closes.
+      resetPlayCtx();
+      expect(contexts).toHaveLength(1);
+      expect(contexts[0]!.closed).toBe(1);
+
+      // The next segment gets a fresh context and is not preempted by the old one.
       playPcm(pcm(2));
-      expect(sources[0]!.stopped).toBe(false); // no longer tracked as active
+      expect(contexts).toHaveLength(2);
       expect(sources[1]!.stopped).toBe(false);
     } finally {
       restore();

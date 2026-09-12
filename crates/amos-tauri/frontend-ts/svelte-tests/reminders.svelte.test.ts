@@ -29,6 +29,31 @@ const inputByLabel = (h: { container: HTMLElement }, label: string) =>
   [...h.container.querySelectorAll("input")].find((i) => i.getAttribute("aria-label") === label) as
     HTMLInputElement | undefined;
 
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function. (`window.localStorage` is a per-access proxy, so the prototype
+ * cannot be patched — the window property itself is replaced.)
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 /** Deterministic fixture: an inbox + a custom "生活" list with 2 pending + 1 done. */
 function seed() {
   const now = Date.now();
@@ -63,6 +88,16 @@ function seed() {
 }
 
 describe("RemindersApp.svelte", () => {
+  test("an intentionally emptied store is not re-seeded with demo reminders", () => {
+    window.localStorage.setItem("amos.reminders", "[]");
+    window.localStorage.setItem("amos.reminderLists", "[]");
+    const host = render(RemindersApp);
+    // The built-in default list is repaired (nothing is unreachable), but the demo
+    // reminders must not come back.
+    expect(txt(host)).not.toContain("买牛奶");
+    expect(readStoreValue<unknown>("amos.reminders", null)).toEqual([]);
+  });
+
   test("seeds show in 全部 and the custom list chip appears", () => {
     seed();
     const host = render(RemindersApp);
@@ -83,6 +118,29 @@ describe("RemindersApp.svelte", () => {
     expect(txt(host)).toContain("买咖啡");
     const stored = readStoreValue<Reminder[]>(REMINDERS_KEY, []);
     expect(stored.some((r) => r.title === "买咖啡")).toBe(true);
+  });
+
+  test("a rejected write is reported and the reminder is not applied", async () => {
+    seed();
+    const restore = failWritesFor(REMINDERS_KEY);
+    try {
+      const host = render(RemindersApp);
+      await fireEvent.click(buttonContaining(host, "新提醒事项") as HTMLButtonElement);
+      await fireEvent.input(inputByLabel(host, "标题") as HTMLInputElement, {
+        target: { value: "买咖啡" },
+      });
+      await fireEvent.click(buttonContaining(host, "添加") as HTMLButtonElement);
+      // The store never accepted it, so the list must not show it (and the compose
+      // form stays open with the draft).
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(txt(host)).not.toContain("买咖啡");
+      expect(inputByLabel(host, "标题")).toBeTruthy();
+      expect(readStoreValue<Reminder[]>(REMINDERS_KEY, []).some((r) => r.title === "买咖啡")).toBe(
+        false,
+      );
+    } finally {
+      restore();
+    }
   });
 
   test("completing moves a reminder out of 全部 into the 已完成 smart view", async () => {

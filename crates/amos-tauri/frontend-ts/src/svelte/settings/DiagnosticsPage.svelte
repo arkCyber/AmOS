@@ -7,12 +7,16 @@
   import SystemPanel from "../SystemPanel.svelte";
   import TaskManager from "../TaskManager.svelte";
   import LmkDebugPanel from "../LmkDebugPanel.svelte";
+  import QuarantinePanel from "./QuarantinePanel.svelte";
 
   // Panels own their headers + data refresh; Sensor/System/TaskManager/Lmk hide
   // themselves when there is nothing to show (daemon offline), so we simply stack.
+  // QuarantinePanel is the one panel that needs no daemon: it reports the corrupt
+  // store values this shell has preserved locally.
 </script>
 
 <div class="space-y-5">
+  <QuarantinePanel />
   <SensorPanel />
   <LiveSensors />
   <SystemPanel />

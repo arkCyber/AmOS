@@ -1,11 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { flipQuick, flipRadio, applyConnectivity, flipLocation, locationEnabled, dndActive, radioIcons, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, NOTIF_CAP, flipFlashlight, torchOn, normalizeFlashlight, type Notif, type FlashlightStore } from "../lib/settings";
+import { flipQuick, flipRadio, flipLocation, locationEnabled, dndActive, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, NOTIF_CAP, flipFlashlight, torchOn, normalizeFlashlight, type Notif, type FlashlightStore } from "../lib/settings";
 import {
+  BACKUP_VERSION,
   SETTINGS_KEY,
+  SYNC_STORES,
+  parseBackup,
   readCloud,
+  restoreStores,
   setCloudPrefs,
   snapshotStores,
+  summarizeBackup,
 } from "../lib/cloud";
+import { FILES_FAV_KEY } from "../lib/files";
+import { CONV_KEY } from "../lib/messages";
+import { NOTES_KEY } from "../lib/notes";
+import { CONTACTS_KEY } from "../lib/contacts";
+import { CALENDAR_KEY, CALENDARS_KEY } from "../lib/calendar";
+import { ALARM_KEY } from "../lib/alarmCore";
+import { CALLLOG_KEY } from "../lib/calllog";
+import { VMEMOS_KEY } from "../lib/voiceMemos";
+import { CAPTURES_KEY } from "../lib/cameraCapture";
+import { DRAFT_KEY } from "../lib/smsDrafts";
+import { INTERP_LOG_KEY } from "../lib/interp";
+import { WIFI_KEY } from "../lib/wifi";
+import { PERMISSIONS_KEY } from "../lib/permissions";
 
 describe("settings / NC helpers", () => {
   test("flipQuick toggles immutably", () => {
@@ -66,32 +84,6 @@ describe("settings / NC helpers", () => {
     const gated = { airplane: true, wifi: false };
     expect(flipRadio(gated, "wifi")).toBe(gated); // unchanged reference
     expect(flipRadio(gated, "bluetooth").bluetooth).toBeUndefined();
-  });
-
-  test("radioIcons shows wifi+bt normally, airplane supersedes them", () => {
-    expect(radioIcons({ wifi: true, bluetooth: false })).toEqual([
-      { kind: "wifi", on: true },
-      { kind: "bluetooth", on: false },
-    ]);
-    expect(radioIcons({ wifi: true, bluetooth: true, airplane: true })).toEqual([
-      { kind: "airplane", on: true },
-    ]);
-    expect(radioIcons({})).toEqual([
-      { kind: "wifi", on: false },
-      { kind: "bluetooth", on: false },
-    ]);
-  });
-
-  test("applyConnectivity dims wifi when offline, leaves bt/airplane alone", () => {
-    const icons = radioIcons({ wifi: true, bluetooth: true });
-    expect(applyConnectivity(icons, true)).toEqual(icons); // online → unchanged
-    const offline = applyConnectivity(icons, false);
-    expect(offline[0]).toEqual({ kind: "wifi", on: false });
-    expect(offline[1]).toEqual({ kind: "bluetooth", on: true }); // bt unaffected
-
-    // airplane present → wifi already gone; offline doesn't change it
-    const ap = radioIcons({ airplane: true });
-    expect(applyConnectivity(ap, false)).toEqual(ap);
   });
 
   test("newestAddedNotif reports only newly-added ids, newest time wins", () => {
@@ -171,18 +163,256 @@ describe("settings / NC helpers", () => {
       "amos.notes": [{ text: "hi" }],
       "amos.reminders": [{ id: "r1", title: "写周报" }],
       "amos.reminderLists": [{ id: "inbox", custom: false, color: "blue" }],
+      [FILES_FAV_KEY]: ["/notes/a.txt"],
+      [CONV_KEY]: [{ id: "c:xiaoan", name: "小安", msgs: [] }],
       "amos.other-not-synced": undefined, // non-listed key is ignored entirely
     };
-    const a = snapshotStores(stores);
-    const b = snapshotStores({ ...stores });
-    expect(a).toBe(b); // same fixed key order → same JSON every time
+    const a = snapshotStores(stores, 1_700_000_000_000);
+    const b = snapshotStores({ ...stores }, 1_700_000_000_000);
+    expect(a).toBe(b); // same fixed key order (and explicit `at`) → same JSON every time
+    // The blob carries its own metadata: format version + when it was taken, so
+    // "when was this backup made?" is a property of the backup, not a side pref.
+    const env = JSON.parse(a) as { v?: number; at?: number; stores?: Record<string, unknown> };
+    expect(env.v).toBe(BACKUP_VERSION);
+    expect(env.at).toBe(1_700_000_000_000);
+    expect(Object.keys(env.stores ?? {})).toContain("amos.notes");
     expect(a).toContain('"amos.photos"');
     expect(a).toContain('"amos.notes"');
     expect(a).toContain('"amos.reminders"'); // reminders are user data → backed up
     expect(a).toContain('"amos.reminderLists"');
+    // The list uses the SAME exported constants the stores are written under: a
+    // stale literal once dropped file favourites and every message thread from
+    // the backup (`amos.files.fav` ≠ FILES_FAV_KEY, `amos.messages` ≠ CONV_KEY).
+    expect(SYNC_STORES).toContain(FILES_FAV_KEY);
+    expect(SYNC_STORES).toContain(CONV_KEY);
+    expect(SYNC_STORES).not.toContain("amos.files.fav");
+    expect(SYNC_STORES).not.toContain("amos.messages");
+    expect(a).toContain(`"${FILES_FAV_KEY}"`);
+    expect(a).toContain(`"${CONV_KEY}"`);
+    // Round 50: the list was **incomplete** — contacts, calendar events, alarms, the
+    // call log, voice memos, captures, SMS drafts and the interpreter transcript are
+    // user content too, and the Settings hint promises "data is snapshotted".
+    for (const key of [
+      CONTACTS_KEY,
+      CALENDAR_KEY,
+      CALENDARS_KEY,
+      ALARM_KEY,
+      CALLLOG_KEY,
+      VMEMOS_KEY,
+      CAPTURES_KEY,
+      DRAFT_KEY,
+      INTERP_LOG_KEY,
+    ]) {
+      expect(SYNC_STORES as readonly string[]).toContain(key);
+      expect(snapshotStores({ [key]: ["x"] }, 1)).toContain(`"${key}"`);
+    }
+    // …while configuration / device state is classified, not backed up: restoring a
+    // backup must not move a device toggle or re-grant a capability.
+    expect(SYNC_STORES).not.toContain(WIFI_KEY);
+    expect(SYNC_STORES).not.toContain(PERMISSIONS_KEY);
     expect(a).not.toContain("other-not-synced"); // non-sync store omitted
     const parsed = JSON.parse(a) as Record<string, unknown>;
     expect(Object.keys(parsed).length).toBeGreaterThan(0);
+  });
+
+  test("parseBackup keeps only backup-eligible keys; a corrupt blob is null", () => {
+    const blob = JSON.stringify({
+      [NOTES_KEY]: [{ id: "n1", text: "hi", ts: 1 }],
+      [PERMISSIONS_KEY]: { camera: ["camera"] }, // config ledger — not content
+      "amos.nope": 1, // an invented key
+    });
+    // Only SYNC_STORES keys survive the decode, in snapshot order.
+    expect(Object.keys(parseBackup(blob) ?? {})).toEqual([NOTES_KEY]);
+    expect(parseBackup(JSON.stringify({}))).toEqual({}); // valid but carries nothing
+    // Corrupt / absent / wrong-shape blobs decode to `null` (never to "empty").
+    expect(parseBackup("")).toBeNull();
+    expect(parseBackup("   ")).toBeNull();
+    expect(parseBackup("{not json")).toBeNull();
+    expect(parseBackup("[]")).toBeNull();
+    expect(parseBackup("null")).toBeNull();
+    expect(parseBackup(undefined)).toBeNull();
+    expect(parseBackup(42)).toBeNull();
+    // An already-parsed object is accepted too (the shared store may hand one back).
+    expect(parseBackup({ [NOTES_KEY]: ["x"] })).toEqual({ [NOTES_KEY]: ["x"] });
+    // Envelope form (v1+): the stores live under `stores`, and the whitelist applies
+    // to that inner map — a forged `amos.permissions` inside it is dropped as well.
+    const v1 = JSON.stringify({
+      v: BACKUP_VERSION,
+      at: 1_700_000_000_000,
+      stores: { [NOTES_KEY]: [{ id: "n1" }], [PERMISSIONS_KEY]: { camera: ["camera"] } },
+    });
+    expect(Object.keys(parseBackup(v1) ?? {})).toEqual([NOTES_KEY]);
+    // Decoding is not the version guard (restore is): a *newer* blob still summarizes.
+    const newer = JSON.stringify({ v: BACKUP_VERSION + 1, at: 1, stores: { [NOTES_KEY]: ["x"] } });
+    expect(parseBackup(newer)).toEqual({ [NOTES_KEY]: ["x"] });
+    // A blob whose `stores` is not an object is treated as a legacy bare map, not as
+    // an envelope, so a malformed envelope cannot masquerade as an empty backup.
+    expect(parseBackup(JSON.stringify({ v: 1, at: 1, stores: [] }))).toEqual({});
+  });
+
+  test("summarizeBackup counts how many stores hold content (empty default excluded)", () => {
+    const AT = 1_700_000_000_000;
+    // What `syncNow` actually writes: every store present, untouched ones as `[]`.
+    const fresh = snapshotStores(
+      Object.fromEntries(SYNC_STORES.map((k) => [k, [] as unknown])),
+      AT,
+    );
+    expect(summarizeBackup(fresh)).toEqual({
+      stores: SYNC_STORES.length,
+      filled: 0,
+      total: SYNC_STORES.length,
+      at: AT,
+      v: BACKUP_VERSION,
+    });
+    const withData = snapshotStores(
+      {
+        [NOTES_KEY]: [{ id: "n1", text: "hi", ts: 1 }],
+        [CONTACTS_KEY]: [{ id: "c1", name: "小安" }],
+        [CALLLOG_KEY]: [] as unknown, // empty → not "filled"
+      },
+      AT,
+    );
+    expect(summarizeBackup(withData)).toEqual({
+      stores: 3,
+      filled: 2,
+      total: SYNC_STORES.length,
+      at: AT,
+      v: BACKUP_VERSION,
+    });
+    // A legacy (pre-envelope) blob still summarizes — but claims no timestamp/version.
+    expect(summarizeBackup(JSON.stringify({ [NOTES_KEY]: ["x"] }))).toEqual({
+      stores: 1,
+      filled: 1,
+      total: SYNC_STORES.length,
+      at: null,
+      v: null,
+    });
+    // A non-positive/absent `at` is not a timestamp (never renders "synced at 1970").
+    expect(summarizeBackup(JSON.stringify({ v: BACKUP_VERSION, at: 0, stores: {} }))).toEqual({
+      stores: 0,
+      filled: 0,
+      total: SYNC_STORES.length,
+      at: null,
+      v: BACKUP_VERSION,
+    });
+    // A corrupt/absent blob has no summary at all — the UI shows no restore then.
+    expect(summarizeBackup("nope")).toBeNull();
+    expect(summarizeBackup("")).toBeNull();
+  });
+
+  test("restoreStores writes back content stores in snapshot order, and writes NOTHING on a corrupt blob", () => {
+    const written: Array<[string, unknown]> = [];
+    const sink = (k: string, v: unknown) => {
+      written.push([k, v]);
+      return true;
+    };
+    const blob = JSON.stringify({
+      [NOTES_KEY]: [{ id: "n1", text: "hi", ts: 1 }],
+      [CONTACTS_KEY]: [{ id: "c1" }],
+    });
+    const ok = restoreStores(blob, sink);
+    expect(ok).toEqual({ ok: true, restored: [NOTES_KEY, CONTACTS_KEY], failed: [], refused: [] });
+    // Snapshot order, not blob order (the blob listed notes first here, but the
+    // guarantee is the fixed SYNC_STORES order — same as `snapshotStores`).
+    expect(written.map(([k]) => k)).toEqual([NOTES_KEY, CONTACTS_KEY]);
+    expect(written[0]![1]).toEqual([{ id: "n1", text: "hi", ts: 1 }]);
+
+    // Hardening: a crafted backup cannot re-grant a capability, move a radio, or
+    // invent a store — those keys are reported and left untouched.
+    const crafted: Array<[string, unknown]> = [];
+    const report = restoreStores(
+      JSON.stringify({
+        [NOTES_KEY]: ["kept"],
+        [PERMISSIONS_KEY]: { camera: ["camera"] },
+        [WIFI_KEY]: { on: true },
+        "amos.evil": 1,
+      }),
+      (k, v) => {
+        crafted.push([k, v]);
+        return true;
+      },
+    );
+    expect(report.restored).toEqual([NOTES_KEY]);
+    expect(report.refused).toEqual([PERMISSIONS_KEY, WIFI_KEY, "amos.evil"].sort());
+    expect(crafted).toEqual([[NOTES_KEY, ["kept"]]]);
+
+    // A corrupt blob must not blank the user's stores ("restore" ≠ "wipe").
+    const untouched: Array<[string, unknown]> = [];
+    for (const bad of ["", "{oops", "[]", "null"]) {
+      expect(
+        restoreStores(bad, (k, v) => {
+          untouched.push([k, v]);
+          return true;
+        }),
+      ).toEqual({
+        ok: false,
+        restored: [],
+        failed: [],
+        refused: [],
+        reason: "malformed",
+      });
+    }
+    expect(untouched).toEqual([]);
+
+    // Envelope blobs restore the same way, through their inner `stores` map.
+    const env: Array<[string, unknown]> = [];
+    const envReport = restoreStores(
+      JSON.stringify({ v: BACKUP_VERSION, at: 1_700_000_000_000, stores: { [NOTES_KEY]: ["v1"] } }),
+      (k, v) => {
+        env.push([k, v]);
+        return true;
+      },
+    );
+    expect(envReport).toEqual({ ok: true, restored: [NOTES_KEY], failed: [], refused: [] });
+    expect(env).toEqual([[NOTES_KEY, ["v1"]]]);
+
+    // A blob from a *newer* format is refused rather than guessed at — applying a
+    // future shape would write mismatched data over live stores.
+    const tooNew: Array<[string, unknown]> = [];
+    const newer = restoreStores(
+      JSON.stringify({ v: BACKUP_VERSION + 1, at: 1, stores: { [NOTES_KEY]: ["future"] } }),
+      (k, v) => {
+        tooNew.push([k, v]);
+        return true;
+      },
+    );
+    expect(newer).toEqual({
+      ok: false,
+      restored: [],
+      failed: [],
+      refused: [],
+      reason: "unsupported-version",
+    });
+    expect(tooNew).toEqual([]);
+    // …while a blob with no version at all is a **legacy** shape, not a newer one,
+    // and still restores (shipping the envelope must not brick an existing backup).
+    const legacy = restoreStores(JSON.stringify({ [NOTES_KEY]: ["old"] }), () => true);
+    expect(legacy.ok).toBe(true);
+    expect(legacy.restored).toEqual([NOTES_KEY]);
+  });
+
+  test("a restore the store rejected is reported as failed, never counted as restored", () => {
+    const blob = JSON.stringify({
+      [NOTES_KEY]: [{ id: "n1" }],
+      [CONTACTS_KEY]: [{ id: "c1" }],
+      [CALLLOG_KEY]: [{ id: "x" }],
+    });
+    // Only the writer knows whether a value landed: here storage refuses one key.
+    const attempted: string[] = [];
+    const report = restoreStores(blob, (k) => {
+      attempted.push(k);
+      return k !== CONTACTS_KEY;
+    });
+    expect(attempted).toEqual([NOTES_KEY, CONTACTS_KEY, CALLLOG_KEY]); // still snapshot order
+    expect(report.ok).toBe(true);
+    expect(report.restored).toEqual([NOTES_KEY, CALLLOG_KEY]);
+    expect(report.failed).toEqual([CONTACTS_KEY]);
+
+    // Every write rejected ⇒ nothing restored, so the UI cannot claim any store back.
+    const all = restoreStores(blob, () => false);
+    expect(all.ok).toBe(true); // the blob was valid; the *storage* is the problem
+    expect(all.restored).toEqual([]);
+    expect(all.failed).toEqual([NOTES_KEY, CONTACTS_KEY, CALLLOG_KEY]);
   });
 
   test("normalizeQuick keeps only known boolean toggles", () => {

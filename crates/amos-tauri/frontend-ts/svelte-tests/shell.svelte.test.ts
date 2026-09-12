@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import Shell from "../src/svelte/Shell.svelte";
-import { resetPropsChannels } from "../src/svelte/propsBus";
+import { resetPropsChannels, propsChannel } from "../src/svelte/propsBus";
 import {
   applyLayout,
   enterEdit,
@@ -24,7 +24,9 @@ import {
   pulseId,
   unlock,
 } from "../src/svelte/shellState.svelte";
-import { moveBefore, writeStoreValue, RECENTS_KEY } from "../src/lib/amosStore";
+import { moveBefore, readStoreValue, writeStoreValue, RECENTS_KEY } from "../src/lib/amosStore";
+import { CONTACTS_KEY } from "../src/lib/contacts";
+import { NOTIF_KEY } from "../src/lib/settings";
 import { zh } from "../src/i18n/locales/zh";
 
 beforeEach(() => {
@@ -52,6 +54,20 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
   });
 
+  test("unmount disposes the channels the shell owns (no stale snapshot on remount)", async () => {
+    const { unmount } = render(Shell);
+    await tick();
+    // Shell fed the controlled "home" channel from shellState during mount.
+    const home = propsChannel<Record<string, unknown>>("home");
+    expect(home.get()).toBeTruthy();
+
+    unmount();
+
+    // The host disposed its channels on teardown, so a fresh get starts clean
+    // instead of inheriting the previous mount's props.
+    expect(propsChannel<Record<string, unknown>>("home").get()).toBeUndefined();
+  });
+
   test("edit surface renders EditHome (Done action present)", async () => {
     enterEdit();
     const { container } = render(Shell);
@@ -74,6 +90,19 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
   });
 
+  test("an id with no screen shows an honest message, never a blank frame", async () => {
+    // An unknown id can still reach `open()` (a link, a persisted layout, a
+    // manifest). The surface must say so rather than render nothing.
+    open("nope-not-an-app");
+    const { container } = render(Shell);
+    await tick();
+    expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+    const box = container.querySelector('[data-testid="app-unavailable"]');
+    expect(box).toBeTruthy();
+    expect(box?.textContent ?? "").toContain("未知应用");
+    expect(box?.textContent ?? "").toContain("nope-not-an-app");
+  });
+
   test("app surface hosts a scrollable region so tall content-flow apps can be paged", async () => {
     open("settings");
     const { container } = render(Shell);
@@ -86,6 +115,24 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(host).toBeTruthy();
     // and it is bounded (min-h-0 flex-1) so it fills the space under the header
     expect(host?.className ?? "").toContain("min-h-0");
+  });
+
+  test("first launch seeds the address book once (so Contacts/Phone are not empty)", async () => {
+    // Fresh install: the key is absent.
+    expect(readStoreValue<unknown>(CONTACTS_KEY, undefined)).toBeUndefined();
+    render(Shell);
+    await tick();
+    const seeded = readStoreValue<unknown>(CONTACTS_KEY, undefined);
+    expect(Array.isArray(seeded)).toBe(true);
+    expect((seeded as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  test("an intentionally emptied address book is never resurrected", async () => {
+    writeStoreValue(CONTACTS_KEY, []); // the user deleted everyone
+    render(Shell);
+    await tick();
+    // Still empty: seeding keys off an ABSENT store, not an empty list.
+    expect(readStoreValue<unknown>(CONTACTS_KEY, undefined)).toEqual([]);
   });
 
   test("Spotlight overlay opens from shellState and closes on setSpot(false)", async () => {
@@ -309,5 +356,263 @@ describe("Shell.svelte (surface decision tree)", () => {
     const expected = moveBefore({ page: [], dock: ["phone", "messages"], hidden: [] }, "phone", "messages");
     expect(layout()).toEqual(expected);
   });
+
+describe("Shell.svelte (edge gestures)", () => {
+  const rootOf = (container: HTMLElement) => container.firstElementChild as HTMLElement;
+  /** Simulate an edge drag: down at `fromY`, move to `toY`, release. */
+  const swipe = (el: HTMLElement, fromY: number, toY: number) => {
+    el.dispatchEvent(new MouseEvent("pointerdown", { clientY: fromY, bubbles: true }));
+    el.dispatchEvent(new MouseEvent("pointermove", { clientY: toY, bubbles: true }));
+    el.dispatchEvent(new MouseEvent("pointerup", { clientY: toY, bubbles: true }));
+  };
+
+  test("a pull DOWN from the top edge opens the Notification Center", async () => {
+    const { container } = render(Shell);
+    await tick();
+    expect(container.querySelector(`[aria-label="${zh["nc.title"]}"]`)).toBeNull();
+    swipe(rootOf(container), 10, 10 + 60);
+    await tick();
+    expect(container.querySelector(`[aria-label="${zh["nc.title"]}"]`)).toBeTruthy();
+  });
+
+  test("a pull UP from the bottom edge opens Recents", async () => {
+    const { container } = render(Shell);
+    await tick();
+    const h = window.innerHeight;
+    expect(container.textContent ?? "").not.toContain(zh["shell.recents"]);
+    swipe(rootOf(container), h - 20, h - 20 - 60);
+    await tick();
+    expect(container.textContent ?? "").toContain(zh["shell.recents"]);
+  });
+
+  test("a body drag (not started at an edge) opens nothing", async () => {
+    const { container } = render(Shell);
+    await tick();
+    swipe(rootOf(container), 400, 470);
+    await tick();
+    expect(container.querySelector(`[aria-label="${zh["nc.title"]}"]`)).toBeNull();
+    expect(container.textContent ?? "").not.toContain(zh["shell.recents"]);
+  });
+
+  test("a too-short edge drag does not fire (below threshold)", async () => {
+    const { container } = render(Shell);
+    await tick();
+    swipe(rootOf(container), 10, 10 + 10);
+    await tick();
+    expect(container.querySelector(`[aria-label="${zh["nc.title"]}"]`)).toBeNull();
+  });
+
+  test("no edge gesture on the lock screen", async () => {
+    lock();
+    const { container } = render(Shell);
+    await tick();
+    swipe(rootOf(container), 10, 10 + 60);
+    await tick();
+    expect(container.querySelector(`[aria-label="${zh["nc.title"]}"]`)).toBeNull();
+  });
+});
+
+describe("Shell.svelte (screen-state reporting)", () => {
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  /** Install a fake bridge recording every `invoke(command, args)`. */
+  function bridge(spy: Array<{ cmd: string; args?: Record<string, unknown> }>) {
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        spy.push({ cmd, args });
+        // A previous run left the display `off` on disk (the case the boot
+        // re-assert exists to clear).
+        if (cmd === "screen_state_get") return { on: false };
+        if (cmd === "screen_state_set") return { on: Boolean(args?.on) };
+        return null;
+      },
+      listen: async () => () => {},
+    };
+  }
+
+  const lastSet = (spy: Array<{ cmd: string; args?: Record<string, unknown> }>) =>
+    [...spy].reverse().find((c) => c.cmd === "screen_state_set");
+
+  test("boot while unlocked re-asserts screen on (clears a stale off)", async () => {
+    const spy: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    bridge(spy);
+    render(Shell);
+    await tick();
+    for (let i = 0; i < 100 && !spy.some((c) => c.cmd === "screen_state_set"); i++) {
+      await new Promise<void>((r) => setTimeout(r, 5));
+    }
+    expect(spy.some((c) => c.cmd === "screen_state_get")).toBe(true);
+    expect(lastSet(spy)?.args).toEqual({ on: true });
+  });
+
+  test("locking reports screen off; unlocking reports screen on", async () => {
+    const spy: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    bridge(spy);
+    render(Shell);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 10));
+    spy.length = 0;
+
+    lock();
+    await tick();
+    expect(lastSet(spy)?.args).toEqual({ on: false });
+
+    spy.length = 0;
+    unlock();
+    await tick();
+    expect(lastSet(spy)?.args).toEqual({ on: true });
+  });
+});
+
+describe("Shell.svelte (store tiles)", () => {
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  /** Bridge that reports one installed store app. */
+  function bridgeWithInstalled() {
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "appstore_installed") {
+          return [
+            {
+              manifest: {
+                id: "org.amos.demo",
+                name: "Demo",
+                summary: "",
+                author: "",
+                version: { major: 1, minor: 0, patch: 0 },
+                category: "utility",
+                package: { url: "", sha256: "" },
+              },
+              installed_at: 1,
+            },
+          ];
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+  }
+
+  test("an installed store app appears on the home screen", async () => {
+    bridgeWithInstalled();
+    // Put the store tile on the home page (as the App Library's "add to dock"
+    // would). The tile cache is only populated by loadStoreTiles() — which nothing
+    // called before the shell wired it, so an installed app was invisible.
+    applyLayout({ page: ["clock", "store:org.amos.demo"], dock: [], hidden: [] });
+    const host = render(Shell);
+    await vi.waitFor(() => {
+      expect(host.container.textContent ?? "").toContain("Demo");
+    });
+  });
+
+  test("opening a store tile explains the missing runtime host (never blank)", async () => {
+    bridgeWithInstalled();
+    const host = render(Shell);
+    await tick();
+    open("store:org.amos.demo");
+    await tick();
+    expect(host.container.querySelector('[data-testid="ext-app-pending"]')).toBeTruthy();
+    // The manifest id is named and the honest reason is shown.
+    const text = host.container.textContent ?? "";
+    expect(text).toContain("org.amos.demo");
+    expect(text).toContain("web-bundle");
+  });
+});
+
+describe("Shell.svelte (clipboard announce mount)", () => {
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  test("a clipboard-changed notice surfaces the announce toast", async () => {
+    const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async () => null,
+      listen: async (ch: string, h: (e: { payload: unknown }) => void) => {
+        handlers[ch] = h;
+        return () => {};
+      },
+    };
+    const { container } = render(Shell);
+    await tick();
+    for (let i = 0; i < 100 && typeof handlers["clipboard-changed"] !== "function"; i++) {
+      await new Promise<void>((r) => setTimeout(r, 5));
+    }
+    expect(typeof handlers["clipboard-changed"]).toBe("function");
+    handlers["clipboard-changed"]({ payload: { seq: 1, timestamp_ms: 1, source: "container" } });
+    await tick();
+    expect(container.querySelector('[data-testid="clipboard-announce"]')).toBeTruthy();
+  });
+});
+
+describe("Shell.svelte (telemetry-spy watch)", () => {
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  const highHit = (severity = "high") => ({
+    payload: {
+      ts_ms: 1,
+      iface: "wlan0",
+      src_ip: "10.0.0.2",
+      src_port: 40000,
+      dst_ip: "203.0.113.9",
+      dst_port: 80,
+      protocol: "tcp",
+      hits: [{ kind: "serial", occurrences: 1, confidence: "low" }],
+      payload_bytes: 128,
+      severity,
+      confidence: "high",
+    },
+  });
+
+  async function renderAndCapture(
+    handlers: Record<string, (e: { payload: unknown }) => void>,
+  ) {
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async () => null,
+      listen: async (ch: string, h: (e: { payload: unknown }) => void) => {
+        handlers[ch] = h;
+        return () => {};
+      },
+    };
+    render(Shell);
+    await tick();
+    for (let i = 0; i < 100 && typeof handlers["telemetry-spy-hit"] !== "function"; i++) {
+      await new Promise<void>((r) => setTimeout(r, 5));
+    }
+    expect(typeof handlers["telemetry-spy-hit"]).toBe("function");
+  }
+
+  test("a high telemetry-spy-hit becomes a durable notification", async () => {
+    const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+    await renderAndCapture(handlers);
+    handlers["telemetry-spy-hit"](highHit());
+    await tick();
+    const stored = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as {
+      title: string;
+    }[];
+    const prefix = zh["spy.notif.title"].split("{")[0].trim();
+    expect(stored.some((n) => n.title.startsWith(prefix))).toBe(true);
+  });
+
+  test("a non-high hit is ignored (no notification)", async () => {
+    const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+    await renderAndCapture(handlers);
+    handlers["telemetry-spy-hit"](highHit("low"));
+    await tick();
+    // The shell seeds demo notifications on first mount, so assert on spy hits
+    // specifically (none should be added for a non-high severity).
+    const stored = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as {
+      title: string;
+    }[];
+    const prefix = zh["spy.notif.title"].split("{")[0].trim();
+    expect(stored.some((n) => n.title.startsWith(prefix))).toBe(false);
+  });
+});
 
 

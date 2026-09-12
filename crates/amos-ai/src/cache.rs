@@ -230,6 +230,11 @@ impl ResponseCache {
         self.capacity
     }
 
+    /// Fixed time-to-live (exposed so `get_status` can report it on the wire).
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Canonical cache key over **everything the backend sees**: `model`,
     /// `max_tokens`, `prompt`, and every `(key, value)` context pair in sorted
     /// key order. Nothing that can change the response is silently excluded —

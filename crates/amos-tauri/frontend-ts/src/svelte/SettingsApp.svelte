@@ -33,6 +33,7 @@
   import { bridged, radioSet, radioStatus } from "../lib/backend";
   import { t, locale } from "./locale.svelte";
   import { GROUP, ROW, LABEL, VALUE, SUB, CHEVRON, H1, ROW_ACTIVE } from "./settings/kit";
+  import { settingsChannel } from "./appLinks";
   import Switch from "./settings/Switch.svelte";
   import DisplayPage from "./settings/DisplayPage.svelte";
   import WallpaperPage from "./settings/WallpaperPage.svelte";
@@ -146,6 +147,22 @@
     syncAux();
     nav("index");
   };
+
+  // Settings search deep link (Spotlight's "search in Settings" action): prefill only.
+  // We take the text and go back to the index — **we do not pick a page**: the index
+  // search below already matches pages, their synonyms and their live values, so it
+  // decides. The link is a request and is consumed once (a later remount starts clean).
+  let linkNonce = 0;
+  $effect(() => {
+    return settingsChannel().subscribe((v) => {
+      if (!v || v.query.trim() === "" || v.nonce === linkNonce) return;
+      linkNonce = v.nonce;
+      page = "index";
+      q = v.query;
+      resetTop();
+      settingsChannel().set({ query: "", nonce: linkNonce });
+    });
+  });
 
   /* ---- Shared quick-settings radio state (flight-mode / wifi / bluetooth) ---- */
   const readQuick = (): QuickSettings => normalizeQuick(readStoreValue<unknown>(SETTINGS_KEY, {}));

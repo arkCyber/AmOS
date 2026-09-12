@@ -83,6 +83,9 @@ cargo run    -p amos-telemetry-spy --example live_spy --features audit -- [iface
 4. **前端消费**：`frontend-ts/lib/telemetrySpy.ts` 的 `startTelemetrySpyWatcher` 订阅该事件，
    经防御式 `toSpyHit` 校验后用 `spyNotif` 写入共享 `NOTIF_KEY`（**绝不回显序列号/IMEI/
    Cell ID 明文**），Notification Center / `NotificationBanner` 即显示外发泄漏风险。
+   **接线点（2026-09-11 补）**：由 `svelte/Shell.svelte` 的 `onMount` 以
+   `startTelemetrySpyWatcher((hit) => recordSpyHit(hit, t))` 启一次、`onDestroy` 退订
+   （此前该函数**只有定义与测试、无任何调用点**，故"Watching"只是文案，通知从不出现）。
 
 诚实边界：默认 host 构建无 pnet capture producer，daemon 的 `emit` 无人喂 → 整条链安静、
 **绝不产生伪造 hit**；真实抓包 producer 接 `TelemetrySpySvc::emit` 是设备/AOSP

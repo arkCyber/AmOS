@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   DEFAULT_SOUND,
   effectiveAlert,
+  flipSound,
   loadSound,
   normalizeSound,
   saveSound,
@@ -79,6 +80,35 @@ describe("sound / alert policy", () => {
     expect(shouldRingOnArrival(1, 2, dnd)).toBe(false);
     const vibOnly = { ring: false, vibrate: true };
     expect(shouldRingOnArrival(1, 2, vibOnly)).toBe(false);
+  });
+
+  test("normalizeSound reads through the legacy {notify,haptics} schema", () => {
+    // The Settings sound page once persisted {notify,haptics} under the SAME key;
+    // a user's choice must survive the schema unification, not reset to defaults.
+    expect(normalizeSound({ notify: false, haptics: true })).toEqual({
+      ring: false,
+      vibrate: true,
+    });
+    expect(normalizeSound({ notify: false })).toEqual({ ring: false, vibrate: true });
+    expect(normalizeSound({ haptics: false })).toEqual({ ring: true, vibrate: false });
+    // New-schema fields win when both are present.
+    expect(normalizeSound({ ring: true, vibrate: true, notify: false, haptics: false })).toEqual({
+      ring: true,
+      vibrate: true,
+    });
+  });
+
+  test("flipSound is immutable and toggles the requested bit", () => {
+    const base = DEFAULT_SOUND;
+    const next = flipSound(base, "ring");
+    expect(base).toEqual({ ring: true, vibrate: true }); // original untouched
+    expect(next).toEqual({ ring: false, vibrate: true });
+    expect(flipSound(next, "vibrate")).toEqual({ ring: false, vibrate: false });
+    expect(next).toEqual({ ring: false, vibrate: true }); // still untouched
+    // A legacy/garbage input is normalized first, so the flip is total.
+    expect(flipSound({ notify: true } as unknown as { ring: boolean; vibrate: boolean }, "ring")).toEqual(
+      { ring: false, vibrate: true },
+    );
   });
 
   test("saveSound/loadSound round-trips through the store and normalizes", () => {

@@ -17,11 +17,11 @@ use amos_proto::amos_governor::{
 };
 use serde::Serialize;
 
-async fn build_channel() -> Result<tonic::transport::Channel, String> {
+async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
 
-async fn connect() -> Result<GovernorClient<tonic::transport::Channel>, String> {
+async fn connect() -> Result<GovernorClient<crate::daemon::DaemonChannel>, String> {
     Ok(GovernorClient::new(build_channel().await?))
 }
 

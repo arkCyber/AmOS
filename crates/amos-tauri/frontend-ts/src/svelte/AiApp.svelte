@@ -9,6 +9,9 @@
     subscribe,
     getAiStatus,
     sendChat,
+    systemClearContext,
+    systemPeekContext,
+    type SystemContextEntry,
     conversationId,
     newConversation,
     cancelAiSession,
@@ -20,8 +23,13 @@
     type HistoryTurn,
   } from "../lib/backend";
   import { tokenOf, cardOf, sessionMetaOf, type AiCard } from "../lib/stream";
+  import { AI_TARGET_WINDOW } from "./appLinks";
   import { capTail } from "../lib/bounded";
   import { parseVoiceEvent } from "../lib/voice";
+  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { NOTES_KEY, normalizeNotes } from "../lib/notes";
+  import { buildCitedSnippet, buildRagPrompt, NOTES_RAG_INDEXED_KEY } from "../lib/notesRag";
+  import { askNotes, liveRagClient, syncNotesIndex } from "../lib/notesRagRun";
   import VoiceMicButton from "./VoiceMicButton.svelte";
   import StreamVoiceButton from "./StreamVoiceButton.svelte";
   import DeviceMicButton from "./DeviceMicButton.svelte";
@@ -55,6 +63,36 @@
   let histories = $state<Record<string, HistoryTurn[] | "loading">>({});
   let busy = $state(false);
   let msgs = $state<AiMsg[]>([]);
+
+  // "Ask my files/notes": when on, a chat turn first retrieves the nearest note
+  // passages and sends a cited, context-augmented prompt (`buildRagPrompt`).
+  // Retrieval is a separate daemon service from the chat model, so an offline
+  // index is reported honestly and the turn still answers (without context).
+  let cite = $state(false);
+  let citeMsg = $state("");
+
+  // System context that another screen attached to this app (Notes' "✦ 发送到 AI",
+  // see `svelte/appLinks.sendToAi`). `chat_agent` merges it into the next request
+  // and **consumes** it, so we re-peek after every send. A `null` reply means
+  // "nothing attached" *or* "could not ask" (indistinguishable on the wire), so we
+  // render only a positive entry and never claim that no context is attached.
+  let ctxEntry = $state<SystemContextEntry | null>(null);
+  const ctxPreview = (text: string): string => {
+    const flat = text.replace(/\s+/g, " ").trim();
+    return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
+  };
+  const refreshContext = async () => {
+    if (!bridged()) return;
+    const e = await systemPeekContext(AI_TARGET_WINDOW);
+    ctxEntry = e ?? null;
+  };
+  const dropContext = async () => {
+    await systemClearContext(AI_TARGET_WINDOW);
+    ctxEntry = null;
+  };
+  $effect(() => {
+    void refreshContext();
+  });
 
   // Streaming control (plain refs; the event callbacks must stay stable).
   let curId: string | null = null; // agent message being streamed
@@ -197,7 +235,34 @@
       ],
       CHAT_MSG_CAP,
     );
-    const r = await sendChat(v, conversationId());
+    let prompt = v;
+    citeMsg = "";
+    if (cite) {
+      citeMsg = t("ai.citeIndexing");
+      try {
+        const known = readStoreValue<string[]>(NOTES_RAG_INDEXED_KEY, []);
+        const notesNow = normalizeNotes(readStoreValue<unknown>(NOTES_KEY, []));
+        const res = await syncNotesIndex(liveRagClient, notesNow, known);
+        writeStoreValue(NOTES_RAG_INDEXED_KEY, res.indexed);
+        const qr = await askNotes(liveRagClient, v);
+        if (qr === null) {
+          citeMsg = t("ai.citeOffline");
+        } else if (qr.hits.length > 0) {
+          prompt = buildRagPrompt(v, buildCitedSnippet(qr.hits));
+          citeMsg = t("ai.citeUsed", { n: String(qr.hits.length) });
+        } else {
+          citeMsg = t("ai.citeNone");
+        }
+      } catch {
+        citeMsg = t("ai.citeOffline");
+      }
+    }
+    // A stop during retrieval cancels the turn before it reaches the daemon.
+    if (aborted) return;
+    const r = await sendChat(prompt, conversationId());
+    // The daemon consumed the attached system context while merging it into this
+    // request, so re-peek and stop claiming it is still attached.
+    void refreshContext();
     // If the command failed to reach the daemon (r == null) no `ai-chat-complete`
     // event will ever fire — clear busy so the UI never sticks on "⏹ 停止".
     if (r == null && !aborted) {
@@ -369,6 +434,24 @@
   {#if !online}
     <p class="mt-1 text-sm opacity-70">{t("backend.inBrowser")}</p>
   {/if}
+  {#if ctxEntry}
+    <div
+      data-testid="ai-context"
+      aria-label={t("ai.contextAttached", { src: ctxEntry.source_window })}
+      class="mt-2 flex items-center justify-between gap-2 rounded-xl bg-accent/10 px-3 py-1.5 text-xs ring-1 ring-accent/25"
+    >
+      <span class="truncate">
+        {t("ai.contextAttached", { src: ctxEntry.source_window })}：{ctxPreview(ctxEntry.text)}
+      </span>
+      <button
+        onclick={() => void dropContext()}
+        aria-label="ai-context-clear"
+        title={t("ai.contextClear")}
+        class="shrink-0 opacity-70 hover:opacity-100"
+      >✕</button>
+    </div>
+  {/if}
+
   <div
     role="log"
     aria-live="polite"
@@ -435,6 +518,15 @@
         if (tx) q = tx;
       }}
     />
+    <button
+      onclick={() => (cite = !cite)}
+      aria-label="ai-cite-toggle"
+      aria-pressed={cite}
+      title={t("ai.citeTitle")}
+      class="grid h-8 shrink-0 place-items-center rounded-full px-2 text-sm {cite
+        ? 'bg-accent text-white'
+        : 'bg-neutral-200/70 dark:bg-neutral-800/70'}"
+    >📚</button>
     <textarea
       bind:value={q}
       rows={2}
@@ -454,5 +546,8 @@
       class="grid h-8 w-9 place-items-center rounded-full bg-accent px-2 text-white disabled:opacity-40"
     >{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
   </div>
+  {#if citeMsg}
+    <p role="status" data-testid="ai-cite-status" class="mt-1 px-1 text-[11px] opacity-60">{citeMsg}</p>
+  {/if}
 </div>
 
