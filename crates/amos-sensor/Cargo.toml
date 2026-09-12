@@ -17,7 +17,7 @@ tonic.workspace = true
 # Real Android backend (CameraManager / LocationManager / SensorManager via JNI,
 # hosted in the System UI APK which owns the Context). Optional: only pulled in
 # when the `android` feature is enabled so desktop/CI builds stay light.
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 
 [features]
 default = []
