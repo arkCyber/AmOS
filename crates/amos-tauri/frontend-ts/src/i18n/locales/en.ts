@@ -69,6 +69,7 @@ export const en: Record<MessageKey, string> = {
   "contacts.importConfirm": "Import",
   "contacts.importBad": "That doesn't look like a vCard file",
   "contacts.importReadFail": "Couldn't read that file",
+  "contacts.importTooBig": "That file is too large — vCard import reads at most 2 MiB of text",
   "contacts.importPreview": "Found {n} importable contacts",
   "contacts.importInvalid": "{n} entries are incomplete and will be skipped",
   "contacts.importDone": "Imported {added}, skipped {dup} duplicates, {invalid} unusable",

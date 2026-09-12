@@ -67,6 +67,7 @@ export const zh = {
   "contacts.importConfirm": "确认导入",
   "contacts.importBad": "无法识别为 vCard 文件",
   "contacts.importReadFail": "无法读取该文件",
+  "contacts.importTooBig": "文件过大——vCard 导入一次最多读取 2 MiB 文本",
   "contacts.importPreview": "解析到 {n} 个可导入联系人",
   "contacts.importInvalid": "{n} 条记录不完整，将被跳过",
   "contacts.importDone": "已导入 {added} 个，跳过重复 {dup} 个，无法识别 {invalid} 个",

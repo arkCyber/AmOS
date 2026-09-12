@@ -136,16 +136,20 @@ export function parseRev(raw: unknown): number {
   if (typeof raw !== "string") return 0;
   const v = raw.trim();
   if (v === "") return 0;
-  const basic = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(?:\.\d+)?(Z|[+-]\d{4})?$/i.exec(v);
+  const basic = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\.\d+)?(Z|[+-]\d{4})?$/i.exec(v);
   if (basic) {
-    const [, y, mo, d, h, mi, se, tz] = basic;
+    const [, y, mo, d, h, mi, se, frac, tz] = basic;
     // A missing time designator defaults to UTC in vCard. Numeric offsets are
     // normalized to `±HH:MM` — engines disagree on the bare `+HHMM` form, and
     // parsing must not depend on that leniency.
     const off =
       tz === undefined || tz === "" || tz.toUpperCase() === "Z" ? "Z" : `${tz.slice(0, 3)}:${tz.slice(3)}`;
     const t = Date.parse(`${y}-${mo}-${d}T${h}:${mi}:${se}${off}`);
-    return Number.isFinite(t) ? t : 0;
+    if (!Number.isFinite(t)) return 0;
+    // Fractional seconds are part of the instant — the old `(?:\.\d+)?` group
+    // matched and silently DROPPED them (123ms vanished). Extended form gets
+    // sub-second precision from Date.parse for free; the basic form must too.
+    return frac ? t + Math.round(Number(`0${frac}`) * 1000) : t;
   }
   // The ISO-extended fallthrough gets the same ±HHMM → ±HH:MM normalization;
   // engines disagree on the bare form, and parsing must not depend on leniency.
@@ -203,6 +207,17 @@ export function countVCards(list: unknown): number {
 
 
 /* ---- import: vCard text → entries ------------------------------------------ */
+
+/**
+ * Upper bound on .vcf text the UI will read from a picked file (2 MiB ≈ tens of
+ * thousands of cards). The import path is intentionally **bounded** (the
+ * codebase's bounded-read discipline, as the wallpaper card / player): the UI
+ * refuses an oversized file BEFORE reading, so a mis-picked multi-hundred-MiB
+ * file can't balloon the renderer's memory. Pasted text is bounded by the
+ * textarea itself; the parser below is still total for any string it gets.
+ */
+export const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
+
 
 /** Split on `sep` while honoring `\`-escapes (used for the structured N value). */
 function splitUnescaped(value: string, sep: string): string[] {

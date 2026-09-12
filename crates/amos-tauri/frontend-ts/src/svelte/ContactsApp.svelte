@@ -40,7 +40,7 @@
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
   import { contactsChannel } from "./appLinks";
-  import { buildVcf, countVCards, mergeImported, parseVcf } from "../lib/contactTransfer";
+  import { buildVcf, countVCards, MAX_IMPORT_BYTES, mergeImported, parseVcf } from "../lib/contactTransfer";
   import type { ParseVcfResult } from "../lib/contactTransfer";
   import { copySelection } from "../lib/clipboard";
 
@@ -151,8 +151,19 @@
   async function pickImportFile(e: Event): Promise<void> {
     const file = (e.currentTarget as HTMLInputElement).files?.[0];
     if (!file) return;
+    // Bounded read: refuse an oversized file BEFORE reading it, instead of
+    // ballooning memory on a mis-picked archive-sized .vcf.
+    if (typeof file.size === "number" && file.size > MAX_IMPORT_BYTES) {
+      pendingImport = null;
+      status = t("contacts.importTooBig");
+      return;
+    }
     try {
       importText = await file.text();
+      // The box now holds DIFFERENT text than any earlier preview — and this
+      // programmatic assignment fires NO `input` event, so the stale parse must
+      // be voided here (same defect class as the textarea's oninput guard).
+      pendingImport = null;
       status = "";
     } catch {
       status = t("contacts.importReadFail"); // a read failure is not "not a vCard"

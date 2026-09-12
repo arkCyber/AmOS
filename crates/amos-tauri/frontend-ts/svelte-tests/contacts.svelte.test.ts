@@ -11,6 +11,7 @@ import ContactsApp from "../src/svelte/ContactsApp.svelte";
 import { readStoreValue } from "../src/lib/amosStore";
 import { contactsChannel } from "../src/svelte/appLinks";
 import { resetPropsChannels } from "../src/svelte/propsBus";
+import { MAX_IMPORT_BYTES } from "../src/lib/contactTransfer";
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 
@@ -324,6 +325,59 @@ describe("ContactsApp.svelte — vCard import/export", () => {
     await new Promise<void>((r) => setTimeout(r, 0)); // let the rejected text() settle
     expect(txt(host)).toContain("无法读取该文件");
     expect(txt(host)).not.toContain("无法识别为 vCard 文件");
+  });
+
+  /** Fire a `change` on the file picker with `file` selected (happy-dom needs the stub). */
+  async function pickFile(host: { container: HTMLElement }, file: File): Promise<void> {
+    const picker = host.container.querySelector('input[type="file"]') as HTMLInputElement | null;
+    expect(picker).toBeTruthy();
+    Object.defineProperty(picker, "files", { value: [file], configurable: true });
+    await fireEvent.change(picker);
+    await new Promise<void>((r) => setTimeout(r, 0)); // let the read settle
+  }
+
+  const vcardText = (name: string, tel: string): string =>
+    `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${name}\r\nTEL:${tel}\r\nEND:VCARD\r\n`;
+
+  test("picking a new file voids the earlier preview (no stale imports)", async () => {
+    const host = render(ContactsApp);
+    await fireEvent.click(button(host, "导入"));
+    const box = textarea(host, "粘贴 vCard 文本，或选择 .vcf 文件");
+    await fireEvent.input(box, { target: { value: vcardText("Stale", "13600000001") } });
+    await fireEvent.click(button(host, "解析预览"));
+    expect(button(host, "确认导入").disabled).toBe(false);
+    // The picked file replaces the box text, but a programmatic assignment fires
+    // no `input` — pre-fix the confirm button still held the OLD parse and would
+    // import "Stale" while the screen showed "Fresh".
+    await pickFile(host, {
+      size: 42,
+      text: () => Promise.resolve(vcardText("Fresh", "13600000002")),
+    } as unknown as File);
+    expect(box.value).toContain("Fresh");
+    expect(button(host, "确认导入").disabled).toBe(true);
+    expect(txt(host)).not.toContain("解析到");
+    await fireEvent.click(button(host, "确认导入")); // disabled ⇒ must be a no-op
+    expect(txt(host)).not.toContain("Fresh");
+    expect(readStoreValue<{ name: string }[]>("amos.contacts", [])).toEqual([]);
+  });
+
+  test("an oversized picked file is refused before reading (bounded import)", async () => {
+    const host = render(ContactsApp);
+    await fireEvent.click(button(host, "导入"));
+    let read = false;
+    const big = {
+      size: MAX_IMPORT_BYTES + 1,
+      text: () => {
+        read = true;
+        return Promise.resolve(vcardText("TooBig", "13600000003"));
+      },
+    } as unknown as File;
+    await pickFile(host, big);
+    expect(txt(host)).toContain("文件过大");
+    expect(txt(host)).not.toContain("无法读取该文件"); // a size refusal ≠ a read failure
+    expect(read).toBe(false); // never even opened
+    expect(textarea(host, "粘贴 vCard 文本，或选择 .vcf 文件").value).toBe("");
+    expect(button(host, "确认导入").disabled).toBe(true);
   });
 
   test("export counts cards, not literal BEGIN:VCARD substrings in values", async () => {

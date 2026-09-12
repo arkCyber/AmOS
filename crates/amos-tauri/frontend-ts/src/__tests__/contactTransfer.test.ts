@@ -72,6 +72,15 @@ describe("contactTransfer: REV timestamps", () => {
     expect(parseRev(42)).toBe(0);
     expect(parseRev(undefined)).toBe(0);
   });
+
+  test("parseRev keeps fractional seconds in both forms (no silent rounding)", () => {
+    // Pre-fix the basic form's `(?:\.\d+)?` matched the fraction and dropped it.
+    expect(parseRev("20260912T080000.123Z")).toBe(Date.parse("2026-09-12T08:00:00Z") + 123);
+    expect(parseRev("20260912T080000.5Z")).toBe(Date.parse("2026-09-12T08:00:00Z") + 500);
+    // The extended fallthrough always had it via Date.parse — incl. offset zones.
+    expect(parseRev("2026-09-12T08:00:00.25Z")).toBe(Date.parse("2026-09-12T08:00:00.250Z"));
+    expect(parseRev("20260912T080000.25+0800")).toBe(Date.parse("2026-09-12T08:00:00.250+08:00"));
+  });
 });
 
 describe("contactTransfer: export (toVCard / buildVcf)", () => {
