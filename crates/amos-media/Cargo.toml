@@ -11,7 +11,7 @@ name = "amos_media"
 path = "src/lib.rs"
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 serde.workspace = true
 serde_json = "1"
 base64 = "0.21"
