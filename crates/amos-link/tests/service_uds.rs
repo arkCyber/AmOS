@@ -9,12 +9,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use amos_link::broker::Broker;
+use amos_link::codec::Clock;
 use amos_link::discovery::{NodeKind, PeerId};
 use amos_link::keyexpr::{Channel, Topic};
+use amos_link::metrics::LinkMetrics;
 use amos_link::node::LinkNode;
-use amos_link::service;
+use amos_link::robot_hal::{
+    actuation_topic, ActuationState, AgentAction, MockRobotHal, RobotBridge,
+};
+use amos_link::service::{self, LinkService};
 use amos_link::telemetry::Heartbeat;
 use amos_proto::amos_link::robot_link_client::RobotLinkClient;
+use amos_proto::amos_link::robot_link_server::RobotLinkServer;
 use amos_proto::amos_link::Empty;
 use tokio::net::UnixStream;
 use tokio_stream::StreamExt;
@@ -221,4 +228,171 @@ async fn control_plane_answers_over_a_unix_domain_socket() {
 
     server.abort();
     let _ = std::fs::remove_file(&socket);
+}
+
+/// The **full chain** of the control loop's return path, over a real UDS:
+/// `RobotBridge` → `amos/dog1/state/actuation` → the daemon's control-plane fold → gRPC.
+///
+/// This is what lets a caller that is not on the link — the System UI's panel — show what a
+/// robot is *doing*, not just that it exists: the reports travel the **data plane**, and the
+/// control plane folds them. Two nodes share one broker — the mounted `amos-daemon` (which
+/// watches) and `dog1` (which drives a real bridge) — the shape a board and a field server
+/// have over Zenoh.
+#[tokio::test]
+async fn the_control_plane_folds_in_a_robots_actuation_reports() {
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-link-actuation-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    // One link (broker), two nodes on it: the daemon that mounts the control plane, and the
+    // robot whose bridge reports.
+    let metrics = Arc::new(LinkMetrics::new());
+    let clock = Arc::new(Clock::host());
+    let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+    let daemon = LinkNode::with_parts(
+        PeerId::new("amos-daemon").expect("peer"),
+        NodeKind::Tool,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+    let robot = LinkNode::with_parts(
+        PeerId::new("dog1").expect("peer"),
+        NodeKind::Robot,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+
+    // The robot's control loop, reporting its mode on its own state topic.
+    let dog1 = PeerId::new("dog1").expect("peer");
+    let control = robot
+        .subscriber::<AgentAction>(
+            Topic::pattern("amos/dog1/control/*").expect("pattern"),
+            amos_link::qos::Qos::control(),
+        )
+        .await
+        .expect("subscribe control");
+    let mut bridge = RobotBridge::new(control, MockRobotHal::new())
+        .reporting(robot.publisher::<ActuationState>(actuation_topic(&dog1).expect("topic")))
+        // A short refresh: the daemon's watcher subscribes *asynchronously*, so the loop
+        // below converges instead of depending on one lucky publish.
+        .with_report_refresh(std::time::Duration::from_millis(20));
+    let commander = robot.publisher::<AgentAction>(
+        Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+    );
+
+    // Mount the control plane on the same UDS the daemon uses, watcher included.
+    let socket = path.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RobotLinkServer::new(LinkService::with_heartbeat(Arc::new(
+                daemon,
+            ))))
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                tokio::net::UnixListener::bind(socket).expect("bind uds"),
+            ))
+            .await
+    });
+    wait_for_socket(&path).await;
+
+    let owned = path.clone();
+    let channel = Endpoint::try_from("http://[::1]:50051")
+        .expect("endpoint")
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let path = owned.clone();
+            async move {
+                let stream = UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+        .expect("connect the channel");
+    let mut client = RobotLinkClient::new(channel);
+
+    // ── nobody has reported yet: the list is empty, never a fabricated zero ──────────
+    let list = client
+        .list_actuations(Empty {})
+        .await
+        .expect("list_actuations")
+        .into_inner();
+    assert!(
+        list.robots.is_empty(),
+        "an unreported robot is absent, not an invented idle one"
+    );
+
+    // ── drive the robot until the control plane has folded a report in ───────────────
+    let mut trotting = None;
+    for _ in 0..60 {
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot","speed":0.5}"#))
+            .await
+            .expect("publish trot");
+        bridge.step().await.expect("step");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let list = client
+            .list_actuations(Empty {})
+            .await
+            .expect("list_actuations")
+            .into_inner();
+        if let Some(found) = list.robots.into_iter().find(|r| r.robot == "dog1") {
+            trotting = Some(found);
+            break;
+        }
+    }
+    let trotting = trotting.expect("the control plane folds in the robot's report");
+    assert_eq!(trotting.gait, "trot");
+    assert!(trotting.armed, "the drivers are energized");
+    assert!(!trotting.estopped);
+    assert!(trotting.seq >= 1, "the report names the action it reflects");
+    assert!(trotting.frames > 0);
+    assert!(trotting.stamp_secs > 0, "the robot's own publish time");
+    assert_eq!(trotting.estop_reason, "", "nothing was cut");
+
+    // ── the e-stop, and the refusal that follows it, both reach the control plane ────
+    commander
+        .publish(&AgentAction::new(r#"{"action":"estop"}"#))
+        .await
+        .expect("publish estop");
+    bridge.step().await.expect("step");
+    commander
+        .publish(&AgentAction::new(r#"{"action":"trot"}"#))
+        .await
+        .expect("publish a stale trot");
+    bridge.step().await.expect("step");
+
+    let mut stopped = None;
+    for _ in 0..20 {
+        let list = client
+            .list_actuations(Empty {})
+            .await
+            .expect("list_actuations")
+            .into_inner();
+        let robot = list.robots.into_iter().find(|r| r.robot == "dog1");
+        if robot.as_ref().is_some_and(|r| !r.last_refusal.is_empty()) {
+            stopped = robot;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    let stopped = stopped.expect("the refusal is folded in too");
+    assert!(stopped.estopped, "the control plane knows torque was cut");
+    assert_eq!(stopped.estop_reason, "commanded");
+    assert!(!stopped.armed);
+    assert_eq!(stopped.gait, "estop");
+    assert!(
+        stopped.last_refusal.contains("re-arm"),
+        "the refusal says how to recover: {}",
+        stopped.last_refusal
+    );
+    assert!(stopped.last_refusal_seq > 0);
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
 }

@@ -176,14 +176,24 @@ impl LatestSlot {
 
     /// Move the frame in if the slot is empty; returns it back when it is occupied.
     /// (A plain sync helper — so no lock guard ever lives across an `await`.)
-    fn try_put(&self, ingress: Ingress) -> Option<Ingress> {
+    ///
+    /// A **poisoned** lock (someone panicked while a frame was being stored) is neither
+    /// "stored" nor "occupied": the slot can never hand a frame to its consumer again, so
+    /// it is reported as such. Reporting it as "occupied" — which is what this helper used
+    /// to do — made `offer_blocking` wait for a `taken` notification that can never come,
+    /// i.e. an **unbounded** wait inside a reliable control publish. A degraded slot must
+    /// end the operation, not stall it (NASA Power of 10 #2: prove every loop ends).
+    fn try_put(&self, ingress: Ingress) -> Result<Option<Ingress>> {
         match self.slot.lock() {
             Ok(mut g) if g.is_none() => {
                 *g = Some(ingress);
-                None
+                Ok(None)
             }
-            // Either occupied (hand the frame back) or poisoned (drop it and count).
-            Ok(_) | Err(_) => Some(ingress),
+            // Occupied: hand the frame back so the caller can apply its policy.
+            Ok(_) => Ok(Some(ingress)),
+            Err(_) => Err(LinkError::Closed(
+                "latest slot is poisoned: this consumer can no longer take frames".to_string(),
+            )),
         }
     }
 
@@ -197,6 +207,10 @@ impl LatestSlot {
     }
 
     /// Best-effort store: overwrite whatever is pending (it is stale by definition).
+    ///
+    /// `false` means "this frame reached nobody": the slot was already occupied by a newer
+    /// frame, or its lock is poisoned. Either way the caller counts a drop — a poisoned
+    /// slot must not be reported as a delivery (see [`LatestSlot::try_put`]).
     fn offer(&self, ingress: Ingress) -> bool {
         let replaced = match self.slot.lock() {
             Ok(mut g) => {
@@ -217,10 +231,14 @@ impl LatestSlot {
     ///
     /// Returns `true` when it had to wait at least once (i.e. this publish was
     /// back-pressured), so the caller — which owns the counters — can record it.
+    ///
+    /// Bounded by construction: it waits only while the slot is provably alive. A closed
+    /// slot (the consumer dropped, or the lock is poisoned) ends the call with a typed
+    /// error instead of a wait nothing can end.
     async fn offer_blocking(&self, ingress: Ingress) -> Result<bool> {
         let mut pending = Some(ingress);
         let mut waited = false;
-        // Terminates when the slot is free (stored) or the subscription is closed.
+        // Terminates when the slot is free (stored), or when it cannot ever be (closed).
         loop {
             if self.is_closed() {
                 return Err(LinkError::Closed(
@@ -228,7 +246,7 @@ impl LatestSlot {
                 ));
             }
             match pending.take() {
-                Some(ing) => match self.try_put(ing) {
+                Some(ing) => match self.try_put(ing)? {
                     None => {
                         self.filled.notify_waiters();
                         return Ok(waited);
@@ -247,7 +265,9 @@ impl LatestSlot {
     }
 
     async fn recv(&self) -> Option<Ingress> {
-        // Terminates when a frame is available, or with `None` after `close()`.
+        // Terminates when a frame is available, or with `None` after `close()` — and also
+        // when the lock is poisoned, which is a closed consumer by definition (waiting for
+        // a frame a poisoned slot can never produce would spin on every notify).
         loop {
             if let Some(ing) = self.take() {
                 self.counters.record_received();
@@ -267,7 +287,10 @@ impl LatestSlot {
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        // A poisoned lock is a closed consumer: it can never hand a frame over again, so
+        // both the publisher's wait (`offer_blocking`) and the consumer's loop (`recv`)
+        // must end here instead of waiting for a notification nothing can send.
+        self.closed.load(Ordering::SeqCst) || self.slot.is_poisoned()
     }
 
     fn has_pending(&self) -> bool {
@@ -752,6 +775,86 @@ mod tests {
         assert_eq!(none.delivered, 0);
 
         let _ = (exact, wild, other, broker.metrics().snapshot());
+    }
+
+    /// Poison a latest slot exactly the way a panic while storing a frame would: hold the
+    /// lock and unwind. (`Mutex` poisoning is sticky, so this reproduces the state.)
+    fn poison(slot: &LatestSlot) {
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slot.slot.lock().expect("lock");
+            panic!("a panic while a frame was being stored");
+        }));
+        assert!(unwound.is_err(), "the helper must really unwind");
+        assert!(slot.slot.is_poisoned(), "…and leave the lock poisoned");
+    }
+
+    /// One frame addressed to a concrete topic (what a publish hands to a sink).
+    fn ingress(key: &str) -> Ingress {
+        Ingress {
+            topic: topic(key),
+            frame: frame(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_reliable_slot_refuses_instead_of_waiting_for_a_notification_nothing_can_send(
+    ) {
+        // The defect this pins: `try_put` reported "occupied" for a poisoned lock, so
+        // `offer_blocking` waited on a `taken` notification that could never arrive — an
+        // **unbounded** wait inside a reliable control publish. A degraded consumer must
+        // end the operation with a typed refusal instead.
+        let slot = LatestSlot::new(Subscription::counters());
+        poison(&slot);
+
+        let err = tokio::time::timeout(
+            Duration::from_millis(500),
+            slot.offer_blocking(ingress("amos/dog1/control/joints")),
+        )
+        .await
+        .expect("the publish must return, not wait forever")
+        .expect_err("a poisoned slot must refuse the frame");
+        assert!(matches!(err, LinkError::Closed(_)), "got: {err:?}");
+
+        // The consumer side ends too: `recv` must not spin on notifications that can never
+        // become a frame.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), slot.recv())
+                .await
+                .expect("recv must not spin on a poisoned slot")
+                .is_none(),
+            "a poisoned slot is a closed consumer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_sensor_slot_is_a_dead_consumer_not_a_silent_delivery() {
+        // Best-effort path: no wait to get stuck in, but the store must not claim success.
+        let broker = Broker::new();
+        let sub = broker
+            .subscribe(&pattern("amos/**"), Qos::sensor())
+            .await
+            .expect("subscribe");
+        let slot = Arc::clone(sub.slot.as_ref().expect("a latest slot"));
+        poison(&slot);
+        assert!(!slot.offer(ingress("amos/dog1/sensor/imu")), "not stored");
+        assert_eq!(
+            sub.stats().dropped,
+            1,
+            "the subscription says where the frame went"
+        );
+
+        // Through the broker a poisoned slot is a **dead consumer**: the liveness sweep
+        // removes it, so the publish neither delivers nor *claims* a subscriber — the same
+        // honest answer the cancelled-subscription test below pins, because a slot that can
+        // never hand a frame over is not listening.
+        let report = broker
+            .publish(&topic("amos/dog1/sensor/imu"), frame(9))
+            .await
+            .expect("publish");
+        assert_eq!(report.matched, Some(0));
+        assert_eq!(report.delivered, 0);
+        assert_eq!(broker.subscriber_count().await, 0);
+        assert_eq!(broker.metrics().snapshot().published, 1);
     }
 
     #[tokio::test]

@@ -26,7 +26,10 @@ Four pieces, in the order data flows:
   matcher (no recursion, bounded work under the registry lock), and `Channel`-implied QoS.
 - **Framed, self-describing messages**: any `serde` type is a `Message`; every frame is
   `magic │ version │ bincode header │ CRC32 │ payload` with a 16 MiB ceiling checked on
-  **both** sides before any allocation.
+  **both** sides before any allocation. The CRC32 covers header ‖ payload and is computed
+  **by streaming** the two slices through one hasher — no second copy of a frame is ever
+  built (an earlier `[…].concat()` doubled a frame's peak memory, on the receive path
+  before the checksum had even been verified; see `docs/amos-link.md` §3.3).
 - **ROS-like QoS** reduced to three fields: `Reliability{BestEffort, Reliable}` × `depth` ×
   `DropPolicy{DropNewest, DropOldest}` — sensor streams are latest-wins, control streams
   back-pressure and are counted as `blocked`.
@@ -39,7 +42,9 @@ Four pieces, in the order data flows:
   deliberately not the same as healthy.
 - **Robot HAL**: an agent's JSON intent is validated, expanded into a gait pose and
   encoded as CRC-checked motor frames over a `RobotHal` seam, with a latched e-stop and a
-  deadman watchdog.
+  deadman watchdog. A torque cut comes back from the HAL as a **measured** frame count
+  (`estop() -> Result<usize>`), so the report of a watchdog stop says what the bus really
+  took instead of assuming one frame per joint.
 - **A return path**: a bridge can `reporting()` its **mode** back on
   `amos/<robot>/state/actuation` (armed / e-stopped + why / which gait / the last refusal),
   published **only when the mode changes** — so a commander can tell an applied command from
@@ -66,7 +71,7 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 | `src/robot_hal.rs` | `AgentAction` → `plan()` → `MotorFrame` (CRC16) → `RobotHal`; `RobotBridge` with e-stop + watchdog, and `reporting()` for the mode return path |
 | `src/health.rs` | `LinkHealth::evaluate` — the fold from counters to a verdict |
 | `src/node.rs` | `LinkNode`: identity + transport + clock + counters + peer table |
-| `src/service.rs` | the tonic control plane (`proto/robot_link.proto`) mounted by `amos-ai` |
+| `src/service.rs` | the tonic control plane (`proto/robot_link.proto`) mounted by `amos-ai`; it also folds the return path (`ListActuations`) so a caller that is not on the link can read what each robot reports |
 
 ## Build & test
 

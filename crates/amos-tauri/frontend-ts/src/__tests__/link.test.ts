@@ -5,6 +5,10 @@ import {
   healthKey,
   linkLevel,
   peerSummary,
+  robotLevel,
+  robotLevelKey,
+  robotSummary,
+  type LinkActuation,
   type LinkStatus,
 } from "../lib/link";
 
@@ -90,5 +94,44 @@ describe("robot-link client (pure helpers)", () => {
     ]) {
       expect(line).toContain(token);
     }
+  });
+});
+
+describe("robot rows (the control loop's return path)", () => {
+  const robot = (over: Partial<LinkActuation> = {}): LinkActuation => ({
+    robot: "dog1",
+    seq: 12,
+    gait: "trot",
+    frames: 13,
+    armed: true,
+    estopped: false,
+    estop_reason: null,
+    watchdog_ms: null,
+    last_refusal: null,
+    stamp_ms: 1,
+    ...over,
+  });
+
+  test("a latched e-stop wins over a stale `armed`", () => {
+    // Torque cut is the fact a user must see first; the panel must never show "armed"
+    // just because the flag was still true when the robot reported.
+    expect(robotLevel(robot({ estopped: true, estop_reason: "watchdog" }))).toBe("estopped");
+  });
+
+  test("armed and never-armed are told apart", () => {
+    expect(robotLevel(robot())).toBe("armed");
+    expect(robotLevel(robot({ armed: false, gait: null, seq: null }))).toBe("idle");
+  });
+
+  test("each level has its own copy key", () => {
+    expect(robotLevelKey("estopped")).toBe("link.robotEstopped");
+    expect(robotLevelKey("armed")).toBe("link.robotArmed");
+    expect(robotLevelKey("idle")).toBe("link.robotIdle");
+  });
+
+  test("the row names the robot, its gait and the action it reflects", () => {
+    expect(robotSummary(robot())).toBe("dog1 · trot · #12");
+    // `null` is "the robot did not report it", never a made-up zero.
+    expect(robotSummary(robot({ gait: null, seq: null }))).toBe("dog1 · - · #-");
   });
 });

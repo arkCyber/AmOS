@@ -22,6 +22,43 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Start the built binary, wait (bounded) for its **first stdout line**, then kill it.
+///
+/// Returns `(first line, was_still_running, stderr)`. Waiting for a line instead of sleeping
+/// a fixed time is what makes this deterministic: the property under test is "the run starts
+/// and keeps going", not "it prints within N milliseconds" (a loaded machine would make the
+/// latter flaky).
+fn run_until_first_line(args: &[&str], wait: Duration) -> (String, bool, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amos-link-cli"))
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the CLI binary spawns");
+    let stdout = child.stdout.take().expect("piped stdout");
+    // A pipe read blocks, so the deadline lives here and the reader lives on its own thread.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let read = std::io::BufRead::read_line(&mut reader, &mut line);
+        let _ = tx.send(match read {
+            // `Ok(0)` is EOF (no line at all); an empty line is not a line either.
+            Ok(0) | Err(_) => String::new(),
+            Ok(_) => line,
+        });
+    });
+    let first = rx.recv_timeout(wait).unwrap_or_default();
+    let still_running = child.try_wait().expect("try_wait").is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+    }
+    (first, still_running, stderr)
+}
+
 /// A live control plane on a private Unix socket: the very service the daemon mounts
 /// (`amos_link::service::mock_server`, heartbeat included) served over a real UDS.
 ///
@@ -107,11 +144,21 @@ fn remote_mode_reads_a_running_control_plane_over_a_unix_socket() {
         .iter()
         .any(|v| stdout.contains(&format!("\"health\": \"{v}\"")));
     assert!(verdict, "a verdict is always named, got: {stdout}");
+    // The return path is part of the same document: robots that reported are listed, and an
+    // empty list is an empty list (not an invented idle robot).
+    assert!(
+        stdout.contains("\"actuations\": []"),
+        "the daemon's folded robot reports are part of `status`, got: {stdout}"
+    );
 
     let (code, stdout, stderr) = run(&["status", "--socket", &socket]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("remote="), "got: {stdout}");
     assert!(stdout.contains("peer=amos-daemon"), "got: {stdout}");
+    assert!(
+        stdout.contains("robots reported (0): nobody has reported its actuation"),
+        "an unreported fleet is named as absent, got: {stdout}"
+    );
 
     let (code, stdout, stderr) = run(&["topics", "--socket", &socket]);
     assert_eq!(code, 0, "stderr: {stderr}");
@@ -568,4 +615,54 @@ fn watch_reports_real_link_liveness_and_exits_on_its_own() {
     assert!(stdout.contains("\"event\":\"status\""), "got: {stdout}");
     assert!(stdout.contains("\"peer\":\"link-watch\""), "got: {stdout}");
     assert!(stdout.contains("\"peers\":0"), "got: {stdout}");
+}
+
+#[test]
+fn arguments_that_used_to_crash_the_process_are_usage_errors_now() {
+    // Negative controls, process-level: both of these aborted the *shipped binary* before
+    // this round (recorded in the audit): `--seconds u64::MAX` panicked with "overflow when
+    // adding duration to instant", and a `--count` of `u64::MAX` panicked with "capacity
+    // overflow" inside `Vec::with_capacity`. A bad argument is exit 2 with a message.
+    let (code, _, stderr) = run(&["discover", "--bus", "--seconds", "18446744073709551615"]);
+    assert_eq!(code, 2, "a bad argument is exit 2, got {code}: {stderr}");
+    assert!(
+        stderr.contains("beyond what this platform's clock can represent"),
+        "the refusal explains itself, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "it must never panic: {stderr}"
+    );
+
+    let (code, _, stderr) = run(&["bench", "--size", "16777216"]);
+    assert_eq!(code, 2, "an unpublishable payload is exit 2, got {code}");
+    assert!(stderr.contains("exceeds the"), "got: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "it must never panic: {stderr}"
+    );
+}
+
+#[test]
+fn a_huge_count_still_starts_the_benchmark_instead_of_aborting_before_the_first_frame() {
+    // The other half of the capacity-overflow defect: a `u64` count is legal and means
+    // "keep publishing", so the run must *start* and stay up rather than die while reserving
+    // a latency vector it could never fill. The process is killed right after its first line
+    // (an unbounded run is the operator's own request).
+    let (first, still_running, stderr) = run_until_first_line(
+        &["bench", "--count", "18446744073709551615"],
+        Duration::from_secs(10),
+    );
+    assert!(
+        first.contains("frames=18446744073709551615"),
+        "it announced the run it was asked for, got: {first:?} (stderr: {stderr})"
+    );
+    assert!(
+        still_running,
+        "the benchmark must still be running after its banner, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("capacity overflow") && !stderr.contains("panicked"),
+        "no abort, no panic: {stderr}"
+    );
 }

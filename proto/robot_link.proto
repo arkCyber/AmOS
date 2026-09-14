@@ -31,6 +31,13 @@ service RobotLink {
   // so a client sees the whole link's liveness rather than a synthetic counter. Use
   // GetStatus for the peer table itself.
   rpc StreamHeartbeats(Empty) returns (stream Heartbeat);
+
+  // What each robot reports about its own actuation — the control loop's **return path**
+  // (`amos/<robot>/state/actuation`, crates/amos-link/src/robot_hal.rs::ActuationState),
+  // folded into the control plane so a caller that is NOT on the link (the System UI) can
+  // see it too. A robot that has never reported since this control plane subscribed is
+  // absent from the list — never a fabricated zero.
+  rpc ListActuations(Empty) returns (ActuationList);
 }
 
 message Empty {}
@@ -106,4 +113,27 @@ message Heartbeat {
   uint64 stamp_secs = 3;             // wall-clock seconds (calibrated if synced)
   uint32 stamp_nanos = 4;            // sub-second part, < 1e9
   uint64 uptime_ms = 5;              // ms since the emitting node started
+}
+
+// One robot's self-reported actuation mode, as published on its own
+// `amos/<robot>/state/actuation` topic (the `state` channel: latest-wins, so this is the
+// robot's *current* mode, not a command history).
+message Actuation {
+  string robot = 1;                  // the reporting peer (also the frame's publisher)
+  uint64 seq = 2;                    // last action it acted on; 0 = none yet
+  string gait = 3;                   // last accepted gait; "" = none accepted yet
+  uint32 frames = 4;                 // frames written to the bus for that action
+  bool armed = 5;                    // drivers energized (read from the bus, not inferred)
+  bool estopped = 6;                 // torque cut and latched until an explicit arm
+  string estop_reason = 7;           // "" | "commanded" | "watchdog" (why torque was cut)
+  uint64 watchdog_ms = 8;            // deadman period; 0 = none configured
+  uint64 last_refusal_seq = 9;       // 0 = nothing refused
+  string last_refusal = 10;          // "" = nothing refused (else: why it was refused)
+  uint64 stamp_secs = 11;            // when the robot published it (calibrated if synced)
+  uint32 stamp_nanos = 12;
+}
+
+// Every robot that has reported since this control plane subscribed, sorted by id.
+message ActuationList {
+  repeated Actuation robots = 1;
 }

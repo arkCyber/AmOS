@@ -5,7 +5,7 @@
 > contract and this page cannot drift apart.
 
 The daemon serves all of these over **one shared Unix Domain Socket** (default $AMOS_SOCKET).
-11 services · 63 RPCs · 127 messages · 19 enums,
+11 services · 64 RPCs · 129 messages · 19 enums,
 across 10 `.proto` files.
 
 ## Index
@@ -17,7 +17,7 @@ across 10 `.proto` files.
 | [`governor.proto`](#governorproto) | `amos_governor` | 1 | 6 | 9 | 2 |
 | [`netguard.proto`](#netguardproto) | `amos_netguard` | 1 | 3 | 7 | 1 |
 | [`privacy.proto`](#privacyproto) | `amos_privacy` | 1 | 9 | 12 | 0 |
-| [`robot_link.proto`](#robot_linkproto) | `amos_link` | 1 | 4 | 8 | 1 |
+| [`robot_link.proto`](#robot_linkproto) | `amos_link` | 1 | 5 | 10 | 1 |
 | [`sensor.proto`](#sensorproto) | `amos_sensor` | 1 | 7 | 12 | 4 |
 | [`telemetry_spy.proto`](#telemetry_spyproto) | `amos_telemetry_spy` | 1 | 2 | 3 | 3 |
 | [`telephony.proto`](#telephonyproto) | `amos_telephony` | 1 | 8 | 10 | 4 |
@@ -905,6 +905,7 @@ The AmOS-Link control plane exposed by the daemon (amos-ai mounts it beside AiAg
 | `ListTopics` | `Empty` | `TopicList` | unary | Every concrete topic the node has seen *published* traffic on, sorted. Subscription patterns are not listed: a pattern is not a topic, and a network transport cannot enumerate what someone else published (it answers empty). |
 | `Publish` | `PublishRequest` | `PublishReply` | unary | Publish a raw payload on a topic. The daemon stamps it with its own peer id, a monotonic sequence number and the (possibly calibrated) clock, so a producer that is not a Rust AmOS-Link node can still inject frames. |
 | `StreamHeartbeats` | `Empty` | `Heartbeat` | server streaming | Server-streaming heartbeat: every peer's beat (including this node's) as it arrives, so a client sees the whole link's liveness rather than a synthetic counter. Use GetStatus for the peer table itself. |
+| `ListActuations` | `Empty` | `ActuationList` | unary | What each robot reports about its own actuation — the control loop's **return path** (`amos/<robot>/state/actuation`, crates/amos-link/src/robot_hal.rs::ActuationState), folded into the control plane so a caller that is NOT on the link (the System UI) can see it too. A robot that has never reported since this control plane subscribed is absent from the list — never a fabricated zero. |
 
 ### Messages
 
@@ -979,6 +980,29 @@ The AmOS-Link control plane exposed by the daemon (amos-ai mounts it beside AiAg
 | `stamp_secs` | `uint64` | 3 | wall-clock seconds (calibrated if synced) |
 | `stamp_nanos` | `uint32` | 4 | sub-second part, < 1e9 |
 | `uptime_ms` | `uint64` | 5 | ms since the emitting node started |
+
+**`Actuation`** — One robot's self-reported actuation mode, as published on its own `amos/<robot>/state/actuation` topic (the `state` channel: latest-wins, so this is the robot's *current* mode, not a command history).
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `robot` | `string` | 1 | the reporting peer (also the frame's publisher) |
+| `seq` | `uint64` | 2 | last action it acted on; 0 = none yet |
+| `gait` | `string` | 3 | last accepted gait; "" = none accepted yet |
+| `frames` | `uint32` | 4 | frames written to the bus for that action |
+| `armed` | `bool` | 5 | drivers energized (read from the bus, not inferred) |
+| `estopped` | `bool` | 6 | torque cut and latched until an explicit arm |
+| `estop_reason` | `string` | 7 | "" \| "commanded" \| "watchdog" (why torque was cut) |
+| `watchdog_ms` | `uint64` | 8 | deadman period; 0 = none configured |
+| `last_refusal_seq` | `uint64` | 9 | 0 = nothing refused |
+| `last_refusal` | `string` | 10 | "" = nothing refused (else: why it was refused) |
+| `stamp_secs` | `uint64` | 11 | when the robot published it (calibrated if synced) |
+| `stamp_nanos` | `uint32` | 12 | — |
+
+**`ActuationList`** — Every robot that has reported since this control plane subscribed, sorted by id.
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `robots` | repeated `Actuation` | 1 | — |
 
 ### Enums
 

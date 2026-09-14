@@ -17,6 +17,9 @@
     linkLevel,
     linkStatus,
     peerSummary,
+    robotLevel,
+    robotLevelKey,
+    robotSummary,
     type LinkStatus,
   } from "../../lib/link";
   import { t } from "../locale.svelte";
@@ -113,6 +116,36 @@
           </ul>
         {:else}
           <p class="mt-1.5 text-sm opacity-70">{t("link.noPeers")}</p>
+        {/if}
+      </div>
+    </section>
+
+    <section class={GROUP}>
+      <div class="px-4 py-3">
+        <p class={H2}>{t("link.robotsHeading")}</p>
+        {#if (status.actuations ?? []).length > 0}
+          <ul class="mt-1.5 space-y-2" data-testid="link-robots">
+            {#each status.actuations ?? [] as robot (robot.robot)}
+              <li class="text-sm">
+                <div class="flex justify-between gap-3">
+                  <span class="truncate">{robotSummary(robot)}</span>
+                  <span class="shrink-0 opacity-70">
+                    {t(robotLevelKey(robotLevel(robot)))}
+                  </span>
+                </div>
+                {#if robot.last_refusal}
+                  <p class="text-xs opacity-60" data-testid="link-robot-refusal">
+                    {t("link.robotRefused", { seq: robot.last_refusal.seq })}:
+                    {robot.last_refusal.reason}
+                  </p>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <p class="mt-1.5 text-sm opacity-70" data-testid="link-robots-none">
+            {t("link.noReports")}
+          </p>
         {/if}
       </div>
     </section>

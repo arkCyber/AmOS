@@ -51,6 +51,23 @@ pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Largest accepted header (a topic + a peer id + numbers; 4 KiB is generous).
 const MAX_HEADER_BYTES: usize = 4 * 1024;
 
+/// CRC32 over a frame's header **and** payload, computed without copying either.
+///
+/// This is the checksum that must cover both halves, and the obvious way to write it —
+/// `crc32fast::hash(&[header, payload].concat())` — is the wrong one for a robot link:
+/// it allocates and copies a *second* full frame. At the 16 MiB ceiling that doubles the
+/// peak memory of one frame, and the copy happens on **every** received frame *before*
+/// the checksum has proven the frame is worth keeping — so a hostile peer could make a
+/// receiver allocate 32 MiB per frame while sending 16 MiB. Streaming the two slices
+/// through one hasher yields the identical CRC32 of the concatenation (CRC32 is defined
+/// over a byte stream, and `Hasher::update` appends) with zero extra allocation.
+pub(crate) fn crc32_over(header: &[u8], payload: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(header);
+    hasher.update(payload);
+    hasher.finalize()
+}
+
 /// A wall-clock instant on the publisher's (possibly calibrated) clock.
 ///
 /// Latency is only meaningful when both ends share a clock, which is why the link
@@ -307,7 +324,7 @@ impl Envelope {
         frame.push(VERSION);
         frame.extend_from_slice(&header_len.to_le_bytes());
         frame.extend_from_slice(&header);
-        let crc = crc32fast::hash(&[&header[..], &self.payload[..]].concat());
+        let crc = crc32_over(&header, &self.payload);
         frame.extend_from_slice(&crc.to_le_bytes());
         frame.extend_from_slice(&self.payload);
         Ok(frame)
@@ -367,7 +384,7 @@ impl Envelope {
             frame[header_end + 2],
             frame[header_end + 3],
         ]);
-        let actual = crc32fast::hash(&[header_bytes, payload].concat());
+        let actual = crc32_over(header_bytes, payload);
         if expect != actual {
             return Err(LinkError::Frame(format!(
                 "crc32 mismatch (frame says {expect:#010x}, computed {actual:#010x})"
@@ -424,6 +441,58 @@ mod tests {
             Timestamp::new(1_700_000_000, 123_456_789).expect("valid stamp"),
             payload,
         )
+    }
+
+    #[test]
+    fn the_streamed_crc_equals_the_concatenated_one_and_is_pinned() {
+        // The checksum is defined over the byte stream `header ‖ payload`, so pushing
+        // both slices through one hasher must equal the (allocating) concatenation it
+        // replaced: the wire format is unchanged, the extra full-frame copy is gone.
+        let header = b"a-header";
+        let payload = b"a-payload";
+        assert_eq!(
+            crc32_over(header, payload),
+            crc32fast::hash(&[&header[..], &payload[..]].concat()),
+            "streaming and concatenating must agree byte for byte"
+        );
+
+        // …and the CRC of a real frame is pinned, because it is part of the wire contract
+        // every other board (and every captured pcap) depends on.
+        let wire = envelope().encode().expect("encode");
+        let header_len = u32::from_le_bytes([wire[5], wire[6], wire[7], wire[8]]) as usize;
+        let at = PREFIX_LEN + header_len;
+        let crc = u32::from_le_bytes([wire[at], wire[at + 1], wire[at + 2], wire[at + 3]]);
+        assert_eq!(
+            crc, 0xFC0E_56E6,
+            "the frame CRC is part of the wire contract, not an implementation detail"
+        );
+    }
+
+    #[test]
+    fn a_flipped_bit_in_either_half_is_caught_before_it_is_parsed() {
+        let wire = envelope().encode().expect("encode");
+        let header_len = u32::from_le_bytes([wire[5], wire[6], wire[7], wire[8]]) as usize;
+        let at = PREFIX_LEN + header_len;
+
+        // A corrupted header byte: refused by the checksum, *before* bincode is handed
+        // bytes a peer controls (the order matters: parse never runs on unverified data).
+        let mut bad_header = wire.clone();
+        bad_header[PREFIX_LEN] ^= 0x01;
+        assert!(matches!(
+            Envelope::decode(&bad_header),
+            Err(LinkError::Frame(_))
+        ));
+
+        // A corrupted payload byte (the last byte of the frame) is caught too — which is
+        // the whole point of covering both halves in one CRC.
+        let mut bad_payload = wire.clone();
+        let last = bad_payload.len() - 1;
+        bad_payload[last] ^= 0x01;
+        assert!(matches!(
+            Envelope::decode(&bad_payload),
+            Err(LinkError::Frame(_))
+        ));
+        assert!(at > PREFIX_LEN, "the frame really has a header to cover");
     }
 
     #[test]

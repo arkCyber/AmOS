@@ -40,13 +40,13 @@ use amos_link::node::LinkNode;
 use amos_link::pubsub::Received;
 use amos_link::qos::Qos;
 use amos_link::robot_hal::{
-    parse_command, plan, ActuationState, AgentAction, MockRobotHal, MotorFrame, RobotHal,
-    ACTUATION_NAME,
+    actuation_pattern, parse_command, plan, ActuationState, AgentAction, EstopReason, Gait,
+    MockRobotHal, MotorFrame, Refusal, RobotHal,
 };
 use amos_link::sequence::{SeqEvent, SeqTracker};
 use amos_link::telemetry::{heartbeat_pattern, Heartbeat, DEFAULT_HEARTBEAT_PERIOD};
 use amos_proto::amos_link::robot_link_client::RobotLinkClient;
-use amos_proto::amos_link::{Empty, HealthState, PublishRequest};
+use amos_proto::amos_link::{Actuation as ProtoActuation, Empty, HealthState, PublishRequest};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -325,10 +325,59 @@ where
     }
 
     let cmd = cmd.unwrap_or(Cmd::Status);
+    // Two argument checks that must happen *before* a run starts, because both used to end
+    // in a panic or an abort instead of a message:
+    //
+    //  * a window the platform clock cannot represent (`Instant + Duration` panics) — the
+    //    run loops build their deadlines through `deadline_after`, so the bound is defined
+    //    in exactly one place;
+    //  * a `--size` above the wire ceiling, which no run could ever publish.
+    deadline_after(Duration::from_secs(opts.seconds)).map_err(|e| e.to_string())?;
+    if opts.size > MAX_BENCH_PAYLOAD {
+        return Err(format!(
+            "--size {} exceeds the {MAX_BENCH_PAYLOAD}-byte ceiling: a bench payload above it \
+             builds a frame that every publish would refuse (the wire ceiling is {} bytes)",
+            opts.size,
+            amos_link::codec::MAX_PAYLOAD_BYTES
+        ));
+    }
     // A second positional command is a typo, not a request to run two things.
     opts.cmd = cmd;
     opts.peer = resolve_peer(opts.peer, cmd);
     Ok(opts)
+}
+
+/// Largest `bench --size` that can actually be published.
+///
+/// A bench frame is `{seq: u64, payload: Vec<u8>}` — a few bytes of bincode framing around
+/// the payload — and the wire ceiling is
+/// [`MAX_PAYLOAD_BYTES`](amos_link::codec::MAX_PAYLOAD_BYTES). A larger `--size` would build
+/// a message every single publish then refuses, so the *argument* is refused up front (exit
+/// 2) instead: the CLI must never spend a run proving that a frame cannot exist. The `- 64`
+/// covers the framing of that struct with a margin.
+pub const MAX_BENCH_PAYLOAD: usize = amos_link::codec::MAX_PAYLOAD_BYTES - 64;
+
+/// How many latency samples `bench` reserves up front.
+///
+/// `--count` is a `u64` off a command line, and `Vec::with_capacity(count as usize)` with a
+/// huge count **aborts the process** ("capacity overflow"): an operator typo must not kill
+/// the tool. The vector still grows to whatever the run actually collects; this is only how
+/// much is reserved before the first frame arrives.
+pub const LATENCY_RESERVE: usize = 4_096;
+
+/// `Instant::now() + period`, or a refusal — **never** an overflow panic.
+///
+/// `Instant` addition panics on overflow ("overflow when adding duration to instant"), and
+/// `--seconds` is a `u64` straight from the command line: `--seconds 18446744073709551615`
+/// used to abort the process. The parser refuses such a window (exit 2) through this same
+/// helper, so a caller that builds [`Opts`] programmatically cannot panic the tool either.
+fn deadline_after(period: Duration) -> Result<Instant> {
+    Instant::now().checked_add(period).ok_or_else(|| {
+        anyhow::anyhow!(
+            "a window of {}s is beyond what this platform's clock can represent",
+            period.as_secs()
+        )
+    })
 }
 
 /// Resolve the node id: the `--peer` value, else `$AMOS_LINK_PEER`, else the default the
@@ -520,6 +569,17 @@ async fn run_remote(opts: &Opts, socket: PathBuf) -> Result<()> {
                 .into_inner();
             let metrics = status.metrics.unwrap_or_default();
             let health = health_label(status.health);
+            // What the robots say about themselves, folded by the daemon (`ListActuations`):
+            // the return path, read from the control plane instead of the data plane.
+            let robots: Vec<(String, ActuationState, u64)> = link
+                .list_actuations(Empty {})
+                .await
+                .with_context(|| format!("ListActuations on {remote}"))?
+                .into_inner()
+                .robots
+                .iter()
+                .map(actuation_from_proto)
+                .collect();
             if opts.json {
                 // The same shape as a local `status`: a document (pretty JSON), not a
                 // line-oriented `--json` stream — an operator greps the same keys either
@@ -540,6 +600,10 @@ async fn run_remote(opts: &Opts, socket: PathBuf) -> Result<()> {
                     "decode_errors": metrics.decode_errors,
                     "encode_errors": metrics.encode_errors,
                     "peers": metrics.peers,
+                    "actuations": robots
+                        .iter()
+                        .map(|(robot, state, stamp)| actuation_json(robot, state, *stamp))
+                        .collect::<Vec<_>>(),
                 });
                 println!("{}", serde_json::to_string_pretty(&document)?);
             } else {
@@ -562,6 +626,21 @@ async fn run_remote(opts: &Opts, socket: PathBuf) -> Result<()> {
                 );
                 if !status.health_reasons.is_empty() {
                     println!("health reasons: {}", status.health_reasons.join(", "));
+                }
+                // The return path: what each robot reports about *itself*. Absent robots are
+                // named as absent, never as idle ones.
+                if robots.is_empty() {
+                    println!(
+                        "robots reported (0): nobody has reported its actuation since the daemon \
+                         started watching (a report is a subscription, not a query)"
+                    );
+                } else {
+                    println!("robots reported ({}):", robots.len());
+                    for (robot, state, stamp) in &robots {
+                        for line in render_actuation(robot, state, *stamp, false) {
+                            println!("  {line}");
+                        }
+                    }
                 }
             }
         }
@@ -657,7 +736,7 @@ async fn run_remote_watch(
         .with_context(|| format!("StreamHeartbeats on {remote}"))?
         .into_inner();
     println!("remote={remote} watching the link's heartbeats for {seconds}s (StreamHeartbeats)");
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let deadline = deadline_after(Duration::from_secs(seconds))?;
     let mut seen = 0u64;
     let mut per_peer: BTreeMap<String, u64> = BTreeMap::new();
     loop {
@@ -916,7 +995,11 @@ async fn run_bench(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
         }
     );
 
-    let mut latencies: Vec<u128> = Vec::with_capacity(count as usize);
+    // A bounded reservation (`--count` is a `u64` from a command line): the vector grows to
+    // whatever the run really collects, but a huge count can no longer abort the process
+    // with a capacity overflow before the first frame is even published.
+    let target = usize::try_from(count).unwrap_or(usize::MAX);
+    let mut latencies: Vec<u128> = Vec::with_capacity(target.min(LATENCY_RESERVE));
     let started = Instant::now();
     let mut sequence = 0u64;
     // Publisher-side sequence accounting: `missing` is the frame loss the *link* caused.
@@ -945,7 +1028,7 @@ async fn run_bench(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
     }
     // Give the last frames a bounded moment to land, then drain once more.
     let deadline = Instant::now() + Duration::from_millis(200);
-    while latencies.len() < count as usize && Instant::now() < deadline {
+    while latencies.len() < target && Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(50), subscriber.recv()).await {
             Ok(Ok(received)) => {
                 seq.observe_received(&received);
@@ -1075,7 +1158,10 @@ async fn run_discover_lan(opts: &Opts) -> Result<()> {
         period.as_millis(),
         opts.seconds
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(opts.seconds.max(1));
+    // `tokio::time::Instant` is a wrapper over the same `std::time::Instant`, so the one
+    // overflow-safe helper covers both clocks.
+    let deadline =
+        tokio::time::Instant::from_std(deadline_after(Duration::from_secs(opts.seconds.max(1)))?);
     // Bounded by `--seconds`: it always ends (a discovery sweep, not a daemon).
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline - tokio::time::Instant::now();
@@ -1122,7 +1208,7 @@ async fn run_discover_bus(opts: &Opts) -> Result<()> {
         node.peer(),
         opts.seconds.max(1)
     );
-    let deadline = Instant::now() + Duration::from_secs(opts.seconds.max(1));
+    let deadline = deadline_after(Duration::from_secs(opts.seconds.max(1)))?;
     // Bounded by `--seconds`: a discovery sweep, not a daemon. It also prints the table
     // *while* it is listening, so an operator sees peers appear instead of a frozen run.
     while Instant::now() < deadline {
@@ -1167,33 +1253,29 @@ fn print_peers(peers: &[PeerView]) {
     }
 }
 
+/// One report from the **data plane** (`state`) → the shared renderer below.
+fn state_lines(received: &Received<ActuationState>, json: bool) -> Vec<String> {
+    render_actuation(
+        received.publisher.as_str(),
+        &received.message,
+        received.stamp.unix_ms(),
+        json,
+    )
+}
+
 /// Render one actuation report: the human line(s), or one JSON document with `--json`.
 ///
-/// Pure (lines out, no printing) so the exact rendering an operator reads is unit-testable —
-/// the same rule this CLI follows for every other command's output.
-fn state_lines(received: &Received<ActuationState>, json: bool) -> Vec<String> {
-    let state = &received.message;
+/// Pure (lines out, no printing) and **shared by both sources** — the data plane (`state`,
+/// where a frame carries its publisher and stamp) and the control plane
+/// (`status --socket`, where the daemon hands back the report it folded in) — so the two
+/// renderings can never drift in what they claim.
+fn render_actuation(robot: &str, state: &ActuationState, stamp_ms: u64, json: bool) -> Vec<String> {
     if json {
-        return vec![serde_json::json!({
-            "robot": received.publisher.as_str(),
-            "seq": state.seq,
-            "gait": state.gait.map(|g| g.key()),
-            "frames": state.frames,
-            "armed": state.armed,
-            "estopped": state.estopped,
-            "estop_reason": state.estop_reason.map(|r| r.key()),
-            "watchdog_ms": state.watchdog_ms,
-            "last_refusal": state.last_refusal.as_ref().map(|r| serde_json::json!({
-                "seq": r.seq,
-                "reason": r.reason,
-            })),
-            "stamp_ms": received.stamp.unix_ms(),
-        })
-        .to_string()];
+        return vec![actuation_json(robot, state, stamp_ms).to_string()];
     }
     let mut lines = vec![format!(
         "robot={} armed={} estopped={}{} gait={} frames={} seq={} watchdog={}",
-        received.publisher,
+        robot,
         state.armed,
         state.estopped,
         state
@@ -1220,6 +1302,52 @@ fn state_lines(received: &Received<ActuationState>, json: bool) -> Vec<String> {
     lines
 }
 
+/// The JSON shape of one report — **one** definition, used by both sources.
+fn actuation_json(robot: &str, state: &ActuationState, stamp_ms: u64) -> serde_json::Value {
+    serde_json::json!({
+        "robot": robot,
+        "seq": state.seq,
+        "gait": state.gait.map(|g| g.key()),
+        "frames": state.frames,
+        "armed": state.armed,
+        "estopped": state.estopped,
+        "estop_reason": state.estop_reason.map(|r| r.key()),
+        "watchdog_ms": state.watchdog_ms,
+        "last_refusal": state.last_refusal.as_ref().map(|r| serde_json::json!({
+            "seq": r.seq,
+            "reason": r.reason,
+        })),
+        "stamp_ms": stamp_ms,
+    })
+}
+
+/// The control plane's copy of a report, back in the domain shape — so `status --socket` and
+/// `state` render through the *same* function.
+///
+/// The proto has no `Option`, so its sentinels (`0` / `""`) become the domain's "absent" here.
+/// An e-stop reason this build does not know stays `None` instead of being folded into one it
+/// does: `estopped` travels separately, so nothing is silently turned into "not cut".
+fn actuation_from_proto(a: &ProtoActuation) -> (String, ActuationState, u64) {
+    let state = ActuationState {
+        seq: (a.seq != 0).then_some(a.seq),
+        gait: Gait::from_key(&a.gait),
+        frames: a.frames as usize,
+        armed: a.armed,
+        estopped: a.estopped,
+        estop_reason: EstopReason::from_key(&a.estop_reason),
+        watchdog_ms: (a.watchdog_ms != 0).then_some(a.watchdog_ms),
+        last_refusal: (!a.last_refusal.is_empty()).then(|| Refusal {
+            seq: a.last_refusal_seq,
+            reason: a.last_refusal.clone(),
+        }),
+    };
+    let stamp_ms = a
+        .stamp_secs
+        .saturating_mul(1000)
+        .saturating_add(u64::from(a.stamp_nanos) / 1_000_000);
+    (a.robot.clone(), state, stamp_ms)
+}
+
 /// Print one actuation report.
 fn print_state(received: &Received<ActuationState>, json: bool) -> Result<()> {
     for line in state_lines(received, json) {
@@ -1243,8 +1371,7 @@ async fn run_state(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
     let pattern = match opts.pattern.as_deref() {
         Some(raw) => Topic::pattern(raw.to_string())
             .with_context(|| format!("`--pattern {raw}` is not a valid pattern"))?,
-        None => Topic::pattern(format!("amos/*/{}/{ACTUATION_NAME}", Channel::State.key()))
-            .context("building the default state pattern")?,
+        None => actuation_pattern().context("building the default state pattern")?,
     };
     // The channel decides the profile: a state report is latest-wins, so a burst of modes
     // cannot leave a consumer acting on one that already expired.
@@ -1326,7 +1453,7 @@ async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
         seconds
     );
 
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let deadline = deadline_after(Duration::from_secs(seconds))?;
     let mut ticker = tokio::time::interval(period);
     let mut seen = 0u64;
     // Per-publisher beat accounting: a jump in a peer's own heartbeat counter means this
@@ -1491,6 +1618,47 @@ fn render_frame(frame: &MotorFrame) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arguments_that_would_panic_or_abort_are_refused_as_usage_errors() {
+        // `--seconds` reaches `Instant + Duration`, which panics on overflow: a window the
+        // platform clock cannot represent must be an exit-2 message, never a crash.
+        let err = parse_from(["discover", "--bus", "--seconds", "18446744073709551615"])
+            .expect_err("an unrepresentable window must be refused");
+        assert!(
+            err.contains("beyond what this platform's clock can represent"),
+            "got: {err}"
+        );
+        // A window every platform can represent still parses.
+        assert_eq!(
+            parse_from(["discover", "--bus", "--seconds", "9"])
+                .expect("parse")
+                .seconds,
+            9
+        );
+
+        // `--size` above the wire ceiling would make every publish of a `bench` run fail:
+        // refuse the argument instead of running a benchmark that cannot publish.
+        let over = parse_from(["bench", "--size", &(MAX_BENCH_PAYLOAD + 1).to_string()])
+            .expect_err("a payload above the ceiling must be refused");
+        assert!(over.contains("exceeds the"), "got: {over}");
+        assert!(
+            over.contains(&MAX_BENCH_PAYLOAD.to_string()),
+            "the refusal names the ceiling it applied, got: {over}"
+        );
+        // …while the ceiling itself is legal (the bound is inclusive, and the CLI says so
+        // by accepting it).
+        assert_eq!(
+            parse_from(["bench", "--size", &MAX_BENCH_PAYLOAD.to_string()])
+                .expect("the ceiling is inside the bound")
+                .size,
+            MAX_BENCH_PAYLOAD
+        );
+        assert_eq!(
+            parse_from(["bench", "--size", "4096"]).expect("parse").size,
+            4096
+        );
+    }
 
     #[test]
     fn parses_commands_and_options() {
@@ -1759,4 +1927,71 @@ mod tests {
         assert_eq!(value["watchdog_ms"].as_u64(), Some(1000));
         assert!(value["stamp_ms"].as_u64().expect("stamp") > 1_000_000_000_000);
     }
+}
+
+/// The control-plane copy of a report decodes back into the domain shape: the proto's
+/// sentinels mean "absent", and a reason this build does not know is never invented.
+#[test]
+fn a_folded_report_decodes_back_into_the_domain_shape() {
+    let idle = ProtoActuation {
+        robot: "dog1".to_string(),
+        seq: 0,
+        gait: String::new(),
+        frames: 0,
+        armed: false,
+        estopped: false,
+        estop_reason: String::new(),
+        watchdog_ms: 0,
+        last_refusal_seq: 0,
+        last_refusal: String::new(),
+        stamp_secs: 7,
+        stamp_nanos: 500_000_000,
+    };
+    let (robot, state, stamp_ms) = actuation_from_proto(&idle);
+    assert_eq!(robot, "dog1");
+    assert_eq!(state.seq, None, "0 means `no action yet`");
+    assert_eq!(state.gait, None, "the empty key means no gait accepted");
+    assert_eq!(state.estop_reason, None);
+    assert_eq!(state.watchdog_ms, None);
+    assert_eq!(state.last_refusal, None);
+    assert_eq!(stamp_ms, 7_500, "seconds + nanos → ms");
+
+    // A real report travels verbatim.
+    let stopped = ProtoActuation {
+        seq: 12,
+        gait: "estop".to_string(),
+        frames: 12,
+        armed: false,
+        estopped: true,
+        estop_reason: "watchdog".to_string(),
+        watchdog_ms: 1000,
+        last_refusal_seq: 13,
+        last_refusal: "e-stop latched: send {\"action\":\"arm\"} to re-arm".to_string(),
+        ..idle.clone()
+    };
+    let (_, state, _) = actuation_from_proto(&stopped);
+    assert_eq!(state.seq, Some(12));
+    assert_eq!(state.gait, Some(Gait::Estop));
+    assert_eq!(state.estop_reason, Some(EstopReason::Watchdog));
+    assert!(state.estopped && !state.armed);
+    assert_eq!(state.watchdog_ms, Some(1000));
+    assert_eq!(state.last_refusal.as_ref().map(|r| r.seq), Some(13));
+
+    // A reason from a newer robot stays unknown — while `estopped` still reports that
+    // torque *was* cut. The JSON says `null`, never a guessed reason.
+    let newer = ProtoActuation {
+        estop_reason: "meltdown".to_string(),
+        ..stopped
+    };
+    let (_, state, _) = actuation_from_proto(&newer);
+    assert!(state.estopped, "the flag is independent of the reason");
+    assert_eq!(
+        state.estop_reason, None,
+        "an unknown reason is not invented"
+    );
+    let value = actuation_json("dog1", &state, 42);
+    assert_eq!(value["robot"], "dog1");
+    assert_eq!(value["estopped"], true);
+    assert_eq!(value["estop_reason"], serde_json::Value::Null);
+    assert_eq!(value["stamp_ms"], 42);
 }

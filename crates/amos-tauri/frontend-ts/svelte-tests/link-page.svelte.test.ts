@@ -132,4 +132,80 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
       expect(calls.filter((c) => c === "link_status").length).toBeGreaterThan(before),
     );
   });
+
+  test("robot rows show what each robot reports about itself", async () => {
+    bridgeReturning({
+      ...STATUS,
+      actuations: [
+        {
+          robot: "dog1",
+          seq: 12,
+          gait: "trot",
+          frames: 13,
+          armed: true,
+          estopped: false,
+          estop_reason: null,
+          watchdog_ms: 1000,
+          last_refusal: null,
+          stamp_ms: 1,
+        },
+        {
+          robot: "dog2",
+          seq: 13,
+          gait: "estop",
+          frames: 12,
+          armed: false,
+          estopped: true,
+          estop_reason: "watchdog",
+          watchdog_ms: 1000,
+          last_refusal: {
+            seq: 14,
+            reason: 'e-stop latched: send {"action":"arm"} to re-arm',
+          },
+          stamp_ms: 2,
+        },
+      ],
+    });
+    const host = render(LinkPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="link-robots"]')).toBeTruthy(),
+    );
+    const rows = host.container.querySelector('[data-testid="link-robots"]')?.textContent ?? "";
+    expect(rows).toContain("dog1 · trot · #12");
+    expect(rows).toContain("已上电");
+    expect(rows).toContain("dog2 · estop · #13");
+    // The watchdog cut is the headline fact for that row, not "armed".
+    expect(rows).toContain("已切扭矩");
+    // The refusal carries the robot's own words (how to recover), not a UI paraphrase.
+    const refusal =
+      host.container.querySelector('[data-testid="link-robot-refusal"]')?.textContent ?? "";
+    expect(refusal).toContain("#14");
+    expect(refusal).toContain("re-arm");
+  });
+
+  test("no reports is stated as such, never as 'all robots idle'", async () => {
+    bridgeReturning({ ...STATUS, actuations: [] });
+    const host = render(LinkPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="link-robots-none"]')).toBeTruthy(),
+    );
+    expect(host.container.textContent ?? "").toContain("还没有机器人上报自身状态");
+    expect(host.container.querySelector('[data-testid="link-robots"]')).toBeNull();
+  });
+
+  test("a daemon older than the RPC does not break the panel", async () => {
+    // Version skew: an older daemon simply omits `actuations`. The panel must show less,
+    // never throw — and the rest of the status still renders.
+    const older: Record<string, unknown> = { ...STATUS };
+    delete older.actuations;
+    bridgeReturning(older);
+    const host = render(LinkPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="link-counters"]')).toBeTruthy(),
+    );
+    expect(
+      host.container.querySelector('[data-testid="link-robots-none"]'),
+    ).toBeTruthy();
+    expect(host.container.querySelector('[data-testid="link-robots"]')).toBeNull();
+  });
 });

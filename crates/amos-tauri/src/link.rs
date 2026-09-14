@@ -20,7 +20,8 @@
 //! never travels through gRPC, and this bridge does not pretend to read it.
 
 use amos_proto::amos_link::{
-    robot_link_client::RobotLinkClient, Empty, HealthState, LinkStatus, Metrics, Peer,
+    robot_link_client::RobotLinkClient, Actuation as ProtoActuation, Empty, HealthState,
+    LinkStatus, Metrics, Peer,
 };
 use serde::Serialize;
 
@@ -52,6 +53,76 @@ pub struct LinkMetricsOut {
     pub encode_errors: u64,
 }
 
+/// A command that was refused before it reached the bus, as the robot reported it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinkRefusalOut {
+    /// The link sequence of the refused action.
+    pub seq: u64,
+    /// Why it was refused (the robot's own words).
+    pub reason: String,
+}
+
+/// What one robot says about its own actuation (the control loop's **return path**).
+///
+/// The reports travel the data plane (`amos/<robot>/state/actuation`); the daemon folds them
+/// and hands them back over the control plane, which is how an app that is not on the link —
+/// this UI — can show what a robot is *doing*, not just that it exists.
+///
+/// The proto has no `Option`, so "absent" arrives as `0` / `""` and is turned back into `None`
+/// here: a UI must be able to tell "never armed" from "armed with value 0", and an e-stop
+/// reason this build does not know stays `None` while `estopped` still says torque was cut.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinkActuationOut {
+    /// The reporting peer (also the frame's publisher).
+    pub robot: String,
+    /// The last action it acted on (`None` before any).
+    pub seq: Option<u64>,
+    /// The last accepted gait (`None` before one was accepted).
+    pub gait: Option<String>,
+    /// Frames written to the bus for that action.
+    pub frames: u64,
+    /// Drivers energized (read from the bus by the robot, never inferred here).
+    pub armed: bool,
+    /// Torque is cut and latched until an explicit arm.
+    pub estopped: bool,
+    /// `"commanded"` | `"watchdog"` | `None` (none, or a reason this build does not know).
+    pub estop_reason: Option<String>,
+    /// The deadman period the robot runs under (`None` = no watchdog configured).
+    pub watchdog_ms: Option<u64>,
+    /// The most recent refusal, if any.
+    pub last_refusal: Option<LinkRefusalOut>,
+    /// When the robot published the report (ms since the epoch, from its own clock).
+    pub stamp_ms: u64,
+}
+
+/// Map one folded report. Nothing here invents a value the robot did not report.
+pub fn actuation_out(a: &ProtoActuation) -> LinkActuationOut {
+    LinkActuationOut {
+        robot: a.robot.clone(),
+        seq: (a.seq != 0).then_some(a.seq),
+        gait: Some(a.gait.clone()).filter(|g| !g.is_empty()),
+        frames: u64::from(a.frames),
+        armed: a.armed,
+        estopped: a.estopped,
+        // Only the tokens this build knows: an unknown reason from a newer robot is not
+        // guessed at *or* passed through as if it were a verdict of ours — `estopped` still
+        // tells the UI that torque was cut, which is the safety fact.
+        estop_reason: match a.estop_reason.as_str() {
+            "commanded" | "watchdog" => Some(a.estop_reason.clone()),
+            _ => None,
+        },
+        watchdog_ms: (a.watchdog_ms != 0).then_some(a.watchdog_ms),
+        last_refusal: (!a.last_refusal.is_empty()).then(|| LinkRefusalOut {
+            seq: a.last_refusal_seq,
+            reason: a.last_refusal.clone(),
+        }),
+        stamp_ms: a
+            .stamp_secs
+            .saturating_mul(1000)
+            .saturating_add(u64::from(a.stamp_nanos) / 1_000_000),
+    }
+}
+
 /// Serializable mirror of the daemon's `LinkStatus` (prost structs are not `Serialize`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LinkStatusOut {
@@ -70,6 +141,9 @@ pub struct LinkStatusOut {
     pub health_reasons: Vec<String>,
     pub metrics: LinkMetricsOut,
     pub peers: Vec<LinkPeerOut>,
+    /// What each robot says about itself (the return path, folded by the daemon) — sorted by
+    /// robot id. Empty means **nobody has reported**, which is not the same as idle.
+    pub actuations: Vec<LinkActuationOut>,
 }
 
 /// Map the wire enum to a stable display token.
@@ -114,8 +188,8 @@ pub fn metrics_out(metrics: Option<&Metrics>) -> LinkMetricsOut {
     }
 }
 
-/// Map a full wire status.
-pub fn status_out(status: &LinkStatus) -> LinkStatusOut {
+/// Map a full wire status, with the robots' reports the daemon folded in beside it.
+pub fn status_out(status: &LinkStatus, actuations: Vec<LinkActuationOut>) -> LinkStatusOut {
     LinkStatusOut {
         peer: status.peer.clone(),
         kind: status.kind.clone(),
@@ -126,13 +200,15 @@ pub fn status_out(status: &LinkStatus) -> LinkStatusOut {
         health_reasons: status.health_reasons.clone(),
         metrics: metrics_out(status.metrics.as_ref()),
         peers: status.peers.iter().map(peer_out).collect(),
+        actuations,
     }
 }
 
-/// Read the running daemon's AmOS-Link status (identity, counters, peers, verdict).
+/// Read the running daemon's AmOS-Link status (identity, counters, peers, verdict) **and** the
+/// robots' own actuation reports (the return path, folded by the daemon).
 ///
-/// A daemon that is not running is an `Err` the UI renders as "not connected" — this
-/// command never fabricates a link status, and it never claims the data plane.
+/// A daemon that is not running is an `Err` the UI renders as "not connected" — this command
+/// never fabricates a link status, and it never claims the data plane.
 #[tauri::command]
 pub async fn link_status() -> Result<LinkStatusOut, String> {
     let mut client = RobotLinkClient::new(daemon::channel().await?);
@@ -141,7 +217,16 @@ pub async fn link_status() -> Result<LinkStatusOut, String> {
         .await
         .map_err(|e| format!("robot-link status failed: {e}"))?
         .into_inner();
-    Ok(status_out(&reply))
+    let robots = client
+        .list_actuations(Empty {})
+        .await
+        .map_err(|e| format!("robot-link ListActuations failed: {e}"))?
+        .into_inner()
+        .robots;
+    Ok(status_out(
+        &reply,
+        robots.iter().map(actuation_out).collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -178,7 +263,7 @@ mod tests {
 
     #[test]
     fn maps_a_status_verbatim() {
-        let out = status_out(&status());
+        let out = status_out(&status(), Vec::new());
         assert_eq!(out.peer, "amos-daemon");
         assert_eq!(out.kind, "brain");
         assert_eq!(out.uptime_ms, 4200);
@@ -224,7 +309,10 @@ mod tests {
         assert_eq!(metrics_out(None), LinkMetricsOut::default());
         let mut s = status();
         s.metrics = None;
-        assert_eq!(status_out(&s).metrics, LinkMetricsOut::default());
+        assert_eq!(
+            status_out(&s, Vec::new()).metrics,
+            LinkMetricsOut::default()
+        );
     }
 
     #[test]
@@ -240,9 +328,69 @@ mod tests {
             health: HealthState::HealthUnknown as i32,
             health_reasons: Vec::new(),
         };
-        let out = status_out(&s);
+        let out = status_out(&s, Vec::new());
         assert!(out.peers.is_empty());
         assert_eq!(out.health, "unknown");
         assert!(out.health_reasons.is_empty());
+    }
+
+    #[test]
+    fn a_folded_report_decodes_without_inventing_anything() {
+        // Before any action: the proto's sentinels mean "absent", not "zero".
+        let idle = ProtoActuation {
+            robot: "dog1".into(),
+            seq: 0,
+            gait: String::new(),
+            frames: 0,
+            armed: false,
+            estopped: false,
+            estop_reason: String::new(),
+            watchdog_ms: 0,
+            last_refusal_seq: 0,
+            last_refusal: String::new(),
+            stamp_secs: 7,
+            stamp_nanos: 500_000_000,
+        };
+        let out = actuation_out(&idle);
+        assert_eq!(out.robot, "dog1");
+        assert_eq!(out.seq, None);
+        assert_eq!(out.gait, None);
+        assert_eq!(out.estop_reason, None);
+        assert_eq!(out.watchdog_ms, None);
+        assert_eq!(out.last_refusal, None);
+        assert_eq!(out.stamp_ms, 7_500);
+
+        // A real report travels verbatim, refusal and reason included.
+        let stopped = ProtoActuation {
+            seq: 12,
+            gait: "estop".into(),
+            frames: 12,
+            estopped: true,
+            estop_reason: "watchdog".into(),
+            watchdog_ms: 1000,
+            last_refusal_seq: 13,
+            last_refusal: "e-stop latched".into(),
+            ..idle.clone()
+        };
+        let out = actuation_out(&stopped);
+        assert_eq!(out.seq, Some(12));
+        assert_eq!(out.gait.as_deref(), Some("estop"));
+        assert!(out.estopped && !out.armed);
+        assert_eq!(out.estop_reason.as_deref(), Some("watchdog"));
+        assert_eq!(out.watchdog_ms, Some(1000));
+        assert_eq!(out.frames, 12);
+        let refusal = out.last_refusal.expect("the refusal travels");
+        assert_eq!(refusal.seq, 13);
+        assert_eq!(refusal.reason, "e-stop latched");
+
+        // A reason from a newer robot stays unknown while `estopped` still says torque was
+        // cut: the UI shows "cut, reason unknown" rather than a guessed reason or "not cut".
+        let newer = ProtoActuation {
+            estop_reason: "meltdown".into(),
+            ..stopped
+        };
+        let out = actuation_out(&newer);
+        assert!(out.estopped, "the safety fact survives an unknown reason");
+        assert_eq!(out.estop_reason, None, "an unknown verdict is not invented");
     }
 }

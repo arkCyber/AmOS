@@ -61,7 +61,7 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 | `robot_hal` | `parse_command`(JSON 校验) → `plan`(步态→关节位姿) → `MotorFrame`(10 字节/CRC16) → `RobotHal` seam（`MockRobotHal`）；`RobotBridge` 带**死手看门狗 + 闩锁急停**，并可 `reporting()` 把模式**回程**到 `amos/<robot>/state/actuation`（仅模式变化时发） | 大模型只能说 JSON；限位、关节范围、CRC 都由这一侧负责。`JointId` 索引**私有**（只能经 `new` 或在**反序列化时**校验得到），`MotorFrame::validate` 在 **CRC16 总线解码**与 **bincode `Message`** 两条路径上都强制（`MockRobotHal::apply` 也在写总线前拒绝整批）。安全语义见 §3.1 |
 | `sequence` | `SeqTracker` / `SeqEvent` / `SeqSummary`：按**发布者**跟踪 `seq` 高水位 ⇒ `in_order` / `gaps` / `missing` / `stale` | 纯状态机（无 IO、无时钟）。「帧丢了」由**发布者自己的计数器**证明，而不是猜：一次跳变 = 一次 gap 事件，`missing` 记它丢了多少帧；等于/低于高水位的帧算 `stale`（重复/乱序/计数器重启），**不混进「丢帧」**。CLI `sub` / `bench` / `watch` 都用它把丢帧变成数字 |
 | `node` | `LinkNode`：身份 + 传输 + 时钟 + 计数器 + 对端表，`publisher::<T>()` / `subscriber::<T>()` 的唯一入口 | 控制面与 CLI 都是它的薄壳 |
-| `service` | tonic 控制面（`proto/robot_link.proto`：GetStatus / ListTopics / Publish / StreamHeartbeats），已挂进 `amos-ai::server::serve()` 的共享 UDS | 控制面≠数据面：RPC 只做管理，字节流永不经过它 |
+| `service` | tonic 控制面（`proto/robot_link.proto`：GetStatus / ListTopics / Publish / StreamHeartbeats / **ListActuations**），已挂进 `amos-ai::server::serve()` 的共享 UDS | 控制面≠数据面：RPC 只做管理，字节流永不经过它。**唯一的例外是有意的**：`ListActuations` 把**回程**（`amos/*/state/actuation`）**订阅并折叠**成一张按 robot 排序的快照表，让不在链路上的调用方也能读到「机器人自报什么」——它是**读**数据面，不是代理数据面 |
 
 计数器（`metrics`）由「知道事实的那一层」写：`published`（交给传输）、`delivered`（进入订阅队列）、
 `dropped`（QoS 策略真的丢了）、`blocked`（**被可靠订阅者背压**：这次发布不得不等队列腾位置）、
@@ -114,6 +114,54 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 `SeqSummary` 传进 `evaluate`。控制面 `LinkStatus.health`（枚举）+ `health_reasons`（每条带数字的 token）
 把同一结论送到非 Rust 客户端。
 
+### 3.3 分配与算术纪律（航天级加固轮，REQ-A241）
+
+> 本节记录一次**按安全关键纪律逐行复核**的结果：五处真实缺陷（都带可复现的负控）与一处
+> **核实后判定不是缺陷**的怀疑。判定标准沿用全仓的 Power of 10 口径：**任何来自线缆/命令行/模型
+> 的值都必须被有界化，任何"等一个可能永不到来的事件"的等待都必须能被证明会结束，任何上报出去的
+> 数字都必须是**测量**而不是假设**。
+
+| # | 缺陷（修前） | 为什么按适航标准不可接受 | 处置 |
+|---|---|---|---|
+| 1 | **CRC 用 `crc32fast::hash(&[header, payload].concat())`** | 每帧**多分配并复制一整份帧**：16 MiB 上限下把一帧的**峰值内存翻倍**；更糟的是它发生在**校验之前**——对端一个 16 MiB 的帧就能让接收端先分配 32 MiB，而"分配必须发生在验证之后"是本 crate 自己写在 §3 的纪律 | 新增 `codec::crc32_over(header, payload)`：`Hasher::update` **流式**覆盖两段，**零额外分配**，CRC 值**逐字节不变** |
+| 2 | **锁中毒 ⇒ 可靠发布无界等待**（`broker::LatestSlot::try_put` 把 `Err(poison)` 当"槽已占用"） | 中毒后 `take()` 永远返回 `None`，`taken` 通知**永远不会有发送者**，于是 `offer_blocking` 在**控制回路上永久等待**；`recv()` 同样会空转。Power of 10 #2 要求"每个循环都要能证明会结束"，而这是一个**没有终止条件**的等待 | `try_put` 返回 `Result<Option<Ingress>>`：中毒 = `LinkError::Closed`（类型化拒绝）；`is_closed()` 把中毒视为**已关闭**（消费者结束、注册项被清扫） |
+| 3 | **看门狗上报的帧数是猜的**（`RobotHal::estop()` 返回 `()`，看门狗路径写死 `frames: JOINTS`） | 上报给大脑/界面的 `frames` 必须是**测量值**。切扭矩没有唯一线形：有的驱动器**一帧广播**就切，有的每关节一帧——对前者，12 是**编造的数字** | `RobotHal::estop() -> Result<usize>`（与 `apply` 同形，实测）；`BridgeEvent::Estopped.frames` 用实测值；`MockRobotHal::estop` 返回 `apply` 的计数 |
+| 4 | **CLI 两个可复现的崩溃**（负控实测：`discover --bus --seconds 18446744073709551615` ⇒ `panicked … overflow when adding duration to instant`；`bench --count 18446744073709551615` ⇒ `panicked … capacity overflow`） | 操作员输入不该**panic**，更不该**abort**（`Vec::with_capacity` 的容量溢出是 abort 级失败）。同一个纪律本轮之前已经用在 `--hz` 上（`Duration::try_from_secs_f64`），但 `Instant + Duration` 与按 `--count` 预留容量这两条漏了 | `deadline_after()`（`checked_add`，**一处定义**）在**解析期**拒绝不可表示的窗口（exit 2），运行时再以同一函数兜底；latency 预留改为有界（`LATENCY_RESERVE`），`target` 用 `usize::try_from` 无截断；`--size` 超过线上限（`MAX_BENCH_PAYLOAD = 16 MiB − 64`）在解析期拒绝 |
+| 5 | **静默截断**：`PublishReply` 的 `usize as u32`、`watchdog_ms` 的 `u128 as u64` | `as` 溢出时**回绕**（2³² 变 0），调用方会读成"几乎什么都没送达"；仓内既有的纪律是**饱和**（`Timestamp::unix_ms`、`next_seq`），这两处不一致 | `service::count_to_u32`、`watchdog_ms` 的 `u64::try_from(...).unwrap_or(u64::MAX)`，各带单测（含 64 位平台上的回绕负控） |
+
+**核实后判定"不是缺陷"的一条（诚实记录）**：本轮曾怀疑所有 `bincode::deserialize`（其默认字节预算
+为 **Unlimited**）可被一个短帧里的长度前缀骗出巨额分配。查依赖源码后**否定**：`bincode 1.3.3` 的
+`SliceReader::get_byte_slice` 会**先**判 `length > slice.len()` 再决定是否分配（`de/read.rs:47`），
+而本 crate 的解码点**全部**喂 `&[u8]`（不是 `io::Read`）——所以 `Vec<u8>`/`String` 的超长声明是
+**拒绝**而不是分配。故此轮**不改**解码配置，只把结论记录在案；**附带条件**：若有解码点改成
+`deserialize_from(reader)`（`IoReader` 会 `temp_buffer.resize(length, 0)`），该结论立刻失效，届时
+必须补 `with_limit`。
+
+**回归证据**（全部可复跑）：
+```bash
+cargo test -p amos-link                                  # 115 lib + 4 e2e + 2 UDS
+cargo test -p amos-link --features amos-link/lan --lib   # 120
+cargo test -p amos-link --features amos-link/zenoh --lib # 117 + 1 ignored
+cargo test -p amos-link-cli                              # 9 parser + 17 process-level
+cargo clippy -p amos-link -p amos-link-cli --all-targets --features lan,zenoh -- -D warnings
+```
+**负控实测**（把缺陷注入回去，证明每条新验证真的会红；每次注入后都 `cmp` 还原为**逐字节一致**）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| CRC 改回 `crc32fast::hash(&[…].concat())` | `allocation_budget`：`encoding a 4194389-byte frame asked for 8388837 bytes`（≈ 2×）⇒ **FAILED** |
+| `LatestSlot::try_put` 的"中毒 = 占用"**与** `is_closed()` 的旧实现一起注入 | `a_poisoned_reliable_slot_refuses_…`：`the publish must return, not wait forever: Elapsed(())`（**真的永久等待**）⇒ 两条用例 **FAILED** |
+| 看门狗路径改回 `frames: JOINTS` | `a_watchdog_cut_reports_…`：`left: Estopped { frames: 12 } / right: { frames: 1 }` ⇒ **FAILED** |
+| CLI 原样 | `--seconds u64::MAX` ⇒ `panicked at lib.rs:1155: overflow when adding duration to instant`；`--count u64::MAX` ⇒ `panicked … capacity overflow`（修**前**的实测输出） |
+
+**新增/加固的验证**：编帧 CRC 的**值被钉住**（`the_streamed_crc_equals_the_concatenated_one_and_is_pinned`
+断言 `crc32_over` == `concat()` 的 CRC，并把一帧真实帧的 CRC 固定为 `0xFC0E56E6` —— 线协议一旦
+漂移，这条会红）；`a_flipped_bit_in_either_half_is_caught_before_it_is_parsed`（帧头/载荷各翻一位，
+且证明**校验先于解析**）；`a_poisoned_reliable_slot_refuses_…`（中毒槽的发布**有界返回**、`recv` 不空转）；
+`a_poisoned_sensor_slot_is_a_dead_consumer_not_a_silent_delivery`；`a_watchdog_cut_reports_the_frames_the_bus_took_not_a_guess`
+（1 帧切扭矩的 HAL ⇔ 上报 1）；`arguments_that_used_to_crash_the_process_are_usage_errors_now`
+（进程级：两条负控命令现在 exit 2）；`a_huge_count_still_starts_the_benchmark_…`。
+
 
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
 
@@ -150,7 +198,7 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
 它需要可用的组播/网络环境，`cargo test -p amos-link --features zenoh -- --ignored` 可在联网机器上手动跑。
 **默认 CI 不会伪造这条证据**。
 
-## 5. 控制面（`proto/robot_link.proto`，4 个 RPC）
+## 5. 控制面（`proto/robot_link.proto`，5 个 RPC）
 
 | RPC | 作用 | 关键实现细节 |
 |---|---|---|
@@ -158,6 +206,7 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
 | `ListTopics` | 传输见过流量的话题清单 | 网络传输回答「不知道」（`Vec::new()`），不伪造空列表 |
 | `Publish` | 由非 Rust 节点注入原始负载 | daemon 用自己的 peer id、独立序号与（已校准的）时钟封装成真正的 `Envelope`，因此**类型化订阅者照样能解** |
 | `StreamHeartbeats` | 服务端流式心跳 | 直接把 `amos/*/telemetry/beat`（**每个** peer 的心跳，含自己）的订阅转发给 gRPC 客户端——传输的是链路上**真的收到过**的帧，不是合成计数器；「到底谁在线」由 `GetStatus` 的对端表回答。**「含自己」是实装的**：`LinkService::with_heartbeat`（`mock_server()` 用的就是这个形状）会为挂载的节点起心跳任务，所以 daemon 自己也真的在 `amos/amos-daemon/telemetry/beat` 上打拍——否则这条流**一帧都发不出来**，而「没有证据」与「链路健康但安静」在流上长得一模一样（证据：`crates/amos-ai/tests/link_rpc_e2e.rs::the_daemon_link_node_beats…`） |
+| `ListActuations` | **回程**：每个机器人自报的 `armed`/`estopped`(+原因)/`gait`/最近一次拒绝 | 数据面在 `amos/<robot>/state/actuation`，控制面**订阅并折叠**它们（`LinkService::with_heartbeat` 起的 watcher），让**不在链路上**的调用方（System UI、CLI）也能读到。三个诚实点：**(a) 按帧头 `publisher` 归属**（谁发布谁是机器人），不信负载自称；**(b) 一张快照表，按 id 排序**，同一机器人后来的报告覆盖旧的；**(c) 没上报过的机器人是「不在列表里」，不是「空闲」**——`mock_server` 刚起来时它是空的，而空 ≠ 全员空闲 |
 
 挂载点：`amos-ai/src/server.rs` 的 `serve()` 里 `.add_service(amos_link::service::mock_server())`，
 与 AiAgent/Sensor/Telephony 同一条 UDS；证据是 `crates/amos-ai/tests/link_rpc_e2e.rs`（真 UDS 往返）。
@@ -190,9 +239,14 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
    两份用例（`svelte-tests/link-page.svelte.test.ts`、`src/__tests__/link.test.ts`）。
    **它只读、不指挥**（发布是 CLI/工具的事），并且**原样带出守护进程的判定**：`unknown`（暂无证据）**不等于**
    `healthy`，时钟未校准会明确说"延迟只是上界"，计数器标明是自启动累计。
+   **（本轮补全）它现在也读"回程"**：`link_status` 同时调 `ListActuations`（§5），所以「机器人链路」页在
+   实时的对端表之下还列出**每台机器人自报的状态**——armed / 已切扭矩(+原因) / 当前步态 / 最近一次被拒绝的指令
+   （连"怎么恢复"都带出来）。这一栏的诚实点写进了界面文案：**没上报过的机器人不在列表里（那不是"空闲"）**，
+   而且列表是**快照不是历史**；老版本的 daemon 没有这个 RPC 时，界面只是少显示一栏、不报错。
    **诚实边界**：面板读的是守护进程**控制面**的状态；数据面（传感器帧、关节设定点）不经过它，
-   也不经过任何 gRPC。**同步改口的地方**：`amos-link/src/service.rs` 的模块文档、
-   `amos-link-cli` 的 `run_watch` 文档、`link_rpc_e2e.rs` 的用例注释（它们原先都写着"没有 GUI 消费者"）。
+   也不经过任何 gRPC —— 回程能被看到，是因为**守护进程订阅了数据面并把它折叠进控制面**，而不是因为 UI 自己上了链路。
+   **同步改口的地方**：`amos-link/src/service.rs` 的模块文档、`amos-link-cli` 的 `run_watch` 文档、
+   `link_rpc_e2e.rs` 的用例注释（它们原先都写着"没有 GUI 消费者"）。
 
 ## 7. 验证入口
 
@@ -216,7 +270,8 @@ cargo run -p amos-link-cli -- discover --bus --seconds 3 --transport zenoh  # �
 cargo run -p amos-link-cli -- watch --seconds 5            # 心跳 + 联邦：「链路还活着吗」
 # 远程模式（`--socket`）：读的是**运行中的节点**（daemon 挂的控制面），不是本地临时节点。
 # status/topics/pub/watch 支持 `--socket`；sub/bench/discover 需要本地数据面，会被点名拒绝。
-cargo run -p amos-link-cli -- status --socket /tmp/amos-ai.sock --json   # 真实 daemon 的身份/计数器/健康
+cargo run -p amos-link-cli -- status --socket /tmp/amos-ai.sock --json   # 真实 daemon 的身份/计数器/健康/**机器人自报状态**
+cargo run -p amos-link-cli -- status --socket /tmp/amos-ai.sock          # 人类可读：含「robots reported (N)」一栏
 cargo run -p amos-link-cli -- topics --socket /tmp/amos-ai.sock          # daemon 自己那条传输见过的话题
 cargo run -p amos-link-cli -- pub --socket /tmp/amos-ai.sock \
     --topic amos/dog1/control/joints --action '{"action":"trot"}'
@@ -227,5 +282,16 @@ cargo test -p amos-link --features zenoh -- --ignored   # 真实 Zenoh 会话往
 # `published` 看起来像有真实流量 —— 现在三条路径（lan/bus/watch）同一条规则。
 # System UI 的链路面板（只读）：设置 →「机器人链路」，读运行中的 daemon。
 cd crates/amos-tauri/frontend-ts && bunx vitest run svelte-tests/link-page.svelte.test.ts
+```
+
+**操作员输入的两个上界**（都在**解析期**拒绝，exit 2，绝不 panic / abort —— 见 §3.3）：
+
+```bash
+# 窗口超出本平台时钟可表示的范围：exit 2 + 说明，而不是 "overflow when adding duration to instant"
+cargo run -p amos-link-cli -- discover --bus --seconds 18446744073709551615
+# 载荷超过线上限（16 MiB − 64）：exit 2，而不是跑一场每次发布都注定失败的 bench
+cargo run -p amos-link-cli -- bench --size 16777216
+# 合法的大计数仍然照跑（"一直发"是操作员自己的请求），但不会再在预留 latency 向量时 abort
+cargo run -p amos-link-cli -- bench --count 18446744073709551615
 ```
 

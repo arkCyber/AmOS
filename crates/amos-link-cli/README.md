@@ -28,6 +28,12 @@ Four honest notes about scope, all enforced in code rather than promised:
 - `--transport zenoh` and `discover --lan` are the real network paths and need the matching
   build feature (`zenoh` / `lan`). Without it the command **says so** instead of silently
   using another transport.
+- **Arguments are bounded where the platform is**: `--seconds` beyond what the clock can
+  represent and `--size` above the wire ceiling (16 MiB − 64, since a larger bench payload
+  could never be published) are refused at parse time with exit 2 — they used to panic
+  (`overflow when adding duration to instant`) or abort (`capacity overflow`). A large
+  `--count` stays legal ("keep publishing" is a legitimate request) and no longer reserves a
+  vector it could never fill.
 - `pub`/`sub` carry `AgentAction` payloads (text or JSON) — the one shape a human and an
   agent can both produce without a schema.
 - `sub` waits for `--count` frames, so **without `--timeout-ms` it waits forever** when
@@ -71,7 +77,11 @@ cargo run -p amos-link-cli --example embed_commands
 
 `status` / `topics` / `pub` / `watch` accept `--socket <PATH>` and then talk to the
 daemon's live control plane (`proto/robot_link.proto` over the UDS) instead of a local
-node. Every line names the socket, so a local answer can never be mistaken for the robot's:
+node. Every line names the socket, so a local answer can never be mistaken for the robot's.
+`status` additionally reports **what each robot says about its own actuation**
+(`ListActuations`): armed / torque cut (and why) / gait / the last refusal — the same facts
+`state` prints, read from the daemon that folded them instead of from the wire. A robot that
+has not reported since the daemon started watching is named as absent, never as idle:
 
 ```bash
 amos-link-cli status --socket /tmp/amos-ai.sock --json

@@ -32,7 +32,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -324,6 +324,19 @@ impl EstopReason {
             EstopReason::Watchdog => "watchdog",
         }
     }
+
+    /// Parse a stable key back (`"commanded"` / `"watchdog"`).
+    ///
+    /// Anything else — including the empty string a consumer uses for "no e-stop" — is
+    /// `None`: an unknown reason is **not invented**, and the `estopped` flag travels
+    /// separately, so a reason this build does not know cannot silently become "not cut".
+    pub fn from_key(s: &str) -> Option<EstopReason> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "commanded" => Some(EstopReason::Commanded),
+            "watchdog" => Some(EstopReason::Watchdog),
+            _ => None,
+        }
+    }
 }
 
 /// What one [`RobotBridge::step`] did.
@@ -353,7 +366,9 @@ pub enum BridgeEvent {
     Estopped {
         /// Which of the two happened.
         reason: EstopReason,
-        /// Frames written to the bus for the cut.
+        /// Frames the bus accepted for the cut — **measured** through
+        /// [`RobotHal::estop`], never assumed (a cut is one broadcast frame on some
+        /// drivers and one frame per joint on others).
         frames: usize,
     },
 }
@@ -682,7 +697,14 @@ pub trait RobotHal: Send + Sync + 'static {
     async fn apply(&self, frames: &[MotorFrame]) -> Result<usize>;
 
     /// Cut torque on every joint (overrides anything queued).
-    async fn estop(&self) -> Result<()>;
+    ///
+    /// Returns **how many frames the bus accepted** for the cut, the same way
+    /// [`RobotHal::apply`] does. It is a return value rather than an assumption because a
+    /// torque cut has no single wire shape: a driver may write one per-joint frame per
+    /// joint, one broadcast frame, or a hardware line. A caller that *reports* the count
+    /// (the bridge's actuation report does) must be able to measure it — an assumed
+    /// "one frame per joint" would be an invented number for every other HAL.
+    async fn estop(&self) -> Result<usize>;
 
     /// True while the drivers are energized.
     fn armed(&self) -> bool;
@@ -801,12 +823,13 @@ impl RobotHal for MockRobotHal {
         Ok(frames.len())
     }
 
-    async fn estop(&self) -> Result<()> {
+    async fn estop(&self) -> Result<usize> {
         let frames: Vec<MotorFrame> = (0..=MAX_JOINT)
             .map(|j| MotorFrame::new(JointId(j), MotorOp::Estop, 0))
             .collect();
-        self.apply(&frames).await?;
-        Ok(())
+        // Measured, not assumed: `apply` returns what the bus accepted, so the bridge's
+        // report carries a number this HAL actually wrote.
+        self.apply(&frames).await
     }
 
     fn armed(&self) -> bool {
@@ -851,6 +874,14 @@ pub async fn execute<H: RobotHal>(hal: &H, action: &AgentAction) -> Result<Vec<M
 /// The `state`-channel name a bridge reports actuation on.
 pub const ACTUATION_NAME: &str = "actuation";
 
+/// How long an **unchanged** mode is re-announced after (see [`RobotBridge::reporting`]).
+///
+/// Five seconds: slow enough that it is not traffic (one small frame per robot per 5 s,
+/// beside a control stream that runs at 10–50 Hz), fast enough that a subscriber which
+/// arrives *late* — a brain that just started, the daemon's control plane — learns what the
+/// robot is doing without waiting for the next transition.
+pub const DEFAULT_REPORT_REFRESH: Duration = Duration::from_secs(5);
+
 /// The topic a bridge reports its actuation state on: `amos/<robot>/state/actuation`.
 ///
 /// The channel is deliberately `state`, not `control`: this is a **discrete mode report**
@@ -863,6 +894,14 @@ pub fn actuation_topic(peer: &crate::discovery::PeerId) -> Result<Topic> {
         peer.as_str(),
         Channel::State.key()
     ))
+}
+
+/// The pattern that matches every robot's actuation report (`amos/*/state/actuation`).
+///
+/// This is what a consumer that is not a single robot's brain subscribes to: the daemon's
+/// control plane (so the System UI can read the return path) and `amos-link-cli state`.
+pub fn actuation_pattern() -> Result<Topic> {
+    Topic::pattern(format!("amos/*/{}/{ACTUATION_NAME}", Channel::State.key()))
 }
 
 /// A command that was refused **before it reached the bus**, as reported to the commander.
@@ -950,6 +989,10 @@ pub struct RobotBridge<H: RobotHal> {
     /// The mode of the last report that actually reached the link, so an unchanged mode is
     /// not re-sent (see [`ActuationState::mode`]). `None` = nothing reported yet.
     last_reported: Option<ActuationState>,
+    /// When the last report reached the link, for the refresh interval.
+    last_report_at: Option<Instant>,
+    /// How long an unchanged mode is re-announced after (`Duration::ZERO` = on change only).
+    report_refresh: Duration,
     /// What the last action was and what the bus did with it.
     last_seq: Option<u64>,
     last_gait: Option<Gait>,
@@ -969,6 +1012,8 @@ impl<H: RobotHal> RobotBridge<H> {
             estop_reason: None,
             reporter: None,
             last_reported: None,
+            last_report_at: None,
+            report_refresh: DEFAULT_REPORT_REFRESH,
             last_seq: None,
             last_gait: None,
             last_frames: 0,
@@ -994,6 +1039,8 @@ impl<H: RobotHal> RobotBridge<H> {
             estop_reason: None,
             reporter: None,
             last_reported: None,
+            last_report_at: None,
+            report_refresh: DEFAULT_REPORT_REFRESH,
             last_seq: None,
             last_gait: None,
             last_frames: 0,
@@ -1011,8 +1058,21 @@ impl<H: RobotHal> RobotBridge<H> {
     /// The bridge works without one (the same code path a unit test drives), and a failed
     /// report never fails a step: the safety action has already happened, so turning a link
     /// hiccup into an `Err` would tell the caller the robot had *not* stopped when it had.
+    ///
+    /// The mode is reported **when it changes**, plus once per
+    /// [`DEFAULT_REPORT_REFRESH`] while it stays the same — because a subscriber that
+    /// arrives *late* (a brain that just booted, the daemon's control plane) would otherwise
+    /// never learn the current mode: the broker keeps **no retained value and replays
+    /// nothing**, so a robot that is steadily trotting has no further transition to send.
     pub fn reporting(mut self, state: Publisher<ActuationState>) -> Self {
         self.reporter = Some(state);
+        self
+    }
+
+    /// Override the refresh interval for an unchanged mode (`Duration::ZERO` = report on
+    /// change only, which is the shape a test drives to pin "no frame per command").
+    pub fn with_report_refresh(mut self, period: Duration) -> Self {
+        self.report_refresh = period;
         self
     }
 
@@ -1027,7 +1087,11 @@ impl<H: RobotHal> RobotBridge<H> {
             armed: self.hal.armed(),
             estopped: self.estop_latched,
             estop_reason: self.estop_reason,
-            watchdog_ms: self.watchdog.map(|p| p.as_millis() as u64),
+            // Saturated, not truncated: `as u64` would silently wrap a watchdog period above
+            // ~584 million years into a small number, and this value travels on the wire.
+            watchdog_ms: self
+                .watchdog
+                .map(|p| u64::try_from(p.as_millis()).unwrap_or(u64::MAX)),
             last_refusal: self.last_refusal.clone(),
         }
     }
@@ -1038,13 +1102,25 @@ impl<H: RobotHal> RobotBridge<H> {
             return;
         };
         let now = self.state();
-        if self.last_reported.as_ref().map(ActuationState::mode) == Some(now.mode()) {
+        let changed = self.last_reported.as_ref().map(ActuationState::mode) != Some(now.mode());
+        // The refresh is what makes the state channel answerable for a **late** subscriber:
+        // the broker retains nothing, so an unchanged mode would otherwise never be re-sent.
+        // It rides `step()` — the caller's own cadence — not a spawned timer, so this type
+        // still has no hidden scheduler.
+        let refresh_due = !self.report_refresh.is_zero()
+            && self
+                .last_report_at
+                .is_some_and(|at| at.elapsed() >= self.report_refresh);
+        if !changed && !refresh_due {
             return;
         }
         match publisher.publish(&now).await {
-            Ok(_) => self.last_reported = Some(now),
+            Ok(_) => {
+                self.last_reported = Some(now);
+                self.last_report_at = Some(Instant::now());
+            }
             // Not fatal, and not silent: the commander keeps its old view until the next
-            // change can be delivered.
+            // change (or refresh) can be delivered.
             Err(e) => tracing::warn!(
                 error = %e,
                 "actuation state could not be reported (link closing?)"
@@ -1087,16 +1163,20 @@ impl<H: RobotHal> RobotBridge<H> {
                 Ok(result) => result?,
                 Err(_) => {
                     // Deadman: no action within the period → cut torque and latch.
-                    self.hal.estop().await?;
+                    // The frame count comes back from the HAL, not from a guess: how many
+                    // frames a cut takes is the driver's business (one per joint, one
+                    // broadcast, a hardware line), and a report must carry a measured number.
+                    let frames = self.hal.estop().await?;
                     self.estop_latched = true;
                     self.estop_reason = Some(EstopReason::Watchdog);
                     tracing::warn!(
                         period_ms = period.as_millis(),
+                        frames,
                         "watchdog tripped: no action arrived, torque cut"
                     );
                     return Ok(BridgeEvent::Estopped {
                         reason: EstopReason::Watchdog,
-                        frames: JOINTS,
+                        frames,
                     });
                 }
             },
@@ -1582,8 +1662,10 @@ mod tests {
         assert_eq!(hal.frames().len(), frames.len());
         assert_eq!(hal.hex_log().len(), frames.len());
 
-        // The e-stop path cuts torque on every joint and disarms.
-        hal.estop().await.expect("estop");
+        // The e-stop path cuts torque on every joint and disarms — and it **reports** how
+        // many frames it wrote (the bridge's actuation report carries this number).
+        let cut = hal.estop().await.expect("estop");
+        assert_eq!(cut, JOINTS, "one cut frame per joint, measured");
         assert!(!hal.armed());
         // An e-stop frame per joint, and no `Enable` (it must never re-arm).
         assert_eq!(hal.frames().len(), frames.len() + JOINTS);
@@ -1734,6 +1816,130 @@ mod tests {
         assert!(!bridge.is_estopped());
     }
 
+    /// A HAL whose torque cut is **one** frame (a bus broadcast), the shape a real driver
+    /// has. It exists to pin that a report carries what the bus took, not what the bridge
+    /// assumed: `estop` used to return `()` and the watchdog path reported `JOINTS`.
+    #[derive(Debug, Default)]
+    struct BroadcastCutHal {
+        log: std::sync::Mutex<Vec<MotorFrame>>,
+        armed: AtomicBool,
+    }
+
+    impl BroadcastCutHal {
+        fn written(&self) -> usize {
+            self.log.lock().map(|l| l.len()).unwrap_or(0)
+        }
+    }
+
+    #[async_trait]
+    impl RobotHal for BroadcastCutHal {
+        async fn apply(&self, frames: &[MotorFrame]) -> Result<usize> {
+            for frame in frames {
+                frame.validate()?;
+            }
+            if let Ok(mut log) = self.log.lock() {
+                log.extend_from_slice(frames);
+            }
+            if frames.iter().any(|f| f.op == MotorOp::Enable) {
+                self.armed.store(true, Ordering::SeqCst);
+            }
+            if frames
+                .iter()
+                .any(|f| matches!(f.op, MotorOp::Disable | MotorOp::Estop))
+            {
+                self.armed.store(false, Ordering::SeqCst);
+            }
+            Ok(frames.len())
+        }
+
+        async fn estop(&self) -> Result<usize> {
+            // One cut frame on the bus, and the count says so.
+            if let Ok(mut log) = self.log.lock() {
+                log.push(MotorFrame::new(JointId(0), MotorOp::Estop, 0));
+            }
+            self.armed.store(false, Ordering::SeqCst);
+            Ok(1)
+        }
+
+        fn armed(&self) -> bool {
+            self.armed.load(Ordering::SeqCst)
+        }
+
+        fn name(&self) -> &'static str {
+            "broadcast-cut"
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absurd_watchdog_period_saturates_instead_of_wrapping() {
+        // `watchdog_ms` travels on the wire (`proto/robot_link.proto`) as a `u64` and comes
+        // from `Duration::as_millis()` (a `u128`): `as u64` would wrap a period above ~584
+        // million years into a *small* number, i.e. report a deadman far shorter than the
+        // configured one. Saturation says "more than this field can express" instead.
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let pattern = Topic::pattern("amos/dog1/control/*").expect("pattern");
+
+        let absurd = RobotBridge::with_watchdog(
+            node.subscriber::<AgentAction>(pattern.clone(), Qos::control())
+                .await
+                .expect("subscribe"),
+            MockRobotHal::new(),
+            Duration::from_secs(u64::MAX),
+        );
+        assert_eq!(absurd.state().watchdog_ms, Some(u64::MAX));
+
+        // …and an ordinary period is reported verbatim (the saturation never fires early).
+        let ordinary = RobotBridge::with_watchdog(
+            node.subscriber::<AgentAction>(pattern, Qos::control())
+                .await
+                .expect("subscribe"),
+            MockRobotHal::new(),
+            Duration::from_millis(1500),
+        );
+        assert_eq!(ordinary.state().watchdog_ms, Some(1500));
+    }
+
+    /// The watchdog's report must carry a **measured** frame count.
+    #[tokio::test]
+    async fn a_watchdog_cut_reports_the_frames_the_bus_took_not_a_guess() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let subscriber = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        // A HAL that cuts torque in one frame: silence trips the deadman immediately.
+        let mut bridge = RobotBridge::with_watchdog(
+            subscriber,
+            BroadcastCutHal::default(),
+            Duration::from_millis(30),
+        );
+
+        assert_eq!(
+            bridge.step().await.expect("watchdog"),
+            BridgeEvent::Estopped {
+                reason: EstopReason::Watchdog,
+                frames: 1,
+            },
+            "the report says how many frames the bus really took"
+        );
+        assert_eq!(bridge.hal().written(), 1, "…and exactly one was written");
+        assert_eq!(bridge.state().frames, 0, "no action was acted on");
+        assert!(bridge.state().estopped);
+    }
+
     /// A malformed action is *refused*, not an error, and never reaches the bus.
     #[tokio::test]
     async fn a_malformed_action_is_refused_without_touching_the_bus() {
@@ -1869,8 +2075,12 @@ mod tests {
             .await
             .expect("subscribe");
         let me = PeerId::new("dog1").expect("peer");
+        // `Duration::ZERO`: report on change only, so this test pins that an unchanged mode
+        // spends no frame (the refresh interval is covered by
+        // `a_late_subscriber_still_learns_the_current_mode`).
         let mut bridge = RobotBridge::new(control, MockRobotHal::new())
-            .reporting(node.publisher::<ActuationState>(actuation_topic(&me).expect("topic")));
+            .reporting(node.publisher::<ActuationState>(actuation_topic(&me).expect("topic")))
+            .with_report_refresh(Duration::ZERO);
         let commander = node.publisher::<AgentAction>(
             Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
         );
@@ -2047,5 +2257,71 @@ mod tests {
             Some(30),
             "the report carries the deadman period it was configured with"
         );
+    }
+
+    /// A **late** subscriber must still learn the current mode.
+    ///
+    /// This is the gap the on-change-only design left: the broker has **no retention and no
+    /// replay** (a subscription is registered, nothing is replayed), so a brain — or the
+    /// daemon's control plane — that subscribes *after* the robot armed sees nothing until
+    /// the next *transition*. A robot that is steadily trotting has no next transition, so
+    /// "what is it doing?" would stay unanswered forever. The bridge therefore re-announces
+    /// the unchanged mode once per refresh interval, riding the control loop's own cadence.
+    #[tokio::test]
+    async fn a_late_subscriber_still_learns_the_current_mode() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let control = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let me = PeerId::new("dog1").expect("peer");
+        // A short refresh so the test does not sleep for the production interval.
+        let mut bridge = RobotBridge::new(control, MockRobotHal::new())
+            .reporting(node.publisher::<ActuationState>(actuation_topic(&me).expect("topic")))
+            .with_report_refresh(Duration::from_millis(20));
+        let commander = node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        );
+
+        // The robot starts trotting **before** anyone is listening.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot","speed":0.5}"#))
+            .await
+            .expect("publish");
+        bridge.step().await.expect("step");
+
+        // …and only now does the brain (or the daemon) subscribe.
+        let mut late = node
+            .subscriber::<ActuationState>(
+                Topic::pattern("amos/*/state/actuation").expect("pattern"),
+                Qos::for_channel(Channel::State),
+            )
+            .await
+            .expect("subscribe");
+
+        // The robot keeps trotting at the same mode: the next step re-announces it, so the
+        // late subscriber learns the *current* mode without waiting for a transition.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot","speed":0.5}"#))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        bridge.step().await.expect("step");
+
+        let report = tokio::time::timeout(Duration::from_millis(200), late.recv())
+            .await
+            .expect("a late subscriber is told the current mode")
+            .expect("recv");
+        assert_eq!(report.message.gait, Some(Gait::Trot));
+        assert!(report.message.armed);
+        assert!(!report.message.estopped);
     }
 }

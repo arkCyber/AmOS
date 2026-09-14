@@ -40,6 +40,36 @@ export interface LinkMetrics {
   encode_errors: number;
 }
 
+/** A command a robot refused before it reached its bus, as the robot itself reported it. */
+export interface LinkRefusal {
+  seq: number;
+  reason: string;
+}
+
+/**
+ * What one robot says about its own actuation — the control loop's **return path**.
+ *
+ * It travels the data plane (`amos/<robot>/state/actuation`); the daemon folds it and hands
+ * it over the control plane, which is how this panel can show what a robot is *doing*.
+ * `null` means "the robot did not report it" — never "zero": `seq: null` is "no action yet",
+ * not "action number zero".
+ */
+export interface LinkActuation {
+  robot: string;
+  seq: number | null;
+  gait: string | null;
+  frames: number;
+  armed: boolean;
+  estopped: boolean;
+  /** `"commanded"` | `"watchdog"` | `null` (none, or a reason this build does not know). */
+  estop_reason: string | null;
+  /** The deadman period the robot runs under; `null` = no watchdog configured. */
+  watchdog_ms: number | null;
+  last_refusal: LinkRefusal | null;
+  /** When the robot published it (ms since the epoch, from the robot's own clock). */
+  stamp_ms: number;
+}
+
 /** Serializable mirror of the daemon `LinkStatus` (matches the Rust serde keys). */
 export interface LinkStatus {
   peer: string;
@@ -52,6 +82,14 @@ export interface LinkStatus {
   health_reasons: string[];
   metrics: LinkMetrics;
   peers: LinkPeer[];
+  /**
+   * What each robot reports about itself, sorted by id. Empty means **nobody has reported** —
+   * which is not the same as "all robots are idle", and the panel says so.
+   *
+   * Optional because a daemon older than the `ListActuations` RPC simply omits it: the panel
+   * must not throw on a version skew, it must show less.
+   */
+  actuations?: LinkActuation[];
 }
 
 /** Read the running daemon's link status. Null offline / on a failed command. */
@@ -120,4 +158,39 @@ export function peerSummary(peers: LinkPeer[]): string {
  */
 export function counterSummary(m: LinkMetrics): string {
   return `published=${m.published} delivered=${m.delivered} dropped=${m.dropped} blocked=${m.blocked} decode_errors=${m.decode_errors} encode_errors=${m.encode_errors}`;
+}
+
+/** A robot's actuation mode, as the panel labels it. */
+export type RobotLevel = "estopped" | "armed" | "idle";
+
+/**
+ * Classify one robot's report (pure, unit-tested).
+ *
+ * `estopped` wins over `armed`: a latched e-stop is the fact a user must see first, and the
+ * bridge's `armed` flag is read from the bus, so the two cannot contradict each other for
+ * long. A robot that has not reported (absent from the list) is **not** classified here at
+ * all — the caller renders "nobody has reported" instead.
+ */
+export function robotLevel(a: LinkActuation): RobotLevel {
+  if (a.estopped) return "estopped";
+  return a.armed ? "armed" : "idle";
+}
+
+/** The i18n key for a robot's level (pure). */
+export function robotLevelKey(level: RobotLevel): string {
+  switch (level) {
+    case "estopped":
+      return "link.robotEstopped";
+    case "armed":
+      return "link.robotArmed";
+    default:
+      return "link.robotIdle";
+  }
+}
+
+/** A one-line description of what a robot is doing, for the panel's row (pure). */
+export function robotSummary(a: LinkActuation): string {
+  const mode = a.gait ?? "-";
+  const seq = a.seq === null ? "-" : String(a.seq);
+  return `${a.robot} · ${mode} · #${seq}`;
 }

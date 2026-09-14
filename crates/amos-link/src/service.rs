@@ -17,23 +17,25 @@
 //! the in-process broker, the host clock, and a running heartbeat); a caller that owns a
 //! calibrated clock or a Zenoh transport mounts [`server`] instead.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use amos_proto::amos_link::{
     robot_link_server::{RobotLink, RobotLinkServer},
-    Empty, HealthState, Heartbeat as ProtoHeartbeat, LinkStatus, Metrics, Peer, PublishReply,
-    PublishRequest, TopicList,
+    Actuation as ProtoActuation, ActuationList, Empty, HealthState, Heartbeat as ProtoHeartbeat,
+    LinkStatus, Metrics, Peer, PublishReply, PublishRequest, TopicList,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::codec::Envelope;
+use crate::codec::{Envelope, Timestamp};
 use crate::discovery::NodeKind;
 use crate::error::LinkError;
 use crate::health::LinkHealth;
-use crate::keyexpr::Topic;
+use crate::keyexpr::{Channel, Topic};
 use crate::node::LinkNode;
+use crate::robot_hal::{actuation_pattern, ActuationState};
 use crate::telemetry::{Heartbeat, HeartbeatTask, DEFAULT_HEARTBEAT_PERIOD};
 
 /// How many heartbeats the control plane may buffer before it drops the oldest.
@@ -41,6 +43,74 @@ use crate::telemetry::{Heartbeat, HeartbeatTask, DEFAULT_HEARTBEAT_PERIOD};
 /// A streaming client that stops reading must not be able to grow the daemon's memory:
 /// beats are a liveness signal, so the newest ones are the only ones worth keeping.
 const HEARTBEAT_CHANNEL: usize = 32;
+
+/// The control plane's copy of the **return path**: the latest actuation report per robot.
+///
+/// The reports themselves travel the data plane (`amos/<robot>/state/actuation`); this table
+/// is the control plane's fold of them, so a caller that is not a link node — the System UI —
+/// can read what the robots say about themselves. A robot that never reported is **absent**
+/// (never a fabricated zero), and the stamp is the robot's own publish time, not ours.
+#[derive(Debug, Default)]
+pub struct ActuationTable {
+    /// `robot id -> (its latest report, when it published it)`.
+    robots: BTreeMap<String, (ActuationState, Timestamp)>,
+}
+
+impl ActuationTable {
+    /// Fold one received report in, keyed by the frame's **publisher** (the robot that owns
+    /// the topic) — not by anything the payload claims.
+    pub fn record(&mut self, robot: &str, state: ActuationState, stamp: Timestamp) {
+        self.robots.insert(robot.to_string(), (state, stamp));
+    }
+
+    /// Every robot that has reported, sorted by id.
+    pub fn robots(&self) -> impl Iterator<Item = (&String, &ActuationState, Timestamp)> {
+        self.robots
+            .iter()
+            .map(|(id, (state, stamp))| (id, state, *stamp))
+    }
+
+    /// How many robots are currently known.
+    pub fn len(&self) -> usize {
+        self.robots.len()
+    }
+
+    /// True when no robot has reported (yet).
+    pub fn is_empty(&self) -> bool {
+        self.robots.is_empty()
+    }
+}
+
+/// The task that keeps [`ActuationTable`] current; held by the service, so the field *is* the
+/// lifetime (dropping the service stops the watcher — the same rule as `_heartbeat`).
+pub struct ActuationWatch {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ActuationWatch {
+    /// Stop watching and wait for the task to finish. Whatever was folded in stays in the
+    /// table (it is a snapshot, not a subscription view) — a fresh watcher can be started
+    /// over it.
+    pub async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            // An aborted task joins with `Cancelled`; that is the expected path, so it is
+            // logged rather than discarded (a silent `let _ =` would hide a real panic in
+            // the watcher — the same rule the heartbeat/federation tasks follow).
+            if let Err(e) = task.await {
+                tracing::debug!(error = %e, "actuation watch task ended");
+            }
+        }
+    }
+}
+
+impl Drop for ActuationWatch {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
 
 /// The gRPC service wiring a [`LinkNode`] to the wire contract.
 pub struct LinkService {
@@ -51,6 +121,11 @@ pub struct LinkService {
     // [`LinkService::with_heartbeat`]). Held (never read) because dropping it would
     // detach the task: the field *is* the lifetime, and the underscore says so.
     _heartbeat: Option<HeartbeatTask>,
+    /// The latest actuation report per robot (the return path, folded — see
+    /// [`ActuationTable`]).
+    actuations: Arc<Mutex<ActuationTable>>,
+    // The watcher that fills `actuations`; held for the same reason as `_heartbeat`.
+    _actuation_watch: Option<ActuationWatch>,
 }
 
 impl LinkService {
@@ -61,6 +136,8 @@ impl LinkService {
             node,
             publish_seq: AtomicU64::new(0),
             _heartbeat: None,
+            actuations: Arc::new(Mutex::new(ActuationTable::default())),
+            _actuation_watch: None,
         }
     }
 
@@ -74,10 +151,14 @@ impl LinkService {
     /// so the beat belongs to the service rather than to a caller that does not exist.
     pub fn with_heartbeat(node: Arc<LinkNode>) -> Self {
         let _heartbeat = start_heartbeat(&node);
+        let actuations = Arc::new(Mutex::new(ActuationTable::default()));
+        let _actuation_watch = start_actuation_watch(&node, Arc::clone(&actuations));
         Self {
             node,
             publish_seq: AtomicU64::new(0),
             _heartbeat,
+            actuations,
+            _actuation_watch,
         }
     }
 
@@ -116,6 +197,73 @@ fn start_heartbeat(node: &Arc<LinkNode>) -> Option<HeartbeatTask> {
             None
         }
     }
+}
+
+/// Start watching the **return path** (`amos/*/state/actuation`), or say why not.
+///
+/// The watcher subscribes on the node's own transport, so a deployment that mounts a
+/// Zenoh-backed node folds in the whole board fleet while the demo node sees whatever its own
+/// process published. It is deliberately a *subscription*, not a query: the broker keeps **no
+/// retained value and replays nothing**, so a robot that reported before this service started
+/// watching stays absent until it reports again — its next mode change, or the periodic
+/// refresh a bridge sends for exactly this reason ([`crate::robot_hal::DEFAULT_REPORT_REFRESH`]).
+fn start_actuation_watch(
+    node: &Arc<LinkNode>,
+    table: Arc<Mutex<ActuationTable>>,
+) -> Option<ActuationWatch> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        tracing::warn!(
+            peer = %node.peer(),
+            "no tokio runtime: the control plane cannot watch robots' actuation reports"
+        );
+        return None;
+    }
+    let node = Arc::clone(node);
+    let task = tokio::spawn(async move {
+        let pattern = match actuation_pattern() {
+            Ok(pattern) => pattern,
+            Err(e) => {
+                tracing::warn!(error = %e, "actuation watch: unusable pattern");
+                return;
+            }
+        };
+        let mut reports = match node
+            .subscriber::<ActuationState>(
+                pattern.clone(),
+                crate::qos::Qos::for_channel(Channel::State),
+            )
+            .await
+        {
+            Ok(subscriber) => subscriber,
+            Err(e) => {
+                tracing::warn!(pattern = %pattern, error = %e, "actuation watch not started");
+                return;
+            }
+        };
+        tracing::debug!(pattern = %pattern, "control plane is watching robots' actuation");
+        // Runs until the link closes; the service owns this task's lifetime.
+        loop {
+            match reports.recv().await {
+                Ok(received) => {
+                    // Keyed by the frame's publisher — the robot that owns the topic — never
+                    // by anything the payload claims.
+                    let robot = received.publisher.as_str().to_string();
+                    let state = received.message;
+                    let stamp = received.stamp;
+                    if let Ok(mut guard) = table.lock() {
+                        guard.record(&robot, state, stamp);
+                    } else {
+                        tracing::warn!("actuation table poisoned; dropping a report");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "actuation watch stopped: link closed");
+                    return;
+                }
+            }
+        }
+    });
+    Some(ActuationWatch { task: Some(task) })
 }
 
 /// A ready-to-mount [`RobotLinkServer`] over a demo node: in-process broker, host clock,
@@ -186,6 +334,26 @@ impl RobotLink for LinkService {
         }))
     }
 
+    /// The robots' own actuation reports, folded (the control loop's return path).
+    ///
+    /// A robot that has not reported since this service started watching is **absent** from
+    /// the list: an empty list means "nobody told us", not "everyone is idle" — the
+    /// distinction the System UI's panel and the CLI both render explicitly.
+    async fn list_actuations(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<ActuationList>, Status> {
+        let table = self
+            .actuations
+            .lock()
+            .map_err(|_| Status::internal("the actuation table is poisoned"))?;
+        let robots = table
+            .robots()
+            .map(|(id, state, stamp)| proto_actuation(id, state, stamp))
+            .collect();
+        Ok(Response::new(ActuationList { robots }))
+    }
+
     /// Publish a raw payload on the node's transport.
     ///
     /// The frame is wrapped in a real [`Envelope`] (this node's peer id, its own
@@ -216,9 +384,9 @@ impl RobotLink for LinkService {
             .map_err(err_status)?;
         Ok(Response::new(PublishReply {
             seq,
-            matched: report.matched.unwrap_or(0) as u32,
-            delivered: report.delivered as u32,
-            dropped: report.dropped as u32,
+            matched: count_to_u32(report.matched.unwrap_or(0)),
+            delivered: count_to_u32(report.delivered),
+            dropped: count_to_u32(report.dropped),
         }))
     }
 
@@ -269,6 +437,47 @@ impl RobotLink for LinkService {
     }
 }
 
+/// Map a local publish-report count onto the `u32` the wire carries, **saturating**.
+///
+/// `PublishReply`'s counters are `u32` in `proto/robot_link.proto` while the report is
+/// `usize` here, and `as u32` truncates *silently*: a large number would be reported as a
+/// small one ("almost nothing was delivered") with no way for the caller to notice. Today
+/// the counts are bounded by the subscription table, so saturation is unreachable — which is
+/// exactly why it must be expressed rather than assumed (the same rule the frame ceiling and
+/// the sequence counter follow).
+fn count_to_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Map one robot's folded report onto the wire message.
+///
+/// The proto has no `Option`, so "absent" is encoded the way the field comments say: `0` for
+/// `seq` / `last_refusal_seq` / `watchdog_ms`, `""` for `gait` / `estop_reason` /
+/// `last_refusal`. Nothing here invents a value the robot did not report.
+fn proto_actuation(robot: &str, state: &ActuationState, stamp: Timestamp) -> ProtoActuation {
+    ProtoActuation {
+        robot: robot.to_string(),
+        seq: state.seq.unwrap_or(0),
+        gait: state.gait.map(|g| g.key().to_string()).unwrap_or_default(),
+        frames: state.frames as u32,
+        armed: state.armed,
+        estopped: state.estopped,
+        estop_reason: state
+            .estop_reason
+            .map(|r| r.key().to_string())
+            .unwrap_or_default(),
+        watchdog_ms: state.watchdog_ms.unwrap_or(0),
+        last_refusal_seq: state.last_refusal.as_ref().map(|r| r.seq).unwrap_or(0),
+        last_refusal: state
+            .last_refusal
+            .as_ref()
+            .map(|r| r.reason.clone())
+            .unwrap_or_default(),
+        stamp_secs: stamp.secs,
+        stamp_nanos: stamp.nanos,
+    }
+}
+
 /// Map a domain heartbeat onto the wire message.
 fn proto_heartbeat(beat: &Heartbeat) -> ProtoHeartbeat {
     ProtoHeartbeat {
@@ -289,5 +498,110 @@ fn err_status(err: LinkError) -> Status {
         }
         LinkError::Closed(_) => Status::unavailable(err.to_string()),
         other => Status::internal(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::robot_hal::{EstopReason, Gait, Refusal};
+
+    #[test]
+    fn publish_counts_saturate_instead_of_wrapping_on_the_wire() {
+        // `PublishReply` is `u32` on the wire and the report is `usize` locally: the honest
+        // rendering of "more than this field can say" is the ceiling, never a wrapped small
+        // number that reads as "almost nothing was delivered".
+        assert_eq!(count_to_u32(0), 0);
+        assert_eq!(count_to_u32(3), 3);
+        assert_eq!(count_to_u32(u32::MAX as usize), u32::MAX);
+        assert_eq!(count_to_u32(usize::MAX), u32::MAX);
+        // The negative control for the truncation this replaced: on a 64-bit host a value
+        // whose *low* 32 bits are small (`2³² + 3`) reads as `3` under `as u32` — "almost
+        // nothing was delivered" — while saturation says "more than this field can express".
+        #[cfg(target_pointer_width = "64")]
+        {
+            let beyond = (1usize << 32) + 3;
+            assert_eq!(count_to_u32(beyond), u32::MAX);
+            assert_eq!(beyond as u32, 3, "…not the low 32 bits");
+        }
+    }
+
+    fn report(gait: Gait, armed: bool) -> ActuationState {
+        ActuationState {
+            seq: Some(1),
+            gait: Some(gait),
+            frames: 13,
+            armed,
+            estopped: false,
+            estop_reason: None,
+            watchdog_ms: Some(1000),
+            last_refusal: None,
+        }
+    }
+
+    #[test]
+    fn the_table_folds_by_robot_and_keeps_the_newest() {
+        let mut table = ActuationTable::default();
+        assert!(table.is_empty(), "nothing has reported yet");
+        table.record("dog1", report(Gait::Trot, true), Timestamp::now());
+        table.record("dog2", report(Gait::Sit, true), Timestamp::now());
+        assert_eq!(table.len(), 2);
+
+        // A robot reports repeatedly; the newest report replaces the older one — it is not
+        // appended.
+        table.record("dog1", report(Gait::Stand, true), Timestamp::now());
+        assert_eq!(table.len(), 2, "still two robots");
+        let ids: Vec<&String> = table.robots().map(|(id, _, _)| id).collect();
+        assert_eq!(ids, vec!["dog1", "dog2"], "sorted by id, not by arrival");
+        let dog1 = table
+            .robots()
+            .find(|(id, _, _)| *id == "dog1")
+            .expect("dog1 is present")
+            .1;
+        assert_eq!(dog1.gait, Some(Gait::Stand), "the newest report won");
+    }
+
+    #[test]
+    fn the_wire_mapping_invents_nothing_the_robot_did_not_report() {
+        let stamp = Timestamp { secs: 7, nanos: 8 };
+        // Before any action the proto's "no value" encodings are used (the proto has no
+        // `Option`), and the field comments say so: 0 / "".
+        let idle = ActuationState {
+            seq: None,
+            gait: None,
+            frames: 0,
+            armed: false,
+            estopped: false,
+            estop_reason: None,
+            watchdog_ms: None,
+            last_refusal: None,
+        };
+        let wire = proto_actuation("dog1", &idle, stamp);
+        assert_eq!(wire.robot, "dog1");
+        assert_eq!(wire.seq, 0);
+        assert_eq!(wire.gait, "");
+        assert_eq!(wire.estop_reason, "");
+        assert_eq!(wire.watchdog_ms, 0);
+        assert_eq!(wire.last_refusal, "");
+        assert_eq!(wire.last_refusal_seq, 0);
+        assert_eq!((wire.stamp_secs, wire.stamp_nanos), (7, 8));
+        assert!(!wire.armed && !wire.estopped);
+
+        // A real report travels verbatim, refusal and all.
+        let mut stopped = report(Gait::Estop, false);
+        stopped.estopped = true;
+        stopped.estop_reason = Some(EstopReason::Watchdog);
+        stopped.last_refusal = Some(Refusal {
+            seq: 3,
+            reason: "e-stop latched".to_string(),
+        });
+        let wire = proto_actuation("dog1", &stopped, stamp);
+        assert_eq!(wire.gait, "estop");
+        assert!(wire.estopped && !wire.armed);
+        assert_eq!(wire.estop_reason, "watchdog");
+        assert_eq!(wire.watchdog_ms, 1000);
+        assert_eq!(wire.frames, 13);
+        assert_eq!(wire.last_refusal_seq, 3);
+        assert_eq!(wire.last_refusal, "e-stop latched");
     }
 }
