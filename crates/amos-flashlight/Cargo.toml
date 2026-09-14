@@ -17,7 +17,7 @@ tokio.workspace = true
 # Real Android torch backend (Android CameraManager#setTorchMode via JNI).
 # Optional: only pulled in when the `android` feature is enabled, so desktop/CI
 # builds stay free of the JNI stack.
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 # Shared JNI rules (clean exception state + class resolution through the app
 # loader): see crates/amos-jni/src/lib.rs and REQ-A186.
 amos-jni = { path = "../amos-jni", optional = true }
