@@ -176,11 +176,19 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
 3. **发现不认证**：`lan` 的信标是明文广播，任何人都能伪造（它只是「去连我」的提示）。**认证路径是
    daemon 的 UDS**（`amos-ai` 的 peer-credential 检查），不是这条信标。
 4. **shm / pico / `unstable` QoS / 加密传输**：见 §4 表格的 ❌ 行，都是有意的未做项。
-5. **System UI 的"链路面板"不存在**（**改口**：本 crate 的模块文档曾把"System UI 的链路面板"写成一个消费者，
-   但 `crates/amos-tauri`（Rust）与 `src/`（Svelte）里**零** `amos_link`/`robot_link` 引用 —— 那是一句
-   "承诺了不存在的消费者"。控制面今天的真实调用方是 **CLI（`--socket`）与外部工具**；GUI 面板属于**未做**，
-   要做得连 Tauri 命令 + 界面 + i18n + 界面用例一起落地，而不是靠一句注释假装它已在。**已经改口的地方**：
-   `amos-link/src/service.rs` 的模块文档、`amos-link-cli` 的 `run_watch` 文档、`link_rpc_e2e.rs` 的用例注释。
+5. **System UI 的"链路面板"——已建成（本条原来的"未做"已兑现）**。历史上本条记录过：本 crate 的模块文档曾把
+   "System UI 的链路面板"写成一个消费者，而 `crates/amos-tauri` 与 `src/` 里**零** `amos_link`/`robot_link`
+   引用 —— 那是一句"承诺了不存在的消费者"，当时 GUI 面板属于**未做**，并记下了兑现它需要
+   "Tauri 命令 + 界面 + i18n + 界面用例一起落地"。现在它成套存在：
+   `crates/amos-tauri/src/link.rs` 的 `link_status`（读 `GetStatus`，把 prost 结构映射成可序列化快照）+
+   设置页 `frontend-ts/src/svelte/settings/LinkPage.svelte`（经 `SettingsApp` 的「机器人链路」行进入）+
+   `lib/link.ts`（纯函数 + 离线契约）+ en/zh 文案 +
+   两份用例（`svelte-tests/link-page.svelte.test.ts`、`src/__tests__/link.test.ts`）。
+   **它只读、不指挥**（发布是 CLI/工具的事），并且**原样带出守护进程的判定**：`unknown`（暂无证据）**不等于**
+   `healthy`，时钟未校准会明确说"延迟只是上界"，计数器标明是自启动累计。
+   **诚实边界**：面板读的是守护进程**控制面**的状态；数据面（传感器帧、关节设定点）不经过它，
+   也不经过任何 gRPC。**同步改口的地方**：`amos-link/src/service.rs` 的模块文档、
+   `amos-link-cli` 的 `run_watch` 文档、`link_rpc_e2e.rs` 的用例注释（它们原先都写着"没有 GUI 消费者"）。
 
 ## 7. 验证入口
 
@@ -191,8 +199,9 @@ cargo test -p amos-link       # 内核 + 端到端用例（默认构建）
 cargo run -p amos-link-cli -- bench --count 2000 --size 4096
 cargo run -p amos-link-cli -- status   # JSON：含 health 判定与 health_reasons（§3.2）
 cargo run -p amos-link-cli -- motor --action '{"action":"trot","speed":0.5}'
-cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 5   # 末行报告 gaps/missing/stale/loss
-cargo run -p amos-link-cli -- sub --pattern 'amos/*/control/*' --count 1  # 档位由 channel 决定（reliable）
+cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 5 --timeout-ms 2000   # 末行报告 gaps/missing/stale/loss
+cargo run -p amos-link-cli -- sub --pattern 'amos/*/control/*' --count 1 --timeout-ms 1000  # 档位由 channel 决定（reliable）
+# 注意 `--timeout-ms`：默认 0 = 永远等，没有发布者时这条命令**不会返回**（本文件的示例一律给上界）。
 cargo run -p amos-link-cli -- discover --peer dog1 --kind robot --lan --seconds 9   # 真 UDP 信标（重复广播）
 cargo run -p amos-link-cli -- discover --peer field-brain --lan --seconds 5         # 另一个进程：两台互相看得见
 cargo run -p amos-link-cli -- discover --bus --seconds 3   # 联邦：链路自身的对端表
@@ -206,5 +215,10 @@ cargo run -p amos-link-cli -- pub --socket /tmp/amos-ai.sock \
     --topic amos/dog1/control/joints --action '{"action":"trot"}'
 cargo run -p amos-link-cli -- watch --socket /tmp/amos-ai.sock --seconds 3  # 流式心跳：真的在打拍
 cargo test -p amos-link --features zenoh -- --ignored   # 真实 Zenoh 会话往返（需网络）
+# 联邦信标节奏 = TTL/3（`federation_period()`，一处规则；默认 TTL 3s ⇒ 每秒 1 个信标）。
+# 此前 `discover --bus` 与 `watch` 硬编码 200ms（5 个/秒），既多打 4 倍信标，又让
+# `published` 看起来像有真实流量 —— 现在三条路径（lan/bus/watch）同一条规则。
+# System UI 的链路面板（只读）：设置 →「机器人链路」，读运行中的 daemon。
+cd crates/amos-tauri/frontend-ts && bunx vitest run svelte-tests/link-page.svelte.test.ts
 ```
 

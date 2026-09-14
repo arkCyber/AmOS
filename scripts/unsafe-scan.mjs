@@ -30,8 +30,19 @@
  *   node scripts/unsafe-scan.mjs --json
  *   node scripts/unsafe-scan.mjs --selftest   # pin the classifier/note-detector
  */
-import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  existsSync,
+  statSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  symlinkSync,
+  rmSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,7 +56,20 @@ export function productionSources(dir = join(root, "crates")) {
     for (const e of readdirSync(d)) {
       if (SKIP_DIRS.has(e) || e === "tests") continue;
       const p = join(d, e);
-      if (statSync(p).isDirectory()) walk(p);
+      // `statSync` **follows symlinks**, so a dangling one throws ENOENT. That is a real
+      // state here: a device build creates `crates/amos-tauri/gen/android/.../jniLibs/
+      // libamos_tauri_lib.so` as a link into `target/<triple>/debug/`, and any later
+      // `cargo clean` (or a fresh clone with a half-written android build) leaves it
+      // pointing at nothing. A gate must *report*, never crash: an entry we cannot stat
+      // is not a Rust source, so it is skipped. (Found by exactly that: `make lint` died
+      // with a Node stack trace instead of a finding.)
+      let stat;
+      try {
+        stat = statSync(p);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) walk(p);
       else if (p.endsWith(".rs") && p.includes("/src/")) out.push(p);
     }
   };
@@ -178,6 +202,29 @@ function runSelfTest() {
 
   const extern = ['unsafe extern "C" fn cb() {}'].join("\n");
   cases.push(["unsafe extern fn found", unsafeSites(productionLines(extern)).length === 1]);
+
+  // A **dangling symlink** under a walked directory must be skipped, not fatal: a device
+  // build leaves `jniLibs/libamos_tauri_lib.so` pointing into `target/<triple>/`, and a
+  // later `cargo clean` makes it dangle — the unguarded walk died here with ENOENT and
+  // CI reported a Node stack trace instead of a finding (the real failure that added this).
+  const tmp = mkdtempSync(join(tmpdir(), "amos-unsafe-scan-"));
+  try {
+    mkdirSync(join(tmp, "crate", "src"), { recursive: true });
+    writeFileSync(join(tmp, "crate", "src", "real.rs"), "fn f() {}\n");
+    symlinkSync(join(tmp, "gone", "lib.so"), join(tmp, "crate", "src", "dangling.so"));
+    let survivors;
+    try {
+      survivors = productionSources(tmp);
+    } catch {
+      survivors = null; // the regression: the walk threw instead of skipping
+    }
+    cases.push([
+      "a dangling symlink is skipped, not fatal",
+      survivors !== null && survivors.length === 1 && survivors[0].endsWith("real.rs"),
+    ]);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 
   let failed = 0;
   for (const [name, ok] of cases) {

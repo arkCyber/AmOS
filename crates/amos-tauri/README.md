@@ -39,6 +39,7 @@ It is **not** a browser and does not embed a second network stack: WebView → R
 | `src/lib.rs` | `run()`: app setup, form factor, screen measurement, logging |
 | `src/ai_bridge.rs` | the daemon client + event forwarding |
 | `src/wm.rs` | window manager adapter (real windows, honest reporting) |
+| `src/link.rs` | the robot-link bridge: reads the daemon's AmOS-Link control plane (`RobotLink.GetStatus`) for the Settings「机器人链路」page |
 | `src/*.rs` | the command modules (telephony, sms, media, appstore, clipboard, radio, …) |
 | `frontend-ts/` | the Svelte/TypeScript System UI (apps, shell, i18n, tests, its own gates) |
 | `tests/` | end-to-end daemon tests over a real UDS |

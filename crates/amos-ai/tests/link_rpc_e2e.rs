@@ -57,10 +57,10 @@ fn socket(name: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 async fn link_control_plane_is_mounted_on_the_daemon_socket() {
     // The robot middleware's control plane must answer on the SAME UDS as every other
-    // daemon service (docs/amos-link.md): the CLI (`--socket`) and external tooling read it,
-    // and a service that is defined but not mounted is exactly the kind of "documented but
-    // absent" defect this repo's audit rounds hunt. (There is deliberately no System UI
-    // consumer today — §6 of the doc records that boundary.)
+    // daemon service (docs/amos-link.md): the CLI (`--socket`), external tooling, and the
+    // System UI's link panel (`amos-tauri::link::link_status`) read it — and a service that
+    // is defined but not mounted is exactly the kind of "documented but absent" defect this
+    // repo's audit rounds hunt.
     let path = socket("mounted");
     let (server, mut link) = mount(&path).await;
 

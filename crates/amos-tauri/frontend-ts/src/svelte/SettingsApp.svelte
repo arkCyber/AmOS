@@ -58,6 +58,7 @@
   import HotspotPage from "./settings/HotspotPage.svelte";
   import FocusPage from "./settings/FocusPage.svelte";
   import WindowPage from "./settings/WindowPage.svelte";
+  import LinkPage from "./settings/LinkPage.svelte";
 
   type Sub =
     | "account"
@@ -79,7 +80,8 @@
     | "guard"
     | "about"
     | "diagnostics"
-    | "window";
+    | "window"
+    | "link";
   type Page = "index" | Sub;
 
   const PAGE_KEY: Record<Sub, string> = {
@@ -103,6 +105,7 @@
     about: "settings.about",
     diagnostics: "settings.diagnostics",
     window: "settings.window",
+    link: "settings.link",
   };
 
   /**
@@ -132,6 +135,7 @@
     about: ["version", "battery", "device", "版本", "电量", "设备", "storage"],
     diagnostics: ["monitor", "debug", "lmk", "监控", "进程", "开发者", "developer"],
     window: ["form factor", "tablet", "desktop", "split", "columns", "形态", "平板", "桌面", "分屏", "列", "分栏", "窗口"],
+    link: ["robot", "ros", "middleware", "topic", "qos", "peer", "heartbeat", "机器人", "中间件", "链路", "话题", "对端", "心跳"],
   };
 
   let page = $state<Page>("index");
@@ -337,6 +341,7 @@
     [
       { kind: "nav", page: "about", key: "settings.about", sub: () => aboutSub },
       { kind: "nav", page: "window", key: "settings.window" },
+      { kind: "nav", page: "link", key: "settings.link" },
       { kind: "nav", page: "diagnostics", key: "settings.diagnostics" },
     ],
   ];
@@ -505,6 +510,8 @@
         <AboutPage />
       {:else if page === "window"}
         <WindowPage />
+      {:else if page === "link"}
+        <LinkPage />
       {/if}
     </div>
   {/if}

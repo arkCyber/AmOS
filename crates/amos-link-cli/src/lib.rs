@@ -1018,6 +1018,21 @@ async fn run_discover(opts: &Opts) -> Result<()> {
     Ok(())
 }
 
+/// The announce cadence every CLI command uses when it joins the federation.
+///
+/// **One rule, one place** (`docs/amos-link.md` §3): a beacon every `TTL/3`, with a
+/// 100 ms floor so a tiny TTL cannot turn the announcer into a spin.
+///
+/// `spawn_federation` enforces the *upper* bound (a period longer than a third of the
+/// peer TTL makes every other table see this node appear and expire forever — a
+/// flapping link). Announcing **faster** than that is legal but it is wire noise, and
+/// it makes this node's own `published` counter read mostly its own beacons: a
+/// hard-coded 200 ms used to make `watch` report 6 publishes/s for a 1 Hz heartbeat
+/// (1 beat + 5 beacons), which is not what the design record says the CLI does.
+fn federation_period(ttl: Duration) -> Duration {
+    (ttl / 3).max(Duration::from_millis(100))
+}
+
 #[cfg(feature = "lan")]
 async fn run_discover_lan(opts: &Opts) -> Result<()> {
     use amos_link::discovery::Discovery;
@@ -1038,7 +1053,7 @@ async fn run_discover_lan(opts: &Opts) -> Result<()> {
     // command exists to answer ("who is on this LAN?"). The cadence follows the rule
     // `spawn_federation` enforces — at most a third of the TTL — so the peers we appear
     // to don't see us flap.
-    let period = (registry.ttl() / 3).max(Duration::from_millis(100));
+    let period = federation_period(registry.ttl());
     let announcer = amos_link::lan::spawn_announcer(Arc::clone(&channel), me, period)
         .context("starting the beacon announcer")?;
     println!(
@@ -1086,7 +1101,7 @@ async fn run_discover_lan(_opts: &Opts) -> Result<()> {
 async fn run_discover_bus(opts: &Opts) -> Result<()> {
     let node = build_node(opts).await?;
     let task = node
-        .spawn_federation(Duration::from_millis(200))
+        .spawn_federation(federation_period(node.peer_ttl()))
         .context("joining the federation")?;
     println!(
         "discovery=bus transport={} peer={} topic=amos/{}/telemetry/beacon listening {}s",
@@ -1151,9 +1166,10 @@ fn print_peers(peers: &[PeerView]) {
 /// clean exit reports “no peers yet” as a fact rather than failing: a lone tool on a quiet
 /// link is a normal state, not an error.
 ///
-/// Note there is **no System UI twin**: the daemon's control plane has no GUI consumer
-/// today (this CLI and external tooling are the callers), and nothing in this repo should
-/// claim one (§6 of docs/amos-link.md records that boundary).
+/// With `--socket` this is also the terminal twin of the System UI's Settings
+/// 「机器人链路 / Robot Link」 page (`amos-tauri`'s `link_status` reads the same
+/// `GetStatus`): both answer "is the robot on the link" from the *daemon's* node,
+/// never from a local demo node.
 async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
     let period = DEFAULT_HEARTBEAT_PERIOD;
     let mut beats = node
@@ -1164,7 +1180,7 @@ async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
         .spawn_heartbeat(period)
         .context("starting the heartbeat task")?;
     let federation = node
-        .spawn_federation(Duration::from_millis(200))
+        .spawn_federation(federation_period(node.peer_ttl()))
         .context("joining the peer federation")?;
 
     let seconds = opts.seconds.max(1);
@@ -1398,6 +1414,44 @@ mod tests {
         assert!(
             parse_from(["status"]).expect("local").socket.is_none(),
             "no socket means a local node"
+        );
+    }
+
+    #[test]
+    fn one_federation_cadence_governs_every_command() {
+        // The documented rule (docs/amos-link.md §3): a beacon every TTL/3.
+        // `PeerRegistry::DEFAULT_TTL` is 3 s ⇒ a 1 s cadence.
+        assert_eq!(
+            federation_period(Duration::from_secs(3)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            federation_period(Duration::from_secs(9)),
+            Duration::from_secs(3)
+        );
+        // …and the result is a period `spawn_federation` accepts (it refuses
+        // `period * 3 > ttl`, i.e. announcing so rarely that peers flap).
+        for ttl in [
+            Duration::from_secs(3),
+            Duration::from_secs(9),
+            Duration::from_secs(1),
+        ] {
+            let period = federation_period(ttl);
+            assert!(
+                period.saturating_mul(3) <= ttl,
+                "ttl={ttl:?} produced an illegal period {period:?}"
+            );
+        }
+        // A degenerate TTL cannot make the announcer spin: the 100 ms floor wins, and
+        // such a TTL is not one any CLI path uses (they all run a 3 s registry) —
+        // `spawn_federation` would refuse the result loudly rather than spin.
+        assert_eq!(
+            federation_period(Duration::from_millis(30)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            federation_period(Duration::ZERO),
+            Duration::from_millis(100)
         );
     }
 

@@ -4,8 +4,9 @@
 //! This module is the *management* plane beside it, and it exists for three callers
 //! that are not Rust link nodes:
 //!
-//! * the System UI (a link view is **not** implemented today — see §6 of
-//!   docs/amos-link.md; this module must not imply a consumer that does not exist),
+//! * the **System UI** (`amos-tauri`'s `link::link_status`, read by the Settings
+//!   「机器人链路 / Robot Link」 page — §6 of docs/amos-link.md recorded this panel as
+//!   missing until it was built),
 //! * the `amos-link-cli`,
 //! * an external tool that wants to inject a frame or read the topic inventory.
 //!

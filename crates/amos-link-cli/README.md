@@ -15,20 +15,28 @@ Part of **[Amos](../../README.md)**.
 amos-link-cli status                   # identity, counters, peers, clock freshness (JSON)
 amos-link-cli topics                   # the topic inventory of a live node
 amos-link-cli pub   --topic amos/dog1/control/joints --action '{"action":"trot"}'
-amos-link-cli sub   --pattern 'amos/**' --count 3
+amos-link-cli sub   --pattern 'amos/**' --count 3 --timeout-ms 2000   # 0 = wait forever
 amos-link-cli bench --count 2000 --size 4096      # real publish→decode latency
 amos-link-cli discover --peer dog1 --peer mini-brain
 amos-link-cli watch --seconds 5                   # heartbeat + federation: is the link alive
 amos-link-cli motor --action '{"action":"trot","speed":0.5}'   # frames + hex
 ```
 
-Two honest notes about scope, both enforced in code rather than promised:
+Four honest notes about scope, all enforced in code rather than promised:
 
 - `--transport zenoh` and `discover --lan` are the real network paths and need the matching
   build feature (`zenoh` / `lan`). Without it the command **says so** instead of silently
   using another transport.
 - `pub`/`sub` carry `AgentAction` payloads (text or JSON) — the one shape a human and an
   agent can both produce without a schema.
+- `sub` waits for `--count` frames, so **without `--timeout-ms` it waits forever** when
+  nothing is publishing — a scripted probe must bound it. Expiry is reported
+  (`timeout after …ms with no frame (received N)`) and the run still exits 0: a bounded
+  observation that saw nothing is a fact, not a failure.
+- Every command that joins the peer federation (`discover --bus`, `watch`, `discover --lan`)
+  announces at the same cadence — a beacon every `TTL/3` (1 s for the default 3 s TTL), from
+  one helper. Announcing faster is legal but it is wire noise, and it makes this node's own
+  `published` counter read mostly its own beacons.
 
 ## Layout
 

@@ -127,6 +127,9 @@ terminal-pty = ["dep:portable-pty"]
 # bridge command core can be exercised headlessly over UDS (no Tauri/GUI).
 [dev-dependencies]
 amos-ai = { path = "../amos-ai" }
+# The robot middleware, so the link bridge e2e can mount the daemon's *real* control
+# plane (`amos_link::service::mock_server`) on a UDS instead of stubbing the wire.
+amos-link = { path = "../amos-link" }
 # The device-care domain crate, for building audit events in the bridge e2e the
 # same way `devcare_clean` does.
 amos-devocare = { path = "../amos-devocare" }

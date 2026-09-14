@@ -49,6 +49,7 @@ pub mod ime;
 #[cfg(feature = "android")]
 pub mod incall;
 pub mod interpret;
+pub mod link;
 pub mod mail;
 pub mod media;
 pub mod mic_permission;
@@ -307,6 +308,7 @@ pub fn run() {
             privacy_client::perm_grants_all,
             netguard::netguard_toggle,
             netguard::netguard_status,
+            link::link_status,
             rag_client::rag_status,
             rag_client::rag_query,
             rag_client::rag_index,
