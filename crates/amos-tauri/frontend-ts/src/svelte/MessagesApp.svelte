@@ -583,11 +583,11 @@
     </div>
     <!-- Device inbox toolbar: compose a new message + trash panel + refresh -->
     <div class="mb-1.5 flex items-center justify-between gap-1.5">
-      <button onclick={startNew} aria-label="new-sms" class="rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.newSms")}</button>
+      <button onclick={startNew} data-testid="new-sms" class="rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.newSms")}</button>
       <div class="flex items-center gap-1.5">
         <button onclick={() => (trashOpen = !trashOpen)} disabled={trashBusy} aria-pressed={trashOpen} data-testid="trash-toggle" title={t("message.trashPanel")}
           class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.trashPanel")}{#if trash.length > 0}<span class="ml-1 opacity-80">{trash.length}</span>{/if}</button>
-        <button onclick={retrySms} disabled={smsBusy} aria-label="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
+        <button onclick={retrySms} disabled={smsBusy} data-testid="refresh-sms" title={t("message.refresh")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700">{t("message.refresh")}</button>
       </div>
     </div>
     {#if trashMsg}
@@ -631,11 +631,11 @@
       <!-- Compose to any number: the platform persists the send, so the thread
            appears in the provider and the list refreshes below. -->
       <div class="mb-1.5 flex items-center gap-1.5" data-testid="new-sms-form">
-        <input bind:value={newTo} aria-label="new-sms-to" placeholder={t("message.toPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
-        <input bind:value={newText} aria-label="new-sms-text" placeholder={t("message.newSmsHint")} onkeydown={(e) => e.key === "Enter" && sendNew()} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
-        <button onclick={sendNew} disabled={smsBusy} aria-label="new-sms-send" class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95 disabled:opacity-40">{t("message.send")}</button>
-        <button onclick={saveDraftNow} aria-label="new-sms-draft" class="shrink-0 rounded-full bg-neutral-200 px-3 py-1.5 text-xs dark:bg-neutral-700">{t("message.saveDraft")}</button>
-        <button onclick={cancelNew} aria-label="new-sms-cancel" class="shrink-0 rounded-full bg-neutral-200 px-2 py-1.5 text-xs dark:bg-neutral-700">{t("message.cancel")}</button>
+        <input bind:value={newTo} data-testid="new-sms-to" aria-label={t("message.toPlaceholder")} placeholder={t("message.toPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
+        <input bind:value={newText} data-testid="new-sms-text" aria-label={t("message.newSmsHint")} placeholder={t("message.newSmsHint")} onkeydown={(e) => e.key === "Enter" && sendNew()} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
+        <button onclick={sendNew} disabled={smsBusy} data-testid="new-sms-send" class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95 disabled:opacity-40">{t("message.send")}</button>
+        <button onclick={saveDraftNow} data-testid="new-sms-draft" class="shrink-0 rounded-full bg-neutral-200 px-3 py-1.5 text-xs dark:bg-neutral-700">{t("message.saveDraft")}</button>
+        <button onclick={cancelNew} data-testid="new-sms-cancel" class="shrink-0 rounded-full bg-neutral-200 px-2 py-1.5 text-xs dark:bg-neutral-700">{t("message.cancel")}</button>
       </div>
     {/if}
     {#if folder === "draft"}
@@ -673,7 +673,7 @@
         {#if smsDenied}
           <p class="text-xs opacity-60">{t("message.smsDeniedHint")}</p>
         {/if}
-        <button onclick={retrySms} disabled={smsBusy} aria-label="sms-retry" class="rounded-full bg-accent px-4 py-1.5 text-xs text-white active:scale-95 disabled:opacity-40">{t("message.retry")}</button>
+        <button onclick={retrySms} disabled={smsBusy} data-testid="sms-retry" class="rounded-full bg-accent px-4 py-1.5 text-xs text-white active:scale-95 disabled:opacity-40">{t("message.retry")}</button>
       </div>
     {:else if realThreads.length === 0}
       <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center" data-testid="sms-empty">
@@ -721,8 +721,8 @@
       <p class="mt-1 text-xs text-red-500" role="alert">{realErr}</p>
     {/if}
     <div class="mt-2 flex items-center gap-2 pb-1">
-      <input bind:value={realText} onkeydown={(e) => e.key === "Enter" && sendReal()} placeholder={t("message.placeholder", { name: activeRealName })} aria-label="real-message-input" class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
-      <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label="send" data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
+      <input bind:value={realText} onkeydown={(e) => e.key === "Enter" && sendReal()} placeholder={t("message.placeholder", { name: activeRealName })} data-testid="real-message-input" aria-label={t("message.placeholder", { name: activeRealName })} class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
+      <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label={t("message.send")} data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
     </div>
     {/if}
   {:else}
@@ -734,8 +734,8 @@
   </div>
   <!-- Always-visible row to start a new contact-thread (local conversations) -->
   <div class="mb-1.5 flex items-center gap-1.5">
-    <input bind:value={newName} aria-label="new-contact" onkeydown={(e) => e.key === "Enter" && confirmAdd()} placeholder={t("message.contactPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:text-white dark:ring-white/10 dark:placeholder:text-white/30" />
-    <button onclick={confirmAdd} aria-label="add-contact" title={t("message.addThread")} class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.confirm")}</button>
+    <input bind:value={newName} data-testid="new-contact" aria-label={t("message.contactPlaceholder")} onkeydown={(e) => e.key === "Enter" && confirmAdd()} placeholder={t("message.contactPlaceholder")} class="min-w-0 flex-1 rounded-full bg-black/5 px-3 py-1.5 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:text-white dark:ring-white/10 dark:placeholder:text-white/30" />
+    <button onclick={confirmAdd} data-testid="add-contact" title={t("message.addThread")} class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white active:scale-95">{t("message.confirm")}</button>
   </div>
 
   {#if active}
@@ -748,7 +748,7 @@
       </div>
       <div class="flex items-center gap-1.5">
         {#if conversations.length > 1}
-          <button onclick={deleteThread} aria-label="delete-thread" title={t("message.deleteThread")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs dark:bg-neutral-700">{t("message.deleteThread")}</button>
+          <button onclick={deleteThread} data-testid="delete-thread" title={t("message.deleteThread")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs dark:bg-neutral-700">{t("message.deleteThread")}</button>
         {/if}
         <button onclick={clear} disabled={msgs.length === 0} aria-label={t("message.clear")} class="rounded-full bg-neutral-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:bg-neutral-700"><span data-icon="trash" class="inline-flex align-[-1px]">{@html iconSvg("trash", "h-3 w-3")}</span> {t("message.clear")}</button>
       </div>
@@ -783,8 +783,8 @@
       </div>
     {/if}
     <div class="mt-2 flex items-center gap-2 pb-1">
-      <input bind:value={text} onkeydown={(e) => e.key === "Enter" && send()} placeholder={t("message.placeholder", { name: active.name })} aria-label="message-input" class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
-      <button onclick={send} title={t("message.placeholder", { name: active.name })} aria-label="send" data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
+      <input bind:value={text} onkeydown={(e) => e.key === "Enter" && send()} placeholder={t("message.placeholder", { name: active.name })} data-testid="message-input" aria-label={t("message.placeholder", { name: active.name })} class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
+      <button onclick={send} title={t("message.placeholder", { name: active.name })} aria-label={t("message.send")} data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
     </div>
   {:else}
     <p class="py-16 text-center text-sm opacity-60">{t("message.noThreads")}</p>

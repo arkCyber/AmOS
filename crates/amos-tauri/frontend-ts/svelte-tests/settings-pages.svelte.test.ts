@@ -36,6 +36,7 @@ import { FOCUS_KEY, type FocusPrefs } from "../src/lib/focusPrefs";
 import { LOCK_KEY } from "../src/lib/lock";
 import { assertHold, clearAllHolds, releaseHold } from "../src/lib/keepAwakeCore";
 import { AUTOOFF_STORE_KEY } from "../src/lib/display";
+import { zh } from "../src/i18n/locales/zh";
 
 beforeEach(() => window.localStorage.clear());
 afterEach(() => {
@@ -392,7 +393,7 @@ describe("Settings real sub pages (interactions)", () => {
     expect(panel?.textContent ?? "").toContain("字节"); // the byte count is shown
     // …and the user can copy the raw text out (the app never rewrites it).
     await fireEvent.click(
-      panel!.querySelector('button[aria-label="quarantine-copy"]') as HTMLButtonElement,
+      panel!.querySelector('button[data-testid="quarantine-copy"]') as HTMLButtonElement,
     );
     await Promise.resolve();
     expect(readQuarantine(KEY)).toBe("{ this is not json");
@@ -649,6 +650,488 @@ describe("RadioPage — remembered Wi‑Fi + Bluetooth device name", () => {
   });
 });
 
+describe("RadioPage — Bluetooth device facts vs the offline preference (REQ-A199)", () => {
+  const qs = (over: Partial<QuickSettings> = {}): QuickSettings => ({
+    wifi: false,
+    bluetooth: true,
+    airplane: false,
+    ...over,
+  });
+  const btNameInput = (host: { container: HTMLElement }) =>
+    host.container.querySelector('[data-testid="bt-name"]') as HTMLInputElement;
+  const btStore = () =>
+    readStoreValue<{ name?: string; paired?: Array<{ id: string }> }>(BT_KEY, {});
+
+  /** Fake Bluetooth bridge: adapter name + paired devices + a rename the platform may
+   *  truncate, answer empty for anything else. */
+  function installBtBridge(opts: {
+    name: string | null;
+    peers: Array<{ address: string; name: string }> | null;
+    rename?: (n: string) => string | null;
+  }) {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "bluetooth_adapter_name") return opts.name;
+        if (cmd === "bluetooth_paired_devices") return opts.peers;
+        if (cmd === "bluetooth_rename_adapter") {
+          const out = opts.rename ? opts.rename(String(args?.name ?? "")) : String(args?.name ?? "");
+          if (out === null) throw new Error("the platform refused");
+          return out;
+        }
+        if (cmd === "radio_status") {
+          return { wifi: false, bluetooth: true, airplane: false, hotspot: false };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  test("offline: pairing a demo device is remembered, and unpairing forgets it", async () => {
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    // No bridge → the demo neighbourhood is offered, with the honest note.
+    expect(txt(host)).toContain("AirPods Pro");
+    expect(txt(host)).toContain("演示列表");
+    expect(host.container.querySelector('[data-testid="bt-device-note"]')).toBeNull();
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="配对 AirPods Pro"]') as HTMLButtonElement,
+    );
+    expect(btStore().paired?.map((d) => d.id)).toEqual(["airpods"]);
+    // The same row now offers unpairing.
+    expect(host.container.querySelector('button[aria-label="取消配对 AirPods Pro"]')).toBeTruthy();
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="取消配对 AirPods Pro"]') as HTMLButtonElement,
+    );
+    expect(btStore().paired).toEqual([]);
+  });
+
+  test("device mode: the adapter's name and its paired devices win, read-only", async () => {
+    const calls = installBtBridge({
+      name: "S5-BT",
+      peers: [
+        { address: "AA:BB:CC:DD:EE:FF", name: "Buds" },
+        { address: "AA:BB:CC:DD:EE:01", name: "" },
+      ],
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("S5-BT"));
+    expect(calls.map((c) => c.cmd)).toContain("bluetooth_paired_devices");
+    // The adapter's rows replace the demo list — a real adapter must not be shown a
+    // fabricated neighbourhood.
+    expect(txt(host)).toContain("Buds");
+    expect(txt(host)).toContain("AA:BB:CC:DD:EE:FF");
+    // A device the platform never named is **labelled by its address**, not left blank
+    // (the address also shows on the right of the row, so this checks the row's label).
+    const labels = [...host.container.querySelectorAll('[data-testid="bt-peer-name"]')].map(
+      (el) => el.textContent,
+    );
+    expect(labels).toEqual(["Buds", "AA:BB:CC:DD:EE:01"]);
+    expect(txt(host)).not.toContain("AirPods Pro");
+    // The adapter's rows replace the demo list — a real adapter must not be shown a
+    // fabricated neighbourhood. (The 附近设备 *header* now belongs to the real scan
+    // section, REQ-A200, so the check is on the demo rows and their note.)
+    expect(txt(host)).not.toContain("AirPods Pro");
+    expect(txt(host)).not.toContain("演示列表");
+    expect(txt(host)).not.toContain("未配对");
+    // Unpairing is a platform limit, not a hidden feature: the rows are read-only and
+    // the screen says why.
+    expect(host.container.querySelector('[data-testid="bt-device-note"]')).toBeTruthy();
+    expect(host.container.querySelector('button[aria-label="取消配对 Buds"]')).toBeNull();
+    // And the discoverability hint switches from "demo" to the real limitation.
+    expect(txt(host)).not.toContain("演示列表");
+  });
+
+  test("device mode: a rename reaches the adapter and the store mirrors ITS answer", async () => {
+    // The platform truncates to two characters — what it reports back is the truth.
+    const calls = installBtBridge({ name: "S5-BT", peers: [], rename: (n) => n.slice(0, 2) });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("S5-BT"));
+
+    await fireEvent.change(btNameInput(host), { target: { value: "Long Name" } });
+    await vi.waitFor(() => {
+      expect(
+        calls.some(
+          (c) => c.cmd === "bluetooth_rename_adapter" && c.args?.name === "Long Name",
+        ),
+      ).toBe(true);
+    });
+    // The input and the remembered name both show what the ADAPTER reports, not what we
+    // asked for.
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("Lo"));
+    expect(btStore().name).toBe("Lo");
+  });
+
+  test("device mode: a refused rename is visible and nothing claims it landed", async () => {
+    installBtBridge({ name: "S5-BT", peers: [], rename: () => null });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("S5-BT"));
+
+    await fireEvent.change(btNameInput(host), { target: { value: "New Name" } });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="bt-rename-error"]')).toBeTruthy(),
+    );
+    // The field snaps back to the adapter's name and the store keeps no new name: the
+    // rejected value cannot look applied anywhere.
+    expect(btNameInput(host).value).toBe("S5-BT");
+    expect(btStore().name).toBeUndefined();
+  });
+});
+
+describe("RadioPage — Bluetooth discovery (REQ-A200)", () => {
+  const qs = (over: Partial<QuickSettings> = {}): QuickSettings => ({
+    wifi: false,
+    bluetooth: true,
+    airplane: false,
+    ...over,
+  });
+  type Scan = {
+    discovering: boolean;
+    classic: boolean;
+    le: boolean;
+    capped: boolean;
+    scan_allowed: boolean;
+    devices: Array<{ address: string; name: string; rssi: number | null; bond: number; le: boolean }>;
+    bonds: Array<{ address: string; state: number }>;
+  };
+  const emptyScan = (over: Partial<Scan> = {}): Scan => ({
+    discovering: false,
+    classic: false,
+    le: false,
+    capped: false,
+    scan_allowed: true,
+    devices: [],
+    bonds: [],
+    ...over,
+  });
+
+  /** Fake bridge: device facts + a scan the test drives step by step. */
+  function installScanBridge(opts: {
+    scan: () => Scan | "unavailable";
+    startScan?: () => boolean;
+    pair?: (address: string) => boolean;
+  }) {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        switch (cmd) {
+          case "bluetooth_adapter_name":
+            return "A17Pro";
+          case "bluetooth_paired_devices":
+            return [];
+          case "bluetooth_start_scan":
+            if (opts.startScan && !opts.startScan()) throw new Error("refused");
+            return true;
+          case "bluetooth_stop_scan":
+            return true;
+          case "bluetooth_scan_state": {
+            const s = opts.scan();
+            if (s === "unavailable") throw new Error("no glue");
+            return s;
+          }
+          case "bluetooth_pair":
+            if (opts.pair && !opts.pair(String(args?.address ?? ""))) {
+              throw new Error("refused");
+            }
+            return true;
+          case "radio_status":
+            return { wifi: false, bluetooth: true, airplane: false, hotspot: false };
+          default:
+            return null;
+        }
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+
+  const btNameInput = (host: { container: HTMLElement }) =>
+    host.container.querySelector('[data-testid="bt-name"]') as HTMLInputElement;
+  const scanNames = (host: { container: HTMLElement }) =>
+    [...host.container.querySelectorAll('[data-testid="bt-scan-name"]')].map((e) => e.textContent);
+
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  test("scan → result rows → pairing asks for the address, then says to confirm", async () => {
+    // The device's state before/after the search — the button, the empty-state wording
+    // and the rows all follow from it, so the test models it rather than assuming.
+    const state: Scan = emptyScan();
+    const calls = installScanBridge({
+      scan: () => ({ ...state }),
+      startScan: () => {
+        state.discovering = true;
+        state.classic = true;
+        state.le = true;
+        state.devices = [
+          { address: "AA:BB:CC:DD:EE:FF", name: "Buds", rssi: -55, bond: 10, le: true },
+        ];
+        return true;
+      },
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    // Nothing has been searched yet: the hint — not "no devices found", and not
+    // "searching", because no scan is running.
+    expect(txt(host)).toContain("点击「搜索」查找附近设备");
+    expect(txt(host)).not.toContain("未搜索到设备");
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() => expect(scanNames(host)).toEqual(["Buds"]));
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="配对 Buds"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="bt-pair-note"]')).toBeTruthy(),
+    );
+    // The pairing request carries the *address*, never the label.
+    expect(calls.find((c) => c.cmd === "bluetooth_pair")?.args).toEqual({
+      address: "AA:BB:CC:DD:EE:FF",
+    });
+  });
+
+  test("a refused scan start is visible and no devices are claimed", async () => {
+    installScanBridge({ scan: () => emptyScan(), startScan: () => false });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="bt-scan-error"]')?.textContent).toContain(
+        "无法开始搜索",
+      ),
+    );
+    expect(scanNames(host)).toEqual([]);
+  });
+
+  test("missing BLUETOOTH_SCAN is reported as 'may not scan', not as 'nothing found'", async () => {
+    installScanBridge({ scan: () => emptyScan({ scan_allowed: false }) });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="bt-scan-denied"]')).toBeTruthy(),
+    );
+    expect(txt(host)).toContain("BLUETOOTH_SCAN");
+    expect(txt(host)).not.toContain("未搜索到设备");
+  });
+
+  test("a capped result list is shown as incomplete", async () => {
+    const state: Scan = emptyScan({ capped: true });
+    installScanBridge({
+      scan: () => ({ ...state }),
+      // The scan ends (the platform caps it) but the results and the cap flag stay.
+      startScan: () => {
+        state.devices = [{ address: "AA:BB", name: "Root", rssi: -70, bond: 10, le: false }];
+        return true;
+      },
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="bt-scan-capped"]')).toBeTruthy(),
+    );
+    expect(txt(host)).toContain("可能不完整");
+  });
+
+  test("leaving the page cancels a running scan", async () => {
+    const state: Scan = emptyScan();
+    const calls = installScanBridge({
+      scan: () => ({ ...state }),
+      startScan: () => {
+        state.discovering = true;
+        return true;
+      },
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() => expect(calls.some((c) => c.cmd === "bluetooth_scan_state")).toBe(true));
+    calls.length = 0;
+    // Unmounting is what leaving the Bluetooth page does — the scan must not be left
+    // running (it costs battery, and the platform would end it silently later).
+    host.unmount();
+    await vi.waitFor(() => expect(calls.some((c) => c.cmd === "bluetooth_stop_scan")).toBe(true));
+  });
+
+  test("a start that is accepted keeps polling even if the first read still says 'not discovering'", async () => {
+    // Device-observed race (REQ-A200, S5): starting discovery is asynchronous, so the
+    // read taken right after an accepted start can still report `discovering: false`.
+    // Believing it stopped the poll and the devices the scan DID find never rendered.
+    let polls = 0;
+    installScanBridge({
+      scan: () => {
+        polls += 1;
+        // First read (right after the start): the platform has not caught up yet.
+        if (polls === 1) return emptyScan({ discovering: false, devices: [] });
+        return emptyScan({
+          discovering: true,
+          devices: [{ address: "43:20:81:5D:7B:C1", name: "midea", rssi: -57, bond: 10, le: false }],
+        });
+      },
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    // The list must arrive on a later poll even though the first read said "stopped".
+    await vi.waitFor(() => expect(scanNames(host)).toEqual(["midea"]), { timeout: 5000 });
+    expect(txt(host)).not.toContain("未搜索到设备");
+  });
+
+  test("the searched transports are stated, and LE rows carry a tag", async () => {
+    // "No devices" on a channel nobody scanned is a different answer, so the screen says
+    // which transports were searched — and marks the rows that answered over LE
+    // (REQ-A201).
+    const state: Scan = emptyScan();
+    installScanBridge({
+      scan: () => ({ ...state }),
+      startScan: () => {
+        state.discovering = true;
+        state.classic = true;
+        state.le = true;
+        state.devices = [
+          { address: "AA:BB", name: "Buds", rssi: -50, bond: 10, le: true },
+          { address: "CC:DD", name: "Headset", rssi: -70, bond: 10, le: false },
+        ];
+        return true;
+      },
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    // Nothing searched yet: no claim about transports.
+    expect(host.container.querySelector('[data-testid="bt-scan-transports"]')).toBeNull();
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() => expect(scanNames(host)).toEqual(["Buds", "Headset"]), { timeout: 5000 });
+    expect(
+      host.container.querySelector('[data-testid="bt-scan-transports"]')?.textContent,
+    ).toContain("经典蓝牙 + 蓝牙 LE");
+    // Only the LE-heard device carries the tag — the classic-only row must not.
+    expect(host.container.querySelectorAll('[data-testid="bt-le-tag"]').length).toBe(1);
+  });
+
+  test("an LE scan that never started is reported as 'classic only', not as 'no devices'", async () => {
+    const state: Scan = emptyScan();
+    installScanBridge({
+      scan: () => ({ ...state }),
+      startScan: () => {
+        state.discovering = true;
+        state.classic = true;
+        state.le = false; // the glue could not start the LE half
+        return true;
+      },
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(
+        host.container.querySelector('[data-testid="bt-scan-transports"]')?.textContent,
+      ).toContain("仅经典蓝牙"),
+    );
+  });
+
+  test("pairing progress comes from the device's bond state, not from 'the request was sent'", async () => {
+    // Device-observed sequence (REQ-A201): a pair request the framework accepts goes to
+    // BOND_BONDING and then either to BOND_BONDED or back to BOND_NONE. The first version
+    // of this screen said nothing at all, so a request in flight was indistinguishable
+    // from a dead button.
+    const state: Scan = emptyScan();
+    const calls = installScanBridge({
+      scan: () => ({ ...state }),
+      startScan: () => {
+        state.discovering = true;
+        state.classic = true;
+        state.devices = [{ address: "11:22", name: "Peer", rssi: -60, bond: 10, le: false }];
+        return true;
+      },
+      pair: () => {
+        // The platform accepted the request: it now runs the pairing flow. The first glue
+        // read still has no transition (the framework has not broadcast yet)…
+        state.bonds = [];
+        return true;
+      },
+    });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="搜索"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() => expect(scanNames(host)).toEqual(["Peer"]), { timeout: 5000 });
+
+    await fireEvent.click(
+      host.container.querySelector('button[aria-label="配对 Peer"]') as HTMLButtonElement,
+    );
+    // …the note says exactly that: the request is out and the device decides the outcome.
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="bt-pair-note"]')?.textContent).toContain(
+        "以设备为准",
+      ),
+    );
+
+    // …then the device reports the transition, and the screen follows it.
+    state.bonds = [{ address: "11:22", state: 11 }];
+    state.devices = [{ address: "11:22", name: "Peer", rssi: -60, bond: 11, le: false }];
+    await vi.waitFor(
+      () =>
+        expect(host.container.querySelector('[data-testid="bt-pair-note"]')?.textContent).toContain(
+          "配对中",
+        ),
+      { timeout: 5000 },
+    );
+    // While pairing is in flight the row offers no "pair" button (the device state does
+    // not allow it) and shows the progress tag instead.
+    expect(host.container.querySelector('[data-testid="bt-bonding-tag"]')).toBeTruthy();
+    expect(host.container.querySelector('button[aria-label="配对 Peer"]')).toBeNull();
+
+    // The pairing completes: the note says so, and the authoritative paired list is
+    // re-read so "My Devices" cannot keep showing the old (empty) answer.
+    calls.length = 0;
+    state.bonds = [{ address: "11:22", state: 12 }];
+    state.devices = [{ address: "11:22", name: "Peer", rssi: -60, bond: 12, le: false }];
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="bt-pair-note"]')?.textContent).toContain(
+        "配对完成",
+      ),
+      { timeout: 5000 },
+    );
+    expect(calls.some((c) => c.cmd === "bluetooth_paired_devices")).toBe(true);
+  });
+
+  test("the demo neighbourhood is not shown when a real adapter answers", async () => {
+    installScanBridge({ scan: () => emptyScan() });
+    const host = render(RadioPage, { props: { which: "bluetooth", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() => expect(btNameInput(host).value).toBe("A17Pro"));
+    expect(txt(host)).not.toContain("AirPods Pro");
+    expect(txt(host)).not.toContain("演示列表");
+  });
+});
+
 describe("PrivacyPage — system media access", () => {
   afterEach(() => {
     delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -848,6 +1331,169 @@ describe("AiPage — client diagnostics ledger (audit P1-3)", () => {
     amosLog("backend", "info-after-warn");
     expect(recentDiag(1).some((e) => e.msg === "info-after-warn")).toBe(false);
     expect(diagStats().suppressed).toBeGreaterThan(0);
+  });
+});
+
+describe("RadioPage — a switch the platform owns (REQ-A202)", () => {
+  const qs = (): QuickSettings => ({
+    wifi: false,
+    bluetooth: false,
+    airplane: false,
+    hotspot: false,
+  });
+
+  /** Fake bridge: `radio_control` says whether this app may switch the radio. */
+  function installBridge(opts: { managed: boolean; openOk?: boolean }) {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        switch (cmd) {
+          case "radio_control":
+            return {
+              radio: String(args?.key ?? ""),
+              app_controlled: !opts.managed,
+              surface: opts.managed ? "wifi_panel" : null,
+              reason: opts.managed ? "switch_removed" : null,
+            };
+          case "radio_open_settings":
+            return opts.openOk ?? true;
+          case "radio_status":
+            return { wifi: false, bluetooth: false, airplane: false, hotspot: false };
+          case "bluetooth_adapter_name":
+            return "A17Pro";
+          case "bluetooth_paired_devices":
+            return [];
+          default:
+            return null;
+        }
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  test("the master switch states the platform's ownership and offers the system settings screen", async () => {
+    const calls = installBridge({ managed: true });
+    const host = render(RadioPage, { props: { which: "wifi", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-managed-note"]')).toBeTruthy(),
+    );
+    // The sentence names THIS radio's platform limit (they differ per radio).
+    expect(txt(host)).toContain(zh["radio.managed.wifi"]);
+    // The switch still shows the device's real state, but is not operable from here:
+    // tapping it would be a write no app may make.
+    const sw = switchByLabel(host, zh["settings.wifi"]) as HTMLButtonElement;
+    expect(sw.disabled).toBe(true);
+
+    calls.length = 0;
+    await fireEvent.click(
+      host.container.querySelector('[data-testid="radio-open-settings"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(calls.find((c) => c.cmd === "radio_open_settings")?.args).toEqual({ key: "wifi" }),
+    );
+    expect(
+      calls.some((c) => c.cmd === "radio_set"),
+      "the page must not attempt a write the platform forbids",
+    ).toBe(false);
+  });
+
+  test("a system surface that will not open is reported on the page", async () => {
+    installBridge({ managed: true, openOk: false });
+    const host = render(RadioPage, {
+      props: { which: "bluetooth", qs: qs(), onToggle: () => {} },
+    });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-open-settings"]')).toBeTruthy(),
+    );
+    await fireEvent.click(
+      host.container.querySelector('[data-testid="radio-open-settings"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(
+        host.container.querySelector('[data-testid="radio-open-failed"]')?.textContent,
+      ).toContain(zh["radio.openSettingsFailed"]),
+    );
+  });
+
+  test("an app-controlled switch is untouched: no note, and the toggle is the app's", async () => {
+    const calls = installBridge({ managed: false });
+    const toggled: string[] = [];
+    const host = render(RadioPage, {
+      props: { which: "wifi", qs: qs(), onToggle: (k) => toggled.push(k) },
+    });
+    await vi.waitFor(() => expect(calls.some((c) => c.cmd === "radio_control")).toBe(true));
+    expect(host.container.querySelector('[data-testid="radio-managed-note"]')).toBeNull();
+    const sw = switchByLabel(host, zh["settings.wifi"]) as HTMLButtonElement;
+    expect(sw.disabled).toBe(false);
+    await fireEvent.click(sw);
+    expect(toggled).toEqual(["wifi"]);
+    expect(calls.some((c) => c.cmd === "radio_open_settings")).toBe(false);
+  });
+
+  test("a refused write is stated next to the switch (REQ-A203)", async () => {
+    // The structured `radio_set` answer reached SettingsApp, which passes the coerced
+    // refusal down: the sentence must sit by the switch that did not move.
+    installBridge({ managed: false });
+    const host = render(RadioPage, {
+      props: {
+        which: "wifi",
+        qs: qs(),
+        onToggle: () => {},
+        refusal: { noteKey: "radio.refused.device", surface: null },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-refused"]')?.textContent).toContain(
+        zh["radio.refused.device"],
+      ),
+    );
+    // The refusal named no surface, so no way out is offered — none is invented.
+    expect(host.container.querySelector('[data-testid="radio-refused-open-settings"]')).toBeNull();
+  });
+
+  test("a refusal that names a surface offers the real switch (REQ-A203)", async () => {
+    const calls = installBridge({ managed: false });
+    const host = render(RadioPage, {
+      props: {
+        which: "wifi",
+        qs: qs(),
+        onToggle: () => {},
+        refusal: { noteKey: "radio.managed.wifi", surface: "wifi_panel" },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-refused"]')).toBeTruthy(),
+    );
+    await fireEvent.click(
+      host.container.querySelector('[data-testid="radio-refused-open-settings"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(calls.find((c) => c.cmd === "radio_open_settings")?.args).toEqual({ key: "wifi" }),
+    );
+  });
+
+  test("a refusal nobody understands still says something was refused (REQ-A203)", async () => {
+    // The reason may not be invented, but "the tap did nothing" is itself a fact the
+    // screen owes the user.
+    const host = render(RadioPage, {
+      props: {
+        which: "bluetooth",
+        qs: qs(),
+        onToggle: () => {},
+        refusal: { noteKey: "", surface: null },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-refused"]')?.textContent).toContain(
+        zh["radio.refused.unknown"],
+      ),
+    );
   });
 });
 

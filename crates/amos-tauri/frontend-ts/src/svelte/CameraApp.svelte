@@ -846,7 +846,7 @@
           <span class="w-9 shrink-0 text-right text-[11px] tabular-nums text-white/70">{zoomText(zoom)}</span>
           <input
             type="range"
-            aria-label="zoom slider"
+            aria-label={t("a11y.zoomSlider")}
             min={ZOOM_MIN}
             max={ZOOM_MAX}
             step={ZOOM_SLIDER_STEP}
@@ -859,7 +859,7 @@
       <!-- iPhone-style bottom bar: thumbnail · shutter · flip -->
       <div class="flex w-full items-center justify-between px-6 pt-0.5">
         <button
-          aria-label="last photo"
+          aria-label={t("a11y.lastPhoto")}
           disabled={!last}
           class="grid h-12 w-12 place-items-center overflow-hidden rounded-[11px] bg-white/15 ring-1 ring-white/40 disabled:opacity-30"
         >
@@ -875,7 +875,7 @@
           onpointerup={onShutterUp}
           onpointercancel={onShutterUp}
           onpointerleave={onShutterUp}
-          aria-label="shutter"
+          aria-label={t("a11y.shutter")}
           disabled={!live}
           class="relative my-1 grid h-[78px] w-[78px] place-items-center rounded-full ring-[5px] ring-white transition active:scale-90 disabled:opacity-40"
         >

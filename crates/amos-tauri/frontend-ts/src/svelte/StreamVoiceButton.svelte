@@ -177,7 +177,7 @@
 <span class="relative inline-flex shrink-0">
   <button
     type="button"
-    aria-label="streaming voice input"
+    aria-label={t("a11y.streamingVoiceInput")}
     onpointerdown={(e) => {
       e.preventDefault();
       if (!recording) void start();

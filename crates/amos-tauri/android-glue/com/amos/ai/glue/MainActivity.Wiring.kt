@@ -3,6 +3,7 @@ package com.amos.ai.glue
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
 import android.view.WindowManager
 import android.webkit.PermissionRequest
@@ -48,9 +49,50 @@ object PermissionWire {
         MicPermissionGlue.ensureBound(activity)
         val want = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO).filter {
             ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
-        }
+        } + bluetoothConnectIfNeeded(activity) + bluetoothScanIfNeeded(activity)
         if (want.isEmpty()) return
         ActivityCompat.requestPermissions(activity, want.toTypedArray(), REQ_CAMERA)
+    }
+
+    /**
+     * `BLUETOOTH_CONNECT` — the API 31+ runtime permission every Bluetooth read/write
+     * in `crates/amos-radio/src/android.rs` needs (`BluetoothAdapter#isEnabled` /
+     * `enable` / `disable`). Without it those JNI calls throw `SecurityException`, so
+     * the permission is part of "the radios can be read at all", not a nicety: the
+     * status bar's Bluetooth badge and the quick-settings tile both depend on it.
+     *
+     * Below API 31 the legacy `BLUETOOTH`/`BLUETOOTH_ADMIN` pair is install-time, so
+     * there is nothing to request (REQ-A185).
+     */
+    private fun bluetoothConnectIfNeeded(activity: Activity): List<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyList()
+        val perm = Manifest.permission.BLUETOOTH_CONNECT
+        return if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) {
+            emptyList()
+        } else {
+            listOf(perm)
+        }
+    }
+
+    /**
+     * `BLUETOOTH_SCAN` — the API 31+ runtime permission `BluetoothGlue.startDiscovery`
+     * needs (REQ-A200). Requested up front with the others so the Bluetooth page's
+     * "search" button is usable immediately; a denial is **not** fatal and is not
+     * hidden either: `startDiscovery` refuses, Rust turns that into a provider error,
+     * and the screen says the scan could not start instead of showing an empty list
+     * that would read as "nothing nearby".
+     *
+     * Below API 31 scanning is covered by the install-time BLUETOOTH/BLUETOOTH_ADMIN
+     * pair, so there is nothing to request.
+     */
+    private fun bluetoothScanIfNeeded(activity: Activity): List<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyList()
+        val perm = Manifest.permission.BLUETOOTH_SCAN
+        return if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) {
+            emptyList()
+        } else {
+            listOf(perm)
+        }
     }
 
     /** Request the media read permission(s) (per API level) if not granted. */

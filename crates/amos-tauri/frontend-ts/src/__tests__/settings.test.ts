@@ -52,26 +52,31 @@ describe("settings / NC helpers", () => {
     expect(dndActive({ dnd: true })).toBe(true);
   });
 
-  test("flipRadio toggles wifi/bt independently when airplane is off", () => {
+  test("flipRadio toggles wifi/bt/hotspot independently when airplane is off", () => {
     const s0 = {};
     const wifiOn = flipRadio(s0, "wifi");
     expect(wifiOn.wifi).toBe(true);
     expect(wifiOn.airplane).toBeUndefined();
     const btOn = flipRadio(s0, "bluetooth");
     expect(btOn.bluetooth).toBe(true);
+    // The AP (hotspot) is its own radio bit, toggled the same way.
+    expect(flipRadio(s0, "hotspot").hotspot).toBe(true);
+    expect(flipRadio({ hotspot: true }, "hotspot").hotspot).toBe(false);
     // toggling back off
     expect(flipRadio(wifiOn, "wifi").wifi).toBe(false);
   });
 
-  test("flipRadio airplane ON cascades wifi + bluetooth off", () => {
-    const before = { wifi: true, bluetooth: true };
+  test("flipRadio airplane ON cascades wifi + bluetooth + hotspot off", () => {
+    const before = { wifi: true, bluetooth: true, hotspot: true };
     const next = flipRadio(before, "airplane");
     expect(next.airplane).toBe(true);
     expect(next.wifi).toBe(false);
     expect(next.bluetooth).toBe(false);
+    expect(next.hotspot).toBe(false);
     // input untouched
     expect(before.wifi).toBe(true);
     expect(before.bluetooth).toBe(true);
+    expect(before.hotspot).toBe(true);
   });
 
   test("flipRadio airplane OFF only clears airplane (no auto re-enable)", () => {
@@ -80,10 +85,11 @@ describe("settings / NC helpers", () => {
     expect(next.wifi).toBeUndefined();
   });
 
-  test("flipRadio gates wifi/bt while airplane is on (no-op)", () => {
+  test("flipRadio gates wifi/bt/hotspot while airplane is on (no-op)", () => {
     const gated = { airplane: true, wifi: false };
     expect(flipRadio(gated, "wifi")).toBe(gated); // unchanged reference
     expect(flipRadio(gated, "bluetooth").bluetooth).toBeUndefined();
+    expect(flipRadio(gated, "hotspot").hotspot).toBeUndefined();
   });
 
   test("newestAddedNotif reports only newly-added ids, newest time wins", () => {

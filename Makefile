@@ -1,4 +1,4 @@
-.PHONY: all build test check lint cov smoke gated-check run-ai run-ui run-ui-dev run-ui-release run-backends health mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs
+.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs device-eval
 
 all: build
 
@@ -10,6 +10,27 @@ build:
 # crate's tests/ dir automatically (incl. crates/amos-tauri/tests/ai_daemon_e2e.rs).
 test:
 	cargo test --workspace
+	# Feature-gated seams whose tests the line above cannot even compile (REQ-A188).
+	# `cargo test --workspace` builds the *default* configuration, so a module behind
+	# `#[cfg(feature = "…")]` is absent — 12 unit tests lived in that blind spot and had
+	# never executed: 9 Android-seam ones (the glue bus's IMU/frame stores, the
+	# device-care reply parser, the media JNI payload caps — measured: 2 + 2 + 5) and 3
+	# NTP-resolver ones. Both steps are host-runnable and offline: no device, no JVM, no
+	# NDK, no native download. scripts/feature-test-scan.mjs (in `make lint`) fails if a
+	# feature-gated test module is not covered by a `cargo test` step here (or in
+	# gated-check for the `audit` features, whose pnet/libpcap is provisioned there).
+	cargo test -p amos-tauri -p amos-media --features amos-tauri/android,amos-media/android --lib
+	# amos-radio's Android-module **host** tests: the Bluetooth glue's JSON contract and
+	# the name/address policy live behind `#[cfg(feature = "android")]`, so the
+	# `--workspace` run above compiles neither (REQ-A200, same blind spot as REQ-A188).
+	cargo test -p amos-radio --features amos-radio/android --lib
+	cargo test -p amos-timesync --features amos-timesync/ntp --lib
+	# …and the tests that hide behind two more features no step used to enable (REQ-A191):
+	# the mail CLI's live SMTP/IMAP paths answer against a local loopback relay (offline),
+	# and the PTY terminal's round trip spawns a real shell (`portable-pty`). Both are
+	# compiled by `make lint`; this is where they *run*.
+	cargo test -p amos-mail-cli --features amos-mail-cli/live --lib
+	cargo test -p amos-tauri --features terminal-pty --lib
 	# TS System-UI: bun-iso-test.mjs runs pure files in one process and each DOM
 	# test file in its OWN process (happy-dom global windows are per-process).
 	cd crates/amos-tauri/frontend-ts && bun run test
@@ -68,6 +89,11 @@ gated-check:
 	cargo build -p amos-timesync-cli --features ntp
 	cargo build -p amos-supervisor --features timesync
 	cargo build -p amos-tauri --features sherpa-asr,piper-tts
+	# …and *run* the native-feature tests the line above only compiles (REQ-A192): the
+	# `sherpa-asr` / `piper-tts` fallback tests (`interpret.rs`, `tts.rs`) sat behind
+	# `#[cfg(feature = …)]` inside a non-gated module, so the REQ-A188 gate (feature-gated
+	# *modules*) could not see them and no step ever executed them.
+	cargo test -p amos-tauri --features sherpa-asr,piper-tts --lib
 	# QCOM/MTK accelerator seams (amos_ai::accelerator): `qnn`/`neuropilot` feature
 	# flags gate vendor-NPU claims — compile + unit-test both branches (no network).
 	cargo check -p amos-ai --features qnn,neuropilot
@@ -101,12 +127,45 @@ gated-check:
 	# `#[ignore]`-gated.
 	cargo clippy -p amos-appstore -p amos-appstore-cli --all-targets --features live -- -D warnings
 	cargo test -p amos-appstore -p amos-appstore-cli --features live
+	# The `audit` features have the same shape as `live` above (REQ-A188): only
+	# `--features audit` compiles `amos-telemetry-spy/src/capture.rs` and
+	# `amos-ai/src/telemetry_spy_capture.rs`, so their 6 tests would never run anywhere.
+	# They are pure env-plan/error-path logic (no raw-socket privilege needed), but the
+	# build pulls `pnet`, which needs libpcap headers — hence this job, not `make test`:
+	# the host path below installs `libpcap-dev`, and the pinned container image carries
+	# it too (rebuild/dispatch the image after a Dockerfile change, see
+	# .github/workflows/container-image.yml — an older pinned tag would fail here).
+	cargo test -p amos-telemetry-spy -p amos-ai \
+		--features amos-telemetry-spy/audit,amos-ai/telemetry-spy-audit --lib
+	# …and the crate's *example*, which no `--all-targets` run in this file compiles: cargo
+	# skips a target whose `required-features` are unmet, silently (REQ-A191 — this was the
+	# one such target with no step). `docs/telemetry-spy.md` documents running it.
+	cargo build -p amos-telemetry-spy --all-targets --features audit
+
+# Format the workspace (Rust): the writing counterpart of `make lint`'s
+# `cargo fmt --all --check`. `GETTING_STARTED.md` hands a newcomer `make fmt`; until
+# this rule existed the command died with `No rule to make target 'fmt'` — a first-run
+# instruction that could not run (caught now by scripts/make-target-doc-scan.mjs).
+fmt:
+	cargo fmt --all
 
 # Production gate: formatting + clippy must be clean; TS shells must typecheck and
 # no `src/lib` export may lose its production call site (dead-export regression).
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	# Feature surfaces that no other step compiles (REQ-A191). The line above builds the
+	# *default* features, and cargo **silently skips** a target whose `required-features`
+	# are unmet — so code behind a feature nobody enables is invisible to every gate in
+	# this list (the third form of the A187 blind spot). Measured: 7 of the workspace's 35
+	# non-default features were enabled by no step anywhere; the three steps below compile
+	# (-D warnings) and lint them. The tests hiding behind two of them
+	# (`amos-mail-cli/live`, `amos-tauri/terminal-pty`) run in `make test`, and the one
+	# feature-gated example (`amos-telemetry-spy`'s `live_spy`, needs pnet) is built in
+	# `gated-check`. scripts/feature-surface-scan.mjs fails if a feature loses its step.
+	cargo clippy -p amos-network-guard --all-targets --features nftables,vpn -- -D warnings
+	cargo clippy -p amos-mail-cli --all-targets --features amos-mail-cli/live -- -D warnings
+	cargo clippy -p amos-tauri --all-targets --features appstore-live,tcp,terminal-pty -- -D warnings
 	cd crates/amos-tauri/frontend-ts && bun run typecheck
 	# Lint-input integrity (see scripts/lint-inputs-scan.mjs): every file the steps
 	# below invoke (`node scripts/*.mjs` plus the allow-lists/baselines they read) must
@@ -115,6 +174,14 @@ lint:
 	# it guards the gates that follow. `--selftest` pins the parser/resolver first.
 	node scripts/lint-inputs-scan.mjs --selftest
 	node scripts/lint-inputs-scan.mjs
+	# The reverse direction (see scripts/unwired-script-scan.mjs): a script that ships but
+	# that the Makefile, the CI workflows and every reachable script never name is dead
+	# weight — and the *executable* layer is the one every gate above depends on. Wired by
+	# a Makefile target normally (`make dev` / `make supervise` / `make gui-smoke-check`
+	# exist because of this scan); an exception needs a reason in
+	# scripts/script-allowlist.json and is reported stale once it stops being unwired.
+	node scripts/unwired-script-scan.mjs --selftest
+	node scripts/unwired-script-scan.mjs
 	# Deliverable integrity (see scripts/untracked-source-scan.mjs): no untracked,
 	# non-ignored file may sit in the working tree, and no deletion may be left unstaged —
 	# the deliverable is the index, and this repository's recurring defect is exactly a
@@ -159,6 +226,22 @@ lint:
 	# its count, or a new file with a discard, fails.
 	node scripts/rust-discard-scan.mjs --selftest
 	node scripts/rust-discard-scan.mjs
+	# Feature-gated test modules (see scripts/feature-test-scan.mjs): a module behind
+	# `#[cfg(feature = "…")]` is not compiled by `cargo test --workspace`, so a test inside
+	# it is dead weight no gate reports — the same blind spot R187 found for clippy, one
+	# step further on (the featured pass *compiled* them, nothing *ran* them). The gate
+	# reads the `cargo test` steps the Makefile actually contains and fails on any
+	# feature-gated module with a runnable test that no step runs.
+	node scripts/feature-test-scan.mjs --selftest
+	node scripts/feature-test-scan.mjs
+	# Feature-gated *surfaces* no gate compiles (see scripts/feature-surface-scan.mjs): the
+	# clippy step above builds default features only, and cargo silently skips a target
+	# whose `required-features` are unmet — so code behind an un-enabled feature is
+	# invisible here (third form of the A187 blind spot). The gate reads the cargo
+	# invocations this Makefile/CI/scripts actually contain and fails on any feature or
+	# feature-gated target they never compile.
+	node scripts/feature-surface-scan.mjs --selftest
+	node scripts/feature-surface-scan.mjs
 	# Static "defined + tested but never wired" scan (see scripts/unwired-scan.mjs):
 	# fails when a src/lib module becomes unreachable from production, when a new
 	# value export appears with no production call site, or when a .svelte component
@@ -212,6 +295,34 @@ lint:
 	# missed the way five were before this scan existed. `--selftest` pins the parser.
 	node scripts/rust-panic-scan.mjs --selftest
 	node scripts/rust-panic-scan.mjs
+	# Platform-verdict integrity (see scripts/jni-boolean-scan.mjs): a JNI call whose
+	# signature returns `Z` is answering *did you accept this?* — discarding it makes a
+	# refusal indistinguishable from a switch, which is how the Airplane cascade
+	# half-applied with no rollback and nothing reported (the hotspot path already
+	# honoured its boolean; its two neighbours did not). `--selftest` pins the
+	# parser/classifier first — and it exists because the first version of the scan
+	# missed exactly the defect it was written for (a `;` inside a comment split the
+	# statement), caught by the negative control.
+	node scripts/jni-boolean-scan.mjs --selftest
+	node scripts/jni-boolean-scan.mjs
+	# Android permission integrity (see scripts/android-permission-scan.mjs): every
+	# platform API this tree calls through JNI/Kotlin is mapped to the permission it
+	# requires, and that permission must be **declared** in the tracked manifest
+	# fragment (and requested from Kotlin when it is a runtime permission). On a real
+	# device the missing Wi-Fi/Bluetooth declarations meant every radio read/write
+	# threw SecurityException while every gate stayed green — a compile has the SDK
+	# methods, the permission is an install/runtime fact (REQ-A185).
+	node scripts/android-permission-scan.mjs --selftest
+	node scripts/android-permission-scan.mjs
+	# JNI hygiene (see scripts/jni-exception-scan.mjs): every provider must attach
+	# through `amos_jni::attached` (a pooled thread can inherit a *pending* exception
+	# and the next JNI call then aborts the process under CheckJNI — device-proven,
+	# REQ-A185) and resolve glue classes through the app's loader
+	# (`amos_jni::resolve_class`) instead of the thread-dependent `find_class`.
+	# Sites that only hold a `JavaVM` carry a reason in scripts/jni-allowlist.json,
+	# and a stale entry fails the gate too. `--selftest` pins the classifier first.
+	node scripts/jni-exception-scan.mjs --selftest
+	node scripts/jni-exception-scan.mjs
 	# Registered Tauri command with no frontend consumer (see
 	# scripts/tauri-command-scan.mjs): the reverse of the unwired-scan — a command
 	# the host exposes but no screen asks for is a capability the UI cannot reach
@@ -252,6 +363,28 @@ lint:
 	# detection first (a comment or an `export` is not a read).
 	node scripts/env-doc-scan.mjs --selftest
 	node scripts/env-doc-scan.mjs
+	# Onboarding-doc integrity (see scripts/onboarding-doc-scan.mjs): the first-run docs
+	# (README/CONTRIBUTING/GETTING_STARTED) must not send a newcomer to a path or package
+	# that no longer exists — `crates/amos-tauri/frontend` (the removed React host; the
+	# live SPA is `frontend-ts`) and `libappindicator3-dev` (removed from Ubuntu 24.04).
+	# `docs-link-scan` only sees `[x](path)` links and `env-doc-scan` only env names, so
+	# neither caught a dead `cd` command inside a code fence.
+	node scripts/onboarding-doc-scan.mjs --selftest
+	node scripts/onboarding-doc-scan.mjs
+	# Documented-command integrity (see scripts/make-target-doc-scan.mjs): every
+	# `make <target>` the docs present as an instruction (inline code / a fenced
+	# line) must be a real Makefile target. `GETTING_STARTED.md` shipped `make fmt`
+	# with no such rule (`No rule to make target 'fmt'`); `docs-link-scan` sees
+	# links and `env-doc-scan` sees env names — neither reads a command.
+	node scripts/make-target-doc-scan.mjs --selftest
+	node scripts/make-target-doc-scan.mjs
+	# Makefile .PHONY hygiene (see scripts/phony-target-scan.mjs): an undeclared
+	# command target is *silently skippable* — a same-named file makes `make` report
+	# success without running it (the "gate that quietly does nothing" class), and a
+	# `.PHONY` name with no rule is a dead declaration. `e2e-local` / `sup-smoke` /
+	# `timesync-smoke` were undeclared.
+	node scripts/phony-target-scan.mjs --selftest
+	node scripts/phony-target-scan.mjs
 
 # Regenerate the gRPC API reference after touching proto/*.proto (then commit it):
 # `make api-docs`. The doc is generated, never hand-edited.
@@ -274,18 +407,33 @@ release-artifacts:
 run-ai:
 	cargo run -p amos-ai
 
+# Run the debug System UI directly. It loads the frontend from `devUrl` (:1420), so
+# without a dev server this is the blank-window case: `make run-ui-dev` starts both,
+# `make run-ui-release` embeds the assets instead.
 run-ui:
 	cargo run -p amos-tauri
 
 # Run the System UI from source against a local frontend dev server (fixes the
-# blank/white window that appears when the dev binary can't reach :5173).
+# blank/white window that appears when the dev binary can't reach devUrl, :1420).
 run-ui-dev:
 	bash scripts/run-gui-dev.sh
+
+# One-command desktop dev loop: the AI daemon (UDS) + the System UI, starting the
+# frontend dev server the debug binary loads from `devUrl` when it is not already up
+# (REQ-A189 — the script used to skip that, so it opened onto nothing served).
+dev:
+	bash scripts/dev.sh
 
 # Production boot: start backends (AI honors the persisted local/cloud choice)
 # + translate, wait until both UDS sockets are ready. Then: cargo run -p amos-tauri
 run-backends:
 	bash scripts/run-backends.sh
+
+# Run amos-ai + amos-translate under amos-supervisor (crash auto-restart, SIGUSR1
+# hot-restart, graceful stop) — the README quick-start path. `ARGS=--print-config`
+# prints the generated supervisor spec instead of running; `ARGS=--dry-run` validates.
+supervise:
+	scripts/supervise-backends.sh $(ARGS)
 
 # Build & launch the EMBEDDED (release) System UI. The debug binary loads
 # devUrl (localhost:1420) and can collide with another app; use this target.
@@ -295,6 +443,17 @@ run-ui-release:
 # RPC readiness probe: both daemons must answer get_status running=true.
 health:
 	bash scripts/health-backends.sh
+
+# GUI smoke for the 同传 app (needs a display): builds, starts the mock translate
+# daemon on a UDS, launches the System UI and prints the on-screen script. The headless
+# readiness probe (display check + build only) is `make gui-smoke-check` — the wrapper
+# scripts/gui-smoke-check.sh advertised a CI/headless use that had no caller until
+# REQ-A189 wired it here.
+gui-smoke:
+	bash scripts/gui-smoke.sh $(ARGS)
+
+gui-smoke-check:
+	bash scripts/gui-smoke-check.sh
 
 # Host-side "honesty" smoke: proves the AI daemon truthfully reports its real
 # engine + degraded state (engine/engine_model/degraded/asr) over get_status —
@@ -317,14 +476,37 @@ mobile-init:
 	@echo "  cargo tauri android build --debug && cargo tauri ios build --debug"
 
 # Best-effort prerequisite check for mobile builds (non-fatal if tools absent).
+#
+# The SDK/NDK probes accept **either** variable name, because that is what the rest of the
+# tree reads: `scripts/android-audio-check.sh` / `-ai-sherpa-check.sh` / `-glue-nv21-check.sh`
+# all take `ANDROID_NDK_HOME` or `ANDROID_SDK_ROOT/ndk/*`, and docs/mobile-targets.md says
+# "需要 ANDROID_HOME / ANDROID_SDK_ROOT". Probing only `ANDROID_HOME` printed
+# "[warn] ANDROID_HOME unset" on a machine where every android-* target passes (REQ-A193) —
+# a check that lies about a working toolchain. The NDK is reported because every android-*
+# target needs it and nothing else checks it.
 mobile-check:
 	@echo "--- Amos mobile toolchain check ---"
 	@(rustup target list --installed 2>/dev/null | grep -q aarch64-linux-android && echo "[ok] rust android target" || echo "[warn] android rust target not installed (see docs/mobile-targets.md)")
 	@(rustup target list --installed 2>/dev/null | grep -q aarch64-apple-ios && echo "[ok] rust ios target" || echo "[warn] ios rust target not installed (see docs/mobile-targets.md)")
 	@(command -v cargo-tauri >/dev/null 2>&1 && echo "[ok] tauri-cli" || echo "[warn] tauri-cli not installed (cargo install tauri-cli --version ^2 --locked)")
 	@(command -v java >/dev/null 2>&1 && echo "[ok] java" || echo "[warn] java not found (JDK 17+ needed for Android)")
-	@(test -n "$$ANDROID_HOME" && echo "[ok] ANDROID_HOME=$$ANDROID_HOME" || echo "[warn] ANDROID_HOME unset (Android SDK)")
+	@(sdk="$${ANDROID_HOME:-$${ANDROID_SDK_ROOT:-}}"; [ -n "$$sdk" ] && echo "[ok] Android SDK=$$sdk" || echo "[warn] neither ANDROID_HOME nor ANDROID_SDK_ROOT is set (Android SDK)")
+	@(ndk="$${ANDROID_NDK_HOME:-}"; if [ -z "$$ndk" ] && [ -n "$${ANDROID_SDK_ROOT:-}" ] && [ -d "$$ANDROID_SDK_ROOT/ndk" ]; then ndk="$$(ls -d "$$ANDROID_SDK_ROOT/ndk"/* 2>/dev/null | sort -V | tail -1)"; fi; [ -n "$$ndk" ] && echo "[ok] Android NDK=$${ndk##*/}" || echo "[warn] Android NDK not found (ANDROID_NDK_HOME, or ANDROID_SDK_ROOT/ndk/*)")
 	@(command -v xcodebuild >/dev/null 2>&1 && echo "[ok] xcodebuild (iOS)" || echo "[warn] xcodebuild not found (iOS)")
+
+# Everything this repository can verify **without a device**, in one command (REQ-A193).
+# CI runs the same work split across jobs (`lint`, `test`, `cov`, `smoke`, `sup-smoke`,
+# `gated-check`, the android checks); this is the sequential local equivalent, so "is this
+# checkout healthy?" is one command instead of a list someone has to remember. Measured
+# 2026-09-13: 18 targets, all EXIT=0 (see CHANGELOG). Device targets (`device-eval`,
+# `android-app`) and the generator (`api-docs`, which *writes* docs/api-grpc.md — lint runs
+# its read-only `--check`) are deliberately not here; neither is `ci-local`'s container
+# build (a multi-GB NDK image) — `make ci-local` covers the rest of that gate.
+verify: lint test check cov ci-local honesty-smoke hot-loop
+verify: smoke sup-smoke timesync-smoke e2e-local gated-check
+verify: android-glue-check android-audio-check android-ai-sherpa-check
+verify: pdf-android-check vector-db-check mobile-check
+	@echo "[verify] all offline verification targets passed"
 
 # Cross-compile + link gate for amos-audio's Android audio seams (AAudio/TinyALSA
 # FFI). Compiles every ABI and link-checks AAudio against the NDK's libaaudio.so
@@ -355,22 +537,28 @@ android-voice-bringup:
 android-rag-bringup:
 	bash scripts/android-rag-bringup.sh $(ARGS)
 
-# Build + install the System UI APK on a connected device, with the two steps
-# that are easy to forget made explicit and ordered:
+# Build + install the System UI APK on a connected device, with the steps that are
+# easy to forget made explicit and ordered:
+#   0. mirror the tracked Kotlin glue into `gen/` (git-ignored) — without it a NEWLY
+#      ADDED glue file, or an edit to one, is simply missing/stale in the APK
+#      (REQ-A175/A176: the alarm glue was absent from every mirror),
 #   1. rebuild the frontend `dist` (tauri.conf's beforeBuildCommand is EMPTY, so
 #      `cargo tauri android build` embeds whatever `dist/` already holds — a
 #      stale bundle silently ships an old UI),
 #   2. build the arm64 debug APK with the `android` feature,
 #   3. install it with runtime permissions granted (`-g`).
 # Override the package/devices as needed: `make android-app DEVICE=...`.
-android-app: 
+android-app:
+	scripts/android-glue-mirror.sh
 	cd crates/amos-tauri/frontend-ts && bun run build
 	cargo tauri android build --debug --features android --target aarch64
 	adb $(if $(DEVICE),-s $(DEVICE),) install -r -g crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 
-# Host-JVM gate for the Kotlin camera glue's pure NV21 packer (no device needed):
-# mirrors android-glue/ into the generated Android project and runs the packer's
-# JUnit tests + the Kotlin compile. Requires a JDK 17 (AGP/Kotlin reject newer).
+# Host-JVM gate for ALL the Android glue's Kotlin (no device needed): mirrors the
+# whole android-glue/ tree into the generated Android project (so the compiled set
+# == the tracked set, reproducibly), VERIFIES the two hand-merged gen/ artefacts
+# (manifest fragments + the generated Activity's glue wiring) and runs the Kotlin
+# compile + the camera packer's JUnit tests. Requires a JDK 17.
 android-glue-check:
 	bash scripts/android-glue-nv21-check.sh
 
@@ -412,3 +600,9 @@ doctor:
 
 clean:
 	cargo clean
+
+# Drive + inspect the running System UI on a connected device (debuggable build).
+# Not part of lint: it needs hardware. See docs/REAL_DEVICE_SYSTEM_UI_AUDIT.md §5.5.
+#   make device-eval JS='document.title'
+device-eval:
+	node scripts/device-ui-eval.mjs $(JS)

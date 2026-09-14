@@ -77,6 +77,9 @@ impl MailBridge {
             name: String::new(),
             email: ACCOUNT_EMAIL.into(),
         };
+        // The in-memory mock accepts every delivery, so a discarded error here can only ever
+        // shorten a *demo* inbox (never a user-visible failure) — kept as an explicit
+        // discard rather than an unexamined one.
         let _ = provider.deliver(
             Some(from_ada),
             vec![me.clone()],

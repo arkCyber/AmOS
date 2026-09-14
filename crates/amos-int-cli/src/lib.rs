@@ -139,6 +139,17 @@ fn drain(rx: &mut mpsc::Receiver<InterpretationOutput>, out: &mut Vec<String>) {
     }
 }
 
+/// Report a dot-command's failure. The REPL prints nothing when a command *works*
+/// (`.status` is the way to look), so silence means "done" — a command that could not
+/// run must therefore never be silent: `.start` on a busy session, `.restart` while
+/// active, `.lang` on a dead session all used to be discarded, which made a refused
+/// command indistinguishable from a successful one.
+fn report<T, E: std::fmt::Display>(out: &mut Vec<String>, cmd: &str, result: Result<T, E>) {
+    if let Err(e) = result {
+        out.push(format!("  [error] .{cmd}: {e}"));
+    }
+}
+
 /// Process one stdin line against the session. Pushes rendered outputs to `out`
 /// and returns `true` when the caller should exit.
 pub async fn exec_line(
@@ -159,28 +170,20 @@ pub async fn exec_line(
                 drain(rx, out);
                 return true;
             }
-            "start" => {
-                let _ = session.start();
-            }
-            "restart" => {
-                let _ = session.restart();
-            }
-            "stop" => {
-                let _ = session.stop();
-            }
-            "abort" => {
-                let _ = session.abort();
-            }
-            "pause" => {
-                let _ = session.pause();
-            }
-            "resume" => {
-                let _ = session.resume();
-            }
+            "start" => report(out, "start", session.start()),
+            "restart" => report(out, "restart", session.restart()),
+            "stop" => report(out, "stop", session.stop()),
+            "abort" => report(out, "abort", session.abort()),
+            "pause" => report(out, "pause", session.pause()),
+            "resume" => report(out, "resume", session.resume()),
             "status" => out.push(format!("  [status] {:?}", session.state())),
             "lang" => {
                 if let Some(l) = parts.next() {
-                    let _ = session.handle(SessionEvent::SetSourceLang(l.into())).await;
+                    report(
+                        out,
+                        "lang",
+                        session.handle(SessionEvent::SetSourceLang(l.into())).await,
+                    );
                 }
             }
             "help" => out.push(USAGE.trim_end().to_string()),
@@ -234,6 +237,8 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
             break;
         }
     }
+    // Best-effort: the process is exiting, so a teardown failure has nowhere left to be
+    // reported (and the session's own `Ended` state is what the operator saw).
     let _ = session.stop();
     drain(&mut rx, &mut out);
     for s in out.drain(..) {
@@ -292,6 +297,29 @@ mod tests {
         assert!(
             out.iter().any(|l| l.contains("[ja] こんにちは")),
             "lang hint should be applied: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_says_so_instead_of_printing_nothing() {
+        let (mut s, mut rx) = fresh();
+        s.start().unwrap();
+        let mut out = Vec::new();
+
+        // A command that works stays silent (that is what "no news" means here)…
+        exec_line(&mut s, &mut rx, ".pause", &mut out).await;
+        assert!(
+            !out.iter().any(|l| l.contains("[error]")),
+            "a command that worked must not report an error: {out:?}"
+        );
+
+        // …and one that cannot run must not look like it did.
+        out.clear();
+        exec_line(&mut s, &mut rx, ".restart", &mut out).await; // refused while active
+        assert!(
+            out.iter()
+                .any(|l| l.starts_with("  [error] .restart:") && l.contains("stop it")),
+            "a refused command must name itself and the reason: {out:?}"
         );
     }
 

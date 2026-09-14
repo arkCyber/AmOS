@@ -1,7 +1,7 @@
-export type QuickKey = "wifi" | "bluetooth" | "airplane" | "darkmode" | "dnd" | "location";
+export type QuickKey = "wifi" | "bluetooth" | "airplane" | "hotspot" | "darkmode" | "dnd" | "location";
 
-/** The radios that go through the real `radio_*` backend (wifi / bluetooth / airplane). */
-export type RadioKey = "wifi" | "bluetooth" | "airplane";
+/** The radios that go through the real `radio_*` backend (wifi / bluetooth / airplane / hotspot). */
+export type RadioKey = "wifi" | "bluetooth" | "airplane" | "hotspot";
 
 /** Persisted quick-settings shape (same keys as the legacy amos.settings). */
 export type QuickSettings = Partial<Record<QuickKey, boolean>>;
@@ -64,18 +64,19 @@ export function normalizeFlashlight(v: unknown): FlashlightStore {
 /**
  * Pure: flip one *radio* toggle, mirroring the Rust `RadioManager` policy used
  * when the Tauri backend is available (so an unbridged UI behaves identically):
- * - Turning Airplane mode ON cascades Wi-Fi + Bluetooth off.
- * - Wi-Fi / Bluetooth cannot be switched on while Airplane mode is active (the
- *   click is a no-op).
+ * - Turning Airplane mode ON cascades Wi-Fi + Bluetooth + the Wi-Fi AP (personal
+ *   hotspot) off.
+ * - Wi-Fi / Bluetooth / hotspot cannot be switched on while Airplane mode is active
+ *   (the click is a no-op).
  * Returns a new object; never mutates the input.
  */
 export function flipRadio(s: QuickSettings, key: RadioKey): QuickSettings {
   if (key === "airplane") {
     const on = !s.airplane;
     if (!on) return { ...s, airplane: false };
-    return { ...s, airplane: true, wifi: false, bluetooth: false };
+    return { ...s, airplane: true, wifi: false, bluetooth: false, hotspot: false };
   }
-  // wifi / bluetooth — gated by airplane mode.
+  // wifi / bluetooth / hotspot — gated by airplane mode.
   if (s.airplane) return s;
   return { ...s, [key]: !s[key] };
 }
@@ -122,6 +123,7 @@ const QUICK_KEYS: readonly QuickKey[] = [
   "wifi",
   "bluetooth",
   "airplane",
+  "hotspot",
   "darkmode",
   "dnd",
   "location",

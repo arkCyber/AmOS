@@ -292,7 +292,7 @@
 <div
   class="flex h-full flex-col px-4 pb-3"
   role="group"
-  aria-label="home screen"
+  aria-label={t("a11y.homeScreen")}
   style="touch-action: none"
   ontouchstart={onHomeTouchStart}
   ontouchend={onHomeTouchEnd}
@@ -307,7 +307,7 @@
   <div
     class="flex min-h-0 flex-1 flex-col overflow-hidden"
     role="group"
-    aria-label="home pages"
+    aria-label={t("a11y.homePages")}
     style="touch-action: pan-y"
     ontouchstart={onGridStart}
     ontouchmove={onGridMove}

@@ -14,6 +14,7 @@ import { tick } from "svelte";
 import StatusBar from "../src/svelte/StatusBar.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import { SETTINGS_KEY, FLASHLIGHT_KEY } from "../src/lib/settings";
+import { zh } from "../src/i18n/locales/zh";
 
 beforeEach(() => window.localStorage.clear());
 afterEach(() => {
@@ -45,7 +46,7 @@ describe("StatusBar.svelte", () => {
     await tick();
     await settle();
     expect(container.textContent ?? "").toMatch(/\d{1,2}:\d{2}/); // fmtClock
-    const batt = container.querySelector('[aria-label="battery level"]');
+    const batt = container.querySelector(`[aria-label="${zh["a11y.batteryLevel"]}"]`);
     expect(batt?.querySelector("svg")).toBeTruthy(); // vector battery outline
     expect(batt?.textContent ?? "").toContain("—"); // never a fabricated %
   });
@@ -61,7 +62,7 @@ describe("StatusBar.svelte", () => {
     const { container } = render(StatusBar);
     await tick();
     await settle();
-    const batt = byAria(container, "battery level");
+    const batt = byAria(container, zh["a11y.batteryLevel"]);
     expect(batt?.textContent ?? "").toContain("80%");
   });
 
@@ -76,21 +77,22 @@ describe("StatusBar.svelte", () => {
     const { container } = render(StatusBar);
     await tick();
     await settle();
-    const batt = byAria(container, "battery level");
+    const batt = byAria(container, zh["a11y.batteryLevel"]);
     expect(batt?.textContent ?? "").toContain("64%");
-    expect(batt?.getAttribute("title")).toContain("charging");
+    // The title is localised copy (it used to be a hard-coded English sentence).
+    expect(batt?.getAttribute("title")).toBe(zh["a11y.batteryCharging"].replace("{pct}", "64%"));
   });
 
   test("shows the flashlight glyph when the torch store is on", async () => {
     const { container } = render(StatusBar);
     await tick();
     await settle();
-    expect(byAria(container, "flashlight on")).toBeFalsy();
+    expect(byAria(container, zh["a11y.flashlightOn"])).toBeFalsy();
 
     writeStoreValue(FLASHLIGHT_KEY, { on: true, torch_present: true });
     await tick();
     await settle();
-    expect(byAria(container, "flashlight on")).toBeTruthy();
+    expect(byAria(container, zh["a11y.flashlightOn"])).toBeTruthy();
   });
 
   test("Do-Not-Disturb flips the alert glyph to 🌒", async () => {

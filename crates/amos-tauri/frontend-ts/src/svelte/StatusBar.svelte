@@ -33,6 +33,7 @@
   import { statusIcons } from "../lib/netStatus";
   import { systemHealth, hostBattery } from "../lib/system";
   import { bridged } from "../lib/backend";
+  import { t } from "./locale.svelte";
 
   const settingsStore = createStoreValue<unknown>(SETTINGS_KEY, {});
   const flashStore = createStoreValue<unknown>(FLASHLIGHT_KEY, {});
@@ -138,9 +139,7 @@
   const battTitle = $derived(
     batt.levelPct === null
       ? undefined
-      : batt.charging === true
-        ? `battery: charging ${battText}`
-        : `battery: ${battText}`,
+      : t(batt.charging === true ? "a11y.batteryCharging" : "a11y.battery", { pct: battText }),
   );
 </script>
 
@@ -151,7 +150,7 @@
     aria-hidden="true"
     class="pointer-events-none absolute left-1/2 top-[9px] h-[22px] w-[112px] -translate-x-1/2 rounded-full bg-black shadow-sm"
   ></span>
-  <span class="flex items-center gap-1 text-[11px] text-neutral-700/90 dark:text-neutral-200/90" aria-label="network status">
+  <span class="flex items-center gap-1 text-[11px] text-neutral-700/90 dark:text-neutral-200/90" aria-label={t("a11y.networkStatus")}>
     {#if alertIcon}
       <span
         data-icon={alertIcon}
@@ -160,18 +159,20 @@
       >{@html iconSvg(alertIcon)}</span>
     {/if}
     {#if flashOn}
-      <span data-icon="flashlight" aria-label="flashlight on" title="Flashlight">{@html iconSvg("flashlight")}</span>
+      <span data-icon="flashlight" aria-label={t("a11y.flashlightOn")} title={t("a11y.flashlight")}>{@html iconSvg("flashlight")}</span>
     {/if}
     {#each icons as ic (ic.kind)}
       <span
         data-icon={ic.kind}
         class={ic.on ? "" : "opacity-40"}
-        title={ic.title}
+        title={ic.titleKey
+          ? t(ic.titleKey, ic.titleSsid ? { ssid: ic.titleSsid } : undefined)
+          : undefined}
       >{@html iconSvg(radioIcon(ic.kind))}</span>
     {/each}
     <span
       class="flex items-center gap-1 tabular-nums"
-      aria-label="battery level"
+      aria-label={t("a11y.batteryLevel")}
       title={battTitle}
     >
       {@html batterySvg(batt.levelPct === null ? 0 : batt.levelPct, "h-3 w-3", battTone)}

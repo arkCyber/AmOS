@@ -7,8 +7,10 @@
 ## 前置
 
 ```bash
-# 1. 启动 AI 守护进程 + System UI(脚本会自动等待 socket 就绪)
-scripts/dev.sh
+# 1. 启动 AI 守护进程 + System UI(脚本会自动等待 socket 就绪;并启动 debug 构建
+#    所需的 Vite dev server,见 tauri.conf.json 的 `build.devUrl`)
+make dev          # 等价于 scripts/dev.sh
+# scripts/dev.sh
 ```
 
 > 启动器窗口(label `main`)出现,状态栏显示当前时间;通知中心铃铛默认有 3 条种子通知。

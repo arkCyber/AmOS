@@ -15,6 +15,7 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import CameraApp from "../src/svelte/CameraApp.svelte";
 import { PHOTOS_KEY } from "../src/lib/photos";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(() => {
   cleanup();
@@ -102,7 +103,7 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     await settle();
     expect(txt(host)).toContain("当前环境无摄像头"); // camera.noCamera
     expect(txt(host)).toContain("🏔️"); // demo viewfinder
-    expect(btnAria(host, "shutter")?.disabled).toBe(true);
+    expect(btnAria(host, zh["a11y.shutter"])?.disabled).toBe(true);
     expect(btnAria(host, "翻转摄像头")?.disabled).toBe(true);
     // mode tabs still render
     expect(btnAria(host, "拍照")).toBeTruthy();
@@ -111,7 +112,7 @@ describe("CameraApp.svelte (offline / control surface)", () => {
 
   test("live feed enables the shutter; a tap saves a photo into Photos", async () => {
     const host = await renderLive();
-    const shot = btnAria(host, "shutter");
+    const shot = btnAria(host, zh["a11y.shutter"]);
     expect(shot?.disabled).toBe(false);
     expect(JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]").length).toBe(0);
     await fireEvent.click(shot as HTMLButtonElement);
@@ -125,7 +126,7 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     const restore = failWritesFor(PHOTOS_KEY);
     try {
       const host = await renderLive();
-      await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+      await fireEvent.click(btnAria(host, zh["a11y.shutter"]) as HTMLButtonElement);
       await settle();
       // The photo is not in the album, so the UI must not say it is.
       expect(txt(host)).toContain("写入失败"); // camera.saveFailed
@@ -272,11 +273,11 @@ describe("CameraApp.svelte (video library)", () => {
     await settle();
     expect(btnAria(host, "视频")?.getAttribute("aria-selected")).toBe("true");
     // Start recording (shutter toggles record in video mode).
-    await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+    await fireEvent.click(btnAria(host, zh["a11y.shutter"]) as HTMLButtonElement);
     await settle();
     expect(txt(host)).toContain("录制中…");
     // Stop → persists and the library filmstrip appears.
-    await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+    await fireEvent.click(btnAria(host, zh["a11y.shutter"]) as HTMLButtonElement);
     await settle();
     const stored = JSON.parse(window.localStorage.getItem("amos.captures") ?? "[]") as unknown[];
     expect(stored.length).toBe(1);
@@ -289,7 +290,7 @@ describe("CameraApp.svelte (video library)", () => {
     await fireEvent.click(btnAria(host, "视频") as HTMLButtonElement);
     await settle();
     // start recording
-    await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+    await fireEvent.click(btnAria(host, zh["a11y.shutter"]) as HTMLButtonElement);
     await settle();
     expect(txt(host)).toContain("录制中…");
     // grab a photo mid-recording → it lands in Photos
@@ -301,7 +302,7 @@ describe("CameraApp.svelte (video library)", () => {
     expect(photos.length).toBe(photosBefore + 1);
     // the recording is NOT interrupted by the grab
     expect(txt(host)).toContain("录制中…");
-    await fireEvent.click(btnAria(host, "shutter") as HTMLButtonElement);
+    await fireEvent.click(btnAria(host, zh["a11y.shutter"]) as HTMLButtonElement);
     await settle();
     expect(txt(host)).not.toContain("录制中…");
   });

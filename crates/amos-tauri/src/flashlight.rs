@@ -20,7 +20,7 @@ use amos_flashlight::{
     FlashlightManager, FlashlightProvider, FlashlightState, MockFlashlightProvider,
 };
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tauri::{AppHandle, State};
 
 /// Durable store key that persists the torch state for restart + cross-window
@@ -339,14 +339,16 @@ pub fn seed_from_settings(settings_json: Option<&str>) -> FlashlightState {
 /// Uses `SharedStore::set` so the `store-updated` broadcast keeps every window
 /// in sync (matching how the frontend's plain quick-toggles already write).
 fn persist_flashlight(app: &AppHandle, store: &SharedStore, snap: FlashlightState) {
-    let mut map: Map<String, Value> = match store
-        .get(FLASHLIGHT_KEY)
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_object().cloned())
-    {
-        Some(m) => m,
-        None => Map::new(),
-    };
+    let (mut map, unusable) = crate::store::object_for_merge(store, FLASHLIGHT_KEY);
+    if unusable {
+        // The stored value is not a JSON object, so nothing in it can be preserved: the write
+        // below replaces it. Saying so is the difference between "rewritten" and "lost".
+        tracing::warn!(
+            target: "amos::flashlight",
+            key = FLASHLIGHT_KEY,
+            "stored flashlight state is not a JSON object — rewriting it from scratch"
+        );
+    }
     map.insert("on".to_string(), Value::Bool(snap.on));
     map.insert("torch_present".to_string(), Value::Bool(snap.torch_present));
     if let Ok(text) = serde_json::to_string(&Value::Object(map)) {

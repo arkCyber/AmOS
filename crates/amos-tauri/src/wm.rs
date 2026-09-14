@@ -869,8 +869,14 @@ impl SystemContext {
     }
 
     /// Peek (without consuming) the context for `target_window`.
+    ///
+    /// Poison-tolerant: a panic in another thread is not "this window has no context".
     pub fn peek(&self, target_window: &str) -> Option<SystemContextEntry> {
-        self.inner.lock().ok()?.get(target_window).cloned()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(target_window)
+            .cloned()
     }
 
     /// Take (and consume) the context for `target_window`, if any.

@@ -10,6 +10,7 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import MapsApp from "../src/svelte/MapsApp.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import { SETTINGS_KEY } from "../src/lib/settings";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(() => {
   cleanup();
@@ -62,7 +63,7 @@ describe("MapsApp.svelte (offline path)", () => {
     const host = render(MapsApp);
     const before = [...host.container.querySelectorAll("img")].map((i) => i.getAttribute("src") ?? "");
     expect(before[0]).toContain("/12/");
-    const zoomIn = host.container.querySelector('button[aria-label="zoom in"]') as HTMLButtonElement;
+    const zoomIn = host.container.querySelector(`button[aria-label="${zh["a11y.zoomIn"]}"]`) as HTMLButtonElement;
     await fireEvent.click(zoomIn);
     const after = [...host.container.querySelectorAll("img")].map((i) => i.getAttribute("src") ?? "");
     expect(after[0]).toContain("/13/");

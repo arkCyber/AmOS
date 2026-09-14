@@ -2,5 +2,29 @@
   {
     "literal": "中文",
     "reason": "The language picker lists every language by its **own** name (中文, English, 日本語 …), which is the correct localisation behaviour — translating a language's self-name would make the list unreadable to a speaker who cannot read the current UI locale. See `settings/LanguagePage.svelte`."
+  },
+  {
+    "literal": "HDR",
+    "reason": "A camera mode chip: `HDR` is the mode's technical name shown on the control itself (universally untranslated on real camera apps), not copy — see `CameraApp.svelte`."
+  },
+  {
+    "literal": "A",
+    "reason": "The account avatar's initial letter (a data glyph derived from the user name), not copy — see `SettingsApp.svelte`."
+  },
+  {
+    "literal": "debug",
+    "reason": "A log level rendered as diagnostic data in the AI diagnostics ledger (the level names are part of the log format, also emitted by the daemon), not UI copy — see `settings/AiPage.svelte`."
+  },
+  {
+    "literal": "info",
+    "reason": "A log level rendered as diagnostic data in the AI diagnostics ledger, not UI copy — see `settings/AiPage.svelte`."
+  },
+  {
+    "literal": "warn",
+    "reason": "A log level rendered as diagnostic data in the AI diagnostics ledger, not UI copy — see `settings/AiPage.svelte`."
+  },
+  {
+    "literal": "error",
+    "reason": "A log level rendered as diagnostic data in the AI diagnostics ledger, not UI copy — see `settings/AiPage.svelte`."
   }
 ]

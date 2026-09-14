@@ -1,0 +1,7 @@
+{
+  "policy": "Scripts (`scripts/*.{sh,mjs,js,cjs}` and the repository-root `*.sh`) that nothing runs: the Makefile, anything under `.github/`, and every reachable script never name them (see scripts/unwired-script-scan.mjs). The normal fix is a Makefile target — `make dev`, `make supervise`, `make gui-smoke-check` exist for exactly this reason — so an entry here means the script is deliberately *not* part of the command surface, and the reason must say why it still ships (and who runs it, if anyone). A stale entry (the script became reachable, or no longer exists) FAILS the gate, so the list cannot rot into a list of lies.",
+  "entries": {
+    "crates/amos-tauri/frontend-ts/scripts/gen-ringtones.mjs": "One-shot deterministic asset generator: it rewrites the four committed WAV ringtone sources under public/sounds/ringtones/. It is documented as a manual step (`node scripts/gen-ringtones.mjs` in public/sounds/ringtones/README.md) and is deliberately off the automated surface — it only needs to run when a tone motif changes, and running it in a gate would rewrite tracked assets.",
+    "crates/amos-tauri/frontend-ts/scripts/gen-ringtones-mp3.mjs": "The second half of that same manual pair (WAV → MP3), documented in the same public/sounds/ringtones/README.md. Kept off the automated surface on purpose: it shells out to ffmpeg, which no gate image provisions, and its output is a committed asset."
+  }
+}

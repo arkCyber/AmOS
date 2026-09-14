@@ -125,9 +125,19 @@ scripts/run-backends.sh
 scripts/run-backends.sh --health
 
 # Run amos-ai + amos-translate under amos-supervisor (crash auto-restart,
-# SIGUSR1 hot-restart, graceful stop). Dry-run print the generated spec first.
+# SIGUSR1 hot-restart, graceful stop) — also `make supervise`. `ARGS=--print-config`
+# prints the generated supervisor spec first (nothing is started).
 scripts/supervise-backends.sh --print-config
 scripts/supervise-backends.sh
+make supervise ARGS=--print-config
+
+# One-command desktop dev loop (daemon + System UI; starts the frontend dev server
+# the debug binary loads from `devUrl` if it is not already up).
+make dev
+
+# GUI smoke for the 同传 app (needs a display): `make gui-smoke` runs it, and
+# `make gui-smoke-check` is the headless readiness probe (display check + build).
+make gui-smoke-check
 
 # RPC readiness probe: both daemons must answer get_status running=true.
 make health
@@ -323,7 +333,15 @@ Run the full suite (Rust unit + end-to-end UDS RPC + TS System-UI) from the repo
 ```bash
 make test          # = cargo test --workspace && bun run test (frontend-ts)
 make check         # fast React/TS check (bun test + typecheck)
+make verify        # everything that needs no device: lint + test + cov + ci-local +
+                   # smoke/sup-smoke/timesync-smoke/honesty-smoke + e2e-local +
+                   # gated-check + the android/glue/audio/pdf/vector-db checks
 ```
+
+`make verify` is the sequential local equivalent of the CI jobs (REQ-A193: 18 device-free
+targets, all EXIT=0 on 2026-09-13). Targets that need a phone (`make android-app`, `make device-eval`),
+and the generator `make api-docs` (which writes `docs/api-grpc.md`; `make lint` runs its
+read-only `--check`), are deliberately excluded.
 
 - **Rust** (`cargo test --workspace`): daemon unit tests (mock inference,
   session counter, status), socket-path test, and an **end-to-end RPC test**
@@ -445,6 +463,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/DELIVERY_NOTES_2026-09-05-display-protection.md](./docs/DELIVERY_NOTES_2026-09-05-display-protection.md) — Commit message + changeset + known limits for the display-protection / auto screen-off work (2026-09-05)
 - [docs/identity-web3.md](./docs/identity-web3.md) — Digital identity & Web3 signing domain core: `amos-identity` (`did:key`, key/keystore) + `amos-web3` (secp256k1, EVM address, EIP-191/EIP-712) — deterministic, no PRNG in the core, honest entropy/at-rest seams
 - [docs/DELIVERY_NOTES_2026-09-05-did-web3.md](./docs/DELIVERY_NOTES_2026-09-05-did-web3.md) — Commit message + changeset + known limits for the DID/Web3 signing domain-core work (2026-09-05)
+- [docs/DELIVERY_REPORT.md](./docs/DELIVERY_REPORT.md) — Delivery & verification report for one arc: root-cause fixes, feature completion, test infrastructure and the voice loop, with the reproducible commands (2026-09)
 - [docs/hardware-buttons.md](./docs/hardware-buttons.md) — Hardware buttons (Home/Voice/AI): `buttons.rs` abstraction + `hardware-button` event + on-device wiring and the S5 FreemeOS camera-key/WebView findings
 - [docs/camera-key-system-remap.md](./docs/camera-key-system-remap.md) — Rooted system-layer steps to remap the camera key away from the OS camera on FreemeOS/MediaTek S5
 - [docs/os-shell-bridge-checklist.md](./docs/os-shell-bridge-checklist.md) — Real-device acceptance for the pure-Svelte OS-shell bridges (auto screen-off, incoming call, hardware Home, OS alarms)

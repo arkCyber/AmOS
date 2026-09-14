@@ -109,8 +109,8 @@
 | Provider seam + Mock 惯例 | `crates/amos-sensor/src/provider.rs`、`radio`、`power`、`audio` | trait（哑读）+ 确定性 Mock，策略放 Manager |
 | `android`-gated 真后端 | `crates/amos-sensor/src/android.rs`（`AndroidSensorProvider`）| `cargo check -p amos-sensor --features android` 可编译 |
 | Rust↔Kotlin glue upcall | `amos-tauri/src/android_glue.rs`（`Java_..._SensorGlue_*`）、`clipboard_glue.rs` | 收/发 JNI，`#[no_mangle]` 符号与 `.kt` 对齐 |
-| Kotlin glue 模板 | `crates/amos-tauri/android-glue/`（SensorGlue.kt / CameraGlue.kt / AmosGlue.kt 等）| 复写进 `gen/android`，包 `com.amos.ai.glue` |
-| 运行时权限模板 | `gen/android/app/src/main/java/com/amos/ai/glue/MainActivity.Wiring.kt` | `requestNeeded`/`onResult`，现只做 CAMERA，可加媒体 |
+| Kotlin glue 模板 | `crates/amos-tauri/android-glue/`（SensorGlue.kt / CameraGlue.kt / AmosGlue.kt 等）| 由 `scripts/android-glue-mirror.sh` 镜像进 `gen/android`（勿手工 `cp`），包 `com.amos.ai.glue` |
+| 运行时权限模板 | `crates/amos-tauri/android-glue/com/amos/ai/glue/MainActivity.Wiring.kt`（`gen/` 里的是它的**镜像**，不是真源） | `PermissionWire.requestNeeded`/`requestMedia`/`onResult`；生成 Activity 的调用由 `scripts/android-activity-wiring-check.sh` 校验 |
 | WebView 已用 MediaStore 的钩子 | `gen/android/.../generated/RustWebChromeClient.kt`（`MediaStore.ACTION_IMAGE_CAPTURE`）| 佐证 MediaStore 通路可用 |
 | Tauri 命令注册点 | `crates/amos-tauri/src/lib.rs` `invoke_handler`（~line 100–235）| 新 `media_*` 命令在此追加，`android` feature 门控 |
 

@@ -74,9 +74,7 @@ impl AndroidBatteryTelemetry {
     }
 
     fn attach(&self) -> Result<JNIEnv<'_>, String> {
-        self.vm
-            .attach_current_thread_permanently()
-            .map_err(|e| e.to_string())
+        amos_jni::attached(&self.vm).map_err(|e| e.to_string())
     }
 
     /// One telemetry snapshot from the real battery state. A failure reading the

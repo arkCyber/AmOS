@@ -51,7 +51,7 @@ impl ClipboardProvider for AndroidClipboardProvider {
     }
 
     fn primary_text(&self) -> Option<String> {
-        let mut env = self.vm.attach_current_thread().ok()?;
+        let mut env = amos_jni::attached(&self.vm).ok()?;
         let obj = self.bridge.as_obj();
         // Kotlin bridge: `fun primaryText(): String?`.
         let result = env
@@ -67,7 +67,7 @@ impl ClipboardProvider for AndroidClipboardProvider {
     }
 
     fn set_primary_text(&self, text: &str) -> Result<(), String> {
-        let mut env = self.vm.attach_current_thread().map_err(|e| e.to_string())?;
+        let mut env = amos_jni::attached(&self.vm).map_err(|e| e.to_string())?;
         let obj = self.bridge.as_obj();
         let jtext = env.new_string(text).map_err(|e| e.to_string())?;
         let jobj: JObject = jtext.into();

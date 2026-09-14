@@ -78,6 +78,22 @@ echo "$OUT"
 echo "$OUT" | grep -q "corrected now" || die "cli status did not report corrected time"
 echo "$OUT" | grep -q "last synced" || die "cli status did not report a synced clock"
 
+# Capture the supervised child's own PID while it is still a direct child of the
+# supervisor, so the orphan guard below can target *that* process. A machine-wide
+# `pgrep -f "sleep 30"` is not isolated: `-f` matches the whole command line as a
+# substring, so an unrelated `sleep 300` (another smoke, a busy host, a stray
+# `sleep`) tripped a **false** "orphaned child" and reddened the whole
+# `make verify` sweep (REQ-A193, 2026-09-13). This mirrors supervisor-smoke.sh's
+# PID-scoped `child_pids` check.
+CHILD=""
+for _ in $(seq 1 100); do
+  CHILD="$(pgrep -P "$SUP" 2>/dev/null | head -1 || true)"
+  [ -n "$CHILD" ] && break
+  sleep 0.05
+done
+[ -n "$CHILD" ] || die "could not find the supervised child of pid $SUP"
+echo "supervised child pid $CHILD"
+
 echo "== SIGINT: graceful stop =="
 kill -INT "$SUP"
 for _ in $(seq 1 60); do
@@ -86,9 +102,14 @@ for _ in $(seq 1 60); do
 done
 kill -0 "$SUP" 2>/dev/null && die "supervisor did not exit after SIGINT"
 
-# No orphaned children.
-if pgrep -f "sleep 30" >/dev/null 2>&1; then
-  die "graceful stop orphaned a supervised child"
+# The captured child must be gone too. Wait briefly for the OS to reap it, then a
+# surviving pid means the graceful stop orphaned it.
+for _ in $(seq 1 40); do
+  kill -0 "$CHILD" 2>/dev/null || break
+  sleep 0.05
+done
+if kill -0 "$CHILD" 2>/dev/null; then
+  die "graceful stop orphaned a supervised child (pid $CHILD)"
 fi
 
 echo "== smoke OK: calibrated, propagated to child, readable via CLI, no orphans =="

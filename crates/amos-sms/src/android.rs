@@ -55,7 +55,7 @@ impl AndroidSmsProvider {
     }
 
     fn attach(&self) -> Result<JNIEnv<'_>, SmsError> {
-        self.vm.attach_current_thread_permanently().map_err(jerr)
+        amos_jni::attached(&self.vm).map_err(jerr)
     }
 
     /// Call a `()Ljava/lang/String;` glue method and read the returned string.

@@ -110,14 +110,28 @@ describe("HomeDock.svelte — actions back to the shell (UP direction)", () => {
     await tick();
   });
 
-  test("home shows no floating search pill (search = downward swipe)", async () => {
+  test("home's Spotlight entry is the standalone pill (no dock-parallel one), and it opens search", async () => {
     channel().set({ layout: layout([], ["phone"]), ext: [], pulseId: null });
     const { container } = render(HomeDock);
     await tick();
-    // The P2 change removed the dock-parallel pill; Spotlight is instead opened
-    // by a downward swipe on the home body (pure decision in lib/edgeSwipe.ts,
-    // covered by that module's unit tests — happy-dom cannot synthesize touches).
-    expect(container.querySelector('button[aria-label="search"]')).toBeNull();
+    // The P2 change removed the *dock-parallel* pill; Spotlight is opened by the
+    // standalone pill below the pager (or by a downward swipe — the pure decision in
+    // lib/edgeSwipe.ts, covered by that module's unit tests, since happy-dom cannot
+    // synthesize touches). Assert by the language-independent hook the component
+    // publishes: the old assertion selected `aria-label="search"`, which matched
+    // nothing while `shell.search` renders 搜索 — a green assertion that proved
+    // nothing, and one that also contradicted the shipped pill (the same defect
+    // `scripts/smoke-ui.mjs` was fixed for).
+    const entries = container.querySelectorAll('[data-testid="home-search-entry"]');
+    expect(entries.length).toBe(1);
+
+    const opened: unknown[] = [];
+    const off = channel().on((event, detail) => {
+      if (event === "search") opened.push(detail);
+    });
+    await fireEvent.click(entries[0] as HTMLButtonElement);
+    expect(opened.length).toBe(1);
+    off();
   });
 });
 

@@ -105,7 +105,8 @@ mod jni {
         bridge: &MicBridge,
         f: impl FnOnce(&mut jni::JNIEnv<'_>) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut e = bridge.vm.attach_current_thread().map_err(jerr)?;
+        // Shared helper: attach with a clean exception state (REQ-A186).
+        let mut e = amos_jni::attached(&bridge.vm).map_err(jerr)?;
         f(&mut e)
     }
 
@@ -150,7 +151,15 @@ mod jni {
             return;
         };
         if let Some(tx) = pending.take() {
-            let _ = tx.send(granted);
+            // The requester may have gone (its command timed out) — then the answer has
+            // no receiver and *that* is the visible fact (REQ-A187).
+            if tx.send(granted).is_err() {
+                tracing::debug!(
+                    target: "amos::mic",
+                    granted,
+                    "mic permission reply dropped — the requester is gone"
+                );
+            }
         }
     }
 

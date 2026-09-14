@@ -7,6 +7,7 @@
   //   index — search field + account card + grouped rows (switch / chevron rows)
   //   account — iCloud / account (real sync)        wifi, bluetooth — radio pages
   //   display / wallpaper / language / lock / ai — real feature pages
+  //   ime — the on-screen input method (pinyin keyboard switch + fuzzy prefs)
   //   notifications / sound / privacy / about — real pages (dnd, sound prefs,
   //       permission revoke, device/about telemetry)
   //   diagnostics — sensor/system/task/lmk live panels
@@ -30,7 +31,9 @@
   import { FOCUS_KEY, FOCUS_SCENARIOS, normalizeFocus, type FocusPrefs } from "../lib/focusPrefs";
   import { readCloud } from "../lib/cloud";
   import { AMOS_UI_VERSION } from "../lib/version";
+  import { readImeEnabled } from "../lib/ime";
   import { bridged, radioSet, radioStatus } from "../lib/backend";
+  import { radioRefusalView, type RadioRefusalView } from "../lib/radioControl";
   import { t, locale } from "./locale.svelte";
   import { GROUP, ROW, LABEL, VALUE, SUB, CHEVRON, H1, ROW_ACTIVE } from "./settings/kit";
   import { settingsChannel } from "./appLinks";
@@ -38,6 +41,7 @@
   import DisplayPage from "./settings/DisplayPage.svelte";
   import WallpaperPage from "./settings/WallpaperPage.svelte";
   import LanguagePage from "./settings/LanguagePage.svelte";
+  import ImePage from "./settings/ImePage.svelte";
   import LockPage from "./settings/LockPage.svelte";
   import AiPage from "./settings/AiPage.svelte";
   import AccountPage from "./settings/AccountPage.svelte";
@@ -50,6 +54,7 @@
   import SoundPage from "./settings/SoundPage.svelte";
   import AboutPage from "./settings/AboutPage.svelte";
   import CellularPage from "./settings/CellularPage.svelte";
+  import HotspotPage from "./settings/HotspotPage.svelte";
   import FocusPage from "./settings/FocusPage.svelte";
 
   type Sub =
@@ -57,12 +62,14 @@
     | "wifi"
     | "bluetooth"
     | "cellular"
+    | "hotspot"
     | "notifications"
     | "sound"
     | "focus"
     | "display"
     | "wallpaper"
     | "language"
+    | "ime"
     | "lock"
     | "ai"
     | "privacy"
@@ -77,12 +84,14 @@
     wifi: "settings.wifi",
     bluetooth: "settings.bluetooth",
     cellular: "settings.cellular",
+    hotspot: "settings.hotspot",
     notifications: "settings.notifications",
     sound: "settings.soundHaptics",
     focus: "settings.focus",
     display: "settings.displayBrightness",
     wallpaper: "settings.wallpaper",
     language: "settings.language",
+    ime: "settings.ime",
     lock: "settings.passcode",
     ai: "settings.ai",
     privacy: "settings.privacy",
@@ -102,12 +111,14 @@
     wifi: ["Wi-Fi", "WiFi", "wireless", "无线", "网络"],
     bluetooth: ["BLE", "wireless", "无线", "连接"],
     cellular: ["mobile data", "data", "sim", "网络", "流量", "数据"],
+    hotspot: ["hotspot", "tether", "tethering", "share", "ap", "个人热点", "热点", "网络共享", "共享"],
     notifications: ["alert", "badge", "提醒", "角标", "横幅", "勿扰", "banner"],
     sound: ["ringtone", "volume", "铃声", "音量", "静音", "mute"],
     focus: ["勿扰", "dnd", "sleep", "driving", "睡眠", "驾驶", "专注"],
     display: ["brightness", "dark", "亮度", "深色", "浅色"],
     wallpaper: ["background", "背景", "图片"],
     language: ["简体", "中文", "english", "语言"],
+    ime: ["pinyin", "keyboard", "input method", "输入法", "拼音", "键盘", "模糊音"],
     lock: ["password", "passcode", "pin", "密码", "面容"],
     ai: ["model", "deepseek", "推理", "inference", "模型"],
     account: ["sync", "backup", "同步", "备份", "iCloud"],
@@ -138,6 +149,7 @@
   };
   const nav = (p: Page) => {
     q = ""; // leaving the index clears the search
+    radioRefusal = null; // a stale refusal must not haunt a page it is not about
     page = p;
     resetTop();
   };
@@ -164,27 +176,60 @@
     });
   });
 
-  /* ---- Shared quick-settings radio state (flight-mode / wifi / bluetooth) ---- */
+  /* ---- Shared quick-settings radio state (flight-mode / wifi / bluetooth / hotspot) ---- */
   const readQuick = (): QuickSettings => normalizeQuick(readStoreValue<unknown>(SETTINGS_KEY, {}));
   let qs = $state<QuickSettings>(readQuick());
   const airplaneOn = $derived(qs.airplane === true);
-  const mergeRadio = (s: QuickSettings, r: { wifi: boolean; bluetooth: boolean; airplane: boolean }) => ({
+  const mergeRadio = (
+    s: QuickSettings,
+    r: { wifi: boolean; bluetooth: boolean; airplane: boolean; hotspot: boolean },
+  ) => ({
     ...s,
     wifi: r.wifi,
     bluetooth: r.bluetooth,
     airplane: r.airplane,
+    hotspot: r.hotspot,
   });
   const persistQuick = (next: QuickSettings) => {
     qs = next;
     writeStoreValue(SETTINGS_KEY, next);
   };
+  /**
+   * The last **refused write** (REQ-A203): `radio_set` answers `applied: false` plus
+   * machine tokens instead of failing into `null`, so the sub pages can say "the
+   * device did not accept this" instead of a toggle that silently does nothing.
+   */
+  let radioRefusal = $state<RadioRefusalView | null>(null);
+  // Mount-time **device truth** (REQ-A185): the tiles show the persisted quick
+  // settings, which is the user's *intent* — until this existed, nothing ever asked
+  // the device, so with the Mock in place (and no Android provider installed) "Wi-Fi
+  // off" could sit on screen while the phone's Wi-Fi was on. One read per mount; a
+  // failure keeps the stored values (honest offline behaviour).
+  let radioRead = false;
+  $effect(() => {
+    if (radioRead || !bridged()) return;
+    radioRead = true;
+    void (async () => {
+      const live = await radioStatus();
+      if (live) persistQuick(mergeRadio(readQuick(), live));
+    })();
+  });
   const toggleRadio = async (key: RadioKey) => {
     if (key !== "airplane" && qs.airplane) return; // gated no-op under airplane mode
     const on = !!qs[key];
     if (bridged()) {
-      const snap = await radioSet(key, !on);
-      if (snap) {
-        persistQuick(mergeRadio(qs, snap));
+      const res = await radioSet(key, !on);
+      if (res) {
+        if (res.applied) {
+          // The write landed: mirror the authoritative snapshot into the store.
+          radioRefusal = null;
+          if (res.state) persistQuick(mergeRadio(qs, res.state));
+          return;
+        }
+        // Refused (REQ-A203): show the **read** state (no bit may lie), keep the
+        // user's persisted intent, and let the sub page say why + offer the way out.
+        if (res.state) qs = mergeRadio(qs, res.state);
+        radioRefusal = radioRefusalView(res.refusal, key);
         return;
       }
       const live = await radioStatus();
@@ -207,6 +252,10 @@
   // when returning from the 蜂窝网络 page (same pattern as the lock-row subtitle).
   let cellularData = $state<boolean>(normalizeCellular(readStoreValue<unknown>(CELLULAR_KEY, {})).data);
   const cellularSub = $derived(cellularData ? t("settings.on") : t("settings.off"));
+  // Hotspot row: a radio bit (off by default), gated off while airplane mode is on.
+  const hotspotSub = $derived(
+    qs.airplane ? t("settings.off") : qs.hotspot ? t("settings.on") : t("settings.off"),
+  );
   const syncCell = () => {
     cellularData = normalizeCellular(readStoreValue<unknown>(CELLULAR_KEY, {})).data;
   };
@@ -221,6 +270,9 @@
   };
   const icloudSub = $derived(cloudOn ? t("settings.on") : t("settings.off"));
   const aboutSub = $derived(`v${AMOS_UI_VERSION}`);
+  /** Live subtitle for the 输入法 row (on/off, re-read on返回 via `syncAux`). */
+  let imeOn = $state(readImeEnabled());
+  const imeSub = $derived(imeOn ? t("settings.imeOn") : t("settings.imeOff"));
   const focusSub = $derived.by(() => {
     const on = FOCUS_SCENARIOS.filter((id) => focusOn[id]).map((id) => t(FOCUS_LABEL[id]));
     return on.length > 0 ? on.join("、") : t("settings.off");
@@ -228,6 +280,9 @@
   const syncAux = () => {
     cloudOn = readCloud(readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {})).enabled;
     focusOn = normalizeFocus(readStoreValue<unknown>(FOCUS_KEY, {}));
+    // The IME's switch lives on its own sub page: re-read it when coming back so
+    // the row's subtitle shows what the user just chose.
+    imeOn = readImeEnabled();
   };
   /* ---- Data-driven index rows (single source for grouped view + search) ---- */
   type Row =
@@ -236,12 +291,13 @@
 
   /** iPhone-style grouped index (visual grouping = whitespace, like iOS Settings). */
   const SECTIONS: Row[][] = [
-    // 网络：飞行模式(开关) / Wi‑Fi / 蓝牙 / 蜂窝网络
+    // 网络：飞行模式(开关) / Wi‑Fi / 蓝牙 / 蜂窝网络 / 个人热点
     [
       { kind: "switch", key: "settings.airplane", on: () => airplaneOn, toggle: () => toggleRadio("airplane") },
       { kind: "nav", page: "wifi", key: "settings.wifi", sub: () => wifiVal },
       { kind: "nav", page: "bluetooth", key: "settings.bluetooth", sub: () => btVal },
       { kind: "nav", page: "cellular", key: "settings.cellular", sub: () => cellularSub },
+      { kind: "nav", page: "hotspot", key: "settings.hotspot", sub: () => hotspotSub },
     ],
     // 通用：通知 / 声音与触感 / 专注模式
     [
@@ -258,6 +314,7 @@
     // 账户与功能：语言 / iCloud / AI 与智能 / 隐私与安全性
     [
       { kind: "nav", page: "language", key: "settings.language", sub: () => langVal },
+      { kind: "nav", page: "ime", key: "settings.ime", sub: () => imeSub },
       { kind: "nav", page: "account", key: "settings.icloudRow", sub: () => icloudSub },
       { kind: "nav", page: "ai", key: "settings.ai" },
       { kind: "nav", page: "privacy", key: "settings.privacy" },
@@ -398,9 +455,11 @@
     </div>
     <div class="space-y-5 pt-3">
       {#if page === "wifi" || page === "bluetooth"}
-        <RadioPage which={page} qs={qs} onToggle={toggleRadio} />
+        <RadioPage which={page} qs={qs} onToggle={toggleRadio} refusal={radioRefusal} />
       {:else if page === "cellular"}
         <CellularPage />
+      {:else if page === "hotspot"}
+        <HotspotPage qs={qs} onToggle={toggleRadio} refusal={radioRefusal} />
       {:else if page === "focus"}
         <FocusPage />
       {:else if page === "display"}
@@ -409,6 +468,8 @@
         <WallpaperPage />
       {:else if page === "language"}
         <LanguagePage />
+      {:else if page === "ime"}
+        <ImePage />
       {:else if page === "lock"}
         <LockPage />
       {:else if page === "ai"}

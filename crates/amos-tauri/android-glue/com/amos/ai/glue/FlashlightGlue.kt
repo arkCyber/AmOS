@@ -84,9 +84,16 @@ object FlashlightGlue {
      * Pick the camera to drive as the torch: prefer the **rear** camera with a
      * flash unit; otherwise fall back to any camera that has a flash. Returns an
      * empty id when no usable torch exists.
+     *
+     * `cm.cameraIdList` is a platform type the compiler already proves non-null, so
+     * the defensive `?: return` this used to carry could never run — an implied
+     * guarantee that was not there (REQ-A185, and the Kotlin compiler said so:
+     * "Elvis operator always returns the left operand"). The real failure mode is a
+     * `CameraAccessException`, which **propagates**: the caller logs it and the torch
+     * keeps its previous state, rather than being turned into a false "no torch".
      */
     private fun torchCamera(cm: CameraManager): Pair<String, Boolean> {
-        val ids = cm.cameraIdList ?: return "" to false
+        val ids = cm.cameraIdList
         val rearWithFlash = ids.firstOrNull {
             flashAvailable(cm, it) && facing(cm, it) == CameraCharacteristics.LENS_FACING_BACK
         }

@@ -51,14 +51,14 @@ describe("PhoneApp.svelte outgoing (fake telephony bridge)", () => {
 
     // key in a number and press call
     for (const d of "13800000000") await fireEvent.click(key(host, d)!);
-    const callBtn = key(host, "call");
+    const callBtn = key(host, zh["phone.call"]);
     expect(callBtn).toBeTruthy();
     await fireEvent.click(callBtn as HTMLButtonElement);
     await tick();
     await settle();
 
     // daemon accepted → in-call UI with a hang-up control, number visible
-    expect(key(host, "end")).toBeTruthy();
+    expect(key(host, zh["a11y.end"])).toBeTruthy();
     expect(txt(host)).toContain("13800000000");
 
     // outgoing call was written to the shared log at dial time
@@ -70,13 +70,13 @@ describe("PhoneApp.svelte outgoing (fake telephony bridge)", () => {
     await tick();
     await settle();
     expect(txt(host)).toContain(zh["phone.talking"]);
-    expect(host.container.querySelector('[aria-label="call duration"]')).toBeTruthy();
+    expect(host.container.querySelector(`[aria-label="${zh["a11y.callDuration"]}"]`)).toBeTruthy();
 
     // hang-up / remote end → back to the idle keypad, no phantom call
     emit({ id: "out-1", peer: "13800000000", state: "Ended", direction: "Outgoing" });
     await tick();
     await settle();
-    expect(key(host, "end")).toBeFalsy();
+    expect(key(host, zh["a11y.end"])).toBeFalsy();
     expect(txt(host)).not.toContain(zh["phone.talking"]);
     // the outgoing log entry survives the reset
     expect(readStoreValue<unknown[]>(CALLLOG_KEY, []).length).toBeGreaterThan(0);

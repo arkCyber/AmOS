@@ -177,7 +177,7 @@
 <span class="relative inline-flex shrink-0">
   <button
     type="button"
-    aria-label="device voice input"
+    aria-label={t("a11y.deviceVoiceInput")}
     onclick={toggle}
     disabled={disabledState}
     title={title}

@@ -175,19 +175,13 @@ fn armed_link_mirrors_a_background_copy_and_ingests_the_container_reply() {
         .write_all(&echo)
         .expect("echo sent");
 
-    // A genuine container copy.
-    guest_clip
-        .set_primary_text("from-container")
-        .expect("container copy");
-
-    // Wait until the guest applied the push AND the container copy reached the host.
-    let wait = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < wait {
-        if guest_clip.text().as_deref() == Some("pushed-from-host")
-            && clip.latest_text().as_deref() == Some("from-container")
-        {
-            break;
-        }
+    // Wait for the push to be **applied on the guest** before the container writes its own
+    // value. The two directions are independent asynchronous paths, so asserting an order
+    // between them was the flake in this test: under load the mirror landed first, the
+    // container's own write then legitimately won, and the assertion below failed even
+    // though both directions had worked.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && guest_clip.text().as_deref() != Some("pushed-from-host") {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
@@ -195,6 +189,15 @@ fn armed_link_mirrors_a_background_copy_and_ingests_the_container_reply() {
         Some("pushed-from-host"),
         "a background window's copy must reach the guest clipboard"
     );
+
+    // A genuine container copy, which must now reach the host shared clipboard.
+    guest_clip
+        .set_primary_text("from-container")
+        .expect("container copy");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && clip.latest_text().as_deref() != Some("from-container") {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(
         clip.latest_text().as_deref(),
         Some("from-container"),

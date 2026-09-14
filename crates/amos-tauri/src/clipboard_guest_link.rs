@@ -306,7 +306,14 @@ mod imp {
             self.stop.store(true, Ordering::Relaxed);
             if let Ok(mut t) = self.thread.lock() {
                 if let Some(h) = t.take() {
-                    let _ = h.join();
+                    // A panic in the ingest thread means the link is no longer ingesting
+                    // while `stop()` returns as if all were well — say so.
+                    if h.join().is_err() {
+                        tracing::warn!(
+                            target: "amos::clipboard",
+                            "the clipboard guest ingest thread panicked; the link is no longer ingesting"
+                        );
+                    }
                 }
             }
         }
@@ -360,8 +367,18 @@ mod imp {
                 Ok((reader, writer)) => {
                     // A read timeout lets `supervise` observe the stop flag on an
                     // **idle** link (a silent guest would otherwise block the read
-                    // forever and make `link::stop()` hang on join).
-                    let _ = reader.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                    // forever and make `link::stop()` hang on join). That is the whole
+                    // reason the timeout is set, so a failure to set it is reported: the
+                    // link may then block `stop()` (i.e. app teardown).
+                    if let Err(e) =
+                        reader.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                    {
+                        tracing::warn!(
+                            target: "amos::clipboard",
+                            error = %e,
+                            "clipboard guest read timeout could not be set — stop() may block on an idle link"
+                        );
+                    }
                     dial_conn.publish(writer);
                     Ok(reader)
                 }
@@ -445,6 +462,10 @@ mod imp {
                 // say so honestly rather than pretending the sink is installed.
                 Err(e) => tracing::warn!("clipboard guest mirror sink not installed: {e}"),
             }
+            // Cannot fail in a way that loses the link: this closure runs at most once
+            // (`get_or_init`), and this is the only writer of `LINK` — so the cell is
+            // always empty here. Left as a discard *deliberately*, with that argument,
+            // rather than as an unexamined one.
             let _ = LINK.set(Arc::clone(&link));
             Some(link)
         });

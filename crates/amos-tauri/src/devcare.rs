@@ -591,9 +591,15 @@ impl DevCareBridge {
     /// its caller — and for which "the lock is busy" is itself the interesting
     /// observation. (It also documents that no command holds the lock for long:
     /// a JNI call made *under* the bridge lock would show up here as contention.)
+    ///
+    /// A **poisoned** lock is not "busy": the diagnostic would report contention that does
+    /// not exist, so the state is read through the poison instead.
     pub fn try_status(&self) -> Option<DevCareStatus> {
-        let inner = self.inner.try_lock().ok()?;
-        Some(Self::status_of(&inner))
+        match self.inner.try_lock() {
+            Ok(inner) => Some(Self::status_of(&inner)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(Self::status_of(&p.into_inner())),
+        }
     }
 
     /// The read-only summary of an already-locked state.
@@ -1377,7 +1383,7 @@ pub async fn devcare_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amos_devocare::CareArea;
+    use amos_devocare::{CareArea, Severity};
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1765,12 +1771,40 @@ mod tests {
         let (_t, b) = seeded();
         let r = b.report(None, None);
         assert!(r.assessed_area(CareArea::Storage));
-        // 175 bytes is well under the 2 GiB warning threshold → a suggestion.
-        assert!(r
+        // 175 bytes is well under the 2 GiB warning threshold → a *Suggestion*
+        // (5 points in the fold). Assert the storage finding itself, not the
+        // folded total: `report` deliberately falls back to the REAL host battery
+        // when the backend has no battery reader — `HostFsScan` has none — so the
+        // total is **host-dependent**. A laptop at ≤20 % on battery adds the
+        // 15-point `care.battery.low` warning and the score drops 95 → 80. (The
+        // assertion was `assert_eq!(r.score, 95)`: green on a battery-less CI
+        // runner, red on a laptop on battery — the exact "green in CI, red on a
+        // laptop" class this tree's gates exist to catch.)
+        let storage = r
             .findings
             .iter()
-            .any(|f| f.key == "care.storage.reclaimable"));
-        assert_eq!(r.score, 95);
+            .find(|f| f.key == "care.storage.reclaimable")
+            .expect("the small reclaimable amount is reported as a suggestion");
+        assert_eq!(storage.severity, Severity::Suggestion);
+        assert_eq!(storage.reclaimable_bytes, 175);
+        // The folded score must equal 100 minus the documented penalty for exactly
+        // the findings present — on ANY host (the battery terms are whatever the
+        // host actually reported). This still pins the score formula without
+        // pinning the host's battery state.
+        let penalty: u32 = r
+            .findings
+            .iter()
+            .map(|f| match f.key.as_str() {
+                "care.storage.reclaimableHigh" => 20,
+                "care.storage.reclaimable" => 5,
+                "care.battery.critical" => 30,
+                "care.battery.low" => 15,
+                "care.battery.thermal" => 10,
+                "care.permissions.many" => 10,
+                _ => 0, // `Info` findings never penalise.
+            })
+            .sum();
+        assert_eq!(r.score as u32, 100 - penalty);
     }
 
     #[tokio::test]

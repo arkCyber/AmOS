@@ -562,7 +562,7 @@
         <div class="text-3xl tabular-nums tracking-widest">{num || "—"}</div>
         <div class="mt-1 text-sm opacity-70">{talking ? t("phone.talking") : t("phone.call")}{!talking && num ? " …" : ""}</div>
         {#if talking}
-          <div aria-label="call duration" class="mt-0.5 text-xs tabular-nums tracking-widest text-accent/80">{fmtCallDuration(elapsedSec)}</div>
+          <div aria-label={t("a11y.callDuration")} class="mt-0.5 text-xs tabular-nums tracking-widest text-accent/80">{fmtCallDuration(elapsedSec)}</div>
         {/if}
       </div>
       {#if recording === "On"}
@@ -609,7 +609,7 @@
         </div>
       {/if}
       <div class="mt-6">
-        <button onclick={() => void endCall()} aria-label="end" data-icon="end" class="grid h-16 w-16 place-items-center rounded-full bg-danger text-white transition active:scale-90">{@html iconSvg("x", "h-7 w-7")}</button>
+        <button onclick={() => void endCall()} aria-label={t("a11y.end")} data-icon="end" class="grid h-16 w-16 place-items-center rounded-full bg-danger text-white transition active:scale-90">{@html iconSvg("x", "h-7 w-7")}</button>
       </div>
     </div>
 
@@ -639,11 +639,11 @@
 
       <div class="mt-3 flex items-start justify-center gap-12">
         <div class="flex flex-col items-center gap-2">
-          <button onclick={() => (num = backspace(num))} disabled={!num} aria-label="backspace" data-icon="delete"
+          <button onclick={() => (num = backspace(num))} disabled={!num} aria-label={t("a11y.backspace")} data-icon="delete"
             class="grid h-11 w-11 place-items-center rounded-full bg-neutral-300/90 text-neutral-700 transition active:scale-90 disabled:opacity-25 dark:bg-white/10 dark:text-white">{@html iconSvg("delete", "h-5 w-5")}</button>
-          <button onclick={() => (num = clearDial(num))} disabled={!num} aria-label="clear" class="text-xs text-accent disabled:opacity-25">{t("phone.clear")}</button>
+          <button onclick={() => (num = clearDial(num))} disabled={!num} aria-label={t("phone.clear")} class="text-xs text-accent disabled:opacity-25">{t("phone.clear")}</button>
         </div>
-        <button onclick={() => void startCall()} disabled={!num} aria-label="call" data-icon="phone"
+        <button onclick={() => void startCall()} disabled={!num} aria-label={t("phone.call")} data-icon="phone"
           class="grid h-[60px] w-[60px] place-items-center rounded-full bg-green-500 text-white shadow-[0_6px_16px_rgba(52,199,89,0.45)] transition active:scale-90 disabled:opacity-40">
           {@html iconSvg("phone", "h-7 w-7")}
         </button>
@@ -664,10 +664,10 @@
           {/if}
           {#if historyTotal > 0}
             {#if confirmClear}
-              <button onclick={clearLog} aria-label="history-clear-confirm" class="rounded-full bg-danger/15 px-2.5 py-1 text-xs text-danger active:scale-95">{t("phone.historyClearConfirm")}</button>
-              <button onclick={() => (confirmClear = false)} aria-label="history-clear-cancel" class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClearCancel")}</button>
+              <button onclick={clearLog} data-testid="history-clear-confirm" class="rounded-full bg-danger/15 px-2.5 py-1 text-xs text-danger active:scale-95">{t("phone.historyClearConfirm")}</button>
+              <button onclick={() => (confirmClear = false)} data-testid="history-clear-cancel" class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClearCancel")}</button>
             {:else}
-              <button onclick={() => (confirmClear = true)} aria-label="history-clear" title={t("phone.historyClear")} class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClear")}</button>
+              <button onclick={() => (confirmClear = true)} data-testid="history-clear" title={t("phone.historyClear")} class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClear")}</button>
             {/if}
           {/if}
         </div>
@@ -764,7 +764,7 @@
         {:else if roleAskable}
           <div data-testid="block-role-needed" class="mb-2 w-full max-w-sm rounded-2xl bg-amber-500/15 px-3 py-2 text-center text-xs text-amber-700 dark:text-amber-300">
             <p>{t("phone.blockRoleNeeded")}</p>
-            <button onclick={() => void requestBlockRole()} disabled={blockBusy} aria-label="block-grant-role"
+            <button onclick={() => void requestBlockRole()} disabled={blockBusy} data-testid="block-grant-role"
               class="mt-1.5 rounded-full bg-accent px-3 py-1 text-xs text-white active:scale-95 disabled:opacity-50">
               {t("phone.blockRoleGrant")}
             </button>
@@ -779,18 +779,18 @@
            gets its own full-width row (on a 360px phone the old single row left it
            only ~65px wide, so the placeholder never fit). -->
       <div class="mb-2 w-full max-w-sm space-y-1.5">
-        <input bind:value={blockNum} aria-label="block-number" onkeydown={(e) => e.key === "Enter" && void addBlockRule()} placeholder={t("phone.blockPlaceholder")} class="w-full rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
+        <input bind:value={blockNum} data-testid="block-number" aria-label={t("phone.blockPlaceholder")} onkeydown={(e) => e.key === "Enter" && void addBlockRule()} placeholder={t("phone.blockPlaceholder")} class="w-full rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:ring-white/10 dark:placeholder:text-white/30" />
         <div class="flex items-center gap-1.5">
-          <select bind:value={blockKind} aria-label="block-kind" class="min-w-0 flex-1 rounded-full bg-black/5 px-2.5 py-2 text-xs dark:bg-white/10">
+          <select bind:value={blockKind} data-testid="block-kind" aria-label={t("phone.blockKindLabel")} class="min-w-0 flex-1 rounded-full bg-black/5 px-2.5 py-2 text-xs dark:bg-white/10">
             <option value="exact">{t("phone.blockKindExact")}</option>
             <option value="prefix">{t("phone.blockKindPrefix")}</option>
           </select>
-          <select bind:value={blockChannel} aria-label="block-channel" class="min-w-0 flex-1 rounded-full bg-black/5 px-2.5 py-2 text-xs dark:bg-white/10">
+          <select bind:value={blockChannel} data-testid="block-channel" aria-label={t("phone.blockChannelLabel")} class="min-w-0 flex-1 rounded-full bg-black/5 px-2.5 py-2 text-xs dark:bg-white/10">
             <option value="both">{t("phone.blockChannelBoth")}</option>
             <option value="call">{t("phone.blockChannelCall")}</option>
             <option value="sms">{t("phone.blockChannelSms")}</option>
           </select>
-          <button onclick={() => void addBlockRule()} disabled={blockBusy} aria-label="block-add" class="shrink-0 rounded-full bg-accent px-4 py-2 text-xs text-white active:scale-95 disabled:opacity-50">{t("phone.blockAdd")}</button>
+          <button onclick={() => void addBlockRule()} disabled={blockBusy} data-testid="block-add" class="shrink-0 rounded-full bg-accent px-4 py-2 text-xs text-white active:scale-95 disabled:opacity-50">{t("phone.blockAdd")}</button>
         </div>
       </div>
       {#if blockPreview}
@@ -806,13 +806,13 @@
       {#if blockErr}
         <p class="mb-1 text-xs text-red-500" role="alert">{blockErr}</p>
       {/if}
-      <button onclick={() => void toggleBlockUnknown()} aria-pressed={blockUnknown} aria-label="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/15 text-accent" : "bg-black/5 dark:bg-white/10")}>
+      <button onclick={() => void toggleBlockUnknown()} aria-pressed={blockUnknown} data-testid="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/15 text-accent" : "bg-black/5 dark:bg-white/10")}>
         {t("phone.blockUnknown")} · {blockUnknown ? t("phone.on") : t("phone.off")}
       </button>
       {#if blockRules.length > 0}
         <button
           onclick={() => void clearAllRules()}
-          aria-label="block-clear"
+          data-testid="block-clear"
           class="mb-2 w-full max-w-sm rounded-2xl bg-black/5 px-4 py-2 text-sm text-danger dark:bg-white/10"
         >
           {confirmClearRules ? t("phone.blockClearConfirm") : t("phone.blockClear")}

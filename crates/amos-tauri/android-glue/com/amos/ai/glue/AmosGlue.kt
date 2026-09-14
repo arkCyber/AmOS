@@ -54,6 +54,10 @@ object AmosGlue {
         // Bind the real torch (rear camera flash) so FlashlightBridge boots with
         // the AndroidFlashlightProvider instead of the desktop Mock.
         startQuietly("flashlight") { FlashlightGlue.bind(context.applicationContext) }
+        // Hand the JVM + context to Rust so the real Android radio provider replaces
+        // the Mock the bridge was built with: without this the quick-settings tiles
+        // mirror the store and claim radio state the device does not have (REQ-A185).
+        startQuietly("radio") { RadioGlue.attach(context.applicationContext) }
         // Bind real SMS (content://sms read + SmsManager send) so SmsBridge uses
         // the AndroidSmsProvider instead of the empty host Mock. Reads/sends
         // succeed once READ_SMS/SEND_SMS are granted (checked at call time).
@@ -79,7 +83,17 @@ object AmosGlue {
 
     private const val TAG = "AmosGlue"
 
-    /** Stop the producers and release the camera/sensor hardware. */
+    /**
+     * Stop the producers and release the camera/sensor hardware.
+     *
+     * `context` is part of the Activity lifecycle call shape (`AmosGlue.onStop(
+     * applicationContext)` from the generated `MainActivity`) and is deliberately
+     * unused: everything released here is process-wide state owned by the glue
+     * objects, so there is nothing to resolve from a context. Suppressed explicitly
+     * rather than silently ignored — an unused parameter is a claim that the call
+     * needs one (REQ-A185).
+     */
+    @Suppress("UNUSED_PARAMETER")
     fun onStop(context: Context) {
         SensorGlue.detach()
         CameraGlue.detach()

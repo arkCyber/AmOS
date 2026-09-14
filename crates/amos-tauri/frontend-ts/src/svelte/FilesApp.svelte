@@ -367,7 +367,7 @@
 
   <!-- search + sort -->
   <div class="mt-2 flex items-center gap-2">
-    <input bind:value={query} placeholder={t("files.search")} aria-label="file-search"
+    <input bind:value={query} placeholder={t("files.search")} data-testid="file-search" aria-label={t("files.search")}
       class="min-w-0 flex-1 rounded-full bg-neutral-200 px-3 py-1 text-sm outline-none dark:bg-neutral-800" />
     <button onclick={() => (globalSearch = !globalSearch)} title={t(globalSearch ? "files.currentFolder" : "files.global")}
       class="shrink-0 rounded-full bg-neutral-300 px-3 py-1 text-xs dark:bg-neutral-700">
@@ -394,11 +394,11 @@
   {#if creating}
     <div class="mt-2 space-y-2 rounded-xl bg-neutral-200/60 p-3 dark:bg-neutral-800/60">
       <span class="block text-xs opacity-60">{t("files.name")}</span>
-      <input bind:value={name} placeholder={t("files.name")} aria-label="file-new-name"
+      <input bind:value={name} placeholder={t("files.name")} data-testid="file-new-name" aria-label={t("files.name")}
         class="w-full rounded-lg bg-white px-2 py-1 text-sm outline-none dark:bg-neutral-900" />
       {#if creating === "file"}
         <span class="block text-xs opacity-60">{t("files.content")}</span>
-        <textarea bind:value={content} rows={2} aria-label="file-new-content"
+        <textarea bind:value={content} rows={2} data-testid="file-new-content" aria-label={t("files.content")}
           class="w-full rounded-lg bg-white px-2 py-1 text-sm outline-none dark:bg-neutral-900"></textarea>
       {/if}
       <div class="flex gap-2">
@@ -412,7 +412,7 @@
   {#if renameId}
     <div class="mt-2 space-y-2 rounded-xl bg-neutral-200/60 p-3 dark:bg-neutral-800/60">
       <span class="block text-xs opacity-60">{t("files.rename")}</span>
-      <input bind:value={renameVal} aria-label="file-rename"
+      <input bind:value={renameVal} data-testid="file-rename" aria-label={t("files.rename")}
         class="w-full rounded-lg bg-white px-2 py-1 text-sm outline-none dark:bg-neutral-900" />
       <div class="flex gap-2">
         <button onclick={submitRename} class={btnCls("accent")}>{t("files.create")}</button>
@@ -470,7 +470,7 @@
           </button>
           {#if !selecting}
             <div class="flex gap-1 pr-2">
-              <button onclick={() => fav(e.id)} aria-label="favorite"
+              <button onclick={() => fav(e.id)} aria-label={t("a11y.favorite")}
                 class={"rounded-full px-2 py-0.5 text-xs " + (favs.includes(e.id) ? "text-amber-500" : "text-neutral-400")}>
                 {favs.includes(e.id) ? "★" : "☆"}
               </button>
@@ -522,7 +522,7 @@
             <input
               bind:value={extQuery}
               placeholder={t("files.externalSearch")}
-              aria-label="external-search"
+              data-testid="external-search" aria-label={t("files.externalSearch")}
               class="min-w-0 flex-1 rounded-full bg-neutral-200 px-3 py-1 text-sm outline-none dark:bg-neutral-800"
             />
             <button onclick={cycleExtSort} title={t("files.sort")} class="shrink-0 rounded-full bg-neutral-300 px-3 py-1 text-xs dark:bg-neutral-700">

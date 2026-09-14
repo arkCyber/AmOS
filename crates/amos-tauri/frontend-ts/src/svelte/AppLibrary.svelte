@@ -342,7 +342,7 @@
       <!-- Custom group: add/remove member apps -->
       <div class="flex h-full flex-col px-4 pb-3 pt-3" data-testid="app-library-custom-edit">
         <div class="flex items-center justify-between">
-          <button onclick={closeCustomGroup} aria-label="back" class="w-6 text-accent text-sm font-semibold">‹</button>
+          <button onclick={closeCustomGroup} aria-label={t("a11y.back")} class="w-6 text-accent text-sm font-semibold">‹</button>
           <span class="flex-1 truncate text-center text-base font-semibold">{openGroupIcon} {openGroupName}</span>
           <button
             type="button"
@@ -379,7 +379,7 @@
       <!-- Custom group: view members -->
       <div class="flex h-full flex-col px-4 pb-3 pt-3" data-testid="app-library-custom-open">
         <div class="flex items-center justify-between">
-          <button onclick={closeCustomGroup} aria-label="back" class="w-6 text-accent text-sm font-semibold">‹</button>
+          <button onclick={closeCustomGroup} aria-label={t("a11y.back")} class="w-6 text-accent text-sm font-semibold">‹</button>
           <span class="flex-1 truncate text-center text-base font-semibold">{openGroupIcon} {openGroupName}</span>
           <span class="w-6"></span>
         </div>
@@ -549,7 +549,7 @@
   {:else if openView === null}
     <div class="flex h-full flex-col px-4 pb-3 pt-3">
       <div class="flex items-center justify-between">
-        <button onclick={backHome} class="w-6 text-accent text-sm font-semibold" aria-label="back">‹</button>
+        <button onclick={backHome} class="w-6 text-accent text-sm font-semibold" aria-label={t("a11y.back")}>‹</button>
         <div class="flex-1 text-center">
           <h2 class="text-lg font-semibold tracking-tight">{t("appLibrary.title")}</h2>
           <p class="text-[10px] opacity-50">{t("appLibrary.hint")}</p>
@@ -574,7 +574,7 @@
           {#if query}
             <button
               type="button"
-              aria-label="clear search"
+              aria-label={t("a11y.clearSearch")}
               onclick={clearSearch}
               class="grid h-5 w-5 shrink-0 cursor-pointer place-items-center rounded-full bg-neutral-300 text-[10px] text-neutral-700 transition active:scale-90 dark:bg-neutral-600 dark:text-neutral-200"
             >✕</button>
@@ -730,7 +730,7 @@
     <!-- Expanded single-category grid -->
     <div class="flex h-full flex-col px-4 pb-3 pt-3">
       <div class="flex items-center justify-between">
-        <button onclick={() => (openView = null)} class="w-6 text-accent text-sm font-semibold" aria-label="back">‹</button>
+        <button onclick={() => (openView = null)} class="w-6 text-accent text-sm font-semibold" aria-label={t("a11y.back")}>‹</button>
         <span class="flex-1 truncate text-center text-base font-semibold">{t(openView.folder.nameKey)}</span>
         <span class="w-6"></span>
       </div>
@@ -758,9 +758,9 @@
   <!-- Home indicator: a horizontal bar (iOS-style); tapping returns to the home. -->
   <div class="flex justify-center pb-1 pt-0.5">
     <button
-      aria-label="home"
+      aria-label={t("a11y.home")}
       data-testid="library-home-indicator"
-      title="Home"
+      title={t("a11y.home")}
       onclick={backHome}
       class="grid w-32 cursor-pointer place-items-center py-1"
     >

@@ -514,7 +514,7 @@
                       </span>
                     {/if}
                     {#if PRIORITY_GLYPH[r.priority]}
-                      <span class="text-orange-500" aria-label="high priority">{PRIORITY_GLYPH[r.priority]}</span>
+                      <span class="text-orange-500" aria-label={t("a11y.highPriority")}>{PRIORITY_GLYPH[r.priority]}</span>
                     {/if}
                     {#if r.flagged}<span class="text-orange-500">⚑</span>{/if}
                     {#if r.notes}<span class="truncate opacity-50">{r.notes}</span>{/if}
@@ -574,7 +574,7 @@
                         </span>
                       {/if}
                       {#if PRIORITY_GLYPH[r.priority]}
-                        <span class="text-orange-500" aria-label="high priority">{PRIORITY_GLYPH[r.priority]}</span>
+                        <span class="text-orange-500" aria-label={t("a11y.highPriority")}>{PRIORITY_GLYPH[r.priority]}</span>
                       {/if}
                       {#if r.flagged}<span class="text-orange-500">⚑</span>{/if}
                       {#if r.notes}<span class="truncate opacity-50">{r.notes}</span>{/if}

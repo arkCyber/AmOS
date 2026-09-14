@@ -137,7 +137,8 @@
 <div class="flex h-full flex-col bg-white dark:bg-neutral-900">
   <div class="flex items-center gap-2 border-b border-black/5 px-3 py-2 dark:border-white/10">
     <button
-      aria-label="note-editor-back"
+      data-testid="note-editor-back"
+      aria-label={t("a11y.back")}
       onclick={back}
       class="shrink-0 rounded-full px-2 py-0.5 text-sm opacity-70 hover:opacity-100"
     >‹</button>
@@ -154,7 +155,7 @@
     bind:value={editVal}
     oninput={onInput}
     onkeydown={onKey}
-    aria-label="note-editor-textarea"
+    data-testid="note-editor-textarea" aria-label={t("note.editorPlaceholder")}
     placeholder={t("note.editorPlaceholder")}
     class="w-full flex-1 resize-none bg-transparent p-3 text-sm leading-relaxed outline-none"
   ></textarea>
@@ -162,20 +163,20 @@
   <div class="flex items-center gap-1.5 border-t border-black/5 px-3 py-2 text-xs dark:border-white/10">
     <button
       onclick={toggleAtCaret}
-      aria-label="note-editor-toggle-task"
+      data-testid="note-editor-toggle-task"
       title={t("note.editorToggleTaskHint")}
       class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
     >☑ {t("note.editorToggleTask")}</button>
     <button
       onclick={prefixAtCaret}
-      aria-label="note-editor-prefix-task"
+      data-testid="note-editor-prefix-task"
       title={t("note.editorPrefixTaskHint")}
       class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
     >＋ {t("note.editorPrefixTask")}</button>
     <button
       onclick={() => (previewOn = !previewOn)}
       aria-pressed={previewOn}
-      aria-label="note-editor-preview"
+      data-testid="note-editor-preview"
       title={t("note.editorPreviewHint")}
       class={"rounded-full px-2.5 py-1 " + (previewOn ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
     >{t("note.editorPreview")}</button>
@@ -183,7 +184,7 @@
 
   {#if previewOn && editVal.trim()}
     <div
-      aria-label="note-editor-preview-body"
+      data-testid="note-editor-preview-body"
       class="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-black/5 px-3 py-2 text-sm leading-relaxed dark:border-white/10"
     >
       {#each fmtInline(editVal) as seg, i (i)}

@@ -277,8 +277,11 @@ pub struct LogSinkHandle {
 impl LogSinkHandle {
     /// Snapshot the sink's state. Cheap; safe to call per `get_status`.
     pub fn report(&self) -> LogSinkReport {
-        let cells = self.file.lock().ok();
-        let (rotations, active_bytes) = match cells.as_ref().and_then(|g| g.as_ref()) {
+        // Poison-tolerant: the point of `report()` is an honest read-out, and "0 rotations /
+        // 0 bytes" because another thread panicked is exactly the kind of false reading this
+        // file exists to avoid (the lost-write counter was fixed for the same reason).
+        let cells = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        let (rotations, active_bytes) = match cells.as_ref() {
             Some(f) => (f.rotations(), f.size()),
             None => (0, 0),
         };

@@ -1,0 +1,18 @@
+[package]
+name = "amos-jni"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared JNI plumbing for the Android providers: attach a thread with a clean exception state, keep it clean after a failed call, and resolve glue classes through the app's own class loader. Design: docs/android-glue.md."
+
+[lib]
+name = "amos_jni"
+path = "src/lib.rs"
+
+[dependencies]
+# The whole point of this crate: every Android provider in the workspace shares one
+# implementation of the two device-proven rules (see `src/lib.rs`).
+jni = "0.21"
+# A failed `exception_clear` must be reported, not swallowed (the discard gate).
+tracing.workspace = true

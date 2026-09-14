@@ -402,7 +402,20 @@ impl Telephony for TelephonyService {
                 let cid = id.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let _ = mock.simulate_connected(&cid).await;
+                    // The documented, ignorable case is named explicitly: the call was hung
+                    // up before it connected. Anything *else* means the demo call never
+                    // becomes Active — the UI would sit on "dialing" forever — and that must
+                    // not be swallowed by the same discard.
+                    if let Err(e) = mock.simulate_connected(&cid).await {
+                        if !matches!(e, TelephonyError::UnknownCall(_)) {
+                            tracing::warn!(
+                                target: "amos::telephony",
+                                call = %cid,
+                                error = %e,
+                                "demo connect failed — the call stays in Dialing"
+                            );
+                        }
+                    }
                 });
             }
         }

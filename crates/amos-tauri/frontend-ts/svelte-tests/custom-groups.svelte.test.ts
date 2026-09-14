@@ -118,7 +118,7 @@ describe("AppLibrary.svelte - 新建分组 (+)", () => {
     ).toBeTruthy();
 
     // back out without saving
-    const back = container.querySelector('button[aria-label="back"]');
+    const back = container.querySelector(`button[aria-label="${zh["a11y.back"]}"]`);
     await fireEvent.click(back as HTMLButtonElement);
     await tick();
 
@@ -406,7 +406,7 @@ describe("AppLibrary.svelte - dedup names + custom icon", () => {
       await tick();
       expect(getCustomGroups().map((g) => g.name)).toContain(expected);
       // each new folder opens prefilled with its unique default name; go back home
-      const back = container.querySelector('button[aria-label="back"]');
+      const back = container.querySelector(`button[aria-label="${zh["a11y.back"]}"]`);
       await fireEvent.click(back as HTMLButtonElement);
       await tick();
     }
@@ -467,7 +467,7 @@ describe("AppLibrary.svelte - dedup names + custom icon", () => {
     expect(getCustomGroups()[0].icon).toBe("❤️");
 
     // back to the library home → the empty group card shows the chosen icon
-    const back = container.querySelector('button[aria-label="back"]');
+    const back = container.querySelector(`button[aria-label="${zh["a11y.back"]}"]`);
     await fireEvent.click(back as HTMLButtonElement);
     await tick();
     expect(container.textContent).toContain("❤️");

@@ -42,6 +42,7 @@ pub fn is_default_dialer_bound() -> bool {
 
 /// Hand the seam an `AppHandle` (from `lib.rs::setup`) for live WebView pushes.
 pub fn set_app(app: AppHandle) {
+    // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
     let _ = APP.set(app);
 }
 
@@ -79,6 +80,7 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_AmosInCallService_nativeStat
         return;
     };
     if let Ok(vm) = env.get_java_vm() {
+        // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
         let _ = VM.set(vm);
     }
     let direction = read_string(&mut env, direction);
@@ -93,7 +95,15 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_AmosInCallService_nativeStat
             emergency: false,
             recording: "Off".to_string(),
         };
-        let _ = app.emit(TELEPHONY_EVENT, payload);
+        // The UI's in-call screen is driven by this event; a failed emit means the call
+        // would sit in the background with no visible state (REQ-A187).
+        if let Err(e) = app.emit(TELEPHONY_EVENT, payload) {
+            tracing::warn!(
+                target: "amos::telephony",
+                error = %e,
+                "in-call state event not delivered to the UI"
+            );
+        }
     }
 }
 
@@ -102,14 +112,18 @@ fn call_static_bool(method: &str) -> Result<bool, String> {
     let vm = VM
         .get()
         .ok_or_else(|| "in-call JVM not captured yet".to_string())?;
-    let mut env = vm
-        .attach_current_thread()
-        .map_err(|e| format!("in-call attach failed: {e}"))?;
-    let class = env
-        .find_class("com/amos/ai/glue/AmosInCallService")
+    // Shared helper: attach with a clean exception state (REQ-A186).
+    let mut env = amos_jni::attached(vm).map_err(|e| format!("in-call attach failed: {e}"))?;
+    // `find_class` uses the *calling thread's* class loader: from a Java-thread upcall
+    // that is the app loader, from a tokio worker it is the bootstrap one and the
+    // resolution fails. This module has no `Context` (only the captured `JavaVM`), so
+    // the call is wrapped in the clearing macro: a failure is returned as an error
+    // instead of leaving an exception pending that would abort the process on the next
+    // JNI call (the device-proven crash class). Recorded in scripts/jni-allowlist.json
+    // with the follow-up (capture the class at upcall time). See REQ-A186.
+    let class = amos_jni::jni_call!(env, env.find_class("com/amos/ai/glue/AmosInCallService"))
         .map_err(|e| e.to_string())?;
-    let value = env
-        .call_static_method(&class, method, "()Z", &[])
+    let value = amos_jni::jni_call!(env, env.call_static_method(&class, method, "()Z", &[]))
         .map_err(|e| e.to_string())?;
     value.z().map_err(|e| e.to_string())
 }

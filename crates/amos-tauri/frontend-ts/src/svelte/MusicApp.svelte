@@ -163,13 +163,13 @@
     </div>
 
     <div class="mt-5 flex items-center justify-center gap-7">
-      <button onclick={() => step(-1)} aria-label="previous" data-icon="skipBack"
+      <button onclick={() => step(-1)} aria-label={t("player.prev")} data-icon="skipBack"
         class="grid h-14 w-14 place-items-center rounded-full bg-neutral-300 text-xl text-neutral-700 transition active:scale-90 dark:bg-white/10 dark:text-white">{@html iconSvg("skipBack", "h-7 w-7")}</button>
       <button onclick={() => (playing = !playing)} aria-label={playing ? "pause" : "play"}
         class="grid h-[72px] w-[72px] place-items-center rounded-full bg-accent text-3xl text-white shadow-[0_8px_20px_rgba(0,122,255,0.35)] transition active:scale-95">
         {@html iconSvg(playing ? "pause" : "play", "h-9 w-9")}
       </button>
-      <button onclick={() => step(1)} aria-label="next" data-icon="skipForward"
+      <button onclick={() => step(1)} aria-label={t("player.next")} data-icon="skipForward"
         class="grid h-14 w-14 place-items-center rounded-full bg-neutral-300 text-xl text-neutral-700 transition active:scale-90 dark:bg-white/10 dark:text-white">{@html iconSvg("skipForward", "h-7 w-7")}</button>
     </div>
 

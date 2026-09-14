@@ -1,7 +1,7 @@
 # 芯片防追踪 · 落地重定标（Anti-telemetry egress guard — honest re-scope）
 
-**日期**: 2026-09-09
-**状态**: 设计/对齐文档 —— 仅澄清与拆任务，**不含代码改动**。
+**日期**: 2026-09-09 · **状态更新**: 2026-09-13 —— 本文 §3/§5 的计划**已落地**（见下方「落地核对」）
+**状态**: 设计/对齐文档的**计划文本**保留作追溯；它不是当前待办。
 **范围**: 把早期那份「芯片防追踪网闸 / 主动抓包审计 / Binder 喂假 / 隐私中心」四层方案，
 依据**真实仓库结构与 Android 真实能力**重定标成可执行、不破坏 CI 的任务清单。
 
@@ -9,6 +9,22 @@
 > host 可编译、feature 门控、单测绿、Mock seam。凡依赖 root、SELinux 策略、厂商闭源、
 > AOSP 平台层的路径，都必须**在装有对应芯片的真机上端到端验收**，绝不把「能编译」当「已接通」，
 > 也绝不把「没真机验证的假设」当结论写进代码注释。
+
+> **落地核对（2026-09-13）**：§3.1 / §3.2 / §3.4 / §5 的计划均已实现，落点如下 ——
+> `crates/amos-network-guard`（`policy.rs` 的 `Destination`/`Effect`/`Policy`/`RuleSet`、
+> `guard.rs` 的 `NetworkGuard`+`MockNetworkGuard`、`audit.rs` 的 `EgressEvent`/`EgressCounter`、
+> 门控 `vpn.rs`/`nftables.rs`、`examples/probe_permission.rs`），已入 workspace `members` +
+> `[workspace.dependencies]`；daemon 侧 `crates/amos-ai/src/netguard_service.rs`，
+> wire = `proto/netguard.proto`（`NetGuardService`）；Tauri 桥 `crates/amos-tauri/src/netguard.rs`
+> （`netguard_toggle`/`netguard_status`，已在 `lib.rs` 注册）；前端
+> `src/svelte/settings/NetGuardPage.svelte` + `src/lib/netguard.ts` + `__tests__/netguard.test.ts`
+> （已在 `SettingsApp.svelte` 登记，i18n key `settings.guard`/`guard.*` 齐全）。
+> **计划里的名字在落地时演进**：`BlockList::contains()` → `RuleSet::effect_for()`/`blocked()`，
+> `NetworkFirewallPage.svelte` → `NetGuardPage.svelte`。
+> **仍未做（据实）**：§3.2-③ 审计并入口径 —— netguard 目前用**自有的** `EgressCounter`，
+> **尚未**并入既有 `PrivacyService.RecentAudit`（`crates/amos-ai/src/privacy_service.rs`）；
+> 以及 §3.3 的 AOSP 平台层补丁（按 §2 属真机/平台范围，不在本仓库）。
+> 因此下面 checklist 里遗留的 `[ ]` 是**落地前的计划文本**，**不代表当前待办**。
 
 ---
 
@@ -27,8 +43,8 @@
 | 原方案假设 | 仓库实际 |
 |---|---|
 | 前端在根目录 `frontend-ts/` | 实际在 `crates/amos-tauri/frontend-ts/`，设置页在 `src/svelte/settings/*Page.svelte`（Svelte 5，见 `package.json` `"svelte": "^5.0.0"`）|
-| 新 crate `amos-network-guard` | 不存在（需新建，且默认构建应为纯 `std`）|
-| 新 crate `amos-telemetry-spy` | 不存在 |
+| 新 crate `amos-network-guard` | 不存在（需新建，且默认构建应为纯 `std`）—— **现已落地**，见文首「落地核对」|
+| 新 crate `amos-telemetry-spy` | 不存在 —— **现已落地**：`crates/amos-telemetry-spy`（并已在 workspace `members`）|
 | 扩展 `amos-framework-api` | **不存在**该 crate；最接近的宿主是 `amos-android`/`amos-telephony`/`amos-ai` |
 | 门控用 `#[cfg(target_os = "android")]` + 每文件 `Ok(())` | 仓库惯例是 **feature flag**：`#[cfg(feature = "android")]`/`#[cfg(feature = "linux")]` + **domain core + seam + Mock + 诚实 unknown**（`amos-telephony`、`amos-monitor`、`amos-power`、`amos-sensor`、`amos-radio` 一致）。`#[cfg(target_os)]` 仅用于 FFI 缝（如 `amos-audio` 的 AAudio/TinyALSA）|
 | 隐私/权限从零建 | **已有**完整链路：`proto/privacy.proto` 定义 `PrivacyService`（Grant/Revoke/**Authorize** 唯一决策口 + `RecentAudit`）→ `amos-tauri/src/privacy_client.rs` 经共享 UDS（`crate::daemon::channel()`）暴露 `#[tauri::command]`；前端已有 `PermissionsApp.svelte`、设置页 `PrivacyPage.svelte` |

@@ -66,8 +66,14 @@ object ClipboardGlue : ClipboardManager.OnPrimaryClipChangedListener {
         context = null
     }
 
-    /** Rust ─► Android: set the real clipboard from an AmOS `clipboard_write`. */
-    fun pushTextClipboard(text: String, seq: Long) {
+    /** Rust ─► Android: set the real clipboard from an AmOS `clipboard_write`.
+     *
+     * No sequence number: the echo-suppression below is what actually stops the
+     * mirror from bouncing back ([onPrimaryClipChanged] compares the text and a time
+     * window), and the platform never hands a seq back on a change event — so the
+     * `seq: Long` this used to take was plumbing that reached nothing (REQ-A185).
+     * The JNI signature in `clipboard_glue.rs` is `(Ljava/lang/String;)V`. */
+    fun pushTextClipboard(text: String) {
         lastPushed = text
         lastPushedAt = SystemClock.elapsedRealtime()
         clip?.setPrimaryClip(ClipData.newPlainText("amos-clipboard", text))

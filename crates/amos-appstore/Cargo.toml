@@ -18,10 +18,19 @@ async-trait = "0.1"
 thiserror = "1"
 sha2 = "0.10"
 ed25519-dalek = "2"
+# Install rollback / uninstall cleanup: a bundle that could not be removed (while the
+# registry says otherwise) is reported instead of being hidden behind the success path.
+tracing.workspace = true
 
 # Web-bundle (tar.gz) installer: extract an app archive into an install dir.
 tar = "0.4"
 flate2 = "1"
+
+# The declarative PWA index manifest (`amos-app.toml`, `src/pwa.rs`). The only
+# text format a *human developer* writes by hand in this crate, so it gets a
+# real parser rather than hand-rolled string handling. Already in the lock file
+# (via the Tauri build tooling), so this adds no new crate to download.
+toml = "0.8"
 
 # A real networked catalog/package backend (downloads over HTTP) plugs in behind
 # the StoreProvider seam. Kept out of the default build so the offline workspace
@@ -34,3 +43,9 @@ ureq = { version = "2", optional = true, features = ["socks-proxy"] }
 [features]
 default = []
 live = ["dep:ureq"]
+
+[dev-dependencies]
+# The PWA grammar must be the grammar the *enforcing* matcher implements, so the
+# parity is pinned against the real matcher (`policy::domain_matches`) instead of a
+# comment — see `pwa::tests::the_domain_grammar_is_what_the_guard_matcher_implements`.
+amos-network-guard.workspace = true

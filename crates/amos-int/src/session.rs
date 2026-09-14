@@ -6,6 +6,7 @@
 //! [`Session::new`]. The engine performs no I/O of its own — everything it
 //! knows comes from the pipeline and everything it says goes out the channel.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -18,6 +19,10 @@ use crate::pipeline::{AsrEvent, Pipeline, SourceText, Translation};
 use crate::segment::{Segment, UtteranceBuilder};
 use crate::state::SessionState;
 
+/// Output channel capacity (the consumer's backpressure budget). Kept as a named constant
+/// so the drop warning and the channel cannot drift apart.
+pub const OUTPUT_CHANNEL_CAPACITY: usize = 128;
+
 /// A live interpretation session.
 pub struct Session {
     id: u64,
@@ -28,6 +33,8 @@ pub struct Session {
     builder: Option<UtteranceBuilder>,
     detected_lang: Option<Language>,
     next_segment: u64,
+    /// Outputs dropped because the consumer fell behind (see [`Session::emit`]).
+    dropped: AtomicU64,
 }
 
 impl Session {
@@ -37,7 +44,7 @@ impl Session {
         config: SessionConfig,
         pipeline: Box<dyn Pipeline>,
     ) -> (Session, mpsc::Receiver<InterpretationOutput>) {
-        let (tx, rx) = mpsc::channel(128);
+        let (tx, rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
         let session = Session {
             id: next_session_id(),
             state: SessionState::Idle,
@@ -47,6 +54,7 @@ impl Session {
             builder: None,
             detected_lang: None,
             next_segment: 1,
+            dropped: AtomicU64::new(0),
         };
         (session, rx)
     }
@@ -324,6 +332,9 @@ impl Session {
     }
 
     fn fail(&mut self, e: InterpretationError) {
+        // Cannot actually fail: `set_state` goes through the *same* `SessionState::allowed`
+        // matrix this guard just checked (`transition` = `if allowed { Ok(to) } else { Err }`),
+        // so the `Result` is discarded deliberately rather than left unexamined.
         if SessionState::allowed(self.state, SessionState::Error) {
             let _ = self.set_state(SessionState::Error);
         }
@@ -354,8 +365,40 @@ impl Session {
         Ok(())
     }
 
+    /// Push an output to the consumer.
+    ///
+    /// The channel is **bounded** (128), so `try_send` can fail in two very different ways
+    /// and they must not be treated alike:
+    ///
+    /// * `Closed` — the consumer dropped its receiver: nobody is listening, so there is
+    ///   nothing to report (that is the documented "headless session" case).
+    /// * `Full` — the consumer is more than 128 outputs behind: this output (which can be a
+    ///   `SegmentFinal`, the translation the user is waiting for) is **dropped**. Dropping
+    ///   it silently would leave the consumer with a gap it cannot detect, so it is counted
+    ///   and reported.
     fn emit(&self, out: InterpretationOutput) {
-        let _ = self.out.try_send(out);
+        if let Err(e) = self.out.try_send(out) {
+            match e {
+                mpsc::error::TrySendError::Closed(_) => {} // no consumer at all: deliberate
+                mpsc::error::TrySendError::Full(dropped) => {
+                    let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        target: "amos::int",
+                        dropped = n,
+                        output = ?std::mem::discriminant(&dropped),
+                        "output dropped: the consumer is more than {} outputs behind",
+                        OUTPUT_CHANNEL_CAPACITY
+                    );
+                }
+            }
+        }
+    }
+
+    /// How many outputs have been dropped because the consumer fell behind (0 in every
+    /// session whose consumer keeps up). Exposed so a caller can report honestly instead of
+    /// presenting an incomplete transcript as complete.
+    pub fn dropped_outputs(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 

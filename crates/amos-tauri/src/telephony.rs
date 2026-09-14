@@ -201,7 +201,16 @@ async fn watch_round(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("telephony watch stream error: {e}"))?
     {
         if let Some(call) = evt.call {
-            let _ = app.emit(TELEPHONY_EVENT, call_payload(&call));
+            // A failed delivery means a registered listener missed this call-state change
+            // (no listener is `Ok` in Tauri) — the in-call UI would silently not update.
+            if let Err(e) = app.emit(TELEPHONY_EVENT, call_payload(&call)) {
+                tracing::warn!(
+                    target: "amos::telephony",
+                    event = TELEPHONY_EVENT,
+                    error = %e,
+                    "telephony event could not be delivered to the UI"
+                );
+            }
         }
     }
     Ok(())

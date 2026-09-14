@@ -16,6 +16,8 @@ pub mod alarm_sched;
 #[cfg(feature = "android")]
 pub mod android_glue;
 pub mod android_lmk;
+#[cfg(feature = "android")]
+pub mod android_log;
 pub mod appstore;
 pub mod assistant_voice;
 /// Spam blocking (calls + SMS): rule storage, SMS filtering and the Android
@@ -42,6 +44,9 @@ pub mod devcare_device;
 pub mod display;
 pub mod flashlight;
 pub mod host_battery;
+/// Input method (IME): the System UI's on-screen pinyin keyboard. `amos-ime` owns
+/// the engine; this bridge owns the session + the `amos-ime.json` profile.
+pub mod ime;
 #[cfg(feature = "android")]
 pub mod incall;
 pub mod interpret;
@@ -80,6 +85,11 @@ use wm::{SystemContext, WmState};
 // single allowed expect in production — everything else is gated (P0-1).
 #[allow(clippy::expect_used)]
 pub fn run() {
+    // Hand Rust's `tracing` to logcat **first**: every provider failure report below
+    // (dropped frame, unarmed glue bus, refused platform call) is a no-op without a
+    // subscriber, so the device could not see any of them (REQ-A187).
+    #[cfg(feature = "android")]
+    android_log::install();
     // Durable store is the source of truth for quick-settings. Radio toggles live
     // in-process (Android services are reachable from the System UI APK, not the
     // headless daemon), so we seed the radio bridge from the persisted
@@ -119,6 +129,33 @@ pub fn run() {
         .manage(sms::trash_shared())
         .manage(blocklist::shared())
         .manage(devcare::DevCareBridge::new())
+        // Input method (IME): the on-screen pinyin keyboard's session + learner.
+        .manage(ime::ImeBridge::boot())
+        // The `amos-app://` gateway: one custom-protocol handler for every system
+        // asset the WebView may read — the compiled PWA index
+        // (`amos-app://index/apps.json` + its icons) and any installed web-bundle
+        // (`amos-app://<app-id>/…`). Tauri's own
+        // `register_asynchronous_uri_scheme_protocol` **is** the mechanism (there
+        // is no separate protocol plugin); reads run on the blocking pool so a
+        // slow disk never stalls the WebView thread. See docs/pwa-index.md.
+        .register_asynchronous_uri_scheme_protocol(amos_appstore::SCHEME, |ctx, request, responder| {
+            let uri = request.uri().to_string();
+            let app = ctx.app_handle().clone();
+            // Detached on purpose: dropping the `JoinHandle` does not cancel the
+            // task, and the responder is moved in and answers when the read ends.
+            drop(tauri::async_runtime::spawn_blocking(move || {
+                let (install_root, index_dir) = {
+                    let bridge = app.state::<appstore::StoreBridge>();
+                    (
+                        bridge.web_install_dir().map(std::path::Path::to_path_buf),
+                        appstore::pwa_index_dir(),
+                    )
+                };
+                let reply =
+                    appstore::serve_protocol_uri(install_root.as_deref(), index_dir.as_deref(), &uri);
+                responder.respond(appstore::protocol_response(reply));
+            }));
+        })
         .invoke_handler(tauri::generate_handler![
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
@@ -168,6 +205,15 @@ pub fn run() {
             clipboard::clipboard_history,
             clipboard::clipboard_clear,
             clipboard_guest_link::clipboard_guest_status,
+            ime::ime_status,
+            ime::ime_key,
+            ime::ime_backspace,
+            ime::ime_clear,
+            ime::ime_commit,
+            ime::ime_fuzzy_toggle,
+            ime::ime_fuzzy_preset,
+            ime::ime_learning_clear,
+            ime::ime_forget_last,
             store::store_get,
             store::store_set,
             store::store_remove,
@@ -215,8 +261,9 @@ pub fn run() {
             appstore::appstore_install,
             appstore::appstore_upgrade,
             appstore::appstore_uninstall,
-            appstore::appstore_bundle_resource,
-            appstore::appstore_bundle_uri,
+            appstore::pwa_index_url,
+            appstore::appstore_bundle_entry,
+            appstore::csp_probe,
             telephony::telephony_dial,
             telephony::telephony_end,
             telephony::telephony_status,
@@ -226,6 +273,15 @@ pub fn run() {
             telephony::telephony_stop_recording,
             radio::radio_status,
             radio::radio_set,
+            radio::radio_control,
+            radio::radio_open_settings,
+            radio::bluetooth_adapter_name,
+            radio::bluetooth_rename_adapter,
+            radio::bluetooth_paired_devices,
+            radio::bluetooth_start_scan,
+            radio::bluetooth_stop_scan,
+            radio::bluetooth_scan_state,
+            radio::bluetooth_pair,
             flashlight::flashlight_status,
             flashlight::flashlight_set,
             sensors::sensor_snapshot,
@@ -300,15 +356,39 @@ pub fn run() {
             // so container-originated copies land in the shared buffer, and install
             // an announce hook so those ingests broadcast a metadata-only
             // `clipboard-changed` notice to foreground UIs (same as Webview writes).
-            let _ = clipboard::arm_ingest(
+            // A failure here is not noise: either the ingest bus was armed with a *different*
+            // clipboard (container copies would land in the wrong buffer) or the announce hook
+            // belongs to someone else (the UI would never be told). Both are once-per-boot
+            // `OnceLock`s, so this can only fire when something really is duplicated.
+            if let Err(e) = clipboard::arm_ingest(
                 app.state::<Arc<clipboard::GlobalClipboard>>()
                     .inner()
                     .clone(),
-            );
+            ) {
+                tracing::warn!(
+                    target: "amos::clipboard",
+                    error = %e,
+                    "clipboard ingest bus NOT armed with the managed buffer"
+                );
+            }
             let handle = app.handle().clone();
-            let _ = clipboard::set_notifier(move |entry: &clipboard::ClipboardEntry| {
-                let _ = handle.emit("clipboard-changed", clipboard::ClipboardNotice::from(entry));
-            });
+            if let Err(e) = clipboard::set_notifier(move |entry: &clipboard::ClipboardEntry| {
+                if let Err(e) = handle.emit("clipboard-changed", clipboard::ClipboardNotice::from(entry)) {
+                    // `emit` errors only for a *registered* listener (no listener is `Ok`).
+                    tracing::warn!(
+                        target: "amos::clipboard",
+                        event = "clipboard-changed",
+                        error = %e,
+                        "container clipboard notice could not be delivered to the UI"
+                    );
+                }
+            }) {
+                tracing::warn!(
+                    target: "amos::clipboard",
+                    error = %e,
+                    "clipboard announce hook NOT installed — container ingests will not notify the UI"
+                );
+            }
             // Guest-container clipboard link (host↔guest text sync): **env-gated and
             // inert by default** — it only dials when `AMOS_GUEST_CLIPBOARD_SOCKET`
             // names a socket, so desktop/CI is unaffected. When armed it installs the
@@ -349,7 +429,16 @@ pub fn run() {
                 let host = app.state::<sensor_host::SensorHost>();
                 let handle = app.handle().clone();
                 let notifier = Arc::new(move |ev: sensor_host::SensorHostEvent| {
-                    let _ = handle.emit(sensor_host::SENSOR_DATA_EVENT, ev);
+                    // A failed delivery means a registered sensor listener missed this sample
+                    // (no listener is `Ok` in Tauri) — the live tiles would silently freeze.
+                    if let Err(e) = handle.emit(sensor_host::SENSOR_DATA_EVENT, ev) {
+                        tracing::warn!(
+                            target: "amos::sensors",
+                            event = sensor_host::SENSOR_DATA_EVENT,
+                            error = %e,
+                            "sensor data could not be delivered to the UI"
+                        );
+                    }
                 });
                 host.set_notifier(notifier);
             }
@@ -360,7 +449,18 @@ pub fn run() {
             #[cfg(feature = "android")]
             {
                 let host = app.state::<sensor_host::SensorHost>();
-                let _ = android_glue::arm(host.producer());
+                // A failed arm means the Kotlin producer upcalls (recordImu /
+                // recordFrame) have nowhere to land: the live sensor and camera feed
+                // would be dead with no other symptom, so the failure is reported
+                // instead of discarded (REQ-A187 — the discard gate could not see this
+                // line because it ran clippy without `--features android`).
+                if let Err(e) = android_glue::arm(host.producer()) {
+                    tracing::warn!(
+                        target: "amos::android",
+                        error = %e,
+                        "android glue bus not armed — live sensor/camera upcalls are dropped"
+                    );
+                }
             }
             // On device, arm the torch device-seam UI pusher so OS-driven torch
             // changes (TorchCallback) reach the System UI live via the shared
@@ -389,6 +489,17 @@ pub fn run() {
                 // The SMS trash lives next to the blocklist (same atomic-write,
                 // corrupt-file-logged policy; same glue-visible directory).
                 sms::trash_shared().configure(sms::trash_file_in(&dir));
+                // The IME profile (fuzzy prefs + learned pins) shares that dir too,
+                // so the on-screen keyboard's preferences survive a restart.
+                app.state::<ime::ImeBridge>().configure(ime::file_in(&dir));
+            } else {
+                // No persistent directory: the IME profile (like the blocklist and
+                // the SMS trash) stays in memory for this run. Say so, instead of
+                // letting the user believe preferences were saved.
+                tracing::warn!(
+                    target: "amos::ime",
+                    "app data dir unavailable — input-method preferences and learning will not persist"
+                );
             }
             // Real in-call bridge (default-dialer / InCallService): give the Rust side
             // an AppHandle so Kotlin-pushed real call states reach the WebView as

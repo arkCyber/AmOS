@@ -60,14 +60,14 @@ describe("NoteEditor.svelte", () => {
     });
 
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-editor-textarea"]',
+      'textarea[data-testid="note-editor-textarea"]',
     ) as HTMLTextAreaElement;
     expect(ta.value).toBe("旧标题");
     await fireEvent.input(ta, { target: { value: "新标题与 **加粗** 正文" } });
     await tick();
 
     // ‹ back must flush the pending autosave before returning.
-    await fireEvent.click(host.container.querySelector('[aria-label="note-editor-back"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-back"]')!);
     await tick();
 
     expect(closed).toBe(1);
@@ -88,7 +88,7 @@ describe("NoteEditor.svelte", () => {
     const status = () =>
       host.container.querySelector('[data-testid="note-editor-status"]')?.textContent ?? "";
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-editor-textarea"]',
+      'textarea[data-testid="note-editor-textarea"]',
     ) as HTMLTextAreaElement;
 
     expect(status()).toContain("保存于"); // initialSaveState → "saved"
@@ -108,15 +108,15 @@ describe("NoteEditor.svelte", () => {
     const note = seed();
     const host = render(NoteEditor, { props: { note, onClose: () => {} } });
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-editor-textarea"]',
+      'textarea[data-testid="note-editor-textarea"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "**加粗** 与 #工作" } });
     await tick();
 
-    await fireEvent.click(host.container.querySelector('[aria-label="note-editor-preview"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-preview"]')!);
     await tick();
 
-    const body = host.container.querySelector('[aria-label="note-editor-preview-body"]');
+    const body = host.container.querySelector('[data-testid="note-editor-preview-body"]');
     expect(body).toBeTruthy();
     expect(body?.querySelector("strong")).toBeTruthy();
     expect((body?.textContent ?? "")).toContain("#工作");
@@ -131,7 +131,7 @@ describe("NoteEditor.svelte", () => {
       props: { note: ghost, onClose: () => (closed += 1) },
     });
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-editor-textarea"]',
+      'textarea[data-testid="note-editor-textarea"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "应该不会被写回" } });
     // Let the trailing-edge autosave run (600 ms) so the failure is reported.
@@ -140,7 +140,7 @@ describe("NoteEditor.svelte", () => {
     // generic "saving" text.
     const status = host.container.querySelector('[data-testid="note-editor-status"]');
     expect(status?.textContent ?? "").toContain("笔记已被删除");
-    await fireEvent.click(host.container.querySelector('[aria-label="note-editor-back"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-back"]')!);
     await tick();
 
     expect(closed).toBe(1);
@@ -158,7 +158,7 @@ describe("NoteEditor.svelte", () => {
       const status = () =>
         host.container.querySelector('[data-testid="note-editor-status"]')?.textContent ?? "";
       const ta = host.container.querySelector(
-        'textarea[aria-label="note-editor-textarea"]',
+        'textarea[data-testid="note-editor-textarea"]',
       ) as HTMLTextAreaElement;
 
       await fireEvent.input(ta, { target: { value: "改动会丢" } });
@@ -187,7 +187,7 @@ describe("NoteEditor.svelte", () => {
     await tick();
 
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-editor-textarea"]',
+      'textarea[data-testid="note-editor-textarea"]',
     ) as HTMLTextAreaElement;
     expect(ta.placeholder).toBe("Start typing…"); // was hard-coded "开始输入…"
     const text = host.container.textContent ?? "";
@@ -197,7 +197,7 @@ describe("NoteEditor.svelte", () => {
     expect(host.container.querySelector('[data-testid="note-editor-status"]')!.textContent).toContain(
       "Saved", // "保存于 {time}"
     );
-    expect(host.container.querySelector('[aria-label="note-editor-preview"]')!.getAttribute("title")).toBe(
+    expect(host.container.querySelector('[data-testid="note-editor-preview"]')!.getAttribute("title")).toBe(
       "Rich-text preview", // "富文本预览"
     );
     expect(/[\u4e00-\u9fff]/.test(text)).toBe(false);

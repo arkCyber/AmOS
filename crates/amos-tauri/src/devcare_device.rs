@@ -65,6 +65,7 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Also performs the one-time backend install when the Kotlin glue has already
 /// announced itself (see [`GLUE`]) — the two sides arrive in either order.
 pub fn install_android_app(app: AppHandle) {
+    // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
     let _ = APP.set(app);
     install_backend_if_ready();
 }
@@ -139,9 +140,8 @@ impl GlueRef {
 
     /// Attach the current thread to the VM for one call.
     fn attach(&self) -> Result<JNIEnv<'_>, String> {
-        self.vm
-            .attach_current_thread_permanently()
-            .map_err(|e| format!("devcare attach failed: {e}"))
+        // Shared helper: attach with a clean exception state (REQ-A186).
+        amos_jni::attached(&self.vm).map_err(|e| format!("devcare attach failed: {e}"))
     }
 }
 
@@ -408,14 +408,31 @@ fn spawn_bringup_selfcheck(glue: Arc<GlueRef>) {
         .app_cache_dir()
         .or_else(|_| app.path().app_data_dir().map(|d| d.join("files")))
         .unwrap_or_default();
-    let _ = std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("devcare-selfcheck".to_string())
         .spawn(move || {
             let report = run_bringup_selfcheck(&glue, &plant_dir, &candidates);
             for dir in candidates {
-                let _ = std::fs::write(dir.join(SELFCHECK_OUT), &report);
+                // The self-check file *is* the evidence a device run produces; a silent
+                // write failure would look exactly like a run that never happened
+                // (REQ-A187).
+                if let Err(e) = std::fs::write(dir.join(SELFCHECK_OUT), &report) {
+                    tracing::warn!(
+                        target: "amos::devcare",
+                        dir = %dir.display(),
+                        error = %e,
+                        "self-check report not written"
+                    );
+                }
             }
-        });
+        })
+    {
+        tracing::warn!(
+            target: "amos::devcare",
+            error = %e,
+            "self-check thread not started — this run produces no report"
+        );
+    }
 }
 
 /// Run every device-care seam once and render a JSON report (see
@@ -606,6 +623,7 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_DevCareGlue_attach(
     // On a device the opposite order is the common one (this runs in the
     // Activity's `onStart`, before Tauri's `setup`), so `install_android_app`
     // completes the install later — see `GLUE`.
+    // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
     let _ = GLUE.set(Arc::clone(&handle));
     install_backend_if_ready();
 }

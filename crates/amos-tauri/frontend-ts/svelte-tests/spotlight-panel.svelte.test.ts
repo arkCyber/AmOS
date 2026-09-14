@@ -93,13 +93,13 @@ describe("SpotlightPanel.svelte (controlled via propsBus 'spotlight')", () => {
   test("a non-empty query offers the note action; an empty one does not", async () => {
     const container = await renderOpen();
     // Nothing typed yet ⇒ no action rows (there is nothing to save).
-    expect(container.querySelector('button[aria-label="spotlight-new-note"]')).toBeNull();
+    expect(container.querySelector('button[data-testid="spotlight-new-note"]')).toBeNull();
 
     const input = container.querySelector("input") as HTMLInputElement;
     await fireEvent.input(input, { target: { value: "买牛奶和鸡蛋" } });
     await tick();
     const action = container.querySelector(
-      'button[aria-label="spotlight-new-note"]',
+      'button[data-testid="spotlight-new-note"]',
     ) as HTMLButtonElement | null;
     expect(action).toBeTruthy();
     expect(action?.textContent ?? "").toContain("买牛奶和鸡蛋");
@@ -114,7 +114,7 @@ describe("SpotlightPanel.svelte (controlled via propsBus 'spotlight')", () => {
     await tick();
 
     await fireEvent.click(
-      container.querySelector('button[aria-label="spotlight-new-note"]') as HTMLButtonElement,
+      container.querySelector('button[data-testid="spotlight-new-note"]') as HTMLButtonElement,
     );
     await tick();
 
@@ -135,13 +135,13 @@ describe("SpotlightPanel.svelte (controlled via propsBus 'spotlight')", () => {
     const restore = failWritesFor("amos.notes");
     try {
       await fireEvent.click(
-        container.querySelector('button[aria-label="spotlight-new-note"]') as HTMLButtonElement,
+        container.querySelector('button[data-testid="spotlight-new-note"]') as HTMLButtonElement,
       );
       await tick();
       // Nothing was stored ⇒ nothing closes, nothing is claimed.
       expect(container.textContent ?? "").toContain("本机存储写入失败");
       expect(container.querySelector("h2")).toBeTruthy();
-      const action = container.querySelector('button[aria-label="spotlight-new-note"]');
+      const action = container.querySelector('button[data-testid="spotlight-new-note"]');
       expect(action?.textContent ?? "").toContain("存不进去");
     } finally {
       restore();
@@ -258,12 +258,12 @@ describe("SpotlightPanel.svelte (controlled via propsBus 'spotlight')", () => {
     // Prose: only the note action — Spotlight never pretends "买牛奶" is a number.
     await fireEvent.input(input, { target: { value: "买牛奶" } });
     await tick();
-    expect(container.querySelector('button[aria-label="spotlight-dial"]')).toBeNull();
+    expect(container.querySelector('button[data-testid="spotlight-dial"]')).toBeNull();
 
     await fireEvent.input(input, { target: { value: "+86 138-0000-0000" } });
     await tick();
     const dial = container.querySelector(
-      'button[aria-label="spotlight-dial"]',
+      'button[data-testid="spotlight-dial"]',
     ) as HTMLButtonElement | null;
     expect(dial).toBeTruthy();
     // The label shows the *stripped* dial string (what the dialler will actually send).
@@ -312,13 +312,13 @@ describe("SpotlightPanel.svelte (controlled via propsBus 'spotlight')", () => {
   test("every query can be handed to Settings' own search", async () => {
     const container = await renderOpen();
     // Nothing typed ⇒ no actions at all (there is nothing to hand over).
-    expect(container.querySelector('button[aria-label="spotlight-settings"]')).toBeNull();
+    expect(container.querySelector('button[data-testid="spotlight-settings"]')).toBeNull();
 
     const input = container.querySelector("input") as HTMLInputElement;
     await fireEvent.input(input, { target: { value: "亮度" } });
     await tick();
     const row = container.querySelector(
-      'button[aria-label="spotlight-settings"]',
+      'button[data-testid="spotlight-settings"]',
     ) as HTMLButtonElement | null;
     expect(row).toBeTruthy();
     expect(row?.textContent ?? "").toContain("亮度");

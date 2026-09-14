@@ -187,7 +187,7 @@ describe("AppLibrary.svelte - iOS-style live search", () => {
     const { container } = renderLibrary();
     await tick();
     await type(container, "天气");
-    const clear = container.querySelector('button[aria-label="clear search"]');
+    const clear = container.querySelector(`button[aria-label="${zh["a11y.clearSearch"]}"]`);
     expect(clear).toBeTruthy();
     await fireEvent.click(clear as HTMLButtonElement);
     await tick();

@@ -14,6 +14,7 @@ import { setLocale } from "../src/svelte/locale.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import { PHOTOS_KEY } from "../src/lib/photos";
 import { CAPTURES_KEY } from "../src/lib/cameraCapture";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(() => {
   cleanup();
@@ -84,7 +85,7 @@ describe("PhotosApp.svelte", () => {
     // switch to Videos → only the video tile remains, stills hidden
     await fireEvent.click(vidChip as HTMLButtonElement);
     await tick();
-    expect(host.container.querySelector('button[aria-label="video"]')).toBeTruthy();
+    expect(host.container.querySelector(`button[aria-label="${zh["a11y.video"]}"]`)).toBeTruthy();
     expect(photoCount()).toBe(0);
     // back to All → stills return
     const allChip = [...host.container.querySelectorAll("button")].find(
@@ -247,7 +248,7 @@ describe("PhotosApp.svelte", () => {
     try {
       const host = render(PhotosApp);
       await vi.waitFor(() => {
-        expect(host.container.querySelector('[aria-label="native photos"]')).toBeTruthy();
+        expect(host.container.querySelector(`[aria-label="${zh["a11y.nativePhotos"]}"]`)).toBeTruthy();
       });
       expect(host.container.querySelector('[title="IMG_native.jpg"]')).toBeTruthy();
     } finally {
@@ -295,7 +296,7 @@ describe("PhotosApp.svelte", () => {
         expect(host.container.querySelector('[data-testid="native-blocked"]')).toBeTruthy();
       });
       // No fabricated native strip while the read is denied.
-      expect(host.container.querySelector('[aria-label="native photos"]')).toBeNull();
+      expect(host.container.querySelector(`[aria-label="${zh["a11y.nativePhotos"]}"]`)).toBeNull();
 
       await fireEvent.click(btnAria(host, "授权读取")!);
       await vi.waitFor(() => {

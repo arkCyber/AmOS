@@ -116,8 +116,8 @@ describe("PhoneApp.svelte (offline UI)", () => {
       await flush();
       expect(txt(host)).toContain("客服热线");
 
-      await fireEvent.click(key(host, "history-clear")!);
-      await fireEvent.click(key(host, "history-clear-confirm")!);
+      await fireEvent.click(host.container.querySelector('button[data-testid="history-clear"]')!);
+      await fireEvent.click(host.container.querySelector('button[data-testid="history-clear-confirm"]')!);
       await flush();
 
       // Wiping the log was rejected: the banner shows and the entry is still there.
@@ -136,9 +136,9 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await fireEvent.click(key(host, "2")!);
     await fireEvent.click(key(host, "3")!);
     expect(txt(host)).toContain("123");
-    await fireEvent.click(key(host, "backspace")!);
+    await fireEvent.click(key(host, zh["a11y.backspace"])!);
     expect(txt(host)).toContain("12");
-    await fireEvent.click(key(host, "clear")!);
+    await fireEvent.click(key(host, zh["phone.clear"])!);
     expect(txt(host)).not.toContain("12");
   });
 
@@ -173,12 +173,12 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await fireEvent.click(key(host, "1")!);
     await fireEvent.click(key(host, "3")!);
     await fireEvent.click(key(host, "8")!);
-    const callBtn = host.container.querySelector('button[aria-label="call"]');
+    const callBtn = host.container.querySelector(`button[aria-label="${zh["phone.call"]}"]`);
     expect(callBtn).toBeTruthy();
     await fireEvent.click(callBtn as HTMLButtonElement);
     await new Promise((r) => setTimeout(r, 10)); // let realDial/telephonyDial settle
     // offline: no in-call UI, but a role=alert with the localized dial error
-    expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
+    expect(host.container.querySelector(`button[aria-label="${zh["a11y.end"]}"]`)).toBeFalsy();
     expect(host.container.querySelector('[role="alert"]')).toBeTruthy();
   });
 
@@ -203,7 +203,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     // The live call is adopted → the peer is named and the user can hang up,
     // instead of a bare keypad over a call they cannot end.
     expect(calls.some((c) => c.cmd === "telephony_status")).toBe(true);
-    expect(host.container.querySelector('button[aria-label="end"]')).toBeTruthy();
+    expect(host.container.querySelector(`button[aria-label="${zh["a11y.end"]}"]`)).toBeTruthy();
     expect(txt(host)).toContain("13800000001");
   });
 
@@ -226,22 +226,22 @@ describe("PhoneApp.svelte (offline UI)", () => {
     });
     const host = render(PhoneApp);
     await new Promise((r) => setTimeout(r, 10));
-    await fireEvent.click(host.container.querySelector('button[aria-label="end"]')!);
+    await fireEvent.click(host.container.querySelector(`button[aria-label="${zh["a11y.end"]}"]`)!);
     await new Promise((r) => setTimeout(r, 10));
-    expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
+    expect(host.container.querySelector(`button[aria-label="${zh["a11y.end"]}"]`)).toBeFalsy();
 
     // A resume recheck must not resurrect the call the user just hung up.
     window.dispatchEvent(new Event("focus"));
     await new Promise((r) => setTimeout(r, 10));
-    expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
+    expect(host.container.querySelector(`button[aria-label="${zh["a11y.end"]}"]`)).toBeFalsy();
   });
 
   test("no live call on the daemon → the keypad shows (nothing invented)", async () => {
     fakeBridge(() => null);
     const host = render(PhoneApp);
     await new Promise((r) => setTimeout(r, 10));
-    expect(host.container.querySelector('button[aria-label="end"]')).toBeFalsy();
-    expect(host.container.querySelector('button[aria-label="call"]')).toBeTruthy();
+    expect(host.container.querySelector(`button[aria-label="${zh["a11y.end"]}"]`)).toBeFalsy();
+    expect(host.container.querySelector(`button[aria-label="${zh["phone.call"]}"]`)).toBeTruthy();
   });
 
   test("blocklist tab adds, lists and removes rules through the bridge", async () => {
@@ -275,10 +275,10 @@ describe("PhoneApp.svelte (offline UI)", () => {
     const host = render(PhoneApp);
     await openBlockTab(host);
     await flush();
-    await fireEvent.input(host.container.querySelector('input[aria-label="block-number"]') as HTMLInputElement, {
+    await fireEvent.input(host.container.querySelector('input[data-testid="block-number"]') as HTMLInputElement, {
       target: { value: "1069" },
     });
-    await fireEvent.click(host.container.querySelector('button[aria-label="block-add"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="block-add"]') as HTMLButtonElement);
     await flush();
     const added = calls.find((c) => c.cmd === "blocklist_add");
     expect(added?.pattern).toBe("1069");
@@ -286,7 +286,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     expect(added?.channel).toBe("both");
     expect(txt(host)).toContain("1069");
     // The unknown-number switch reaches the same rule store.
-    await fireEvent.click(host.container.querySelector('button[aria-label="block-unknown"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="block-unknown"]') as HTMLButtonElement);
     await flush();
     expect(calls.find((c) => c.cmd === "blocklist_set_unknown")?.on).toBe(true);
     // Removing the rule drops it from the list.
@@ -310,7 +310,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await openBlockTab(host);
     await flush();
     await fireEvent.input(
-      host.container.querySelector('input[aria-label="block-number"]') as HTMLInputElement,
+      host.container.querySelector('input[data-testid="block-number"]') as HTMLInputElement,
       { target: { value: "1008611" } },
     );
     await new Promise((r) => setTimeout(r, 300)); // preview is debounced (250 ms)
@@ -330,7 +330,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await openBlockTab(host);
     await flush();
     await fireEvent.input(
-      host.container.querySelector('input[aria-label="block-number"]') as HTMLInputElement,
+      host.container.querySelector('input[data-testid="block-number"]') as HTMLInputElement,
       { target: { value: "12345678" } },
     );
     await new Promise((r) => setTimeout(r, 300));
@@ -354,7 +354,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await openBlockTab(host);
     await flush();
     const clearBtn = () =>
-      host.container.querySelector('button[aria-label="block-clear"]') as HTMLButtonElement | null;
+      host.container.querySelector('button[data-testid="block-clear"]') as HTMLButtonElement | null;
     expect(clearBtn()).toBeTruthy();
     await fireEvent.click(clearBtn()!); // arms the confirm
     expect(calls.some((c) => c.cmd === "blocklist_clear")).toBe(false);
@@ -402,10 +402,10 @@ describe("PhoneApp.svelte (offline UI)", () => {
     const host = render(PhoneApp);
     await openBlockTab(host);
     await flush();
-    await fireEvent.input(host.container.querySelector('input[aria-label="block-number"]') as HTMLInputElement, {
+    await fireEvent.input(host.container.querySelector('input[data-testid="block-number"]') as HTMLInputElement, {
       target: { value: "abc" },
     });
-    await fireEvent.click(host.container.querySelector('button[aria-label="block-add"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="block-add"]') as HTMLButtonElement);
     await flush();
     const alert = host.container.querySelector('[role="alert"]');
     expect(alert?.textContent ?? "").toContain("号码无效");
@@ -441,7 +441,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await flush();
     expect(host.container.querySelector('[data-testid="block-role-needed"]')).toBeTruthy();
     await fireEvent.click(
-      host.container.querySelector('button[aria-label="block-grant-role"]') as HTMLButtonElement,
+      host.container.querySelector('button[data-testid="block-grant-role"]') as HTMLButtonElement,
     );
     await flush();
     expect(calls.some((c) => c.cmd === "blocklist_request_role")).toBe(true);
@@ -515,7 +515,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await flush();
     expect(host.container.querySelector('[data-testid="block-role-unavailable"]')).toBeTruthy();
     // Nothing can be asked for here → no dead grant button, and no false "held".
-    expect(host.container.querySelector('button[aria-label="block-grant-role"]')).toBeNull();
+    expect(host.container.querySelector('button[data-testid="block-grant-role"]')).toBeNull();
     expect(host.container.querySelector('[data-testid="block-role-held"]')).toBeNull();
   });
 
@@ -540,7 +540,7 @@ describe("PhoneApp.svelte (offline UI)", () => {
     await openBlockTab(host);
     await flush();
     expect(host.container.querySelector('[data-testid="block-role-held"]')).toBeTruthy();
-    expect(host.container.querySelector('button[aria-label="block-grant-role"]')).toBeNull();
+    expect(host.container.querySelector('button[data-testid="block-grant-role"]')).toBeNull();
     expect(host.container.querySelector('[data-testid="block-role-needed"]')).toBeNull();
   });
 
@@ -666,8 +666,8 @@ describe("PhoneApp.svelte (offline UI)", () => {
     const host = render(PhoneApp);
     await openHistoryTab(host);
     await flush();
-    const el = (aria: string) =>
-      host.container.querySelector(`button[aria-label="${aria}"]`) as HTMLButtonElement;
+    const el = (id: string) =>
+      host.container.querySelector(`button[data-testid="${id}"]`) as HTMLButtonElement;
     // First tap only arms the confirm — nothing is cleared yet.
     await fireEvent.click(el("history-clear"));
     await flush();

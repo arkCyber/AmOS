@@ -173,7 +173,16 @@ impl BlocklistState {
             return; // no file configured (tests / host before setup)
         };
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            // Name the directory failure itself: the write below will fail too, and its
+            // error would not tell the operator that it was the mkdir that was refused.
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    target: "amos::blocklist",
+                    dir = %dir.display(),
+                    error = %e,
+                    "blocklist directory could not be created"
+                );
+            }
         }
         let payload = self.read().to_json();
         let tmp = path.with_extension("json.tmp");
@@ -433,14 +442,16 @@ mod device {
         let vm = VM
             .get()
             .ok_or_else(|| "blocklist JVM not captured yet".to_string())?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("blocklist attach failed: {e}"))?;
-        let class = env
-            .find_class("com/amos/ai/glue/BlocklistGlue")
+        // Shared helper: attach with a clean exception state (REQ-A186).
+        let mut env =
+            amos_jni::attached(vm).map_err(|e| format!("blocklist attach failed: {e}"))?;
+        // Same boundary as `incall`: no `Context` here (only the captured `JavaVM`), so
+        // the class is resolved through the calling thread's loader — correct from a
+        // Java upcall, a clean error from a tokio worker — and the call is wrapped so a
+        // failure cannot leave an exception pending (see scripts/jni-allowlist.json).
+        let class = amos_jni::jni_call!(env, env.find_class("com/amos/ai/glue/BlocklistGlue"))
             .map_err(|e| e.to_string())?;
-        let value = env
-            .call_static_method(&class, method, "()Z", &[])
+        let value = amos_jni::jni_call!(env, env.call_static_method(&class, method, "()Z", &[]))
             .map_err(|e| e.to_string())?;
         value.z().map_err(|e| e.to_string())
     }
@@ -488,6 +499,7 @@ mod device {
         };
         // Remember the VM so the status/role commands can call back into Kotlin.
         if let Ok(vm) = env.get_java_vm() {
+            // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
             let _ = VM.set(vm);
         }
         // SAFETY: `dir` is a live local ref for the duration of this call.

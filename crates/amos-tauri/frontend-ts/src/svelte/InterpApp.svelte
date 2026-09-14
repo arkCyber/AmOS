@@ -362,7 +362,7 @@
       <button onclick={() => void togglePause()} class={btnCls("neutral", "sm")}>
         {paused ? t("interp.resume") : t("interp.pause")}
       </button>
-      <button onclick={() => void toggleMic()} title="mic" class={chipCls(rec)}>
+      <button onclick={() => void toggleMic()} title={t("a11y.mic")} class={chipCls(rec)}>
         {rec ? "●" : "🎤"}
       </button>
     {:else}

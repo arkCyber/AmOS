@@ -83,7 +83,7 @@ describe("Shell.svelte (surface decision tree)", () => {
     const { container } = render(Shell);
     await tick();
     expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
-    const back = container.querySelector('button[aria-label="back"]') as HTMLButtonElement | null;
+    const back = container.querySelector(`button[aria-label="${zh["a11y.back"]}"]`) as HTMLButtonElement | null;
     expect(back).toBeTruthy();
     await fireEvent.click(back!);
     await tick();
@@ -238,7 +238,7 @@ describe("Shell.svelte (surface decision tree)", () => {
     const { container } = render(Shell);
     await tick();
     const editBtn = [...container.querySelectorAll("button")].find(
-      (b) => b.getAttribute("aria-label") === "edit home",
+      (b) => b.getAttribute("aria-label") === zh["a11y.editHome"],
     );
     expect(editBtn).toBeTruthy();
     await fireEvent.click(editBtn as HTMLButtonElement);
@@ -271,7 +271,7 @@ describe("Shell.svelte (surface decision tree)", () => {
     await tick();
     // Both the home pill and the NC action carry aria-label="search"; either
     // routes to Spotlight through Shell.
-    const search = container.querySelector('button[aria-label="search"]') as HTMLButtonElement | null;
+    const search = container.querySelector(`button[aria-label="${zh["shell.search"]}"]`) as HTMLButtonElement | null;
     expect(search).toBeTruthy();
     await fireEvent.click(search!);
     await tick();
@@ -283,7 +283,7 @@ describe("Shell.svelte (surface decision tree)", () => {
     const { container } = render(Shell);
     await tick();
     const lockBtn = [...container.querySelectorAll("button")].find(
-      (b) => b.getAttribute("aria-label") === "lock",
+      (b) => b.getAttribute("aria-label") === zh["a11y.lock"],
     );
     expect(lockBtn).toBeTruthy();
     await fireEvent.click(lockBtn as HTMLButtonElement);
@@ -471,8 +471,8 @@ describe("Shell.svelte (store tiles)", () => {
     delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   });
 
-  /** Bridge that reports one installed store app. */
-  function bridgeWithInstalled() {
+  /** Bridge that reports one installed store app, with a runnable web bundle. */
+  function bridgeWithInstalled(entry?: { url: string; start: string } | "reject") {
     (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (cmd: string) => {
         if (cmd === "appstore_installed") {
@@ -490,6 +490,10 @@ describe("Shell.svelte (store tiles)", () => {
               installed_at: 1,
             },
           ];
+        }
+        if (cmd === "appstore_bundle_entry") {
+          if (entry === "reject") throw new Error("no web install dir (set AMOS_APPSTORE_INSTALL_DIR)");
+          return entry ?? { url: "amos-app://org.amos.demo/index.html", start: "index.html" };
         }
         return null;
       },
@@ -509,17 +513,40 @@ describe("Shell.svelte (store tiles)", () => {
     });
   });
 
-  test("opening a store tile explains the missing runtime host (never blank)", async () => {
+  test("opening a store tile runs its bundle at the app's own origin", async () => {
     bridgeWithInstalled();
     const host = render(Shell);
     await tick();
     open("store:org.amos.demo");
+    await vi.waitFor(() => {
+      expect(host.container.querySelector('[data-testid="ext-app-frame"]')).toBeTruthy();
+    });
+    const frame = host.container.querySelector('[data-testid="ext-app-frame"]') as HTMLIFrameElement;
+    // The app's OWN origin — not the index's, not the shell's — is what makes the
+    // bundle same-origin with its own assets and cross-origin to AmOS.
+    expect(frame.getAttribute("src")).toBe("amos-app://org.amos.demo/index.html");
+    // Sandboxed, and without the flags that would let it escape (no top-navigation,
+    // no popups, no modals). `allow-same-origin` is safe only because the frame is
+    // cross-origin to the shell.
+    const sandbox = frame.getAttribute("sandbox") ?? "";
+    expect(sandbox).toContain("allow-scripts");
+    expect(sandbox).toContain("allow-same-origin");
+    expect(sandbox).not.toContain("allow-top-navigation");
+    expect(sandbox).not.toContain("allow-popups");
+  });
+
+  test("a bundle the host cannot serve explains why (never blank)", async () => {
+    bridgeWithInstalled("reject");
+    const host = render(Shell);
     await tick();
-    expect(host.container.querySelector('[data-testid="ext-app-pending"]')).toBeTruthy();
-    // The manifest id is named and the honest reason is shown.
+    open("store:org.amos.demo");
+    await vi.waitFor(() => {
+      expect(host.container.querySelector('[data-testid="ext-app-failed"]')).toBeTruthy();
+    });
     const text = host.container.textContent ?? "";
-    expect(text).toContain("org.amos.demo");
-    expect(text).toContain("web-bundle");
+    // The host's own words, not a generic shrug.
+    expect(text).toContain("AMOS_APPSTORE_INSTALL_DIR");
+    expect(text).toContain("无法运行");
   });
 });
 

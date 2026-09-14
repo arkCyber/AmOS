@@ -57,7 +57,7 @@ describe("FilesApp.svelte", () => {
   test("creating a folder adds it to the current directory", async () => {
     const host = render(FilesApp);
     await fireEvent.click(btnContaining(host, "文件夹")!);
-    const input = host.container.querySelector('input[aria-label="file-new-name"]') as HTMLInputElement;
+    const input = host.container.querySelector('input[data-testid="file-new-name"]') as HTMLInputElement;
     expect(input).toBeTruthy();
     await fireEvent.input(input, { target: { value: "工作" } });
     await fireEvent.click(btnContaining(host, "保存")!);
@@ -70,7 +70,7 @@ describe("FilesApp.svelte", () => {
       const host = render(FilesApp);
       await fireEvent.click(btnContaining(host, "文件夹")!);
       const input = host.container.querySelector(
-        'input[aria-label="file-new-name"]',
+        'input[data-testid="file-new-name"]',
       ) as HTMLInputElement;
       await fireEvent.input(input, { target: { value: "工作" } });
       await fireEvent.click(btnContaining(host, "保存")!);
@@ -79,7 +79,7 @@ describe("FilesApp.svelte", () => {
       expect(txt(host)).toContain("本机存储写入失败");
       expect(txt(host)).not.toContain("工作");
       const still = host.container.querySelector(
-        'input[aria-label="file-new-name"]',
+        'input[data-testid="file-new-name"]',
       ) as HTMLInputElement | null;
       expect(still?.value).toBe("工作");
     } finally {
@@ -199,7 +199,7 @@ describe("FilesApp.svelte — device files (external, read-only)", () => {
     await openSection(host);
     await vi.waitFor(() => expect(txt(host)).toContain("report.pdf"));
 
-    const filter = host.container.querySelector('input[aria-label="external-search"]') as HTMLInputElement;
+    const filter = host.container.querySelector('input[data-testid="external-search"]') as HTMLInputElement;
     await fireEvent.input(filter, { target: { value: "holiday" } });
     await vi.waitFor(() => expect(txt(host)).not.toContain("report.pdf"));
     expect(txt(host)).toContain("holiday.jpg");

@@ -451,7 +451,16 @@ impl SmsTrashState {
             return; // no file configured (tests / host before setup)
         };
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            // Name the directory failure itself: the write below will fail too, and its
+            // error would not tell the operator that it was the mkdir that was refused.
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    target: "amos::sms",
+                    dir = %dir.display(),
+                    error = %e,
+                    "sms trash directory could not be created"
+                );
+            }
         }
         let payload = self.read().to_json();
         let tmp = path.with_extension("json.tmp");
@@ -963,6 +972,7 @@ mod events {
 
     /// Install the emitter (called once from `lib.rs::setup`).
     pub fn install(app: AppHandle) {
+        // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
         let _ = APP.set(app);
     }
 
@@ -1007,7 +1017,16 @@ mod events {
             from = %if payload.address.is_empty() { "<unknown>".to_string() } else { mask_address(&payload.address) },
             "incoming SMS signalled by the device"
         );
-        let _ = app.emit(SMS_RECEIVED_EVENT, payload);
+        // The inbox refresh depends on this event reaching the WebView; a failed emit
+        // means a new message is in the store but the UI still shows the old inbox
+        // (REQ-A187).
+        if let Err(e) = app.emit(SMS_RECEIVED_EVENT, payload) {
+            tracing::warn!(
+                target: "amos::sms",
+                error = %e,
+                "incoming SMS not delivered to the UI (it is in the store)"
+            );
+        }
     }
 }
 
@@ -1043,6 +1062,7 @@ mod device {
     fn install(vm: jni::JavaVM, env: &jni::JNIEnv<'_>, glue: JObject<'_>) {
         use amos_sms::AndroidSmsProvider;
         if let Ok(p) = AndroidSmsProvider::new(vm, env, glue) {
+            // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
             let _ = DEVICE.set(Arc::new(p)); // first attach wins (exactly-once)
         }
     }

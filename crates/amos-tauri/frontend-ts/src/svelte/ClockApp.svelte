@@ -401,7 +401,7 @@
 <div class="p-6">
   <StoreErrorBar message={storeErr} />
   <!-- Tabs (mini Segmented) -->
-  <div class="flex justify-center gap-1 pt-1 pb-3" role="tablist" aria-label="clock-tabs">
+  <div class="flex justify-center gap-1 pt-1 pb-3" role="tablist" data-testid="clock-tabs">
     <button role="tab" aria-selected={tab === "world"} onclick={() => (tab = "world")} class={seg(tab === "world")}>{t("clock.world")}</button>
     <button role="tab" aria-selected={tab === "stopwatch"} onclick={() => (tab = "stopwatch")} class={seg(tab === "stopwatch")}>{t("clock.stopwatch")}</button>
     <button role="tab" aria-selected={tab === "timer"} onclick={() => (tab = "timer")} class={seg(tab === "timer")}>{t("clock.timer")}</button>
@@ -471,7 +471,7 @@
                     <button onclick={() => moveCity(c.zone, -1)} disabled={wc[0]?.zone === c.zone} aria-label={t("clock.moveUp")} data-role="move-up" class="grid h-4 w-5 place-items-center rounded bg-neutral-300 text-[10px] leading-none disabled:opacity-25 dark:bg-neutral-700">▲</button>
                     <button onclick={() => moveCity(c.zone, 1)} disabled={wc[wc.length - 1]?.zone === c.zone} aria-label={t("clock.moveDown")} data-role="move-down" class="grid h-4 w-5 place-items-center rounded bg-neutral-300 text-[10px] leading-none disabled:opacity-25 dark:bg-neutral-700">▼</button>
                   </div>
-                  <button onclick={() => removeCityAt(c.zone)} aria-label="remove-city" data-icon="x" class="inline-flex items-center gap-1 rounded-full bg-neutral-300 px-2 text-xs text-danger dark:bg-neutral-700">{@html iconSvg("x", "h-3 w-3")}</button>
+                  <button onclick={() => removeCityAt(c.zone)} data-testid="remove-city" data-icon="x" class="inline-flex items-center gap-1 rounded-full bg-neutral-300 px-2 text-xs text-danger dark:bg-neutral-700">{@html iconSvg("x", "h-3 w-3")}</button>
                 {/if}
                 <span class="tabular-nums">{zoneClock(now, c.zone)}</span>
               </div>
@@ -518,7 +518,7 @@
         <button onclick={tmToggle} disabled={tm.totalMs === 0 && !tm.running} aria-label={t("clock.timer")} data-icon={tm.running ? "pause" : "play"} class={round(tm.running ? "bg-danger" : "bg-green-500")}>
           {@html iconSvg(tm.running ? "pause" : "play", "h-7 w-7")}
         </button>
-        <button onclick={tmReset} disabled={tm.totalMs === 0} aria-label="reset" data-icon="reset" class="grid h-12 w-12 place-items-center rounded-full bg-neutral-300 text-neutral-700 disabled:opacity-30 dark:bg-neutral-700 dark:text-neutral-100">{@html iconSvg("rotateCcw", "h-5 w-5")}</button>
+        <button onclick={tmReset} disabled={tm.totalMs === 0} aria-label={t("a11y.reset")} data-icon="reset" class="grid h-12 w-12 place-items-center rounded-full bg-neutral-300 text-neutral-700 disabled:opacity-30 dark:bg-neutral-700 dark:text-neutral-100">{@html iconSvg("rotateCcw", "h-5 w-5")}</button>
       </div>
     </div>
   {/if}
@@ -634,8 +634,8 @@
       <div class="mt-1 text-4xl font-medium tabular-nums">{fmtStopwatch(sw.elapsedMs)}</div>
       <div class="mt-3 flex items-center justify-center gap-4">
         <button onclick={swToggle} aria-label={t("clock.stopwatch")} data-icon={sw.running ? "pause" : "play"} class={round(sw.running ? "bg-danger" : "bg-green-500")}>{@html iconSvg(sw.running ? "pause" : "play", "h-7 w-7")}</button>
-        <button onclick={doLap} disabled={!sw.running} aria-label="lap" class="h-10 rounded-full bg-neutral-300 px-3 text-sm disabled:opacity-30 dark:bg-neutral-700">{t("clock.lap")}</button>
-        <button onclick={resetSw} disabled={sw.elapsedMs === 0 && !sw.running} aria-label="reset" data-icon="reset" class="grid h-12 w-12 place-items-center rounded-full bg-neutral-300 text-neutral-700 disabled:opacity-30 dark:bg-neutral-700 dark:text-neutral-100">{@html iconSvg("rotateCcw", "h-5 w-5")}</button>
+        <button onclick={doLap} disabled={!sw.running} aria-label={t("clock.lap")} class="h-10 rounded-full bg-neutral-300 px-3 text-sm disabled:opacity-30 dark:bg-neutral-700">{t("clock.lap")}</button>
+        <button onclick={resetSw} disabled={sw.elapsedMs === 0 && !sw.running} aria-label={t("a11y.reset")} data-icon="reset" class="grid h-12 w-12 place-items-center rounded-full bg-neutral-300 text-neutral-700 disabled:opacity-30 dark:bg-neutral-700 dark:text-neutral-100">{@html iconSvg("rotateCcw", "h-5 w-5")}</button>
       </div>
       {#if laps.length > 0}
         <div class="mt-3 space-y-1 border-t pt-2 text-sm tabular-nums">

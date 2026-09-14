@@ -10,6 +10,7 @@ import Shell from "./svelte/Shell.svelte";
 import { bootOsChrome } from "./svelte/osBoot";
 import { hydrateFromSystemStore } from "./lib/amosStore";
 import { installUiFailureObserver } from "./lib/uiFailures";
+import { invoke } from "./lib/backend";
 import {
   enterEdit,
   lock,
@@ -55,6 +56,19 @@ function mountShell() {
  * or absent snapshot must never block the shell — so it is best-effort.
  */
 async function boot() {
+  // TEMP PROBE (REQ-A171): forward CSP violations + two boot markers to the host,
+  // which prints them to stderr. A CSP violation is otherwise only visible in the
+  // WebView console — nothing outside the window can read it, so the shell's own
+  // policy could not be verified without a human watching devtools.
+  const cspProbe = (msg: string) => void invoke("csp_probe", { report: msg });
+  document.addEventListener("securitypolicyviolation", (e) => {
+    const ev = e as SecurityPolicyViolationEvent;
+    cspProbe(
+      `VIOLATION ${ev.violatedDirective} blocked ${ev.blockedURI || "(inline)"} at ${ev.sourceFile}:${ev.lineNumber}`,
+    );
+  });
+  cspProbe("boot-reached");
+
   // Install the failure observer **first**: everything below runs through async callbacks
   // (the store hydration, the app watchers), and a throw in one of them used to leave no
   // trace at all (REQ-A151). It only observes — it does not swallow the event.
@@ -67,6 +81,7 @@ async function boot() {
   // Apply persisted theme/locale to the document before first paint.
   bootOsChrome();
   mountShell();
+  cspProbe("shell-mounted");
 }
 
 void boot();

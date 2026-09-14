@@ -1,0 +1,4 @@
+{
+  "policy": "Two kinds of feature-gated test that no `cargo test` step runs (see scripts/feature-test-scan.mjs): `entries` = a **feature-gated module** (`#[cfg(feature = \"…\")] mod x;`) that contains tests; `gatedTests` = a test *item* behind a positive `#[cfg(feature = \"…\")]` inside a non-gated module (REQ-A192), keyed `crate/feature`. In both cases coverage is checked *syntactically* against the Makefile (with transitive feature enablement), so the normal fix is a step like `cargo test -p <crate> --features <crate>/<feature>`, not an entry here. An entry needs a reason: a test that genuinely cannot run on a host (it needs a device/JVM/NDK) belongs here until it is moved behind a device harness; anything else is a bug in the Makefile. A stale entry (no longer a finding) FAILS the gate.",
+  "entries": {}
+}

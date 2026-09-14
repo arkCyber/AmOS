@@ -151,9 +151,7 @@ impl AndroidBatteryPowerSource {
     }
 
     fn attach(&self) -> Result<JNIEnv<'_>, String> {
-        self.vm
-            .attach_current_thread_permanently()
-            .map_err(|e| e.to_string())
+        amos_jni::attached(&self.vm).map_err(|e| e.to_string())
     }
 
     fn read_current_ua(&self, env: &mut JNIEnv<'_>, mgr: &JObject<'_>) -> Option<i64> {

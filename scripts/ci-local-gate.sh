@@ -27,6 +27,31 @@ ok()   { printf '  [ok] %s\n' "$*"; }
 bad()  { printf '  [FAIL] %s\n' "$*"; fails=$((fails + 1)); }
 wrn()  { printf '  [warn] %s\n' "$*"; warn=$((warn + 1)); }
 
+# Bounded Docker probe (REQ-A193). `docker info` can hang for minutes — a starting or wedged
+# Docker Desktop — and a gate that hangs is worse than one that skips: the REQ-A193 sweep sat
+# in this call for 5+ minutes with the daemon up. `AMOS_DOCKER_PROBE_SECS` (default 20) bounds
+# it; anything slower is reported as "did not answer" instead of blocking the whole sweep.
+#
+# Two details the first version got wrong, both found by the negative control: the killed
+# child must be SIGKILLed (the Docker CLI does not act on SIGTERM while it is waiting, so the
+# probe stayed blocked for 10 minutes), and the timeout path must **not** `wait` for it (a
+# child that outlives the kill would block the gate — the very hang this function prevents).
+docker_timeout="${AMOS_DOCKER_PROBE_SECS:-20}"
+docker_up() {
+  local _t="$docker_timeout" _i=0 _pid
+  ( docker info >/dev/null 2>&1 ) &
+  _pid=$!
+  while kill -0 "$_pid" 2>/dev/null; do
+    if (( _i >= _t * 10 )); then
+      kill -KILL "$_pid" 2>/dev/null
+      return 1
+    fi
+    sleep 0.1
+    _i=$((_i + 1))
+  done
+  wait "$_pid" 2>/dev/null
+}
+
 echo "=== AmOS local CI-parity gate ($REPO_ROOT) ==="
 
 # --- 1. bash syntax over every shell script --------------------------------
@@ -86,19 +111,17 @@ done
 echo; echo "-- 5. container build --"
 want_docker=0
 for a in "$@"; do [[ "$a" == "--docker" ]] && want_docker=1; done
-if [[ "$want_docker" -eq 1 ]] || docker info >/dev/null 2>&1; then
-  if docker info >/dev/null 2>&1; then
-    echo "  building .github/docker/ci-android --platform linux/amd64 (downloads the NDK; may take a while)..."
-    if docker build --platform linux/amd64 -q .github/docker/ci-android >/dev/null; then
-      ok "docker image builds"
-    else
-      bad "docker image build failed"
-    fi
+if ! command -v docker >/dev/null 2>&1; then
+  wrn "docker not available; skipping build"
+elif [[ "$want_docker" -eq 1 ]] || docker_up; then
+  echo "  building .github/docker/ci-android --platform linux/amd64 (downloads the NDK; may take a while)..."
+  if docker build --platform linux/amd64 -q .github/docker/ci-android >/dev/null; then
+    ok "docker image builds"
   else
-    wrn "docker daemon not running; skipping build (start Docker Desktop, or pass --docker)"
+    bad "docker image build failed"
   fi
 else
-  wrn "docker not available; skipping build"
+  wrn "docker daemon did not answer within ${docker_timeout}s; skipping build (wait for Docker Desktop, or pass --docker to try anyway)"
 fi
 
 echo

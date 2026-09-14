@@ -14,10 +14,20 @@ path = "src/lib.rs"
 async-trait = "0.1"
 thiserror = "1"
 tokio.workspace = true
+# A failed Airplane rollback must be visible (see `manager::rollback_to`): the
+# caller's error is about the *cascade*, not about the state the device is left in.
+tracing.workspace = true
 # Real Android backend (Android ConnectivityManager/WifiManager + BluetoothManager
 # via JNI). Optional: only pulled in when the `android` feature is enabled, so
 # desktop/CI builds stay free of the JNI stack.
 jni = { version = "0.21", optional = true }
+# Shared JNI rules (clean exception state + class resolution through the app
+# loader): see crates/amos-jni/src/lib.rs and REQ-A186.
+amos-jni = { path = "../amos-jni", optional = true }
+# The Kotlin glue answers the Bluetooth scan as a JSON string (the house pattern
+# for a glue list — see DevCareGlue/`devcare_device.rs`); parsing it here keeps the
+# JNI boundary to plain strings. Optional, like the rest of the Android face.
+serde_json = { version = "1", optional = true }
 
 [features]
 default = []
@@ -25,4 +35,9 @@ default = []
 # of the System UI APK (cross-compiled for aarch64-linux-android); the module is
 # deliberately excluded from desktop/CI. Runtime still requires a real Android
 # VM + a Context; `cargo check --features android` validates that it *compiles*.
-android = ["dep:jni"]
+android = ["dep:jni", "dep:amos-jni", "dep:serde_json"]
+
+[dev-dependencies]
+# `tests/rollback_reporting.rs` captures the manager's warnings with its own
+# subscriber (own process, like `amos-supervisor/tests/restart_failure_reporting.rs`).
+tracing-subscriber.workspace = true

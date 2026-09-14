@@ -48,6 +48,7 @@ const ASSIGN: Record<string, CategoryId> = {
   privacy: "system",
   android: "system",
   store: "system",
+  pwa: "system",
   terminal: "utilities",
 };
 

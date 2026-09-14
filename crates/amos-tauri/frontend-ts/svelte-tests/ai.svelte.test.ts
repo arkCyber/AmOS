@@ -12,6 +12,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import AiApp from "../src/svelte/AiApp.svelte";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
 
@@ -47,7 +48,7 @@ describe("AiApp.svelte (offline shell)", () => {
     await settle();
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "你好" } });
-    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, zh["a11y.send"]) as HTMLButtonElement);
     await settle();
     expect(input?.value).toBe(""); // echoed, not a silent no-op
     expect(txt(host)).toContain("你好");
@@ -61,7 +62,7 @@ describe("AiApp.svelte (offline shell)", () => {
     // Seed a conversation by sending offline.
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "hi" } });
-    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, zh["a11y.send"]) as HTMLButtonElement);
     await settle();
     expect(txt(host)).not.toContain("与 AI 对话"); // no longer empty
     // First tap arms...
@@ -80,7 +81,7 @@ describe("AiApp.svelte (offline shell)", () => {
     await settle();
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "hi" } });
-    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, zh["a11y.send"]) as HTMLButtonElement);
     await settle();
     // Arm the two-step clear...
     await fireEvent.click(btnText(host, "清空") as HTMLButtonElement);
@@ -100,7 +101,7 @@ describe("AiApp.svelte (offline shell)", () => {
     expect(btnText(host, "复制回答")).toBeFalsy();
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "hello" } });
-    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, zh["a11y.send"]) as HTMLButtonElement);
     await settle();
     expect(btnText(host, "复制回答")).toBeTruthy(); // last agent bubble has text
   });
@@ -211,14 +212,14 @@ describe("AiApp.svelte (bridged: ask-my-notes grounding)", () => {
     const host = render(AiApp);
     await settle();
 
-    const toggle = btnByAria(host, "ai-cite-toggle");
+    const toggle = host.container.querySelector('[data-testid="ai-cite-toggle"]');
     expect(toggle).toBeTruthy();
     await fireEvent.click(toggle as HTMLButtonElement);
     expect((toggle as HTMLButtonElement).getAttribute("aria-pressed")).toBe("true");
 
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "我这个月还剩多少钱？" } });
-    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, zh["a11y.send"]) as HTMLButtonElement);
 
     await waitUntil(() => host.container.querySelector('[data-testid="ai-cite-status"]') !== null);
     // The retrieval service was actually used…
@@ -237,10 +238,10 @@ describe("AiApp.svelte (bridged: ask-my-notes grounding)", () => {
     const host = render(AiApp);
     await settle();
 
-    await fireEvent.click(btnByAria(host, "ai-cite-toggle") as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('[data-testid="ai-cite-toggle"]') as HTMLButtonElement);
     const input = textareaByPlaceholder(host, "输入指令");
     await fireEvent.input(input as HTMLTextAreaElement, { target: { value: "随便问问" } });
-    await fireEvent.click(btnByAria(host, "send") as HTMLButtonElement);
+    await fireEvent.click(btnByAria(host, zh["a11y.send"]) as HTMLButtonElement);
 
     await waitUntil(() => host.container.querySelector('[data-testid="ai-cite-status"]') !== null);
     expect(txt(host)).toContain("笔记检索离线");
@@ -299,7 +300,7 @@ describe("AiApp.svelte — attached system context (wm SystemContext)", () => {
     await settle();
     expect(banner(host)).toBeTruthy();
 
-    await fireEvent.click(btnByAria(host, "ai-context-clear") as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('[data-testid="ai-context-clear"]') as HTMLButtonElement);
     await settle();
 
     expect(calls).toContainEqual({

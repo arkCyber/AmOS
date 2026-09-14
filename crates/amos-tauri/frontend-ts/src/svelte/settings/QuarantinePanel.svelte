@@ -42,7 +42,7 @@
         </span>
         <button
           onclick={() => void copy(r.key)}
-          aria-label="quarantine-copy"
+          data-testid="quarantine-copy"
           class="shrink-0 rounded-full bg-black/5 px-3 py-1 text-xs active:scale-95 dark:bg-white/10"
         >
           {copied === r.key ? t("settings.quarantineCopied") : t("settings.quarantineCopy")}

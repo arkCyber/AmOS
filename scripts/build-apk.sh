@@ -64,6 +64,11 @@ EOF
 # the APK links jni providers that are on disk (matches documented bring-up).
 scripts/build-android.sh
 
+# Put the tracked Kotlin glue where this build reads it (gen/ is git-ignored, so
+# without this step a NEWLY ADDED glue file — or an edited one — would be missing
+# or stale in the APK). Same single implementation the host compile gate uses.
+scripts/android-glue-mirror.sh
+
 cd crates/amos-tauri
 echo
 echo "== building System UI APK (android feature HARD-CODED) =="

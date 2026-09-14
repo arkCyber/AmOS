@@ -514,14 +514,14 @@
     bind:value={text}
     rows={3}
     placeholder={t("note.placeholder")}
-    aria-label="note-compose"
+    data-testid="note-compose" aria-label={t("note.placeholder")}
     class="mb-2 w-full resize-none rounded-2xl bg-black/5 p-3 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:text-neutral-100 dark:ring-white/10 dark:placeholder:text-white/30"
   ></textarea>
   <div class="flex items-center justify-between">
     <span class="flex items-center gap-2">
       <button onclick={add} class="rounded-full bg-accent px-4 py-1.5 text-sm text-white active:scale-95">{t("note.add")}</button>
-      <button onclick={importMd} aria-label="note-import-md" title={t("note.importMdHint")} class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">⇪ md</button>
-      <button onclick={toggleAsk} aria-label="note-ask-toggle" aria-pressed={askOpen} class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">🔍 {t("note.ask")}</button>
+      <button onclick={importMd} data-testid="note-import-md" title={t("note.importMdHint")} class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">⇪ md</button>
+      <button onclick={toggleAsk} data-testid="note-ask-toggle" aria-pressed={askOpen} class="rounded-full bg-black/5 px-3 py-1.5 text-sm dark:bg-white/10">🔍 {t("note.ask")}</button>
     </span>
     <span class="text-xs opacity-50">{t("note.stats", { chars: String(composeStats.chars), lines: String(composeStats.lines) })}</span>
   </div>
@@ -533,10 +533,10 @@
           bind:value={askQ}
           onkeydown={(e) => e.key === "Enter" && runAsk()}
           placeholder={t("note.askPlaceholder")}
-          aria-label="note-ask-q"
+          data-testid="note-ask-q" aria-label={t("note.askPlaceholder")}
           class="min-w-0 flex-1 rounded-full bg-white/70 px-3.5 py-1.5 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-black/20 dark:text-neutral-100 dark:ring-white/10 dark:placeholder:text-white/30"
         />
-        <button onclick={runAsk} disabled={ragBusy || !bridged()} aria-label="note-ask-run" class="rounded-full bg-accent px-4 py-1.5 text-sm text-white disabled:opacity-50">{t("note.askRun")}</button>
+        <button onclick={runAsk} disabled={ragBusy || !bridged()} data-testid="note-ask-run" class="rounded-full bg-accent px-4 py-1.5 text-sm text-white disabled:opacity-50">{t("note.askRun")}</button>
       </div>
       {#if ragState}
         <p data-testid="note-rag-status" class="mt-1 text-[11px] opacity-60">
@@ -576,11 +576,11 @@
   {#if mode === "all"}
     <div class="mt-2 flex flex-col gap-1 text-xs opacity-70">
       <label class="flex items-center gap-2">
-        <input type="checkbox" bind:checked={prefs.openInEditor} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-open-in-editor" />
+        <input type="checkbox" bind:checked={prefs.openInEditor} onchange={() => saveNotesPrefs(prefs)} data-testid="note-pref-open-in-editor" />
         {t("note.tapToEditHint")}
       </label>
       <label class="flex items-center gap-2">
-        <input type="checkbox" bind:checked={prefs.sortByModified} onchange={() => saveNotesPrefs(prefs)} aria-label="note-pref-sort-by-modified" />
+        <input type="checkbox" bind:checked={prefs.sortByModified} onchange={() => saveNotesPrefs(prefs)} data-testid="note-pref-sort-by-modified" />
         {t("note.sortHint")}
       </label>
     </div>
@@ -590,7 +590,7 @@
     <input
       bind:value={searchQ}
       placeholder={t("note.search")}
-      aria-label="note-search"
+      data-testid="note-search" aria-label={t("note.search")}
       class="mt-2 w-full rounded-full bg-black/5 px-3.5 py-1.5 text-sm text-neutral-900 outline-none ring-1 ring-black/5 placeholder:text-black/30 dark:bg-white/10 dark:text-neutral-100 dark:ring-white/10 dark:placeholder:text-white/30"
     />
   {/if}
@@ -605,10 +605,10 @@
     <div class="mt-2 flex items-center justify-end gap-2 text-xs">
       {#if armedEmpty}
         <span class="text-danger">{t("note.emptyTrashConfirm")}</span>
-        <button onclick={() => { armedEmpty = false; persist(removeMany(notes, trashed.map((n) => n.id))); }} aria-label="note-empty-trash-confirm" class="text-danger hover:underline">{t("note.deleteForever")}</button>
+        <button onclick={() => { armedEmpty = false; persist(removeMany(notes, trashed.map((n) => n.id))); }} data-testid="note-empty-trash-confirm" class="text-danger hover:underline">{t("note.deleteForever")}</button>
         <button onclick={() => (armedEmpty = false)} class="opacity-60 hover:underline">{t("note.cancel")}</button>
       {:else}
-        <button onclick={() => (armedEmpty = true)} aria-label="note-empty-trash" class="text-danger hover:underline">{t("note.emptyTrash")}</button>
+        <button onclick={() => (armedEmpty = true)} data-testid="note-empty-trash" class="text-danger hover:underline">{t("note.emptyTrash")}</button>
       {/if}
     </div>
   {/if}
@@ -712,7 +712,7 @@
                   bind:value={editVal}
                   onkeydown={onEditKey}
                   rows={6}
-                  aria-label="note-edit"
+                  data-testid="note-edit" aria-label={t("note.editLabel")}
                   class="w-full resize-y rounded-xl bg-white/70 p-2 text-sm leading-relaxed outline-none dark:bg-neutral-900/70"
                 ></textarea>
                 {#if editTasks.length > 0}
@@ -730,26 +730,26 @@
                   <button
                     onclick={toggleAtCaret}
                     title={t("note.editorToggleTaskHint")}
-                    aria-label="note-edit-toggle-task"
+                    data-testid="note-edit-toggle-task"
                     class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
                   >☑ {t("note.editorToggleTask")}</button>
                   <button
                     onclick={prefixAtCaret}
                     title={t("note.editorPrefixTaskHint")}
-                    aria-label="note-edit-prefix-task"
+                    data-testid="note-edit-prefix-task"
                     class="rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
                   >＋ {t("note.editorPrefixTask")}</button>
                   <button
                     onclick={() => (previewOn = !previewOn)}
                     aria-pressed={previewOn}
-                    aria-label="note-edit-preview"
+                    data-testid="note-edit-preview"
                     title={t("note.editorPreviewHint")}
                     class={"rounded-full px-2.5 py-1 " + (previewOn ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
                   >{t("note.editorPreview")}</button>
                 </div>
 
                 {#if previewOn && editVal.trim()}
-                  <div aria-label="note-preview" class="mt-2 whitespace-pre-wrap rounded-xl bg-white/40 p-2 text-sm leading-relaxed ring-1 ring-black/5 dark:bg-neutral-900/40 dark:ring-white/10">
+                  <div data-testid="note-preview" class="mt-2 whitespace-pre-wrap rounded-xl bg-white/40 p-2 text-sm leading-relaxed ring-1 ring-black/5 dark:bg-neutral-900/40 dark:ring-white/10">
                     {#each fmtInline(editVal) as seg, i (i)}
                       {#if seg.tag}<span class="font-medium text-accent underline decoration-accent/40 underline-offset-2">{seg.text}</span>
                       {:else if seg.bold}<strong class="font-semibold">{seg.text}</strong>
@@ -764,12 +764,12 @@
                 <div class="mt-2 flex items-center justify-between text-xs">
                   <span class="opacity-60">{fmtTime(n.ts)}</span>
                   <div class="flex gap-2">
-                    <button onclick={() => void copyEditing()} aria-label="Copy to AmOS clipboard" title={t("note.copyHint")} class="opacity-70 hover:opacity-100">⧉</button>
-                    <button onclick={() => void pasteEditing()} aria-label="Paste from AmOS clipboard" title={t("note.pasteHint")} class="opacity-70 hover:opacity-100">📋</button>
-                    <button onclick={() => (trayOpen = !trayOpen)} aria-label="Clipboard history" aria-pressed={trayOpen} title={t("note.clipHistoryHint")} class="opacity-70 hover:opacity-100">🕘</button>
+                    <button onclick={() => void copyEditing()} aria-label={t("note.copyHint")} title={t("note.copyHint")} class="opacity-70 hover:opacity-100">⧉</button>
+                    <button onclick={() => void pasteEditing()} aria-label={t("note.pasteHint")} title={t("note.pasteHint")} class="opacity-70 hover:opacity-100">📋</button>
+                    <button onclick={() => (trayOpen = !trayOpen)} aria-label={t("note.clipHistoryHint")} aria-pressed={trayOpen} title={t("note.clipHistoryHint")} class="opacity-70 hover:opacity-100">🕘</button>
                     <button
                       onclick={() => sendToAi("notes", editVal)}
-                      aria-label="note-send-ai"
+                      data-testid="note-send-ai"
                       title={t("note.sendToAi")}
                       class="opacity-70 hover:opacity-100"
                     >✦ {t("note.sendToAi")}</button>
@@ -835,11 +835,11 @@
                 </span>
                 <div class="flex flex-wrap gap-2">
                   <button onclick={() => void doExportOne(n)} title={t("note.export")} class="hover:underline">↧ {t("note.export")}</button>
-                  <button onclick={() => void doExportMd(n)} aria-label="note-export-md" title={t("note.exportMdHint")} class="hover:underline">⇩ .md</button>
+                  <button onclick={() => void doExportMd(n)} data-testid="note-export-md" title={t("note.exportMdHint")} class="hover:underline">⇩ .md</button>
                   {#if mode === "all"}
                     <button onclick={() => persist(togglePin(notes, n.id))} title={t("note.pin")} class={"hover:underline " + (n.pinned ? "text-amber-500" : "opacity-70")}>{n.pinned ? "★" : "☆"}</button>
                     <button onclick={() => setStateOf(n.id, "archived")} class="hover:underline">{t("note.archive")}</button>
-                    <button onclick={() => dupeOf(n.id)} aria-label="note-duplicate" title={t("note.duplicate")} class="hover:underline">⧉ {t("note.duplicate")}</button>
+                    <button onclick={() => dupeOf(n.id)} data-testid="note-duplicate" title={t("note.duplicate")} class="hover:underline">⧉ {t("note.duplicate")}</button>
                     <button onclick={() => beginEdit(n)} class="text-accent hover:underline">{t("note.edit")}</button>
                     <button onclick={() => openEditor(n)} class="text-accent hover:underline">{t("note.fullPage")}</button>
                   {/if}

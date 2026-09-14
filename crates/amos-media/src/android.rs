@@ -77,7 +77,7 @@ impl AndroidMediaProvider {
 
     /// Attach the current thread to the VM for one call.
     fn attach(&self) -> Result<JNIEnv<'_>> {
-        self.vm.attach_current_thread_permanently().map_err(jerr)
+        amos_jni::attached(&self.vm).map_err(jerr)
     }
 }
 impl MediaProvider for AndroidMediaProvider {

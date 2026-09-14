@@ -39,6 +39,10 @@ amos-blocklist = { path = "../amos-blocklist" }
 # report. Its `hostfs` backend is the root-confined filesystem scanner/provider.
 amos-devocare = { path = "../amos-devocare" }
 amos-display.workspace = true
+# amos-ime: the input-method (IME) domain core — the pinyin engine (inputx-pinyin)
+# plus fuzzy preferences and per-user learning. Backs the System UI's on-screen
+# keyboard through the `ime_*` commands (docs/input-method.md).
+amos-ime = { path = "../amos-ime" }
 # amos-media: external-storage/media domain core — its MediaManager + MediaProvider
 # seam backs the local `media_*` commands (Mock on host; Android MediaStore on-device
 # later). See docs/android-storage-unify.md + docs/media.md.
@@ -55,6 +59,9 @@ amos-sensor = { path = "../amos-sensor" }
 # Real Android radio provider (via amos-radio/android). Optional: only pulled in
 # when amos-tauri's `android` feature is on (System UI APK on-device build).
 jni = { version = "0.21", optional = true }
+# Rust tracing -> logcat on device (android feature only; see src/android_log.rs).
+tracing-subscriber = { workspace = true, optional = true }
+amos-jni = { path = "../amos-jni", optional = true }
 tauri.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -87,6 +94,8 @@ default = []
 # system-component seam, not the app path).
 android = [
     "dep:jni",
+    "dep:tracing-subscriber",
+    "dep:amos-jni",
     "amos-radio/android",
     "amos-flashlight/android",
     "amos-sensor/android",

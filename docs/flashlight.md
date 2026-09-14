@@ -106,9 +106,11 @@ Mock（模拟桌面语义），这是把真机接线做成“骨架 + 编译门�
 
 1. adb 授权：`adb devices` 显示 `device`（已确认）。设备为 SDK 34 / Android 14，torch API 23+
    与 `TorchCallback` 均可用。
-2. Tauri Android 工程已存在（`gen/android/`），且 `android-glue/`（含 `FlashlightGlue.kt`）已拷入
-   `gen/android/app/src/main/java/com/amos/ai/glue/`；`AndroidManifest.xml` 已声明 `CAMERA` 与
-   `android.hardware.camera.flash(required=false)`。
+2. Tauri Android 工程已存在（`gen/android/`）；**用 `scripts/android-glue-mirror.sh` 把整棵
+   `android-glue/`（含 `FlashlightGlue.kt`）镜像进 `gen/android/app/src/main/java/com/amos/ai/glue/`
+   —— 不要手工 `cp`**（会陈旧/漏新文件；该脚本同时校验生成清单与 Activity 装配）。`AndroidManifest.xml`
+   需声明 `CAMERA` 与 `android.hardware.camera.flash(required=false)`（`android-glue/AndroidManifest.permissions.xml`
+   片段，合并后由该脚本校验）。
 3. `MainActivity.kt` 已接 `AmosGlue`/`PermissionWire` 生命周期：`onStart` 请求 `CAMERA` 并在已持有时启动
    生产者（torch bind）；`onRequestPermissionsResult` 授予后在 `AmosGlue.onCameraPermissionGranted`
    重新 bind 真机 torch；`onStop` 释放相机/传感器。**注意**：`gen/android` 由 `cargo tauri android init`

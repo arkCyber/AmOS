@@ -99,7 +99,17 @@ impl HardwareButtons {
         // event because on-device the hand-rolled frontend bridge (which relies on
         // `window.__TAURI_INTERNALS__.listen`) does not register in Tauri v2, so the
         // event never reaches the UI without this.
-        let _ = app.emit(HARDWARE_BUTTON_EVENT, button);
+        // An `emit` error means a listener exists but the event could not reach it (Tauri
+        // returns `Ok` when there is no listener at all), i.e. the UI misses this button
+        // press. The DOM dispatch below is the second path, but not a reason to hide this.
+        if let Err(e) = app.emit(HARDWARE_BUTTON_EVENT, button) {
+            tracing::warn!(
+                target: "amos::buttons",
+                event = HARDWARE_BUTTON_EVENT,
+                error = %e,
+                "hardware-button event could not be delivered to the UI"
+            );
+        }
         dispatch_dom(app, button);
     }
 
@@ -152,7 +162,18 @@ fn dispatch_dom(app: &tauri::AppHandle, button: HardwareButton) {
         "window.dispatchEvent(new CustomEvent('hardware-button', {{detail: {{name: '{name}'}}}}));"
     );
     for w in app.webview_windows().values() {
-        let _ = w.eval(&js);
+        // The eval is the delivery path that works on-device (the Tauri event system does
+        // not reach the webview there — that is why this exists at all), so a window that
+        // cannot be evaluated is a hardware button that does nothing. Say so instead of
+        // leaving the press unexplained.
+        if let Err(e) = w.eval(&js) {
+            tracing::warn!(
+                target: "amos::buttons",
+                window = %w.label(),
+                error = %e,
+                "hardware-button DOM event could not be evaluated in this window"
+            );
+        }
     }
 }
 
@@ -188,6 +209,7 @@ mod android_impl {
     static APP: OnceLock<AppHandle> = OnceLock::new();
 
     pub fn install_app(app: AppHandle) {
+        // Exactly-once: a redundant re-attach keeps the first one (REQ-A187 baseline).
         let _ = APP.set(app);
     }
 

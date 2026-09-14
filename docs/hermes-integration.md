@@ -16,7 +16,7 @@
 | agent | `POST /v1/agent/run` / `GET /v1/agent/status` | Agent 驱动 |
 | sessions | `GET/POST /v1/sessions...` | 会话管理 |
 | health | `GET /health` | 健康探测 |
-| gRPC（feature `grpc`） | `11438`（`proto/hermes.proto` → `HermesService`） | `StreamChatCompletion`/`RunAgent`/`ListTools`/`Check` |
+| gRPC（feature `grpc`） | `11438`（hermes-rust 的 `proto/hermes.proto` → `HermesService`；该文件在 hermes-rust 仓，不在本仓） | `StreamChatCompletion`/`RunAgent`/`ListTools`/`Check` |
 
 **流式格式（关键）**：`/v1/chat/completions` 每个 `StreamEvent` 转 SSE——
 - 中间 token：`data: {"type":"token","content":"..."}`

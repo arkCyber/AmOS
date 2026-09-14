@@ -114,7 +114,9 @@ echo "System UI APK: use scripts/build-apk.sh (the ONLY supported APK entry) —
 echo "  it hard-codes amos-tauri's 'android' feature so the on-device APK always"
 echo "  links the jni providers (radio/flashlight/sensor/aaudio). Building the"
 echo "  APK without 'android' crashes on launch with UnsatisfiedLinkError."
-echo "  cd crates/amos-tauri && cargo tauri android build --features android"
+echo "  (The raw 'cd crates/amos-tauri && cargo tauri android build --features"
+echo "   android' is for debugging only: it skips scripts/android-glue-mirror.sh,"
+echo "   so the APK can ship a stale or missing Kotlin glue.)"
 echo
 echo "Stage to device (example):"
 echo "  adb root; adb push target/$TARGET/release/amos-ai /system/bin/ ; adb shell chmod 0755 /system/bin/amos-ai"

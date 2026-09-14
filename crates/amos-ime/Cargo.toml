@@ -1,0 +1,27 @@
+[package]
+name = "amos-ime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# The pinyin engine dependency declares `rust-version = "1.95"` (edition 2024);
+# the workspace floor is 1.80, so this crate states its own honest floor instead
+# of pretending the older one holds.
+rust-version = "1.95"
+description = "AmOS input-method (IME) domain core: a Mandarin pinyin engine (inputx-pinyin) + fuzzy-pair preferences + per-user learning persistence + a headless-testable typing session. Backs the System UI's on-screen keyboard (docs/input-method.md)."
+
+[lib]
+name = "amos_ime"
+path = "src/lib.rs"
+
+[dependencies]
+# Core engine only: the embedded FST dictionary (~4.4 MB, ~165k pinyin codes)
+# and the segmentation-Viterbi `best_composition` sentence builder. The upstream
+# crate's DEFAULT features add the word-bigram + trigram FSTs (~20 MB) that power
+# `predict_next_words` / `bigram_boost` — deliberately OFF here: nothing in the
+# System UI consumes next-word prediction yet, and a mobile System UI must not pay
+# 20 MB of binary for a model it never queries. Turning them on is a one-line
+# change (see docs/input-method.md §Deferred), not a redesign: the candidate path
+# used here (`Session::candidates` + `best_composition`) is feature-independent.
+inputx-pinyin = { version = "1.4", default-features = false }
+serde.workspace = true
+serde_json = "1.0"

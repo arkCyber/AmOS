@@ -10,6 +10,7 @@ import StreamVoiceButton from "../src/svelte/StreamVoiceButton.svelte";
 import DeviceMicButton from "../src/svelte/DeviceMicButton.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import { PERMISSIONS_KEY } from "../src/lib/permissions";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
 
@@ -21,7 +22,7 @@ const buttonByAria = (h: { container: HTMLElement }, aria: string) =>
 describe("Ai voice buttons (offline)", () => {
   test("ASR mic button is disabled + offline title when not bridged", () => {
     const host = render(VoiceMicButton, { props: { online: false, onTranscript: () => {} } });
-    const b = buttonByAria(host, "voice input");
+    const b = buttonByAria(host, zh["a11y.voiceInput"]);
     expect(b?.disabled).toBe(true);
     expect(b?.title).toContain("离线"); // ai.streamVoiceOffline
   });
@@ -30,7 +31,7 @@ describe("Ai voice buttons (offline)", () => {
     const host = render(StreamVoiceButton, {
       props: { online: false, session: () => "s" },
     });
-    const b = buttonByAria(host, "streaming voice input");
+    const b = buttonByAria(host, zh["a11y.streamingVoiceInput"]);
     expect(b?.disabled).toBe(true);
     expect(b?.title).toContain("离线"); // ai.streamVoiceOffline
   });
@@ -39,7 +40,7 @@ describe("Ai voice buttons (offline)", () => {
     const host = render(DeviceMicButton, {
       props: { online: false, session: () => "s" },
     });
-    const b = buttonByAria(host, "device voice input");
+    const b = buttonByAria(host, zh["a11y.deviceVoiceInput"]);
     expect(b?.disabled).toBe(true);
     expect(b?.title).toContain("离线"); // ai.deviceMicOffline
   });
@@ -73,7 +74,7 @@ describe("StreamVoiceButton — resident listener teardown", () => {
     });
 
     const host = render(StreamVoiceButton, { props: { online: true, session: () => "s" } });
-    await fireEvent.click(buttonByAria(host, "streaming voice input")!);
+    await fireEvent.click(buttonByAria(host, zh["a11y.streamingVoiceInput"])!);
     await settle();
     expect(calls).toContain("assistant_voice_start");
 
@@ -121,7 +122,7 @@ describe("DeviceMicButton — OS mic grant (dialog-free read)", () => {
     writeStoreValue(PERMISSIONS_KEY, { ai: ["microphone"] });
     const host = render(DeviceMicButton, { props: { online: true, session: () => "s" } });
     await settle();
-    const b = buttonByAria(host, "device voice input");
+    const b = buttonByAria(host, zh["a11y.deviceVoiceInput"]);
     expect(b?.title).toContain("RECORD_AUDIO");
     expect(calls).toContain("mic_permission_state");
     // The read must never prompt — only a user press asks for the grant.
@@ -140,7 +141,7 @@ describe("DeviceMicButton — OS mic grant (dialog-free read)", () => {
     writeStoreValue(PERMISSIONS_KEY, { ai: ["microphone"] });
     const host = render(DeviceMicButton, { props: { online: true, session: () => "s" } });
     await settle();
-    const b = buttonByAria(host, "device voice input");
+    const b = buttonByAria(host, zh["a11y.deviceVoiceInput"]);
     expect(b?.title).toContain("AAudio"); // ai.deviceMicTitle
   });
 });

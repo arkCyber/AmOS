@@ -136,7 +136,16 @@ async fn main() -> ExitCode {
         };
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
+                res = tokio::signal::ctrl_c() => {
+                    // A *failed* handler is not a Ctrl-C: the future completing with `Err`
+                    // means we cannot listen at all, and shutting down silently would look
+                    // like an operator action. (Behaviour is unchanged — the supervisor
+                    // stops — but it is now explained.)
+                    if let Err(e) = res {
+                        eprintln!("warning: cannot wait for Ctrl-C ({e}); shutting down");
+                    }
+                    break;
+                }
                 _ = async {
                     match usr1.as_mut() {
                         Some(u) => { u.recv().await; }
@@ -156,7 +165,10 @@ async fn main() -> ExitCode {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.ok();
+        // Same rule as the Unix branch: a failed signal handler is not a Ctrl-C.
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("warning: cannot wait for Ctrl-C ({e}); shutting down");
+        }
     }
 
     // Stop the periodic time-sync task (reporting its final calibration) before

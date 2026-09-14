@@ -12,11 +12,15 @@
     bridged,
     flashlightSet,
     flashlightStatus,
+    radioControl,
+    radioOpenSettings,
     radioSet,
     radioStatus,
     type FlashlightPayload,
+    type RadioControlReply,
     type RadioPayload,
   } from "../lib/backend";
+  import { radioManagedState, radioRefusalView, type RadioRefusalView } from "../lib/radioControl";
   import { attachFocusTrap } from "../lib/focusTrap";
   import { iconSvg, quickIcon } from "../lib/sysIcons";
   import { propsChannel } from "./propsBus";
@@ -86,6 +90,57 @@
     const un = settingsStore.subscribe((v) => (settings = normalizeQuick(v)));
     return un;
   });
+  // Mount-time **device truth** (REQ-A185): ask the radios once so these tiles show
+  // what the device holds instead of only the persisted intent (the Mock made the two
+  // identical; the real provider makes the difference visible). A failure keeps the
+  // stored values.
+  let radioRead = false;
+  $effect(() => {
+    if (radioRead || !bridged()) return;
+    radioRead = true;
+    void (async () => {
+      const live = await radioStatus();
+      if (live) persistSettings(mergeRadio(settings, live));
+    })();
+  });
+
+  // Which switches the **platform** owns (REQ-A202). Asked once, on mount, exactly like
+  // the status read above: a tile that cannot work must say so *before* the user taps it
+  // (and must offer the system surface), instead of swallowing a refusal that `invoke`
+  // reports as `null`.
+  let ctlRead = false;
+  let radioCtl = $state<Record<RadioKey, RadioControlReply | null>>({
+    wifi: null,
+    bluetooth: null,
+    airplane: null,
+    hotspot: null,
+  });
+  $effect(() => {
+    if (ctlRead || !bridged()) return;
+    ctlRead = true;
+    void (async () => {
+      const keys: RadioKey[] = ["wifi", "bluetooth", "airplane", "hotspot"];
+      const answers = await Promise.all(keys.map((k) => radioControl(k)));
+      const next = { ...radioCtl };
+      keys.forEach((k, i) => (next[k] = answers[i] ?? null));
+      radioCtl = next;
+    })();
+  });
+
+  const managed = (key: RadioKey) => radioManagedState(radioCtl[key], key);
+  /** The radios whose switch this platform owns — each gets its own honest line. */
+  const managedRadios = $derived(
+    (["wifi", "bluetooth", "airplane"] as RadioKey[]).filter((k) => managed(k).managed),
+  );
+  /** `true` when the last managed tap could not open the system surface. */
+  let managedFailed = $state(false);
+  /**
+   * The last **refused write** (REQ-A203): `radio_set` now answers `applied: false`
+   * with machine tokens instead of failing into `null`, so "the device refused this
+   * time" is a visible line with an optional way out — not just a ledger entry.
+   */
+  let refused = $state<RadioRefusalView | null>(null);
+  let refusedKey = $state<RadioKey | null>(null);
   $effect(() => {
     const un = notifStore.subscribe((v) => (notifs = normalizeNotifs(v)));
     return un;
@@ -129,6 +184,7 @@
     wifi: r.wifi,
     bluetooth: r.bluetooth,
     airplane: r.airplane,
+    hotspot: r.hotspot,
   });
   const mergeFlash = (p: FlashlightPayload): FlashlightStore => ({
     on: p.on,
@@ -158,18 +214,51 @@
   // local policy (incl. airplane cascade) so offline behaves identically.
   const toggleRadio = async (key: RadioKey) => {
     if (key !== "airplane" && settings.airplane) return; // gated no-op under APM
+    // A switch the platform owns must not be *attempted* (REQ-A202): `radio_set` would
+    // refuse it before touching the device, and `invoke` would hand back `null` — the tile
+    // would just not move, with nothing on screen explaining why. Hand the user to the
+    // system surface instead, and say what happened.
+    if (bridged() && managed(key).managed) {
+      const opened = await radioOpenSettings(key);
+      // A failed open must be visible: the alternative is a tile that silently does
+      // nothing, which is exactly what this change removes (REQ-A202).
+      managedFailed = !opened;
+      return;
+    }
     const on = !!settings[key];
     if (bridged()) {
-      const snap = await radioSet(key, !on);
-      if (snap) {
-        persistSettings(mergeRadio(settings, snap));
+      const res = await radioSet(key, !on);
+      if (res) {
+        managedFailed = false;
+        if (res.applied) {
+          // The write landed: mirror the authoritative snapshot into the store.
+          refused = null;
+          refusedKey = null;
+          if (res.state) persistSettings(mergeRadio(settings, res.state));
+          return;
+        }
+        // Refused (REQ-A203): mirror the freshly **read** state so no bit lies, and
+        // show the sentence the refusal's tokens map to — with the system surface to
+        // offer when the platform owns the switch. Nothing is persisted: the store
+        // keeps the intent it had, the device kept its state.
+        if (res.state) settings = mergeRadio(settings, res.state);
+        refused = radioRefusalView(res.refusal, key);
+        refusedKey = refused.noteKey ? key : null;
         return;
       }
+      // The command itself failed (or never arrived): fall back to a fresh read.
       const live = await radioStatus();
       if (live) settings = mergeRadio(settings, live);
       return;
     }
     persistSettings(flipRadio(settings, key));
+  };
+
+  /** Offer the real switch for the refused radio (only when a surface is known). */
+  const openRefusedSettings = async () => {
+    if (!refusedKey) return;
+    const opened = await radioOpenSettings(refusedKey);
+    managedFailed = !opened;
   };
 
   const toggleFlash = async () => {
@@ -215,10 +304,10 @@
 
     <!-- Control-center system actions (formerly the home top bar). -->
     <div class="mt-2 flex items-center justify-end gap-2">
-      <button aria-label="search" title="search" onclick={() => act("search")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="search">{@html iconSvg("search", "h-[17px] w-[17px]")}</span></button>
-      <button aria-label="recents" title="recents" onclick={() => act("recents")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="recents">{@html iconSvg("recents", "h-[17px] w-[17px]")}</span></button>
-      <button aria-label="edit home" title="edit home" onclick={() => act("edit")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="pencil">{@html iconSvg("pencil", "h-[17px] w-[17px]")}</span></button>
-      <button aria-label="lock" title="lock" onclick={() => act("lock")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="lock">{@html iconSvg("lock", "h-[17px] w-[17px]")}</span></button>
+      <button aria-label={t("shell.search")} title={t("shell.search")} onclick={() => act("search")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="search">{@html iconSvg("search", "h-[17px] w-[17px]")}</span></button>
+      <button aria-label={t("shell.recents")} title={t("shell.recents")} onclick={() => act("recents")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="recents">{@html iconSvg("recents", "h-[17px] w-[17px]")}</span></button>
+      <button aria-label={t("a11y.editHome")} title={t("a11y.editHome")} onclick={() => act("edit")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="pencil">{@html iconSvg("pencil", "h-[17px] w-[17px]")}</span></button>
+      <button aria-label={t("a11y.lock")} title={t("a11y.lock")} onclick={() => act("lock")} class="grid h-9 w-9 place-items-center rounded-full bg-white/55 text-sm ring-1 ring-white/50 shadow-sm transition active:scale-90 dark:bg-white/10 dark:ring-white/10"><span data-icon="lock">{@html iconSvg("lock", "h-[17px] w-[17px]")}</span></button>
     </div>
 
     <!-- Torch / flashlight tile. -->
@@ -263,9 +352,12 @@
     <div class="mt-4 grid grid-cols-3 gap-2.5">
       {#each QUICK as q (q.key)}
         {@const on = q.key === "darkmode" ? dark : q.key === "location" ? locationEnabled(settings) : !!settings[q.key]}
+        {@const ctl = q.key === "wifi" || q.key === "bluetooth" || q.key === "airplane" ? managed(q.key) : { managed: false, noteKey: "", surface: null }}
         <button
           onclick={() => void toggle(q.key)}
           aria-pressed={on}
+          aria-label={ctl.managed ? `${t(q.label)} · ${t("radio.openSettings")}` : undefined}
+          data-managed={ctl.managed ? "system" : undefined}
           class={
             "flex flex-col items-center justify-center gap-1.5 rounded-3xl py-4 text-[11px] font-medium backdrop-blur transition active:scale-95 " +
             (on
@@ -275,9 +367,51 @@
         >
           <span data-icon={q.key} class="text-xl leading-none">{@html iconSvg(quickIcon(q.key), "h-[22px] w-[22px]")}</span>
           {t(q.label)}
+          <!-- A switch the platform owns is not this app's to move: the tile says so
+               instead of looking like a button that silently does nothing (REQ-A202). -->
+          {#if ctl.managed}
+            <span aria-hidden="true" class="text-[10px] leading-none opacity-70">⚙</span>
+          {/if}
         </button>
       {/each}
     </div>
+
+    <!-- The explanation for each switch the platform owns, and whether the last managed
+         tap could actually open the system surface (REQ-A202). -->
+    {#if managedFailed}
+      <div class="mt-2 px-1">
+        <p role="status" data-testid="nc-radio-managed-failed" class="text-[11px] leading-snug text-danger">
+          {t("radio.openSettingsFailed")}
+        </p>
+      </div>
+    {/if}
+    <!-- A refused write (REQ-A203): the device said no *this time* — say so, mirror the
+         real state, and offer the system switch when there is one to offer. -->
+    {#if refused}
+      <div class="mt-2 px-1">
+        <p role="status" data-testid="nc-radio-refused" class="text-[11px] leading-snug text-danger">
+          {refused.noteKey === "" ? t("radio.refused.unknown") : t(refused.noteKey)}
+        </p>
+        {#if refused.surface !== null && refusedKey}
+          <button
+            onclick={() => void openRefusedSettings()}
+            data-testid="nc-radio-refused-open-settings"
+            class="mt-1 text-[11px] font-semibold text-accent underline underline-offset-2"
+          >
+            {t("radio.openSettings")}
+          </button>
+        {/if}
+      </div>
+    {/if}
+    {#if managedRadios.length > 0}
+      <div class="mt-2 space-y-0.5 px-1">
+        {#each managedRadios as key (key)}
+          <p data-testid="nc-radio-managed" class="text-[11px] leading-snug opacity-70">
+            {t(managed(key).noteKey)}
+          </p>
+        {/each}
+      </div>
+    {/if}
 
     <div class="mt-3 flex items-center justify-between px-1">
       <span class="text-xs font-semibold uppercase tracking-widest opacity-50">
@@ -290,7 +424,7 @@
           {notifs.length} ·
         {/if}
       </span>
-      <button onclick={clear} aria-label="clear" class="text-xs font-medium text-accent hover:underline">{t("nc.clear")}</button>
+      <button onclick={clear} aria-label={t("nc.clear")} class="text-xs font-medium text-accent hover:underline">{t("nc.clear")}</button>
     </div>
 
     <div class="mt-2 flex-1 space-y-2.5 overflow-auto pr-0.5">
@@ -308,7 +442,7 @@
               <span class="font-semibold">{n.icon} {n.app ?? n.title}</span>
               <button
                 onclick={() => dismiss(n.id)}
-                aria-label="dismiss"
+                aria-label={t("a11y.dismiss")}
                 data-icon="x"
                 class="grid h-6 w-6 place-items-center rounded-full opacity-60 transition hover:opacity-100"
               >{@html iconSvg("x", "h-3 w-3")}</button>

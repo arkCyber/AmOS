@@ -147,7 +147,17 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_CameraGlue_recordFrame(
     }
     // SAFETY: `env` is the JVM-supplied JNIEnv* of this native call.
     if let Ok(env) = unsafe { jni::JNIEnv::from_raw(env) } {
-        let _ = handle_frame(&env, camera_id, width, height, format, fps, bytes);
+        // Every frame the host cannot decode used to be dropped **silently**, while the
+        // UI kept showing "live view" (the Kotlin producer logs its own encode
+        // failures; this is the host half). Reported per frame (REQ-A187).
+        if let Err(e) = handle_frame(&env, camera_id, width, height, format, fps, bytes) {
+            tracing::warn!(
+                target: "amos::camera",
+                camera_id,
+                error = %e,
+                "camera frame dropped by the host"
+            );
+        }
     }
 }
 

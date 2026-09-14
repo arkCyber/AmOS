@@ -33,6 +33,7 @@ export const SVELTE_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   interpreter: () => import("./InterpApp.svelte"),
   mail: () => import("./MailApp.svelte"),
   store: () => import("./StoreApp.svelte"),
+  pwa: () => import("./PwaHubApp.svelte"),
   privacy: () => import("./PermissionsApp.svelte"),
   contacts: () => import("./ContactsApp.svelte"),
   magnifier: () => import("./MagnifierApp.svelte"),

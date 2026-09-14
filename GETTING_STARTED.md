@@ -44,7 +44,7 @@ sudo apt-get install -y \
 # For Tauri development
 sudo apt-get install -y \
   libwebkit2gtk-4.1-dev \
-  libappindicator3-dev \
+  libayatana-appindicator3-dev \
   librsvg2-dev \
   patchelf \
   libgtk-3-dev
@@ -117,7 +117,7 @@ cargo test --workspace
 cargo test -p amos-ai
 
 # Run only frontend tests
-cd crates/amos-tauri/frontend && bun run test
+cd crates/amos-tauri/frontend-ts && bun run test
 ```
 
 ## Code Quality Checks
@@ -130,7 +130,7 @@ make fmt  # or: cargo fmt --all
 make lint  # or: cargo clippy --workspace --all-targets -- -D warnings
 
 # Check frontend syntax
-cd crates/amos-tauri/frontend && bun run check
+cd crates/amos-tauri/frontend-ts && bun run check
 ```
 
 ## Project Structure

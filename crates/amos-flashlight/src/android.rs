@@ -118,7 +118,7 @@ impl AndroidFlashlightProvider {
     /// `amos-radio`/`amos-telephony`: calls arrive on a bounded tokio worker
     /// pool, so the permanently-attached threads cannot grow unbounded.
     fn env(&self) -> Result<JNIEnv<'_>> {
-        self.vm.attach_current_thread_permanently().map_err(jerr)
+        amos_jni::attached(&self.vm).map_err(jerr)
     }
 
     /// Drive `CameraManager#setTorchMode(cameraId, on)`. Throws (→ Provider

@@ -250,7 +250,15 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_SensorGlue_attachContext(
     let ctx = unsafe { jni::objects::JObject::from_raw(context) };
     if let Ok(env) = env {
         if let Ok(vm) = env.get_java_vm() {
-            let _ = android_ctx::bind(vm, &env, ctx);
+            // The sensor context is what makes GNSS/IMU real; a silent bind failure
+            // would leave the snapshot on the mock with no symptom (REQ-A187).
+            if let Err(e) = android_ctx::bind(vm, &env, ctx) {
+                tracing::warn!(
+                    target: "amos::sensor",
+                    error = %e,
+                    "sensor context not bound — GNSS/IMU stay on the mock"
+                );
+            }
         }
     }
 }

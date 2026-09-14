@@ -1,0 +1,12 @@
+[
+  {
+    "file": "crates/amos-tauri/src/incall.rs",
+    "token": "find_class(",
+    "reason": "The in-call module holds only the captured JavaVM (no Context), so the glue class cannot be resolved through the app loader here. The call is wrapped in amos_jni::jni_call! so a failure is returned instead of leaving an exception pending. Follow-up: capture the jclass at upcall time (AmosInCallService.nativeState runs on a Java thread)."
+  },
+  {
+    "file": "crates/amos-tauri/src/blocklist.rs",
+    "token": "find_class(",
+    "reason": "Same boundary as incall.rs: no Context in this module (BlocklistGlue.configure passes only the files dir). Wrapped in amos_jni::jni_call! so a failed resolution cannot poison the thread. Follow-up: resolve the class from BlocklistGlue_configure (a Java upcall) and cache the global ref."
+  }
+]

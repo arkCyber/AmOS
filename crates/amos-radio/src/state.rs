@@ -7,11 +7,20 @@ pub enum RadioMode {
     Wifi,
     Bluetooth,
     Airplane,
+    /// The Wi-Fi **access point** (personal hotspot / tethering). Distinct from
+    /// [`RadioMode::Wifi`] (the station/client radio): this one *shares* the
+    /// device's connection with other devices instead of joining a network.
+    Hotspot,
 }
 
 impl RadioMode {
     /// Every radio the quick-settings / System UI can drive.
-    pub const ALL: [RadioMode; 3] = [RadioMode::Wifi, RadioMode::Bluetooth, RadioMode::Airplane];
+    pub const ALL: [RadioMode; 4] = [
+        RadioMode::Wifi,
+        RadioMode::Bluetooth,
+        RadioMode::Airplane,
+        RadioMode::Hotspot,
+    ];
 
     /// Stable wire/UI key (matches the frontend `QuickKey` values).
     pub fn key(self) -> &'static str {
@@ -19,6 +28,7 @@ impl RadioMode {
             RadioMode::Wifi => "wifi",
             RadioMode::Bluetooth => "bluetooth",
             RadioMode::Airplane => "airplane",
+            RadioMode::Hotspot => "hotspot",
         }
     }
 
@@ -28,6 +38,7 @@ impl RadioMode {
             "wifi" => Some(RadioMode::Wifi),
             "bluetooth" => Some(RadioMode::Bluetooth),
             "airplane" => Some(RadioMode::Airplane),
+            "hotspot" => Some(RadioMode::Hotspot),
             _ => None,
         }
     }
@@ -39,6 +50,8 @@ pub struct RadioSnapshot {
     pub wifi: bool,
     pub bluetooth: bool,
     pub airplane: bool,
+    /// The Wi-Fi AP (personal hotspot) is up.
+    pub hotspot: bool,
 }
 
 impl RadioSnapshot {
@@ -48,6 +61,7 @@ impl RadioSnapshot {
             RadioMode::Wifi => self.wifi,
             RadioMode::Bluetooth => self.bluetooth,
             RadioMode::Airplane => self.airplane,
+            RadioMode::Hotspot => self.hotspot,
         }
     }
 
@@ -61,6 +75,10 @@ impl RadioSnapshot {
             },
             RadioMode::Airplane => RadioSnapshot {
                 airplane: on,
+                ..self
+            },
+            RadioMode::Hotspot => RadioSnapshot {
+                hotspot: on,
                 ..self
             },
         }
@@ -85,6 +103,7 @@ mod tests {
         assert!(s.get(RadioMode::Wifi));
         assert!(!s.get(RadioMode::Bluetooth));
         assert!(!s.get(RadioMode::Airplane));
+        assert!(!s.get(RadioMode::Hotspot));
 
         let s = s
             .with(RadioMode::Airplane, true)
@@ -92,5 +111,12 @@ mod tests {
         assert!(!s.get(RadioMode::Wifi));
         assert!(s.get(RadioMode::Airplane));
         assert!(!s.get(RadioMode::Bluetooth));
+        assert!(!s.get(RadioMode::Hotspot));
+
+        // The AP bit is its own axis: raising it must not disturb any other radio.
+        let s = s.with(RadioMode::Hotspot, true);
+        assert!(s.get(RadioMode::Hotspot));
+        assert!(s.get(RadioMode::Airplane));
+        assert!(!s.get(RadioMode::Wifi));
     }
 }

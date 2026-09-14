@@ -198,10 +198,10 @@
     >
       {t("maps.locate")}
     </button>
-    <button onclick={() => (zoom = zoomOut(zoom))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label="zoom out">
+    <button onclick={() => (zoom = zoomOut(zoom))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label={t("a11y.zoomOut")}>
       −
     </button>
-    <button onclick={() => (zoom = zoomIn(zoom))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label="zoom in">
+    <button onclick={() => (zoom = zoomIn(zoom))} class="h-8 w-8 rounded-full bg-neutral-300 dark:bg-neutral-700" aria-label={t("a11y.zoomIn")}>
       +
     </button>
     <div class="flex items-center gap-1">

@@ -74,7 +74,18 @@ async fn lmk_round(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("android LMK watch stream error: {e}"))?
     {
-        let _ = app.emit(LMK_SURFACE_EVENT, surface_payload(&evt));
+        // A failed emit is not "nobody is listening" (that is `Ok` in Tauri: the JS bridge is
+        // only evaluated for windows that registered a listener) — it means a listener exists
+        // and the event could not reach it, i.e. the UI never learns about this LMK surface.
+        // Reported per event instead of discarded.
+        if let Err(e) = app.emit(LMK_SURFACE_EVENT, surface_payload(&evt)) {
+            tracing::warn!(
+                target: "amos::lmk",
+                event = LMK_SURFACE_EVENT,
+                error = %e,
+                "LMK surface event could not be delivered to the UI"
+            );
+        }
     }
     Ok(())
 }

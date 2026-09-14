@@ -3,8 +3,6 @@
     "src/lib/ansi.ts::hasEscape",
     "src/lib/backend.ts::pollNativeAlarms",
     "src/lib/backend.ts::realDial",
-    "src/lib/backend.ts::storeBundleResource",
-    "src/lib/backend.ts::storeBundleUri",
     "src/lib/backend.ts::storeFind",
     "src/lib/backend.ts::storeSearch",
     "src/lib/backend.ts::storeStatus",

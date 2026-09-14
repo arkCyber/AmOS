@@ -5,10 +5,17 @@
 ```bash
 scripts/gui-smoke.sh            # 一键：build + 起 mock daemon + 启动 GUI
 scripts/gui-smoke.sh --check    # 只验证前置（显示环境 + 可构建）
+make gui-smoke                  # 同上（REQ-A189 起的 Makefile 目标）
+make gui-smoke-check            # 无头就绪探针：显示环境检查 + 构建
 ```
 
 > 无显示器环境（CI/headless）可用 `GUI_SMOKE_FORCE=1 scripts/gui-smoke.sh --check`
 > 仅验证可构建；或跑无头全链路冒烟 `cargo test -p amos-translate --test full_chain`。
+>
+> `scripts/gui-smoke-check.sh` 的注释曾写着"供 CI/headless 用"，但**没有任何 CI
+> 任务或 make 目标调用它**（REQ-A189 量出：48 个脚本里有 4 个无调用者）。它现在是
+> `make gui-smoke-check`；CI 的 `make lint`/`make test` **不**跑它（它会 `cargo build`
+> 两个二进制并要求显示环境），所以无头就绪仍然靠上面那两条命令。
 
 ## 前置
 

@@ -1,7 +1,8 @@
 //! `amos-radio` — radio / connectivity domain core.
 //!
 //! Transport- and platform-agnostic rules and seams for the radios AmOS exposes
-//! as quick-settings toggles (Wi-Fi, Bluetooth, Airplane mode), so the business
+//! as quick-settings toggles (Wi-Fi, Bluetooth, Airplane mode, the Wi-Fi access
+//! point / personal hotspot), so the business
 //! logic is testable offline and a real device backend can be swapped in later.
 //! Mirrors the shape of `amos-telephony` (domain kernel + provider seam + Mock).
 //!
@@ -13,8 +14,9 @@
 //!   register over the real radios (get / set each bit); [`MockRadioProvider`] is
 //!   the deterministic in-memory impl for tests and offline demos.
 //! * [`manager`] — [`RadioManager`] wraps a provider and owns the **policy** the
-//!   UI depends on: enabling Airplane mode cascades Wi-Fi + Bluetooth off, and
-//!   the non-airplane radios cannot be switched on while Airplane is active.
+//!   UI depends on: enabling Airplane mode cascades Wi-Fi + Bluetooth + the Wi-Fi
+//!   access point (personal hotspot) off, and the non-airplane radios cannot be
+//!   switched on while Airplane is active.
 //!
 //! The real Android backend (Android `ConnectivityManager` for Wi-Fi and
 //! `BluetoothManager` for Bluetooth, reached from the System UI APK via JNI /
@@ -28,6 +30,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod bluetooth;
 pub mod error;
 pub mod manager;
 pub mod provider;
@@ -36,9 +39,16 @@ pub mod state;
 #[cfg(feature = "android")]
 pub mod android;
 
+pub use bluetooth::{
+    BtBond, BtPeer, BtScan, BtScanDevice, BOND_BONDED, BOND_BONDING, BOND_NONE,
+    MAX_LOCAL_NAME_BYTES,
+};
 pub use error::{RadioError, Result};
 pub use manager::RadioManager;
-pub use provider::{MockRadioProvider, RadioProvider};
+pub use provider::{
+    MockRadioProvider, PlatformReason, RadioControl, RadioProvider, SwitchableProvider,
+    SystemSurface,
+};
 pub use state::{RadioMode, RadioSnapshot};
 
 #[cfg(feature = "android")]

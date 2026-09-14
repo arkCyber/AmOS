@@ -29,6 +29,19 @@ import { tmpdir } from "node:os";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const viteBin = join(root, "node_modules", "vite", "bin", "vite.js");
+// Run vite through its **shim** (`node_modules/.bin/vite`), not through whichever
+// runtime happens to be running this script. vite's shebang is `#!/usr/bin/env node`,
+// and executing `vite.js` *with bun* (`bun vite.js build`) is broken in bun 1.2.1: the
+// generated AiApp chunk comes out with a truncated multi-byte character and esbuild's
+// `vite:esbuild-transpile` pass then fails to re-parse it
+// (`Expected "]" but found "\xbf"`). Every other entry point (`bun run build`,
+// `bunx vite build`, CI) goes through the shim, which is why only this smoke saw the
+// failure — and why it could never pass under `bun run smoke:ui` (its documented use).
+const viteShim = join(root, "node_modules", ".bin", "vite");
+const isWin = process.platform === "win32";
+// On Windows the shim is a `.cmd`, so fall back to the current runtime + the JS entry.
+const viteCmd = isWin ? process.execPath : viteShim;
+const viteArgs = isWin ? [viteBin] : [];
 const port = Number(process.env.PORT ?? 4173);
 const maxMs = Number(process.env.UI_SMOKE_MAX_SEC ?? 45) * 1000;
 const base = `http://localhost:${port}/`;
@@ -110,7 +123,7 @@ async function main() {
     if (!skipBuild) {
       log("building production bundle (dist/)…");
       await new Promise((resolve, reject) => {
-        const b = spawn(process.execPath, [viteBin, "build"], { stdio: "inherit" });
+        const b = spawn(viteCmd, [...viteArgs, "build"], { stdio: "inherit" });
         b.on("exit", (c) => (c === 0 ? resolve() : reject(new Error(`vite build exited ${c}`))));
         b.on("error", reject);
       });
@@ -124,7 +137,12 @@ async function main() {
     } else {
       const out = openSync(join(work, "preview.out"), "w");
       const err = openSync(join(work, "preview.err"), "w");
-      preview = spawnDetached(process.execPath, [viteBin, "preview", "--port", String(port), "--strictPort"], out, err);
+      preview = spawnDetached(
+        viteCmd,
+        [...viteArgs, "preview", "--port", String(port), "--strictPort"],
+        out,
+        err,
+      );
       closeSync(out);
       closeSync(err);
       if (!(await httpOk(base))) {

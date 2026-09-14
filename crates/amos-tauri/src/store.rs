@@ -117,13 +117,22 @@ impl SharedStore {
     }
 
     /// Read a value (used by the `store_get` command / hydration).
+    ///
+    /// A *poisoned* lock (a handler panicked while holding it) is not an absent key: the
+    /// value is still in the map, so the guard is taken with
+    /// [`std::sync::PoisonError::into_inner`] — the same rule the other bridges use. `.ok()`
+    /// here used to report every key as missing after any panic anywhere in the store.
     pub fn get(&self, key: &str) -> Option<String> {
-        self.inner.lock().ok()?.get(key).cloned()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .cloned()
     }
 
     /// Snapshot of all keys (used by a freshly-opened window to hydrate).
     pub fn snapshot(&self) -> HashMap<String, String> {
-        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Mutate + persist without broadcasting (Rust services can use this even
@@ -147,25 +156,43 @@ impl SharedStore {
     /// Write a value, persist, and broadcast the change to every window.
     pub fn set(&self, app: &AppHandle, key: &str, value: String) {
         self.insert(key, value.clone());
-        let _ = app.emit(
+        // A failed broadcast means a registered listener missed the update (no listener is
+        // `Ok` in Tauri) — the other windows would silently keep the stale value.
+        if let Err(e) = app.emit(
             STORE_UPDATED_EVENT,
             StoreUpdated {
                 key: key.to_string(),
                 value: Some(value),
             },
-        );
+        ) {
+            tracing::warn!(
+                target: "amos::store",
+                event = STORE_UPDATED_EVENT,
+                key,
+                error = %e,
+                "store update could not be broadcast to the other windows"
+            );
+        }
     }
 
     /// Remove a key, persist, and broadcast the change to every window.
     pub fn remove(&self, app: &AppHandle, key: &str) {
         self.remove_key(key);
-        let _ = app.emit(
+        if let Err(e) = app.emit(
             STORE_UPDATED_EVENT,
             StoreUpdated {
                 key: key.to_string(),
                 value: None,
             },
-        );
+        ) {
+            tracing::warn!(
+                target: "amos::store",
+                event = STORE_UPDATED_EVENT,
+                key,
+                error = %e,
+                "store removal could not be broadcast to the other windows"
+            );
+        }
     }
 
     /// Best-effort write of the whole map as pretty JSON to the backing file.
@@ -183,11 +210,46 @@ impl SharedStore {
             return;
         };
         if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
+            // Saying *why* matters here: the write below fails too when the directory is
+            // missing, and "No such file or directory" alone does not tell the operator
+            // that it was the directory creation that was refused (same rule the
+            // blocklist and the input-method profile follow).
+            if let Err(e) = fs::create_dir_all(dir) {
+                tracing::warn!(
+                    "could not create the store directory {}: {e}",
+                    dir.display()
+                );
+            }
         }
         if let Err(e) = fs::write(path, bytes) {
             tracing::warn!("failed to persist state to {}: {e}", path.display());
         }
+    }
+}
+
+/// The JSON **object** stored at `key`, for a *merge*, plus whether a value was present but
+/// could not be used.
+///
+/// The two empty cases are not the same and must not be treated alike:
+///
+/// * **no value** → this is the first write; merging into a fresh object is right, and
+///   nothing can be lost;
+/// * **a value that is not a JSON object** (corrupt, or a legacy scalar) → the keys this
+///   function cannot see *will be dropped* by whoever merges into the returned map.
+///
+/// Both used to collapse into `None`, so a corrupt `amos.settings` silently wiped every
+/// other quick-toggle (darkmode / dnd / location / wallpaper) on the next radio or torch
+/// change. Callers report the second case instead of losing the user's settings quietly.
+pub fn object_for_merge(
+    store: &SharedStore,
+    key: &str,
+) -> (serde_json::Map<String, serde_json::Value>, bool) {
+    let Some(raw) = store.get(key) else {
+        return (serde_json::Map::new(), false);
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Object(m)) => (m, false),
+        _ => (serde_json::Map::new(), true),
     }
 }
 
@@ -291,6 +353,49 @@ mod tests {
             assert!(thrice.get("amos.settings").is_some());
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_merge_tells_apart_missing_from_unusable_state() {
+        use serde_json::json;
+
+        let s = SharedStore::memory();
+        // Nothing stored yet: the first write, and nothing can be lost.
+        assert_eq!(
+            object_for_merge(&s, "amos.settings"),
+            (Default::default(), false)
+        );
+
+        s.insert("amos.settings", r#"{"darkmode":true,"dnd":false}"#.into());
+        let (m, unusable) = object_for_merge(&s, "amos.settings");
+        assert!(!unusable, "a JSON object is usable");
+        assert_eq!(m.get("darkmode"), Some(&json!(true)));
+
+        // Present but *not* an object (corrupt, or a legacy scalar): the keys it should have
+        // carried cannot be preserved, and that is what the caller has to report.
+        for raw in ["dark", "42", "[1,2]", "{oops", ""] {
+            s.insert("amos.settings", raw.into());
+            let (m, unusable) = object_for_merge(&s, "amos.settings");
+            assert!(unusable, "{raw:?} is present but unusable");
+            assert!(m.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_make_values_look_absent() {
+        let s = SharedStore::memory();
+        s.insert("amos.settings", "{}".into());
+
+        // Poison the lock the way a panicking command handler would.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = s.inner.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("a handler panicked while holding the store lock");
+        }));
+        assert!(s.inner.is_poisoned(), "the lock must really be poisoned");
+
+        // The value is still in the map: "missing" would be a claim about the user's data.
+        assert_eq!(s.get("amos.settings").as_deref(), Some("{}"));
+        assert_eq!(s.snapshot().len(), 1);
     }
 
     #[test]

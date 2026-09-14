@@ -183,7 +183,7 @@
             <div class="divide-y divide-black/5 overflow-hidden rounded-2xl bg-white/55 shadow-sm ring-1 ring-black/5 dark:divide-white/5 dark:bg-white/5 dark:ring-white/10">
               <button
                 onclick={runNewNote}
-                aria-label="spotlight-new-note"
+                data-testid="spotlight-new-note"
                 class="flex w-full items-center gap-3 px-3.5 py-2.5 text-left text-sm transition active:bg-accent/10"
               >
                 <span class="grid h-11 w-11 shrink-0 place-items-center rounded-[12px] bg-accent/15 text-[22px]" aria-hidden="true">📝</span>
@@ -192,7 +192,7 @@
               {#if dialTarget}
                 <button
                   onclick={runDial}
-                  aria-label="spotlight-dial"
+                  data-testid="spotlight-dial"
                   class="flex w-full items-center gap-3 px-3.5 py-2.5 text-left text-sm transition active:bg-accent/10"
                 >
                   <span class="grid h-11 w-11 shrink-0 place-items-center rounded-[12px] bg-accent/15 text-[22px]" aria-hidden="true">📞</span>
@@ -201,7 +201,7 @@
               {/if}
               <button
                 onclick={runSettingsSearch}
-                aria-label="spotlight-settings"
+                data-testid="spotlight-settings"
                 class="flex w-full items-center gap-3 px-3.5 py-2.5 text-left text-sm transition active:bg-accent/10"
               >
                 <span class="grid h-11 w-11 shrink-0 place-items-center rounded-[12px] bg-accent/15 text-[22px]" aria-hidden="true">⚙️</span>

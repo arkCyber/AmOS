@@ -107,27 +107,78 @@ cd crates/amos-tauri
 cargo tauri android init
 # produces gen/android/… with MainActivity + AndroidManifest.xml
 ```
-Then merge `crates/amos-tauri/android-glue/AndroidManifest.permissions.xml`’s
-`<uses-permission>` lines into `gen/android/app/src/main/AndroidManifest.xml`, and copy the
-Kotlin glue into place:
+Then merge the tracked fragment(s) from
+`crates/amos-tauri/android-glue/` into `gen/android/app/src/main/AndroidManifest.xml`,
+and mirror the Kotlin glue into place — **always via the script, never a hand `cp`** (a
+manual copy goes stale, and a newly added glue file never reaches the APK):
 ```bash
-cp -r android-glue/com/amos/ai/glue gen/android/app/src/main/java/com/amos/ai/
+scripts/android-glue-mirror.sh   # mirrors the glue AND verifies the merges below
 ```
+The script also **checks** that the generated manifest declares every `android:name` the
+fragments declare (`AndroidManifest.permissions.xml` — permissions/features, and
+`AndroidManifest.components.xml` — the in-call/screening services and the SMS receiver),
+failing loudly with the missing entries and their source fragment. Both merges stay
+manual (the generated manifest is Tauri's); drift, however, is now loud — it already had
+happened twice: the hotspot's `TETHER_PRIVILEGED` sat declared-but-unmerged, and the three
+glue components existed **only** in the generated file (a clean checkout would have built
+an APK with no in-call UI, no call screening and no live SMS receive).
 
 ### 5.2 Runtime CAMERA + WebView media (one‑time wiring)
-In the generated `MainActivity` (Tauri v2 activity):
-- `onStart` → `PermissionWire.requestNeeded(this)` then `AmosGlue.onStart(applicationContext)`
-  after the grant.
-- `onRequestPermissionsResult` → `PermissionWire.onResult(this, requestCode, grantResults)`
-  and (optional) `PermissionWire.mediaChrome` on the webview so `getUserMedia` goes live.
+In the generated `MainActivity` (Tauri v2 activity) — the template with the full set of
+calls is `crates/amos-tauri/android-glue/com/amos/ai/glue/MainActivity.Wiring.kt`:
+- `onCreate` → `AlwaysOn.apply(this)` (常驻·永亮)
+- `onStart` → `PermissionWire.requestNeeded(this)` + `PermissionWire.requestMedia(this)` +
+  `PermissionWire.ensureAttached(this)`, then `TelephonyGlue.bind(...)`/`ensureCallPermission`,
+  `BlocklistGlue.bind(...)`/`attachActivity(this)`, `DevCareGlue.attachActivity(this)`/
+  `bind(...)`, and — once CAMERA is held — `AmosGlue.onStart(applicationContext)`.
+- `onRequestPermissionsResult` → `PermissionWire.onResult(...)` + `TelephonyGlue.onResult(...)`,
+  then `AmosGlue.onCameraPermissionGranted(...)` + `AmosGlue.onStart(...)` on a CAMERA grant.
+- `onStop` → `AmosGlue.onStop(applicationContext)` (frees the camera/torch).
+- optionally `PermissionWire.mediaChrome` on the webview so `getUserMedia` goes live.
+
+`scripts/android-glue-mirror.sh` **verifies** these 15 call sites are present in the
+generated Activity and fails loudly (with each missing call and what it is for) — because
+a fresh `tauri android init` Activity calls none of them, and that APK would ship the whole
+compiled glue without binding any of it.
 
 ### 5.3 Build + install the System UI APK (no root needed)
 ```bash
+scripts/build-apk.sh                 # release APK (unsigned — cannot be installed)
+scripts/build-apk.sh --config        # **debug** APK (debug-signed ⇒ installable, debuggable)
 cd crates/amos-tauri
-cargo tauri android build --features android   # builds + assembles debug/release APK
 adb install -r gen/android/app/build/outputs/apk/debug/app-debug.apk
 adb shell monkey -p com.amos.ai 1              # launch
 ```
+> JDK 17 is required (AGP/Kotlin 1.x reject newer JDKs). Export it for the build:
+> `JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home`.
+> A release APK cannot be installed at all (no signing config is tracked, REQ-A176
+> boundary) — device verification needs `--config`.
+
+### 5.5 Device-driven UI verification (REQ-A185)
+The System UI is a WebView: `uiautomator` sees **one** node and `input tap` has no
+coordinates a test can derive, so device checks used to stop at "the app launched".
+A **debuggable** build exposes the WebView devtools socket, and
+`scripts/device-ui-eval.mjs` drives it over CDP (nothing is installed, nothing is
+patched):
+
+```bash
+node scripts/device-ui-eval.mjs 'document.title'                       # → "Amos System UI"
+node scripts/device-ui-eval.mjs 'document.querySelectorAll("[data-testid]").length'
+node scripts/device-ui-eval.mjs --await 'await window.__probe()'       # async expressions
+node scripts/device-ui-eval.mjs --list                                 # devtools targets
+```
+It finds the app pid, forwards `@webview_devtools_remote_<pid>` and evaluates in the
+real page — so a control's presence, its rendered text and the **real bridge's**
+answer are all observable. Native (non-WebView) UI — permission dialogs, system
+bars — is still `uiautomator`'s job; the two together cover a device round.
+
+Permission ground truth (what the installed APK may actually call) is
+`dumpsys`, not the source:
+```bash
+adb shell dumpsys package com.amos.ai | sed -n '/requested permissions:/,/install permissions:/p'
+```
+
+### 5.6 Verify on device
 
 ### 5.4 Headless daemons — requires ROOT (skip on this device)
 This phone cannot be rooted; the daemons-in-/system path is documented in

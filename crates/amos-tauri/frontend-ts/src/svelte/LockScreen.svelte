@@ -127,7 +127,7 @@
   {#if batteryLevel !== null}
     <div
       data-testid="lock-battery"
-      aria-label="battery level"
+      aria-label={t("a11y.batteryLevel")}
       class="absolute right-6 top-6 z-20 flex items-center gap-1.5 text-neutral-100 tabular-nums"
     >
       {@html batterySvg(batteryLevel, "h-3.5 w-3.5", battTone)}

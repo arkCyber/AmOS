@@ -270,6 +270,14 @@ impl GlobalClipboard {
         self.inner.lock().map_err(|e| e.to_string())
     }
 
+    /// A read-only guard that **tolerates poison**: a panic in another thread is not a
+    /// statement about the user's clipboard, so reads still see what is there. Writes keep
+    /// going through [`Self::lock`] and refuse on poison — pushing more changes into a core
+    /// someone else's panic may have left half-updated is the case that *should* fail loudly.
+    fn read(&self) -> std::sync::MutexGuard<'_, ClipboardCore> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Validate + store a payload as the newest clipboard entry.
     pub fn write(
         &self,
@@ -293,8 +301,11 @@ impl GlobalClipboard {
     }
 
     /// The newest entry, if any (cloned for callers).
+    ///
+    /// A poisoned lock is *not* an empty clipboard: the core is still there, so reads go
+    /// through [`Self::read`] instead of reporting "nothing was ever copied".
     pub fn latest(&self) -> Option<ClipboardEntry> {
-        self.lock().ok()?.latest().cloned()
+        self.read().latest().cloned()
     }
 
     /// The newest entry's plain-text rendering, if any — used for AI-context
@@ -305,16 +316,15 @@ impl GlobalClipboard {
 
     /// A bounded history snapshot, newest first.
     pub fn history(&self, limit: Option<usize>) -> Vec<ClipboardEntry> {
-        let core = match self.lock() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
+        // Poison-tolerant like the other accessors: an empty *history* would be a claim about
+        // the user's clipboard, and a panic elsewhere is not that claim.
+        let core = self.read();
         core.history(limit.unwrap_or(HISTORY_LIMIT).min(HISTORY_LIMIT))
     }
 
     /// Look up one entry by its sequence number.
     pub fn by_seq(&self, seq: u64) -> Option<ClipboardEntry> {
-        self.lock().ok()?.by_seq(seq)
+        self.read().by_seq(seq)
     }
 
     /// Clear the whole history, returning how many entries were removed.
@@ -471,7 +481,17 @@ pub fn clipboard_write(
     // Best-effort sync to the platform (container) clipboard + notify UIs with a
     // metadata-only notice (full content is fetched via foreground-gated read).
     mirror_to_native(&entry);
-    let _ = app.emit("clipboard-changed", ClipboardNotice::from(&entry));
+    if let Err(e) = app.emit("clipboard-changed", ClipboardNotice::from(&entry)) {
+        // The write itself succeeded, so the copy is real — but no UI would learn that the
+        // clipboard changed. (`emit` errors only for a *registered* listener; no listener is
+        // `Ok`.) Reported rather than discarded.
+        tracing::warn!(
+            target: "amos::clipboard",
+            event = "clipboard-changed",
+            error = %e,
+            "clipboard-changed notice could not be delivered to the UI"
+        );
+    }
     Ok(entry)
 }
 

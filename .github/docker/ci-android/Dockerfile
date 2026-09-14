@@ -56,7 +56,9 @@ ENV PATH="${CARGO_HOME}/bin:/opt/android-sdk/cmdline-tools/latest/bin:${ANDROID_
 # Tauri v2 on 24.04 needs *ayatana*-appindicator (the old `libappindicator3-dev`
 # was dropped on 24.04 — a classic reason gated jobs "suddenly" break when
 # runners float from 22.04 to 24.04). build-essential + cmake + pkg-config cover
-# crates that build C at cross-compile time (zstd-sys, onnxruntime, …).
+# crates that build C at cross-compile time (zstd-sys, onnxruntime, …), and
+# libpcap-dev covers `pnet` — `make gated-check` runs the `audit` features' tests
+# (REQ-A188), and `pnet`'s build fails without the libpcap headers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -67,6 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2-dev \
         libayatana-appindicator3-dev \
         libgtk-3-dev \
+        libpcap-dev \
         librsvg2-dev \
         libssl-dev \
         libwebkit2gtk-4.1-dev \

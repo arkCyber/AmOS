@@ -54,6 +54,21 @@ field() { # status_line field_name -> value
   echo "$1" | tr ' ' '\n' | grep -o "^$2=[^ ]*" | head -1 | cut -d= -f2
 }
 
+# The reported `engine` is the *serving path*, not just the backend kind: the backend
+# circuit breaker (REQ-A131) is on by default and shows up as an honest `+breaker`
+# suffix (`mock+breaker`) — the daemon's own status test pins exactly that set
+# (`reply.engine == "mock" || reply.engine == "mock+breaker"`). So compare the **kind**
+# and reject decorators nobody knows, instead of failing on a legitimate suffix
+# (this smoke was pinning the pre-breaker label and had been failing ever since).
+# Unknown decorator ⇒ empty kind ⇒ the caller's comparison fails loudly.
+engine_kind() { # reported_name -> kind ("", when the decorator is not a known one)
+  case "$1" in
+    *+breaker) printf '%s' "${1%+breaker}" ;;
+    *+*) printf '' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 # --- 1) mock: default dev engine, never "degraded" ---------------------------
 AMOS_BACKEND=mock "$AI" --socket "$S1" >"$L1" 2>&1 &
 P1=$!
@@ -61,7 +76,9 @@ wait_sock "$S1" || die "mock daemon socket not up (see $L1)"
 OUT=$(probe "$S1")
 echo "  mock:   $OUT"
 [ "$(field "$OUT" running)" = true ] || die "mock should be running"
-[ "$(field "$OUT" engine)" = mock ] || die "mock engine must report mock"
+MOCK_KIND=$(field "$OUT" engine)
+MOCK_KIND=$(engine_kind "$MOCK_KIND")
+[ "$MOCK_KIND" = mock ] || die "mock engine must report the mock kind (got $(field "$OUT" engine))"
 [ "$(field "$OUT" degraded)" = false ] || die "mock-as-default is NOT degraded"
 pass "mock -> engine=mock degraded=false"
 kill "$P1" 2>/dev/null
@@ -74,7 +91,8 @@ wait_sock "$S2" || die "hermes daemon socket not up (see $L2)"
 OUT=$(probe "$S2")
 echo "  hermes: $OUT"
 [ "$(field "$OUT" degraded)" = true ] || die "requested-real-but-unreachable must degrade honestly"
-[ "$(field "$OUT" engine)" = mock ] || die "degraded daemon serves the mock engine"
+DEGRADED_KIND=$(engine_kind "$(field "$OUT" engine)")
+[ "$DEGRADED_KIND" = mock ] || die "degraded daemon serves the mock engine (got $(field "$OUT" engine))"
 pass "hermes(unreachable) -> engine=mock degraded=true"
 kill "$P2" 2>/dev/null
 wait "$P2" 2>/dev/null || true
@@ -93,8 +111,9 @@ P3=$!
 wait_sock "$S3" || die "ollama daemon socket not up (see $L3)"
 OUT=$(probe "$S3")
 echo "  ollama: $OUT"
-[ "$(field "$OUT" engine)" = "$expect_engine" ] \
-  || die "ollama engine should be $expect_engine (got $(field "$OUT" engine))"
+OLLAMA_KIND=$(engine_kind "$(field "$OUT" engine)")
+[ "$OLLAMA_KIND" = "$expect_engine" ] \
+  || die "ollama engine kind should be $expect_engine (got $(field "$OUT" engine))"
 [ "$(field "$OUT" degraded)" = "$expect_degraded" ] \
   || die "ollama degraded should be $expect_degraded (got $(field "$OUT" degraded))"
 pass "ollama -> engine=$expect_engine degraded=$expect_degraded (matches reachability)"

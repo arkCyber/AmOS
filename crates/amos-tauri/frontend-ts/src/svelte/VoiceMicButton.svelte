@@ -182,7 +182,7 @@
 <span class="relative inline-flex shrink-0">
   <button
     type="button"
-    aria-label="voice input"
+    aria-label={t("a11y.voiceInput")}
     onclick={() => {
       if (transcribing) return;
       if (recording) void stop();

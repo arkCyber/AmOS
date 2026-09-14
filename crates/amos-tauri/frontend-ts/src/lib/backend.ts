@@ -696,23 +696,187 @@ export async function telephonyStopRecording(
   return invoke<TelephonyCall>("telephony_stop_recording", { callId });
 }
 
-/* ---- Radio / connectivity (radio_*: wifi / bluetooth / airplane). Real radios
- *       live on the System UI side (Android services), so unlike telephony these
- *       do NOT round-trip through the headless daemon. ---- */
-export type RadioPayload = { wifi: boolean; bluetooth: boolean; airplane: boolean };
+/* ---- Radio / connectivity (radio_*: wifi / bluetooth / airplane / hotspot). Real
+ *       radios live on the System UI side (Android services), so unlike telephony
+ *       these do NOT round-trip through the headless daemon. ---- */
+export type RadioPayload = {
+  wifi: boolean;
+  bluetooth: boolean;
+  airplane: boolean;
+  hotspot: boolean;
+};
 
-/** Read the current radio state (wifi / bluetooth / airplane). */
+/** Read the current radio state (wifi / bluetooth / airplane / hotspot). */
 export async function radioStatus(): Promise<RadioPayload | null> {
   return invoke<RadioPayload>("radio_status");
 }
 
-/** Toggle one radio. Airplane mode cascades Wi-Fi + Bluetooth off and gates
- * them until it is turned back off; returns the authoritative resulting state. */
+/**
+ * Why a `radio_set` did not apply (REQ-A203). Machine tokens only — the screen owns
+ * the wording; `detail` is free-form ledger copy.
+ */
+export type RadioRefusal = {
+  /** `platform_managed` / `airplane_active` / `provider_refused` / `unsupported`. */
+  kind: string;
+  /** The radio the refusal names (a cascade names the refused member), if known. */
+  radio?: string | null;
+  /** For `platform_managed`: the system surface that owns the switch. */
+  surface?: string | null;
+  /** For `platform_managed`: why (`switch_removed` / `privileged_only`). */
+  reason?: string | null;
+  /** Diagnostic sentence for the ledger — never the screen's primary wording. */
+  detail?: string;
+};
+
+/** The full, structured answer to one `radio_set` (REQ-A203): refusals are data. */
+export type RadioSetReply = {
+  radio: string;
+  requested: boolean;
+  /** `true` when the write landed (and the store was mirrored Rust-side). */
+  applied: boolean;
+  /** The device's state **after the attempt** — `null` only when even the read failed. */
+  state: RadioPayload | null;
+  /** Present exactly when `applied` is `false`. */
+  refusal: RadioRefusal | null;
+};
+
+/**
+ * Toggle one radio. Airplane mode cascades Wi-Fi + Bluetooth + the hotspot off and
+ * gates them until it is turned back off. The reply is **structured**: `applied`
+ * says whether the write landed, and a refusal (the device saying no to *this*
+ * attempt, a platform-owned switch, the airplane guard) comes back as data with
+ * machine tokens — instead of a failed `invoke` that used to collapse into `null`
+ * and leave a tile tap looking like nothing happened (REQ-A203).
+ */
 export async function radioSet(
-  key: "wifi" | "bluetooth" | "airplane",
+  key: "wifi" | "bluetooth" | "airplane" | "hotspot",
   enabled: boolean,
-): Promise<RadioPayload | null> {
-  return invoke<RadioPayload>("radio_set", { key, enabled });
+): Promise<RadioSetReply | null> {
+  const res = await invoke<RadioSetReply>("radio_set", { key, enabled });
+  // The refusal no longer travels as a command failure, so the ledger routing that
+  // `invoke` used to do happens here — the diagnostic record must not get quieter
+  // just because the answer became structured.
+  if (res && !res.applied) {
+    amosWarn("backend", "radio_set refused", res.refusal?.detail ?? res.refusal?.kind ?? res.refusal);
+  }
+  return res;
+}
+
+/* ---- Platform-managed switches (REQ-A202): on modern Android the platform owns the
+ *       Wi-Fi (API 29+) and Bluetooth (API 33+) switches, and the airplane bit has always
+ *       needed WRITE_SECURE_SETTINGS. `radio_set` then refuses — before touching anything —
+ *       and the screen's job is to say so and offer the system surface instead of a write
+ *       that cannot succeed. These two commands are that path. ---- */
+
+/** The platform's answer to "may an app switch this radio?" (machine tokens only). */
+export type RadioControlReply = {
+  radio: string;
+  /** `true` = this app may switch it (a `radio_set` failure is then a real refusal). */
+  app_controlled: boolean;
+  /** The system surface that owns it: `"wifi_panel"` / `"bluetooth_settings"` / … */
+  surface: string | null;
+  /** Why not: `"switch_removed"` (the platform took the API away) / `"privileged_only"`. */
+  reason: string | null;
+};
+
+/** Ask whether this app may switch `key`, and which system surface owns it if not. */
+export async function radioControl(
+  key: "wifi" | "bluetooth" | "airplane" | "hotspot",
+): Promise<RadioControlReply | null> {
+  return invoke<RadioControlReply>("radio_control", { key });
+}
+
+/** Open the system surface that owns a platform-managed switch. `true` = an Activity
+ *  started; `null`/`false` means it did not, and the screen must say so. */
+export async function radioOpenSettings(
+  key: "wifi" | "bluetooth" | "airplane" | "hotspot",
+): Promise<boolean | null> {
+  return invoke<boolean>("radio_open_settings", { key });
+}
+
+/* ---- Bluetooth details (REQ-A199): what the adapter calls itself and which devices
+ *       it is paired with. Each call answers with the **device's** value, or fails when
+ *       nobody can ask (offline host, or a build whose Android glue never attached) —
+ *       in which case the screen keeps showing its stored preference and says so. ---- */
+
+/** One paired device as the adapter reports it. */
+export type BluetoothPeer = { address: string; name: string };
+
+/** The adapter's own name, as the device reports it. Fails when nobody can ask. */
+export async function bluetoothAdapterName(): Promise<string | null> {
+  return invoke<string>("bluetooth_adapter_name");
+}
+
+/** Rename the adapter; resolves with the name the **adapter** reports afterwards (it may
+ *  truncate), or null when the request did not reach a device. */
+export async function bluetoothRenameAdapter(name: string): Promise<string | null> {
+  return invoke<string>("bluetooth_rename_adapter", { name });
+}
+
+/** The devices the adapter is paired with (empty list = paired with nothing). */
+export async function bluetoothPairedDevices(): Promise<BluetoothPeer[] | null> {
+  return invoke<BluetoothPeer[]>("bluetooth_paired_devices");
+}
+
+/* ---- Bluetooth discovery (REQ-A200; LE + bond states REQ-A201): the scan runs in the
+ *       device glue, the screen starts/stops it and polls its state. `scan_allowed:
+ *       false` (no BLUETOOTH_SCAN) is deliberately distinct from an empty `devices` list,
+ *       and `classic` / `le` say which transports were actually searched. ---- */
+
+/** One device seen by a scan. */
+export type BluetoothScanDevice = {
+  address: string;
+  /** Advertised name, or "" when the platform has none (label the row with the address). */
+  name: string;
+  rssi: number | null;
+  /**
+   * The raw platform bond state: 10 none / 11 bonding / 12 bonded. Not a bool — "pairing
+   * in progress" is a third answer the row renders as progress (see `lib/bluetooth`).
+   */
+  bond: number;
+  /** Seen over a Bluetooth **LE** advertisement (vs classic BR/EDR discovery). */
+  le: boolean;
+};
+
+/** One bond transition the glue saw during the scan session. */
+export type BluetoothBond = { address: string; state: number };
+
+/** A scan's state: running / transports / capped / allowed / results / bond changes. */
+export type BluetoothScan = {
+  /** A search is running (classic discovery **or** the LE scan). */
+  discovering: boolean;
+  /** Classic (BR/EDR) discovery is running. */
+  classic: boolean;
+  /** The LE scan is running (`false` = LE was not searched, not "LE found nothing"). */
+  le: boolean;
+  /** The result list hit the device-side cap, so it may be partial. */
+  capped: boolean;
+  /** Whether this app may scan at all (`BLUETOOTH_SCAN` granted). */
+  scan_allowed: boolean;
+  devices: BluetoothScanDevice[];
+  /** Bond transitions seen this session, for the address the user asked to pair with. */
+  bonds: BluetoothBond[];
+};
+
+/** Start a scan. `false` = the platform refused (no adapter / no BLUETOOTH_SCAN). */
+export async function bluetoothStartScan(): Promise<boolean | null> {
+  return invoke<boolean>("bluetooth_start_scan");
+}
+
+/** Cancel a scan (called when the screen leaves the Bluetooth page). */
+export async function bluetoothStopScan(): Promise<boolean | null> {
+  return invoke<boolean>("bluetooth_stop_scan");
+}
+
+/** The current scan state. */
+export async function bluetoothScanState(): Promise<BluetoothScan | null> {
+  return invoke<BluetoothScan>("bluetooth_scan_state");
+}
+
+/** Ask the platform to pair with `address`. `true` = the request was ACCEPTED (the
+ *  system's pairing flow starts and the user confirms on the peer) — never "paired". */
+export async function bluetoothPair(address: string): Promise<boolean | null> {
+  return invoke<boolean>("bluetooth_pair", { address });
 }
 
 /* ---- Flashlight / torch (flashlight_*). Illumination on/off. Like the radios,
@@ -924,24 +1088,6 @@ export async function systemStoreSet(key: string, value: string): Promise<void |
 /** Snapshot of the durable Rust system store (boot hydration into localStorage). */
 export async function systemStoreSnapshot(): Promise<Record<string, string> | null> {
   return invoke<Record<string, string>>("store_snapshot");
-}
-
-/** One file of an installed web-bundle, served as base64 + MIME for the UI to render. */
-export interface BundleResource {
-  mime: string;
-  nosniff: boolean;
-  base64: string;
-}
-export async function storeBundleResource(
-  id: string,
-  path: string,
-): Promise<BundleResource | null> {
-  return invoke<BundleResource>("appstore_bundle_resource", { id, path });
-}
-
-/** One file of an installed web-bundle addressed as an `amos-app://` URI. */
-export async function storeBundleUri(uri: string): Promise<BundleResource | null> {
-  return invoke<BundleResource>("appstore_bundle_uri", { uri });
 }
 
 

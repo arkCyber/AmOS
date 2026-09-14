@@ -14,6 +14,8 @@ import { notesChannel, AI_TARGET_WINDOW } from "../src/svelte/appLinks";
 import { resetPropsChannels } from "../src/svelte/propsBus";
 import { resetShellState, surface } from "../src/svelte/shellState.svelte";
 import { setLocale } from "../src/svelte/locale.svelte";
+import { zh } from "../src/i18n/locales/zh";
+import { en } from "../src/i18n/locales/en";
 
 afterEach(cleanup);
 afterEach(() => setLocale("zh")); // never leak a locale into the next case
@@ -59,7 +61,7 @@ describe("NotesApp.svelte", () => {
 
   test("adding a note expands it, shows its body, and persists", async () => {
     const host = render(NotesApp);
-    const ta = host.container.querySelector('textarea[aria-label="note-compose"]') as HTMLTextAreaElement;
+    const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "买牛奶\n鸡蛋" } });
     await fireEvent.click(btnTrim(host, "保存")!);
 
@@ -73,7 +75,7 @@ describe("NotesApp.svelte", () => {
     try {
       const host = render(NotesApp);
       const ta = host.container.querySelector(
-        'textarea[aria-label="note-compose"]',
+        'textarea[data-testid="note-compose"]',
       ) as HTMLTextAreaElement;
       await fireEvent.input(ta, { target: { value: "会丢的笔记" } });
       await fireEvent.click(btnTrim(host, "保存")!);
@@ -95,7 +97,7 @@ describe("NotesApp.svelte", () => {
     const restore = failWritesFor("amos.notes");
     const host = render(NotesApp);
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     try {
       await fireEvent.input(ta, { target: { value: "第一次失败" } });
@@ -117,7 +119,7 @@ describe("NotesApp.svelte", () => {
 
   test("archiving removes it from 备忘录 and it appears in 归档", async () => {
     const host = render(NotesApp);
-    const ta = host.container.querySelector('textarea[aria-label="note-compose"]') as HTMLTextAreaElement;
+    const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "待办清单" } });
     await fireEvent.click(btnTrim(host, "保存")!);
     expect(txt(host)).toContain("待办清单");
@@ -137,7 +139,7 @@ describe("NotesApp.svelte", () => {
   });
   test("#标签 surfaces a chip that filters the list; ✕ clears it", async () => {
     const host = render(NotesApp);
-    const ta = host.container.querySelector('textarea[aria-label="note-compose"]') as HTMLTextAreaElement;
+    const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "汇报\n本周进度 #工作" } });
     await fireEvent.click(btnTrim(host, "保存")!);
     await fireEvent.input(ta, { target: { value: "买菜清单" } });
@@ -163,7 +165,7 @@ describe("NotesApp.svelte", () => {
 
   test("multi-select batch archives two notes at once", async () => {
     const host = render(NotesApp);
-    const ta = host.container.querySelector('textarea[aria-label="note-compose"]') as HTMLTextAreaElement;
+    const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
     const add = async (v: string) => {
       await fireEvent.input(ta, { target: { value: v } });
       await fireEvent.click(btnTrim(host, "保存")!);
@@ -191,7 +193,7 @@ describe("NotesApp.svelte", () => {
   });
   test("exporting a note without a backend copies it and shows a fallback message", async () => {
     const host = render(NotesApp);
-    const ta = host.container.querySelector('textarea[aria-label="note-compose"]') as HTMLTextAreaElement;
+    const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "导出正文" } });
     await fireEvent.click(btnTrim(host, "保存")!);
     const exportBtn = [...host.container.querySelectorAll("button")].find((b) =>
@@ -208,7 +210,7 @@ describe("NotesApp.svelte — editor affordances", () => {
   const tick = () => new Promise<void>((r) => setTimeout(r, 0));
   const addNote = async (host: { container: HTMLElement }, v: string) => {
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: v } });
     await fireEvent.click(btnTrim(host, "保存")!);
@@ -223,7 +225,7 @@ describe("NotesApp.svelte — editor affordances", () => {
     await tick();
   };
   const noteEditTa = (host: { container: HTMLElement }) =>
-    host.container.querySelector('textarea[aria-label="note-edit"]') as HTMLTextAreaElement;
+    host.container.querySelector('textarea[data-testid="note-edit"]') as HTMLTextAreaElement;
 
   test("live rich-text preview shows while editing and renders markers", async () => {
     const host = render(NotesApp);
@@ -231,10 +233,10 @@ describe("NotesApp.svelte — editor affordances", () => {
     await enterEdit(host);
     expect(noteEditTa(host)).toBeTruthy();
 
-    await fireEvent.click(host.container.querySelector('[aria-label="note-edit-preview"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-edit-preview"]')!);
     await tick();
 
-    const prev = host.container.querySelector('[aria-label="note-preview"]');
+    const prev = host.container.querySelector('[data-testid="note-preview"]');
     expect(prev).toBeTruthy();
     expect(prev?.querySelector("strong")).toBeTruthy(); // **加粗** rendered bold
     expect(txt(host)).toContain("#工作");
@@ -247,7 +249,7 @@ describe("NotesApp.svelte — editor affordances", () => {
     const ta = noteEditTa(host);
     expect(ta.value).toBe("- [ ] 买牛奶");
 
-    await fireEvent.click(host.container.querySelector('[aria-label="note-edit-toggle-task"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-edit-toggle-task"]')!);
     await tick();
     expect(noteEditTa(host).value).toBe("- [x] 买牛奶");
   });
@@ -256,7 +258,7 @@ describe("NotesApp.svelte — editor affordances", () => {
     const host = render(NotesApp);
     await addNote(host, "写周报");
     await enterEdit(host);
-    await fireEvent.click(host.container.querySelector('[aria-label="note-edit-prefix-task"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-edit-prefix-task"]')!);
     await tick();
     expect(noteEditTa(host).value).toBe("- [ ] 写周报");
   });
@@ -309,7 +311,7 @@ describe("NotesApp.svelte — full-page editor wiring", () => {
   test("opening 整页 swaps to NoteEditor; ‹ back flushes the autosave and returns", async () => {
     const host = render(NotesApp);
     const compose = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(compose, { target: { value: "第一版标题" } });
     await fireEvent.click(btnTrim(host, "保存")!);
@@ -325,17 +327,17 @@ describe("NotesApp.svelte — full-page editor wiring", () => {
     await tick();
 
     const ed = host.container.querySelector(
-      'textarea[aria-label="note-editor-textarea"]',
+      'textarea[data-testid="note-editor-textarea"]',
     ) as HTMLTextAreaElement;
     expect(ed).toBeTruthy();
     await fireEvent.input(ed, { target: { value: "第二版标题与正文" } });
     await tick();
 
     // ‹ back flushes the pending autosave and returns to the list.
-    await fireEvent.click(host.container.querySelector('[aria-label="note-editor-back"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-back"]')!);
     await tick();
 
-    expect(host.container.querySelector('[aria-label="note-editor-textarea"]')).toBeNull();
+    expect(host.container.querySelector('[data-testid="note-editor-textarea"]')).toBeNull();
     expect(txt(host)).toContain("第二版标题与正文"); // list row reflects the save
     const stored = readStoreValue<{ id: string; text: string; ts: number }[]>(
       "amos.notes",
@@ -367,12 +369,12 @@ describe("NotesApp.svelte — Markdown import / export", () => {
   test("⇪ md imports the compose content as a front-matter-stripped note", async () => {
     const host = render(NotesApp);
     const compose = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(compose, {
       target: { value: "---\ntitle: 周报\n---\n# 周报标题\n\n正文内容" },
     });
-    await fireEvent.click(host.container.querySelector('[aria-label="note-import-md"]')!);
+    await fireEvent.click(host.container.querySelector('[data-testid="note-import-md"]')!);
     await tick();
 
     const stored = readStoreValue<{ id: string; text: string }[]>("amos.notes", []);
@@ -384,13 +386,13 @@ describe("NotesApp.svelte — Markdown import / export", () => {
   test("⇩ .md export affordance is present and reports the clipboard fallback", async () => {
     const host = render(NotesApp);
     const compose = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(compose, { target: { value: "导出正文" } });
     await fireEvent.click(btnTrim(host, "保存")!); // adds + opens the note
     await tick();
 
-    const mdBtn = host.container.querySelector('[aria-label="note-export-md"]');
+    const mdBtn = host.container.querySelector('[data-testid="note-export-md"]');
     expect(mdBtn).toBeTruthy();
     await fireEvent.click(mdBtn as HTMLButtonElement);
     await tick();
@@ -419,7 +421,7 @@ describe("NotesApp.svelte — open-in-editor preference", () => {
     window.localStorage.removeItem("amos.notesPrefs");
     const host = render(NotesApp);
     await tapRow(host);
-    expect(host.container.querySelector('textarea[aria-label="note-editor-textarea"]')).toBeNull();
+    expect(host.container.querySelector('textarea[data-testid="note-editor-textarea"]')).toBeNull();
     expect(txt(host)).toContain("点按我"); // expanded inline detail
   });
 
@@ -428,7 +430,7 @@ describe("NotesApp.svelte — open-in-editor preference", () => {
     window.localStorage.setItem("amos.notesPrefs", JSON.stringify({ openInEditor: true }));
     const host = render(NotesApp);
     await tapRow(host);
-    expect(host.container.querySelector('textarea[aria-label="note-editor-textarea"]')).toBeTruthy();
+    expect(host.container.querySelector('textarea[data-testid="note-editor-textarea"]')).toBeTruthy();
   });
 
   test("the toggle persists openInEditor to amos.notesPrefs", async () => {
@@ -436,7 +438,7 @@ describe("NotesApp.svelte — open-in-editor preference", () => {
     window.localStorage.removeItem("amos.notesPrefs");
     const host = render(NotesApp);
     const cb = host.container.querySelector(
-      'input[aria-label="note-pref-open-in-editor"]',
+      'input[data-testid="note-pref-open-in-editor"]',
     ) as HTMLInputElement;
     expect(cb).toBeTruthy();
     await fireEvent.click(cb); // bind:checked flips to true
@@ -492,7 +494,7 @@ describe("NotesApp.svelte — 按修改时间排序偏好", () => {
     window.localStorage.removeItem("amos.notesPrefs");
     const host = render(NotesApp);
     const cb = host.container.querySelector(
-      'input[aria-label="note-pref-sort-by-modified"]',
+      'input[data-testid="note-pref-sort-by-modified"]',
     ) as HTMLInputElement;
     expect(cb).toBeTruthy();
     expect(cb.checked).toBe(false);
@@ -557,7 +559,7 @@ describe("NotesApp.svelte — 复制便签", () => {
     const row = host.container.querySelector(".mt-3.space-y-2 button") as HTMLButtonElement;
     await fireEvent.click(row); // expand the note to reveal its action toolbar
     const btn = host.container.querySelector(
-      'button[aria-label="note-duplicate"]',
+      'button[data-testid="note-duplicate"]',
     ) as HTMLButtonElement;
     expect(btn).toBeTruthy();
     await fireEvent.click(btn);
@@ -593,7 +595,7 @@ describe("NotesApp.svelte — 搜索高亮", () => {
     const host = render(NotesApp);
     await new Promise<void>((r) => setTimeout(r, 0));
     const input = host.container.querySelector(
-      'input[aria-label="note-search"]',
+      'input[data-testid="note-search"]',
     ) as HTMLInputElement;
     await fireEvent.input(input, { target: { value: "牛奶" } });
     await new Promise<void>((r) => setTimeout(r, 0));
@@ -626,7 +628,7 @@ describe("NotesApp.svelte — 清空最近删除（两步确认）", () => {
 
     // arm
     const arm = host.container.querySelector(
-      'button[aria-label="note-empty-trash"]',
+      'button[data-testid="note-empty-trash"]',
     ) as HTMLButtonElement;
     expect(arm).toBeTruthy();
     await fireEvent.click(arm);
@@ -642,11 +644,11 @@ describe("NotesApp.svelte — 清空最近删除（两步确认）", () => {
 
     // arm again and confirm
     const arm2 = host.container.querySelector(
-      'button[aria-label="note-empty-trash"]',
+      'button[data-testid="note-empty-trash"]',
     ) as HTMLButtonElement;
     await fireEvent.click(arm2);
     const confirmBtn = host.container.querySelector(
-      'button[aria-label="note-empty-trash-confirm"]',
+      'button[data-testid="note-empty-trash-confirm"]',
     ) as HTMLButtonElement;
     await fireEvent.click(confirmBtn);
     const saved = JSON.parse(window.localStorage.getItem("amos.notes") ?? "[]");
@@ -664,7 +666,7 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     const host = render(NotesApp);
     await new Promise<void>((r) => setTimeout(r, 0));
     const input = host.container.querySelector(
-      'input[aria-label="note-search"]',
+      'input[data-testid="note-search"]',
     ) as HTMLInputElement;
     await fireEvent.input(input, { target: { value: "转账" } });
     await new Promise<void>((r) => setTimeout(r, 0));
@@ -682,7 +684,7 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
 
     // Creating a memo still works while AI is offline (never blocked).
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "离线也能记" } });
     await fireEvent.click(btnTrim(host, "保存")!);
@@ -718,7 +720,7 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     // The clipboard tray lives in the note editor toolbar → add a note first
     // (saving opens it in the editor).
     const compose = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(compose, { target: { value: "剪辑测试" } });
     await fireEvent.click(btnTrim(host, "保存")!);
@@ -727,7 +729,7 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     await fireEvent.click(btnTrim(host, "编辑")!);
     await new Promise<void>((r) => setTimeout(r, 0));
 
-    await fireEvent.click(host.container.querySelector('button[aria-label="Clipboard history"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector(`button[aria-label="${zh["note.clipHistoryHint"]}"]`) as HTMLButtonElement);
     await new Promise<void>((r) => setTimeout(r, 0));
     // A binary entry used to render as "—"; it now shows its honest preview, and
     // whitespace in a text entry is collapsed for the one-line picker.
@@ -753,7 +755,7 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     };
     const host = render(NotesApp);
     await fireEvent.click(
-      host.container.querySelector('button[aria-label="note-ask-toggle"]') as HTMLButtonElement,
+      host.container.querySelector('button[data-testid="note-ask-toggle"]') as HTMLButtonElement,
     );
     await new Promise<void>((r) => setTimeout(r, 0));
     const status = host.container.querySelector('[data-testid="note-rag-status"]');
@@ -768,7 +770,7 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
   test("ask-my-notes toggles a panel and reports offline without a daemon", async () => {
     const host = render(NotesApp);
     const toggle = host.container.querySelector(
-      'button[aria-label="note-ask-toggle"]',
+      'button[data-testid="note-ask-toggle"]',
     ) as HTMLButtonElement;
     expect(toggle).toBeTruthy();
     // Panel is closed until toggled.
@@ -779,7 +781,7 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     // button is disabled (never a silent no-op).
     expect(txt(host)).toContain("笔记检索需要守护进程");
     const run = host.container.querySelector(
-      'button[aria-label="note-ask-run"]',
+      'button[data-testid="note-ask-run"]',
     ) as HTMLButtonElement;
     expect(run.disabled).toBe(true);
     // Toggling off closes the panel again.
@@ -806,7 +808,7 @@ describe("NotesApp.svelte — Spotlight deep link (appLinks.openNote)", () => {
     const host = render(NotesApp);
     await tick();
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-editor-textarea"]',
+      'textarea[data-testid="note-editor-textarea"]',
     ) as HTMLTextAreaElement | null;
     expect(ta).toBeTruthy();
     expect(ta?.value).toBe("会议记录");
@@ -820,7 +822,7 @@ describe("NotesApp.svelte — Spotlight deep link (appLinks.openNote)", () => {
     notesChannel().set({ noteId: "gone", nonce: 8 });
     const host = render(NotesApp);
     await tick();
-    expect(host.container.querySelector('textarea[aria-label="note-editor-textarea"]')).toBeNull();
+    expect(host.container.querySelector('textarea[data-testid="note-editor-textarea"]')).toBeNull();
     expect(txt(host)).toContain("买菜清单");
   });
 });
@@ -848,7 +850,7 @@ describe("NotesApp.svelte — send to AI (wm SystemContext)", () => {
   /** Add a note, expand its row and enter edit mode so the toolbar shows. */
   async function editNote(host: { container: HTMLElement }, text: string) {
     const ta = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: text } });
     await fireEvent.click(btnTrim(host, "保存")!);
@@ -869,7 +871,7 @@ describe("NotesApp.svelte — send to AI (wm SystemContext)", () => {
     await editNote(host, "预算审查 #work");
 
     const send = host.container.querySelector(
-      'button[aria-label="note-send-ai"]',
+      'button[data-testid="note-send-ai"]',
     ) as HTMLButtonElement | null;
     expect(send).toBeTruthy();
     await fireEvent.click(send as HTMLButtonElement);
@@ -891,13 +893,13 @@ describe("NotesApp.svelte — send to AI (wm SystemContext)", () => {
     // Create a note (the row is expanded afterwards) so the footer + inline toolbar
     // render — those are the affordances whose copy used to be hard-coded in zh.
     const compose = host.container.querySelector(
-      'textarea[aria-label="note-compose"]',
+      'textarea[data-testid="note-compose"]',
     ) as HTMLTextAreaElement;
     await fireEvent.input(compose, { target: { value: "Groceries" } });
     await fireEvent.click(btnTrim(host, "Save")!);
     await tick();
 
-    const importBtn = host.container.querySelector('[aria-label="note-import-md"]')!;
+    const importBtn = host.container.querySelector('[data-testid="note-import-md"]')!;
     expect(importBtn.getAttribute("title")).toBe("Import the input as Markdown"); // was "把输入内容当作 Markdown 导入"
     expect(btnTrim(host, "Full page")).toBeTruthy(); // was "整页"
 
@@ -905,11 +907,11 @@ describe("NotesApp.svelte — send to AI (wm SystemContext)", () => {
     // hard-coded Chinese titles this round localised.
     await fireEvent.click(btnTrim(host, "Edit")!);
     await tick();
-    expect(host.container.querySelector('[aria-label="note-edit-preview"]')!.getAttribute("title")).toBe(
+    expect(host.container.querySelector('[data-testid="note-edit-preview"]')!.getAttribute("title")).toBe(
       "Rich-text preview", // was "富文本预览"
     );
-    expect(host.container.querySelector('[aria-label="Clipboard history"]')!.getAttribute("title")).toBe(
-      "Clipboard history", // was "剪贴板历史"
+    expect(host.container.querySelector(`[aria-label="${en["note.clipHistoryHint"]}"]`)!.getAttribute("title")).toBe(
+      en["note.clipHistoryHint"], // was hard-coded "剪贴板历史"
     );
     expect(txt(host)).not.toContain("整页");
   });

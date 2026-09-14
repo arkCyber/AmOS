@@ -34,7 +34,7 @@ This project adheres to a [Code of Conduct](./CODE_OF_CONDUCT.md). By participat
    sudo apt-get update
    sudo apt-get install -y \
      libwebkit2gtk-4.1-dev \
-     libappindicator3-dev \
+     libayatana-appindicator3-dev \
      librsvg2-dev \
      patchelf \
      libgtk-3-dev
@@ -139,6 +139,7 @@ For feature requests, describe:
    ```bash
    make lint
    make test
+   make verify   # optional but recommended: every device-free gate in one command
    ```
 
 2. **Update documentation** if you've changed:
@@ -198,7 +199,7 @@ cargo test -p amos-ai
 cargo test --test rpc_test
 
 # Frontend tests
-cd crates/amos-tauri/frontend && bun run test
+cd crates/amos-tauri/frontend-ts && bun run test
 ```
 
 ### Writing Tests

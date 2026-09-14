@@ -419,7 +419,7 @@
       <p class="py-10 text-center text-sm opacity-60">{t("photo.favEmpty")}</p>
     {:else}
       {#if nativeShown}
-        <div class="mb-2" role="region" aria-label="native photos">
+        <div class="mb-2" role="region" aria-label={t("a11y.nativePhotos")}>
           <div class="flex gap-1 overflow-x-auto px-1">
             {#each native as n (n.id)}
               <div
@@ -445,7 +445,7 @@
           {#if it.kind === "video"}
             {@const v = it.v}
             <div class="relative aspect-square overflow-hidden bg-black text-4xl">
-              <button aria-label="video" onclick={() => void openVideo(v.id)}
+              <button aria-label={t("a11y.video")} onclick={() => void openVideo(v.id)}
                 class="absolute inset-0 grid h-full w-full place-items-center">
                 <span class="opacity-90">🎬</span>
                 <span class="absolute bottom-1 right-1 rounded bg-black/60 px-1 text-xs tabular-nums text-white">{fmtLen(v.durationMs)}</span>
@@ -453,7 +453,7 @@
                   <span class="absolute bottom-1 left-1 rounded bg-black/60 px-1 text-xs font-medium text-white">{resLabelOf(v)}</span>
                 {/if}
               </button>
-              <button aria-label="favourite video" onclick={() => favVideo(v.id)}
+              <button aria-label={t("a11y.favouriteVideo")} onclick={() => favVideo(v.id)}
                 class="absolute right-1 top-1 z-10 grid h-6 w-6 place-items-center rounded-full bg-black/45 text-xs text-white">{v.fav ? "♥" : "♡"}</button>
             </div>
           {:else}
@@ -501,7 +501,7 @@
               <p role="status" class="text-xs text-white/80">{wallMsg}</p>
             {/if}
             <div class="flex items-center justify-between gap-3 self-stretch">
-              <button onclick={closeVideo} aria-label="close video" data-icon="x" class="grid h-8 w-8 place-items-center rounded-full bg-white/15 text-white ring-1 ring-white/25">{@html iconSvg("x", "h-4 w-4")}</button>
+              <button onclick={closeVideo} aria-label={t("a11y.closeVideo")} data-icon="x" class="grid h-8 w-8 place-items-center rounded-full bg-white/15 text-white ring-1 ring-white/25">{@html iconSvg("x", "h-4 w-4")}</button>
               <button onclick={() => playId && shareVideo(playId)} class="rounded-full bg-white/15 px-4 py-1.5 text-sm text-white ring-1 ring-white/25">{t("photo.share")}</button>
               <button onclick={() => playId && void deleteVideo(playId)} class="rounded-full bg-danger/90 px-4 py-1.5 text-sm text-white">{t("photo.delete")}</button>
             </div>

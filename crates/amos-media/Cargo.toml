@@ -19,6 +19,9 @@ base64 = "0.21"
 # the Kotlin `MediaStoreGlue` in the System UI APK over JNI (String↔String JSON).
 # Optional so desktop/CI stay light.
 jni = { version = "0.21", optional = true }
+# Shared JNI rules (clean exception state + class resolution through the app
+# loader): see crates/amos-jni/src/lib.rs and REQ-A186.
+amos-jni = { path = "../amos-jni", optional = true }
 
 [dev-dependencies]
 
@@ -28,5 +31,5 @@ default = []
 # Needs the Kotlin MediaStoreGlue in the generated System UI app + a runtime
 # permission grant, so `cargo check --features android` only proves it compiles;
 # real behavior is exercised at device time (docs/android-storage-unify.md §6 C).
-android = ["dep:jni"]
+android = ["dep:jni", "dep:amos-jni"]
 

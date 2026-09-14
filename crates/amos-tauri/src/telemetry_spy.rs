@@ -140,7 +140,16 @@ async fn spy_round(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("telemetry-spy watch stream error: {e}"))?
     {
-        let _ = app.emit(SPY_HIT_EVENT, spy_payload(&evt));
+        // A failed delivery means a registered spy listener missed this hit (no listener is
+        // `Ok` in Tauri) — the privacy surface would silently stay quiet.
+        if let Err(e) = app.emit(SPY_HIT_EVENT, spy_payload(&evt)) {
+            tracing::warn!(
+                target: "amos::spy",
+                event = SPY_HIT_EVENT,
+                error = %e,
+                "telemetry-spy hit could not be delivered to the UI"
+            );
+        }
     }
     Ok(())
 }

@@ -65,6 +65,8 @@
   import SpotlightPanel from "./SpotlightPanel.svelte";
   import NotificationCenter from "./NotificationCenter.svelte";
   import ClipboardAnnounce from "./ClipboardAnnounce.svelte";
+  import ImeOverlay from "./ImeOverlay.svelte";
+  import ExtAppHost from "./ExtAppHost.svelte";
 
   interface HomeProps {
     layout: HomeLayout;
@@ -393,7 +395,7 @@
           <div class="flex items-center justify-between border-b border-neutral-200/70 bg-white/50 px-3 py-3 backdrop-blur-md dark:border-neutral-800 dark:bg-white/5">
             <button
               onclick={goHome}
-              aria-label="back"
+              aria-label={t("a11y.back")}
               class="-ml-1 grid h-10 w-10 cursor-pointer place-items-center rounded-full text-accent text-[17px] font-semibold transition active:bg-black/5 dark:active:bg-white/10"
             >‹</button>
             <span class="flex-1 truncate text-center text-[17px] font-semibold tracking-tight">{appTitle(s.id)}</span>
@@ -405,17 +407,12 @@
           <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {#key s.id}
               {#if isExtId(s.id)}
-                <!-- A store-installed app has a tile + manifest but no local Svelte
-                     screen: its web-bundle runtime host is not built yet. Say so
-                     honestly instead of showing a blank app frame. -->
-                <div
-                  data-testid="ext-app-pending"
-                  class="flex h-full flex-col items-center justify-center gap-2 px-8 text-center"
-                >
-                  <span class="text-3xl" aria-hidden="true">🧩</span>
-                  <p class="text-sm font-semibold">{appTitle(s.id)}</p>
-                  <p class="text-xs opacity-60">{t("store.extPending", { id: midOf(s.id) })}</p>
-                </div>
+                <!-- A store-installed app has no local Svelte screen: it runs its
+                     own web-bundle at its own origin on the `amos-app://` protocol.
+                     The host resolves the entry URL from Rust (which also proves
+                     the app is installed and its entry is servable) and says why
+                     when it cannot. -->
+                <ExtAppHost mid={midOf(s.id)} name={appTitle(s.id)} />
               {:else if AppComp}
                 <AppComp />
               {:else}
@@ -441,9 +438,9 @@
                shell home. The whole strip is the touch target (44px tall for touch). -->
           <div class="flex justify-center pb-2 pt-1">
             <button
-              aria-label="home"
+              aria-label={t("a11y.home")}
               data-testid="home-indicator"
-              title="Home"
+              title={t("a11y.home")}
               onclick={goHome}
               class="grid w-40 cursor-pointer place-items-center py-2"
             >
@@ -471,6 +468,8 @@
       <SpotlightPanel />
       <NotificationCenter />
       <ClipboardAnnounce />
+      <!-- Input method: the pinyin keyboard for whichever text field is focused. -->
+      <ImeOverlay />
     {/if}
   {/if}
 </div>

@@ -159,6 +159,9 @@ impl Translator for TranslatorService {
                                 }
                             }
                             Err(e) => {
+                                // The only way this send fails is the client having dropped the
+                                // response stream — there is nobody left to tell about `e`. If it
+                                // *does* land, the error reaches the client and we stop.
                                 let _ = tx.send(Err(Status::internal(e.to_string()))).await;
                                 break;
                             }

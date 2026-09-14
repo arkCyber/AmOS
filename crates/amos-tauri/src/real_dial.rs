@@ -73,9 +73,9 @@ mod android_impl {
         let (vm, ctx) = CTX.get().ok_or_else(|| {
             "real dial context not bound — call TelephonyGlue.nativeAttach at boot".to_string()
         })?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("failed to attach to JVM: {e}"))?;
+        // Shared helper: attach with a clean exception state (REQ-A186).
+        let mut env =
+            amos_jni::attached(vm).map_err(|e| format!("failed to attach to JVM: {e}"))?;
 
         let action = env.new_string(ACTION_CALL).map_err(|e| e.to_string())?;
         let intent = env
@@ -154,7 +154,15 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_TelephonyGlue_nativeAttach(
     let ctx = unsafe { jni::objects::JObject::from_raw(context) };
     if let Ok(e) = env {
         if let Ok(vm) = e.get_java_vm() {
-            let _ = android_impl::bind(vm, &e, ctx);
+            // The dial context is what makes ACTION_CALL real; a silent bind failure
+            // would leave "real dialing" on the mock with no symptom (REQ-A187).
+            if let Err(err) = android_impl::bind(vm, &e, ctx) {
+                tracing::warn!(
+                    target: "amos::telephony",
+                    error = %err,
+                    "real dial context not bound — dialing stays on the mock"
+                );
+            }
         }
     }
 }

@@ -10,10 +10,14 @@
  * (the single audited chokepoint) says so.
  *
  * This module is intentionally pure (no DOM / no bridge / no daemon) so the
- * request validation + deny-by-default reply logic is unit-testable, matching
- * `lib/bundle.ts`. Wiring it into an actual `postMessage` listener / real origin
+ * request validation + deny-by-default reply logic is unit-testable — the same
+ * pure-seam style the repo uses elsewhere (it used to cite `lib/bundle.ts`, which
+ * was **removed** in REQ-A171 once the real-origin bundle host replaced the
+ * srcdoc path). Wiring it into an actual `postMessage` listener / real origin
  * host is device/ecosystem work (see `docs/permissions-sandbox-audit-plan.md`
- * Phase 3) and is **not** faked here.
+ * Phase 3) and is **not** faked here: the origin host now exists
+ * (`svelte/ExtAppHost.svelte`), but nothing in the shell has a capability to hand
+ * out yet, so every frame stays deny-by-default.
  *
  * Invariant: an unknown resource, a malformed frame, or an *unknown* daemon
  * outcome is always treated as **denied** — a sandboxed third party is never

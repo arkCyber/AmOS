@@ -218,7 +218,16 @@ impl InterpretationBridge {
 
 fn emit(app: &AppHandle, payloads: Vec<InterpretEventPayload>) {
     for p in payloads {
-        let _ = app.emit(INTERPRET_EVENT, p);
+        // A failed delivery means a registered interp listener never received this chunk
+        // (no listener is `Ok` in Tauri), so the transcript on screen silently loses a piece.
+        if let Err(e) = app.emit(INTERPRET_EVENT, p) {
+            tracing::warn!(
+                target: "amos::interpret",
+                event = INTERPRET_EVENT,
+                error = %e,
+                "interpret event could not be delivered to the UI"
+            );
+        }
     }
 }
 

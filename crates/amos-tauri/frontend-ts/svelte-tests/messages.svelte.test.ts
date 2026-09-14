@@ -17,6 +17,7 @@ import { afterEach } from "vitest";
 import { tick } from "svelte";
 import { messagesChannel } from "../src/svelte/appLinks";
 import { resetPropsChannels } from "../src/svelte/propsBus";
+import { zh } from "../src/i18n/locales/zh";
 
 // Each test starts from a fresh, single seeded 小安 conversation (the Messages
 // screen persists to the shared store, which is not reset between tests) and an
@@ -61,7 +62,7 @@ function failWritesFor(key: string): () => void {
     Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
 }
 const input = (h: { container: HTMLElement }) =>
-  h.container.querySelector('input[aria-label="message-input"]') as HTMLInputElement | null;
+  h.container.querySelector('input[data-testid="message-input"]') as HTMLInputElement | null;
 
 describe("MessagesApp.svelte", () => {
   test("an intentionally emptied store is not re-seeded with the demo thread", () => {
@@ -84,7 +85,7 @@ describe("MessagesApp.svelte", () => {
     const before = txt(host);
     await fireEvent.input(input(host)!, { target: { value: "你好 Amos" } });
     const sendBtn = [...host.container.querySelectorAll("button")].find(
-      (b) => b.getAttribute("aria-label") === "send",
+      (b) => b.getAttribute("aria-label") === zh["message.send"],
     );
     expect(sendBtn).toBeTruthy();
     await fireEvent.click(sendBtn as HTMLButtonElement);
@@ -138,11 +139,11 @@ describe("MessagesApp.svelte", () => {
     try {
       const host = render(MessagesApp);
       const ni = host.container.querySelector(
-        'input[aria-label="new-contact"]',
+        'input[data-testid="new-contact"]',
       ) as HTMLInputElement;
       await fireEvent.input(ni, { target: { value: "李四" } });
       await fireEvent.click(
-        host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement,
+        host.container.querySelector('button[data-testid="add-contact"]') as HTMLButtonElement,
       );
       await tick();
       // Nothing was stored, so the thread list must not show it.
@@ -158,10 +159,10 @@ describe("MessagesApp.svelte", () => {
 
   test("adding a new contact opens an empty thread and switches to it", async () => {
     const host = render(MessagesApp);
-    const ni = host.container.querySelector('input[aria-label="new-contact"]') as HTMLInputElement | null;
+    const ni = host.container.querySelector('input[data-testid="new-contact"]') as HTMLInputElement | null;
     expect(ni).toBeTruthy();
     await fireEvent.input(ni as HTMLInputElement, { target: { value: "李四" } });
-    const addBtn = host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement | null;
+    const addBtn = host.container.querySelector('button[data-testid="add-contact"]') as HTMLButtonElement | null;
     expect(addBtn).toBeTruthy();
     await fireEvent.click(addBtn as HTMLButtonElement);
     await tick();
@@ -173,14 +174,14 @@ describe("MessagesApp.svelte", () => {
   test("each thread keeps its own messages (send stays in the active one)", async () => {
     const host = render(MessagesApp);
     // add 李四 (the new-contact row is always visible)
-    const ni = host.container.querySelector('input[aria-label="new-contact"]') as HTMLInputElement;
+    const ni = host.container.querySelector('input[data-testid="new-contact"]') as HTMLInputElement;
     await fireEvent.input(ni, { target: { value: "李四" } });
-    await fireEvent.click(host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="add-contact"]') as HTMLButtonElement);
     await tick();
     // send a message to 李四
-    const msgIn = host.container.querySelector('input[aria-label="message-input"]') as HTMLInputElement;
+    const msgIn = host.container.querySelector('input[data-testid="message-input"]') as HTMLInputElement;
     await fireEvent.input(msgIn, { target: { value: "给李四的私信" } });
-    const sendBtn = host.container.querySelector('button[aria-label="send"]') as HTMLButtonElement;
+    const sendBtn = host.container.querySelector(`button[aria-label="${zh["message.send"]}"]`) as HTMLButtonElement;
     await fireEvent.click(sendBtn);
     await tick();
     expect(txt(host)).toContain("给李四的私信");
@@ -197,13 +198,13 @@ describe("MessagesApp.svelte", () => {
   test("deleting a thread (only when >1) removes it and selects another", async () => {
     const host = render(MessagesApp);
     // only one thread → no delete button yet
-    expect(host.container.querySelector('button[aria-label="delete-thread"]')).toBeNull();
-    const ni = host.container.querySelector('input[aria-label="new-contact"]') as HTMLInputElement;
+    expect(host.container.querySelector('button[data-testid="delete-thread"]')).toBeNull();
+    const ni = host.container.querySelector('input[data-testid="new-contact"]') as HTMLInputElement;
     await fireEvent.input(ni, { target: { value: "王五" } });
-    await fireEvent.click(host.container.querySelector('button[aria-label="add-contact"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="add-contact"]') as HTMLButtonElement);
     await tick();
-    expect(host.container.querySelector('button[aria-label="delete-thread"]')).toBeTruthy();
-    await fireEvent.click(host.container.querySelector('button[aria-label="delete-thread"]') as HTMLButtonElement);
+    expect(host.container.querySelector('button[data-testid="delete-thread"]')).toBeTruthy();
+    await fireEvent.click(host.container.querySelector('button[data-testid="delete-thread"]') as HTMLButtonElement);
     await tick();
     // falls back to the remaining 小安 thread
     expect(txt(host)).toContain("小安");
@@ -257,7 +258,7 @@ describe("MessagesApp.svelte", () => {
     expect(msgCall?.threadId).toBe("1");
     expect(msgCall && "thread_id" in msgCall).toBe(false);
     // local-only affordances are hidden in real-SMS mode
-    expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
+    expect(host.container.querySelector('input[data-testid="new-contact"]')).toBeNull();
   });
 
   test("keeps local conversations with the honest host mock", async () => {
@@ -313,10 +314,10 @@ describe("MessagesApp.svelte", () => {
     // Denied is an error state — never an empty inbox, never the local demo chat.
     expect(host.container.querySelector('[data-testid="sms-error"]')).toBeTruthy();
     expect(txt(host)).toContain("短信权限被拒绝");
-    expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
+    expect(host.container.querySelector('input[data-testid="new-contact"]')).toBeNull();
     // Granting the permission and retrying recovers into the real inbox.
     granted = true;
-    await fireEvent.click(host.container.querySelector('button[aria-label="sms-retry"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="sms-retry"]') as HTMLButtonElement);
     await new Promise<void>((r) => setTimeout(r, 0));
     await tick();
     expect(host.container.querySelector('[data-testid="sms-error"]')).toBeNull();
@@ -339,7 +340,7 @@ describe("MessagesApp.svelte", () => {
     await tick();
     expect(host.container.querySelector('[data-testid="sms-empty"]')).toBeTruthy();
     expect(txt(host)).toContain("本机暂无短信");
-    expect(host.container.querySelector('input[aria-label="new-contact"]')).toBeNull();
+    expect(host.container.querySelector('input[data-testid="new-contact"]')).toBeNull();
   });
 
   test("refreshes live when the device pushes a received SMS", async () => {
@@ -414,15 +415,15 @@ describe("MessagesApp.svelte", () => {
     await tick();
     await new Promise<void>((r) => setTimeout(r, 0));
     await tick();
-    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="new-sms"]') as HTMLButtonElement);
     await tick();
-    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-to"]') as HTMLInputElement, {
+    await fireEvent.input(host.container.querySelector('input[data-testid="new-sms-to"]') as HTMLInputElement, {
       target: { value: "+8613800138000" },
     });
-    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-text"]') as HTMLInputElement, {
+    await fireEvent.input(host.container.querySelector('input[data-testid="new-sms-text"]') as HTMLInputElement, {
       target: { value: "测试短信" },
     });
-    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms-send"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="new-sms-send"]') as HTMLButtonElement);
     await new Promise<void>((r) => setTimeout(r, 0));
     await tick();
     const sent = calls.find((c) => c.cmd === "sms_send");
@@ -530,15 +531,15 @@ describe("MessagesApp.svelte", () => {
     await new Promise<void>((r) => setTimeout(r, 0));
     await tick();
     // Compose → 存草稿 (not sending anything).
-    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="new-sms"]') as HTMLButtonElement);
     await tick();
-    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-to"]') as HTMLInputElement, {
+    await fireEvent.input(host.container.querySelector('input[data-testid="new-sms-to"]') as HTMLInputElement, {
       target: { value: "10086" },
     });
-    await fireEvent.input(host.container.querySelector('input[aria-label="new-sms-text"]') as HTMLInputElement, {
+    await fireEvent.input(host.container.querySelector('input[data-testid="new-sms-text"]') as HTMLInputElement, {
       target: { value: "想问下流量包" },
     });
-    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms-draft"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="new-sms-draft"]') as HTMLButtonElement);
     await tick();
     expect(calls.some((c) => c.cmd === "sms_send")).toBe(false); // nothing was sent
     // The drafts folder lists it from the local store.
@@ -550,9 +551,9 @@ describe("MessagesApp.svelte", () => {
     // Editing it prefils the composer; sending clears the draft and sends for real.
     await fireEvent.click(host.container.querySelector('button[aria-label="draft-edit-10086"]') as HTMLButtonElement);
     await tick();
-    const to = host.container.querySelector('input[aria-label="new-sms-to"]') as HTMLInputElement;
+    const to = host.container.querySelector('input[data-testid="new-sms-to"]') as HTMLInputElement;
     expect(to.value).toBe("10086");
-    await fireEvent.click(host.container.querySelector('button[aria-label="new-sms-send"]') as HTMLButtonElement);
+    await fireEvent.click(host.container.querySelector('button[data-testid="new-sms-send"]') as HTMLButtonElement);
     await new Promise<void>((r) => setTimeout(r, 0));
     await tick();
     const sent = calls.find((c) => c.cmd === "sms_send");

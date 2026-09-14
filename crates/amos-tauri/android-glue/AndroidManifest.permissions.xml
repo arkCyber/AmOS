@@ -29,6 +29,69 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Personal hotspot / Wi-Fi tethering (docs/radio.md §7,
+         crates/amos-tauri/android-glue/.../TetheringGlue.kt):
+         `TetheringManager#startTethering(TetheringRequest, Executor,
+         StartTetheringCallback)` / `#stopTethering`. The public tethering API
+         only exists from **API 36** (verified with `javap`: `TetheringManager` is
+         absent from the android-34/35 `android.jar`s, and `ConnectivityManager`'s
+         tethering members are `@SystemApi`), so below 36 the glue honestly
+         reports "unavailable" instead of faking a fallback.
+         TETHER_PRIVILEGED is a **signature|privileged** permission — only a
+         platform-signed / privileged app can hold it, so a normally-installed
+         AmOS gets a refusal, the glue returns `false`, and Rust surfaces a
+         provider error: the UI then honestly says the hotspot could not start
+         instead of claiming an AP that is not up. Declared (with the lint ignore)
+         so the requirement is visible at the manifest level; granting it requires
+         a privileged install. ACCESS_NETWORK_STATE above is what the tethering
+         state checks need. -->
+    <uses-permission android:name="android.permission.TETHER_PRIVILEGED"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Radios: Wi-Fi + Bluetooth on/off and state (crates/amos-radio/src/android.rs,
+         the `android` feature). **Not** privileged — these are the permissions the
+         provider's own calls require, and until REQ-A185 none of them was declared,
+         so on a real device every read/write threw SecurityException and the
+         quick-settings tiles were dead (the compile gate cannot see this: the SDK
+         *has* the methods, the permission is an install/runtime concern).
+
+           * ACCESS_WIFI_STATE  — `WifiManager#isWifiEnabled` (the status bar's Wi-Fi
+             badge and `radio_status`'s `wifi` bit). Normal ⇒ granted at install.
+           * CHANGE_WIFI_STATE  — `WifiManager#setWifiEnabled`. Normal ⇒ granted at
+             install, but API 29+ additionally restricts the *caller* to system /
+             device-owner apps: on a normally-installed build the platform answers
+             `false` and the provider reports that honestly (REQ-A184) instead of
+             claiming a switch it did not make.
+           * BLUETOOTH / BLUETOOTH_ADMIN — the legacy pair used on API ≤ 30
+             (`BluetoothAdapter#isEnabled` / `enable` / `disable`).
+           * BLUETOOTH_CONNECT — the API 31+ replacement, a **runtime** permission:
+             it is requested at startup (MainActivity.Wiring.kt `requestNeeded`) and
+             again on demand by nothing else, so a denial surfaces as a provider
+             error rather than a silently-off toggle. On API 33+ the platform also
+             forbids non-system apps from *enabling/disabling* Bluetooth at all —
+             that refusal is reported, not papered over. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Bluetooth **discovery** (REQ-A200): `BluetoothGlue.startDiscovery` / `bond`
+         need the API 31+ **runtime** `BLUETOOTH_SCAN` (below 31 the install-time
+         BLUETOOTH/BLUETOOTH_ADMIN pair above covers scanning, which is why that pair
+         is capped at 30 and this one is not). `neverForLocation` is accurate: the
+         scan is not used to derive the user's location here. Requested at startup by
+         `MainActivity.Wiring.kt`, and a denial surfaces as an honest error rather
+         than an empty result list.
+         BLUETOOTH_ADVERTISE is deliberately **not** declared: it is only needed to
+         make *this* device discoverable, and nothing in this tree does that
+         (`BluetoothAdapter#setScanMode` is not public SDK) — a declaration with no
+         call site would be reported `stale` by scripts/android-permission-scan.mjs. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
+
     <!-- Real outbound dialing: the AmOS Phone dialer fires ACTION_CALL through
          Android Telecom (needs runtime CALL_PHONE grant; see docs/telephony.md). -->
     <uses-permission android:name="android.permission.CALL_PHONE" />

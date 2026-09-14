@@ -22,7 +22,7 @@
 //!     ingested into the shared AmOS clipboard (so a Webview app can paste it).
 //!   * **Rust ─► Android**: an `AndroidClipboardSink` (a [`ClipboardNative`])
 //!     mirrors AmOS writes onto the container's `ClipboardManager` via a Kotlin
-//!     bridge object (`pushTextClipboard(String, long)`), so an app running
+//!     bridge object (`pushTextClipboard(String)`), so an app running
 //!     inside the container can paste AmOS-side copies.
 //!
 //! This module only exists on-device. Like `android_glue`, it compiles under
@@ -30,7 +30,7 @@
 //! runtime. Nothing is faked: until the sink is attached (or the ingest bus is
 //! armed) every path is an honest no-op.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::clipboard::{self, ClipboardEntry, ClipboardNative};
 use jni::objects::{GlobalRef, JObject, JString, JValue};
@@ -46,8 +46,6 @@ struct AndroidClipboardSink {
     vm: JavaVM,
     /// Global ref to the Kotlin `ClipboardGlue` bridge instance.
     bridge: GlobalRef,
-    /// Monotonic counter for cross-process ordering hints.
-    seq: Mutex<u64>,
 }
 
 impl ClipboardNative for AndroidClipboardSink {
@@ -60,24 +58,27 @@ impl ClipboardNative for AndroidClipboardSink {
         let text = entry
             .plain_text()
             .ok_or_else(|| "image-only payload can't mirror to a text clipboard".to_string())?;
-        let seq = {
-            let mut g = self.seq.lock().map_err(|e| e.to_string())?;
-            *g += 1;
-            *g
-        };
 
         // Attach the current (Tauri main) thread to the JVM. On Android the main
         // thread is already attached, so this returns a cheap nested guard.
-        let mut env = self.vm.attach_current_thread().map_err(|e| e.to_string())?;
+        // Shared helper: attach with a clean exception state (REQ-A186).
+        let mut env = amos_jni::attached(&self.vm).map_err(|e| e.to_string())?;
         let obj = self.bridge.as_obj();
         let jtext = env.new_string(text).map_err(|e| e.to_string())?;
         let jobj: JObject = jtext.into();
-        // Kotlin bridge: `fun pushTextClipboard(text: String, seq: Long)`.
+        // Kotlin bridge: `fun pushTextClipboard(text: String)`.
+        //
+        // This used to pass a monotonic `seq` "for cross-process ordering hints",
+        // but the Kotlin side never read it and the platform does not report a seq
+        // on a clipboard change, so the counter reached nothing (REQ-A185 — caught
+        // by the Kotlin compiler: "Parameter 'seq' is never used"). Echo suppression
+        // is the text + time window in `ClipboardGlue.onPrimaryClipChanged`, which
+        // is the mechanism that actually exists.
         env.call_method(
             obj,
             "pushTextClipboard",
-            "(Ljava/lang/String;J)V",
-            &[JValue::Object(&jobj), JValue::Long(seq as i64)],
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&jobj)],
         )
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -104,13 +105,9 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_ClipboardGlue_attach(
         // SAFETY: `bridge` is a live local ref for the duration of this call.
         let obj = unsafe { JObject::from_raw(bridge) };
         let registered = env.new_global_ref(obj).ok().and_then(|bridge| {
-            env.get_java_vm().ok().map(|vm| {
-                Arc::new(AndroidClipboardSink {
-                    vm,
-                    bridge,
-                    seq: Mutex::new(0),
-                })
-            })
+            env.get_java_vm()
+                .ok()
+                .map(|vm| Arc::new(AndroidClipboardSink { vm, bridge }))
         });
         if let Some(sink) = registered {
             // Exactly-once; a redundant re-attach simply keeps the first sink.

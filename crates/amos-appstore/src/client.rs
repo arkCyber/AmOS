@@ -139,7 +139,18 @@ impl<P: StoreProvider> AppStore<P> {
         match installer.install(manifest, bytes) {
             Ok(_) => Ok(()),
             Err(e) => {
-                let _ = installer.uninstall(&manifest.id);
+                // The failed install's unpacked bundle has to be cleaned up, and the cleanup
+                // may itself fail: then the app is **not** in the registry but its files stay
+                // on disk. The caller sees the install error (which is about the install), so
+                // only the log can say that the rollback left something behind.
+                if let Err(cleanup) = installer.uninstall(&manifest.id) {
+                    tracing::warn!(
+                        target: "amos::store",
+                        id = %manifest.id,
+                        error = %cleanup,
+                        "install rollback could not remove the unpacked bundle"
+                    );
+                }
                 Err(e)
             }
         }
@@ -389,7 +400,18 @@ impl<P: StoreProvider> AppStore<P> {
             }
         }
         if let Some(dir) = &self.web_install {
-            let _ = crate::webinstall::WebInstaller::new(dir.clone()).uninstall(id);
+            // The registry entry is gone, so the app *is* uninstalled as far as the user can
+            // see — but its unpacked bundle may survive. `Ok(())` here therefore means "not
+            // installed anymore", never "the disk was cleaned", and a failure to clean is
+            // reported instead of being covered by that success.
+            if let Err(e) = crate::webinstall::WebInstaller::new(dir.clone()).uninstall(id) {
+                tracing::warn!(
+                    target: "amos::store",
+                    id = %id,
+                    error = %e,
+                    "uninstalled from the registry, but the unpacked bundle could not be removed"
+                );
+            }
         }
         Ok(())
     }
@@ -403,7 +425,15 @@ impl<P: StoreProvider> AppStore<P> {
             .apps
             .get(id)
             .cloned();
-        let cataloged = self.resolve_catalog(id).await.ok();
+        let cataloged = match self.resolve_catalog(id).await {
+            Ok(manifest) => Some(manifest),
+            // "The catalog does not publish this app" is an *answer*. Any other error is a
+            // failure to **ask** — and dressing that up is a lie the user sees: an offline
+            // device would be told the app does not exist (below), or that an installed app is
+            // up to date (further down) when the catalog was never reached.
+            Err(StoreError::UnknownApp { .. }) => None,
+            Err(e) => return Err(e),
+        };
 
         let Some(app) = installed else {
             return match cataloged {
@@ -1142,6 +1172,43 @@ mod tests {
         // Re-upgrading when already current is a clean no-op, not a reinstall.
         let noop = store.upgrade_apk("com.amos.mail").await.unwrap_err();
         assert!(matches!(noop, StoreError::NoUpdate { .. }), "{noop}");
+    }
+
+    /// A catalog that cannot be read at all (offline backend / IO failure): "we could not
+    /// ask" — which must never be reported as an answer.
+    struct OfflineProvider;
+
+    #[async_trait]
+    impl crate::StoreProvider for OfflineProvider {
+        fn name(&self) -> &'static str {
+            "offline-provider"
+        }
+        async fn catalog(&self) -> crate::Result<Vec<AppManifest>> {
+            Err(StoreError::Provider("catalog unreachable".into()))
+        }
+        async fn fetch_package(&self, _m: &AppManifest) -> crate::Result<Vec<u8>> {
+            Err(StoreError::Provider("catalog unreachable".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_catalog_is_neither_unknown_nor_up_to_date() {
+        let store = AppStore::new(OfflineProvider);
+
+        // A catalog we could not reach must not become "this app does not exist"…
+        let err = store.status("org.amos.ghost").await.unwrap_err();
+        assert!(matches!(err, StoreError::Provider(_)), "{err}");
+
+        // …and an *installed* app must not be reported as up to date, which would hide the
+        // update the user cannot see while offline.
+        store.record(app("org.amos.a", "A", "1.0.0")).unwrap();
+        let err = store.status("org.amos.a").await.unwrap_err();
+        assert!(matches!(err, StoreError::Provider(_)), "{err}");
+        assert_eq!(
+            store.installed_version("org.amos.a").unwrap().as_deref(),
+            Some("1.0.0"),
+            "the registry itself is still readable"
+        );
     }
 
     /// A provider that hands the engine an *unvalidated* manifest — unlike

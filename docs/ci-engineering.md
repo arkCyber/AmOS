@@ -1,6 +1,6 @@
 # CI 环境漂移修复 — 工程化改动说明 (CI engineering: killing environment drift)
 
-**日期**: 2026-09-09 · **分支目标**: `feature/system-monitor-and-power`
+**日期**: 2026-09-09（该轮工作已并入 `main`）
 **范围**: `gated-native-backends` / `android-audio-seams` / `lint-and-test` 三流水线反复
 红的问题——根因不是“x86 vs arm64”本身，而是**本地 Mac 与 Ubuntu runner 之间交叉编译
 链不一致**导致的漂移（NDK 版本、api 级、`libappindicator3-dev` 在 24.04 被移除、
@@ -60,7 +60,15 @@ clang 写死，与 CI 的 NDK 26 / api 26 语义不一致。
 - `./deploy.sh ci-local`：跑本地校验脚本；`./deploy.sh docker` 本地构建镜像；
   `./deploy.sh doctor` 打印当前工具链版本。
 
-Makefile 新增 `make ci-local` / `make deploy` / `make doctor` 便于入口统一。
+  第 5 步（容器构建）的 Docker 探测是**有界的**（`AMOS_DOCKER_PROBE_SECS`，默认 20s）：
+  此前 `docker info` 在 Docker Desktop 启动中/卡住时会**无限挂起**，把整条门禁一起拖住
+  （REQ-A193 实测挂 5 分钟以上）；现在超时即打印 `docker daemon did not answer within Ns;
+  skipping build`，`--docker` 仍可强制尝试。
+
+Makefile 新增 `make ci-local` / `make deploy` / `make doctor` 便于入口统一；另有
+`make verify` = **一条命令跑完所有"不需要设备"的验证目标**（lint/test/check/cov/ci-local/
+smoke/sup-smoke/timesync-smoke/honesty-smoke/hot-loop/e2e-local/gated-check/android-* 等），
+即 CI 各 job 的本地串行等价物（REQ-A193）。
 
 ## 5. 建议验收
 

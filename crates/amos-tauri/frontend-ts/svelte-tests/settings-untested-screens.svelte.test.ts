@@ -73,7 +73,7 @@ describe("QuarantinePanel (the read side of the corrupt-value quarantine)", () =
     const host = render(QuarantinePanel);
     await settle();
     await fireEvent.click(
-      host.container.querySelector('button[aria-label="quarantine-copy"]') as HTMLButtonElement,
+      host.container.querySelector('button[data-testid="quarantine-copy"]') as HTMLButtonElement,
     );
     await settle();
     // The raw preserved bytes go to the clipboard verbatim (no "repair" attempt).
@@ -93,7 +93,7 @@ describe("QuarantinePanel (the read side of the corrupt-value quarantine)", () =
     const host = render(QuarantinePanel);
     await settle();
     const btn = host.container.querySelector(
-      'button[aria-label="quarantine-copy"]',
+      'button[data-testid="quarantine-copy"]',
     ) as HTMLButtonElement;
     await fireEvent.click(btn);
     await settle();

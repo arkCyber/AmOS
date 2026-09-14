@@ -1,0 +1,5 @@
+{
+  "policy": "Declared features (and cargo targets with `required-features`) that **no gate step compiles** — see scripts/feature-surface-scan.mjs. `make lint`'s `cargo clippy --workspace --all-targets` runs default features only, and cargo *silently skips* a target whose required-features are unmet, so such code is invisible to every gate (REQ-A191). The normal fix is a step: `cargo clippy -p <crate> --features <feat> -- -D warnings` in `make lint` (or `cargo test` in `make test` when the feature hides tests). An entry here means the feature is deliberately kept out of every gate, and the reason must say why that is safe — a stale entry (the feature became compiled, or no longer exists) FAILS, so the list cannot rot. Keys are `crate/feature` for features and `crate:kind:name` for targets.",
+  "features": {},
+  "targets": {}
+}

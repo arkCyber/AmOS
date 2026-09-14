@@ -21,6 +21,7 @@ members = [
     "crates/amos-timesync",
     "crates/amos-timesync-cli",
     "crates/amos-radio",
+    "crates/amos-jni",
     "crates/amos-flashlight",
     "crates/amos-sensor",
     "crates/amos-profiling",
@@ -40,6 +41,7 @@ members = [
     "crates/amos-sms",
     "crates/amos-blocklist",
     "crates/amos-devocare",
+    "crates/amos-ime",
 ]
 
 [workspace.package]
@@ -70,6 +72,7 @@ pnet = "0.35"
 # ---- local workspace crates ----
 amos-proto = { path = "crates/amos-proto" }
 amos-android = { path = "crates/amos-android" }
+amos-jni = { path = "crates/amos-jni" }
 amos-int = { path = "crates/amos-int" }
 amos-appstore = { path = "crates/amos-appstore" }
 amos-timesync = { path = "crates/amos-timesync" }
@@ -88,6 +91,7 @@ amos-media = { path = "crates/amos-media" }
 amos-clipboard = { path = "crates/amos-clipboard" }
 amos-web3 = { path = "crates/amos-web3" }
 amos-identity = { path = "crates/amos-identity" }
+amos-ime = { path = "crates/amos-ime" }
 
 # ---- profile tuning for fast iteration / smaller mobile binaries ----
 [profile.dev]

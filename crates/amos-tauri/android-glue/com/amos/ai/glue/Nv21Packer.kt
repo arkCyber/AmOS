@@ -100,7 +100,17 @@ internal object Nv21Packer {
                 val start = row * rowStride
                 if (start < limit) {
                     val avail = minOf(cols, limit - start)
-                    src.get(start, dst, o, avail)
+                    // NOT `src.get(start, dst, o, avail)` (the absolute bulk get): it
+                    // exists in the JDK stub `android.jar` compiles against but **not**
+                    // in this device's runtime — on Android 14 (API 34) it threw
+                    // `NoSuchMethodError: No virtual method get(I[BII)Ljava/nio/ByteBuffer;`
+                    // and the caller dropped every frame ("frame encode dropped"), so the
+                    // native camera path produced nothing while the build stayed green.
+                    // The API-1 relative bulk get does the same copy (REQ-A185).
+                    val prev = src.position()
+                    src.position(start)
+                    src.get(dst, o, avail)
+                    src.position(prev)
                 }
                 o += cols
             }

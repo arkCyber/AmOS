@@ -1,0 +1,67 @@
+<!--
+  AmOS System UI — Android **components** fragment (real-device step).
+
+  This is NOT a complete manifest. When the Tauri-Android project is generated
+  (cargo tauri android init), merge the <service>/<receiver> entries below into
+  gen/android/app/src/main/AndroidManifest.xml of the System UI app — inside
+  <application>.
+
+  WHY this file exists (audit, 2026-09-13): these three registrations used to live
+  ONLY in the git-ignored generated manifest, hand-added during bring-up. That
+  makes them invisible to a clean checkout: `tauri android init` + the documented
+  glue mirror produced an APK where the Kotlin was compiled in but **nothing bound
+  it** — no in-call UI (AmosInCallService), no call screening (AmosCallScreening
+  Service) and no live SMS receive while the process is stopped (SmsReceiver).
+  They are tracked now, and `scripts/android-glue-mirror.sh` verifies every
+  `android:name` declared here is present in the generated manifest (fail loud).
+
+  The values are copied verbatim from the working generated manifest, including
+  the relative `.glue.` prefix Tauri's namespace (`com.amos.ai`) resolves — the
+  mirror script compares these literals, so keep them spelled the same way.
+
+  `docs/sms.md` / `docs/REAL_DEVICE_SYSTEM_UI_AUDIT.md` describe the behaviour.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Real call control + incoming-call surface (only active once the user makes
+         AmOS the default phone app / ROLE_DIALER). AmOS shows the in-call UI. -->
+    <service
+        android:name=".glue.AmosInCallService"
+        android:exported="false"
+        android:foregroundServiceType="phoneCall"
+        android:permission="android.permission.BIND_INCALL_SERVICE">
+        <intent-filter>
+            <action android:name="android.telecom.InCallService" />
+        </intent-filter>
+        <meta-data
+            android:name="android.telecom.IN_CALL_SERVICE_UI"
+            android:value="true" />
+    </service>
+
+    <!-- Real incoming-call blocking: the system binds this screening service for
+         every incoming call while AmOS holds the Call Screening role
+         (RoleManager.ROLE_CALL_SCREENING, API 29+). Blocked numbers are rejected
+         before the phone rings. -->
+    <service
+        android:name="com.amos.ai.glue.AmosCallScreeningService"
+        android:exported="true"
+        android:permission="android.permission.BIND_SCREENING_SERVICE">
+        <intent-filter>
+            <action android:name="android.telecom.CallScreeningService" />
+        </intent-filter>
+    </service>
+
+    <!-- Live receive: manifest receiver so SMS_RECEIVED is delivered even when the
+         System UI process was not running. Protected broadcast → require the sender
+         to hold BROADCAST_SMS (third parties cannot inject messages). -->
+    <receiver
+        android:name="com.amos.ai.glue.SmsReceiver"
+        android:enabled="true"
+        android:exported="true"
+        android:permission="android.permission.BROADCAST_SMS">
+        <intent-filter android:priority="999">
+            <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+        </intent-filter>
+    </receiver>
+
+</manifest>

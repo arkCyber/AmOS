@@ -160,6 +160,10 @@ impl SampleRing {
             let step = self.read_timeout.min(POLL_STEP).min(remaining);
             let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if g.buf.is_empty() {
+                // The wait result is deliberately discarded: all this needs is the *elapsed
+                // time* (`wait_timeout` returns "timed out" vs "notified", and the loop
+                // re-checks the buffer and the deadline either way). No failure is hidden —
+                // a poisoned lock is already handled by `unwrap_or_else` above.
                 let _ = self.cv.wait_timeout(g, step);
             }
         }

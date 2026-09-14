@@ -37,6 +37,7 @@ export const APP_META: AppMeta[] = [
   { id: "interpreter", titleKey: "app.interpreter", icon: "🌐" },
   { id: "mail", titleKey: "app.mail", icon: "✉️" },
   { id: "store", titleKey: "app.store", icon: "🛍️" },
+  { id: "pwa", titleKey: "app.pwa", icon: "📦" },
   { id: "privacy", titleKey: "app.privacy", icon: "🛡️" },
   { id: "contacts", titleKey: "app.contacts", icon: "👥" },
   { id: "magnifier", titleKey: "app.magnifier", icon: "🔍" },

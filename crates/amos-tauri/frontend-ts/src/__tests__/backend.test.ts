@@ -43,8 +43,6 @@ import {
   pollNativeAlarms,
   registerNativeAlarm,
   sendChat,
-  storeBundleResource,
-  storeBundleUri,
   storeCatalog,
   storeFind,
   storeInstall,
@@ -372,8 +370,6 @@ describe("backend bridge", () => {
     await storeInstall("app.amos.notes");
     await storeUpgrade("app.amos.notes");
     await storeUninstall("app.amos.notes");
-    await storeBundleResource("app.amos.notes", "index.html");
-    await storeBundleUri("amos-app://app.amos.notes/index.html");
 
     // System store hydration + notes export + native-alarm bridge.
     await systemStoreSnapshot();
@@ -409,7 +405,7 @@ describe("backend bridge", () => {
       "mail_send", "mail_set_flagged", "mail_set_seen", "mail_delete", "mail_move",
       "appstore_catalog", "appstore_search", "appstore_find", "appstore_installed",
       "appstore_updatable", "appstore_status", "appstore_install", "appstore_upgrade",
-      "appstore_uninstall", "appstore_bundle_resource", "appstore_bundle_uri",
+      "appstore_uninstall",
       "store_snapshot", "store_set", "notes_export_txt",
       "scheduler_alarm_register", "scheduler_alarm_cancel", "scheduler_alarm_poll",
       "telephony_dial", "real_dial", "telephony_end", "telephony_answer",

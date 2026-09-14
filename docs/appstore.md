@@ -5,6 +5,8 @@
 当前交付的是**纯 Rust 领域内核 crate**（`crates/amos-appstore`），不含 UI / CLI / Tauri 桥接——先把**契约**和**下载→校验→安装**的包管理核心钉死，再逐层接壳。这正是仓库一贯的拆分方式（参考 `amos-mail` / `amos-int` / `amos-tts`）。
 
 > 状态：**领域内核 + Tauri 桥接 + CLI + HTTP 后端 + 发布签名 + 动态注册表 + F-Droid 兼容层已实现**（2026-09-12）。Rust 侧：离线领域内核 + provider seam + mock + 测试；`HttpStoreProvider`（`live` 门控）拉真实 HTTP 目录 + 下载包；Ed25519 **发布签名**（`DeveloperKey` 签名 manifest、引擎安装前验签）；**F-Droid 仓库兼容**（`FdroidRepoProvider`：官方 `index-v1.json` 双形态解析 → 同一 `AppManifest` 契约，APK 下载 + sha256 校验，已对 f-droid.org 实测）。已通过 `amos-tauri/src/appstore.rs`（managed `StoreBridge` + `appstore_*` 命令）与前端 `store*` typed 桥接暴露给 WebView；另有 `amos-appstore-cli` 在终端驱动同一引擎。系统 UI 已含「应用商店」应用页（目录/安装/卸载/升级），且**已装第三方应用会作为 tile 动态并入主屏**（`store:<id>`，点击打开占位容器）。剩余：installer（真实运行宿主）与 APK 静默安装的设备桥见文末[路线图](#路线图)。
+>
+> 另见 [`pwa-index.md`](./pwa-index.md)：**预装 PWA 的声明式索引**（`amos-app.toml` v0.1）与 `amos-app://` 私有协议网关——它和本文的商店是同一套 `amos-app://` 命名空间的两半（索引 = 出厂声明，商店 = 下载安装）。
 
 ---
 
@@ -189,7 +191,7 @@ let store = AppStore::new(provider).with_web_install_dir("/data/amos/apps".into(
 store.install("org.amos.pomodoro").await?; // 校验通过后即解包到 /data/amos/apps/<id>/
 ```
 
-**Tauri 侧**：设 `AMOS_APPSTORE_INSTALL_DIR` 后，`StoreBridge` 自动用该目录解包；宿主可用命令 `appstore_bundle_resource(id, path)` 取回 bundle 文件（base64 + MIME，`nosniff`），无需自定义协议即可在 UI 内渲染本地资源。
+**Tauri 侧**：设 `AMOS_APPSTORE_INSTALL_DIR` 后，`StoreBridge` 自动用该目录解包。**历史注记**：这里曾提供 `appstore_bundle_resource(id, path)`（逐文件 base64 + MIME + `nosniff`）供前端在**没有自定义协议**的情况下渲染本地资源；该通道已随 srcdoc 路径一起**删除**（REQ-A171），现行路径见 §4.10。
 
 `tar` 的 `unpack` 会拒绝 `..`/绝对路径（防穿越）；解包后校验 `start` 文件存在并落 `manifest.json`。**宿主**把该目录 serve 出来即可真正运行（宿主/启动尚未实现，见路线图）。
 
@@ -204,20 +206,74 @@ let dir = installer.dir_for(&id);
 let f = resolve_request(&dir, "assets/app.js")?; // ServedFile{ path, content_type:"text/javascript…", nosniff:true }
 ```
 
-### 4.10 前端 srcdoc 宿主（无自定义协议）
+### 4.10 运行时宿主：真 origin（现行）与 srcdoc 内联（被取代）
 
-系统 UI 的三方应用容器 `components/ExtApp.tsx` 已能**真正运行** web-bundle：它把
-`amos_appstore::serve` 的安全解析交给 **Tauri 桥接** `appstore_bundle_resource(id, path)`
-（逐文件 base64 + MIME），前端用 `frontend-ts/src/lib/bundle.ts`（纯函数、已单测）把
-`index.html` 里的相对 `script/link/img` 引用解析并内联成 `data:` URL，得到**单一自包含文档**
-后放进 `sandbox="allow-scripts"`（无 `allow-same-origin`）的 `srcdoc` iframe 运行——三方代码
-拿不到 OS 壳/存储，且路径在 Rust 侧已被 `serve` 限定在自身 bundle 目录内。内联只处理**真实
-标签属性**：`<script>/<style>` 正文与 HTML 注释里的 `src=`/`href=` 字样会被忽略，不会污染
-bundle 的代码/样式（`bundle.test.ts` 回归单测覆盖）。
+**现行路径**：三方应用现在运行在**自己的真 origin** 上。Rust 侧 `appstore_bundle_entry(id)`
+（`crates/amos-tauri/src/appstore.rs`）先证明「这个 id 合法 + 该应用**确实已安装** + 它的入口
+**确实可被服务**」（`read_bundle_meta` 拒绝穿越的 `start` 与缺失文件），再按**平台正确的**
+形态返回入口 URL（macOS/iOS/Linux `amos-app://<id>/…`，Windows/Android
+`http://amos-app.<id>/…`，见 `docs/pwa-index.md` §1）。前端 `svelte/ExtAppHost.svelte` 把它放进一个
+`sandbox="allow-scripts allow-same-origin allow-forms"` 的 iframe（`Shell.svelte` 的 `store:<id>`
+分支）——**没有** `allow-top-navigation` / `allow-popups` / `allow-modals`。`allow-same-origin`
+在这里是**安全的**：MDN 警告的是「frame 与父页同源时它能把 sandbox 摘掉」，而 bundle 的 origin
+（`amos-app://<id>`）与壳的 origin（`tauri://localhost`）**scheme 与 host 都不同**；没有它，
+bundle 连自己的 `fetch('app.js')` 都发不出去，多页 / ESM bundle 也就跑不起来。
+每个失败都**说出来**：没桥 / 宿主拒绝（原样带宿主的话，如
+`no web install dir (set AMOS_APPSTORE_INSTALL_DIR)`）/ URL 不可信 —— 四种状态四段文案。
 
-诚实边界：这是“无需自定义协议”的落地路径，适合 **classic 单页** demo bundle（脚本以 `data:`
-子资源运行，需宿主 CSP 放行 data）。真正多页 / ESM / 需要独立 origin 的第三方 bundle，仍是
-未来注册 `amos-app://` 自定义协议宿主（serve.rs 已为它设计好）——见文末路线图。
+**被取代的路径**：`frontend-ts/src/lib/bundle.ts`（逐文件 base64 + MIME，把相对资源内联成
+`data:` URL，塞进 `sandbox="allow-scripts"`（**无** `allow-same-origin`）的 `srcdoc` iframe）当年
+是"无需自定义协议"的落地路径。它的**唯一消费者 `components/ExtApp.tsx` 在 React 移除时已经不在**，
+且自定义协议宿主已经上线，所以它**今天没有任何生产调用点**；它作为**更严的**（不透明 origin）
+宿主模式被 `scripts/unwired-allowlist.json` 显式保留并写明"下一轮若无人认领即删除"。
+`lib/sandboxBridge.ts`（沙箱能力申请 → `perm_authorize` 单一收口）**两种模式都还需要**，理由不变。
+
+> 诚实边界：真 origin 宿主的多页 / ESM / 自身 `fetch` 能力来自协议与 origin 的**设计**，组件测试
+> 只覆盖「我们这一侧」的判定（iframe 的 `src`/`sandbox`、四种失败文案）；**真机未验收**。
+- 旧的 base64 读通道（`appstore_bundle_resource` / `appstore_bundle_uri` 命令 + `read_bundle_resource` /
+  `read_bundle_uri` + 前端 `storeBundleResource` / `storeBundleUri`）已**整体删除**（REQ-A171）：它只服务
+  于 srcdoc 路径，且 `read_bundle_uri` 会**委托**给策略生产者 `serve_bundle` 再把策略**丢掉** —— 留着一个
+  「能 serve 出没有策略的文档」的接缝，与下面新增的性质直接矛盾。
+
+#### 4.10.1 bundle 的出口声明 → WebView 强制（声明变成承诺）
+
+publisher 在自己的 `amos-app.json` 里声明它要访问的主机：
+
+```json
+{ "id": "org.amos.demo", "name": "Demo", "start": "index.html",
+  "allowed_domains": ["api.example.com", "cdn.example.org"] }
+```
+
+* **同一份文法**：与 PWA 索引的 `[permissions.network].allowed_domains` 共用
+  `pwa::validate_domain_pattern`（裸主机名；无通配形式）。装错形式（`*.host`、`https://…`、大写）在
+  **安装期与读取期都拒绝**，不静默丢弃 —— 会被 CSP **授予**的规则不能未经检查。
+* **声明在签名包内部**：`amos-app.json` 位于 `tar.gz` 里，因此它落在 sha256（与可选 Ed25519 签名）
+  覆盖的字节里 —— 签名之后无法换成更宽松的一份。
+* **强制点**：宿主（`amos-appstore::host::serve_bundle` → `pwa::bundle_csp`）为该 bundle **每个响应**
+  生成 `Content-Security-Policy`，Tauri 处理器把它作为响应头发出。为什么必须是**响应头**：CSP 是
+  **逐文档**执行的，而 bundle 是**自己 origin 上的另一个文档** —— 壳的策略（`tauri.conf.json` 里那份）
+  对它**完全没有约束力**。
+* **策略形状**：`default-src 'self'` / `script-src 'self'`（只能加载包内自己的代码 ⇒ publisher 不能引入
+  远端的别人的代码）、`connect-src 'self'` **加上声明的主机**（`https://` 与 `wss://`，主机及其一级
+  通配；**明文 `http://`/`ws://` 不授予**）、`form-action` 同一份清单、`img-src`/`media-src`/`font-src`
+  允许 `data:`/`blob:`（静态包的内联资源）、`object-src 'none'`、`base-uri 'none'`、`frame-src 'none'`。
+  空清单 = 「这个应用谁也不许连」。
+* **索引命名空间**：`apps.json` 与图标是**数据不是文档**，带 `default-src 'none'; frame-ancestors 'none'`
+  —— 即使有人把 JSON 框起来，那里也不会执行任何东西。**404 拒绝响应同样带策略**。
+
+**未覆盖 —— 直说**：bundle 仍然可以把**自己的 frame 导航**到一个外部 URL，而那次导航可以把数据放进
+路径。CSP 的 `navigate-to` 在我们出货的引擎里**没有实现**，所以这一条在这里关不掉。想关它需要一个真正的
+出口守卫，而**逐 bundle 的出口守卫今天不可能**：bundle 与壳**同进程同 uid**，`amos-network-guard` 的
+规则是 uid 维度的，包过滤器分不出两者。这条当作**结构性结论**记在这里，免得有人承诺一个做不到的东西。
+
+> ⚠️ **shell 自己的 CSP（`tauri.conf.json` 的 `csp`）已在 REQ-A171 写入，但未在真实窗口验证**。
+> 两个细节是读源码推出来的，不是猜的：① Tauri 的 `set_csp` 会给自己的注入脚本/样式**自动加 nonce**
+> （`manager/mod.rs::replace_csp_nonce`），而 **CSP3 下 nonce 存在时 `'unsafe-inline'` 被忽略**；② 壳里有
+> **15 处内联 `style=`**（壁纸 backdrop、相机变焦、dock…）。所以配置带了
+> `dangerousDisableAssetCspModification: ["style-src"]`，让 `style-src 'self' 'unsafe-inline'` 真正生效 ——
+> 代价是样式注入面变宽（而壳本来就需要内联样式），换来的是 `script-src 'self'` 这条真正有价值的约束。
+> 这份配置的**键名**已被负控验证（写入一个假键 ⇒ `tauri-build` 报 `unknown field` 并列出合法键集），
+> 但**策略本身是否打断 UI 未经验证**。
 
 ### 4.11 `amos-app://` 协议宿主（Rust 层，已就绪）
 
@@ -394,7 +450,7 @@ amos-appstore-cli export index-v1.json --repo-address https://store.amos.local/r
 
 ## 8. 测试
 
-`cargo test -p amos-appstore` —— 覆盖：版本解析与排序、sha256 校验与篡改拒绝、id slug 校验、manifest 校验、mock 目录往返与摘要盖章、**下载→校验→安装**成功路径、**篡改字节被拒**、未知/重复/缺失等干净错误、升级只升不降、卸载、注册表跨进程持久化、**F-Droid 兼容**（index 解析/映射/导出往返/字符串数字/分组形态/引擎拒绝 web 安装 APK/localized 回填/antiFeatures 显式过滤/`author` 回退/分类映射扩展与双向对称（全 8 分类导出→导回不变）/导出 `suggestedVersionCode`；`--features live` 下另有环回端到端：拉索引→目录→APK 下载→pin 校验，以及**下载体量上限 fail-closed**（配额读满即报错、不静默截断；含 256B 环回超限用例）；另有 `#[ignore]` 门控的**真实联网**端到端：对 f-droid.org 拉 61MB 索引 → localized 中文回填 → 下载最小 APK 并校验 sha256）。CLI 侧覆盖 `info`/`export` 解析与离线 dispatch（导出文件被 `FdroidRepoProvider` 回读验证）与**原子落盘**（覆盖写、无临时文件残留）。质量门禁：`clippy`（含 `deny(clippy::unwrap_used, …)`）与 `rustfmt` 均通过。测试数为**实跑值，且命令随数字一并记下**（避免再次成为无人复核的陈旧散文）：`cargo test --workspace` → **1715 passed / 0 failed**；本模块 `live` 口径 `cargo test --workspace --features amos-appstore/live,amos-appstore-cli/live` → **1727 / 0**（= 默认 1715 加上 appstore 两 crate 的 live 增量 +12）；若把 `amos-mail`/`amos-mail-cli` 的 `live` 也一并启用则 → **1741 / 0**（2026-09-12 实跑；此三数均无脚本门禁固定，改测试后需重新实跑。注意 `live` 半边的 `http.rs` 与 CLI 的 `--repo`/`--pin` 路径**不在** `make lint`/`make test` 里——它们由 `make gated-check` 编译并测试，见 `docs/fdroid-audit.md` 第四轮）。
+`cargo test -p amos-appstore` —— 覆盖：版本解析与排序、sha256 校验与篡改拒绝、id slug 校验、manifest 校验、mock 目录往返与摘要盖章、**下载→校验→安装**成功路径、**篡改字节被拒**、未知/重复/缺失等干净错误、升级只升不降、卸载、注册表跨进程持久化、**F-Droid 兼容**（index 解析/映射/导出往返/字符串数字/分组形态/引擎拒绝 web 安装 APK/localized 回填/antiFeatures 显式过滤/`author` 回退/分类映射扩展与双向对称（全 8 分类导出→导回不变）/导出 `suggestedVersionCode`；`--features live` 下另有环回端到端：拉索引→目录→APK 下载→pin 校验，以及**下载体量上限 fail-closed**（配额读满即报错、不静默截断；含 256B 环回超限用例）；另有 `#[ignore]` 门控的**真实联网**端到端：对 f-droid.org 拉 61MB 索引 → localized 中文回填 → 下载最小 APK 并校验 sha256）。CLI 侧覆盖 `info`/`export` 解析与离线 dispatch（导出文件被 `FdroidRepoProvider` 回读验证）与**原子落盘**（覆盖写、无临时文件残留）。质量门禁：`clippy`（含 `deny(clippy::unwrap_used, …)`）与 `rustfmt` 均通过。测试数为**实跑值，且命令随数字一并记下**（避免再次成为无人复核的陈旧散文）：`cargo test --workspace` → **1719 passed / 0 failed**；本模块 `live` 口径 `cargo test --workspace --features amos-appstore/live,amos-appstore-cli/live` → **1731 / 0**（= 默认 1719 加上 appstore 两 crate 的 live 增量 +12）；若把 `amos-mail`/`amos-mail-cli` 的 `live` 也一并启用则 → **1745 / 0**（2026-09-12 实跑；此三数均无脚本门禁固定，改测试后需重新实跑。注意 `live` 半边的 `http.rs` 与 CLI 的 `--repo`/`--pin` 路径**不在** `make lint`/`make test` 里——它们由 `make gated-check` 编译并测试，见 `docs/fdroid-audit.md` 第四轮）。
 
 ---
 
@@ -407,7 +463,8 @@ amos-appstore-cli export index-v1.json --repo-address https://store.amos.local/r
 - [x] **`APPS` 动态注册表**（部分，2026-09-03）：store 已装应用经 `frontend-ts/src/lib/storeApps.ts` 作为 `store:<manifest-id>` tile 并入 `amos.home.layout` **上主屏**（`HomeDock`/标题/`AppComponent` 均已识别 ext tile），点击打开占位容器页 `components/ExtApp.tsx`；Store 页 install/upgrade/uninstall 后经 `notifyStoreTilesChanged()` 即时刷新。**边界**：dock/编辑主屏/Spotlight/Recents 目前仍只列出内置应用；真正"运行第三方代码"待 installer（真实 web-bundle 宿主）。
 - [x] **发布签名**（2026-09-03）：Ed25519 作者签名（`DeveloperKey`/`sign_manifest`）+ 引擎安装前验签（不符 `BadPublisherSignature` 拒绝），钉死「谁发布的」；公钥信任准入（pin/密钥服务器）留给商店层。
 - [x] **installer（web-bundle 后端）**（2026-09-03）：`amos_appstore::webinstall`（`WebInstaller`）——把 `tar.gz` 的 web-bundle（`index.html` + 资源 + `amos-app.json`）解包到 `<root>/<id>/`、校验入口、写 `manifest.json`、可卸载；tar 拒绝 `..` 路径。宿主把解包目录 serve 出来即可运行。
-- [x] **web-bundle 宿主（前端 srcdoc 沙箱）**（2026-09-04）：`components/ExtApp.tsx` 不再只是占位页——若该 app 带可运行的 web 界面，就逐文件经 `storeBundleResource`（base64）取回，用 `lib/bundle.ts` 的纯函数把相对资源内联成**单一自包含文档**，再放进 `sandbox="allow-scripts"` 的 `srcdoc` iframe 运行（无 same-origin → 碰不到 OS 壳）；无 web 界面的仅清单安装回落为清单展示（`extApp.notWeb`），加载失败给错误并可重载。纯内联核心已单测（`bundle.test.ts`）。诚实边界：这是**无自定义协议**路径，适合 classic 单页 demo bundle；多页/ESM/需真 origin 的 bundle 仍待真正 `amos-app://` 协议宿主（Rust `amos_appstore::serve` 已就绪，见 §4.9/4.10）。
+- [x] **web-bundle 运行时宿主（真 origin，现行）**（2026-09-13，REQ-A169）：三方应用运行在自己的真 origin 上——Rust `appstore_bundle_entry(id)` 证明「id 合法 + 已安装 + 入口可服务」后给出**平台正确**的入口 URL，前端 `svelte/ExtAppHost.svelte` 放进 `sandbox="allow-scripts allow-same-origin allow-forms"` 的 iframe（`Shell.svelte` 的 `store:<id>` 分支）——多页 / ESM / 自身 `fetch` 因此可用。旧的 srcdoc 内联路径（下面的条目）**已被取代**：它的唯一消费者 `components/ExtApp.tsx` 随 React 移除而不在，今天零生产调用点。
+- [x] **web-bundle 宿主（前端 srcdoc 沙箱，已被取代）**（2026-09-04）：`components/ExtApp.tsx` 不再是占位页——若该 app 带可运行的 web 界面，就逐文件经 `storeBundleResource`（base64）取回，用 `lib/bundle.ts` 的纯函数把相对资源内联成**单一自包含文档**，再放进 `sandbox="allow-scripts"` 的 `srcdoc` iframe 运行（无 same-origin → 碰不到 OS 壳）；无 web 界面的仅清单安装回落为清单展示（`extApp.notWeb`），加载失败给错误并可重载。**现状（2026-09-13）**：React 壳已移除 ⇒ 该路径无生产调用点，`lib/bundle.ts` 与其单测仍在，但只有 allow-list 保留其"更严宿主模式"的身份（见 §4.10）。
 - [x] **F-Droid 仓库兼容层**（2026-09-12）：`amos_appstore::fdroid`——官方 `index-v1.json` 双形态解析（`packages` 分组对象 / 扁平数组、数字/字符串数值）→ 映射为同一 `AppManifest` 契约（`FdroidRepoProvider`，即 `docs/fdroid-audit.md` 缺口 3 的内核半步）；反向 `catalog_to_fdroid_index_v1` 让我们的目录**以 F-Droid 格式发布**。CLI 增加 `--repo`（浏览/搜索/find）与 `download`（取 APK + sha256 验证落盘，不假装安装）。**已对 f-droid.org 实测**：find/search/download 全通；分类映射**双向对称**（导出→导回不变）；联网下载体量**有上限且 fail-closed**，CLI 落盘**原子**（无半截产物）；另有 `#[ignore]` 门控的真实联网端到端用例（`cargo test -p amos-appstore --features live -- --ignored`）。诚实边界：索引 PGP 验签未实现（先以 `--pin` sha256 过渡）；APK **静默安装**仍待设备桥（缺口 1）。**审计轮（同日）**又补掉 3 处真实缺陷：导出 `icon` 由绝对 URL 改为仓库相对文件名（此前「导出→导回」会双前缀成 `icons/https://…`）、代理回环判定由整串子串改为解析 host（此前 `localhost.evil.test` 会绕过出口代理）、悬空的 `--pin` 报错而不再静默变成「无 pin」。
 - [~] **[桥] guest 容器安装通道**（缺口 1，**命令层 + gRPC 面已落地；消费者/接线仍未做**）：`AndroidController::install_apk`（`waydroid app install <path>`）+ `AndroidRuntime::install`，安装成功即把该包在 per-APK 能力账本里**重置为 deny-by-default**（`ledger.revoke_all`，不继承上一版构建的授权）；守护进程侧新增 gRPC `InstallAndroidApp`（`EnhancedAndroidManager::install_app` 有超时保护），已过真实 UDS 端到端验证。**仍未做**：Tauri 命令 / System UI 的消费者（本轮**刻意不**加没有消费者的 UI），以及 F-Droid APK 从商店到该通道的接线——见 `docs/fdroid-audit.md` 缺口 1。
 

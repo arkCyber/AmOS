@@ -30,7 +30,7 @@ use tar::Archive;
 use crate::error::{Result, StoreError};
 use crate::model::AppManifest;
 
-/// The on-disk `amos-app.json` a web-bundle carries (identity + entry).
+/// The on-disk `amos-app.json` a web-bundle carries (identity + entry + egress).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebBundleMeta {
     pub id: String,
@@ -38,6 +38,18 @@ pub struct WebBundleMeta {
     /// Entry html relative to the bundle root (default `index.html`).
     #[serde(default = "default_start")]
     pub start: String,
+    /// Hosts this bundle is allowed to reach, in the **same grammar** the PWA
+    /// index uses (`pwa::validate_domain_pattern`): bare hosts, which cover the
+    /// host and every subdomain; there is no wildcard form.
+    ///
+    /// This is a **declaration that gets enforced** — the host folds it into the
+    /// `Content-Security-Policy` of every response it serves for this bundle
+    /// (`pwa::bundle_csp`), so an empty list means "this app talks to nobody".
+    /// It lives *inside* the archive on purpose: the archive is what the sha256
+    /// (and any publisher signature) covers, so the declaration cannot be swapped
+    /// for a more permissive one after signing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
 }
 
 fn default_start() -> String {
@@ -156,15 +168,23 @@ impl WebInstaller {
     }
 }
 
-/// Require the two files a runnable web-bundle must expose.
-fn validate_bundle(dir: &Path) -> Result<()> {
+/// The on-disk `amos-app.json` of an extracted bundle, **read and validated**.
+///
+/// The bundle's entry (`meta.start`) comes from inside the archive (a plain JSON
+/// field), so the `tar` crate's own `..`-rejection does not apply to it — this
+/// checks that it really resolves to a file **inside** `dir` before anyone serves
+/// it. Returns the meta so a host can point at the bundle's real entry instead of
+/// assuming `index.html`.
+pub fn read_bundle_meta(dir: &Path) -> Result<WebBundleMeta> {
     let meta_path = dir.join("amos-app.json");
-    let raw = fs::read(&meta_path)
-        .map_err(|e| StoreError::Provider(format!("bundle missing amos-app.json: {e}")))?;
+    let raw = fs::read(&meta_path).map_err(|e| {
+        StoreError::Provider(format!(
+            "bundle {} has no amos-app.json: {e}",
+            dir.display()
+        ))
+    })?;
     let meta: WebBundleMeta = serde_json::from_slice(&raw)
         .map_err(|e| StoreError::Provider(format!("bad amos-app.json: {e}")))?;
-    // The entry comes from inside the archive (a plain JSON field), so it is not
-    // constrained by the tar crate's own `..`-rejection — refuse traversal here.
     let entry = safe_join(dir, &meta.start)?;
     if !entry.is_file() {
         return Err(StoreError::Provider(format!(
@@ -172,7 +192,20 @@ fn validate_bundle(dir: &Path) -> Result<()> {
             meta.start
         )));
     }
-    Ok(())
+    // The declared egress is validated here, with the **same** grammar the PWA
+    // index uses, and a bad pattern is refused rather than dropped: a pattern the
+    // WebView would never match is a rule that silently does nothing, and a
+    // pattern that *did* get through unchecked would be granted in the CSP.
+    for pattern in &meta.allowed_domains {
+        crate::pwa::validate_domain_pattern(pattern)
+            .map_err(|e| StoreError::Provider(format!("bundle {}: {e}", dir.display())))?;
+    }
+    Ok(meta)
+}
+
+/// Require the two files a runnable web-bundle must expose.
+fn validate_bundle(dir: &Path) -> Result<()> {
+    read_bundle_meta(dir).map(|_| ())
 }
 
 /// Read helper wrapper into a StoreError::Provider (so error lines stay short).
@@ -579,5 +612,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A bundle directory written directly, so the meta can be any shape.
+    fn meta_dir(tag: &str, meta: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "amos-bundlemeta-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("amos-app.json"), meta).unwrap();
+        std::fs::write(dir.join("index.html"), b"<html></html>").unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_declared_egress_is_read_and_validated() {
+        let dir = meta_dir(
+            "ok",
+            r#"{"id":"org.amos.demo","name":"D","start":"index.html","allowed_domains":["api.example.com","cdn.example.org"]}"#,
+        );
+        let meta = read_bundle_meta(&dir).unwrap();
+        assert_eq!(
+            meta.allowed_domains,
+            vec!["api.example.com", "cdn.example.org"]
+        );
+
+        // An omitted list is an empty list — "this app talks to nobody" — not a
+        // parse error (a bundle that needs no network is the normal case).
+        let dir = meta_dir(
+            "none",
+            r#"{"id":"org.amos.demo","name":"D","start":"index.html"}"#,
+        );
+        assert!(read_bundle_meta(&dir).unwrap().allowed_domains.is_empty());
+
+        // A pattern the guard-matcher/WebView could never match is **refused**
+        // rather than stored: a rule that silently does nothing is the defect this
+        // grammar exists to prevent, and an unchecked one would be *granted* in
+        // the CSP.
+        for bad in [
+            r#"{"id":"org.amos.demo","name":"D","start":"index.html","allowed_domains":["*.example.com"]}"#,
+            r#"{"id":"org.amos.demo","name":"D","start":"index.html","allowed_domains":["example"]}"#,
+            r#"{"id":"org.amos.demo","name":"D","start":"index.html","allowed_domains":["https://example.com"]}"#,
+            r#"{"id":"org.amos.demo","name":"D","start":"index.html","allowed_domains":["Example.com"]}"#,
+        ] {
+            let dir = meta_dir("bad", bad);
+            let err = read_bundle_meta(&dir).expect_err("a bad pattern is refused");
+            assert!(err.to_string().contains("allowed domain"), "{bad}: {err}");
+        }
     }
 }

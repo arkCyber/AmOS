@@ -56,6 +56,7 @@ pub mod fdroid;
 pub mod host;
 pub mod model;
 pub mod provider;
+pub mod pwa;
 pub mod serve;
 pub mod sign;
 pub mod webinstall;
@@ -75,15 +76,23 @@ pub use fdroid::{
     catalog_to_fdroid_index_v1, fdroid_index_to_catalog, FdroidApp, FdroidIndexV1, FdroidLocalized,
     FdroidPackage, FdroidRepoMeta, FdroidRepoProvider, F_DROID_OFFICIAL_REPO,
 };
-pub use host::{is_valid_app_id, parse_bundle_uri, serve_bundle, ServedBundle, SCHEME};
+pub use host::{
+    is_index_uri, is_reserved_netloc, is_valid_app_id, parse_bundle_uri, serve_bundle, serve_uri,
+    ServedBundle, INDEX_NETLOC, SCHEME,
+};
 pub use model::{
     AppCategory, AppManifest, AppStatus, Checksum, HashAlgorithm, InstalledApp, PackageFormat,
     PackageRef, PublisherSig, Version,
 };
 pub use provider::{MockStoreProvider, StoreProvider};
+pub use pwa::{
+    builtin_index, bundle_csp, csp_connect_sources, index_base_url, index_base_url_for, index_csp,
+    index_document_url, protocol_base_url, protocol_base_url_for, protocol_url, serve_index,
+    DisplayMode, Orientation, PwaIndex, PwaManifest, ToolAction, INDEX_SCHEMA,
+};
 pub use serve::{content_type_for, resolve_request, ServedFile};
 pub use sign::{sign_manifest, verify_manifest_signature, DeveloperKey};
-pub use webinstall::{read_file, WebBundleMeta, WebInstall, WebInstaller};
+pub use webinstall::{read_bundle_meta, read_file, WebBundleMeta, WebInstall, WebInstaller};
 
 #[cfg(feature = "live")]
 pub use http::HttpStoreProvider;

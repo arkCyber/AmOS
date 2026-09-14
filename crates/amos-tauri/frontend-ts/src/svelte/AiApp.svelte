@@ -445,7 +445,7 @@
       </span>
       <button
         onclick={() => void dropContext()}
-        aria-label="ai-context-clear"
+        data-testid="ai-context-clear"
         title={t("ai.contextClear")}
         class="shrink-0 opacity-70 hover:opacity-100"
       >✕</button>
@@ -520,7 +520,7 @@
     />
     <button
       onclick={() => (cite = !cite)}
-      aria-label="ai-cite-toggle"
+      data-testid="ai-cite-toggle"
       aria-pressed={cite}
       title={t("ai.citeTitle")}
       class="grid h-8 shrink-0 place-items-center rounded-full px-2 text-sm {cite
@@ -540,8 +540,8 @@
     <button
       onclick={() => void send()}
       disabled={busy}
-      aria-label="send"
-      title="send"
+      aria-label={t("a11y.send")}
+      title={t("a11y.send")}
       data-icon="send"
       class="grid h-8 w-9 place-items-center rounded-full bg-accent px-2 text-white disabled:opacity-40"
     >{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
