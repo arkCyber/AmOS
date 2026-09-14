@@ -103,8 +103,10 @@
       }, SHOW_MS);
       // Audible/haptic arrival alert, gated by the *effective* policy. Both gates
       // require the unread count to have actually grown, so a dismissal/clear
-      // (or a policy change while idle) never re-alerts.
-      if (shouldRingOnArrival(prev.length, notifs.length, policy)) playNotifyTone();
+      // (or a policy change while idle) never re-alerts. The chime honors the
+      // user's loudness (REQ-A205); under DND the effective gate never rings.
+      if (shouldRingOnArrival(prev.length, notifs.length, policy))
+        playNotifyTone({ volume: policy.volume });
       if (shouldVibrateOnArrival(prev.length, notifs.length, policy)) haptic();
     }
     prev = notifs;

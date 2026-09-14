@@ -1,4 +1,4 @@
-.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs device-eval
+.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs device-eval frontend-dist frontend-fresh app-open
 
 all: build
 
@@ -25,6 +25,12 @@ test:
 	# `--workspace` run above compiles neither (REQ-A200, same blind spot as REQ-A188).
 	cargo test -p amos-radio --features amos-radio/android --lib
 	cargo test -p amos-timesync --features amos-timesync/ntp --lib
+	# amos-link's feature-gated channels (REQ-A188 shape): the UDP-beacon discovery
+	# (`lan`, real sockets on loopback — offline) and the Zenoh transport (`zenoh`,
+	# whose offline cases are the config/env mapping; the live session round trip is
+	# `#[ignore]`d on purpose). Both are compiled by `make lint`; this is where they run.
+	cargo test -p amos-link --features amos-link/lan --lib
+	cargo test -p amos-link --features amos-link/zenoh --lib
 	# …and the tests that hide behind two more features no step used to enable (REQ-A191):
 	# the mail CLI's live SMTP/IMAP paths answer against a local loopback relay (offline),
 	# and the PTY terminal's round trip spawns a real shell (`portable-pty`). Both are
@@ -45,6 +51,19 @@ check:
 # already covered by correctness in `make test`).
 cov:
 	cd crates/amos-tauri/frontend-ts && bun run coverage:gate
+
+# Build the frontend bundle the *embedded* (release) desktop binary loads.
+# `tauri.conf.json`'s `beforeBuildCommand` is EMPTY, so the release binary embeds
+# whatever `frontend-ts/dist` contains at build time — it must be rebuilt by hand.
+frontend-dist:
+	cd crates/amos-tauri/frontend-ts && bun run build
+
+# Is that bundle newer than its sources? (see scripts/dist-freshness.mjs, REQ-A228)
+# `scripts/run-ui-release.sh` runs this before building, so the release UI can never
+# silently be an older tree than the one you are looking at. Not part of `lint`: a
+# fresh checkout legitimately has no `dist/`.
+frontend-fresh:
+	node scripts/dist-freshness.mjs
 
 # Headless end-to-end smokes: start a mock daemon and drive the real chain.
 smoke:
@@ -166,6 +185,13 @@ lint:
 	cargo clippy -p amos-network-guard --all-targets --features nftables,vpn -- -D warnings
 	cargo clippy -p amos-mail-cli --all-targets --features amos-mail-cli/live -- -D warnings
 	cargo clippy -p amos-tauri --all-targets --features appstore-live,tcp,terminal-pty -- -D warnings
+	# amos-link's two network channels: the `lan` UDP-beacon discovery and the `zenoh`
+	# inter-board transport (docs/amos-link.md). Neither is in the default build, so
+	# without these steps `src/lan.rs` and `src/zenoh.rs` would be compiled by nothing
+	# (scripts/feature-surface-scan.mjs fails if that happens).
+	cargo clippy -p amos-link --all-targets --features lan -- -D warnings
+	cargo clippy -p amos-link --all-targets --features zenoh -- -D warnings
+	cargo clippy -p amos-link-cli --all-targets --features lan,zenoh -- -D warnings
 	cd crates/amos-tauri/frontend-ts && bun run typecheck
 	# Lint-input integrity (see scripts/lint-inputs-scan.mjs): every file the steps
 	# below invoke (`node scripts/*.mjs` plus the allow-lists/baselines they read) must
@@ -242,6 +268,13 @@ lint:
 	# feature-gated target they never compile.
 	node scripts/feature-surface-scan.mjs --selftest
 	node scripts/feature-surface-scan.mjs
+	# Embedded-bundle freshness (see scripts/dist-freshness.mjs, REQ-A228): the release
+	# desktop binary embeds `frontend-ts/dist` and `tauri.conf.json`'s
+	# `beforeBuildCommand` is empty, so a stale bundle ships a UI that silently does not
+	# match the tree. Only the **selftest** runs here (temp tree): a clean checkout has
+	# no `dist/` and must not fail lint. `make frontend-fresh` checks the real tree, and
+	# `scripts/run-ui-release.sh` runs it before it builds.
+	node scripts/dist-freshness.mjs --selftest
 	# Static "defined + tested but never wired" scan (see scripts/unwired-scan.mjs):
 	# fails when a src/lib module becomes unreachable from production, when a new
 	# value export appears with no production call site, or when a .svelte component
@@ -274,6 +307,17 @@ lint:
 	# it. `--selftest` first proves the classifier itself still fails when it should.
 	node scripts/hot-loop-scan.mjs --selftest
 	node scripts/hot-loop-scan.mjs
+	# Structure: no recursion in production Rust (see scripts/rust-recursion-scan.mjs,
+	# NASA Power of 10 rule 1 — the audit recorded "Rust has no goto" and never checked
+	# recursion). `crates/amos-link`'s key-expression matcher was a recursive backtracker
+	# whose worst case at the 32-segment ceiling was ~10^11 paths *while holding the
+	# broker's registry lock*, and `crates/amos-web3`'s EIP-712 dependency walk recursed
+	# once per declared type (i.e. per whatever a signing request contained). Also catches
+	# **mutual** recursion inside a file (a call graph resolved the way Rust resolves
+	# names). Baseline is empty; `--selftest` pins the extractor and the false-positive
+	# shapes first.
+	node scripts/rust-recursion-scan.mjs --selftest
+	node scripts/rust-recursion-scan.mjs
 	# The gRPC API reference is generated (scripts/proto-doc.mjs): its parser must
 	# still work, and the checked-in docs/api-grpc.md must match proto/*.proto.
 	node scripts/proto-doc.mjs --selftest
@@ -283,6 +327,15 @@ lint:
 	# links and 404'd). `--selftest` pins the strip/extract/classify logic first.
 	node scripts/docs-link-scan.mjs --selftest
 	node scripts/docs-link-scan.mjs
+	# Crate-door documentation (see scripts/crate-readme-scan.mjs): every workspace member
+	# ships a README.md in the standard shape — title naming the crate, a link back to the
+	# root README, the six sections, and its own `-p <crate>` command — and its `examples/`
+	# dir and the README agree with each other (every example file named, every promised
+	# `--example` real). A crate that cannot ship examples needs a reason in
+	# scripts/crate-readme-allowlist.json. `docs-link-scan` above only proves the links
+	# *resolve*; this one proves there is a document to link to at all.
+	node scripts/crate-readme-scan.mjs --selftest
+	node scripts/crate-readme-scan.mjs
 	# Rust "pub fn defined but never referenced" scan (see scripts/rust-unwired-scan.mjs):
 	# the Rust counterpart of the TS gate — a `pub` item in a library crate is
 	# treated as reachable by the compiler, so `dead_code` never fires on it.
@@ -437,8 +490,21 @@ supervise:
 
 # Build & launch the EMBEDDED (release) System UI. The debug binary loads
 # devUrl (localhost:1420) and can collide with another app; use this target.
+# NOTE: this launches the **bare** `target/release/amos-tauri` binary, which macOS
+# refuses to activate — the window is on screen but sits behind other apps unless you
+# bring it forward (the host warns about exactly that: REQ-A232). To *see* the shell,
+# use `make app-open` (the `.app` bundle, which macOS does activate).
 run-ui-release:
 	bash scripts/run-ui-release.sh
+
+# Build + open the macOS `.app` bundle — the only form macOS will activate/focus, so
+# this is the target that actually puts the shell window in front of you (REQ-A232).
+# The bundle embeds `frontend-ts/dist`, so the freshness gate runs first (a stale
+# bundle must not ship, see REQ-A228) — `make frontend-dist` if it complains.
+app-open:
+	node scripts/dist-freshness.mjs
+	cd crates/amos-tauri && cargo tauri build --bundles app
+	open "$(CURDIR)/target/release/bundle/macos/Amos.app"
 
 # RPC readiness probe: both daemons must answer get_status running=true.
 health:

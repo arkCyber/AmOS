@@ -9,7 +9,7 @@
   },
   {
     "name": "wm_open",
-    "reason": "Multi-window host (`windows`). The Svelte shell is single-surface and `lib/wm.ts` is allow-listed until the split-screen UI lands (docs/multi-window.md)."
+    "reason": "Multi-window host (`windows`). The Svelte shell renders apps in its **own single surface** (it never asks the WM to open/focus/hide a real app window); the split controls added in REQ-A224 drive `wm_split*` against windows that already exist, but nothing opens a second window yet (docs/multi-window.md)."
   },
   {
     "name": "wm_focus",

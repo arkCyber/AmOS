@@ -34,6 +34,7 @@ DEFAULT_BINS=(
   amos-mail-cli      # mail CLI
   amos-appstore-cli  # app-store CLI
   amos-timesync-cli  # time-sync CLI
+  amos-link-cli      # robot-middleware CLI (status/pub/sub/bench/discover/watch/motor)
   amos-pdf-parser    # PDF text extraction CLI
 )
 if [[ -n "${AMOS_RELEASE_BINS:-}" ]]; then

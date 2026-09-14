@@ -17,6 +17,7 @@ import DiagnosticsPage from "../src/svelte/settings/DiagnosticsPage.svelte";
 import WallpaperPage from "../src/svelte/settings/WallpaperPage.svelte";
 import { t } from "../src/svelte/locale.svelte";
 import { FOCUS_KEY, FOCUS_SCENARIOS } from "../src/lib/focusPrefs";
+import { SETTINGS_KEY } from "../src/lib/settings";
 import { LOCK_KEY } from "../src/lib/lock";
 import { CORRUPT_SUFFIX } from "../src/lib/amosStore";
 
@@ -33,10 +34,11 @@ const saveButton = (h: { getByRole: (r: string, o?: unknown) => HTMLElement }) =
   h.getByRole("button", { name: t("lock.save") });
 
 describe("FocusPage.svelte", () => {
-  test("shows one switch per scenario, all off by default, and states its honest scope", () => {
+  test("shows the real DND switch plus one per intent scenario, all off by default, and states its honest scope", () => {
     const host = render(FocusPage);
     const switches = host.getAllByRole("switch");
-    expect(switches.length).toBe(FOCUS_SCENARIOS.length);
+    // 勿扰 (real quick-settings bit) + 工作 + 睡眠.
+    expect(switches.length).toBe(FOCUS_SCENARIOS.length + 1);
     expect(switches.map((s) => s.getAttribute("aria-checked"))).toEqual([
       "false",
       "false",
@@ -45,16 +47,36 @@ describe("FocusPage.svelte", () => {
     expect(txt(host)).toContain(t("settings.focusDnd"));
     expect(txt(host)).toContain(t("settings.focusWork"));
     expect(txt(host)).toContain(t("settings.focusSleep"));
-    // The page claims *intent*, and says where real silencing comes from.
+    // The page says which switch is real and that the intents silence nothing.
     expect(txt(host)).toContain(t("settings.focusHint"));
   });
 
-  test("toggling flips the switch and persists the intent durably", async () => {
+  test("the 勿扰 switch writes the quick-settings bit the shell honours — NOT the intent ledger (REQ-A206)", async () => {
+    const host = render(FocusPage);
+    await fireEvent.click(host.getAllByRole("switch")[0]); // 勿扰
+
+    expect(host.getAllByRole("switch")[0].getAttribute("aria-checked")).toBe("true");
+    // The same amos.settings.dnd key `lib/settings.dndActive` (banner, control
+    // center, 通知 page) reads — the write path IS the silencing path.
+    expect(stored(SETTINGS_KEY)).toMatchObject({ dnd: true });
+    // And the intent ledger is untouched by the DND switch.
+    expect(stored(FOCUS_KEY)).toBeNull();
+  });
+
+  test("a pre-existing real DND bit renders the switch on", () => {
+    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ dnd: true }));
+    const host = render(FocusPage);
+    expect(host.getAllByRole("switch")[0].getAttribute("aria-checked")).toBe("true");
+  });
+
+  test("toggling an intent scenario flips the switch and persists durably", async () => {
     const host = render(FocusPage);
     await fireEvent.click(host.getAllByRole("switch")[1]); // work
 
     expect(host.getAllByRole("switch")[1].getAttribute("aria-checked")).toBe("true");
-    expect(stored(FOCUS_KEY)).toMatchObject({ dnd: false, work: true, sleep: false });
+    expect(stored(FOCUS_KEY)).toMatchObject({ work: true, sleep: false });
+    // The intent switch must not touch the real DND bit.
+    expect(stored(SETTINGS_KEY)?.dnd).toBeUndefined();
   });
 
   test("garbage in the store is normalized instead of rendered as truth", () => {

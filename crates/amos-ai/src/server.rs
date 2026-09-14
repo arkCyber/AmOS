@@ -2054,6 +2054,14 @@ pub async fn serve_with_log_sink(
         // is the in-process mock; a real Android HAL provider is swapped in later
         // (feature `android`) without changing the mount point.
         .add_service(amos_sensor::service::mock_server())
+        // AmOS-Link control plane (crates/amos-link + proto/robot_link.proto): the
+        // robot middleware's management surface — node status (identity, counters,
+        // peers, clock freshness), the live topic inventory, a raw publish entry point
+        // for tooling/agents, and a server-streaming heartbeat. The DATA plane (stereo
+        // frames, joint commands) does NOT travel over this RPC: it is `Envelope`-
+        // framed payloads over an AmOS-Link transport (in-process broker by default,
+        // Zenoh across boards). See docs/amos-link.md.
+        .add_service(amos_link::service::mock_server())
         // Resource-governor service (crates/amos-ai governor_service + proto
         // governor.proto): lets a System UI / per-app host register apps & jobs and
         // move apps through their lifecycle, driving the SAME shared governor the

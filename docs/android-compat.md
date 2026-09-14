@@ -105,7 +105,7 @@ container or used to control the Rust `WindowManager` (see `docs/multi-window.md
 | W1 | 启动器打开「安卓应用」页 | 列表显示容器内已装 APK + 真实图标(`extract_icon_bytes`) |
 | W2 | 点击「微信」 | 状态显示"已启动 · window_id = …";`amos-ai` 日志显示 `LaunchAndroidApp` 经 `WaydroidRuntime` 执行 `am start` |
 | W3 | 连续启动两个 APK | 每次返回不同的 `window_id`,且**不与 Tauri 窗口 label 冲突**(安卓表面与 `amos-wm` 的 `WindowId` 各自独立命名空间) |
-| W4 | 检查 `wm_windows` 调试卡(设置页) | 每个已启动 APK 显示为一条 `legacy:<window_id> [System] 外部表面` 记录,参与聚焦/z 序;不再是 Tauri Webview 窗口 |
+| W4 | 检查「窗口管理器 (调试)」卡片（设置 →「窗口与形态」页底部，REQ-A225 起位于此） | 每个已启动 APK 显示为一条 `legacy:<window_id> [System] Shown · 外部表面` 记录,参与聚焦/z 序;不再是 Tauri Webview 窗口 |
 
 ### 当前边界(诚实)
 - **表面合成**(Wayland 层叠 / DMA-BUF 纹理,见上文「input method & gesture sharing」
@@ -115,6 +115,12 @@ container or used to control the Rust `WindowManager` (see `docs/multi-window.md
   (`legacy:<window_id>`,见 `wm.rs::open_surface`),在状态机中参与聚焦/z 序并出现在
   `wm_windows` 里,但**刻意不创建 `WebviewWindow`**(它是容器侧合成表面)。「合成 +
   多窗口」的像素层整合仍属后续工作。
+- **外部表面不是分屏候选**（REQ-A226）：它的几何归容器，`apply_split_to_real` 不会为
+  它摆位，所以宿主**不把它列进分屏候选**（`wm_split_candidates` / `LayoutSnapshot.candidates`
+  由同一个 `pane_candidates` 剔除它）。因此 `W4` 的调试卡里能看到 `legacy:*`，而设置页的
+  「可分屏窗口」看不到它——这是**如实**的差异，不是缺陷。**模型层仍可表达**（`enter_split`
+  接受任意两个已注册窗口，那是"它们该在哪"的意图），但宿主会把**没能摆位**的窗格 `warn!`
+  出来，而不是静默；若将来容器愿意服从窗格矩形，去掉那一处过滤即可。
 - 在无 Waydroid 的 CI/开发机上,`W1`–`W4` 均可通过 `DemoRuntime` 验证(返回合成
   window id),这正是 `crates/amos-android` 端到端测试覆盖的路径。
 - **LMK-proxy 的生命周期状态 + 容器侧 Kill 已落地,但「表面拆除」仍是 seam**：`TriggerLmk`

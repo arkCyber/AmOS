@@ -61,6 +61,8 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
     ├── amos-sms/                 # SMS domain core: threads/messages/folders (inbox/sent/draft), validate (normalize + bounded segments), pluggable SmsProvider seam (Mock / Android `android`-gated SmsGlue reading content://sms + SmsManager send), push-receive events (docs/sms.md)
     ├── amos-blocklist/           # spam-blocking rule core: exact/prefix rules per channel (call/sms/both), number equivalence (+CC / leading-0), unknown-number toggle, cap-500 LRU + JSON persistence shared by the SMS filter and the Android CallScreeningService (docs/sms.md §11)
     ├── amos-devocare/           # device-care (手机管家) domain core: junk scan→analyze→plan→execute (uri-dedup, review-only needs acknowledgement) with a CleanProvider seam + root-confined `hostfs` backend (bounded depth, no symlink follow, user media never matched), UninstallGuard (system + pinned-critical refusals), read-only sensitive-permission review, and a folded CareReport where unknown areas stay unassessed (docs/devcare.md)
+    ├── amos-link/               # AmOS-Link robot middleware (ROS-class): key-expression topics + `*`/`**` with channel-implied QoS profiles, bincode `Envelope` frames with CRC32 + a 16 MiB frame ceiling, ROS-like QoS (best-effort latest-wins vs reliable back-pressure, counted as `blocked`), in-process Broker transport + optional Zenoh inter-board transport (`zenoh`), bus federation + CRC-checked UDP-beacon discovery (`lan`, with a repeating announcer so a peer that joins the LAN later still learns one that booted earlier) with static peers that never TTL-expire, heartbeats/NodeStatus + per-publisher sequence-gap accounting, a JSON→motor-frame robot HAL with validated frame/joint invariants, a latched e-stop + deadman watchdog, and a tonic control plane mounted by the daemon (docs/amos-link.md)
+    ├── amos-link-cli/           # robot-middleware CLI: status / topics / pub / sub / bench / discover (mock|bus|lan) / watch / motor over one in-process node, or `--socket <path>` to read a *running* daemon's control plane (status/topics/pub/watch; process-level smoke in tests/cli_smoke.rs)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -83,6 +85,20 @@ cargo run -p amos-tauri
 > (`http://localhost:1420`), which can collide with another app. To view **this**
 > project's UI reliably, run `make run-ui-release` (builds release, embeds dist,
 > binds no port).
+>
+> **To actually *see* the window** (macOS): `make app-open` — it builds the `.app`
+> bundle (embedding `dist`, freshness-checked first) and opens it. A **bare**
+> `cargo build` binary is not an app bundle, so macOS will not activate it: the window
+> is on screen but sits behind whatever is in front, and the host can only `warn!`
+> about it (`the platform did not hand focus to the shell window …` — REQ-A232). The
+> `.app` is the form the OS will bring forward.
+>
+> That path embeds `frontend-ts/dist`, and `tauri.conf.json`'s `beforeBuildCommand`
+> is **empty** — so the bundle must be rebuilt by hand whenever `frontend-ts/src`
+> changes: `make frontend-dist` (then `make frontend-fresh` says whether it is
+> current). `scripts/run-ui-release.sh` and `make app-open` both run that check and
+> refuse to build a stale UI (REQ-A228). The debug path (`make run-ui-dev`, `make dev`)
+> loads the Vite dev server, so it always shows your sources and needs neither step.
 
 Manual (two terminals):
 

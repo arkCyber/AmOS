@@ -23,6 +23,7 @@ interface HomeProps {
   layout: { page: string[]; dock: string[]; hidden: string[] };
   ext: StoreTile[];
   pulseId: string | null;
+  grid?: { cols: number; rows: number };
 }
 
 const channel = (): PropsChannel<HomeProps> => propsChannel<HomeProps>("home");
@@ -217,6 +218,68 @@ describe("HomeDock.svelte — pulse highlight + store-installed (ext) tiles", ()
   });
 });
 
+
+describe("HomeDock.svelte — form-factor grid (tablet is not a stretched phone)", () => {
+  const allApps = [
+    "clock", "settings", "calculator", "weather", "notes", "reminders",
+    "vmemos", "photos", "files", "android", "messages", "phone",
+    "music", "maps", "camera", "ai",
+  ];
+
+  test("no grid in the payload → the historical phone geometry (4×3 = 12/page)", async () => {
+    channel().set({ layout: layout(allApps, []), ext: [], pulseId: null });
+    const { container } = render(HomeDock);
+    await tick();
+
+    const grid = container.querySelector('[data-testid="home-grid"]') as HTMLElement;
+    expect(grid.getAttribute("data-cols")).toBe("4");
+    expect(grid.getAttribute("data-rows")).toBe("3");
+    expect((grid.getAttribute("style") ?? "").replace(/\s/g, "")).toContain(
+      "grid-template-columns:repeat(4,",
+    );
+    // 16 apps / 12 per page → two pages, i.e. the phone paging is intact.
+    expect(container.querySelectorAll('button[data-testid="home-dot"]').length).toBe(2);
+  });
+
+  test("a tablet portrait grid pages at iPadOS density (4×6 = 24/page)", async () => {
+    channel().set({
+      layout: layout(allApps, []),
+      ext: [],
+      pulseId: null,
+      grid: { cols: 4, rows: 6 },
+    });
+    const { container } = render(HomeDock);
+    await tick();
+
+    const grid = container.querySelector('[data-testid="home-grid"]') as HTMLElement;
+    expect(grid.getAttribute("data-cols")).toBe("4");
+    expect(grid.getAttribute("data-rows")).toBe("6");
+    expect((grid.getAttribute("style") ?? "").replace(/\s/g, "")).toContain(
+      "grid-template-columns:repeat(4,",
+    );
+    // 16 apps fit on ONE page of 24 → no paging dots.
+    expect(container.querySelectorAll('button[data-testid="home-dot"]').length).toBe(0);
+    expect(byLabel(container, label("app.ai"))).toBeTruthy();
+  });
+
+  test("a tablet landscape grid is 6 columns and 24 per page", async () => {
+    channel().set({
+      layout: layout(allApps, []),
+      ext: [],
+      pulseId: null,
+      grid: { cols: 6, rows: 4 },
+    });
+    const { container } = render(HomeDock);
+    await tick();
+
+    const grid = container.querySelector('[data-testid="home-grid"]') as HTMLElement;
+    expect(grid.getAttribute("data-cols")).toBe("6");
+    expect((grid.getAttribute("style") ?? "").replace(/\s/g, "")).toContain(
+      "grid-template-columns:repeat(6,",
+    );
+    expect(container.querySelectorAll('button[data-testid="home-dot"]').length).toBe(0);
+  });
+});
 
 describe("HomeDock.svelte — grid-shrink page-index clamp (parity with React)", () => {
   test("a stale high page index is clamped, so re-expansion does not auto-jump back", async () => {

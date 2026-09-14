@@ -11,6 +11,7 @@ import { bootOsChrome } from "./svelte/osBoot";
 import { hydrateFromSystemStore } from "./lib/amosStore";
 import { installUiFailureObserver } from "./lib/uiFailures";
 import { invoke } from "./lib/backend";
+import { appIdFromHash } from "./lib/windowRoute";
 import {
   enterEdit,
   lock,
@@ -24,6 +25,7 @@ import {
 //   /shell.html?surface=app&id=phone → app(phone)
 //   /shell.html?surface=lock         → lock
 //   /shell.html?surface=edit         → edit
+//   /index.html#window=notes         → app(notes)   (a real app window/split pane)
 function mountShell() {
   const root = document.getElementById("root") ?? (() => {
     const el = document.createElement("div");
@@ -39,6 +41,13 @@ function mountShell() {
     if (surface === "app") open(p.get("id") || "clock");
     else if (surface === "lock") lock();
     else if (surface === "edit") enterEdit();
+    // An app window the host opened for a specific app (`#window=<label>`) — the
+    // `?surface=` overrides above win, because they are the headless-acceptance
+    // path and a real window never carries both.
+    else {
+      const win = appIdFromHash(location.hash);
+      if (win) open(win);
+    }
   } catch {
     /* ignore; default home */
   }

@@ -100,8 +100,32 @@ describe("Settings real sub pages (interactions)", () => {
     await fireEvent.click(switchByLabel(host, "通知提示音") as HTMLButtonElement);
     await fireEvent.click(switchByLabel(host, "触感反馈") as HTMLButtonElement);
     // The same key/schema the status bar + notification-arrival path read.
-    const saved = readStoreValue<SoundPolicy>(SOUND_KEY, { ring: true, vibrate: true });
-    expect(saved).toEqual({ ring: false, vibrate: false });
+    const saved = readStoreValue<SoundPolicy>(SOUND_KEY, { ring: true, vibrate: true, volume: 1 });
+    expect(saved).toEqual({ ring: false, vibrate: false, volume: 1 });
+  });
+
+  test("声音与触感: the alert-volume slider persists the chime loudness (REQ-A205)", async () => {
+    const host = render(SettingsApp);
+    await navigate(host, "声音与触感");
+    const slider = () =>
+      host.container.querySelector('[data-testid="sound-volume"]') as HTMLInputElement | null;
+    expect(slider()).toBeTruthy();
+    // Default loudness: 100%.
+    expect(slider()?.value).toBe("100");
+    await fireEvent.input(slider() as HTMLInputElement, { target: { value: "50" } });
+    // Persisted through the same amos.sound key the arrival path reads.
+    const saved = readStoreValue<SoundPolicy>(SOUND_KEY, { ring: true, vibrate: true, volume: 1 });
+    expect(saved.volume).toBeCloseTo(0.5);
+    // The % readout mirrors the persisted policy.
+    expect(txt(host)).toContain("50%");
+    // A fresh page reads the loudness back from the store, not local state.
+    host.unmount();
+    const host2 = render(SettingsApp);
+    await navigate(host2, "声音与触感");
+    const slider2 = host2.container.querySelector(
+      '[data-testid="sound-volume"]',
+    ) as HTMLInputElement;
+    expect(slider2.value).toBe("50");
   });
 
   test("隐私与安全性: revoking a granted capability removes it from the ledger", async () => {
@@ -136,13 +160,19 @@ describe("Settings real sub pages (interactions)", () => {
     expect(switchByLabel(host, "数据漫游")?.disabled).toBe(true);
   });
 
-  test("专注模式: scenario toggles persist via the amos.focus ledger", async () => {
+  test("专注模式: 勿扰 is the REAL quick-settings bit; 工作/睡眠 stay in the amos.focus ledger (REQ-A206)", async () => {
     const host = render(SettingsApp);
     await navigate(host, "专注模式");
     await fireEvent.click(switchByLabel(host, "勿扰") as HTMLButtonElement);
     await fireEvent.click(switchByLabel(host, "工作") as HTMLButtonElement);
-    const saved = readStoreValue<FocusPrefs>(FOCUS_KEY, { dnd: false, work: false, sleep: false });
-    expect(saved).toEqual({ dnd: true, work: true, sleep: false });
+    // The DND switch must land in the store the shell honours
+    // (lib/settings.dndActive reads amos.settings.dnd) — the same bit the 通知
+    // page writes. It used to write a decorative amos.focus.dnd that muted nothing.
+    const quick = readStoreValue<QuickSettings>(SETTINGS_KEY, {});
+    expect(quick.dnd).toBe(true);
+    // Intent scenarios keep their own ledger — without a decorative dnd field.
+    const saved = readStoreValue<FocusPrefs>(FOCUS_KEY, { work: false, sleep: false });
+    expect(saved).toEqual({ work: true, sleep: false });
   });
 
   test("外发网闸: honest offline state renders (no bridge → not connected, switch disabled)", async () => {

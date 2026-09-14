@@ -79,6 +79,16 @@ pub mod amos_telemetry_spy {
     tonic::include_proto!("amos_telemetry_spy");
 }
 
+pub mod amos_link {
+    //! Generated types for the AmOS-Link control plane (the robot middleware):
+    //! `robot_link_client` (client), `robot_link_server` (server), and messages
+    //! (`LinkStatus`, `TopicList`, `PublishRequest`/`PublishReply`, `Heartbeat`,
+    //! `Metrics`, `Peer`). Data-plane frames do **not** travel here — they are
+    //! `Envelope`-framed payloads over an AmOS-Link transport; see
+    //! `proto/robot_link.proto` and `docs/amos-link.md`.
+    tonic::include_proto!("amos_link");
+}
+
 /// gRPC metadata header carrying the caller's client id.
 ///
 /// The System UI (Tauri core) sends this on every RPC so the daemon's security

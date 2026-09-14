@@ -9,6 +9,12 @@
  */
 
 import { invoke, subscribe } from "./backend";
+import { wmWindows } from "./wm";
+
+// The wire type has one owner: `lib/wm.ts` (the `wm_*` bridge). Re-exported here so
+// the LMK reconcile's callers/tests keep their import path.
+export type { WmWindowInfo } from "./wm";
+import type { WmWindowInfo } from "./wm";
 
 /** Tauri event name for one daemon `WatchLmk` decision (Rust side emits this). */
 export const LMK_SURFACE_EVENT = "lmk-surface";
@@ -37,11 +43,6 @@ export function shouldTearDown(p: LmkSurfacePayload): boolean {
 export async function closeLegacySurface(windowId: string): Promise<boolean> {
   const snap = await invoke("wm_close", { label: legacySurfaceLabel(windowId) });
   return snap != null;
-}
-
-/** A window in the Rust wm snapshot (`wm_windows`). */
-export interface WmWindowInfo {
-  label: string;
 }
 
 /** A live container task from the daemon LMK snapshot (`android_lmk_tasks`). */
@@ -76,11 +77,6 @@ export function staleLegacySurfaceLabels(
 /** Fetch the daemon's authoritative live LMK tasks (null when the daemon is down). */
 export async function androidLmkTasks(): Promise<AndroidLmkTask[] | null> {
   return invoke<AndroidLmkTask[]>("android_lmk_tasks");
-}
-
-/** Fetch the Rust wm snapshot windows (null when not inside Tauri). */
-export async function wmWindows(): Promise<{ windows?: WmWindowInfo[] } | null> {
-  return invoke<{ windows?: WmWindowInfo[] }>("wm_windows");
 }
 
 /**

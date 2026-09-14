@@ -23,6 +23,12 @@ libc = "0.2"
 amos-android.workspace = true
 amos-telephony.workspace = true
 amos-sensor.workspace = true
+# AmOS-Link robot middleware (crates/amos-link + proto/robot_link.proto +
+# docs/amos-link.md): the daemon mounts its CONTROL PLANE on the shared UDS so the
+# System UI / a field tool can read the link's status, list its topics, inject a
+# frame and stream heartbeats. Pure-Rust and offline by default (in-process broker);
+# the Zenoh/Zenoh-over-LAN transport is a separate build feature of that crate.
+amos-link.workspace = true
 amos-profiling.workspace = true
 amos-power = { workspace = true, features = ["linux"] }
 amos-applife.workspace = true

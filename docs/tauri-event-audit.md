@@ -22,6 +22,11 @@ worth holding even when it is clean.
    `*_EVENT` constant, resolved **workspace-wide** so a constant defined in
    `backend.ts` and used in `MessagesApp.svelte` still resolves) must appear in a
    production `subscribe(...)`/`listen(...)`, or be allow-listed with a reason.
+   **What counts as production is decided by removing `#[cfg(test)]` regions, not by
+   cutting the file at the first one** (REQ-A231): a test seam placed above real code
+   used to hide everything after it — the scan then reported a live emitter
+   (`layout-changed`) as "no Rust code emits it", and — worse — would have stayed
+   *green* about a genuinely unconsumed emitter in that region.
 2. **consumed ⇒ emitted** — a screen subscribing to an event no Rust code emits can
    never fire.
 3. **payload fields** — for events whose payload is a plain Rust **struct** and

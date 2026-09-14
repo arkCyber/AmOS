@@ -276,11 +276,14 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
   });
 
   test("index rows surface persisted state (focus subtitle)", async () => {
-    // Focus scenario on → the 专注模式 row subtitle lists it.
-    writeStoreValue(FOCUS_KEY, { dnd: false, work: true, sleep: false });
+    // REQ-A206: the 专注模式 subtitle lists the REAL DND bit (amos.settings.dnd)
+    // first, then the saved intent scenarios from amos.focus.
+    writeStoreValue(FOCUS_KEY, { work: true, sleep: false });
+    writeStoreValue(SETTINGS_KEY, { dnd: true });
     const host = render(SettingsApp);
     expect(txt(host)).toContain("专注模式");
-    expect(txt(host)).toContain("工作"); // enabled-scenario subtitle
+    expect(txt(host)).toContain("勿扰"); // the real DND bit is listed
+    expect(txt(host)).toContain("工作"); // enabled intent scenario
   });
 
   test("index search also matches alias/sub-page keywords", async () => {

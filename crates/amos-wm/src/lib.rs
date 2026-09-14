@@ -24,6 +24,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+/// Form-factor / layout-policy domain (see [`crate::form`]).
+pub mod form;
 /// Desktop geometry / split-screen domain (see [`crate::layout`]).
 pub mod layout;
 /// Split-screen session over two windows (see [`crate::split`]).

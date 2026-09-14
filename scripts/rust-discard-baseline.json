@@ -36,7 +36,7 @@
     "crates/amos-tauri/src/media.rs": 1,
     "crates/amos-tauri/src/mic_permission.rs": 1,
     "crates/amos-tauri/src/sms.rs": 2,
-    "crates/amos-tauri/src/android_log.rs": 1
+    "crates/amos-tauri/src/host_log.rs": 1
   },
   "macroGenerated": {
     "note": "Informational: `clippy::let_underscore_must_use` findings attributed to a macro-generated span (the `#[tauri::command]` wrapper's signature line). One per command, not gated, not audited as debt — see `policy`.",

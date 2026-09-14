@@ -257,21 +257,42 @@ impl TypedData {
         let mut out = BTreeSet::new();
         let mut visited = BTreeSet::new();
         self.collect_deps(name, &mut out, &mut visited);
+        // Enforced here, not left to the walk: a *cycle* back to the start type used to put
+        // it back into the set (the recursive form inserted a dependency before recursing,
+        // so an already-visited type was re-added). `encode_type` filters the start type out
+        // anyway, which is why the contradiction with this doc comment was invisible.
+        out.remove(name);
         out.into_iter().collect()
     }
 
+    /// Collect the reachable types with an **explicit work list**, not recursion
+    /// (NASA Power of 10 rule 1).
+    ///
+    /// The `visited` set always bounded the *work*, but nothing bounded the *depth*: a long
+    /// chain of struct types costs one stack frame per link, and EIP-712 typed data is
+    /// whatever the party asking for a signature sends — a chain of a few thousand types is
+    /// a few hundred kilobytes of JSON and would have overflowed the signing thread's stack
+    /// (a crash, not an error, in the most sensitive path this crate has). The loop below
+    /// keeps the stack flat and allocates only what the declared types require; the set the
+    /// caller sees is unchanged (`visited` only decides what still needs *expanding*).
     fn collect_deps(&self, name: &str, out: &mut BTreeSet<String>, visited: &mut BTreeSet<String>) {
-        if !visited.insert(name.to_string()) {
-            return;
-        }
-        let Some(fields) = self.types.get(name) else {
-            return;
-        };
-        for f in fields {
-            let base = base_type(&f.typ);
-            if self.types.contains_key(base) && base != name {
-                out.insert(base.to_string());
-                self.collect_deps(base, out, visited);
+        let mut pending = vec![name.to_string()];
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let Some(fields) = self.types.get(&current) else {
+                continue;
+            };
+            for f in fields {
+                let base = base_type(&f.typ);
+                if base != current && self.types.contains_key(base) {
+                    out.insert(base.to_string());
+                    // …but only an unvisited type still needs to be expanded.
+                    if !visited.contains(base) {
+                        pending.push(base.to_string());
+                    }
+                }
             }
         }
     }
@@ -490,6 +511,88 @@ mod tests {
 
     fn h(bytes: [u8; 32]) -> String {
         bytes::encode_hex(&bytes)
+    }
+
+    #[test]
+    fn a_long_type_chain_is_collected_without_recursing() {
+        // Typed data is whatever the party asking for a signature sends, so the *shape* of
+        // the type graph is not ours to trust. This chain used to cost one stack frame per
+        // link — 20 000 links is a few hundred kilobytes of JSON, and well past the ~2 MiB
+        // stack a worker thread gets, so the recursive form would abort the signing path
+        // rather than return an error. The work list keeps the stack flat; the assertion is
+        // about the outcome (everything reachable is collected), which is what must not
+        // regress.
+        let links = 20_000usize;
+        let mut types = serde_json::Map::new();
+        for i in 0..links {
+            let field = if i + 1 < links {
+                serde_json::json!({ "name": "next", "type": format!("T{}", i + 1) })
+            } else {
+                serde_json::json!({ "name": "leaf", "type": "uint256" })
+            };
+            types.insert(format!("T{i}"), serde_json::Value::Array(vec![field]));
+        }
+        let doc = serde_json::json!({
+            "types": types,
+            "primaryType": "T0",
+            "domain": { "name": "AmOS", "version": "1", "chainId": 1 },
+            "message": {},
+        });
+        let typed = TypedData::from_json(&doc.to_string()).expect("typed data parses");
+
+        let deps = typed.referenced_types("T0");
+        assert_eq!(
+            deps.len(),
+            links - 1,
+            "every link after the start is reachable"
+        );
+        // The set is ordered as *strings* (BTreeSet), so "T1" sorts first and "T9999" last.
+        assert_eq!(deps.first().map(String::as_str), Some("T1"));
+        assert!(
+            deps.contains(&"T19999".to_string()),
+            "the far end is reachable"
+        );
+        assert!(
+            !deps.iter().any(|t| t == "T0"),
+            "the starting type is never its own dependency"
+        );
+
+        // …and the canonical encoding names all of them (the start type first).
+        // EIP-712's `encodeType` spells each field as `<type> <name>`.
+        let encoded = typed.encode_type("T0").expect("encodeType");
+        assert!(
+            encoded.starts_with("T0(T1 next)"),
+            "got: {}",
+            &encoded[..40]
+        );
+        assert!(
+            encoded.contains("T19999(uint256 leaf)"),
+            "the chain is complete"
+        );
+    }
+
+    #[test]
+    fn a_cyclic_type_graph_collects_each_type_once() {
+        // A → B → A is legal typed data. The walk must terminate, report each type once,
+        // and — per `referenced_types`' own contract — never list the starting type, even
+        // though the cycle reaches it. (The recursive form did list it there; `encode_type`
+        // filtered it out, so the canonical encoding below is unchanged either way, which
+        // is why that contradiction was invisible until the walk was rewritten.)
+        let typed = TypedData::from_json(
+            r#"{
+              "types": {
+                "A": [ { "name": "b", "type": "B" } ],
+                "B": [ { "name": "a", "type": "A" } ]
+              },
+              "primaryType": "A",
+              "domain": { "name": "AmOS", "version": "1", "chainId": 1 },
+              "message": {}
+            }"#,
+        )
+        .expect("typed data parses");
+        assert_eq!(typed.referenced_types("A"), vec!["B"]);
+        // …and the canonical encoding leads with the primary type exactly once.
+        assert_eq!(typed.encode_type("A").expect("encodeType"), "A(B b)B(A a)");
     }
 
     #[test]

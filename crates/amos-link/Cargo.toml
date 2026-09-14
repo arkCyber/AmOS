@@ -1,0 +1,57 @@
+[package]
+name = "amos-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AmOS-Link: a decentralized, dependency-light robot middleware (ROS-class pub/sub) for AmOS — key-expression topics + wildcards, bincode `Message` payloads with a self-describing `Envelope` frame + CRC32, ROS-like QoS (reliable/best-effort, latest-sample-wins), an in-process broker transport, UDP-beacon peer discovery, a JSON→motor-frame robot HAL and a tonic control plane. Design: docs/amos-link.md."
+
+[lib]
+name = "amos_link"
+path = "src/lib.rs"
+
+[dependencies]
+# The wire contract for the control plane (proto/robot_link.proto) and its gRPC glue.
+amos-proto.workspace = true
+tonic.workspace = true
+# Calibrated timestamps: every Envelope is stamped with the node's clock so a
+# receiver can measure true one-way latency once the clock is synced
+# (docs/timesync.md + crates/amos-timesync).
+amos-timesync = { path = "../amos-timesync" }
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
+async-trait.workspace = true
+bincode.workspace = true
+crc32fast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror = "1"
+
+# Zenoh is the optional *inter-node* transport (the LAN/5G bus): a few hundred KB,
+# no DDS, and scouting finds peers without a hand-written IP list. Kept behind a
+# feature so the default build stays pure-Rust/offline and the in-process broker
+# remains the testable default. Default features are off on purpose: TCP + UDP +
+# local UDS are what a robot link needs (no QUIC/TLS/WS payload in the binary).
+zenoh = { version = "1.10", default-features = false, features = [
+    "transport_tcp",
+    "transport_udp",
+    "transport_unixsock-stream",
+], optional = true }
+# Only for the `lan` feature: SO_REUSEADDR/SO_REUSEPORT on the beacon socket.
+socket2 = { version = "0.6", optional = true }
+
+[features]
+default = []
+# `src/lan.rs`: real UDP-beacon discovery over the LAN (multicast group by
+# default; `AMOS_LINK_BEACON_ADDR` overrides the target). `socket2` is only for
+# SO_REUSEADDR/SO_REUSEPORT, so several processes on one host can share the port.
+lan = ["dep:socket2"]
+# `src/zenoh.rs`: the Zenoh-backed Transport (cross-board / cross-server links).
+zenoh = ["dep:zenoh"]
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+tower.workspace = true
+hyper-util.workspace = true

@@ -26,7 +26,14 @@ interface TauriInternals {
 }
 
 function bridge(): TauriBridge | null {
-  if (typeof window === "undefined") return null;
+  // `typeof window === "undefined"` covers a non-DOM runtime; the `window === null`
+  // half covers a test double or an embedder that nulls the global. Without the
+  // second check this **threw** (`null.__TAURI_INTERNALS__`) instead of returning
+  // null, breaking the "null when not bridged" contract this module documents —
+  // found when `lib/wm.ts` stopped re-implementing the bridge and delegated here
+  // (REQ-A220). `typeof null === "object"`, so the undefined check alone is not
+  // enough.
+  if (typeof window !== "object" || window === null) return null;
   const internals = (window as unknown as { __TAURI_INTERNALS__?: TauriInternals })
     .__TAURI_INTERNALS__;
   if (!internals || typeof internals !== "object" || typeof internals.invoke !== "function") {

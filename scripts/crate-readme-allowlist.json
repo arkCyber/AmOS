@@ -1,0 +1,6 @@
+{
+  "_comment": "scripts/crate-readme-scan.mjs: crates that cannot ship an examples/ directory need a reason here. A crate that later gains examples/ is reported [stale] so this list cannot rot.",
+  "no_examples": {
+    "amos-jni": "JNI plumbing: every entry point needs a live JVM/JNIEnv (attached thread + app class loader). A host example cannot run one, and a fake that prints class names would demonstrate the opposite of the crate's point (the exception-clearing rules at docs/android-glue.md). The crate is exercised on device through the Android providers that use it."
+  }
+}

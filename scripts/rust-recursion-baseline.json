@@ -1,0 +1,5 @@
+{
+  "policy": "Known production recursion (NASA Power of 10 rule 1), frozen per `path::fn` with a reason. A **new** recursive function fails `make lint` until it is either rewritten or acknowledged here; an entry that no longer matches is reported `[stale]` so this ratchet cannot rot. The intended steady state for a safety-critical crate is **zero** entries: prefer the iterative form (a bounded loop or a dynamic program) over a recursive one, and if recursion is genuinely unavoidable, write down why its depth is bounded.",
+  "captured": "2026-09-14",
+  "entries": []
+}

@@ -43,7 +43,14 @@ describe("android LMK surface bridge (pure helpers)", () => {
   });
 });
 
-const W = (label: string): WmWindowInfo => ({ label });
+const W = (label: string): WmWindowInfo => ({
+  id: 0,
+  label,
+  kind: label.startsWith("legacy:") ? "System" : "App",
+  state: "Shown",
+  focused: false,
+  external: label.startsWith("legacy:"),
+});
 const T = (window_id: string): AndroidLmkTask => ({
   window_id,
   package_name: "com.tencent.mm",

@@ -1,0 +1,109 @@
+// AmOS-Link control-plane contract — the robot middleware's service bus.
+//
+// Transport: the same Unix Domain Socket as ai_agent / sensor / telephony (one UDS
+// for the whole OS backend). Data-plane traffic (stereo depth frames, joint set
+// points) does NOT travel here: those are `Envelope`-framed binary payloads over an
+// AmOS-Link `Transport` (in-process broker today, Zenoh behind the `zenoh` feature).
+// This service is the *control plane* on top of it: status, the live topic
+// inventory, a raw publish entry point for tooling/agents, and a heartbeat stream.
+// Design & contract: docs/amos-link.md, crates/amos-link/src/service.rs.
+syntax = "proto3";
+
+package amos_link;
+
+// The AmOS-Link control plane exposed by the daemon (amos-ai mounts it beside
+// AiAgent / Sensor / Telephony on the shared UDS).
+service RobotLink {
+  // Node identity, uptime, clock freshness, counters and the live peer table.
+  rpc GetStatus(Empty) returns (LinkStatus);
+
+  // Every concrete topic the node has seen *published* traffic on, sorted.
+  // Subscription patterns are not listed: a pattern is not a topic, and a network
+  // transport cannot enumerate what someone else published (it answers empty).
+  rpc ListTopics(Empty) returns (TopicList);
+
+  // Publish a raw payload on a topic. The daemon stamps it with its own peer id,
+  // a monotonic sequence number and the (possibly calibrated) clock, so a
+  // producer that is not a Rust AmOS-Link node can still inject frames.
+  rpc Publish(PublishRequest) returns (PublishReply);
+
+  // Server-streaming heartbeat: every peer's beat (including this node's) as it arrives,
+  // so a client sees the whole link's liveness rather than a synthetic counter. Use
+  // GetStatus for the peer table itself.
+  rpc StreamHeartbeats(Empty) returns (stream Heartbeat);
+}
+
+message Empty {}
+
+// One peer learned through discovery (a beacon), with its freshness in ms.
+message Peer {
+  string id = 1;                     // stable peer id (PeerId)
+  string kind = 2;                   // robot / brain / sensor / actuator / tool
+  string endpoint = 3;               // transport endpoint if the beacon carried one
+  uint64 last_seen_ms = 4;           // age of the last evidence (a beacon, or a declaration)
+  uint64 beacons = 5;                // beacons observed; 0 = declared by hand (static, never TTL-expired)
+}
+
+// Cumulative link counters since the node started (never reset, never faked).
+message Metrics {
+  uint64 published = 1;              // Envelope frames handed to the transport
+  uint64 delivered = 2;              // frames accepted by a subscriber queue
+  uint64 dropped = 3;                // frames dropped by a QoS policy (best-effort)
+  uint64 decode_errors = 4;          // frames a subscriber could not decode
+  uint64 peers = 5;                  // peers currently fresh in the registry
+  uint64 encode_errors = 6;          // messages that failed to encode before the wire
+  uint64 blocked = 7;                // publishes that had to wait for a reliable subscriber
+}
+
+message LinkStatus {
+  string peer = 1;                   // this node's peer id
+  string kind = 2;                   // this node's kind
+  string version = 3;                // amos-link crate version
+  uint64 uptime_ms = 4;              // ms since the node was created
+  bool clock_synced = 5;             // true when a calibrated clock is in use
+  Metrics metrics = 6;
+  repeated Peer peers = 7;
+  HealthState health = 8;            // the link's own verdict (see LINK_HEALTH docs)
+  // Why that verdict, one token per reason carrying its number ("decode_errors=3",
+  // "frame_loss=6 in 2 gap(s)"). Empty for HEALTHY.
+  repeated string health_reasons = 9;
+}
+
+// The link's verdict about itself: a fold of the counters into a judgement, never a
+// fabricated "OK". UNKNOWN means *no evidence yet*, which is deliberately not the same
+// as healthy.
+enum HealthState {
+  HEALTH_UNKNOWN = 0;                // nothing published, delivered or seen yet
+  HEALTH_HEALTHY = 1;                // traffic flowing and no reason fired
+  HEALTH_DEGRADED = 2;               // working, but something measurable is wrong
+}
+
+message TopicList {
+  repeated string topics = 1;        // concrete key expressions, sorted
+}
+
+message PublishRequest {
+  // Topic to publish on. Wildcards are refused (a publisher names one topic).
+  string topic = 1;
+  // Opaque payload bytes. The daemon wraps them in an AmOS-Link Envelope; a
+  // bincode-encoded `Message` keeps the typed subscribers working.
+  bytes payload = 2;
+}
+
+message PublishReply {
+  uint64 seq = 1;                    // the sequence number the node stamped
+  // Subscribers whose pattern matched. A network transport (Zenoh) cannot count
+  // remote subscribers, so it reports 0 — the same "unknown" the topic inventory
+  // answers with; only the in-process Broker knows this for real.
+  uint32 matched = 2;
+  uint32 delivered = 3;              // frames accepted by a subscriber queue
+  uint32 dropped = 4;                // frames dropped by a QoS policy
+}
+
+message Heartbeat {
+  string peer = 1;                   // emitting peer id
+  uint64 seq = 2;                    // per-peer monotonic heartbeat counter
+  uint64 stamp_secs = 3;             // wall-clock seconds (calibrated if synced)
+  uint32 stamp_nanos = 4;            // sub-second part, < 1e9
+  uint64 uptime_ms = 5;              // ms since the emitting node started
+}

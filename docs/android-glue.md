@@ -82,7 +82,7 @@ provider 层）。装配失败只记日志、留在 Mock（离线语义不变）
 真机上一条都看不到（A185 的"Rust tracing 不落 logcat"到这里才说清 —— 不是"不落 logcat"，而是
 **没有任何落点**）。
 
-补全：新增 `crates/amos-tauri/src/android_log.rs`（android 特性），在 `run()` 的**第一行**安装
+补全：新增 `crates/amos-tauri/src/host_log.rs`（**REQ-A229 前的文件名是 `android_log.rs`**；该模块现在是**一个订阅点、两个 sink**——Android 走 logcat，桌面走 stderr，见 `docs/multi-window.md` §1.5 的 PC 实机验收），在 `run()` 的**第一行**安装
 `tracing_subscriber` 的一个 layer，把每条事件经 `__android_log_write(prio, "AmosRust", line)`
 写进 logcat —— 不需要新依赖（`liblog` 已因 NDK 音频路径被链接），失败静默（logging 不能成为
 新的故障源），`try_init` 保证幂等。

@@ -30,9 +30,9 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 |---|---|
 | `amos-proto` | gRPC contracts (`ai_agent`, `android_compat`) + socket helper; tonic-generated |
 | `amos-ai` | AI daemon (gRPC server) + CLI args; headless, socket `0700`, graceful shutdown |
-| `amos-wm` | transport-agnostic window-manager state machine (z-order/focus) |
+| `amos-wm` | transport-agnostic window-manager state machine (z-order/focus) + desktop geometry/split-screen domain + **form-factor/layout-policy domain** (phone/tablet/desktop/robot class, per-class capabilities, runtime content-column signal) |
 | `amos-android` | Waydroid / demo runtime + icon extraction + PNG generation |
-| `amos-tauri` | System UI: launcher, built-in Svelte app screens, notification center, gRPC bridge, Android commands |
+| `amos-tauri` | System UI: launcher, built-in Svelte app screens, notification center, gRPC bridge, Android commands, window-manager adapter (real `WebviewWindow`s; the OS screen area is **measured** from the screen window on boot + every resize/DPI change, not hard-coded) |
 | `amos-translate` | simultaneous-interpretation daemon (gRPC) with pluggable translation + ASR providers |
 | `amos-int` | transport-agnostic interpretation session engine (state machine, utterance assembly, `Pipeline` trait) |
 | `amos-asr` | streaming speech recognition: `StreamingRecognizer` abstraction + `AsrPipeline` (Partial/Final) + gated sherpa-onnx backend |
@@ -43,6 +43,8 @@ one connection; the WebView talks to a real daemon, not directly to hardware.
 | `amos-applife` | app/process lifecycle domain core: per-app `Foreground/Visible/ForegroundService/Background/Cached(tombstone)/Stopped` state ladder + LRU ordering + a deterministic memory-pressure reclaim (LMK-proxy) victim selector (`docs/app-lifecycle.md`) |
 | `amos-scheduler` | background-task scheduler + wakeup-alignment domain core: `AlarmExact` vs `Deferred` jobs with `[earliest,latest]` windows, Doze/charging/maintenance-window gating for deferred work, coalesced due-batching (fewer wakes) and next-wake computation (`docs/scheduler.md`) |
 | `amos-monitor` | system working-status (health) domain core: folds `SystemSampler` load (CPU/mem) + `amos-profiling` battery/power + `amos-applife` process counts into one honest `SystemHealth` (`docs/system-monitor.md`) |
+| `amos-link` | AmOS-Link robot middleware: key-expression topics (`*`/`**`) with channel-implied QoS profiles, bincode `Envelope` frames with CRC32, ROS-like QoS (best-effort latest-wins vs reliable back-pressure, counted as `blocked`), an in-process broker transport + an optional Zenoh inter-board transport, CRC-checked UDP-beacon peer discovery (`lan`) with static peers that never TTL-expire, heartbeats/status + per-publisher sequence-gap accounting, a JSON→motor-frame robot HAL whose frames/joints are validated on every decode path, and a tonic control plane mounted by the daemon (`docs/amos-link.md`) |
+| `amos-link-cli` | terminal for the middleware: `status`/`topics`/`pub`/`sub`/`bench`/`discover`/`watch`/`motor` over one in-process node (process-level smoke in `tests/cli_smoke.rs`) |
 
 ## RPC contract (`proto/`)
 

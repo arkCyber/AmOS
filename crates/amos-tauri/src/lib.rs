@@ -16,8 +16,6 @@ pub mod alarm_sched;
 #[cfg(feature = "android")]
 pub mod android_glue;
 pub mod android_lmk;
-#[cfg(feature = "android")]
-pub mod android_log;
 pub mod appstore;
 pub mod assistant_voice;
 /// Spam blocking (calls + SMS): rule storage, SMS filtering and the Android
@@ -44,6 +42,7 @@ pub mod devcare_device;
 pub mod display;
 pub mod flashlight;
 pub mod host_battery;
+pub mod host_log;
 /// Input method (IME): the System UI's on-screen pinyin keyboard. `amos-ime` owns
 /// the engine; this bridge owns the session + the `amos-ime.json` profile.
 pub mod ime;
@@ -85,11 +84,13 @@ use wm::{SystemContext, WmState};
 // single allowed expect in production — everything else is gated (P0-1).
 #[allow(clippy::expect_used)]
 pub fn run() {
-    // Hand Rust's `tracing` to logcat **first**: every provider failure report below
-    // (dropped frame, unarmed glue bus, refused platform call) is a no-op without a
-    // subscriber, so the device could not see any of them (REQ-A187).
-    #[cfg(feature = "android")]
-    android_log::install();
+    // Install the `tracing` sink **first**: every report below (boot facts, a shell
+    // window that could not be sized, a screen that could not be measured, a degraded
+    // provider) is a no-op without a subscriber. On device that is logcat; on desktop
+    // it is stderr — and *before REQ-A229 the desktop had no subscriber at all*, so the
+    // PC build printed nothing and the "reported, not silent" claims were unverifiable
+    // where a desktop user actually runs it.
+    host_log::install();
     // Durable store is the source of truth for quick-settings. Radio toggles live
     // in-process (Android services are reachable from the System UI APK, not the
     // headless daemon), so we seed the radio bridge from the persisted
@@ -351,6 +352,70 @@ pub fn run() {
             alarm_sched::scheduler_alarm_poll,
             real_dial::real_dial
         ])
+        .on_window_event(|window, event| {
+            // Keep the layout model's screen equal to the **real** window area.
+            // Only the screen window (the Launcher/main surface) defines that area:
+            // every other window — including split panes, which this very handler's
+            // `finish_layout` re-places — is positioned *inside* it, so reacting to
+            // their resizes would feed the pane-writing loop back into itself.
+            if !wm::is_screen_window(window.label()) {
+                return;
+            }
+            // The event's **own** reading: at `ScaleFactorChanged` the window has
+            // not been resized yet, so re-reading `inner_size()` there would pair
+            // the new DPI with the old size.
+            let Some((width, height, new_scale)) = wm::resize_reading(event) else {
+                return;
+            };
+            let scale = match new_scale {
+                Some(scale) => scale,
+                None => window.scale_factor().unwrap_or(1.0),
+            };
+            let state = window.state::<WmState>();
+            match state.sync_from_pixels(width, height, scale, window.app_handle()) {
+                Ok(Some(snapshot)) => {
+                    // This measurement is post-application by construction (the event
+                    // carries the size the window now has), so it is the authoritative
+                    // answer to the boot-time shell-size request: say plainly whether the
+                    // OS honoured it. The boot path's own read right after `set_size`
+                    // cannot do this — it can still show the old size (measured on
+                    // macOS: ~50 ms of 480×820 before the resize lands), which is
+                    // exactly why the request is remembered instead of assumed.
+                    // (REQ-A230)
+                    let applied = amos_wm::layout::Size::new(snapshot.screen_w, snapshot.screen_h);
+                    match state.note_applied_size(applied) {
+                        Ok(Some(wm::ShellFitOutcome::Honoured { size })) => tracing::info!(
+                            width = size.width,
+                            height = size.height,
+                            "the requested shell window size was applied"
+                        ),
+                        Ok(Some(wm::ShellFitOutcome::Adjusted { requested, applied })) => {
+                            tracing::warn!(
+                                requested_width = requested.width,
+                                requested_height = requested.height,
+                                applied_width = applied.width,
+                                applied_height = applied.height,
+                                "the OS applied a different shell window size than requested \
+                                 (a display that cannot hold it, or a window-manager clamp)"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            target: "amos::wm",
+                            error = %e,
+                            "could not record the applied shell window size"
+                        ),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    target: "amos::wm",
+                    error = %e,
+                    "could not re-measure the OS window after a resize; \
+                     the layout keeps its previous screen"
+                ),
+            }
+        })
         .setup(|app| {
             // Arm the native clipboard ingest bus with the managed GlobalClipboard
             // so container-originated copies land in the shared buffer, and install
@@ -399,6 +464,109 @@ pub fn run() {
                 tracing::info!("clipboard guest link armed: socket={:?}", guest_link.socket);
             } else {
                 tracing::debug!("clipboard guest link inert: {}", guest_link.reason);
+            }
+            // A PC must not keep launching the shell as a handset slab: app windows
+            // already opened at their class's size, but the **main** window came
+            // from a static config value and was never adapted (REQ-A222). Only the
+            // exact handset default is replaced — a size somebody chose is left
+            // alone — and a failure is reported rather than silently ignored.
+            {
+                let handle = app.handle().clone();
+                let state = app.state::<WmState>();
+                match state.fit_shell_window(&handle) {
+                    Ok(Some((was, amos_wm::form::ShellFit::Maximize))) => tracing::info!(
+                        was_width = was.width,
+                        was_height = was.height,
+                        "requested a desktop-aligned (maximized) shell window; the next \
+                         measurement reports the area the platform gave it"
+                    ),
+                    Ok(Some((was, amos_wm::form::ShellFit::Resize(now)))) => tracing::info!(
+                        was_width = was.width,
+                        was_height = was.height,
+                        width = now.width,
+                        height = now.height,
+                        "requested this form factor's shell window size \
+                         (the next measurement reports what the OS applied)"
+                    ),
+                    Ok(Some((_, amos_wm::form::ShellFit::Leave))) => tracing::debug!(
+                        "shell window size left unchanged (the policy asked for nothing)"
+                    ),
+                    Ok(None) => tracing::debug!("shell window size left unchanged"),
+                    Err(e) => tracing::warn!(
+                        target: "amos::wm",
+                        error = %e,
+                        "could not size the shell window for this form factor"
+                    ),
+                }
+            }
+            // Measure the **real** OS window instead of keeping the layout's
+            // fallback rectangle: the split geometry and the content-column signal
+            // are derived from it, so an unmeasured host would describe a window
+            // nobody has (REQ-A218). Reported, not silent: on failure the model
+            // keeps the fallback and the log says so.
+            {
+                let handle = app.handle().clone();
+                let state = app.state::<WmState>();
+                match state.sync_window_layout(&handle) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => tracing::debug!(
+                        "layout screen unchanged on boot (or no screen window yet)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "amos::wm",
+                        error = %e,
+                        "could not measure the OS window; the layout keeps its fallback screen"
+                    ),
+                }
+            }
+            // A **bare** (non-bundled) macOS binary is not a "regular" app: it has no
+            // Dock presence and cannot come to the front by itself, so `set_focus()`
+            // returns `Ok` while the user sees nothing (measured, REQ-A232). Ask for the
+            // regular policy first — and report a refusal, because a platform that will
+            // not treat this as an app must not be mistaken for a focused window.
+            #[cfg(target_os = "macos")]
+            if let Err(e) = app
+                .handle()
+                .set_activation_policy(tauri::ActivationPolicy::Regular)
+            {
+                tracing::warn!(
+                    target: "amos::wm",
+                    error = %e,
+                    "could not make this process a regular macOS app; the shell window \
+                     may open behind other windows"
+                );
+            }
+            // The model starts with the Launcher **focused** (`amos-wm` asserts it) and
+            // this adapter documents `FocusChanged(Some(id)) → set_focus()`, but nothing
+            // ever told the OS at boot: a shell started from a background process (a
+            // terminal, a script, CI-driven launch) stayed behind every other app — the
+            // window rendered and the user saw nothing (measured on macOS: `frontmost`
+            // was false with the editor in front — REQ-A232). Do it **after** the resize
+            // and the measurement, so the window comes forward at its final size.
+            {
+                let handle = app.handle().clone();
+                let state = app.state::<WmState>();
+                match state.focus_launcher(&handle) {
+                    // Only say "focused" when the platform confirms it.
+                    Ok(wm::LauncherFocus::Focused) => tracing::info!(
+                        "the shell window is focused (the model's starting state, confirmed by the platform)"
+                    ),
+                    Ok(wm::LauncherFocus::Refused) => tracing::warn!(
+                        target: "amos::wm",
+                        "the platform did not hand focus to the shell window; it is on screen but \
+                         may sit behind other apps (a non-bundled macOS binary has no app bundle \
+                         to activate — build/run the `.app`, or bring it forward yourself)"
+                    ),
+                    Ok(wm::LauncherFocus::NoWindow) => tracing::warn!(
+                        target: "amos::wm",
+                        "no shell window to focus at boot; the UI may be invisible to the user"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "amos::wm",
+                        error = %e,
+                        "could not bring the shell window to the front; it may open behind other windows"
+                    ),
+                }
             }
             // System-wide readiness probe: log the daemon status once on boot.
             let bridge = app.state::<AiBridge>();

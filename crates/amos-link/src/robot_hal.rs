@@ -1,0 +1,1607 @@
+//! The robot HAL: the agent's intent → a quadruped's motor frames.
+//!
+//! This is the "small brain" boundary. The language model (or the field server) speaks
+//! JSON — it must not know hex, CRC or joint limits. This module owns that translation,
+//! and it is deliberately **pure**: parsing, validation, gait expansion and frame
+//! encoding are all plain functions, so the whole intent→bytes path is unit-tested
+//! without a robot (the [`MockRobotHal`] sink is where a test collects the frames a real
+//! UART/CAN driver would send).
+//!
+//! ```text
+//!   {"action":"trot","speed":0.6,"duration_ms":800}      ← agent JSON (LLM output)
+//!            │ parse_command
+//!            ▼
+//!   RobotCommand { gait: Trot, speed, targets: [] }      ← validated intent
+//!            │ plan
+//!            ▼
+//!   aa55 03 01 e8030000 crc16 …                          ← one hex frame per joint
+//!            │ RobotHal::apply
+//!            ▼
+//!   the servo bus (Mock today, a UART/CAN driver later)
+//! ```
+//!
+//! Frame layout (10 bytes, little-endian, CRC16-CCITT over the first 8):
+//!
+//! ```text
+//!   0xAA 0x55 │ id u8 │ op u8 │ arg i32 │ crc16 u16
+//! ```
+//!
+//! Joint indices follow the quadruped convention `leg * 3 + (hip, thigh, knee)`; the
+//! position argument is in **milli-degrees**, so a frame never carries a float and two
+//! nodes can never disagree about rounding.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{LinkError, Result};
+
+/// Frame start bytes (`0xAA55`).
+pub const FRAME_SOF: [u8; 2] = [0xAA, 0x55];
+/// Bytes of one encoded motor frame: SOF + id + op + arg(i32) + crc16.
+pub const FRAME_LEN: usize = 2 + 1 + 1 + 4 + 2;
+/// Joints of the reference quadruped: 4 legs x (hip, thigh, knee).
+pub const JOINTS: usize = 12;
+/// Largest accepted joint index.
+pub const MAX_JOINT: u8 = (JOINTS - 1) as u8;
+
+/// The pose table and the joint range must agree: [`Gait::pose`] returns a row of exactly
+/// [`JOINTS`] values and `plan` turns its index into a joint, so a mismatch would mean a
+/// joint that can never be commanded — or an index past [`MAX_JOINT`]. Checked by the
+/// **compiler**, so no reviewer has to remember it.
+const _: () = assert!(JOINTS == MAX_JOINT as usize + 1);
+/// Travel limit of any joint, in milli-degrees (±90°).
+pub const MAX_JOINT_MILLI_DEG: i32 = 90_000;
+/// Largest torque limit a frame may carry, in milli-percent of rated torque (100%).
+pub const MAX_TORQUE_MILLI_PERCENT: i32 = 100_000;
+
+/// A joint under closed-loop position control.
+///
+/// The index is **private** on purpose: a `JointId` that exists outside this module is
+/// one that was validated (0..=[`MAX_JOINT`]) — including when it arrives over the wire,
+/// because `Deserialize` goes through [`JointId::new`] — so no caller can smuggle an
+/// out-of-range joint into a [`MotorFrame`] and past the HAL's safety layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct JointId(u8);
+
+impl JointId {
+    /// Validate a joint index (0..=[`MAX_JOINT`]).
+    pub fn new(index: u8) -> Result<Self> {
+        if index > MAX_JOINT {
+            return Err(LinkError::Robot(format!(
+                "joint {index} is out of range (0..={MAX_JOINT})"
+            )));
+        }
+        Ok(JointId(index))
+    }
+
+    /// The joint index (0..=[`MAX_JOINT`] by construction).
+    pub const fn index(self) -> u8 {
+        self.0
+    }
+
+    /// The leg this joint belongs to.
+    pub fn leg(self) -> u8 {
+        self.0 / 3
+    }
+
+    /// The joint within its leg: 0 = hip, 1 = thigh, 2 = knee.
+    pub fn part(self) -> u8 {
+        self.0 % 3
+    }
+}
+
+impl TryFrom<u8> for JointId {
+    type Error = LinkError;
+
+    /// The wire form is validated too: a frame claiming joint 200 is *refused*, counted
+    /// as a decode error by the subscriber and skipped — not accepted as joint 200.
+    fn try_from(index: u8) -> Result<Self> {
+        JointId::new(index)
+    }
+}
+
+impl From<JointId> for u8 {
+    fn from(joint: JointId) -> Self {
+        joint.0
+    }
+}
+
+/// A gait the framework knows how to expand into a pose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gait {
+    /// Four feet planted (the safe default; `{"action":"stand"}`).
+    Stand,
+    /// The diagonal trot every quadruped starts with.
+    Trot,
+    /// A slower crawl gait (one foot in the air at a time).
+    Walk,
+    /// Haunches down.
+    Sit,
+    /// Energize the drivers **without moving** — the only way to clear a latched
+    /// e-stop (see [`RobotBridge`]). Deliberately a *gait* rather than a flag inside a
+    /// motion command: an agent that has just been e-stopped must make it obvious that
+    /// it is asking to arm again.
+    Arm,
+    /// Emergency stop — the only command that never needs a gait pose.
+    Estop,
+}
+
+impl Gait {
+    /// Every gait, in documentation order.
+    pub const ALL: [Gait; 6] = [
+        Gait::Stand,
+        Gait::Trot,
+        Gait::Walk,
+        Gait::Sit,
+        Gait::Arm,
+        Gait::Estop,
+    ];
+
+    /// Stable JSON/CLI key.
+    pub fn key(self) -> &'static str {
+        match self {
+            Gait::Stand => "stand",
+            Gait::Trot => "trot",
+            Gait::Walk => "walk",
+            Gait::Sit => "sit",
+            Gait::Arm => "arm",
+            Gait::Estop => "estop",
+        }
+    }
+
+    /// Parse a gait key (case-insensitive; `e-stop`/`stop` mean `estop`).
+    pub fn from_key(s: &str) -> Option<Gait> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "stand" => Some(Gait::Stand),
+            "trot" => Some(Gait::Trot),
+            "walk" => Some(Gait::Walk),
+            "sit" => Some(Gait::Sit),
+            "arm" | "enable" | "rearm" | "re-arm" => Some(Gait::Arm),
+            "estop" | "e-stop" | "stop" => Some(Gait::Estop),
+            _ => None,
+        }
+    }
+
+    /// True for the halt command (which skips speed/duration validation).
+    pub fn is_emergency(self) -> bool {
+        matches!(self, Gait::Estop)
+    }
+
+    /// True for the arm command (energize only; clears a latched e-stop).
+    pub fn is_arm(self) -> bool {
+        matches!(self, Gait::Arm)
+    }
+
+    /// True when the gait moves the robot (so a latched e-stop must refuse it).
+    pub fn is_motion(self) -> bool {
+        matches!(self, Gait::Stand | Gait::Trot | Gait::Walk | Gait::Sit)
+    }
+
+    /// The pose this gait drives, in milli-degrees per joint (hip, thigh, knee per leg).
+    ///
+    /// A single table, not a gait *generator*: the frames a robot needs at 100 Hz are
+    /// the ones a real gait controller emits, and pretending this module plans
+    /// trajectories would be a lie. What it does is translate and validate intent.
+    pub fn pose(self, speed: f32) -> [i32; JOINTS] {
+        // Speed scales the thigh/knee extension, never the hip (stability first): the
+        // hip column stays at 0 md in every pose. A **non-finite** speed is treated as 0
+        // (the slowest pose) rather than passed to `clamp`: `f32::clamp` propagates NaN,
+        // and `NaN as i32` is 0, which would silently produce a *straighter* stance than
+        // any legal speed — an unvalidated float must not pick a pose.
+        let s = if speed.is_finite() {
+            speed.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let extend = |base: i32| -> i32 { -((base as f32) * (0.5 + 0.5 * s)) as i32 };
+        match self {
+            Gait::Stand => [
+                0,
+                extend(35_000),
+                extend(60_000), // FL
+                0,
+                extend(35_000),
+                extend(60_000), // FR
+                0,
+                extend(35_000),
+                extend(60_000), // RL
+                0,
+                extend(35_000),
+                extend(60_000), // RR
+            ],
+            Gait::Trot => [
+                0,
+                extend(20_000),
+                extend(45_000), // FL
+                0,
+                extend(45_000),
+                extend(80_000), // FR
+                0,
+                extend(45_000),
+                extend(80_000), // RL
+                0,
+                extend(20_000),
+                extend(45_000), // RR
+            ],
+            Gait::Walk => [
+                0,
+                extend(30_000),
+                extend(55_000),
+                0,
+                extend(30_000),
+                extend(55_000),
+                0,
+                extend(30_000),
+                extend(55_000),
+                0,
+                extend(30_000),
+                extend(55_000),
+            ],
+            Gait::Sit => [
+                0,
+                extend(70_000),
+                extend(30_000),
+                0,
+                extend(70_000),
+                extend(30_000),
+                0,
+                extend(20_000),
+                extend(10_000),
+                0,
+                extend(20_000),
+                extend(10_000),
+            ],
+            // Arming holds every joint where it is (a zero pose = "no commanded
+            // motion"); what matters for `Arm` is the `Enable` frames `plan` emits.
+            Gait::Arm | Gait::Estop => [0; JOINTS],
+        }
+    }
+}
+
+/// One joint's commanded position, in milli-degrees (integer: no float on the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JointTarget {
+    /// Which joint.
+    pub joint: JointId,
+    /// Target angle in milli-degrees (e.g. `-45000` = -45°).
+    pub milli_deg: i32,
+}
+
+impl JointTarget {
+    /// Validate the angle against the HAL's travel limit.
+    ///
+    /// The check is a **range comparison, not `abs()`**: this value comes straight from an
+    /// agent's JSON, and `i32::MIN.abs()` would overflow — a debug-build panic, and in a
+    /// release build a negative wrap that *passes* an `abs() > limit` test and lets an
+    /// insane set point through. `-2147483648` must be refused like any other
+    /// out-of-travel angle.
+    pub fn new(joint: JointId, milli_deg: i32) -> Result<Self> {
+        if !(-MAX_JOINT_MILLI_DEG..=MAX_JOINT_MILLI_DEG).contains(&milli_deg) {
+            return Err(LinkError::Robot(format!(
+                "joint {} target {milli_deg} md exceeds the +/-{MAX_JOINT_MILLI_DEG} md travel limit",
+                joint.index()
+            )));
+        }
+        Ok(Self { joint, milli_deg })
+    }
+}
+
+/// A validated intent: which gait, how fast, for how long, and any joint overrides.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RobotCommand {
+    /// The gait to run (or halt for).
+    pub gait: Gait,
+    /// Speed factor in `[0, 1]` (0 = no travel; ignored by `estop`).
+    pub speed: f32,
+    /// How long the command should hold, in milliseconds (0 = "until changed").
+    pub duration_ms: u32,
+    /// Optional explicit joint targets (milli-degrees) overriding the gait's pose.
+    pub targets: Vec<JointTarget>,
+}
+
+/// Why a [`RobotBridge`] refused to move, or stopped moving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EstopReason {
+    /// The agent (or the field server) sent an explicit `{"action":"estop"}`.
+    Commanded,
+    /// No action arrived within the watchdog period: the link is presumed lost.
+    Watchdog,
+}
+
+impl EstopReason {
+    /// Stable wire/CLI key.
+    pub fn key(self) -> &'static str {
+        match self {
+            EstopReason::Commanded => "commanded",
+            EstopReason::Watchdog => "watchdog",
+        }
+    }
+}
+
+/// What one [`RobotBridge::step`] did.
+///
+/// A refused *action* is not an I/O error: it is the safety layer working, and the
+/// caller must be able to log it and keep looping. Only a transport failure (or a
+/// broken bus) is an `Err`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BridgeEvent {
+    /// The action was translated and written to the bus.
+    Applied {
+        /// The action that arrived (its link metadata included).
+        seq: u64,
+        /// The frames that reached the bus.
+        frames: usize,
+        /// True when the action armed the drivers (`{"action":"arm"}` or any gait).
+        armed: bool,
+    },
+    /// Motion was refused because the bridge is e-stopped (latched until an `arm`).
+    Refused {
+        /// The action that arrived and was refused.
+        seq: u64,
+        /// The human-readable reason (also logged).
+        reason: String,
+    },
+    /// Torque was cut: by the watchdog (link presumed lost) or by an explicit e-stop.
+    Estopped {
+        /// Which of the two happened.
+        reason: EstopReason,
+        /// Frames written to the bus for the cut.
+        frames: usize,
+    },
+}
+
+/// The operations a motor frame can carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MotorOp {
+    /// Set the target position (argument = milli-degrees).
+    SetPosition,
+    /// Set the torque limit (argument = milli-percent of rated torque).
+    SetTorque,
+    /// Energize the driver.
+    Enable,
+    /// De-energize the driver.
+    Disable,
+    /// Cut torque immediately (latched until an explicit `Enable`).
+    Estop,
+}
+
+impl MotorOp {
+    /// The wire opcode.
+    pub fn code(self) -> u8 {
+        match self {
+            MotorOp::SetPosition => 0x01,
+            MotorOp::SetTorque => 0x02,
+            MotorOp::Enable => 0x03,
+            MotorOp::Disable => 0x04,
+            MotorOp::Estop => 0x05,
+        }
+    }
+
+    /// Decode an opcode (`None` for an unknown byte).
+    pub fn from_code(code: u8) -> Option<MotorOp> {
+        match code {
+            0x01 => Some(MotorOp::SetPosition),
+            0x02 => Some(MotorOp::SetTorque),
+            0x03 => Some(MotorOp::Enable),
+            0x04 => Some(MotorOp::Disable),
+            0x05 => Some(MotorOp::Estop),
+            _ => None,
+        }
+    }
+}
+
+/// One frame on the servo bus.
+///
+/// A frame is a *set point*, so it is validated wherever it can come from the outside:
+/// the CRC16 bus decoder ([`MotorFrame::decode`]) and the `bincode` `Message` path
+/// (a controller may publish `MotorFrame`s on the link) both refuse a frame that fails
+/// [`MotorFrame::validate`]. Constructing one locally with [`MotorFrame::new`] is the
+/// caller's own validated intent (`plan` builds them from a checked `RobotCommand`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MotorFrameWire", into = "MotorFrameWire")]
+pub struct MotorFrame {
+    /// Destination joint.
+    pub joint: JointId,
+    /// What to do.
+    pub op: MotorOp,
+    /// Operation argument (milli-degrees for a position, milli-percent for torque).
+    pub arg: i32,
+}
+
+/// The wire form of a [`MotorFrame`]: identical field order, types and encoding, so a
+/// frame on the wire is unchanged — the only difference is that decoding runs
+/// [`MotorFrame::validate`] before a `MotorFrame` can exist.
+#[derive(Serialize, Deserialize)]
+struct MotorFrameWire {
+    joint: JointId,
+    op: MotorOp,
+    arg: i32,
+}
+
+impl TryFrom<MotorFrameWire> for MotorFrame {
+    type Error = LinkError;
+
+    fn try_from(wire: MotorFrameWire) -> Result<Self> {
+        let frame = MotorFrame {
+            joint: wire.joint,
+            op: wire.op,
+            arg: wire.arg,
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+}
+
+impl From<MotorFrame> for MotorFrameWire {
+    /// Encoding never *creates* a frame, so it does not re-validate (that would make
+    /// `encode` fallible for a value the caller already had to obtain legitimately).
+    fn from(frame: MotorFrame) -> Self {
+        Self {
+            joint: frame.joint,
+            op: frame.op,
+            arg: frame.arg,
+        }
+    }
+}
+
+impl MotorFrame {
+    /// Build a frame.
+    ///
+    /// Infallible on purpose: every in-tree producer (`plan`, the HAL's own e-stop/enable
+    /// batches) derives the argument from a validated command or a constant. A frame that
+    /// arrives from outside goes through [`MotorFrame::validate`] instead — see the type
+    /// docs.
+    pub fn new(joint: JointId, op: MotorOp, arg: i32) -> Self {
+        Self { joint, op, arg }
+    }
+
+    /// Check the argument against the limits of its operation.
+    ///
+    /// The joint is already guaranteed by [`JointId`] (valid on both the constructor and
+    /// the wire path); the argument is what a frame can still get wrong. The comparison
+    /// is a range check rather than `abs()`, so `i32::MIN` — an overflow in a debug
+    /// build, a wrap that would *pass* in a release build — is refused like any other
+    /// out-of-range value.
+    pub fn validate(&self) -> Result<()> {
+        match self.op {
+            MotorOp::SetPosition => {
+                if !(-MAX_JOINT_MILLI_DEG..=MAX_JOINT_MILLI_DEG).contains(&self.arg) {
+                    return Err(LinkError::Robot(format!(
+                        "joint {} position {} md is outside the +/-{MAX_JOINT_MILLI_DEG} md \
+                         travel limit",
+                        self.joint.index(),
+                        self.arg
+                    )));
+                }
+                Ok(())
+            }
+            MotorOp::SetTorque => {
+                if !(0..=MAX_TORQUE_MILLI_PERCENT).contains(&self.arg) {
+                    return Err(LinkError::Robot(format!(
+                        "joint {} torque {} is outside 0..={MAX_TORQUE_MILLI_PERCENT} \
+                         milli-percent",
+                        self.joint.index(),
+                        self.arg
+                    )));
+                }
+                Ok(())
+            }
+            // The remaining operations carry no set point (a driver reads no argument
+            // from them), so there is nothing to bound.
+            MotorOp::Enable | MotorOp::Disable | MotorOp::Estop => Ok(()),
+        }
+    }
+
+    /// Encode to the 10-byte bus frame (CRC16-CCITT over the first 8 bytes).
+    pub fn encode(&self) -> [u8; FRAME_LEN] {
+        let mut out = [0u8; FRAME_LEN];
+        out[0] = FRAME_SOF[0];
+        out[1] = FRAME_SOF[1];
+        out[2] = self.joint.0;
+        out[3] = self.op.code();
+        out[4..8].copy_from_slice(&self.arg.to_le_bytes());
+        let crc = crc16_ccitt(&out[..8]);
+        out[8..10].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// The frame as lowercase hex (`aa550301e8030000b9e1`).
+    pub fn encode_hex(&self) -> String {
+        to_hex(&self.encode())
+    }
+
+    /// Decode a frame, refusing a bad SOF, an unknown opcode, a CRC mismatch, an
+    /// out-of-range joint or an argument outside its operation's limits.
+    ///
+    /// The last two are the safety-relevant ones: a CRC-valid frame is still *untrusted*
+    /// (only random corruption is caught by a checksum, not a wrong or malicious
+    /// producer), and a joint index or set point that never could have been commanded
+    /// must not reach a HAL that trusts its input.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != FRAME_LEN {
+            return Err(LinkError::Frame(format!(
+                "motor frame is {} bytes, expected {FRAME_LEN}",
+                bytes.len()
+            )));
+        }
+        if bytes[..2] != FRAME_SOF {
+            return Err(LinkError::Frame("bad motor frame SOF".to_string()));
+        }
+        let expect = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let actual = crc16_ccitt(&bytes[..8]);
+        if expect != actual {
+            return Err(LinkError::Frame(format!(
+                "motor frame crc mismatch ({expect:#06x} != {actual:#06x})"
+            )));
+        }
+        let op = MotorOp::from_code(bytes[3])
+            .ok_or_else(|| LinkError::Frame(format!("unknown motor opcode {:#04x}", bytes[3])))?;
+        let arg = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let frame = Self {
+            joint: JointId::new(bytes[2])?,
+            op,
+            arg,
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+}
+
+/// CRC16-CCITT (poly `0x1021`, init `0xFFFF`) — the checksum every servo bus accepts.
+pub fn crc16_ccitt(bytes: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for byte in bytes {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Lowercase hex, no separators (avoids a dependency for ten bytes).
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+    }
+    s
+}
+
+/// The JSON an agent (or a UI) sends — the shape [`parse_command`] accepts.
+///
+/// Unknown fields are ignored (`serde` default), so a future agent can add hints
+/// without breaking an older board; a *missing* gait is refused, because guessing a
+/// gait for a robot is exactly the kind of silent default that hurts.
+#[derive(Clone, Debug, Deserialize)]
+struct RawCommand {
+    /// The gait/action key.
+    action: String,
+    /// Optional speed factor in `[0, 1]` (default 0.5).
+    #[serde(default)]
+    speed: Option<f32>,
+    /// Optional hold time in ms (default 0 = until changed).
+    #[serde(default)]
+    duration_ms: Option<u32>,
+    /// Optional explicit joint targets: `[{"joint":2,"milli_deg":-30000}, …]`.
+    #[serde(default)]
+    targets: Vec<RawTarget>,
+}
+
+/// One explicit joint target inside [`RawCommand`].
+#[derive(Clone, Debug, Deserialize)]
+struct RawTarget {
+    /// Joint index.
+    joint: u8,
+    /// Either an absolute milli-degree angle…
+    #[serde(default)]
+    milli_deg: Option<i32>,
+    /// …or a float degree angle (converted, for agent convenience).
+    #[serde(default)]
+    deg: Option<f32>,
+}
+
+/// Parse an agent's JSON action into a validated [`RobotCommand`].
+///
+/// Refusals are explicit and named (so the agent gets a message it can act on): an
+/// unknown action, a speed outside `[0, 1]`, a joint out of range, an angle beyond the
+/// travel limit, or a target without an angle.
+pub fn parse_command(json: &str) -> Result<RobotCommand> {
+    let raw: RawCommand = serde_json::from_str(json)
+        .map_err(|e| LinkError::Robot(format!("action is not valid JSON: {e}")))?;
+    let gait = Gait::from_key(&raw.action)
+        .ok_or_else(|| LinkError::Robot(format!("unknown action `{}`", raw.action)))?;
+    if gait.is_emergency() {
+        // The halt path must never be refused for a cosmetic reason (a speed typo must
+        // not block an e-stop); targets are irrelevant to a torque cut.
+        return Ok(RobotCommand {
+            gait,
+            speed: 0.0,
+            duration_ms: raw.duration_ms.unwrap_or(0),
+            targets: Vec::new(),
+        });
+    }
+    if gait.is_arm() {
+        // Arming is an energize, not a motion: a speed makes no sense and a joint target
+        // would be a hidden motion command after an e-stop, so both are ignored.
+        return Ok(RobotCommand {
+            gait,
+            speed: 0.0,
+            duration_ms: raw.duration_ms.unwrap_or(0),
+            targets: Vec::new(),
+        });
+    }
+    let speed = raw.speed.unwrap_or(0.5);
+    if !(0.0..=1.0).contains(&speed) {
+        return Err(LinkError::Robot(format!("speed {speed} is outside [0, 1]")));
+    }
+    let mut targets = Vec::with_capacity(raw.targets.len());
+    for t in raw.targets {
+        let joint = JointId::new(t.joint)?;
+        let milli_deg = match (t.milli_deg, t.deg) {
+            (Some(md), _) => md,
+            (None, Some(deg)) => (deg * 1000.0).round() as i32,
+            (None, None) => {
+                return Err(LinkError::Robot(format!(
+                    "target for joint {} has neither `milli_deg` nor `deg`",
+                    t.joint
+                )))
+            }
+        };
+        targets.push(JointTarget::new(joint, milli_deg)?);
+    }
+    Ok(RobotCommand {
+        gait,
+        speed,
+        duration_ms: raw.duration_ms.unwrap_or(0),
+        targets,
+    })
+}
+
+/// The servo bus: where [`MotorFrame`]s are actually written.
+#[async_trait]
+pub trait RobotHal: Send + Sync + 'static {
+    /// Send frames to the bus; returns how many were accepted.
+    ///
+    /// An implementation is the **last place** a bad set point can be stopped, so it must
+    /// refuse a frame that fails [`MotorFrame::validate`] instead of trusting its caller —
+    /// a driver that trusts its input is not a safety layer.
+    async fn apply(&self, frames: &[MotorFrame]) -> Result<usize>;
+
+    /// Cut torque on every joint (overrides anything queued).
+    async fn estop(&self) -> Result<()>;
+
+    /// True while the drivers are energized.
+    fn armed(&self) -> bool;
+
+    /// Which implementation this is (`"mock"`, `"uart"`, …).
+    fn name(&self) -> &'static str;
+}
+
+/// Expand a command into the frames a bus driver sends.
+///
+/// `Estop` short-circuits to a torque cut on every joint — the one path that must not
+/// depend on pose planning. `Arm` energizes every joint **and commands no motion** (the
+/// zero pose), which is what makes "re-arm after an e-stop" a deliberate act rather than
+/// a side effect. Every other gait emits `Enable` (idempotent on real drivers) followed
+/// by one position frame per joint, with explicit targets overriding the gait pose.
+pub fn plan(command: &RobotCommand) -> Vec<MotorFrame> {
+    if command.gait.is_emergency() {
+        return (0..=MAX_JOINT)
+            .map(|j| MotorFrame::new(JointId(j), MotorOp::Estop, 0))
+            .collect();
+    }
+    if command.gait.is_arm() {
+        // Enable per joint, no position frame: the drivers come up holding position.
+        return (0..=MAX_JOINT)
+            .map(|j| MotorFrame::new(JointId(j), MotorOp::Enable, 0))
+            .collect();
+    }
+    let pose = command.gait.pose(command.speed);
+    let mut frames = Vec::with_capacity(JOINTS + 1);
+    frames.push(MotorFrame::new(JointId(0), MotorOp::Enable, 0));
+    for (index, milli_deg) in pose.iter().enumerate() {
+        let joint = JointId(index as u8);
+        let arg = command
+            .targets
+            .iter()
+            .find(|t| t.joint == joint)
+            .map(|t| t.milli_deg)
+            .unwrap_or(*milli_deg);
+        frames.push(MotorFrame::new(joint, MotorOp::SetPosition, arg));
+    }
+    frames
+}
+
+/// A HAL that records what a real bus would have sent.
+#[derive(Debug)]
+pub struct MockRobotHal {
+    frames: Mutex<Vec<MotorFrame>>,
+    armed: AtomicBool,
+    applied: AtomicU64,
+}
+
+impl MockRobotHal {
+    /// A mock with de-energized drivers.
+    pub fn new() -> Self {
+        Self {
+            frames: Mutex::new(Vec::new()),
+            armed: AtomicBool::new(false),
+            applied: AtomicU64::new(0),
+        }
+    }
+
+    /// Every frame this HAL has been asked to send, in order.
+    pub fn frames(&self) -> Vec<MotorFrame> {
+        self.frames.lock().map(|f| f.clone()).unwrap_or_default()
+    }
+
+    /// How many frames were accepted.
+    pub fn applied(&self) -> u64 {
+        self.applied.load(Ordering::Relaxed)
+    }
+
+    /// Forget the recorded frames (keeping the counters).
+    pub fn clear(&self) {
+        if let Ok(mut f) = self.frames.lock() {
+            f.clear();
+        }
+    }
+
+    /// The recorded frames as hex, one line per frame (what a bus log looks like).
+    pub fn hex_log(&self) -> Vec<String> {
+        self.frames().iter().map(MotorFrame::encode_hex).collect()
+    }
+}
+
+impl Default for MockRobotHal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl RobotHal for MockRobotHal {
+    async fn apply(&self, frames: &[MotorFrame]) -> Result<usize> {
+        // Refuse the whole batch *before* writing anything: a partial write would leave
+        // the joints in a mixed state, which is worse than refusing the command.
+        for frame in frames {
+            frame.validate()?;
+        }
+        let mut record = self
+            .frames
+            .lock()
+            .map_err(|_| LinkError::Robot("mock HAL poisoned".to_string()))?;
+        record.extend_from_slice(frames);
+        drop(record);
+        if frames.iter().any(|f| f.op == MotorOp::Enable) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        if frames
+            .iter()
+            .any(|f| matches!(f.op, MotorOp::Disable | MotorOp::Estop))
+        {
+            self.armed.store(false, Ordering::SeqCst);
+        }
+        self.applied
+            .fetch_add(frames.len() as u64, Ordering::Relaxed);
+        Ok(frames.len())
+    }
+
+    async fn estop(&self) -> Result<()> {
+        let frames: Vec<MotorFrame> = (0..=MAX_JOINT)
+            .map(|j| MotorFrame::new(JointId(j), MotorOp::Estop, 0))
+            .collect();
+        self.apply(&frames).await?;
+        Ok(())
+    }
+
+    fn armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
+    }
+
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// An agent action as it travels on the link: the model's JSON, verbatim.
+///
+/// Carried as a string on purpose — the brain must be able to introduce a new field
+/// without recompiling the board, and *this* side still validates everything before a
+/// motor moves ([`AgentAction::parse`] runs the same checks the CLI does).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAction {
+    /// The raw JSON the agent produced.
+    pub json: String,
+}
+
+impl AgentAction {
+    /// Wrap an agent's JSON action.
+    pub fn new(json: impl Into<String>) -> Self {
+        Self { json: json.into() }
+    }
+
+    /// Validate it into a [`RobotCommand`].
+    pub fn parse(&self) -> Result<RobotCommand> {
+        parse_command(&self.json)
+    }
+}
+
+/// Translate one agent action and write it to the bus; returns the frames sent.
+pub async fn execute<H: RobotHal>(hal: &H, action: &AgentAction) -> Result<Vec<MotorFrame>> {
+    let frames = plan(&action.parse()?);
+    let applied = hal.apply(&frames).await?;
+    Ok(frames[..applied.min(frames.len())].to_vec())
+}
+
+/// The "small brain" glue: the control topic on one side, the servo bus on the other.
+///
+/// Deliberately a `step()` and not a `loop`: the caller owns the cadence (a 50 Hz
+/// control task, a test, the CLI), which keeps this type free of a hidden scheduler and
+/// makes the whole intent→frames path observable from a unit test.
+///
+/// Two safety properties live here, because they cannot live in the agent (it is the
+/// component that may be wrong, slow, or disconnected):
+///
+/// 1. **Latched e-stop.** Once an `estop` is applied — commanded *or* tripped by the
+///    watchdog — every later motion command is [`BridgeEvent::Refused`] until an
+///    explicit `{"action":"arm"}` arrives. A robot must not restart because a stale
+///    `trot` was still in the queue.
+/// 2. **Deadman watchdog** (opt-in, [`RobotBridge::with_watchdog`]). If no action
+///    arrives within the period, the bridge cuts torque itself and reports
+///    [`EstopReason::Watchdog`]: the honest answer to "the Wi-Fi died mid-stride".
+pub struct RobotBridge<H: RobotHal> {
+    subscriber: crate::pubsub::Subscriber<AgentAction>,
+    hal: H,
+    watchdog: Option<Duration>,
+    estop_latched: bool,
+}
+
+impl<H: RobotHal> RobotBridge<H> {
+    /// Pair a control-channel subscription with a servo bus (no watchdog: the caller
+    /// guarantees a cadence).
+    pub fn new(subscriber: crate::pubsub::Subscriber<AgentAction>, hal: H) -> Self {
+        Self {
+            subscriber,
+            hal,
+            watchdog: None,
+            estop_latched: false,
+        }
+    }
+
+    /// The same bridge, but a silence longer than `period` cuts torque.
+    ///
+    /// This is the deadman switch a field robot needs: with a 1 s period on a control
+    /// topic that is refreshed at 10–50 Hz, a lost link stops the robot instead of
+    /// letting the last command run forever.
+    pub fn with_watchdog(
+        subscriber: crate::pubsub::Subscriber<AgentAction>,
+        hal: H,
+        period: Duration,
+    ) -> Self {
+        Self {
+            subscriber,
+            hal,
+            watchdog: Some(period),
+            estop_latched: false,
+        }
+    }
+
+    /// The bus this bridge drives.
+    pub fn hal(&self) -> &H {
+        &self.hal
+    }
+
+    /// True while motion is refused until an `arm` arrives.
+    pub fn is_estopped(&self) -> bool {
+        self.estop_latched
+    }
+
+    /// The deadman period, if one is configured.
+    pub fn watchdog(&self) -> Option<Duration> {
+        self.watchdog
+    }
+
+    /// Wait for the next action (or for the watchdog) and act on it.
+    ///
+    /// A *refusal* is an `Ok` event, not an error: it is the safety layer doing its job.
+    /// Only a transport failure or a broken bus surfaces as `Err`.
+    pub async fn step(&mut self) -> Result<BridgeEvent> {
+        let received = match self.watchdog {
+            Some(period) => match tokio::time::timeout(period, self.subscriber.recv()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    // Deadman: no action within the period → cut torque and latch.
+                    self.hal.estop().await?;
+                    self.estop_latched = true;
+                    tracing::warn!(
+                        period_ms = period.as_millis(),
+                        "watchdog tripped: no action arrived, torque cut"
+                    );
+                    return Ok(BridgeEvent::Estopped {
+                        reason: EstopReason::Watchdog,
+                        frames: JOINTS,
+                    });
+                }
+            },
+            None => self.subscriber.recv().await?,
+        };
+        let seq = received.seq;
+
+        let command = match received.message.parse() {
+            Ok(command) => command,
+            Err(e) => {
+                // Malformed intent never reaches the bus (and never silently becomes a
+                // default pose).
+                tracing::warn!(seq, error = %e, "refusing a malformed action");
+                return Ok(BridgeEvent::Refused {
+                    seq,
+                    reason: e.to_string(),
+                });
+            }
+        };
+
+        if command.gait.is_arm() {
+            let frames = plan(&command);
+            let applied = self.hal.apply(&frames).await?;
+            let was_latched = self.estop_latched;
+            self.estop_latched = false;
+            tracing::info!(seq, was_latched, "armed: motion allowed again");
+            return Ok(BridgeEvent::Applied {
+                seq,
+                frames: applied,
+                armed: true,
+            });
+        }
+
+        if self.estop_latched && command.gait.is_motion() {
+            let reason = "e-stop latched: send {\"action\":\"arm\"} to re-arm".to_string();
+            tracing::warn!(seq, reason = %reason, "refusing motion while e-stopped");
+            return Ok(BridgeEvent::Refused { seq, reason });
+        }
+
+        let frames = plan(&command);
+        let applied = self.hal.apply(&frames).await?;
+        if command.gait.is_emergency() {
+            self.estop_latched = true;
+            tracing::warn!(seq, "commanded e-stop");
+            return Ok(BridgeEvent::Estopped {
+                reason: EstopReason::Commanded,
+                frames: applied,
+            });
+        }
+        Ok(BridgeEvent::Applied {
+            seq,
+            frames: applied,
+            armed: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joints_map_to_legs_and_parts() {
+        assert_eq!(JointId::new(0).expect("joint").leg(), 0);
+        assert_eq!(JointId::new(11).expect("joint").leg(), 3);
+        assert_eq!(JointId::new(11).expect("joint").part(), 2);
+        assert!(JointId::new(12).is_err(), "out of range");
+        assert_eq!(JointId::new(MAX_JOINT).expect("joint").index(), MAX_JOINT);
+        assert!(JointTarget::new(JointId(0), MAX_JOINT_MILLI_DEG + 1).is_err());
+        assert!(JointTarget::new(JointId(0), -MAX_JOINT_MILLI_DEG).is_ok());
+    }
+
+    #[test]
+    fn a_joint_id_is_valid_on_every_construction_path() {
+        // Refused by the constructor...
+        assert!(JointId::new(MAX_JOINT + 1).is_err());
+        assert!(JointId::new(200).is_err());
+        assert_eq!(JointId::new(3).expect("joint").index(), 3);
+        // ...by the bincode `Message` path (a `JointId` arriving as a payload)...
+        assert!(bincode::deserialize::<JointId>(&[200u8]).is_err());
+        assert_eq!(
+            bincode::deserialize::<JointId>(&[MAX_JOINT]).expect("in range"),
+            JointId(MAX_JOINT)
+        );
+        // ...and by `TryFrom<u8>` directly.
+        assert!(JointId::try_from(200u8).is_err());
+    }
+
+    #[test]
+    fn the_arithmetic_extremes_are_refused_not_overflowed() {
+        // `i32::MIN.abs()` overflows: a debug panic, and in release a negative wrap that
+        // would *pass* an `abs() > limit` test. An agent's JSON can carry it, so the check
+        // has to be a range comparison.
+        let joint = JointId(0);
+        let err = JointTarget::new(joint, i32::MIN).expect_err("i32::MIN must be refused");
+        assert!(matches!(err, LinkError::Robot(_)), "got: {err:?}");
+        assert!(JointTarget::new(joint, i32::MAX).is_err());
+        assert!(JointTarget::new(joint, -MAX_JOINT_MILLI_DEG - 1).is_err());
+        assert!(JointTarget::new(joint, MAX_JOINT_MILLI_DEG + 1).is_err());
+        assert!(JointTarget::new(joint, -MAX_JOINT_MILLI_DEG).is_ok());
+        assert!(JointTarget::new(joint, MAX_JOINT_MILLI_DEG).is_ok());
+
+        // The same extreme on a *frame* is refused by `validate`, never by `.abs()`.
+        assert!(MotorFrame::new(JointId(0), MotorOp::SetPosition, i32::MIN)
+            .validate()
+            .is_err());
+        assert!(MotorFrame::new(JointId(0), MotorOp::SetTorque, i32::MIN)
+            .validate()
+            .is_err());
+        // And the JSON path that reaches it refuses the whole action.
+        assert!(parse_command(
+            r#"{"action":"trot","targets":[{"joint":1,"milli_deg":-2147483648}]}"#
+        )
+        .is_err());
+    }
+
+    /// One bus frame assembled by hand — a valid SOF and CRC16 over arbitrary contents,
+    /// which is what a buggy or hostile producer can put on the wire.
+    fn raw_frame(joint: u8, op: u8, arg: i32) -> [u8; FRAME_LEN] {
+        let mut out = [0u8; FRAME_LEN];
+        out[0] = FRAME_SOF[0];
+        out[1] = FRAME_SOF[1];
+        out[2] = joint;
+        out[3] = op;
+        out[4..8].copy_from_slice(&arg.to_le_bytes());
+        let crc = crc16_ccitt(&out[..8]);
+        out[8..10].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_bus_frame_must_be_a_valid_set_point() {
+        // A joint that does not exist: the CRC is fine, the frame is not.
+        let err = MotorFrame::decode(&raw_frame(200, MotorOp::Enable.code(), 0))
+            .expect_err("joint 200 does not exist");
+        assert!(matches!(err, LinkError::Robot(_)), "got: {err:?}");
+
+        // A position beyond the travel limit, including the arithmetic extremes.
+        for arg in [
+            MAX_JOINT_MILLI_DEG + 1,
+            -MAX_JOINT_MILLI_DEG - 1,
+            i32::MIN,
+            i32::MAX,
+        ] {
+            assert!(
+                MotorFrame::decode(&raw_frame(3, MotorOp::SetPosition.code(), arg)).is_err(),
+                "position {arg} must be refused"
+            );
+        }
+        // A torque outside 0..=100%.
+        for arg in [-1, MAX_TORQUE_MILLI_PERCENT + 1, i32::MIN] {
+            assert!(MotorFrame::decode(&raw_frame(3, MotorOp::SetTorque.code(), arg)).is_err());
+        }
+
+        // The legal extremes still decode, so the limits are inclusive.
+        assert!(MotorFrame::decode(&raw_frame(
+            3,
+            MotorOp::SetPosition.code(),
+            -MAX_JOINT_MILLI_DEG
+        ))
+        .is_ok());
+        assert!(MotorFrame::decode(&raw_frame(
+            3,
+            MotorOp::SetTorque.code(),
+            MAX_TORQUE_MILLI_PERCENT
+        ))
+        .is_ok());
+        // A no-argument op ignores its argument (there is nothing to bound).
+        assert!(MotorFrame::decode(&raw_frame(MAX_JOINT, MotorOp::Estop.code(), i32::MIN)).is_ok());
+    }
+
+    #[test]
+    fn a_typed_frame_payload_must_be_a_valid_set_point() {
+        use crate::codec::Message;
+
+        // The bincode path (a `MotorFrame` published on the link) is validated as well:
+        // only a *decoder* can enforce it, so an invalid frame may be written but must
+        // never be readable.
+        let valid = MotorFrame::new(JointId(3), MotorOp::SetPosition, -15_000);
+        let wire = <MotorFrame as Message>::encode(&valid).expect("encode");
+        assert_eq!(
+            wire.len(),
+            9,
+            "the wire form is pinned: u8 joint + u32 op tag + i32 arg"
+        );
+        assert_eq!(
+            <MotorFrame as Message>::decode(&wire).expect("decode"),
+            valid
+        );
+
+        let bad_joint = MotorFrame {
+            joint: JointId(200),
+            op: MotorOp::Enable,
+            arg: 0,
+        };
+        let wire = <MotorFrame as Message>::encode(&bad_joint).expect("encode");
+        assert!(
+            <MotorFrame as Message>::decode(&wire).is_err(),
+            "an out-of-range joint must not decode"
+        );
+
+        let bad_arg = MotorFrame {
+            joint: JointId(3),
+            op: MotorOp::SetPosition,
+            arg: i32::MIN,
+        };
+        let wire = <MotorFrame as Message>::encode(&bad_arg).expect("encode");
+        assert!(
+            <MotorFrame as Message>::decode(&wire).is_err(),
+            "an out-of-travel set point must not decode"
+        );
+    }
+
+    #[test]
+    fn every_planned_pose_respects_the_travel_limits() {
+        // A consistency proof between the pose table and the limits: whatever a gait asks
+        // for at any speed must be a legal set point, or `plan` would build frames the bus
+        // (and now the decoder) refuses.
+        for gait in Gait::ALL {
+            for speed in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let command = RobotCommand {
+                    gait,
+                    speed,
+                    duration_ms: 0,
+                    targets: Vec::new(),
+                };
+                for frame in plan(&command) {
+                    assert!(
+                        frame.validate().is_ok(),
+                        "{gait:?} at speed {speed} produced an out-of-limit frame: {frame:?}"
+                    );
+                    // Every planned frame survives the bus round trip.
+                    assert_eq!(
+                        MotorFrame::decode(&frame.encode()).expect("decode our own frame"),
+                        frame
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mock_hal_refuses_a_batch_outside_the_limits_and_writes_nothing() {
+        let hal = MockRobotHal::new();
+        let batch = [
+            MotorFrame::new(JointId(1), MotorOp::Enable, 0),
+            MotorFrame::new(JointId(2), MotorOp::SetPosition, i32::MIN),
+        ];
+        let err = hal
+            .apply(&batch)
+            .await
+            .expect_err("the batch must be refused");
+        assert!(matches!(err, LinkError::Robot(_)), "got: {err:?}");
+        assert!(
+            hal.frames().is_empty(),
+            "a refused batch writes nothing at all — not even its valid prefix"
+        );
+        assert_eq!(hal.applied(), 0);
+        assert!(!hal.armed(), "the refused batch energized nothing");
+
+        // The same batch without the bad frame is applied in full.
+        let ok = [MotorFrame::new(JointId(1), MotorOp::Enable, 0)];
+        assert_eq!(hal.apply(&ok).await.expect("apply"), 1);
+        assert!(hal.armed());
+    }
+
+    /// A deterministic totality sweep for the bus decoder: 1 000 pseudo-random 10-byte
+    /// frames plus random single-byte mutations of a real frame must all come back as
+    /// `Err`, or decode consistently, but **never** as a panic.
+    ///
+    /// Fixed seed, no fuzzing dependency: the property reproduces forever, so a gate runs
+    /// it offline today and in a year with the same result.
+    #[test]
+    fn decoding_arbitrary_bus_bytes_never_panics() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as u32
+        };
+
+        for _ in 0..1_000 {
+            let mut bytes = [0u8; FRAME_LEN];
+            for byte in &mut bytes {
+                *byte = (next() & 0xff) as u8;
+            }
+            if let Ok(decoded) = MotorFrame::decode(&bytes) {
+                // A frame that *did* decode must re-encode to the identical bytes.
+                assert_eq!(decoded.encode(), bytes);
+            }
+        }
+
+        let valid = MotorFrame::new(JointId(5), MotorOp::SetPosition, -20_000).encode();
+        for _ in 0..500 {
+            let mut mutated = valid;
+            let index = (next() as usize) % mutated.len();
+            mutated[index] ^= 1 << (next() % 8);
+            let _ = MotorFrame::decode(&mutated);
+        }
+    }
+
+    #[test]
+    fn a_non_finite_speed_cannot_pick_a_pose() {
+        // `f32::clamp` propagates NaN and `NaN as i32` is 0 — a *straighter* stance than any
+        // legal speed produces. An unvalidated float (a `RobotCommand` built by hand, whose
+        // fields are public) must not be able to steer the pose table, so **every**
+        // non-finite speed lands on the slowest pose: an invalid request must never produce
+        // a more aggressive gait than the safe end of the range.
+        for gait in Gait::ALL {
+            let slowest = gait.pose(0.0);
+            assert_eq!(gait.pose(f32::NAN), slowest, "{gait:?} with NaN");
+            assert_eq!(gait.pose(f32::INFINITY), slowest, "{gait:?} with +inf");
+            assert_eq!(gait.pose(f32::NEG_INFINITY), slowest, "{gait:?} with -inf");
+            if gait.is_motion() {
+                assert_ne!(slowest, gait.pose(1.0), "{gait:?} speed must matter");
+            } else {
+                // Arm/estop carry no pose at all — there is nothing for speed to scale.
+                assert_eq!(slowest, [0; JOINTS], "{gait:?} carries no pose");
+            }
+            // A finite out-of-range speed clamps to an end (documented; `parse_command` is
+            // where a bad speed is actually refused).
+            assert_eq!(gait.pose(-1.0), gait.pose(0.0), "{gait:?} below range");
+            assert_eq!(gait.pose(2.0), gait.pose(1.0), "{gait:?} above range");
+        }
+    }
+
+    #[test]
+    fn the_pose_table_and_the_joint_range_are_one_thing() {
+        // The compile-time assertion in this module (`const _: () = assert!(...)`) is the
+        // gate; this is the runtime witness that the two constants really do describe one
+        // quadruped: a pose row has exactly one value per joint, and every joint index in
+        // the range is addressable.
+        for gait in Gait::ALL {
+            let pose = gait.pose(0.5);
+            assert_eq!(pose.len(), JOINTS);
+            assert_eq!(usize::from(MAX_JOINT) + 1, JOINTS);
+            assert!(JointId::new(MAX_JOINT).is_ok(), "the last joint exists");
+            assert!(JointId::new(MAX_JOINT + 1).is_err(), "and it is the last");
+        }
+    }
+
+    #[test]
+    fn gait_keys_round_trip_and_are_forgiving() {
+        for g in Gait::ALL {
+            assert_eq!(Gait::from_key(g.key()), Some(g));
+        }
+        assert_eq!(Gait::from_key("TROT"), Some(Gait::Trot));
+        assert_eq!(Gait::from_key(" e-stop "), Some(Gait::Estop));
+        assert_eq!(Gait::from_key("gallop"), None);
+        assert!(Gait::Estop.is_emergency());
+        assert!(!Gait::Stand.is_emergency());
+    }
+
+    #[test]
+    fn frames_encode_and_decode_with_a_checked_crc() {
+        let f = MotorFrame::new(JointId(3), MotorOp::SetPosition, 1500);
+        let bytes = f.encode();
+        assert_eq!(bytes.len(), FRAME_LEN);
+        assert_eq!(&bytes[..2], &FRAME_SOF);
+        assert_eq!(bytes[2], 3);
+        assert_eq!(bytes[3], MotorOp::SetPosition.code());
+        assert_eq!(MotorFrame::decode(&bytes).expect("decode"), f);
+        assert_eq!(f.encode_hex(), to_hex(&bytes));
+        assert_eq!(f.encode_hex().len(), FRAME_LEN * 2);
+
+        // A single flipped bit is caught (the point of the CRC).
+        let mut bad = bytes;
+        bad[6] ^= 0x01;
+        assert!(MotorFrame::decode(&bad).is_err());
+        // As is a foreign opcode and a wrong length.
+        let mut bad_op = bytes;
+        bad_op[3] = 0x7f;
+        let crc = crc16_ccitt(&bad_op[..8]);
+        bad_op[8..10].copy_from_slice(&crc.to_le_bytes());
+        assert!(MotorFrame::decode(&bad_op).is_err());
+        assert!(MotorFrame::decode(&bytes[..4]).is_err());
+    }
+
+    #[test]
+    fn crc16_matches_the_ccitt_known_answer() {
+        // The classic CCITT-FALSE check value for "123456789" is 0x29B1.
+        assert_eq!(crc16_ccitt(b"123456789"), 0x29B1);
+        assert_eq!(crc16_ccitt(&[]), 0xFFFF);
+    }
+
+    #[test]
+    fn agent_json_is_validated_not_trusted() {
+        let ok = parse_command(r#"{"action":"trot","speed":0.25,"duration_ms":800}"#).expect("ok");
+        assert_eq!(ok.gait, Gait::Trot);
+        assert_eq!(ok.speed, 0.25);
+        assert_eq!(ok.duration_ms, 800);
+        assert!(ok.targets.is_empty());
+
+        // Unknown fields are ignored (forward compatible), defaults applied.
+        let defaulted = parse_command(r#"{"action":"stand","mood":"happy"}"#).expect("ok");
+        assert_eq!(defaulted.speed, 0.5);
+        assert_eq!(defaulted.duration_ms, 0);
+
+        // `deg` is accepted for an agent that thinks in degrees.
+        let degs =
+            parse_command(r#"{"action":"stand","targets":[{"joint":1,"deg":-12.5}]}"#).expect("ok");
+        assert_eq!(degs.targets[0].milli_deg, -12_500);
+
+        // Refusals are named.
+        assert!(parse_command("not json").is_err());
+        assert!(parse_command(r#"{"action":"gallop"}"#).is_err());
+        assert!(parse_command(r#"{"action":"trot","speed":2}"#).is_err());
+        assert!(parse_command(r#"{"action":"trot","targets":[{"joint":99,"deg":0}]}"#).is_err());
+        assert!(parse_command(r#"{"action":"trot","targets":[{"joint":1}]}"#).is_err());
+        assert!(parse_command(r#"{"action":"trot","targets":[{"joint":1,"deg":200}]}"#).is_err());
+
+        // The halt path is never refused for a cosmetic reason.
+        let stop = parse_command(r#"{"action":"estop","speed":9}"#).expect("estop wins");
+        assert_eq!(stop.gait, Gait::Estop);
+        assert!(stop.targets.is_empty());
+    }
+
+    #[test]
+    fn planning_produces_an_enable_then_one_frame_per_joint() {
+        let cmd = parse_command(r#"{"action":"trot","speed":0.5}"#).expect("cmd");
+        let frames = plan(&cmd);
+        assert_eq!(frames.len(), JOINTS + 1);
+        assert_eq!(frames[0].op, MotorOp::Enable);
+        assert_eq!(frames[1].joint, JointId(0));
+        assert_eq!(frames[1].op, MotorOp::SetPosition);
+        assert_eq!(frames[JOINTS].joint, JointId(MAX_JOINT));
+        // Every joint is addressed exactly once by a position frame.
+        let mut positions: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.op == MotorOp::SetPosition)
+            .map(|f| f.joint.0)
+            .collect();
+        positions.sort_unstable();
+        assert_eq!(positions, (0..=MAX_JOINT).collect::<Vec<u8>>());
+
+        // A faster gait moves the knees further than a slow one.
+        let slow = Gait::Trot.pose(0.0);
+        let fast = Gait::Trot.pose(1.0);
+        assert!(fast[2].abs() > slow[2].abs());
+
+        // An explicit target overrides the pose for that joint only.
+        let overridden =
+            parse_command(r#"{"action":"trot","targets":[{"joint":5,"milli_deg":1234}]}"#)
+                .expect("cmd");
+        let frames = plan(&overridden);
+        assert_eq!(frames[6].arg, 1234, "joint 5 is the 6th position frame");
+        assert_ne!(frames[7].arg, 1234, "the other joints keep the pose");
+
+        // Estop is a torque cut on every joint, never a pose.
+        let stop = plan(&parse_command(r#"{"action":"estop"}"#).expect("cmd"));
+        assert_eq!(stop.len(), JOINTS);
+        assert!(stop.iter().all(|f| f.op == MotorOp::Estop));
+    }
+
+    #[tokio::test]
+    async fn the_mock_hal_records_drives_and_halts() {
+        let hal = MockRobotHal::new();
+        assert_eq!(hal.name(), "mock");
+        assert!(!hal.armed());
+
+        let cmd = parse_command(r#"{"action":"trot","speed":1.0}"#).expect("cmd");
+        let frames = plan(&cmd);
+        assert_eq!(hal.apply(&frames).await.expect("apply"), frames.len());
+        assert_eq!(hal.applied() as usize, frames.len());
+        assert!(hal.armed(), "Enable energizes the drivers");
+        assert_eq!(hal.frames().len(), frames.len());
+        assert_eq!(hal.hex_log().len(), frames.len());
+
+        // The e-stop path cuts torque on every joint and disarms.
+        hal.estop().await.expect("estop");
+        assert!(!hal.armed());
+        // An e-stop frame per joint, and no `Enable` (it must never re-arm).
+        assert_eq!(hal.frames().len(), frames.len() + JOINTS);
+        assert_eq!(hal.frames().last().expect("frame").op, MotorOp::Estop);
+
+        // `clear` forgets the log but not the counters.
+        let before = hal.applied();
+        hal.clear();
+        assert!(hal.frames().is_empty());
+        assert_eq!(hal.applied(), before);
+    }
+
+    #[tokio::test]
+    async fn execute_translates_an_agent_action_onto_the_bus() {
+        let hal = MockRobotHal::new();
+        let action = AgentAction::new(r#"{"action":"walk","speed":0.3}"#);
+        let sent = execute(&hal, &action).await.expect("execute");
+        assert_eq!(sent.len(), JOINTS + 1);
+        assert_eq!(action.parse().expect("parse").gait, Gait::Walk);
+
+        // A refusal never touches the bus.
+        let before = hal.applied();
+        let bad = AgentAction::new(r#"{"action":"teleport"}"#);
+        assert!(execute(&hal, &bad).await.is_err());
+        assert_eq!(hal.applied(), before, "no frame was sent for a bad action");
+    }
+
+    #[tokio::test]
+    async fn the_bridge_drives_the_bus_from_the_control_channel() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::{Channel, Topic};
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let subscriber = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let mut bridge = RobotBridge::new(subscriber, MockRobotHal::new());
+        assert_eq!(bridge.hal().name(), "mock");
+
+        let publisher = node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        );
+        publisher
+            .publish(&AgentAction::new(r#"{"action":"sit","speed":0.4}"#))
+            .await
+            .expect("publish");
+
+        let got = bridge.step().await.expect("step");
+        assert_eq!(
+            got,
+            BridgeEvent::Applied {
+                seq: 1,
+                frames: JOINTS + 1,
+                armed: true
+            }
+        );
+        assert!(!bridge.is_estopped());
+        assert_eq!(bridge.watchdog(), None);
+        assert_eq!(bridge.hal().frames().len(), JOINTS + 1);
+        assert!(bridge.hal().armed());
+    }
+
+    /// The deadman: silence longer than the watchdog period cuts torque by itself.
+    #[tokio::test]
+    async fn the_watchdog_stops_a_robot_whose_link_went_quiet() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::{Channel, Topic};
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let subscriber = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let mut bridge =
+            RobotBridge::with_watchdog(subscriber, MockRobotHal::new(), Duration::from_millis(50));
+        assert_eq!(bridge.watchdog(), Some(Duration::from_millis(50)));
+
+        let commander = node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        );
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot","speed":0.5}"#))
+            .await
+            .expect("publish");
+        assert_eq!(
+            bridge.step().await.expect("step"),
+            BridgeEvent::Applied {
+                seq: 1,
+                frames: JOINTS + 1,
+                armed: true
+            }
+        );
+        assert!(bridge.hal().armed());
+
+        // ...and then the link goes quiet: the next step trips the deadman.
+        let frames_before = bridge.hal().frames().len();
+        assert_eq!(
+            bridge.step().await.expect("watchdog"),
+            BridgeEvent::Estopped {
+                reason: EstopReason::Watchdog,
+                frames: JOINTS
+            }
+        );
+        assert!(!bridge.hal().armed(), "the watchdog cut torque");
+        assert!(
+            bridge.is_estopped(),
+            "a watchdog stop latches like any other"
+        );
+        assert_eq!(
+            bridge.hal().frames().len(),
+            frames_before + JOINTS,
+            "one e-stop frame per joint reached the bus"
+        );
+
+        // A motion command that arrives *after* the trip is still refused.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot"}"#))
+            .await
+            .expect("publish");
+        assert!(matches!(
+            bridge.step().await.expect("step"),
+            BridgeEvent::Refused { .. }
+        ));
+        // ...and `arm` puts it back in service.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"rearm"}"#))
+            .await
+            .expect("publish arm");
+        assert_eq!(
+            bridge.step().await.expect("arm"),
+            BridgeEvent::Applied {
+                seq: 3,
+                frames: JOINTS,
+                armed: true
+            }
+        );
+        assert!(!bridge.is_estopped());
+    }
+
+    /// A malformed action is *refused*, not an error, and never reaches the bus.
+    #[tokio::test]
+    async fn a_malformed_action_is_refused_without_touching_the_bus() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::{Channel, Topic};
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let subscriber = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let mut bridge = RobotBridge::new(subscriber, MockRobotHal::new());
+        let commander = node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        );
+        commander
+            .publish(&AgentAction::new("this is not json"))
+            .await
+            .expect("publish");
+        match bridge.step().await.expect("step") {
+            BridgeEvent::Refused { reason, .. } => assert!(reason.contains("JSON"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(bridge.hal().applied(), 0, "nothing reached the bus");
+        assert!(!bridge.is_estopped(), "a typo is not an e-stop");
+    }
+
+    #[test]
+    fn arm_energizes_every_joint_without_commanding_motion() {
+        let cmd = parse_command(r#"{"action":"arm"}"#).expect("arm");
+        assert!(cmd.gait.is_arm());
+        assert!(!cmd.gait.is_motion(), "arm is not a motion gait");
+        assert_eq!(cmd.targets.len(), 0, "targets are dropped on arm");
+        let frames = plan(&cmd);
+        assert_eq!(frames.len(), JOINTS);
+        assert!(frames.iter().all(|f| f.op == MotorOp::Enable));
+        assert!(
+            !frames.iter().any(|f| f.op == MotorOp::SetPosition),
+            "arming must not command a pose"
+        );
+        // Aliases an agent might emit.
+        assert_eq!(Gait::from_key("re-arm"), Some(Gait::Arm));
+        assert_eq!(Gait::from_key("enable"), Some(Gait::Arm));
+        assert_eq!(Gait::Arm.key(), "arm");
+        assert_eq!(EstopReason::Commanded.key(), "commanded");
+        assert_eq!(EstopReason::Watchdog.key(), "watchdog");
+    }
+}

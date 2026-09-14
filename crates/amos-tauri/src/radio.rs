@@ -767,7 +767,11 @@ mod tests {
         assert_eq!(refusal.radio.as_deref(), Some("wifi"));
         assert_eq!(refusal.surface.as_deref(), Some("wifi_panel"));
         assert_eq!(refusal.reason.as_deref(), Some("switch_removed"));
-        assert!(refusal.detail.contains("wifi_panel"), "{:?}", refusal.detail);
+        assert!(
+            refusal.detail.contains("wifi_panel"),
+            "{:?}",
+            refusal.detail
+        );
         let state = p.state.expect("the read answer must survive the bridge");
         assert!(state.wifi && state.bluetooth);
     }

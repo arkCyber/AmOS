@@ -123,48 +123,37 @@ impl HostFsScanner {
             });
         }
         let mut out = HostScan::default();
-        self.walk(&self.root, 0, false, false, &mut out)?;
+        self.walk(&mut out)?;
         Ok(out)
     }
 
-    fn walk(
-        &self,
-        dir: &Path,
-        depth: usize,
-        in_cache: bool,
-        in_thumbs: bool,
-        out: &mut HostScan,
-    ) -> Result<()> {
-        if depth > MAX_SCAN_DEPTH {
-            return Ok(());
+    /// Walk the root into `out` — **iteratively**, with an explicit frame stack.
+    ///
+    /// This was the workspace's last recursive function (NASA Power of 10 rule 1 forbids
+    /// recursion, and `scripts/rust-recursion-scan.mjs` gates it). The conversion is
+    /// behaviour-preserving on both counts that matter here:
+    ///
+    /// * **Visit order** is unchanged — children are expanded in `read_dir` order and a
+    ///   subdirectory is fully walked before its next sibling (pre-order DFS), because
+    ///   exceeding [`MAX_JUNK_ITEMS`] is an *error*, so which item trips the cap is part of
+    ///   the contract;
+    /// * **Memory shape** is unchanged — one [`Frame`] per *active* level, exactly what the
+    ///   call stack held, so a wide tree does not turn into a wide frontier. The depth is
+    ///   still capped by [`MAX_SCAN_DEPTH`], which is what made the old recursion bounded.
+    fn walk(&self, out: &mut HostScan) -> Result<()> {
+        let mut stack: Vec<Frame> = Vec::new();
+        if let Some(root) = Frame::open(&self.root, 0, false, false, out)? {
+            stack.push(root);
         }
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => {
-                out.unreadable_dirs += 1;
-                return Ok(());
+        while let Some(frame) = stack.last_mut() {
+            if frame.next >= frame.children.len() {
+                stack.pop(); // this level is done: back to the parent
+                continue;
             }
-        };
+            let child = frame.children[frame.next].clone();
+            frame.next += 1;
+            let (depth, in_cache, in_thumbs) = (frame.depth, frame.in_cache, frame.in_thumbs);
 
-        let mut children: Vec<PathBuf> = Vec::new();
-        for entry in entries {
-            match entry {
-                Ok(e) => children.push(e.path()),
-                Err(_) => out.unreadable_dirs += 1,
-            }
-        }
-
-        // An empty directory is left-over junk — but never the root itself.
-        if children.is_empty() {
-            if depth > 0 {
-                if let Some(uri) = path_string(dir) {
-                    push(out, JunkItem::new(uri, JunkKind::EmptyDir, 0))?;
-                }
-            }
-            return Ok(());
-        }
-
-        for child in children {
             // `symlink_metadata` does not follow links: a symlink reports neither
             // `is_dir` nor `is_file`, so it is skipped and can never be used to
             // walk outside the root.
@@ -180,7 +169,11 @@ impl HostFsScanner {
                 let name = file_name_lower(&child);
                 let child_cache = in_cache || CACHE_DIRS.contains(&name.as_str());
                 let child_thumbs = in_thumbs || THUMB_DIRS.contains(&name.as_str());
-                self.walk(&child, depth + 1, child_cache, child_thumbs, out)?;
+                if let Some(child_frame) =
+                    Frame::open(&child, depth + 1, child_cache, child_thumbs, out)?
+                {
+                    stack.push(child_frame);
+                }
                 continue;
             }
             if !meta.is_file() {
@@ -201,6 +194,76 @@ impl HostFsScanner {
             }
         }
         Ok(())
+    }
+}
+
+/// One level of an in-progress walk: a directory's children plus the cursor into them.
+///
+/// The explicit replacement for a recursive call frame (see [`HostFsWalk::walk`]): it holds
+/// exactly what one level needed — the entries, how far we got, the depth and the inherited
+/// cache/thumb flags — so a deep tree costs one frame per active level, never more.
+struct Frame {
+    children: Vec<PathBuf>,
+    next: usize,
+    depth: usize,
+    in_cache: bool,
+    in_thumbs: bool,
+}
+
+impl Frame {
+    /// Open one level: refuse an over-deep directory, count an unreadable one, record an
+    /// empty one as junk (unless it is the root) — and otherwise hand back a frame whose
+    /// children still need visiting. `None` means "nothing to descend into".
+    fn open(
+        dir: &Path,
+        depth: usize,
+        in_cache: bool,
+        in_thumbs: bool,
+        out: &mut HostScan,
+    ) -> Result<Option<Frame>> {
+        if depth > MAX_SCAN_DEPTH {
+            return Ok(None);
+        }
+        let children = match fs::read_dir(dir) {
+            Ok(entries) => {
+                let mut children: Vec<PathBuf> = Vec::new();
+                for entry in entries {
+                    match entry {
+                        Ok(e) => children.push(e.path()),
+                        Err(_) => out.unreadable_dirs += 1,
+                    }
+                }
+                // Sorted, so a scan is **reproducible**: `read_dir` order is unspecified and
+                // filesystem-dependent, and the order decides which item trips
+                // [`MAX_JUNK_ITEMS`] (an error, not a truncation) — a refusal that names a
+                // different item on every machine is not a diagnosable refusal. Sorting also
+                // makes the walk's visit order testable, which is how this iterative form
+                // was checked against the recursive one.
+                children.sort();
+                children
+            }
+            Err(_) => {
+                out.unreadable_dirs += 1;
+                return Ok(None);
+            }
+        };
+
+        // An empty directory is left-over junk — but never the root itself.
+        if children.is_empty() {
+            if depth > 0 {
+                if let Some(uri) = path_string(dir) {
+                    push(out, JunkItem::new(uri, JunkKind::EmptyDir, 0))?;
+                }
+            }
+            return Ok(None);
+        }
+        Ok(Some(Frame {
+            children,
+            next: 0,
+            depth,
+            in_cache,
+            in_thumbs,
+        }))
     }
 }
 
@@ -359,6 +422,40 @@ mod tests {
         ks.sort();
         ks.dedup();
         ks
+    }
+
+    #[test]
+    fn the_walk_visits_in_a_reproducible_pre_order() {
+        // The walk is iterative now (`Frame` stack) and its visit order is part of the
+        // contract: `MAX_JUNK_ITEMS` overflow is an *error*, so which item is seen last is
+        // observable. Children are sorted, so the order is the same on every filesystem —
+        // and this pins the pre-order DFS the recursive form had:
+        //
+        //   root/a/z.log     (descend into `a` first: it sorts before `b.log`)
+        //   root/b.log       (then the sibling file)
+        //   root/c           (then the empty directory, visited when it is opened)
+        let t = TempRoot::new();
+        t.file("a/z.log", 10);
+        t.file("b.log", 20);
+        t.dir("c");
+        // A user photo, to prove the order test is not just seeing everything.
+        t.file("holiday.jpg", 5);
+
+        let scan = HostFsScanner::new(t.path()).scan().expect("scan");
+        let seen: Vec<&str> = scan.items.iter().map(|i| i.uri.as_str()).collect();
+        let expected: Vec<String> = ["a/z.log", "b.log", "c"]
+            .iter()
+            .map(|rel| t.path().join(rel).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "pre-order DFS, lexicographic among siblings"
+        );
+        assert_eq!(
+            scan.items.last().expect("an item").kind,
+            JunkKind::EmptyDir,
+            "the empty directory is last (it is recorded when its level opens)"
+        );
     }
 
     #[test]

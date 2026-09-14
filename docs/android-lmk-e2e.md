@@ -37,11 +37,12 @@ beat 只回收 `Background`/`Cached`。要在 GUI 里目视“表面消失”，
 
 | # | 操作 | 预期（判定） |
 |---|---|---|
-| G1 | Launcher「安卓应用」页点“微信”启动 | 出现 `legacy:<window_id>` 表面；`wm_windows`/调试卡含该 external System 窗口 |
+| G1 | Launcher「安卓应用」页点“微信”启动 | 出现 `legacy:<window_id>` 表面；设置 →「窗口与形态」→「窗口管理器 (调试)」卡片含该 external System 窗口（`legacy:<id> [System] … · 外部表面`） |
 | G2 | 用 debug 入口把该 app 背景化（OnActivity Stop） | 其 host 状态变 `Background`；`Governor::GetState` 可见 |
 | G3 | 触发 `TriggerLmk(Critical)`（或 `AMOS_GOVERNOR_MEMORY_PRESSURE=1` 下等下一 beat） | daemon 日志：`force-stopped app: com.tencent.mm` + `WatchLmk` 广播 `RECLAIMED`；容器内 `am force-stop` 下发 |
-| G4 | 观察 System UI | **`legacy:<window_id>` 表面被拆除**（`wm_windows` 不再含它；窗口从多窗口/前台消失）——事件路径（`lmk-surface` → `wm_close`）与对账兜底（启动+30s 周期）二者都消除它 |
+| G4 | 观察 System UI（设置 →「窗口与形态」→「窗口管理器 (调试)」卡片，或点其「刷新」） | **`legacy:<window_id>` 表面被拆除**（卡片不再含它；窗口从多窗口/前台消失）——事件路径（`lmk-surface` → `wm_close`）与对账兜底（启动+30s 周期）二者都消除它 |
 | G5 | 杀掉 daemon，重启后重启 System UI | 启动即 reconcile：若之前有残留 stale `legacy` 表面，数秒内被对账清除（验证 `startPeriodicReconcile` 的启动即跑） |
+| G6 | G4 之后**再次**在「安卓应用」页点「微信」 | 该 APK **重新**被注册为一个 `legacy:<window_id>` 外部表面（新 id、调试卡里 `Shown`/`Focused`，`window_id` 可与上次不同）——REQ-A227：拆除必须把 `label ⇄ id` 一起清掉，否则重开会静默短路进一个已死的 id（**修复前这里会"什么都没发生"**） |
 
 ### 端到端失败排查
 - G2/G3 无事件：确认 daemon 是**带 host 装配**的新版（`server.rs` 用 `with_parts_and_events`）；

@@ -44,17 +44,18 @@ describe("cellular prefs", () => {
 });
 
 describe("focus prefs", () => {
-  test("exposes the three scenarios and an all-off default", () => {
-    expect(FOCUS_SCENARIOS).toEqual(["dnd", "work", "sleep"]);
-    expect(defaultFocus()).toEqual({ dnd: false, work: false, sleep: false });
+  test("exposes the two intent scenarios and an all-off default (DND is NOT an intent — it is the quick-settings bit)", () => {
+    expect(FOCUS_SCENARIOS).toEqual(["work", "sleep"]);
+    expect(defaultFocus()).toEqual({ work: false, sleep: false });
   });
 
-  test("normalize keeps only known scenario booleans (default off)", () => {
-    expect(normalizeFocus(null)).toEqual({ dnd: false, work: false, sleep: false });
-    expect(normalizeFocus({ work: true })).toEqual({ dnd: false, work: true, sleep: false });
-    // unknown keys / non-booleans are dropped
-    expect(normalizeFocus({ dnd: "yes", sleep: true, extra: true })).toEqual({
-      dnd: false,
+  test("normalize keeps only intent booleans; the legacy decorative dnd field is dropped, never converted", () => {
+    expect(normalizeFocus(null)).toEqual({ work: false, sleep: false });
+    expect(normalizeFocus({ work: true })).toEqual({ work: true, sleep: false });
+    // REQ-A206: a pre-fix store's `dnd` field never had any effect, so it is
+    // dropped on read (byte-identical behaviour) — NOT auto-applied as real DND
+    // (that would newly silence a device on upgrade).
+    expect(normalizeFocus({ dnd: true, sleep: true, extra: 1 })).toEqual({
       work: false,
       sleep: true,
     });
@@ -63,8 +64,8 @@ describe("focus prefs", () => {
   test("toggleFocus is immutable and flips one scenario", () => {
     const base = defaultFocus();
     const next = toggleFocus(base, "work");
-    expect(base).toEqual({ dnd: false, work: false, sleep: false }); // untouched
-    expect(next).toEqual({ dnd: false, work: true, sleep: false });
+    expect(base).toEqual({ work: false, sleep: false }); // untouched
+    expect(next).toEqual({ work: true, sleep: false });
     expect(toggleFocus(next, "work")).toEqual(defaultFocus()); // can toggle back off
   });
 });

@@ -6,6 +6,7 @@ import {
   layoutSurfaces,
   LAYOUT_CHANGED_EVENT,
   normalizeLayout,
+  normalizeWindows,
   onLayoutChanged,
   paneCss,
   paneFor,
@@ -20,6 +21,7 @@ import {
   wmSplitDemo,
   type LayoutSnapshot,
 } from "../lib/wm";
+import { clearDiag, recentDiag } from "../lib/debugLog";
 
 type Call = { command: string; args?: Record<string, unknown> };
 type Listener = (e: { payload: unknown }) => void;
@@ -42,6 +44,11 @@ const splitSnap: LayoutSnapshot = {
     ],
   },
   candidates: ["maps", "notes"],
+  form: "desktop",
+  columns: 3,
+  multi_window: true,
+  free_resize: true,
+  divider_gap: 8,
 };
 
 const fullScreenSnap: LayoutSnapshot = {
@@ -49,6 +56,11 @@ const fullScreenSnap: LayoutSnapshot = {
   screen_h: 1920,
   split: null,
   candidates: [],
+  form: "phone",
+  columns: 1,
+  multi_window: false,
+  free_resize: false,
+  divider_gap: 8,
 };
 
 function setWindow(obj: unknown) {
@@ -108,6 +120,25 @@ describe("wm command wrappers", () => {
   test("returns null when not running inside Tauri", async () => {
     setWindow(null);
     expect(await wmLayoutSnapshot()).toBeNull();
+  });
+
+  test("a command that fails resolves to null and reaches the diagnostics ledger", async () => {
+    // REQ-A220: the bridge used to await `__TAURI_INTERNALS__.invoke` itself, so a
+    // Rust `Err` **rejected** the promise — an unhandled rejection in every
+    // consumer that did not hand-roll a `.catch`, and a failure the UI's ledger
+    // never saw. It now delegates to `lib/backend.ts`'s `invoke`.
+    clearDiag();
+    setWindow({
+      __TAURI_INTERNALS__: {
+        invoke: async () => {
+          throw new Error("split geometry is not available");
+        },
+        listen: async () => () => {},
+      },
+    });
+    await expect(wmLayoutSnapshot()).resolves.toBeNull();
+    const logged = recentDiag(20).find((e) => `${e.msg}`.includes("wm_layout_snapshot"));
+    expect(logged, "the failure is retrievable, not swallowed").toBeTruthy();
   });
 
   test("onLayoutChanged subscribes, normalizes host broadcasts, unsubscribes", async () => {
@@ -181,6 +212,62 @@ describe("normalizeLayout", () => {
     const s = normalizeLayout({ screen_w: NaN, screen_h: "x", split: { percent: -5 } });
     expect(s.screen_w).toBe(0);
     expect(s.split?.percent).toBe(50);
+  });
+
+  test("the mirrored key set is exactly the Rust wire shape", () => {
+    // Pinned on the Rust side by `the_layout_snapshot_wire_shape_is_pinned`
+    // (crates/amos-tauri/src/wm.rs): a renamed Rust field must fail there, and a
+    // field forgotten here must fail here. Both lists are the contract documented
+    // in docs/multi-window.md §1.5 — `tauri-reply-scan.mjs` cannot see this pair
+    // (the wrapper passes a *variable* command to `invoke`), so these two tests are
+    // what keeps the mirror honest.
+    expect(Object.keys(normalizeLayout({})).sort()).toEqual([
+      "candidates",
+      "columns",
+      "divider_gap",
+      "form",
+      "free_resize",
+      "multi_window",
+      "screen_h",
+      "screen_w",
+      "split",
+    ]);
+  });
+
+  test("an unreadable snapshot degrades to the most restrictive class", () => {
+    // A capability must never be *gained* from a malformed payload: an absent or
+    // bogus class/column count reads as phone / one column / no extra windows.
+    const s = normalizeLayout({
+      form: "wat",
+      columns: 99,
+      multi_window: "yes",
+      free_resize: 1,
+      divider_gap: -3,
+    });
+    expect(s.form).toBe("phone");
+    expect(s.columns).toBe(1);
+    expect(s.multi_window).toBe(false);
+    expect(s.free_resize).toBe(false);
+    expect(s.divider_gap).toBe(8);
+  });
+
+  test("carries a well-formed class and its capabilities through", () => {
+    const s = normalizeLayout({
+      form: "tablet",
+      columns: 2,
+      multi_window: true,
+      free_resize: false,
+      divider_gap: 12,
+    });
+    expect(s.form).toBe("tablet");
+    expect(s.columns).toBe(2);
+    expect(s.multi_window).toBe(true);
+    expect(s.free_resize).toBe(false);
+    expect(s.divider_gap).toBe(12);
+    // Every class the host can send is accepted verbatim.
+    for (const form of ["phone", "tablet", "desktop", "robot"] as const) {
+      expect(normalizeLayout({ form }).form).toBe(form);
+    }
   });
 });
 
@@ -259,5 +346,60 @@ describe("pure split helpers (render the split)", () => {
     expect(describeSplit(splitSnap.split)).toContain("notes ⇆ maps");
     expect(describeSplit(splitSnap.split)).toContain("vertical @ 40%");
     expect(describeSplit(null)).toBe("fullscreen");
+  });
+});
+
+describe("normalizeWindows (the wm_windows payload)", () => {
+  test("keeps the host's own words verbatim", () => {
+    const view = normalizeWindows({
+      focused: 7,
+      windows: [
+        { id: 7, label: "main", kind: "Launcher", state: "Shown", focused: false, external: false },
+        {
+          id: 9,
+          label: "legacy:waydroid_0",
+          kind: "System",
+          state: "Focused",
+          focused: true,
+          external: true,
+        },
+      ],
+    });
+    expect(view.focused).toBe(7);
+    expect(view.windows.map((w) => w.label)).toEqual(["main", "legacy:waydroid_0"]);
+    expect(view.windows[1]).toEqual({
+      id: 9,
+      label: "legacy:waydroid_0",
+      kind: "System",
+      state: "Focused",
+      focused: true,
+      external: true,
+    });
+  });
+
+  test("drops a window without a usable label instead of inventing one", () => {
+    // An unnamed record cannot be addressed by any command, so showing it would
+    // only advertise something the shell can never act on.
+    const view = normalizeWindows({
+      windows: [{ label: "" }, { label: 42 }, null, {}, { label: "notes" }],
+    });
+    expect(view.windows.map((w) => w.label)).toEqual(["notes"]);
+  });
+
+  test("a malformed payload degrades to the conservative view, never a throw", () => {
+    for (const raw of [null, undefined, 7, "windows", [], { windows: "nope" }, { windows: {} }]) {
+      const view = normalizeWindows(raw);
+      expect(view.focused, `${JSON.stringify(raw)} has no focused window`).toBeNull();
+      expect(view.windows, `${JSON.stringify(raw)} has no windows`).toEqual([]);
+    }
+    // Present-but-garbage fields fall back per field (kind/state/focused/external).
+    expect(
+      normalizeWindows({ focused: Number.NaN, windows: [{ label: "app-1", kind: "", focused: 1 }] }),
+    ).toEqual({
+      focused: null,
+      windows: [
+        { id: 0, label: "app-1", kind: "Unknown", state: "", focused: false, external: false },
+      ],
+    });
   });
 });

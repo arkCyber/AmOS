@@ -21,6 +21,7 @@
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import {
     SETTINGS_KEY,
+    dndActive,
     flipRadio,
     normalizeQuick,
     type QuickSettings,
@@ -56,6 +57,7 @@
   import CellularPage from "./settings/CellularPage.svelte";
   import HotspotPage from "./settings/HotspotPage.svelte";
   import FocusPage from "./settings/FocusPage.svelte";
+  import WindowPage from "./settings/WindowPage.svelte";
 
   type Sub =
     | "account"
@@ -76,7 +78,8 @@
     | "spy"
     | "guard"
     | "about"
-    | "diagnostics";
+    | "diagnostics"
+    | "window";
   type Page = "index" | Sub;
 
   const PAGE_KEY: Record<Sub, string> = {
@@ -99,6 +102,7 @@
     guard: "settings.guard",
     about: "settings.about",
     diagnostics: "settings.diagnostics",
+    window: "settings.window",
   };
 
   /**
@@ -114,7 +118,7 @@
     hotspot: ["hotspot", "tether", "tethering", "share", "ap", "个人热点", "热点", "网络共享", "共享"],
     notifications: ["alert", "badge", "提醒", "角标", "横幅", "勿扰", "banner"],
     sound: ["ringtone", "volume", "铃声", "音量", "静音", "mute"],
-    focus: ["勿扰", "dnd", "sleep", "driving", "睡眠", "驾驶", "专注"],
+    focus: ["勿扰", "dnd", "sleep", "睡眠", "专注"],
     display: ["brightness", "dark", "亮度", "深色", "浅色"],
     wallpaper: ["background", "背景", "图片"],
     language: ["简体", "中文", "english", "语言"],
@@ -127,6 +131,7 @@
     guard: ["firewall", "netfilter", "block", "网闸", "防火墙", "阻断", "回传"],
     about: ["version", "battery", "device", "版本", "电量", "设备", "storage"],
     diagnostics: ["monitor", "debug", "lmk", "监控", "进程", "开发者", "developer"],
+    window: ["form factor", "tablet", "desktop", "split", "columns", "形态", "平板", "桌面", "分屏", "列", "分栏", "窗口"],
   };
 
   let page = $state<Page>("index");
@@ -264,7 +269,6 @@
   let cloudOn = $state<boolean>(readCloud(readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {})).enabled);
   let focusOn = $state<FocusPrefs>(normalizeFocus(readStoreValue<unknown>(FOCUS_KEY, {})));
   const FOCUS_LABEL: Record<keyof FocusPrefs, string> = {
-    dnd: "settings.focusDnd",
     work: "settings.focusWork",
     sleep: "settings.focusSleep",
   };
@@ -273,13 +277,21 @@
   /** Live subtitle for the 输入法 row (on/off, re-read on返回 via `syncAux`). */
   let imeOn = $state(readImeEnabled());
   const imeSub = $derived(imeOn ? t("settings.imeOn") : t("settings.imeOff"));
+  // REQ-A206: the subtitle lists the REAL DND bit (qs.dnd — what the shell honours)
+  // first, then the saved intent scenarios. The old subtitle read the decorative
+  // amos.focus.dnd field, so it could claim 勿扰 was on while nothing was muted.
   const focusSub = $derived.by(() => {
-    const on = FOCUS_SCENARIOS.filter((id) => focusOn[id]).map((id) => t(FOCUS_LABEL[id]));
-    return on.length > 0 ? on.join("、") : t("settings.off");
+    const parts: string[] = [];
+    if (dndActive(qs)) parts.push(t("settings.focusDnd"));
+    for (const id of FOCUS_SCENARIOS) if (focusOn[id]) parts.push(t(FOCUS_LABEL[id]));
+    return parts.length > 0 ? parts.join("、") : t("settings.off");
   });
   const syncAux = () => {
     cloudOn = readCloud(readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {})).enabled;
     focusOn = normalizeFocus(readStoreValue<unknown>(FOCUS_KEY, {}));
+    // The 专注模式 page now writes the quick-settings DND bit (REQ-A206): re-read
+    // quick settings too, so the focus subtitle reflects what was just chosen.
+    qs = readQuick();
     // The IME's switch lives on its own sub page: re-read it when coming back so
     // the row's subtitle shows what the user just chose.
     imeOn = readImeEnabled();
@@ -321,9 +333,10 @@
       { kind: "nav", page: "spy", key: "settings.spy" },
       { kind: "nav", page: "guard", key: "settings.guard" },
     ],
-    // 系统：关于本机 / 系统监控与开发者
+    // 系统：关于本机 / 窗口与形态 / 系统监控与开发者
     [
       { kind: "nav", page: "about", key: "settings.about", sub: () => aboutSub },
+      { kind: "nav", page: "window", key: "settings.window" },
       { kind: "nav", page: "diagnostics", key: "settings.diagnostics" },
     ],
   ];
@@ -490,6 +503,8 @@
         <SoundPage />
       {:else if page === "about"}
         <AboutPage />
+      {:else if page === "window"}
+        <WindowPage />
       {/if}
     </div>
   {/if}

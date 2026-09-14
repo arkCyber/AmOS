@@ -27,6 +27,11 @@
   import { createStoreValue } from "./store";
   import type { StoreTile } from "../lib/storeApps";
   import { propsChannel } from "./propsBus";
+  import {
+    pageCapacity,
+    PHONE_GRID,
+    type HomeGrid,
+  } from "../lib/formLayout";
   import AppIcon from "./AppIcon.svelte";
   import { fmtClock } from "../lib/time";
   import { forecast } from "../lib/weather";
@@ -37,6 +42,13 @@
     layout: HomeLayout;
     ext: StoreTile[];
     pulseId: string | null;
+    /**
+     * Home-screen grid geometry, decided by the shell from the host's **class**
+     * (`lib/formLayout`). Optional on purpose: a channel payload that predates the
+     * field (or a preview build with no host) degrades to the phone grid — the same
+     * "never gain a capability from a missing payload" rule `lib/wm.ts` follows.
+     */
+    grid?: HomeGrid;
   }
   const home = propsChannel<HomeProps>("home");
 
@@ -53,6 +65,8 @@
   const layout = $derived(incoming?.layout ?? EMPTY_LAYOUT);
   const ext = $derived(incoming?.ext ?? []);
   const pulseId = $derived(incoming?.pulseId ?? null);
+  /** Icon-grid geometry for this device class (phone 4×3 unless the shell says otherwise). */
+  const grid = $derived(incoming?.grid ?? PHONE_GRID);
 
   // ---- Reactive notifications + Do-Not-Disturb (live, cross-window) ----
   const notifStore = createStoreValue<Notif[]>(NOTIF_KEY, []);
@@ -98,13 +112,14 @@
   const pageIds = $derived(layout.page.filter(known));
   const dockIds = $derived(layout.dock.filter(known));
 
-  function buildPages(ids: string[]): string[][] {
+  function buildPages(ids: string[], per: number): string[][] {
     const pages: string[][] = [];
-    const per = 12; // 4 cols x 3 rows
     for (let i = 0; i < ids.length; i += per) pages.push(ids.slice(i, i + per));
     return pages;
   }
-  const gridPages = $derived(buildPages(pageIds));
+  // `per` is the **class's** page capacity (phone 12 = 4×3 unchanged; tablet 24),
+  // so a tablet pages its home screen at iPadOS's density instead of the phone's.
+  const gridPages = $derived(buildPages(pageIds, pageCapacity(grid)));
   let gridPage = $state(0);
   const lastIndex = $derived(Math.max(0, gridPages.length - 1));
   const safePage = $derived(gridPage > lastIndex ? lastIndex : gridPage);
@@ -341,7 +356,18 @@
     <!-- paged icon grid: vertically centered in the space above the paging/search
          rows (dock is pinned at the bottom of the column). -->
     <div class="flex min-h-0 flex-1 flex-col justify-center">
-      <div class="grid grid-cols-4 place-content-center place-items-center gap-y-6" data-testid="home-grid">
+      <!-- Grid geometry is the device class's (`lib/formLayout`): the phone keeps the
+           historical 4×3, a tablet gets iPadOS's 4×6 portrait / 6×4 landscape. The
+           column count is an **inline style**, not a `grid-cols-N` class, because
+           Tailwind purges class names it cannot see statically; `grid-cols-4` stays
+           as the static fallback so the layout is sane even without the style. -->
+      <div
+        class="grid grid-cols-4 place-content-center place-items-center gap-y-6"
+        style="grid-template-columns: repeat({grid.cols}, minmax(0, 1fr))"
+        data-testid="home-grid"
+        data-cols={grid.cols}
+        data-rows={grid.rows}
+      >
         {#each shownGrid as id (id)}
           {@render tile(id)}
         {/each}

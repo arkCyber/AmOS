@@ -1,10 +1,5 @@
 [
   {
-    "path": "src/lib/wm.ts",
-    "module": true,
-    "reason": "Multi-window split-layout bridge for the Rust `wm_*` commands. The bridge + its pure placement helpers are complete and unit-tested, but no Svelte surface renders a split yet (the shell is single-surface). Wiring is the split-screen UI work tracked in docs/multi-window.md; keep until that surface lands."
-  },
-  {
     "path": "src/lib/sandboxBridge.ts",
     "module": true,
     "reason": "Deny-by-default capability decision seam for sandboxed web-bundles. Its own docs state that wiring it into a real postMessage listener / origin host is device/ecosystem work (docs/permissions-sandbox-audit-plan.md Phase 3) and intentionally not faked. UPDATE (2026-09-13, REQ-A169/A170): the *origin host* half now exists (ExtAppHost.svelte + the amos-app:// bundle host), so what is still missing is precisely the other half — the postMessage listener and the daemon `perm_authorize` chokepoint behind it. Nothing in the shell has a capability to hand out yet, which is why every frame stays deny-by-default."

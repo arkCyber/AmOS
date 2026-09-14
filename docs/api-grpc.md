@@ -5,8 +5,8 @@
 > contract and this page cannot drift apart.
 
 The daemon serves all of these over **one shared Unix Domain Socket** (default $AMOS_SOCKET).
-10 services · 59 RPCs · 119 messages · 18 enums,
-across 9 `.proto` files.
+11 services · 63 RPCs · 127 messages · 19 enums,
+across 10 `.proto` files.
 
 ## Index
 
@@ -17,6 +17,7 @@ across 9 `.proto` files.
 | [`governor.proto`](#governorproto) | `amos_governor` | 1 | 6 | 9 | 2 |
 | [`netguard.proto`](#netguardproto) | `amos_netguard` | 1 | 3 | 7 | 1 |
 | [`privacy.proto`](#privacyproto) | `amos_privacy` | 1 | 9 | 12 | 0 |
+| [`robot_link.proto`](#robot_linkproto) | `amos_link` | 1 | 4 | 8 | 1 |
 | [`sensor.proto`](#sensorproto) | `amos_sensor` | 1 | 7 | 12 | 4 |
 | [`telemetry_spy.proto`](#telemetry_spyproto) | `amos_telemetry_spy` | 1 | 2 | 3 | 3 |
 | [`telephony.proto`](#telephonyproto) | `amos_telephony` | 1 | 8 | 10 | 4 |
@@ -885,6 +886,109 @@ Domain core & honesty boundaries: docs/permissions-sandbox-audit-plan.md.
 |---|---|---|---|
 | `records` | repeated `AuditRecord` | 1 | — |
 | `durable` | `bool` | 2 | — |
+
+## `robot_link.proto`
+
+Package: `amos_link`
+
+Transport: the same Unix Domain Socket as ai_agent / sensor / telephony (one UDS for the whole OS backend). Data-plane traffic (stereo depth frames, joint set points) does NOT travel here: those are `Envelope`-framed binary payloads over an AmOS-Link `Transport` (in-process broker today, Zenoh behind the `zenoh` feature). This service is the *control plane* on top of it: status, the live topic inventory, a raw publish entry point for tooling/agents, and a heartbeat stream. Design & contract: docs/amos-link.md, crates/amos-link/src/service.rs.
+
+### Services
+
+#### `RobotLink`
+
+The AmOS-Link control plane exposed by the daemon (amos-ai mounts it beside AiAgent / Sensor / Telephony on the shared UDS).
+
+| Method | Request | Reply | Kind | Notes |
+|---|---|---|---|---|
+| `GetStatus` | `Empty` | `LinkStatus` | unary | Node identity, uptime, clock freshness, counters and the live peer table. |
+| `ListTopics` | `Empty` | `TopicList` | unary | Every concrete topic the node has seen *published* traffic on, sorted. Subscription patterns are not listed: a pattern is not a topic, and a network transport cannot enumerate what someone else published (it answers empty). |
+| `Publish` | `PublishRequest` | `PublishReply` | unary | Publish a raw payload on a topic. The daemon stamps it with its own peer id, a monotonic sequence number and the (possibly calibrated) clock, so a producer that is not a Rust AmOS-Link node can still inject frames. |
+| `StreamHeartbeats` | `Empty` | `Heartbeat` | server streaming | Server-streaming heartbeat: every peer's beat (including this node's) as it arrives, so a client sees the whole link's liveness rather than a synthetic counter. Use GetStatus for the peer table itself. |
+
+### Messages
+
+**`Empty`**
+
+*(no fields)*
+
+**`Peer`** — One peer learned through discovery (a beacon), with its freshness in ms.
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `id` | `string` | 1 | stable peer id (PeerId) |
+| `kind` | `string` | 2 | robot / brain / sensor / actuator / tool |
+| `endpoint` | `string` | 3 | transport endpoint if the beacon carried one |
+| `last_seen_ms` | `uint64` | 4 | age of the last evidence (a beacon, or a declaration) |
+| `beacons` | `uint64` | 5 | beacons observed; 0 = declared by hand (static, never TTL-expired) |
+
+**`Metrics`** — Cumulative link counters since the node started (never reset, never faked).
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `published` | `uint64` | 1 | Envelope frames handed to the transport |
+| `delivered` | `uint64` | 2 | frames accepted by a subscriber queue |
+| `dropped` | `uint64` | 3 | frames dropped by a QoS policy (best-effort) |
+| `decode_errors` | `uint64` | 4 | frames a subscriber could not decode |
+| `peers` | `uint64` | 5 | peers currently fresh in the registry |
+| `encode_errors` | `uint64` | 6 | messages that failed to encode before the wire |
+| `blocked` | `uint64` | 7 | publishes that had to wait for a reliable subscriber |
+
+**`LinkStatus`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `peer` | `string` | 1 | this node's peer id |
+| `kind` | `string` | 2 | this node's kind |
+| `version` | `string` | 3 | amos-link crate version |
+| `uptime_ms` | `uint64` | 4 | ms since the node was created |
+| `clock_synced` | `bool` | 5 | true when a calibrated clock is in use |
+| `metrics` | `Metrics` | 6 | — |
+| `peers` | repeated `Peer` | 7 | — |
+| `health` | `HealthState` | 8 | the link's own verdict (see LINK_HEALTH docs) |
+| `health_reasons` | repeated `string` | 9 | Why that verdict, one token per reason carrying its number ("decode_errors=3", "frame_loss=6 in 2 gap(s)"). Empty for HEALTHY. |
+
+**`TopicList`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `topics` | repeated `string` | 1 | concrete key expressions, sorted |
+
+**`PublishRequest`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `topic` | `string` | 1 | Topic to publish on. Wildcards are refused (a publisher names one topic). |
+| `payload` | `bytes` | 2 | Opaque payload bytes. The daemon wraps them in an AmOS-Link Envelope; a bincode-encoded `Message` keeps the typed subscribers working. |
+
+**`PublishReply`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `seq` | `uint64` | 1 | the sequence number the node stamped |
+| `matched` | `uint32` | 2 | Subscribers whose pattern matched. A network transport (Zenoh) cannot count remote subscribers, so it reports 0 — the same "unknown" the topic inventory answers with; only the in-process Broker knows this for real. |
+| `delivered` | `uint32` | 3 | frames accepted by a subscriber queue |
+| `dropped` | `uint32` | 4 | frames dropped by a QoS policy |
+
+**`Heartbeat`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `peer` | `string` | 1 | emitting peer id |
+| `seq` | `uint64` | 2 | per-peer monotonic heartbeat counter |
+| `stamp_secs` | `uint64` | 3 | wall-clock seconds (calibrated if synced) |
+| `stamp_nanos` | `uint32` | 4 | sub-second part, < 1e9 |
+| `uptime_ms` | `uint64` | 5 | ms since the emitting node started |
+
+### Enums
+
+**`HealthState`** — The link's verdict about itself: a fold of the counters into a judgement, never a fabricated "OK". UNKNOWN means *no evidence yet*, which is deliberately not the same as healthy.
+
+| Value | # | Notes |
+|---|---|---|
+| `HEALTH_UNKNOWN` | 0 | — |
+| `HEALTH_HEALTHY` | 1 | — |
+| `HEALTH_DEGRADED` | 2 | — |
 
 ## `sensor.proto`
 

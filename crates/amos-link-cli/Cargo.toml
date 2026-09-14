@@ -1,0 +1,42 @@
+[package]
+name = "amos-link-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AmOS-Link CLI: drive and inspect the robot middleware from a terminal — `status`, `topics`, `pub`, `sub`, `bench`, `discover`, `motor`. Runs one in-process AmOS-Link node (broker transport) so an operator can smoke the pub/sub path, measure round-trip latency and translate an agent's JSON action into motor frames; `--feature lan`/`--feature zenoh` switch discovery/transport to the real network."
+
+[lib]
+name = "amos_link_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amos-link-cli"
+path = "src/main.rs"
+
+[dependencies]
+amos-link = { path = "../amos-link" }
+# The control plane's wire contract (`proto/robot_link.proto`), so `--socket` can address
+# a *running* daemon's node instead of a local one — the same client stack (tonic over a
+# Unix socket) every other client in the workspace uses.
+amos-proto.workspace = true
+tonic.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The process-level remote test mounts the real `RobotLink` service on a UDS
+# (`UnixListenerStream`), so `--socket` is proven against a live server, not a mock.
+tokio-stream.workspace = true
+
+[features]
+default = []
+# Real discovery for `discover --announce/--watch` (nothing else changes).
+lan = ["amos-link/lan"]
+# Zenoh-backed transport for `--transport zenoh` (cross-board / cross-server).
+zenoh = ["amos-link/zenoh"]

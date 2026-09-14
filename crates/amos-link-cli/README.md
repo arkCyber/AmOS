@@ -1,0 +1,105 @@
+# amos-link-cli — drive and inspect the robot middleware from a terminal
+
+`amos-link-cli` is the terminal for **[AmOS-Link](../amos-link/README.md)**: it builds one
+in-process link node and exercises the paths an operator cares about — publish, subscribe,
+the topic inventory, a latency benchmark, discovery and the JSON→motor-frame translation —
+or, with `--socket`, reads the **running** daemon's control plane instead of a local node.
+Part of **[Amos](../../README.md)**.
+
+> ⚠️ Amos is a research prototype — not qualified for safety-critical use (see the
+> [root README](../../README.md)).
+
+## What it is
+
+```text
+amos-link-cli status                   # identity, counters, peers, clock freshness (JSON)
+amos-link-cli topics                   # the topic inventory of a live node
+amos-link-cli pub   --topic amos/dog1/control/joints --action '{"action":"trot"}'
+amos-link-cli sub   --pattern 'amos/**' --count 3
+amos-link-cli bench --count 2000 --size 4096      # real publish→decode latency
+amos-link-cli discover --peer dog1 --peer mini-brain
+amos-link-cli watch --seconds 5                   # heartbeat + federation: is the link alive
+amos-link-cli motor --action '{"action":"trot","speed":0.5}'   # frames + hex
+```
+
+Two honest notes about scope, both enforced in code rather than promised:
+
+- `--transport zenoh` and `discover --lan` are the real network paths and need the matching
+  build feature (`zenoh` / `lan`). Without it the command **says so** instead of silently
+  using another transport.
+- `pub`/`sub` carry `AgentAction` payloads (text or JSON) — the one shape a human and an
+  agent can both produce without a schema.
+
+## Layout
+
+| file | what |
+|---|---|
+| `src/main.rs` | the binary: args → `parse_args` → `run`, exit codes (2 = usage, 1 = failure) |
+| `src/lib.rs` | `parse_from`/`parse_args` (manual parser, no clap), `run`, `USAGE`, and one function per command |
+| `tests/cli_smoke.rs` | process-level smoke: runs the **shipped binary** (argv in, exit code + stdout out) |
+
+## Build & test
+
+```bash
+cargo test -p amos-link-cli                     # unit (parser) + process-level smoke
+cargo test -p amos-link-cli --features lan      # `discover --lan` compiles (real beacons)
+cargo run -p amos-link-cli -- --help
+cargo clippy -p amos-link-cli --all-targets --features lan,zenoh -- -D warnings
+```
+
+## Examples
+
+```bash
+# Embed the CLI's command set in a program (no shell): parse argv as data, run in-process.
+cargo run -p amos-link-cli --example embed_commands
+```
+
+| example | shows |
+|---|---|
+| `embed_commands` | `parse_from` + `run` (what `main.rs` calls) used from a harness: runs `status`, `bench` and `motor` and prints what the shell would have printed |
+
+## Remote mode (`--socket`)
+
+`status` / `topics` / `pub` / `watch` accept `--socket <PATH>` and then talk to the
+daemon's live control plane (`proto/robot_link.proto` over the UDS) instead of a local
+node. Every line names the socket, so a local answer can never be mistaken for the robot's:
+
+```bash
+amos-link-cli status --socket /tmp/amos-ai.sock --json
+amos-link-cli topics --socket /tmp/amos-ai.sock
+amos-link-cli pub    --socket /tmp/amos-ai.sock --topic amos/dog1/control/joints \
+                     --action '{"action":"trot"}' --count 2 --hz 2
+amos-link-cli watch  --socket /tmp/amos-ai.sock --seconds 3   # the link's real heartbeats
+```
+
+`sub` / `bench` / `discover` need a **local data-plane node** and are refused by name when
+`--socket` is present; `motor` needs no link at all and refuses `--socket` too.
+
+## Environment variables
+
+| variable | meaning | default |
+|---|---|---|
+| `AMOS_LINK_PEER` | this node's id when `--peer` is omitted | `amos-node` (per-command defaults for `bench`/`watch`/`motor`) |
+| `AMOS_LINK_BEACON_ADDR` | beacon target for `discover --lan` | `239.255.42.99:7446` |
+| `AMOS_LINK_ZENOH_ENDPOINT` | Zenoh endpoints for `--transport zenoh` | Zenoh's own default scouting |
+
+## Honest boundaries
+
+- **The CLI is not a robot.** Its own node is a tool: `bench`/`watch` default to
+  `link-bench`/`link-watch` identities, and `discover --lan` is a bounded sweep
+  (`--seconds`), never a daemon.
+- **`--socket` reads the control plane only** — status, inventory, injection and the
+  heartbeat stream. A data-plane command is refused rather than downgraded.
+- **`pub --socket` injects bytes**, encoded exactly like a local publish (the `Message`
+  trait's bincode), so typed subscribers decode it; the daemon stamps its own peer id,
+  sequence and clock on the frame.
+- Discovery over `lan` is **unauthenticated** (plaintext beacons); the authenticated path is
+  the daemon's UDS.
+- Exit codes are part of the contract: `0` ok, `1` failure (a refusal or an unreachable
+  peer), `2` usage error.
+
+## Related
+
+- [`crates/amos-link`](../amos-link/README.md) — the middleware kernel this drives.
+- [`docs/amos-link.md`](../../docs/amos-link.md) — design record + the operator cheatsheet.
+- [`proto/robot_link.proto`](../../proto/robot_link.proto) — the control-plane contract.

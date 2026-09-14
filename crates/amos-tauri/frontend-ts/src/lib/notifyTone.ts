@@ -8,8 +8,28 @@
  * Audio is unavailable (SSR, tests, headless), or when the browser blocks audio.
  */
 
+/** Options for the synthesized chime. */
+export interface NotifyToneOptions {
+  /**
+   * Chime loudness 0..1 (1 = the historical default envelope; 0 = play nothing).
+   * Scales only the gain of the tone we synthesize ourselves — never a claim
+   * about any system audio stream.
+   */
+  volume?: number;
+}
+
+/** Clamp to 0..1; unreadable → 1 (the historical default). */
+function chimeVolume(v: number | undefined): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) return 1;
+  if (v <= 0) return 0;
+  if (v >= 1) return 1;
+  return v;
+}
+
 /** Play the notification chime. Safe to call anywhere — never throws. */
-export function playNotifyTone(): void {
+export function playNotifyTone(opts?: NotifyToneOptions): void {
+  const vol = chimeVolume(opts?.volume);
+  if (vol <= 0) return; // volume 0 = honest silence: no context, no oscillator
   try {
     if (typeof window === "undefined") return;
     const Ctor =
@@ -18,6 +38,7 @@ export function playNotifyTone(): void {
     if (!Ctor) return;
     const ctx = new Ctor();
     const dur = 0.5;
+    const peak = 0.15 * vol;
 
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
@@ -27,7 +48,7 @@ export function playNotifyTone(): void {
     osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.16);
 
     gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(peak, ctx.currentTime + 0.02);
     gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
 
     osc.connect(gain);

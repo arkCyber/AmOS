@@ -44,6 +44,7 @@
   import { restoreTimerState, persistFromTimer } from "../lib/timerStore";
   import { CITY_CATALOG, resolveCity, searchCities } from "../lib/cityIndex";
   import { playNotifyTone } from "../lib/notifyTone";
+  import { loadSound } from "../lib/sound";
 
   const p2 = (n: number) => String(n).padStart(2, "0");
   const fmt = (d: Date) => `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
@@ -222,7 +223,9 @@
     const done = timerDone;
     if (risingEdge(timerDonePrev, done)) {
       timerDonePrev = true;
-      playNotifyTone();
+      // The timer chime is the synthesized notify tone; it honors the user's
+      // loudness from the persisted sound policy (REQ-A205).
+      playNotifyTone({ volume: loadSound().volume });
     } else if (!done) {
       timerDonePrev = false;
     }

@@ -11,6 +11,8 @@
   import { t } from "./locale.svelte";
   import type { HomeLayout } from "../lib/amosStore";
   import { moveBefore, addAppsToDock, readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { homeGrid, PHONE_GRID, type HomeGrid } from "../lib/formLayout";
+  import { onLayoutChanged, wmLayoutSnapshot, type LayoutSnapshot } from "../lib/wm";
   import { CONTACTS_KEY, seedContacts } from "../lib/contacts";
   import {
     applyLayout,
@@ -72,7 +74,22 @@
     layout: HomeLayout;
     ext: StoreTile[];
     pulseId: string | null;
+    /** Home-screen grid geometry for this device's **class** (see lib/formLayout).
+     * The shell owns it because the shell is what reads the host's authority; the
+     * grid is pushed down the same reactive channel as the layout, in place. */
+    grid: HomeGrid;
   }
+
+  // The host's layout authority (`form` + the **measured** screen). The shell reads
+  // it once and then on every `layout-changed` push (the host only emits on a real
+  // change), exactly like the 窗口与形态 settings page does — the UI must never infer
+  // the device class from its own viewport (a phone and a tablet are one build,
+  // `docs/multi-window.md` §1.5). No host (browser preview) ⇒ stays `null` ⇒ the
+  // phone grid, the most conservative plan.
+  let layoutSnap = $state<LayoutSnapshot | null>(null);
+  const homeGridPlan = $derived(
+    layoutSnap ? homeGrid(layoutSnap.form, layoutSnap.screen_w, layoutSnap.screen_h) : PHONE_GRID,
+  );
 
   // Store-installed (third-party) tiles live in the module cache in
   // `lib/storeApps`, which only `loadStoreTiles` ever populates — and the Store
@@ -92,6 +109,7 @@
         layout: layout(),
         ext,
         pulseId: pulseId(),
+        grid: homeGridPlan,
       });
     }
   });
@@ -200,6 +218,9 @@
   // in onDestroy — also released immediately if unmount beats the resolution.
   let stopLmkWatch = () => {};
   let lmkDisposed = false;
+  // Async form-factor (`layout-changed`) unsubscribe — same lifecycle pattern.
+  let stopLayoutWatch = () => {};
+  let layoutDisposed = false;
   // Async telemetry-spy Watch unsubscribe (same lifecycle pattern as the LMK one).
   let stopSpyWatch = () => {};
   let spyDisposed = false;
@@ -221,6 +242,20 @@
     // Seed the address book before any app surface can read it (Contacts / Phone /
     // IncomingCall all hydrate `amos.contacts` at component init).
     seedContactsOnce();
+    // Form-factor authority for the home grid: read the host's snapshot once, then
+    // follow its `layout-changed` pushes (the host emits only on a real change, so
+    // this is not a poll). A `null` answer (no bridge, or a failed command — recorded
+    // in the diagnostics ledger by `lib/backend`) leaves the phone plan in place
+    // rather than keeping a stale tablet reading (`WindowPage`'s honesty rule).
+    void wmLayoutSnapshot().then((s) => {
+      if (s) layoutSnap = s;
+    });
+    void onLayoutChanged((s) => {
+      layoutSnap = s;
+    }).then((stop) => {
+      if (layoutDisposed) stop();
+      else stopLayoutWatch = stop;
+    });
     // Boot re-assert (docs/display-idle.md §4): a previous run may have left
     // `off` on disk, which would make the daemon defer as if the display were
     // still dark. Clear it when the shell starts unlocked (best-effort, no-op
@@ -270,6 +305,8 @@
   onDestroy(() => {
     lmkDisposed = true;
     stopLmkWatch();
+    layoutDisposed = true;
+    stopLayoutWatch();
     spyDisposed = true;
     stopSpyWatch();
     stopWatchers.forEach((stop) => stop());

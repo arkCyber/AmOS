@@ -89,14 +89,62 @@ export function collectEventConsts(src) {
 }
 
 /**
+ * Remove every `#[cfg(test)]` item so the **production** scan sees the whole file.
+ *
+ * The first version of this scanner truncated the source at the *first*
+ * `#[cfg(test)]`, assuming test code is one trailing module. A file carrying a small
+ * `#[cfg(test)]` helper *above* production code then silently lost every line after
+ * it — and in REQ-A231 a test seam added mid-file (`WmState::register_app`,
+ * `WmState::set_shell_fit`) made the scanner stop before `app.emit(LAYOUT_EVENT, …)`
+ * and report a live event as "*no Rust code emits* `layout-changed`". Removing the
+ * items (bracket-balanced, so `fn`/`mod`/`impl`/`struct` bodies all end correctly)
+ * keeps production visible no matter where a test seam lives, while test-only
+ * emits/consts still stay out of the tables.
+ */
+export function stripTestRegions(src) {
+  const attrRe = /#\[cfg\([^\]]*\btest\b[^\]]*\)\]/g;
+  let out = src;
+  for (;;) {
+    attrRe.lastIndex = 0;
+    const m = attrRe.exec(out);
+    if (!m) return out;
+    // Walk to the item's end: the item is over at a `;` outside every bracket, or
+    // when the block it opened comes back to zero depth.
+    const stack = [];
+    let sawBlock = false;
+    let end = -1;
+    for (let i = m.index + m[0].length; i < out.length; i++) {
+      const c = out[i];
+      if (c === "(" || c === "[" || c === "{") {
+        if (c === "{") sawBlock = true;
+        stack.push(c);
+        continue;
+      }
+      if (c === ")" || c === "]" || c === "}") {
+        stack.pop();
+        if (sawBlock && stack.length === 0) {
+          end = i + 1;
+          break;
+        }
+        continue;
+      }
+      if (c === ";" && stack.length === 0) {
+        end = i + 1;
+        break;
+      }
+    }
+    out = out.slice(0, m.index) + out.slice(end < 0 ? out.length : end);
+    if (end < 0) return out;
+  }
+}
+
+/**
  * Event names the host **emits**: a quoted literal or a `*_EVENT` constant (local
  * or from the workspace-wide `consts` table, with or without a module path such as
  * `sensor_host::SENSOR_DATA_EVENT`).
  */
 export function parseEmitters(src, consts = new Map()) {
-  const clean = stripComments(src);
-  const cut = clean.indexOf("#[cfg(test)]");
-  const prod = cut < 0 ? clean : clean.slice(0, cut);
+  const prod = stripTestRegions(stripComments(src));
   const table = new Map([...collectEventConsts(prod), ...consts]);
   const out = [];
   for (const m of prod.matchAll(/\.emit\s*\(\s*([A-Za-z_][\w:]*|"[^"]+")\s*,/g)) {
@@ -163,6 +211,34 @@ export function runSelftest() {
   ok("an unresolvable name is flagged, not invented", emitted.some((e) => e.unresolved && e.name === "COMPUTED_NAME"));
   ok("ignores test-only emits", !names.includes("never-in-prod"));
 
+  // REQ-A231: a `#[cfg(test)]` helper **above** production code must not blind the
+  // scan. The old cut-at-first-`#[cfg(test)]` did exactly that and reported a live
+  // event (`layout-changed`) as never emitted.
+  const withMidFileSeam = [
+    'pub const LAYOUT_EVENT: &str = "layout-changed";',
+    "fn emit_layout(app: &AppHandle) { let _ = app.emit(LAYOUT_EVENT, snap); }",
+    "#[cfg(test)]",
+    "fn seam() { let _ = (); }",
+    "fn later(app: &AppHandle) { let _ = app.emit(\"clipboard-changed\", notice); }",
+  ].join("\n");
+  const seamNames = parseEmitters(withMidFileSeam).map((e) => e.name);
+  ok("a mid-file cfg(test) item does not hide the emit above it", seamNames.includes("layout-changed"));
+  ok("…nor the emit below it", seamNames.includes("clipboard-changed"));
+  const seamConsts = collectEventConsts(stripTestRegions(withMidFileSeam));
+  ok("a mid-file cfg(test) item does not hide a later const", seamConsts.get("LAYOUT_EVENT") === "layout-changed");
+  ok(
+    "a cfg(test) item is removed, not truncated",
+    stripTestRegions("fn a() {}\n#[cfg(test)]\nfn t() {}\nfn b() {}").includes("fn b()"),
+  );
+  ok(
+    "a cfg(test) module with nested braces ends at its own closing brace",
+    stripTestRegions('fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let x = (1, 2); }\n}\nfn b() {}').includes("fn b()"),
+  );
+  ok(
+    "a cfg(test) const with brackets is removed whole",
+    !stripTestRegions("fn a() {}\n#[cfg(test)]\nconst T: [u8; 2] = [1, 2];\nfn b() {}").includes("[u8; 2]"),
+  );
+
   const subs = parseSubscribers(
     [
       'export const LMK_SURFACE_EVENT = "lmk-surface";',
@@ -214,8 +290,7 @@ function runScan() {
   const rustSources = rustFiles.map((f) => ({ file: f, src: readFileSync(f, "utf8") }));
   const rustConsts = new Map();
   for (const { src } of rustSources) {
-    const cut = src.indexOf("#[cfg(test)]");
-    for (const [k, v] of collectEventConsts(cut < 0 ? src : src.slice(0, cut))) rustConsts.set(k, v);
+    for (const [k, v] of collectEventConsts(stripTestRegions(src))) rustConsts.set(k, v);
   }
   const shapes = new Map();
   const emitted = [];

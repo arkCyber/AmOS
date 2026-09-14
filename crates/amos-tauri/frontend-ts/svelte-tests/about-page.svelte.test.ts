@@ -40,6 +40,8 @@ describe("AboutPage.svelte", () => {
     expect(batt?.textContent ?? "").toContain("—"); // no real source → not fabricated
     const cell = byTest(container, "about-cellular");
     expect(cell?.textContent ?? "").toContain(zh["settings.cellularNone"]);
+    // Not bridged → the probe never runs → no probe stamp is claimed either.
+    expect(byTest(container, "about-probe")).toBeNull();
   });
 
   test("host battery fills the About page on a /proc-less desktop", async () => {
@@ -51,5 +53,53 @@ describe("AboutPage.svelte", () => {
     await settle();
     const batt = byTest(container, "about-battery");
     expect(batt?.textContent ?? "").toContain("75%");
+  });
+
+  test("re-probes the daemon every 10 s while open — the readout cannot go stale (REQ-A204)", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let calls = 0;
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "system_health") {
+          calls += 1;
+          return { battery_level_pct: 50 + calls, battery_charging: false };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const { container } = render(AboutPage);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0); // flush the initial probe
+    expect(calls).toBe(1);
+    // The probe stamp is claimed next to the battery row.
+    const stamp = byTest(container, "about-probe");
+    expect(stamp?.textContent ?? "").toContain("上次探测");
+    expect(byTest(container, "about-battery")?.textContent ?? "").toContain("51%");
+
+    // One interval later the page asks again — a drain/refill shows up.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toBe(2);
+    expect(byTest(container, "about-battery")?.textContent ?? "").toContain("52%");
+  });
+
+  test("a failed probe resets the row to the honest '—' (no stale percentage)", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let online = true;
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "system_health") return online ? { battery_level_pct: 80 } : null;
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const { container } = render(AboutPage);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(byTest(container, "about-battery")?.textContent ?? "").toContain("80%");
+    // The daemon drops mid-view: the next probe answers null → back to '—'.
+    online = false;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(byTest(container, "about-battery")?.textContent ?? "").toContain("—");
   });
 });
