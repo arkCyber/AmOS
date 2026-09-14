@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 tokio.workspace = true
 # A failed Airplane rollback must be visible (see `manager::rollback_to`): the
 # caller's error is about the *cascade*, not about the state the device is left in.

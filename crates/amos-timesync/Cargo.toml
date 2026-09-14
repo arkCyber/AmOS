@@ -16,7 +16,7 @@ serde_json = "1"
 tokio.workspace = true
 tracing.workspace = true
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 
 # Real network time query (SNTP over UDP) for the NtpTimeSource. Kept behind the
 # `ntp` feature so the default workspace build stays offline-green, mirroring
