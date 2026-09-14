@@ -19,6 +19,7 @@ amos-link-cli sub   --pattern 'amos/**' --count 3 --timeout-ms 2000   # 0 = wait
 amos-link-cli bench --count 2000 --size 4096      # real publish→decode latency
 amos-link-cli discover --peer dog1 --peer mini-brain
 amos-link-cli watch --seconds 5                   # heartbeat + federation: is the link alive
+amos-link-cli state --timeout-ms 2000             # what robots report about themselves
 amos-link-cli motor --action '{"action":"trot","speed":0.5}'   # frames + hex
 ```
 
@@ -80,8 +81,8 @@ amos-link-cli pub    --socket /tmp/amos-ai.sock --topic amos/dog1/control/joints
 amos-link-cli watch  --socket /tmp/amos-ai.sock --seconds 3   # the link's real heartbeats
 ```
 
-`sub` / `bench` / `discover` need a **local data-plane node** and are refused by name when
-`--socket` is present; `motor` needs no link at all and refuses `--socket` too.
+`sub` / `state` / `bench` / `discover` need a **local data-plane node** and are refused by
+name when `--socket` is present; `motor` needs no link at all and refuses `--socket` too.
 
 ## Environment variables
 

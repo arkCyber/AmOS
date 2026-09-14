@@ -38,6 +38,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LinkError, Result};
+use crate::keyexpr::{Channel, Topic};
+use crate::pubsub::Publisher;
 
 /// Frame start bytes (`0xAA55`).
 pub const FRAME_SOF: [u8; 2] = [0xAA, 0x55];
@@ -846,7 +848,80 @@ pub async fn execute<H: RobotHal>(hal: &H, action: &AgentAction) -> Result<Vec<M
     Ok(frames[..applied.min(frames.len())].to_vec())
 }
 
-/// The "small brain" glue: the control topic on one side, the servo bus on the other.
+/// The `state`-channel name a bridge reports actuation on.
+pub const ACTUATION_NAME: &str = "actuation";
+
+/// The topic a bridge reports its actuation state on: `amos/<robot>/state/actuation`.
+///
+/// The channel is deliberately `state`, not `control`: this is a **discrete mode report**
+/// (armed / e-stopped / which gait), so `Qos::for_channel(Channel::State)` gives it
+/// latest-wins semantics — a brain that joins late learns the robot's real mode instead of
+/// replaying a command history.
+pub fn actuation_topic(peer: &crate::discovery::PeerId) -> Result<Topic> {
+    Topic::new(format!(
+        "amos/{}/{}/{ACTUATION_NAME}",
+        peer.as_str(),
+        Channel::State.key()
+    ))
+}
+
+/// A command that was refused **before it reached the bus**, as reported to the commander.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    /// The link sequence of the refused action.
+    pub seq: u64,
+    /// Why it was refused (malformed intent, or motion while e-stopped).
+    pub reason: String,
+}
+
+/// What the bridge last did, as it travels on [`actuation_topic`].
+///
+/// This is the **return path** of the control loop. Without it a commander cannot tell an
+/// applied command from a refused one, and — the case that matters most — a watchdog
+/// torque cut is **invisible** to the peer whose link just died: it would keep believing
+/// its last `trot` is running.
+///
+/// Who published it is the envelope's `publisher` (the robot), exactly as the topic
+/// doctrine in `docs/amos-link.md` §2 describes, so the payload does not duplicate it. The
+/// report time is the envelope's stamp for the same reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActuationState {
+    /// The most recent action the bridge acted on (`None` before any arrived).
+    pub seq: Option<u64>,
+    /// The last **accepted** gait (`None` before one was accepted).
+    pub gait: Option<Gait>,
+    /// Frames written to the bus for that action.
+    pub frames: usize,
+    /// Drivers energized — read from the bus itself ([`RobotHal::armed`]), not inferred.
+    pub armed: bool,
+    /// Torque is cut and latched until an explicit `arm` arrives.
+    pub estopped: bool,
+    /// Why torque was cut; `None` while not e-stopped.
+    pub estop_reason: Option<EstopReason>,
+    /// The deadman period, when the bridge has one (`None` = the caller guarantees cadence).
+    pub watchdog_ms: Option<u64>,
+    /// The most recent refusal, if any.
+    pub last_refusal: Option<Refusal>,
+}
+
+impl ActuationState {
+    /// The **mode** part of this report: the discrete state that decides whether a new
+    /// report is worth a frame.
+    ///
+    /// A 50 Hz control stream must not become 50 state frames per second on a `state`
+    /// channel, so the per-action detail (`seq`, `frames`) is excluded from the comparison:
+    /// it travels *with* a report when the mode changes, it never causes one.
+    pub fn mode(&self) -> (bool, bool, Option<EstopReason>, Option<Gait>, Option<&str>) {
+        (
+            self.armed,
+            self.estopped,
+            self.estop_reason,
+            self.gait,
+            self.last_refusal.as_ref().map(|r| r.reason.as_str()),
+        )
+    }
+}
+
 ///
 /// Deliberately a `step()` and not a `loop`: the caller owns the cadence (a 50 Hz
 /// control task, a test, the CLI), which keeps this type free of a hidden scheduler and
@@ -867,6 +942,19 @@ pub struct RobotBridge<H: RobotHal> {
     hal: H,
     watchdog: Option<Duration>,
     estop_latched: bool,
+    /// Why torque is cut while latched (commanded vs watchdog). Cleared by `arm`.
+    estop_reason: Option<EstopReason>,
+    /// Where the actuation state is reported (the control loop's return path). `None`
+    /// keeps the bridge purely local — the shape a unit test drives.
+    reporter: Option<Publisher<ActuationState>>,
+    /// The mode of the last report that actually reached the link, so an unchanged mode is
+    /// not re-sent (see [`ActuationState::mode`]). `None` = nothing reported yet.
+    last_reported: Option<ActuationState>,
+    /// What the last action was and what the bus did with it.
+    last_seq: Option<u64>,
+    last_gait: Option<Gait>,
+    last_frames: usize,
+    last_refusal: Option<Refusal>,
 }
 
 impl<H: RobotHal> RobotBridge<H> {
@@ -878,6 +966,13 @@ impl<H: RobotHal> RobotBridge<H> {
             hal,
             watchdog: None,
             estop_latched: false,
+            estop_reason: None,
+            reporter: None,
+            last_reported: None,
+            last_seq: None,
+            last_gait: None,
+            last_frames: 0,
+            last_refusal: None,
         }
     }
 
@@ -896,6 +991,64 @@ impl<H: RobotHal> RobotBridge<H> {
             hal,
             watchdog: Some(period),
             estop_latched: false,
+            estop_reason: None,
+            reporter: None,
+            last_reported: None,
+            last_seq: None,
+            last_gait: None,
+            last_frames: 0,
+            last_refusal: None,
+        }
+    }
+
+    /// Report this bridge's actuation state on the link (see [`ActuationState`]).
+    ///
+    /// This closes the control loop: a commander subscribing to
+    /// `amos/<robot>/state/actuation` learns that its command was *refused*, that an
+    /// e-stop is latched, or that the **watchdog cut torque** — the last one is otherwise
+    /// unobservable to the very peer whose link just died.
+    ///
+    /// The bridge works without one (the same code path a unit test drives), and a failed
+    /// report never fails a step: the safety action has already happened, so turning a link
+    /// hiccup into an `Err` would tell the caller the robot had *not* stopped when it had.
+    pub fn reporting(mut self, state: Publisher<ActuationState>) -> Self {
+        self.reporter = Some(state);
+        self
+    }
+
+    /// What the bridge would report right now (also the honest answer for a caller with no
+    /// publisher attached).
+    pub fn state(&self) -> ActuationState {
+        ActuationState {
+            seq: self.last_seq,
+            gait: self.last_gait,
+            frames: self.last_frames,
+            // Read from the bus, not inferred: "armed" is the driver's fact.
+            armed: self.hal.armed(),
+            estopped: self.estop_latched,
+            estop_reason: self.estop_reason,
+            watchdog_ms: self.watchdog.map(|p| p.as_millis() as u64),
+            last_refusal: self.last_refusal.clone(),
+        }
+    }
+
+    /// Publish the current state **when its mode changed**, never once per command.
+    async fn report(&mut self) {
+        let Some(publisher) = self.reporter.as_ref() else {
+            return;
+        };
+        let now = self.state();
+        if self.last_reported.as_ref().map(ActuationState::mode) == Some(now.mode()) {
+            return;
+        }
+        match publisher.publish(&now).await {
+            Ok(_) => self.last_reported = Some(now),
+            // Not fatal, and not silent: the commander keeps its old view until the next
+            // change can be delivered.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "actuation state could not be reported (link closing?)"
+            ),
         }
     }
 
@@ -914,11 +1067,21 @@ impl<H: RobotHal> RobotBridge<H> {
         self.watchdog
     }
 
-    /// Wait for the next action (or for the watchdog) and act on it.
+    /// Wait for the next action (or for the watchdog), act on it, and **report the result**
+    /// on the link when the actuation *mode* changed (see [`RobotBridge::reporting`]).
     ///
     /// A *refusal* is an `Ok` event, not an error: it is the safety layer doing its job.
-    /// Only a transport failure or a broken bus surfaces as `Err`.
+    /// Only a transport failure or a broken bus surfaces as `Err` — and then nothing is
+    /// reported, because the bridge learned nothing new about the robot.
     pub async fn step(&mut self) -> Result<BridgeEvent> {
+        let event = self.step_inner().await?;
+        self.report().await;
+        Ok(event)
+    }
+
+    /// The safety core of one step: the decisions themselves, with no reporting — so they
+    /// stay exactly as unit-testable as they were before a reporter existed.
+    async fn step_inner(&mut self) -> Result<BridgeEvent> {
         let received = match self.watchdog {
             Some(period) => match tokio::time::timeout(period, self.subscriber.recv()).await {
                 Ok(result) => result?,
@@ -926,6 +1089,7 @@ impl<H: RobotHal> RobotBridge<H> {
                     // Deadman: no action within the period → cut torque and latch.
                     self.hal.estop().await?;
                     self.estop_latched = true;
+                    self.estop_reason = Some(EstopReason::Watchdog);
                     tracing::warn!(
                         period_ms = period.as_millis(),
                         "watchdog tripped: no action arrived, torque cut"
@@ -946,6 +1110,10 @@ impl<H: RobotHal> RobotBridge<H> {
                 // Malformed intent never reaches the bus (and never silently becomes a
                 // default pose).
                 tracing::warn!(seq, error = %e, "refusing a malformed action");
+                self.last_refusal = Some(Refusal {
+                    seq,
+                    reason: e.to_string(),
+                });
                 return Ok(BridgeEvent::Refused {
                     seq,
                     reason: e.to_string(),
@@ -958,6 +1126,11 @@ impl<H: RobotHal> RobotBridge<H> {
             let applied = self.hal.apply(&frames).await?;
             let was_latched = self.estop_latched;
             self.estop_latched = false;
+            self.estop_reason = None;
+            self.last_seq = Some(seq);
+            self.last_gait = Some(command.gait);
+            self.last_frames = applied;
+            self.last_refusal = None;
             tracing::info!(seq, was_latched, "armed: motion allowed again");
             return Ok(BridgeEvent::Applied {
                 seq,
@@ -969,13 +1142,22 @@ impl<H: RobotHal> RobotBridge<H> {
         if self.estop_latched && command.gait.is_motion() {
             let reason = "e-stop latched: send {\"action\":\"arm\"} to re-arm".to_string();
             tracing::warn!(seq, reason = %reason, "refusing motion while e-stopped");
+            self.last_refusal = Some(Refusal {
+                seq,
+                reason: reason.clone(),
+            });
             return Ok(BridgeEvent::Refused { seq, reason });
         }
 
         let frames = plan(&command);
         let applied = self.hal.apply(&frames).await?;
+        self.last_seq = Some(seq);
+        self.last_gait = Some(command.gait);
+        self.last_frames = applied;
+        self.last_refusal = None;
         if command.gait.is_emergency() {
             self.estop_latched = true;
+            self.estop_reason = Some(EstopReason::Commanded);
             tracing::warn!(seq, "commanded e-stop");
             return Ok(BridgeEvent::Estopped {
                 reason: EstopReason::Commanded,
@@ -1603,5 +1785,267 @@ mod tests {
         assert_eq!(Gait::Arm.key(), "arm");
         assert_eq!(EstopReason::Commanded.key(), "commanded");
         assert_eq!(EstopReason::Watchdog.key(), "watchdog");
+    }
+
+    /// The report topic is a **`state` channel** topic: latest-wins, so a brain that joins
+    /// late learns the robot's real mode without replaying a command history.
+    #[test]
+    fn the_report_topic_is_a_state_channel_topic() {
+        let peer = crate::discovery::PeerId::new("dog1").expect("peer");
+        let topic = actuation_topic(&peer).expect("topic");
+        assert_eq!(topic.as_str(), "amos/dog1/state/actuation");
+        assert_eq!(topic.channel(), Some(Channel::State));
+        assert_eq!(
+            crate::qos::Qos::for_channel(Channel::State),
+            crate::qos::Qos::state()
+        );
+        // An id that cannot be a topic segment is refused, never silently mangled.
+        assert!(crate::discovery::PeerId::new("bad peer").is_err());
+    }
+
+    /// A bridge with no reporter still answers honestly about itself.
+    #[tokio::test]
+    async fn state_is_answerable_without_a_reporter() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let subscriber = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let mut bridge = RobotBridge::new(subscriber, MockRobotHal::new());
+
+        // Nothing has happened yet: no action, drivers down, no e-stop.
+        let idle = bridge.state();
+        assert_eq!(idle.seq, None);
+        assert_eq!(idle.gait, None);
+        assert!(!idle.armed);
+        assert!(!idle.estopped);
+        assert_eq!(idle.watchdog_ms, None);
+
+        // After one action the same method describes what the bus actually did.
+        node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        )
+        .publish(&AgentAction::new(r#"{"action":"stand"}"#))
+        .await
+        .expect("publish");
+        bridge.step().await.expect("step");
+        let moved = bridge.state();
+        assert_eq!(moved.seq, Some(1));
+        assert_eq!(moved.gait, Some(Gait::Stand));
+        assert!(moved.armed, "the bus reports energized drivers");
+        assert_eq!(moved.frames, JOINTS + 1);
+    }
+
+    /// The return path: mode changes are reported, per-command churn is not.
+    #[tokio::test]
+    async fn the_return_path_reports_mode_changes_not_every_command() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let control = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        // The commander's view of the robot.
+        let mut reports = node
+            .subscriber::<ActuationState>(
+                Topic::pattern("amos/*/state/actuation").expect("pattern"),
+                Qos::for_channel(Channel::State),
+            )
+            .await
+            .expect("subscribe");
+        let me = PeerId::new("dog1").expect("peer");
+        let mut bridge = RobotBridge::new(control, MockRobotHal::new())
+            .reporting(node.publisher::<ActuationState>(actuation_topic(&me).expect("topic")));
+        let commander = node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        );
+
+        // 1. `arm`: drivers up, no motion — a mode change, so it is reported.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"arm"}"#))
+            .await
+            .expect("publish");
+        bridge.step().await.expect("step");
+        let first = reports.recv().await.expect("a report").message;
+        assert!(first.armed);
+        assert!(!first.estopped);
+        assert_eq!(first.gait, Some(Gait::Arm));
+        assert_eq!(first.estop_reason, None);
+        assert_eq!(first.last_refusal, None);
+        assert_eq!(first.watchdog_ms, None);
+
+        // 2. `trot`: a different gait ⇒ one report, carrying the command's own numbers.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot","speed":0.5}"#))
+            .await
+            .expect("publish");
+        bridge.step().await.expect("step");
+        let second = reports.recv().await.expect("a report").message;
+        assert_eq!(second.gait, Some(Gait::Trot));
+        assert_eq!(second.seq, Some(2));
+        assert_eq!(second.frames, JOINTS + 1);
+
+        // 3. The **same** gait again: the mode is unchanged, so no frame is spent on it —
+        //    a 50 Hz control stream must not become 50 state frames per second.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot","speed":0.9}"#))
+            .await
+            .expect("publish");
+        bridge.step().await.expect("step");
+        assert!(
+            reports.try_recv().expect("try_recv").is_none(),
+            "an unchanged mode is not republished"
+        );
+
+        // 4. `estop`: torque is cut and latched ⇒ reported, with the reason.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"estop"}"#))
+            .await
+            .expect("publish");
+        bridge.step().await.expect("step");
+        let third = reports.recv().await.expect("a report").message;
+        assert!(third.estopped);
+        assert!(!third.armed, "the bus de-energizes on an e-stop");
+        assert_eq!(third.estop_reason, Some(EstopReason::Commanded));
+
+        // 5. Motion while latched: refused — and the commander learns *that*, not silence.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot"}"#))
+            .await
+            .expect("publish");
+        assert!(matches!(
+            bridge.step().await.expect("step"),
+            BridgeEvent::Refused { .. }
+        ));
+        let fourth = reports.recv().await.expect("a report").message;
+        assert!(fourth.estopped, "still latched");
+        assert_eq!(fourth.last_refusal.as_ref().map(|r| r.seq), Some(5));
+        assert!(
+            fourth
+                .last_refusal
+                .as_ref()
+                .expect("refusal")
+                .reason
+                .contains("re-arm"),
+            "the reason names how to recover"
+        );
+    }
+
+    /// A malformed action is refused **and reported**: the agent that wrote it is the one
+    /// that needs to know.
+    #[tokio::test]
+    async fn a_refused_action_is_reported_with_its_reason() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let control = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let mut reports = node
+            .subscriber::<ActuationState>(
+                Topic::pattern("amos/*/state/actuation").expect("pattern"),
+                Qos::for_channel(Channel::State),
+            )
+            .await
+            .expect("subscribe");
+        let me = PeerId::new("dog1").expect("peer");
+        let mut bridge = RobotBridge::new(control, MockRobotHal::new())
+            .reporting(node.publisher::<ActuationState>(actuation_topic(&me).expect("topic")));
+
+        node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        )
+        .publish(&AgentAction::new(r#"{"action":"teleport"}"#))
+        .await
+        .expect("publish");
+        assert!(matches!(
+            bridge.step().await.expect("step"),
+            BridgeEvent::Refused { .. }
+        ));
+        let report = reports.recv().await.expect("a report").message;
+        assert_eq!(report.last_refusal.as_ref().map(|r| r.seq), Some(1));
+        assert!(!report.armed, "a refused action never armed anything");
+        assert_eq!(report.gait, None, "and it did not become the current gait");
+    }
+
+    /// The case the return path exists for: a **watchdog torque cut** is invisible to the
+    /// peer whose link just died, unless the robot says so.
+    #[tokio::test]
+    async fn a_watchdog_torque_cut_is_reported_to_the_commander() {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let control = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let mut reports = node
+            .subscriber::<ActuationState>(
+                Topic::pattern("amos/*/state/actuation").expect("pattern"),
+                Qos::for_channel(Channel::State),
+            )
+            .await
+            .expect("subscribe");
+        let me = PeerId::new("dog1").expect("peer");
+        let mut bridge =
+            RobotBridge::with_watchdog(control, MockRobotHal::new(), Duration::from_millis(30))
+                .reporting(node.publisher::<ActuationState>(actuation_topic(&me).expect("topic")));
+        let commander = node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        );
+
+        // Armed first, so the report that follows is unambiguously the trip.
+        commander
+            .publish(&AgentAction::new(r#"{"action":"arm"}"#))
+            .await
+            .expect("publish");
+        bridge.step().await.expect("step");
+        assert!(reports.recv().await.expect("armed report").message.armed);
+
+        // Now the link goes quiet and the deadman fires.
+        assert_eq!(
+            bridge.step().await.expect("step"),
+            BridgeEvent::Estopped {
+                reason: EstopReason::Watchdog,
+                frames: JOINTS,
+            }
+        );
+        let report = reports.recv().await.expect("watchdog report").message;
+        assert!(report.estopped, "the commander learns torque was cut");
+        assert_eq!(report.estop_reason, Some(EstopReason::Watchdog));
+        assert!(!report.armed);
+        assert_eq!(
+            report.watchdog_ms,
+            Some(30),
+            "the report carries the deadman period it was configured with"
+        );
     }
 }

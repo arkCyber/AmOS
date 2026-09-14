@@ -38,6 +38,9 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
      └── RobotBridge ◄── amos/dog1/control/action ◄────────┘  {"action":"trot","speed":0.8}
               │
               └──► MockRobotHal：aa55 01 01 e8030000 crc16 …（每关节一帧，CRC16-CCITT）
+
+  dog1  ── amos/dog1/state/actuation ──►  brain(pattern amos/*/state/actuation)
+         （**回程**：armed / estopped(+原因) / gait / 最近一次拒绝）
 ```
 
 **话题归属与发布者是两件事**：`amos/dog1/control/action` 这个**话题**属于被控对象（机器狗的控制输入），
@@ -55,7 +58,7 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 | `discovery` | `Beacon`（`AMLB │ ver=2 │ body_len │ CRC32 │ bincode` 帧）+ `PeerRegistry`（TTL 过期、按新鲜度排序、**静态对端永不过期**）+ `MockDiscovery` + **`BusDiscovery`/`spawn_federation`**（信标走链路自身传输：`amos/<peer>/telemetry/beacon`） | 注册表是**纯状态机**（时间作为参数传入）。信标帧带**长度 + CRC32**，且**两侧都检查**（`encode` 拒绝自己造出超限帧，`decode` 先于任何反序列化拒绝伪造长度/超限帧/CRC 不符），`PeerInfo::validate` 限制端点数量与长度 ⇒ 一条被损坏的「我是谁、来哪连我」不会变成一条被静默信任的假对端。版本 2 之前的节点会被**按版本拒绝**，而不是喂进另一种布局的 body。**静态对端**（`learn_peer`，锁定网络里没有组播）没有信标可错过，因此**不受 TTL 驱逐**（只会被 `forget_peer` 移除，或被它自己的信标转成被 TTL 管理的动态对端）；`learn_peer` 也**不会抹掉已测得的活跃度**（改端点不会把死板卡变活）。总线联邦让**任何传输**都能填满对端表（含 Zenoh），并**过滤自身回声**（节点绝不把自己当 peer） |
 | `lan`(feature) | `LanDiscovery`：UDP 组播信标（默认 `239.255.42.99:7446`，`AMOS_LINK_BEACON_ADDR` 覆盖），`SO_REUSEADDR/PORT` 让同机多进程共用一个端口；`spawn_announcer` **按周期重复**广播（不是开机喊一次） | 明文、未认证：这是**发现的提示**，不是身份证明（见 §6）。数据报上限（`MAX_DATAGRAM` 1024B）之外还有帧上限 `MAX_BEACON_BYTES = 512`：外来/超限/篡改报文一律被跳过而不是解析。**为什么要重复**：信标是收方唯一的证据，而证据会随 TTL 过期——只喊一次的节点**只有已经在听的**对端能发现（开机跑起来的机器狗、或一分钟后才入网的场边笔记本，都会看不见它）。周期由调用方给（CLI 用 TTL/3，与 `spawn_federation` 同一条规则：喊得比这更稀，别的表就会看到「加入—过期」反复循环 = 一个扑腾的节点）；每拍都带**新的** `Timestamp`（活着的对端不该一直自称"我刚开机的那一秒"） |
 | `telemetry` | `Heartbeat`（`amos/<peer>/telemetry/beat`，1 Hz）+ `NodeStatus`（JSON 自查）+ `spawn_heartbeat` | 心跳是**消息**，走同一条 pub/sub 通道，因此 `topics` 里看得见 |
-| `robot_hal` | `parse_command`(JSON 校验) → `plan`(步态→关节位姿) → `MotorFrame`(10 字节/CRC16) → `RobotHal` seam（`MockRobotHal`）；`RobotBridge` 带**死手看门狗 + 闩锁急停** | 大模型只能说 JSON；限位、关节范围、CRC 都由这一侧负责。`JointId` 索引**私有**（只能经 `new` 或在**反序列化时**校验得到），`MotorFrame::validate` 在 **CRC16 总线解码**与 **bincode `Message`** 两条路径上都强制（`MockRobotHal::apply` 也在写总线前拒绝整批）。安全语义见 §3.1 |
+| `robot_hal` | `parse_command`(JSON 校验) → `plan`(步态→关节位姿) → `MotorFrame`(10 字节/CRC16) → `RobotHal` seam（`MockRobotHal`）；`RobotBridge` 带**死手看门狗 + 闩锁急停**，并可 `reporting()` 把模式**回程**到 `amos/<robot>/state/actuation`（仅模式变化时发） | 大模型只能说 JSON；限位、关节范围、CRC 都由这一侧负责。`JointId` 索引**私有**（只能经 `new` 或在**反序列化时**校验得到），`MotorFrame::validate` 在 **CRC16 总线解码**与 **bincode `Message`** 两条路径上都强制（`MockRobotHal::apply` 也在写总线前拒绝整批）。安全语义见 §3.1 |
 | `sequence` | `SeqTracker` / `SeqEvent` / `SeqSummary`：按**发布者**跟踪 `seq` 高水位 ⇒ `in_order` / `gaps` / `missing` / `stale` | 纯状态机（无 IO、无时钟）。「帧丢了」由**发布者自己的计数器**证明，而不是猜：一次跳变 = 一次 gap 事件，`missing` 记它丢了多少帧；等于/低于高水位的帧算 `stale`（重复/乱序/计数器重启），**不混进「丢帧」**。CLI `sub` / `bench` / `watch` 都用它把丢帧变成数字 |
 | `node` | `LinkNode`：身份 + 传输 + 时钟 + 计数器 + 对端表，`publisher::<T>()` / `subscriber::<T>()` 的唯一入口 | 控制面与 CLI 都是它的薄壳 |
 | `service` | tonic 控制面（`proto/robot_link.proto`：GetStatus / ListTopics / Publish / StreamHeartbeats），已挂进 `amos-ai::server::serve()` 的共享 UDS | 控制面≠数据面：RPC 只做管理，字节流永不经过它 |
@@ -81,6 +84,7 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 | **算术极值不溢出** | 限位检查是**区间比较**而非 `abs()`；`Timestamp::unix_ms` 饱和；`SeqTracker` 的 `expected = last + 1` 用 `checked_add`；CLI `--hz` 走 `Duration::try_from_secs_f64`（**不是**会 panic 的 `from_secs_f64`） | 这些值全部来自线上/大模型/命令行：`i32::MIN.abs()` 会 panic（debug）或在 release **回绕后通过检查**，`secs = u64::MAX` 会让 `secs * 1000` 溢出，`--hz 1e-300` 会让 `from_secs_f64` 直接 panic —— 安全层与工具都不能有这种边角 |
 | **定时器周期必须非零** | `spawn_heartbeat`/`spawn_federation` 对 `Duration::ZERO` 返回**带类型错误**；两处 tick 都设 `MissedTickBehavior::Delay`（错过的心跳/信标**不补发**） | `tokio::time::interval(0)` 会在**被 spawn 的 task 内部** panic：调用方拿到的是一个「看着活着、其实已死」的句柄 —— 「静默死亡」不是「关停」，这一条在本仓被单独拒绝 |
 | **非有限浮点不选位姿** | `Gait::pose` 对 `NaN`/`±inf` 一律取**最慢**位姿；位姿表长度与关节数由**编译期断言**钉住（`const _: () = assert!(JOINTS == MAX_JOINT + 1)`） | `f32::clamp` 会传播 NaN，而 `NaN as i32 == 0` 会产生**比任何合法速度都更直**的站姿；一个非法请求绝不能换来更激进的动作。编译期断言让「位姿表 ↔ 关节范围」的一致性由**编译器**而不是评审者保证 |
+| **回程（模式上报）** | `RobotBridge::reporting(publisher)` 之后，桥在 `amos/<robot>/state/actuation`（`state` 通道 = **最新值胜**）上报 `armed` / `estopped`(+原因) / 当前 `gait` / **最近一次拒绝**；`seq`/`frames` 等逐指令细节**不参与"变化"判定**，所以 50 Hz 控制流不会变成 50 帧/秒的状态流 | 「机器人停了」这件事，**掉线的那个对端恰恰无法轮询**：Wi-Fi 断掉触发看门狗切扭矩时，只有机器人主动说，大脑才知道自己那条 `trot` 没在跑（否则它一直以为在跑）。**上报失败不会让 `step()` 返回 Err**：安全动作已经发生，把一次链路抖动说成"没停"是更坏的谎 |
 
 `BridgeEvent` 的三种结果与 `metrics` 的关系是刻意的：**被拒的指令仍然算 `delivered`**（帧确实到了，
 是安全层拒绝执行），这与「帧丢了」是两件不同的事实。
@@ -202,6 +206,9 @@ cargo run -p amos-link-cli -- motor --action '{"action":"trot","speed":0.5}'
 cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 5 --timeout-ms 2000   # 末行报告 gaps/missing/stale/loss
 cargo run -p amos-link-cli -- sub --pattern 'amos/*/control/*' --count 1 --timeout-ms 1000  # 档位由 channel 决定（reliable）
 # 注意 `--timeout-ms`：默认 0 = 永远等，没有发布者时这条命令**不会返回**（本文件的示例一律给上界）。
+cargo run -p amos-link-cli -- state --timeout-ms 2000   # 回程：机器人自报的模式（armed/estopped/gait/拒绝）
+# 注意：`sub`/`state` 订阅的是**本进程**的 broker；要看**另一个进程**（板卡）说了什么，
+# 用 `--transport zenoh`（真网络），或者板卡侧自己跑 RobotBridge + reporting。
 cargo run -p amos-link-cli -- discover --peer dog1 --kind robot --lan --seconds 9   # 真 UDP 信标（重复广播）
 cargo run -p amos-link-cli -- discover --peer field-brain --lan --seconds 5         # 另一个进程：两台互相看得见
 cargo run -p amos-link-cli -- discover --bus --seconds 3   # 联邦：链路自身的对端表

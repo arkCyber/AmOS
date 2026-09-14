@@ -26,7 +26,8 @@ use amos_link::node::LinkNode;
 use amos_link::pubsub::{Publisher, Subscriber};
 use amos_link::qos::Qos;
 use amos_link::robot_hal::{
-    AgentAction, BridgeEvent, EstopReason, MockRobotHal, MotorOp, RobotBridge, RobotHal, JOINTS,
+    actuation_topic, ActuationState, AgentAction, BridgeEvent, EstopReason, Gait, MockRobotHal,
+    MotorOp, RobotBridge, RobotHal, JOINTS,
 };
 use amos_link::sequence::{SeqEvent, SeqTracker};
 use serde::{Deserialize, Serialize};
@@ -338,4 +339,121 @@ async fn a_subscriber_that_is_gone_does_not_stall_an_unrelated_topic() {
     assert_eq!(high_rate.seq(), 50);
     drop(control);
     assert!(metrics.snapshot().published >= 50);
+}
+
+/// The **return path**: the brain learns the robot stopped, without asking it.
+///
+/// The scenario a field deployment actually hits — the link goes quiet mid-gait, the
+/// robot's deadman cuts torque, and the peer whose link is the thing that died is **told**.
+/// Before the return path existed `RobotBridge::step` returned `Estopped` to its *local*
+/// caller only, so the field server kept believing its `trot` was still running.
+///
+/// It also pins the topic doctrine of `docs/amos-link.md` §2 on the wire: the topic
+/// `amos/dog1/state/actuation` belongs to the robot and is published by the robot — the
+/// envelope's `publisher` says so, which is why the payload does not repeat it.
+#[tokio::test]
+async fn the_brain_observes_a_watchdog_torque_cut_on_the_state_channel() {
+    let metrics = Arc::new(LinkMetrics::new());
+    let clock = Arc::new(Clock::host());
+    let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+
+    let robot = LinkNode::with_parts(
+        PeerId::new("dog1").expect("peer"),
+        NodeKind::Robot,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+    let brain = LinkNode::with_parts(
+        PeerId::new("mini-brain").expect("peer"),
+        NodeKind::Brain,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+    let dog1 = PeerId::new("dog1").expect("peer");
+
+    // The robot's control loop, reporting its actuation state (same node = same identity).
+    let control = robot
+        .subscriber::<AgentAction>(
+            Topic::pattern("amos/dog1/control/*").expect("pattern"),
+            Qos::control(),
+        )
+        .await
+        .expect("subscribe control");
+    let mut bridge =
+        RobotBridge::with_watchdog(control, MockRobotHal::new(), Duration::from_millis(30))
+            .reporting(robot.publisher::<ActuationState>(actuation_topic(&dog1).expect("topic")));
+
+    // The field server watches every robot's mode on the `state` channel.
+    let mut reports = brain
+        .subscriber::<ActuationState>(
+            Topic::pattern("amos/*/state/actuation").expect("pattern"),
+            Qos::for_channel(Channel::State),
+        )
+        .await
+        .expect("subscribe state");
+
+    // ── the brain commands a trot; the robot applies it and reports the new mode ──
+    brain
+        .publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        )
+        .publish(&AgentAction::new(r#"{"action":"trot","speed":0.6}"#))
+        .await
+        .expect("publish trot");
+    assert_eq!(
+        bridge.step().await.expect("step"),
+        BridgeEvent::Applied {
+            seq: 1,
+            frames: JOINTS + 1,
+            armed: true
+        }
+    );
+    let trotting = reports.recv().await.expect("a state report");
+    assert_eq!(trotting.message.gait, Some(Gait::Trot));
+    assert!(trotting.message.armed);
+    assert!(!trotting.message.estopped);
+    // The robot is the publisher of its own state topic — not the brain that commanded it.
+    assert_eq!(
+        trotting.publisher, dog1,
+        "the state topic belongs to (and is published by) the robot"
+    );
+    assert_eq!(trotting.topic, actuation_topic(&dog1).expect("topic"));
+
+    // ── the link dies mid-gait: the deadman cuts torque, and the brain is told ──
+    assert_eq!(
+        bridge.step().await.expect("step"),
+        BridgeEvent::Estopped {
+            reason: EstopReason::Watchdog,
+            frames: JOINTS,
+        }
+    );
+    let stopped = reports.recv().await.expect("a state report").message;
+    assert!(stopped.estopped, "the commander learns torque was cut");
+    assert_eq!(stopped.estop_reason, Some(EstopReason::Watchdog));
+    assert!(!stopped.armed);
+    assert_eq!(stopped.watchdog_ms, Some(30));
+    // …and the robot is latched: a stale `trot` from a queue cannot revive it.
+    brain
+        .publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        )
+        .publish(&AgentAction::new(r#"{"action":"trot"}"#))
+        .await
+        .expect("publish stale trot");
+    assert!(matches!(
+        bridge.step().await.expect("step"),
+        BridgeEvent::Refused { .. }
+    ));
+    let refusal = reports.recv().await.expect("a state report").message;
+    assert!(
+        refusal
+            .last_refusal
+            .as_ref()
+            .expect("refusal")
+            .reason
+            .contains("re-arm"),
+        "the brain is told why its command did nothing, and how to recover"
+    );
 }

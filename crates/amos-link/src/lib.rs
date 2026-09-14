@@ -94,8 +94,8 @@ pub use node::{LinkNode, VERSION};
 pub use pubsub::{Publisher, Received, Subscriber};
 pub use qos::{DropPolicy, Qos, Reliability};
 pub use robot_hal::{
-    AgentAction, Gait, JointId, JointTarget, MockRobotHal, MotorFrame, MotorOp, RobotBridge,
-    RobotCommand, RobotHal,
+    actuation_topic, ActuationState, AgentAction, Gait, JointId, JointTarget, MockRobotHal,
+    MotorFrame, MotorOp, Refusal, RobotBridge, RobotCommand, RobotHal, ACTUATION_NAME,
 };
 pub use sequence::{SeqEvent, SeqSummary, SeqTracker};
 pub use telemetry::{

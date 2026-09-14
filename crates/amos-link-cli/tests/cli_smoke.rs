@@ -162,6 +162,16 @@ fn remote_mode_refuses_commands_that_need_a_local_node_and_bad_sockets() {
     );
     assert!(stderr.contains("bench"), "the refusal names it: {stderr}");
 
+    // `state` is a subscription too (the robot's own reports), so it needs a local node —
+    // the control plane can answer `status` but not stream the data plane.
+    let (code, _, stderr) = run(&["state", "--socket", &socket]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("state"), "the refusal names it: {stderr}");
+    assert!(
+        stderr.contains("needs a local data-plane node"),
+        "got: {stderr}"
+    );
+
     // `motor` takes no link at all, so a socket is a mistake, not an instruction.
     let (code, _, stderr) = run(&[
         "motor",
@@ -261,6 +271,48 @@ fn pub_reports_what_it_published() {
             "--hz {hz} must not panic, got: {stderr}"
         );
     }
+}
+
+#[test]
+fn state_watches_the_return_path_and_is_bounded_by_a_timeout() {
+    // `state` reads what robots report about themselves (`amos/*/state/actuation`). On a
+    // quiet link it must say what it did and exit — and the QoS profile must be *derived*
+    // from the pattern's channel (`state`, latest-wins), never remembered by hand.
+    let (code, stdout, stderr) = run(&["state", "--timeout-ms", "50"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("watching amos/*/state/actuation"),
+        "the default pattern covers every robot, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("from channel state"),
+        "the profile is derived from the channel, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("timeout after 50ms with no report"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("stats received=0"), "got: {stdout}");
+
+    // `--pattern` narrows it to one robot, and an unusable pattern is refused (not ignored).
+    let (code, stdout, stderr) = run(&[
+        "state",
+        "--pattern",
+        "amos/dog1/state/actuation",
+        "--timeout-ms",
+        "50",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("watching amos/dog1/state/actuation"),
+        "got: {stdout}"
+    );
+    let (code, _, stderr) = run(&["state", "--pattern", "not a pattern"]);
+    assert_eq!(
+        code, 1,
+        "an unusable pattern is a failure, not a silent default"
+    );
+    assert!(stderr.contains("not a valid pattern"), "got: {stderr}");
 }
 
 #[test]

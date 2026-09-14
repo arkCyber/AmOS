@@ -35,11 +35,14 @@ use std::time::{Duration, Instant};
 use amos_link::codec::Message;
 use amos_link::discovery::{NodeKind, PeerId, PeerInfo, PeerRegistry, PeerView};
 use amos_link::health::LinkHealth;
-use amos_link::keyexpr::Topic;
+use amos_link::keyexpr::{Channel, Topic};
 use amos_link::node::LinkNode;
 use amos_link::pubsub::Received;
 use amos_link::qos::Qos;
-use amos_link::robot_hal::{parse_command, plan, AgentAction, MockRobotHal, MotorFrame, RobotHal};
+use amos_link::robot_hal::{
+    parse_command, plan, ActuationState, AgentAction, MockRobotHal, MotorFrame, RobotHal,
+    ACTUATION_NAME,
+};
 use amos_link::sequence::{SeqEvent, SeqTracker};
 use amos_link::telemetry::{heartbeat_pattern, Heartbeat, DEFAULT_HEARTBEAT_PERIOD};
 use amos_proto::amos_link::robot_link_client::RobotLinkClient;
@@ -60,6 +63,8 @@ USAGE:
     amos-link-cli discover [--peer <ID>]...   Show the peer table (mock or --lan)
     amos-link-cli watch [--seconds N]         Heartbeat + federation: live link liveness
     amos-link-cli motor --action <JSON>       Translate an agent action into motor frames
+    amos-link-cli state [--pattern <P>]       What robots report about themselves (default:
+                           amos/*/state/actuation): armed / e-stopped / gait / refusals
 
 OPTIONS:
         --peer <ID>        This node's id (default: amos-node; $AMOS_LINK_PEER)
@@ -107,6 +112,8 @@ pub enum Cmd {
     Watch,
     /// Translate an agent action into motor frames.
     Motor,
+    /// Watch what robots report about themselves on `amos/<robot>/state/actuation`.
+    State,
 }
 
 impl Cmd {
@@ -121,6 +128,7 @@ impl Cmd {
             Cmd::Discover => "discover",
             Cmd::Watch => "watch",
             Cmd::Motor => "motor",
+            Cmd::State => "state",
         }
     }
 }
@@ -230,6 +238,7 @@ where
             "-h" | "--help" => opts.help = true,
             "-V" | "--version" => opts.version = true,
             "status" | "topics" | "pub" | "sub" | "bench" | "discover" | "watch" | "motor"
+            | "state"
                 if cmd.is_none() =>
             {
                 cmd = Some(match arg.as_str() {
@@ -240,6 +249,7 @@ where
                     "bench" => Cmd::Bench,
                     "discover" => Cmd::Discover,
                     "watch" => Cmd::Watch,
+                    "state" => Cmd::State,
                     _ => Cmd::Motor,
                 });
             }
@@ -336,6 +346,7 @@ fn resolve_peer(cli: String, cmd: Cmd) -> String {
         Cmd::Bench => "link-bench".to_string(),
         Cmd::Watch => "link-watch".to_string(),
         Cmd::Motor => "motor-tool".to_string(),
+        Cmd::State => "link-state".to_string(),
         _ => "amos-node".to_string(),
     }
 }
@@ -479,6 +490,7 @@ pub async fn run(opts: Opts) -> Result<()> {
             );
         }
         Cmd::Bench => run_bench(&node, &opts).await?,
+        Cmd::State => run_state(&node, &opts).await?,
         Cmd::Watch => run_watch(&node, &opts).await?,
         // Already handled above (they never build a node); kept exhaustive so adding a
         // command to `Cmd` forces a decision here.
@@ -575,7 +587,7 @@ async fn run_remote(opts: &Opts, socket: PathBuf) -> Result<()> {
         }
         Cmd::Pub => run_remote_pub(opts, &mut link, &remote).await?,
         Cmd::Watch => run_remote_watch(opts, &mut link, &remote).await?,
-        Cmd::Sub | Cmd::Bench | Cmd::Discover => bail!(
+        Cmd::Sub | Cmd::Bench | Cmd::Discover | Cmd::State => bail!(
             "`{}` needs a local data-plane node, not a control plane: --socket exposes \
              status / topics / pub / watch (drop --socket to run it locally)",
             opts.cmd.key()
@@ -817,10 +829,10 @@ fn period_of(opts: &Opts) -> Result<Option<Duration>> {
 }
 
 /// Receive one frame, honouring `--timeout-ms` (0 = wait forever).
-async fn recv_with_timeout(
-    subscriber: &mut amos_link::pubsub::Subscriber<AgentAction>,
+async fn recv_with_timeout<T: Message>(
+    subscriber: &mut amos_link::pubsub::Subscriber<T>,
     timeout_ms: u64,
-) -> Result<Option<Received<AgentAction>>> {
+) -> Result<Option<Received<T>>> {
     if timeout_ms == 0 {
         return Ok(Some(
             subscriber.recv().await.context("subscription closed")?,
@@ -1153,6 +1165,127 @@ fn print_peers(peers: &[PeerView]) {
             peer.info.endpoint().unwrap_or("-")
         );
     }
+}
+
+/// Render one actuation report: the human line(s), or one JSON document with `--json`.
+///
+/// Pure (lines out, no printing) so the exact rendering an operator reads is unit-testable —
+/// the same rule this CLI follows for every other command's output.
+fn state_lines(received: &Received<ActuationState>, json: bool) -> Vec<String> {
+    let state = &received.message;
+    if json {
+        return vec![serde_json::json!({
+            "robot": received.publisher.as_str(),
+            "seq": state.seq,
+            "gait": state.gait.map(|g| g.key()),
+            "frames": state.frames,
+            "armed": state.armed,
+            "estopped": state.estopped,
+            "estop_reason": state.estop_reason.map(|r| r.key()),
+            "watchdog_ms": state.watchdog_ms,
+            "last_refusal": state.last_refusal.as_ref().map(|r| serde_json::json!({
+                "seq": r.seq,
+                "reason": r.reason,
+            })),
+            "stamp_ms": received.stamp.unix_ms(),
+        })
+        .to_string()];
+    }
+    let mut lines = vec![format!(
+        "robot={} armed={} estopped={}{} gait={} frames={} seq={} watchdog={}",
+        received.publisher,
+        state.armed,
+        state.estopped,
+        state
+            .estop_reason
+            .map(|r| format!("({})", r.key()))
+            .unwrap_or_default(),
+        state.gait.map(|g| g.key()).unwrap_or("-"),
+        state.frames,
+        state
+            .seq
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        state
+            .watchdog_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".to_string()),
+    )];
+    if let Some(refusal) = state.last_refusal.as_ref() {
+        lines.push(format!(
+            "  last refusal: seq {} — {}",
+            refusal.seq, refusal.reason
+        ));
+    }
+    lines
+}
+
+/// Print one actuation report.
+fn print_state(received: &Received<ActuationState>, json: bool) -> Result<()> {
+    for line in state_lines(received, json) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// `state`: watch what robots report about themselves on `amos/<robot>/state/actuation`.
+///
+/// This is the **return path** of the control loop
+/// ([`ActuationState`](amos_link::robot_hal::ActuationState)): a robot whose bridge has a
+/// state publisher reports its *mode* there — armed, e-stopped (and why), the current gait,
+/// and the last refusal. An operator (or the brain that commanded it) can therefore tell an
+/// applied command from a refused one, and can see a **watchdog torque cut** without asking
+/// the robot anything — the peer whose link died is exactly the one that cannot poll.
+///
+/// Bounded like `sub`: `--count` reports or `--timeout-ms`, and a timeout is reported as a
+/// fact rather than hanging (the default `--timeout-ms 0` still waits forever).
+async fn run_state(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
+    let pattern = match opts.pattern.as_deref() {
+        Some(raw) => Topic::pattern(raw.to_string())
+            .with_context(|| format!("`--pattern {raw}` is not a valid pattern"))?,
+        None => Topic::pattern(format!("amos/*/{}/{ACTUATION_NAME}", Channel::State.key()))
+            .context("building the default state pattern")?,
+    };
+    // The channel decides the profile: a state report is latest-wins, so a burst of modes
+    // cannot leave a consumer acting on one that already expired.
+    let (qos, source) = match opts.qos {
+        Some(qos) => (qos, "--qos".to_string()),
+        None => (
+            Qos::for_channel(Channel::State),
+            format!("channel {}", Channel::State.key()),
+        ),
+    };
+    let mut reports = node
+        .subscriber::<ActuationState>(pattern.clone(), qos)
+        .await
+        .with_context(|| format!("subscribing to {pattern}"))?;
+    let count = opts.count.unwrap_or(1);
+    println!(
+        "watching {pattern} qos={}/{} from {} (waiting for {count} report(s))",
+        qos.reliability.key(),
+        qos.drop_policy.key(),
+        source
+    );
+    for _ in 0..count {
+        let received = match recv_with_timeout(&mut reports, opts.timeout_ms).await? {
+            Some(report) => report,
+            None => {
+                println!(
+                    "timeout after {}ms with no report (received {})",
+                    opts.timeout_ms,
+                    reports.stats().received
+                );
+                break;
+            }
+        };
+        print_state(&received, opts.json)?;
+    }
+    let stats = reports.stats();
+    println!(
+        "stats received={} dropped={} decode_errors={} (state is latest-wins per robot)",
+        stats.received, stats.dropped, stats.decode_errors
+    );
+    Ok(())
 }
 
 /// `watch`: publish this node's heartbeat, join the peer federation, and print the
@@ -1531,9 +1664,99 @@ mod tests {
             );
         }
         for command in [
-            "status", "topics", "pub", "sub", "bench", "discover", "watch", "motor",
+            "status", "topics", "pub", "sub", "bench", "discover", "watch", "motor", "state",
         ] {
             assert!(USAGE.contains(command), "{command} is missing from USAGE");
         }
+    }
+
+    /// The `state` command's rendering: what an operator reads about the return path.
+    #[test]
+    fn the_state_command_renders_the_return_path() {
+        use amos_link::codec::Timestamp;
+        use amos_link::robot_hal::{ActuationState, EstopReason, Gait, Refusal};
+
+        let report = |message: ActuationState| Received {
+            message,
+            topic: Topic::new("amos/dog1/state/actuation").expect("topic"),
+            publisher: PeerId::new("dog1").expect("peer"),
+            seq: 1,
+            stamp: Timestamp::now(),
+            frame_len: 0,
+        };
+        let trotting = ActuationState {
+            seq: Some(2),
+            gait: Some(Gait::Trot),
+            frames: 13,
+            armed: true,
+            estopped: false,
+            estop_reason: None,
+            watchdog_ms: Some(1000),
+            last_refusal: None,
+        };
+
+        // A trotting robot: gait, frames, and the deadman period it runs under.
+        let line = state_lines(&report(trotting.clone()), false);
+        assert_eq!(line.len(), 1);
+        assert_eq!(
+            line[0],
+            "robot=dog1 armed=true estopped=false gait=trot frames=13 seq=2 watchdog=1000ms"
+        );
+
+        // A watchdog torque cut — the fact the return path exists for.
+        let stopped = state_lines(
+            &report(ActuationState {
+                armed: false,
+                estopped: true,
+                estop_reason: Some(EstopReason::Watchdog),
+                ..trotting.clone()
+            }),
+            false,
+        );
+        assert_eq!(stopped.len(), 1, "nothing was refused, so one line");
+        assert!(stopped[0].contains("armed=false"), "got: {}", stopped[0]);
+        assert!(
+            stopped[0].contains("estopped=true(watchdog)"),
+            "the reason is named: {}",
+            stopped[0]
+        );
+
+        // A refusal adds the *why*: the operator learns how to recover.
+        let refused = state_lines(
+            &report(ActuationState {
+                seq: Some(3),
+                estopped: true,
+                estop_reason: Some(EstopReason::Commanded),
+                watchdog_ms: None,
+                last_refusal: Some(Refusal {
+                    seq: 3,
+                    reason: "e-stop latched".to_string(),
+                }),
+                ..trotting.clone()
+            }),
+            false,
+        );
+        assert_eq!(refused.len(), 2);
+        assert!(refused[1].contains("seq 3"), "got: {}", refused[1]);
+        assert!(refused[1].contains("e-stop latched"), "got: {}", refused[1]);
+
+        // `--json` is one machine-readable document carrying the same facts.
+        let json = state_lines(
+            &report(ActuationState {
+                armed: false,
+                estopped: true,
+                estop_reason: Some(EstopReason::Watchdog),
+                ..trotting
+            }),
+            true,
+        );
+        assert_eq!(json.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&json[0]).expect("json");
+        assert_eq!(value["robot"], "dog1");
+        assert_eq!(value["gait"], "trot");
+        assert_eq!(value["estopped"], true);
+        assert_eq!(value["estop_reason"], "watchdog");
+        assert_eq!(value["watchdog_ms"].as_u64(), Some(1000));
+        assert!(value["stamp_ms"].as_u64().expect("stamp") > 1_000_000_000_000);
     }
 }

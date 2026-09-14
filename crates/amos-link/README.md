@@ -40,6 +40,10 @@ Four pieces, in the order data flows:
 - **Robot HAL**: an agent's JSON intent is validated, expanded into a gait pose and
   encoded as CRC-checked motor frames over a `RobotHal` seam, with a latched e-stop and a
   deadman watchdog.
+- **A return path**: a bridge can `reporting()` its **mode** back on
+  `amos/<robot>/state/actuation` (armed / e-stopped + why / which gait / the last refusal),
+  published **only when the mode changes** — so a commander can tell an applied command from
+  a refused one, and a watchdog torque cut is visible to the very peer whose link died.
 
 It is **not**: a scheduler (you own the control thread and its rate), a ROS compatibility
 layer (no `.msg`/IDL, no DDS wire), or a replacement for the daemon's authenticated UDS
@@ -59,7 +63,7 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 | `src/zenoh.rs` | *(feature `zenoh`)* the inter-board transport |
 | `src/telemetry.rs` | `Heartbeat` + `NodeStatus` + `spawn_heartbeat` |
 | `src/sequence.rs` | `SeqTracker`: per-publisher gaps/duplicates, so "a frame was lost" is a number |
-| `src/robot_hal.rs` | `AgentAction` → `plan()` → `MotorFrame` (CRC16) → `RobotHal`; `RobotBridge` with e-stop + watchdog |
+| `src/robot_hal.rs` | `AgentAction` → `plan()` → `MotorFrame` (CRC16) → `RobotHal`; `RobotBridge` with e-stop + watchdog, and `reporting()` for the mode return path |
 | `src/health.rs` | `LinkHealth::evaluate` — the fold from counters to a verdict |
 | `src/node.rs` | `LinkNode`: identity + transport + clock + counters + peer table |
 | `src/service.rs` | the tonic control plane (`proto/robot_link.proto`) mounted by `amos-ai` |
@@ -86,7 +90,7 @@ cargo run -p amos-link --example robot_brain_loop
 
 | example | shows |
 |---|---|
-| `robot_brain_loop` | two nodes on one broker: a depth frame the brain decodes (latest-wins), its measured age, the control action that reaches the robot's bus, the 13 CRC-checked motor frames, the latched e-stop refusing motion, and the counters + health verdict |
+| `robot_brain_loop` | two nodes on one broker: a depth frame the brain decodes (latest-wins), its measured age, the control action that reaches the robot's bus, the 13 CRC-checked motor frames, the mode the brain reads back off `state`, the latched e-stop refusing motion (with the refusal reported), and the counters + health verdict |
 
 What the run prints (real output, abbreviated):
 
