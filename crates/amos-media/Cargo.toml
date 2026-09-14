@@ -14,7 +14,7 @@ path = "src/lib.rs"
 thiserror = "1"
 serde.workspace = true
 serde_json = "1"
-base64 = "0.21"
+base64 = "0.23"
 # Real Android MediaStore backend (`src/android.rs`, feature `android`): talks to
 # the Kotlin `MediaStoreGlue` in the System UI APK over JNI (String↔String JSON).
 # Optional so desktop/CI stay light.
