@@ -96,7 +96,7 @@ pub use qos::{DropPolicy, Qos, Reliability};
 pub use robot_hal::{
     actuation_pattern, actuation_topic, ActuationState, AgentAction, Gait, JointId, JointTarget,
     MockRobotHal, MotorFrame, MotorOp, Refusal, RobotBridge, RobotCommand, RobotHal,
-    ACTUATION_NAME, DEFAULT_REPORT_REFRESH,
+    StreamRobotHal, ACTUATION_NAME, DEFAULT_REPORT_REFRESH,
 };
 pub use sequence::{SeqEvent, SeqSummary, SeqTracker};
 pub use telemetry::{

@@ -430,27 +430,35 @@ impl PeerRegistry {
     /// The default beacon TTL: three missed beacons at the default 1 Hz cadence.
     pub const DEFAULT_TTL: Duration = Duration::from_secs(3);
 
-    /// A registry that forgets a peer after `ttl` without a beacon.
+    /// A registry that forgets a peer after `ttl` without a beacon, and **without an
+    /// identity of its own**.
     ///
-    /// Without a local id every peer is accepted, including one that names this node — the
-    /// shape a *test* wants (a table with no identity of its own). Production constructors
-    /// ([`LinkNode`](crate::node::LinkNode), the CLI sweep) use
-    /// [`PeerRegistry::with_local`].
-    pub fn new(ttl: Duration) -> Self {
+    /// Test-only, and deliberately so: a table that was never told whose table it is accepts
+    /// every peer, *including one that names this node* — the exact state the invariant above
+    /// forbids. Production constructors ([`LinkNode`](crate::node::LinkNode), the CLI's
+    /// `discover` sweep) use [`PeerRegistry::with_local`], and this constructor is not
+    /// compiled into a non-test build, so "a node is never its own peer" is a property of the
+    /// crate's API rather than of a review. The unit test that exercises it
+    /// (`a_node_is_never_a_peer_of_itself`) is the only place that an identity-less table can
+    /// still be observed.
+    #[cfg(test)]
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self::with_identity(ttl, None)
+    }
+
+    /// The one place a registry's fields are set: identity either is known, or it is not.
+    fn with_identity(ttl: Duration, local: Option<PeerId>) -> Self {
         Self {
             ttl,
             peers: BTreeMap::new(),
-            local: None,
+            local,
             self_entries_refused: 0,
         }
     }
 
     /// A registry that refuses to record **this node itself** as a peer (see the type docs).
     pub fn with_local(ttl: Duration, local: PeerId) -> Self {
-        Self {
-            local: Some(local),
-            ..Self::new(ttl)
-        }
+        Self::with_identity(ttl, Some(local))
     }
 
     /// This node's id, when the registry was told it.
@@ -615,11 +623,16 @@ impl PeerRegistry {
     }
 }
 
-impl Default for PeerRegistry {
-    fn default() -> Self {
-        Self::new(Self::DEFAULT_TTL)
-    }
-}
+// There is deliberately **no `Default`** for `PeerRegistry`.
+//
+// Until this round there was one, and it was a hole in the invariant above: `Default` is a
+// standard trait, so `PeerRegistry::default()`, `.unwrap_or_default()`, a `#[derive(Default)]`
+// on any struct holding one — or a downstream crate — could build the identity-less table
+// that accepts its own node as a peer, *in a production build*, without ever naming the
+// test-only constructor. A registry that was not told whose table it is cannot refuse
+// anything, so there is no correct default to give: the constructor requires an identity
+// (`PeerRegistry::with_local`) and the compiler enforces it (removing the anonymous
+// constructor made that `impl` fail to compile — it was the only production caller).
 
 /// The topic beacons travel on: `amos/<peer>/telemetry/beacon`.
 pub const BEACON_TOPIC: &str = "beacon";
@@ -1021,8 +1034,9 @@ mod tests {
         assert_eq!(registry.peers(now).len(), 1);
         assert_eq!(registry.self_entries_refused(), 3);
 
-        // A registry with no identity of its own (`new`) keeps accepting everything — the
-        // shape a table-only unit test wants; production constructors use `with_local`.
+        // A registry with no identity of its own (`new`, `cfg(test)`-only) keeps accepting
+        // everything — the shape a table-only unit test wants. It cannot exist in a
+        // production build, which is what makes the invariant a property of the API.
         let mut anonymous = PeerRegistry::new(PeerRegistry::DEFAULT_TTL);
         assert!(
             anonymous.observe(&own, now),
@@ -1284,7 +1298,8 @@ mod tests {
 
     #[test]
     fn peers_are_ordered_by_freshness() {
-        let mut reg = PeerRegistry::default();
+        let mut reg =
+            PeerRegistry::with_local(PeerRegistry::DEFAULT_TTL, PeerId::new("me").expect("peer"));
         reg.observe(&Beacon::new(peer("old"), stamp(100)), stamp(100));
         reg.observe(&Beacon::new(peer("new"), stamp(102)), stamp(102));
         let views = reg.peers(stamp(102));

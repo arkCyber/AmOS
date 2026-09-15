@@ -34,8 +34,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::path::Path;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::{LinkError, Result};
 use crate::keyexpr::{Channel, Topic};
@@ -748,6 +752,35 @@ pub fn plan(command: &RobotCommand) -> Vec<MotorFrame> {
     frames
 }
 
+/// The drivers' energized state **after** a batch, derived from the ops in wire order.
+///
+/// An `any()` over the batch — which is what both HALs used to do — answers the wrong
+/// question: a batch that ends with `Enable` leaves a real driver armed, and a batch that
+/// ends with `Estop`/`Disable` leaves it dead, *whatever else is in it*. Order-blindness
+/// silently inverted the state of a mixed batch, and the number it produced was then
+/// reported to the commander as a measurement ([`ActuationState::armed`]). The fold makes
+/// the last arming-relevant op the one that decides, which is what a bus does.
+///
+/// Position/torque frames carry no arming meaning and leave the state alone.
+fn armed_after(armed: bool, frames: &[MotorFrame]) -> bool {
+    frames.iter().fold(armed, |state, frame| match frame.op {
+        MotorOp::Enable => true,
+        MotorOp::Disable | MotorOp::Estop => false,
+        MotorOp::SetPosition | MotorOp::SetTorque => state,
+    })
+}
+
+/// The per-joint torque cut a HAL sends when torque must be gone **now**.
+///
+/// One `Estop` frame per joint, in a fixed-size array: this is part of the safety path, so
+/// its shape is decided at compile time (NASA Power of 10 #2 — no resource that can grow at
+/// runtime, no "sometimes" batch). It is *our* bus shape, not a law of robotics: a driver
+/// whose bus cuts torque with a single broadcast frame reports `1` from
+/// [`RobotHal::estop`], which is exactly why that method returns a measured count.
+fn full_torque_cut() -> [MotorFrame; JOINTS] {
+    std::array::from_fn(|index| MotorFrame::new(JointId(index as u8), MotorOp::Estop, 0))
+}
+
 /// A HAL that records what a real bus would have sent.
 #[derive(Debug)]
 pub struct MockRobotHal {
@@ -809,27 +842,19 @@ impl RobotHal for MockRobotHal {
             .map_err(|_| LinkError::Robot("mock HAL poisoned".to_string()))?;
         record.extend_from_slice(frames);
         drop(record);
-        if frames.iter().any(|f| f.op == MotorOp::Enable) {
-            self.armed.store(true, Ordering::SeqCst);
-        }
-        if frames
-            .iter()
-            .any(|f| matches!(f.op, MotorOp::Disable | MotorOp::Estop))
-        {
-            self.armed.store(false, Ordering::SeqCst);
-        }
+        // Wire order decides (see `armed_after`): the last arming-relevant op in the batch
+        // is the state the drivers are left in.
+        let armed = armed_after(self.armed.load(Ordering::SeqCst), frames);
+        self.armed.store(armed, Ordering::SeqCst);
         self.applied
             .fetch_add(frames.len() as u64, Ordering::Relaxed);
         Ok(frames.len())
     }
 
     async fn estop(&self) -> Result<usize> {
-        let frames: Vec<MotorFrame> = (0..=MAX_JOINT)
-            .map(|j| MotorFrame::new(JointId(j), MotorOp::Estop, 0))
-            .collect();
         // Measured, not assumed: `apply` returns what the bus accepted, so the bridge's
         // report carries a number this HAL actually wrote.
-        self.apply(&frames).await
+        self.apply(&full_torque_cut()).await
     }
 
     fn armed(&self) -> bool {
@@ -838,6 +863,165 @@ impl RobotHal for MockRobotHal {
 
     fn name(&self) -> &'static str {
         "mock"
+    }
+}
+
+/// A HAL that writes the frames to a **real byte stream** — the shape a servo bus actually
+/// has on a robot: a UART character device, a Unix socket a controller daemon listens on,
+/// or a TCP bridge in front of a CAN adapter.
+///
+/// What it is *not*: a driver. Baud rate, parity, CAN bit timing and driver-enable lines are
+/// the device's business — a deployment configures the port (`stty -F /dev/ttyUSB0 1M raw`
+/// before start) and this HAL writes the bytes. What it *is*: the code path between
+/// "validated frame" and "the wire", with the two properties a bus layer must have and a
+/// mock cannot demonstrate:
+///
+/// 1. **Nothing is written before the whole batch validates.** A refused frame must not
+///    leave the joints half-commanded — the same rule [`MockRobotHal`] documents, now on a
+///    real descriptor (its test reads the socket and finds **zero** bytes).
+/// 2. **The accepted count is the number really written.** It advances only after
+///    `write_all` returned for that frame, so a driver failure mid-batch is reported with
+///    the frames that did get out — never with a number taken from the plan.
+///
+/// [`RobotHal::armed`] is the running fold of the ops that were actually written
+/// ([`armed_after`]), so it is a measurement of the wire, not of the caller's intent.
+pub struct StreamRobotHal<W> {
+    writer: tokio::sync::Mutex<W>,
+    armed: AtomicBool,
+    written: AtomicU64,
+}
+
+impl<W> StreamRobotHal<W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    /// Wrap any async byte sink (a device file, a socket, a recording pipe in a test).
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer: tokio::sync::Mutex::new(writer),
+            armed: AtomicBool::new(false),
+            written: AtomicU64::new(0),
+        }
+    }
+
+    /// Frames actually written to the bus since this HAL was created.
+    pub fn frames_written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
+    }
+
+    /// Bytes actually written (`frames × FRAME_LEN`) — the odometer a bus log would show.
+    pub fn bytes_written(&self) -> u64 {
+        self.frames_written().saturating_mul(FRAME_LEN as u64)
+    }
+}
+
+impl<W> std::fmt::Debug for StreamRobotHal<W> {
+    /// The bus's *state*, never its contents: a writer may be a socket or a device file, and
+    /// `Debug` is what a failing assertion prints. (Field reads, not the accessors: `Debug`
+    /// must not require the writer to be an `AsyncWrite`.)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamRobotHal")
+            .field("armed", &self.armed.load(Ordering::SeqCst))
+            .field("frames_written", &self.written.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl StreamRobotHal<tokio::fs::File> {
+    /// Open a **character device** (a serial/UART port, a PTY pair) read-write and write
+    /// frames to it.
+    ///
+    /// The honest boundary, stated where it bites: this opens the path and writes bytes. It
+    /// does **not** configure the port — termios (baud rate, `raw` mode, flow control) is
+    /// the deployment's step, done before the node starts
+    /// (`stty -F /dev/ttyUSB0 1M raw`), because a HAL that silently reconfigures a bus
+    /// someone else may own is worse than one that writes exactly what it was given. A
+    /// write to a port whose parameters are wrong still succeeds at this layer; the driver
+    /// then sees garbage, which is why port setup is part of the bring-up runbook and not of
+    /// this call.
+    pub async fn open_device(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .await
+            .map_err(|e| {
+                LinkError::Transport(format!("opening the motor bus {}: {e}", path.display()))
+            })?;
+        Ok(Self::new(file))
+    }
+}
+
+#[cfg(unix)]
+impl StreamRobotHal<tokio::net::UnixStream> {
+    /// Connect to a motor controller that listens on a **Unix socket** and write frames to
+    /// it (the shape a board-local servo daemon has).
+    ///
+    /// A refused connection is an error the caller sees at startup, not a bus that silently
+    /// accepts nothing: a robot whose motor daemon is down must never report `armed: true`.
+    pub async fn connect_unix(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
+            LinkError::Transport(format!(
+                "connecting to the motor bus {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self::new(stream))
+    }
+}
+
+#[async_trait]
+impl<W> RobotHal for StreamRobotHal<W>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    async fn apply(&self, frames: &[MotorFrame]) -> Result<usize> {
+        // The safety layer, before a single byte moves: a partial write leaves the joints
+        // in a mixed state, which is worse than refusing the command.
+        for frame in frames {
+            frame.validate()?;
+        }
+        let mut writer = self.writer.lock().await;
+        let mut armed = self.armed.load(Ordering::SeqCst);
+        let mut accepted = 0usize;
+        for frame in frames {
+            let bytes = frame.encode();
+            writer.write_all(&bytes).await.map_err(|e| {
+                LinkError::Transport(format!(
+                    "the motor bus refused frame {accepted}/{} (joint {}): {e}",
+                    frames.len(),
+                    frame.joint.index()
+                ))
+            })?;
+            accepted += 1;
+            // The flag follows the bytes that really reached the descriptor: a failure
+            // reported below must not leave `armed()` describing frames that never left.
+            armed = armed_after(armed, std::slice::from_ref(frame));
+            self.armed.store(armed, Ordering::SeqCst);
+            self.written.fetch_add(1, Ordering::Relaxed);
+        }
+        writer.flush().await.map_err(|e| {
+            LinkError::Transport(format!(
+                "flushing the motor bus after {accepted} frame(s): {e}"
+            ))
+        })?;
+        Ok(accepted)
+    }
+
+    async fn estop(&self) -> Result<usize> {
+        // Measured like `apply`: the report says how many frames the bus really took.
+        self.apply(&full_torque_cut()).await
+    }
+
+    fn armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
+    }
+
+    fn name(&self) -> &'static str {
+        "stream"
     }
 }
 
@@ -1676,6 +1860,37 @@ mod tests {
         hal.clear();
         assert!(hal.frames().is_empty());
         assert_eq!(hal.applied(), before);
+    }
+    #[tokio::test]
+    async fn the_mock_hal_answers_the_armed_question_from_the_wire_order() {
+        // The defect this pins (found while threading a real bus through the same helper):
+        // the flag was computed by two `any()` passes, so a batch that **ended** with
+        // `Enable` reported `armed: false` as soon as it mentioned an `Estop` anywhere —
+        // exactly the state that decides whether the next movement command is allowed, and
+        // exactly the value the bridge publishes as a measurement.
+        let hal = MockRobotHal::new();
+        let enable = MotorFrame::new(JointId::new(0).expect("joint"), MotorOp::Enable, 0);
+        let estop = MotorFrame::new(JointId::new(1).expect("joint"), MotorOp::Estop, 0);
+
+        hal.apply(&[enable, estop]).await.expect("apply");
+        assert!(!hal.armed(), "the last op was a torque cut");
+
+        hal.apply(&[estop, enable])
+            .await
+            .expect("a re-arm after a cut is one batch");
+        assert!(hal.armed(), "the last op was Enable");
+
+        // A position frame carries no arming meaning: it must not flip the state either way.
+        let position =
+            MotorFrame::new(JointId::new(2).expect("joint"), MotorOp::SetPosition, 1_000);
+        hal.apply(&[position]).await.expect("apply");
+        assert!(hal.armed(), "a set point is not an arming op");
+
+        // And the same rule across batches: the state is carried, not recomputed.
+        hal.apply(&[estop]).await.expect("apply");
+        assert!(!hal.armed());
+        hal.apply(&[position]).await.expect("apply");
+        assert!(!hal.armed(), "a cut is not undone by a set point");
     }
 
     #[tokio::test]

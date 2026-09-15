@@ -41,7 +41,7 @@ use amos_link::pubsub::Received;
 use amos_link::qos::Qos;
 use amos_link::robot_hal::{
     actuation_pattern, parse_command, plan, ActuationState, AgentAction, EstopReason, Gait,
-    MockRobotHal, MotorFrame, Refusal, RobotHal,
+    MockRobotHal, MotorFrame, Refusal, RobotHal, StreamRobotHal,
 };
 use amos_link::sequence::{SeqEvent, SeqTracker};
 use amos_link::telemetry::{heartbeat_pattern, Heartbeat, DEFAULT_HEARTBEAT_PERIOD};
@@ -63,6 +63,8 @@ USAGE:
     amos-link-cli discover [--peer <ID>]...   Show the peer table (mock or --lan)
     amos-link-cli watch [--seconds N]         Heartbeat + federation: live link liveness
     amos-link-cli motor --action <JSON>       Translate an agent action into motor frames
+    amos-link-cli motor --action <JSON> --device <PATH>
+                           …and write those frames to a real motor bus
     amos-link-cli state [--pattern <P>]       What robots report about themselves (default:
                            amos/*/state/actuation): armed / e-stopped / gait / refusals
 
@@ -88,6 +90,11 @@ OPTIONS:
                            instead of a local node: status / topics / pub / watch read the
                            running robot (`sub`/`bench`/`discover` need a local node and
                            are refused by name)
+        --device <PATH>    `motor`: write the frames to a *real* bus instead of the mock —
+                           a Unix socket a motor controller listens on, or a character
+                           device (a serial/UART port; configure it first, e.g.
+                           `stty -F /dev/ttyUSB0 1M raw`). Frames leave as CRC16-checked
+                           motor frames, and the count printed is the count written.
         --json             `sub`/`watch`/`status --socket`: print each line as JSON
     -h, --help             Print this help and exit
     -V, --version          Print version and exit
@@ -184,6 +191,9 @@ pub struct Opts {
     /// Address a *running* node's control plane on this Unix socket instead of building a
     /// local one (`None` = local node).
     pub socket: Option<PathBuf>,
+    /// `motor`: write the frames to this real bus (a Unix socket or a character device)
+    /// instead of the mock (`None` = mock).
+    pub device: Option<PathBuf>,
     /// `-h`.
     pub help: bool,
     /// `-V`.
@@ -213,6 +223,7 @@ impl Opts {
             timeout_ms: 0,
             json: false,
             socket: None,
+            device: None,
             help: false,
             version: false,
         }
@@ -320,6 +331,7 @@ where
             }
             "--json" => opts.json = true,
             "--socket" => opts.socket = Some(PathBuf::from(value("--socket")?)),
+            "--device" => opts.device = Some(PathBuf::from(value("--device")?)),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -344,6 +356,15 @@ where
     // A second positional command is a typo, not a request to run two things.
     opts.cmd = cmd;
     opts.peer = resolve_peer(opts.peer, cmd);
+    // `--device` writes motor frames, so it belongs to `motor` alone — and that is a *usage*
+    // error (exit 2), refused here where the rest of the argv shape is checked: silently
+    // ignoring it would leave an operator believing frames went to a bus never opened.
+    if opts.device.is_some() && opts.cmd != Cmd::Motor {
+        return Err(format!(
+            "--device writes motor frames and belongs to `motor` (this is `{}`)",
+            opts.cmd.key()
+        ));
+    }
     Ok(opts)
 }
 
@@ -1178,6 +1199,22 @@ async fn run_discover_lan(opts: &Opts) -> Result<()> {
         period.as_millis(),
         opts.seconds
     );
+    // What the socket was *actually* configured with (a pinned interface, a suppressed
+    // loopback): on a multi-NIC board this is the difference between "the LAN carried
+    // nothing" and "the beacon left through the wrong NIC", and an operator cannot tell them
+    // apart from the peer table alone.
+    let applied = channel.options();
+    println!(
+        "beacon iface={} loop={}",
+        applied
+            .iface
+            .map_or_else(|| "kernel-default".to_string(), |a| a.to_string()),
+        match applied.multicast_loop {
+            Some(true) => "on".to_string(),
+            Some(false) => "off".to_string(),
+            None => "platform-default".to_string(),
+        }
+    );
     // `tokio::time::Instant` is a wrapper over the same `std::time::Instant`, so the one
     // overflow-safe helper covers both clocks.
     let deadline =
@@ -1595,7 +1632,12 @@ async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
     Ok(())
 }
 
-/// The pure command: agent JSON → validated intent → motor frames → the mock bus.
+/// The pure command: agent JSON → validated intent → motor frames → a bus.
+///
+/// The bus is the mock unless the operator names a real one with `--device`: the same frames
+/// then go to a Unix socket a controller listens on, or to a character device (a serial/UART
+/// port). Either way the last line reports what the *bus* accepted — `apply` returns the count
+/// it really wrote, so the number is a measurement in both cases (docs/amos-link.md §3.1).
 async fn run_motor(opts: &Opts) -> Result<()> {
     let action = opts
         .action
@@ -1614,18 +1656,76 @@ async fn run_motor(opts: &Opts) -> Result<()> {
     for frame in &frames {
         println!("{}", render_frame(frame));
     }
-    // Write them to the mock bus, so the reported line comes from a real apply() path.
-    let hal = MockRobotHal::new();
-    let applied = hal
-        .apply(&frames)
+
+    match opts.device.as_deref() {
+        // The default: a mock bus, so the reported line still comes from a real `apply()`.
+        None => {
+            let hal = MockRobotHal::new();
+            let applied = hal
+                .apply(&frames)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "applied {applied} frame(s) to hal={} armed={}",
+                hal.name(),
+                hal.armed()
+            );
+        }
+        Some(path) => {
+            let hal = open_motor_bus(path).await?;
+            let applied = hal
+                .apply(&frames)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "applied {applied} frame(s) to hal={} armed={} at {}",
+                hal.name(),
+                hal.armed(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Open the operator's motor bus as a byte sink the HAL can write frames to.
+///
+/// Two shapes are real on a robot, and the path says which one it is: a **Unix socket** a
+/// controller daemon listens on (`connect`), or a **character device** — a serial/UART port or
+/// a PTY — which is opened read-write. Everything else (a regular file, a directory) is refused
+/// by the OS with an error that names the path, which is the honest outcome: silently creating
+/// a file called `/dev/ttyUSB0` is not a service.
+///
+/// Port parameters (baud, `raw` mode) are **not** set here — see `StreamRobotHal::open_device`
+/// for why: a CLI that reconfigures a bus someone else may own is worse than one that writes
+/// what it was given.
+#[cfg(unix)]
+async fn open_motor_bus(path: &Path) -> Result<Box<dyn RobotHal>> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("opening the motor bus {}", path.display()))?;
+    if metadata.file_type().is_socket() {
+        let hal = StreamRobotHal::connect_unix(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        return Ok(Box::new(hal));
+    }
+    let hal = StreamRobotHal::open_device(path)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!(
-        "applied {applied} frame(s) to hal={} armed={}",
-        hal.name(),
-        hal.armed()
-    );
-    Ok(())
+    Ok(Box::new(hal))
+}
+
+/// On a platform with no Unix sockets there is no motor bus this CLI can open: say so rather
+/// than pretend the device was written to.
+#[cfg(not(unix))]
+async fn open_motor_bus(path: &Path) -> Result<Box<dyn RobotHal>> {
+    bail!(
+        "--device `{}` is only supported on Unix (the motor bus is a socket or a device file)",
+        path.display()
+    )
 }
 
 /// One motor frame as a bus log line: `joint op arg hex`.

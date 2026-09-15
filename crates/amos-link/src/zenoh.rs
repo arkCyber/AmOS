@@ -294,15 +294,104 @@ mod tests {
         }
     }
 
-    /// A real session round trip: two subscribers on one key expression, one publish.
+    /// A Zenoh config for a peer that talks to exactly one other peer on loopback.
     ///
-    /// `#[ignore]`d because it opens a real Zenoh session (peer mode + multicast
-    /// scouting) and is therefore environment-dependent — the gate scans ignore
-    /// ignored tests on purpose. Run it by hand on a networked host:
+    /// `key` is `listen/endpoints` or `connect/endpoints`. Scouting is **off** on purpose:
+    /// this test is about the session, not about discovery, and leaving multicast scouting on
+    /// would make it depend on the network — the property that forced the old test into
+    /// `#[ignore]`.
+    fn peer_config(key: &str, endpoint: &str) -> zenoh::Config {
+        let mut config = zenoh::Config::default();
+        config.insert_json5("mode", "\"peer\"").expect("peer mode");
+        config
+            .insert_json5("scouting/multicast/enabled", "false")
+            .expect("scouting off");
+        config
+            .insert_json5("scouting/gossip/enabled", "false")
+            .expect("gossip off");
+        config
+            .insert_json5(key, &format!("[\"{endpoint}\"]"))
+            .expect("endpoint");
+        config
+    }
+
+    /// A TCP port nobody is listening on right now (probe, release, hand it to the session).
+    fn free_tcp_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        probe.local_addr().expect("probe address").port()
+    }
+
+    /// A real session round trip between two sessions in one process, over TCP loopback.
+    ///
+    /// The previous round left this boundary as "`#[ignore]`d: it opens a real session (peer
+    /// mode + multicast scouting) and is environment-dependent". The round trip itself does not
+    /// need scouting to be *unpredictable*: two peers with explicit endpoints on loopback are a
+    /// real session (real TCP, real handshake, real pub/sub routing) that any host can run, so
+    /// the assertion is deterministic and the test no longer needs ignoring. What stays a field
+    /// item is *scouting* across hosts (`scouting_finds_a_peer_on_a_real_network`, ignored
+    /// below): that one needs a network someone else controls.
+    ///
+    /// The scheduler is explicit and deliberate: `#[tokio::test]` defaults to the
+    /// **current-thread** scheduler, and Zenoh's runtime *panics* on it ("Please use multi
+    /// thread scheduler instead"). The previous round's `#[ignore]`d test was written with the
+    /// default — so it could not have passed on any machine, and being ignored is why nobody
+    /// found out. A test that cannot run is not a boundary; it is a gap with a note on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_typed_frame_crosses_a_real_session_over_tcp_loopback() {
+        let port = free_tcp_port();
+        let listens = format!("tcp/127.0.0.1:{port}");
+        let listener = ZenohTransport::open_with(peer_config("listen/endpoints", &listens))
+            .await
+            .expect("the listening session opens");
+        let dialer = ZenohTransport::open_with(peer_config("connect/endpoints", &listens))
+            .await
+            .expect("the connecting session opens");
+        assert_eq!(dialer.name(), "zenoh");
+
+        // The subscriber lives on the *listening* side, the publisher on the connecting one:
+        // the frame therefore has to cross the session boundary to be seen.
+        let mut sub = crate::pubsub::Subscriber::<crate::telemetry::Heartbeat>::subscribe(
+            listener.clone().shared(),
+            Topic::pattern("amos/**/telemetry/beat").expect("pattern"),
+            Qos::sensor(),
+            Arc::new(crate::metrics::LinkMetrics::new()),
+        )
+        .await
+        .expect("subscribe on the listening session");
+        // A session is asynchronous: the link has to be established before a put is routed.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let shared = dialer.clone().shared();
+        let peer = crate::discovery::PeerId::new("dog1").expect("peer");
+        let publisher = crate::pubsub::Publisher::new(
+            shared,
+            Topic::new("amos/dog1/telemetry/beat").expect("topic"),
+            peer.clone(),
+            Arc::new(crate::codec::Clock::host()),
+            Arc::new(crate::metrics::LinkMetrics::new()),
+        );
+        let beat = crate::telemetry::Heartbeat::new(peer, 1, crate::codec::Timestamp::now(), 5);
+        publisher.publish(&beat).await.expect("publish");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
+            .await
+            .expect("a frame crosses the session")
+            .expect("recv");
+        assert_eq!(received.message, beat, "the payload survives the wire");
+        assert_eq!(received.publisher.as_str(), "dog1");
+        // A network transport cannot enumerate what other nodes publish: it says so.
+        assert!(listener.topics().await.is_empty(), "network bus: unknown");
+    }
+
+    /// Scouting: two peers that were *not* told about each other find each other on the LAN.
+    ///
+    /// Ignored because it is the one part that needs the network to cooperate (multicast
+    /// scouting, and a second host or at least a second interface): a sandbox or a locked-down
+    /// runner cannot promise it. Run it on a real pair of boards/laptops:
     /// `cargo test -p amos-link --features zenoh -- --ignored`.
-    #[tokio::test]
-    #[ignore = "opens a real Zenoh session (network/scouting); run manually"]
-    async fn a_typed_frame_crosses_a_real_session() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs real multicast scouting on the local network; run manually"]
+    async fn scouting_finds_a_peer_on_a_real_network() {
         let transport = ZenohTransport::open().await.expect("open session");
         assert_eq!(transport.name(), "zenoh");
         let shared = transport.clone().shared();
@@ -329,6 +418,5 @@ mod tests {
             .expect("a frame arrives over the session")
             .expect("recv");
         assert_eq!(received.message, beat);
-        assert!(transport.topics().await.is_empty(), "network bus: unknown");
     }
 }

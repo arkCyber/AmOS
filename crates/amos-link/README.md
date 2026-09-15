@@ -49,6 +49,12 @@ Four pieces, in the order data flows:
   deadman watchdog. A torque cut comes back from the HAL as a **measured** frame count
   (`estop() -> Result<usize>`), so the report of a watchdog stop says what the bus really
   took instead of assuming one frame per joint.
+- **A real byte-stream HAL** (`StreamRobotHal`): the frames go to a real descriptor — a motor
+  controller's Unix socket, or a character device (a serial/UART port) — with the two
+  properties a bus layer must have: **the whole batch validates before any byte moves**, and
+  **the accepted count is the count written**. `armed()` is folded from the ops in **wire
+  order**, so a batch that ends with an e-stop cannot report the drivers as energized.
+  Port parameters (baud/`raw`) stay the deployment's job (see the boundaries below).
 - **A return path**: a bridge can `reporting()` its **mode** back on
   `amos/<robot>/state/actuation` (armed / e-stopped + why / which gait / the last refusal),
   published **only when the mode changes** — so a commander can tell an applied command from
@@ -123,6 +129,8 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
 | variable | meaning | read by |
 |---|---|---|
 | `AMOS_LINK_BEACON_ADDR` | beacon target `ip:port` (default `239.255.42.99:7446`) | `src/lan.rs` |
+| `AMOS_LINK_BEACON_IFACE` | pin the beacon channel to one interface (a local IPv4 address). **Required on a multi-NIC board**: the outgoing datagram and the group join both bind to it, instead of the kernel choosing (which can send the beacon out the 5G modem while the camera board listens on Wi-Fi). A bad value is refused at startup, never ignored. | `src/lan.rs` |
+| `AMOS_LINK_BEACON_LOOP` | multicast loopback switch (`1`/`0`, default: the platform's). Turning it off hides our own beacons from **every** local process, so it is not the correctness mechanism — the peer table's self-refusal is. | `src/lan.rs` |
 | `AMOS_LINK_ZENOH_ENDPOINT` | Zenoh endpoints, comma-separated (`tcp/10.0.0.7:7447`) | `src/zenoh.rs` |
 
 ## Honest boundaries
@@ -136,10 +144,22 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
   its frequency are the caller's (a real product runs 50–100 Hz).
 - **`zenoh-pico` / MCU** is out of scope: this is the host/board-side Rust middleware, not a
   firmware library.
+- **Not a motor driver.** [`StreamRobotHal`] writes bytes to a device or a socket; it does not
+  configure the port — termios (baud rate, `raw` mode, flow control) is the deployment's step
+  before the node starts (`stty -F /dev/ttyUSB0 1M raw`). A wrong port setting still "succeeds"
+  at this layer, which is why it is a bring-up item.
+- **No real servo has been driven by this code.** The evidence is "correct CRC16 frames on a real
+  descriptor" (`tests/hardware_hal.rs`), not "the joints moved".
 - **`shm`, `unstable` per-call QoS, encrypted transports**: deliberately not used — see
   `docs/amos-link.md` §4/§6 for each ❌ together with its reason.
-- Cross-**board** multicast behaviour (switch IGMP, Wi-Fi power save) is a field
-  verification item; the `lan` tests prove the protocol on loopback, not on a switch.
+- **Multicast on a real switch is still a field item**: the `lan` tests now prove the *protocol and
+  the socket configuration* on a real multicast group over a real interface (`tests/lan_multicast.rs`),
+  including the self-echo; what no loopback test can promise is the switch in between — IGMP
+  snooping, STP, Wi-Fi power save — so pin the interface (`AMOS_LINK_BEACON_IFACE`) and verify on
+  the real hardware.
+- **Zenoh session round trips are tested; Zenoh *scouting* across hosts is not.** Two peers with
+  explicit endpoints over TCP loopback are a real session and run in CI; `scouting_finds_a_peer_on_a_real_network`
+  stays `#[ignore]`d because it needs a network someone else controls.
 
 ## Related
 

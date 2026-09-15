@@ -40,11 +40,14 @@
  * Scope boundaries (honest, not silently assumed):
  *   * Inline `mod name { … }` bodies are not resolved — no feature-gated inline module
  *     carries tests today; the declaration form read here is the one the repo uses.
- *   * `#[path = "…"]` indirection is not followed, and a file-level `#![cfg(feature)]` is
- *     out of scope (neither exists today — checked).
- *   * `crates/<crate>/tests/` files are not scanned: they are separate test *targets* whose own
- *     feature gating would need a `--features` variant of the workspace run, a different
- *     (and today empty) question.
+ *   * `#[path = "…"]` indirection is not followed.
+ *   * **Integration test targets** (`crates/<crate>/tests/*.rs`) are scanned for a
+ *     crate-root `#![cfg(feature = "…")]` (rule 3, REQ-A243) — that is the shape where the
+ *     whole *target* disappears, and it needs a step that both enables the feature and does
+ *     not restrict itself to `--lib`. Files nested under `tests/` (e.g. `tests/support/…`)
+ *     are not targets and are not scanned; neither is a `#[cfg]` on an individual item of an
+ *     integration test (rule 2 covers that shape inside `src/`, and the two would need the
+ *     same step).
  *   * Coverage is *syntactic*: it reads the Makefile, so a test step a human deletes is
  *     reported, but a feature enabled transitively (e.g. `android` pulling in
  *     `amos-radio/android`) is not credited — the gate asks for the explicit step.
@@ -168,6 +171,82 @@ export function hasRunnableTest(source) {
     // `#[ignore]` may be written above or below the test attribute.
     return !/#\[ignore/.test(lines.slice(Math.max(0, i - 2), i + 3).join("\n"));
   });
+}
+
+/**
+ * Top-level `crates/<crate>/tests/*.rs` — the files cargo treats as **integration test
+ * targets**. A nested file (`tests/support/counting_alloc.rs`) is a *module* the targets
+ * include, not a target of its own, so only the top level is read here.
+ */
+export function integrationTargets(dir = join(root, "crates")) {
+  const out = [];
+  if (!existsSync(dir)) return out;
+  for (const crate of readdirSync(dir)) {
+    const testsDir = join(dir, crate, "tests");
+    if (!existsSync(testsDir) || !statSync(testsDir).isDirectory()) continue;
+    for (const entry of readdirSync(testsDir)) {
+      const p = join(testsDir, entry);
+      if (entry.endsWith(".rs") && statSync(p).isFile()) out.push(p);
+    }
+  }
+  return out.sort();
+}
+
+/**
+ * The crate-root `#![cfg(feature = "…")]` of an integration target, as a sorted feature
+ * list (empty when the target is ungated).
+ *
+ * This is rule 3 (REQ-A243), and it exists because the first two rules cannot see this
+ * shape: a *whole target* gated by an inner attribute is not compiled at all without the
+ * feature, so `cargo test --workspace` says nothing about it, and `scan()` never looks in
+ * `tests/`. Measured when the rule was added: `crates/amos-link/tests/lan_multicast.rs`
+ * (the real multicast tests) ran in **no** Makefile step, because the step that enables
+ * `lan` was `cargo test -p amos-link --features amos-link/lan --lib` — and `--lib` is not
+ * one of `--all-targets`/`--bins`/`--examples`, so the target stayed unbuilt (the file
+ * existed, was reviewed, and executed nothing).
+ */
+export function targetGate(source) {
+  const out = new Set();
+  for (const raw of source.split("\n")) {
+    const t = raw.trim();
+    if (t === "" || t.startsWith("//")) continue;
+    // Inner attributes must come first in a file, so the first item ends the search.
+    if (!t.startsWith("#![cfg(")) break;
+    if (/#!\[cfg\(\s*not\s*\(/.test(t)) continue; // the opposite gate: it runs by default
+    for (const m of t.matchAll(/feature\s*=\s*"([^"]+)"/g)) out.add(m[1]);
+  }
+  return [...out].sort();
+}
+
+/**
+ * Integration targets whose tests no `cargo test` step runs — one finding per (file,
+ * feature). Unlike the other two rules, enabling the feature is **not** enough: a step that
+ * says `--lib` (or names another target) compiles… nothing of this file, so the step must
+ * also select this target (`--all-targets`, or `--test <name>`).
+ */
+export function uncoveredGatedTargets(dir = join(root, "crates")) {
+  const makefile = readFileSync(join(root, "Makefile"), "utf8");
+  const invocations = testInvocations(makefile);
+  const findings = [];
+  for (const file of integrationTargets(dir)) {
+    const pkg = crateOf(file);
+    if (pkg === null) continue;
+    let src;
+    try {
+      src = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    const features = targetGate(src);
+    if (features.length === 0 || !hasRunnableTest(src)) continue;
+    const name = file.split("/").pop().replace(/\.rs$/, "");
+    const runs = invocations.some(
+      (inv) => covers(inv, pkg, features[0]) && runsTarget(inv, name),
+    );
+    if (runs) continue;
+    for (const feature of features) findings.push({ file: rel(file), pkg, feature });
+  }
+  return findings.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
 }
 
 /** Feature-gated modules that contain tests. One finding per (file, feature). */
@@ -309,6 +388,12 @@ export function testInvocations(makefile) {
       workspace: false,
       allFeatures: false,
       noRun: false,
+      /** `--lib` (or a `--bins`/`--examples`-only selection): the lib target, not the rest. */
+      libOnly: false,
+      /** `--all-targets` (or `--tests`): every target of the package. */
+      broadTargets: false,
+      /** `--test <name>` selections. */
+      namedTargets: [],
       text: joined,
     };
     for (let j = 0; j < args.length; j++) {
@@ -318,6 +403,11 @@ export function testInvocations(makefile) {
       else if (a === "--workspace" || a === "--all") inv.workspace = true;
       else if (a === "--all-features") inv.allFeatures = true;
       else if (a === "--no-run") inv.noRun = true;
+      else if (a === "--lib") inv.libOnly = true;
+      else if (a === "--all-targets" || a === "--tests") inv.broadTargets = true;
+      else if (a === "--test") inv.namedTargets.push(args[++j] ?? "");
+      else if (a.startsWith("--test=")) inv.namedTargets.push(a.slice("--test=".length));
+      else if (a === "--bins" || a === "--examples" || a === "--benches") inv.libOnly = true;
       else if (a === "--features" || a === "-F") inv.features.push(...(args[++j] ?? "").split(/[,\s]+/));
       else if (a.startsWith("--features=")) {
         inv.features.push(...a.slice("--features=".length).split(/[,\s]+/));
@@ -339,6 +429,20 @@ export function covers(inv, pkg, feature) {
   if (!inv.workspace && !inv.packages.includes(pkg)) return false;
   if (inv.allFeatures) return true;
   return inv.features.includes(`${pkg}/${feature}`) || inv.features.includes(feature);
+}
+
+/**
+ * Whether `inv` executes the integration target `name` of the package it covers.
+ *
+ * `--lib` is the trap this exists for: it is a *target* flag, so `cargo test -p p --features
+ * f --lib` enables the feature and still never builds `tests/<name>.rs`. An invocation with
+ * no target flag at all is broad (cargo runs every target), `--all-targets`/`--tests` say so
+ * explicitly, and `--test <name>` names this one.
+ */
+export function runsTarget(inv, name) {
+  if (inv.noRun) return false;
+  if (inv.namedTargets.includes(name)) return true;
+  return !inv.libOnly && (inv.broadTargets || inv.namedTargets.length === 0);
 }
 
 function runSelfTest() {
@@ -399,6 +503,48 @@ function runSelfTest() {
   check(
     "--workspace --features pkg/f covers it",
     covers({ packages: [], features: ["x/f"], workspace: true, allFeatures: false, noRun: false }, "x", "f"),
+  );
+
+  // Rule 3 (REQ-A243): a feature-gated integration *target*.
+  check(
+    "a crate-root feature gate is read",
+    JSON.stringify(targetGate('#![cfg(feature = "lan")]\n\nuse x;\n')) === JSON.stringify(["lan"]),
+  );
+  check(
+    "an ungated target has no gate",
+    targetGate('#![cfg(unix)]\n\n#[test]\nfn a() {}\n').length === 0,
+  );
+  check(
+    "a gate that appears after an item is not a file-level gate",
+    targetGate('use x;\n#![cfg(feature = "lan")]\n').length === 0,
+  );
+  check(
+    "`#![cfg(not(feature = …))]` is the opposite gate and never counts",
+    targetGate('#![cfg(not(feature = "lan"))]\n\n#[test]\nfn a() {}\n').length === 0,
+  );
+  check(
+    "`--lib` does NOT run an integration target",
+    !runsTarget({ noRun: false, libOnly: true, broadTargets: false, namedTargets: [] }, "lan_multicast"),
+  );
+  check(
+    "no target flag at all is broad",
+    runsTarget({ noRun: false, libOnly: false, broadTargets: false, namedTargets: [] }, "lan_multicast"),
+  );
+  check(
+    "`--all-targets` runs it",
+    runsTarget({ noRun: false, libOnly: false, broadTargets: true, namedTargets: [] }, "lan_multicast"),
+  );
+  check(
+    "`--test <name>` runs that one",
+    runsTarget({ noRun: false, libOnly: true, broadTargets: false, namedTargets: ["lan_multicast"] }, "lan_multicast"),
+  );
+  check(
+    "`--test <other>` does not",
+    !runsTarget({ noRun: false, libOnly: true, broadTargets: false, namedTargets: ["hardware_hal"] }, "lan_multicast"),
+  );
+  check(
+    "`tests/support/…` is not a target",
+    integrationTargets().every((f) => !f.includes("/tests/support/")),
   );
 
   check("a test item is found", TEST_ITEM.test("fn a() {}\n#[cfg(test)]\nmod tests {\n  #[test]\n  fn t() {}\n}\n"));
@@ -482,18 +628,33 @@ for (const f of findings) {
 }
 const gatedFindings = uncoveredGatedTests();
 const gatedUncovered = gatedFindings.filter((f) => !(`${f.pkg}/${f.feature}` in allowGated));
+const targetFindings = uncoveredGatedTargets();
+const targetUncovered = targetFindings.filter(
+  (f) => !(`${f.pkg}/${f.feature}` in (allowFile.gatedTargets ?? {})),
+);
 const stale = [
   ...Object.keys(allow).filter((file) => !findings.some((f) => f.file === file)),
   ...Object.keys(allowGated).filter(
     (k) => !gatedFindings.some((f) => `${f.pkg}/${f.feature}` === k),
   ),
+  ...Object.keys(allowFile.gatedTargets ?? {}).filter(
+    (k) => !targetFindings.some((f) => `${f.pkg}/${f.feature}` === k),
+  ),
 ];
 
 if (args.includes("--json")) {
   console.log(
-    JSON.stringify({ findings, uncovered, gatedFindings, gatedUncovered, stale }, null, 2),
+    JSON.stringify(
+      { findings, uncovered, gatedFindings, gatedUncovered, targetFindings, targetUncovered, stale },
+      null,
+      2,
+    ),
   );
-  process.exit(uncovered.length === 0 && gatedUncovered.length === 0 && stale.length === 0 ? 0 : 1);
+  process.exit(
+    uncovered.length === 0 && gatedUncovered.length === 0 && targetUncovered.length === 0 && stale.length === 0
+      ? 0
+      : 1,
+  );
 }
 
 for (const f of uncovered) {
@@ -508,11 +669,19 @@ for (const f of gatedUncovered) {
       `add a step: cargo test -p ${f.pkg} --features ${f.pkg}/${f.feature}`,
   );
 }
-for (const file of stale) console.log(`  stale allow-list entry: ${file} (no longer a finding)`);
-if (uncovered.length > 0 || gatedUncovered.length > 0 || stale.length > 0) {
+for (const f of targetUncovered) {
   console.log(
-    `[feature-test-scan] FAIL — ${uncovered.length} feature-gated module(s) and ` +
-      `${gatedUncovered.length} feature-gated test item(s) are run by no \`cargo test\` step, ` +
+    `  never run: ${f.file} — the whole target is behind \`#![cfg(feature = "${f.feature}")]\`; ` +
+      `add a step that enables the feature **and** builds the target (no \`--lib\`): ` +
+      `cargo test -p ${f.pkg} --features ${f.pkg}/${f.feature}`,
+  );
+}
+for (const file of stale) console.log(`  stale allow-list entry: ${file} (no longer a finding)`);
+if (uncovered.length > 0 || gatedUncovered.length > 0 || targetUncovered.length > 0 || stale.length > 0) {
+  console.log(
+    `[feature-test-scan] FAIL — ${uncovered.length} feature-gated module(s), ` +
+      `${gatedUncovered.length} feature-gated test item(s) and ${targetUncovered.length} ` +
+      `feature-gated test target(s) are run by no \`cargo test\` step, ` +
       `${stale.length} stale allow-list entry(ies). A test behind a feature that ` +
       "`cargo test --workspace` does not enable is dead weight: fix the Makefile, or record " +
       "the reason in scripts/feature-test-allowlist.json.",
@@ -520,8 +689,9 @@ if (uncovered.length > 0 || gatedUncovered.length > 0 || stale.length > 0) {
   process.exit(1);
 }
 console.log(
-  `[feature-test-scan] OK — ${findings.length} feature-gated module(s) with tests and ` +
-    `${gatedFindings.length} feature-gated test item(s), all run by a \`cargo test\` step ` +
+  `[feature-test-scan] OK — ${findings.length} feature-gated module(s) with tests, ` +
+    `${gatedFindings.length} feature-gated test item(s) and ${targetFindings.length} ` +
+    `feature-gated test target(s), all run by a \`cargo test\` step ` +
     `(${invocations.length} test invocation(s) read from the Makefile).`,
 );
 

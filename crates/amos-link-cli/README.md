@@ -24,6 +24,7 @@ amos-link-cli discover --lan --peer dog1 --seconds 9   # real UDP beacons; the l
 amos-link-cli watch --seconds 5                   # heartbeat + federation: is the link alive
 amos-link-cli state --timeout-ms 2000             # what robots report about themselves
 amos-link-cli motor --action '{"action":"trot","speed":0.5}'   # frames + hex
+amos-link-cli motor --action '{"action":"stand"}' --device /run/motor.sock  # …onto a real bus
 ```
 
 Four honest notes about scope, all enforced in code rather than promised:
@@ -110,6 +111,13 @@ name when `--socket` is present; `motor` needs no link at all and refuses `--soc
 - **The CLI is not a robot.** Its own node is a tool: `bench`/`watch` default to
   `link-bench`/`link-watch` identities, and `discover --lan` is a bounded sweep
   (`--seconds`), never a daemon.
+- **`motor --device` writes real bytes, and stops there.** The frames go to a Unix socket a
+  controller listens on, or to a character device (a serial/UART port) — with the whole batch
+  validated **before** the first byte, and the printed count being the count written (a bus that
+  cannot be opened is exit 1 and says so, never "applied 13 frames"). What it does **not** do:
+  configure the port (baud/`raw` is yours: `stty -F /dev/ttyUSB0 1M raw`), or prove a servo
+  moved. `--device` belongs to `motor` alone — anywhere else it is a usage error (exit 2), never
+  a silently ignored flag.
 - **`--socket` reads the control plane only** — status, inventory, injection and the
   heartbeat stream. A data-plane command is refused rather than downgraded.
 - **`pub --socket` injects bytes**, encoded exactly like a local publish (the `Message`

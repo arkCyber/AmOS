@@ -469,6 +469,109 @@ fn motor_translates_an_action_into_frames_and_hex() {
     );
     assert!(stdout.contains("armed=false"), "got: {stdout}");
 }
+#[cfg(unix)]
+#[test]
+fn motor_device_writes_real_frames_to_a_listening_controller() {
+    // The hardware boundary, end to end and process-level: the *shipped binary* connects to a
+    // controller socket and the frames arrive as CRC16-checked motor frames. Nothing here is a
+    // mock — the bytes cross a real descriptor, which is what `MockRobotHal` can never prove.
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("amos-link-cli-motor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("motor.sock");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("the motor daemon listens");
+
+    let daemon = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("the CLI attaches");
+        let mut bytes = Vec::new();
+        // Read to EOF: the tool closes the bus when it exits, so the wire length is the
+        // frames' length — the test does not have to be told how many were sent.
+        socket.read_to_end(&mut bytes).expect("the bus is readable");
+        bytes
+    });
+
+    let (code, stdout, stderr) = run(&[
+        "motor",
+        "--action",
+        r#"{"action":"stand"}"#,
+        "--device",
+        path.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("applied 13 frame(s) to hal=stream armed=true"),
+        "the reported line names the real bus and a measured count: {stdout}"
+    );
+    assert!(
+        stdout.contains(path.to_str().expect("utf-8 path")),
+        "the report names which device was written: {stdout}"
+    );
+
+    let bytes = daemon.join().expect("the daemon thread finishes");
+    assert!(!bytes.is_empty(), "the CLI wrote the frames to the bus");
+    assert_eq!(
+        bytes.len() % 10,
+        0,
+        "the wire carries whole motor frames, got {} bytes",
+        bytes.len()
+    );
+    let frames: Vec<amos_link::robot_hal::MotorFrame> = bytes
+        .chunks(10)
+        .map(|chunk| amos_link::robot_hal::MotorFrame::decode(chunk).expect("CRC16 verifies"))
+        .collect();
+    assert_eq!(frames.len(), 13, "stand = enable + one frame per joint");
+    assert_eq!(
+        frames.first().map(|f| f.op),
+        Some(amos_link::robot_hal::MotorOp::Enable),
+        "the batch energizes first"
+    );
+    assert_eq!(
+        frames.last().map(|f| f.op),
+        Some(amos_link::robot_hal::MotorOp::SetPosition)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_device_that_cannot_be_opened_is_a_failure_that_names_it() {
+    // A missing bus must be an error, never a silent "applied 13 frames": a robot whose
+    // controller is down must not be reported as commanded.
+    let missing = std::env::temp_dir().join("amos-link-no-such-motor-bus.sock");
+    let _ = std::fs::remove_file(&missing);
+    let (code, stdout, stderr) = run(&[
+        "motor",
+        "--action",
+        r#"{"action":"stand"}"#,
+        "--device",
+        missing.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(code, 1, "a bus that cannot be opened is a failure exit");
+    assert!(
+        stderr.contains("no-such-motor-bus.sock"),
+        "the error names the path: {stderr}"
+    );
+    assert!(
+        !stdout.contains("applied"),
+        "nothing was applied, nothing may be reported: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn device_belongs_to_motor_alone_and_says_so() {
+    // `--device` on another command is a *usage* error (exit 2), not a silently ignored flag:
+    // an operator must never believe frames went to a bus this run never opened.
+    let (code, _, stderr) = run(&["status", "--device", "/tmp/whatever.sock"]);
+    assert_eq!(code, 2, "argv shape errors are usage errors");
+    assert!(
+        stderr.contains("belongs to `motor`"),
+        "the refusal names the rule: {stderr}"
+    );
+}
 
 #[test]
 fn discover_lists_the_seeded_peer_table_and_never_the_local_node() {

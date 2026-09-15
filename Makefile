@@ -27,10 +27,14 @@ test:
 	cargo test -p amos-timesync --features amos-timesync/ntp --lib
 	# amos-link's feature-gated channels (REQ-A188 shape): the UDP-beacon discovery
 	# (`lan`, real sockets on loopback — offline) and the Zenoh transport (`zenoh`,
-	# whose offline cases are the config/env mapping; the live session round trip is
-	# `#[ignore]`d on purpose). Both are compiled by `make lint`; this is where they run.
-	cargo test -p amos-link --features amos-link/lan --lib
-	cargo test -p amos-link --features amos-link/zenoh --lib
+	# whose offline cases are the config/env mapping; a **deterministic** session round
+	# trip over TCP loopback, and the scouting case that stays `#[ignore]`d on purpose).
+	# Both are compiled by `make lint`; this is where they run. **No `--lib` here**: the
+	# `lan` feature also gates an integration target (`tests/lan_multicast.rs`, the real
+	# multicast tests), and `--lib` would have left that target running nowhere —
+	# the very "test the gate makes invisible" shape this step exists for (REQ-A243).
+	cargo test -p amos-link --features amos-link/lan
+	cargo test -p amos-link --features amos-link/zenoh
 	# …and the tests that hide behind two more features no step used to enable (REQ-A191):
 	# the mail CLI's live SMTP/IMAP paths answer against a local loopback relay (offline),
 	# and the PTY terminal's round trip spawns a real shell (`portable-pty`). Both are
@@ -96,6 +100,10 @@ gated-check:
 	cargo build -p amos-asr --features sherpa
 	cargo build -p amos-asr --features sherpa --example sherpa_asr
 	cargo build -p amos-asr --features sherpa --example sherpa_session
+	# The whole-buffer ASR target (REQ-A243): a crate-root `#![cfg(feature = "sherpa")]`
+	# meant it was *built* above and run by nothing. It self-skips when the model files are
+	# absent, so the honest place for it is here, where the native libs are provisioned.
+	cargo test -p amos-asr --features sherpa --test sherpa_buffer
 	# Real local ASR inside the AI daemon (bidi Payload::Audio → sherpa).
 	cargo build -p amos-ai --features asr-sherpa
 	cargo test -p amos-ai --features asr-sherpa --test bidi_sherpa_audio
@@ -128,8 +136,12 @@ gated-check:
 	cargo check -p amos-power --features android
 	# CPU/NPU frequency-governor sysfs applier (amos-power, `linux` feature):
 	# real scaling_max_freq writes + tempdir tests; host-compiles without a device.
+	# **No `--lib`** (REQ-A243): `tests/closed_loop_linux.rs` is a feature-gated *target*
+	# (its own header documents `cargo test -p amos-power --features linux --test
+	# closed_loop_linux`), and `--lib` compiled the feature while running none of it —
+	# scripts/feature-test-scan.mjs rule 3 now fails on exactly that shape.
 	cargo check -p amos-power --features linux
-	cargo test -p amos-power --features linux --lib
+	cargo test -p amos-power --features linux
 	# System working-status sampler (amos-monitor): real /proc reads over an
 	# injected root (`linux`) + on-device Android skeleton (`android`). The linux
 	# tests run entirely over a tempdir fixture — no root/device needed.

@@ -196,7 +196,83 @@ filtered 3 entries naming this node itself (a node is not its own peer)
 **回归证据**：`cargo test -p amos-link`（**117 lib + 1 分配预算 + 4 e2e + 2 UDS**）、`--features lan` **120**、`--features zenoh` **117 + 1 ignored**、`cargo test -p amos-link-cli`（**9 + 17**）。**边界（诚实）**：`with_local` 只认**一个**本机 id（一个进程一个节点，与 `PeerId` 的约定一致）；`PeerRegistry::new`（无身份）仍接受一切 —— 那是单元测试想要的形状，生产构造器一律用 `with_local`；组播回环是**平台默认**（`IP_MULTICAST_LOOP`），本轮不改 socket 选项：**过滤比期望对方不发回来**可靠。
 
 
+### 3.5 真硬件输出：从 `plan` 到真实字节流（第三轮，REQ-A243）
+
+> 上一轮记下的边界是「**真硬件 HAL 未实现**（只有 `MockRobotHal`）」。本轮兑现它：新增
+> `StreamRobotHal`（任意 `AsyncWrite`：设备节点、Unix 套接字、TCP 桥），CLI 用 `--device` 接上去。
+> 「真」字仍然要说清楚：它写的是**真实字节流**，不是完整驱动 —— 波特率/`raw`/位定时是**部署**的事
+> （`stty -F /dev/ttyUSB0 1M raw`），本层不偷偷改别人的总线（见下「诚实边界」）。
+
+| 形状 | 构造 | 用途 |
+|---|---|---|
+| `StreamRobotHal::new(w)` | 任意 `AsyncWrite + Unpin + Send` | 测试、管道、自定义桥 |
+| `StreamRobotHal::open_device(path)` | 字符设备（UART/PTY） | 真串口/板卡串口线 |
+| `StreamRobotHal::connect_unix(path)` | Unix 域套接字 | 板卡上的电机守护进程 |
+
+**两条总线层必须具备的性质**（mock 证明不了，这里是实测）：
+
+1. **整批校验先于任何字节**：`apply` 先把整批 `validate()` 走完，再碰描述符。实测
+   （`tests/hardware_hal.rs`）：一批 `[Enable(合法), SetPosition(越限)]` ⇒ 返回 `Err`，
+   `frames_written()==0`，对端套接字在 150 ms 内**读到 0 字节** —— 不会有「一半关节被下令」。
+2. **上报的 accepted 数就是真的写出去的数**：计数只在某帧的 `write_all` 返回**之后**前进，因此中途
+   失败会带着「已写出 N 帧」报错，而不是照抄计划的长度。
+
+**（本轮缺陷）`armed` 曾是"批内有没有 Enable"**：两个 HAL 都用两趟 `any()` 回答「驱动器还带电吗」，
+于是**以 `Enable` 结尾**的批次只要**任何位置**出现过 `Estop`，就报 `armed: false` —— 而这是
+「下一条运动指令是否允许」的依据，也是回程里**上报给指挥方**的数字。处置：把规则收成一处
+`armed_after(armed, frames)`（**按线缆顺序折叠，最后一个带装定语义的 op 生效**），`StreamRobotHal`
+更是**每写出一帧就折一帧**：它按构造就免疫这个缺陷类别（写序即线序）。
+
+**实测（CLI 进程级，`crates/amos-link-cli/tests/cli_smoke.rs`）**：测试自己起一个控制器套接字，
+`amos-link-cli motor --action '{"action":"stand"}' --device <socket>` ⇒ 末行
+`applied 13 frame(s) to hal=stream armed=true at <path>`，对端**读回 130 字节并逐帧 `MotorFrame::decode`
+（CRC16 校验通过）**：`Enable` 在先、12 条 `SetPosition` 在后。设备打不开时是 **exit 1** 且错误里带路径
+（绝不出现「applied 13 frames」这种假报告），`--device` 用在别的命令上是**用法错误 exit 2**。
+
+**诚实边界（本轮新增）**：
+
+- **不配置端口**：只 `open`+`write`。写到一个参数错的串口在本层**照样成功**，驱动器收到垃圾 —— 所以端口
+  设置写进 bring-up 清单，而不是写进这个函数。
+- **没有真实伺服验收**：证据止于「真实字节流上是正确的 CRC16 帧」，不是「电机动了」。真机验收仍是现场项。
+- **`--device` 仅 Unix**（套接字/设备文件是 Unix 概念），别的平台明确拒绝而不是假装写过了。
+
+
+### 3.6 组播：接口固定、回环开关，与「无身份表」的退场（REQ-A243）
+
+> 同轮收口另外三条边界。两条是**能测的部分**（多网卡机器的组播、真实组播路径上的自回声），
+> 一条是**接口收紧**（上一轮说「生产构造器一律 `with_local`」，本轮让这句话由编译器保证）。
+
+| # | 边界（上一轮的说法） | 本轮处置 | 实测证据 |
+|---|---|---|---|
+| 1 | 「跨板卡组播待现场验证」 | 新增 `AMOS_LINK_BEACON_IFACE`（本机 IPv4）：**出向** `set_multicast_if_v4`、**入向** 组加入绑定到同一接口。多网卡板子上「内核挑一个」不是决策：信标可能从 5G 模组出去，而相机板在 Wi-Fi 上；组加入绑到 `0.0.0.0` 只在**默认接口**订阅 —— 两者永远碰不上 | `tests/lan_multicast.rs`（真组播、真接口）：组加入 + `spawn_announcer` + 收帧，**每一拍都是新时间戳**；`AMOS_LINK_BEACON_IFACE=127.0.0.1 amos-link-cli discover --lan …` ⇒ `beacon iface=127.0.0.1 loop=platform-default`，且仍 `filtered 2 entries naming this node itself`；`en0` 这类**错值在启动期被拒**（`is not an interface IPv4 address`） |
+| 2 | 「组播回环是平台默认，本轮不改 socket 选项」 | 新增 `AMOS_LINK_BEACON_LOOP`（**默认仍是平台默认**）。关闭它**不是**正确性机制：`IP_MULTICAST_LOOP=0` 会连**同机第二个进程**都收不到（内核根本不把数据报复制回本机），所以「节点不是自己的对端」仍由**对端表**保证 | 同一个套接字形状：loop 开 ⇒ 自己的信标**真的回来了**（并喂给 `PeerRegistry::with_local` ⇒ `observe==false`、`self_entries_refused()==1`、表为空）；loop 关 ⇒ 300 ms 内**一帧都没有**（同测试内互为阳性对照） |
+| 3 | 「`PeerRegistry::new`（无身份）仍接受一切 —— 那是单元测试要的形状」 | **让 API 保证它**：`new` 变成 `#[cfg(test)] pub(crate)`，并且**删掉 `impl Default for PeerRegistry`** —— `Default` 是标准 trait，`PeerRegistry::default()` / `.unwrap_or_default()` / 下游 `#[derive(Default)]` 都能在**生产构建**里造出那张「接受一切」的表 | **负控（编译期）**：往非测试代码里写一个 `PeerRegistry::new(DEFAULT_TTL)` 调用 ⇒ **构建失败**（`no associated function named 'new'`）。删掉 `new` 时暴露的正是那条路：`impl Default` 是**唯一**的生产调用方 |
+
+**Zenoh 真会话往返（同轮收口）**：原先是 `#[ignore]`，理由是「开真会话（peer + 组播 scouting）依赖环境」。
+本轮把它拆开：**会话往返本身可以确定**——同进程两个 peer、显式端点、关掉 scouting，走真实 TCP 环回
+（`a_typed_frame_crosses_a_real_session_over_tcp_loopback`，已**不再 ignore**）；留在 `#[ignore]` 的只剩
+*跨主机 scouting*（`scouting_finds_a_peer_on_a_real_network`）。**顺带查出一个被 `#[ignore]` 掩盖的事实**：
+`#[tokio::test]` 默认 **current-thread** 调度器，而 Zenoh 运行时在其上**直接 panic**
+（"Please use multi thread scheduler instead"）—— 旧用例在任何机器上都**不可能通过**；`#[ignore]` 让它
+既没红也没绿。**负控**：把调度器改回默认 ⇒ 该用例 FAILED（Zenoh 的 panic 原样复现）。
+
+
+**门禁覆盖（同轮查出并修掉的第 8 个缺陷）**：新增的真组播测试是 `tests/lan_multicast.rs`，整份文件被
+`#![cfg(feature = "lan")]` 门住；而 Makefile 里那条 lan 步骤写的是 `… --features amos-link/lan --lib`
+—— **`--lib` 会把集成测试目标排除在外**，于是这份文件写了、评审了、**执行了零次**：
+`feature-test-scan` 只查"特性门住的模块/测试项"（`tests/` 明确写在范围外），`feature-surface-scan` 只要求它
+**被编译**。本轮给前者加了**规则 3**（`targetGate()` + `runsTarget()`：既要求启用特性，也要求步骤**没有**用
+`--lib` 限制目标、或点名 `--test <name>`），selftest 从 23 例扩到 **33 例**；新规则**当场抓出仓库里另外两处
+同形状的既有缺陷**——`crates/amos-power/tests/closed_loop_linux.rs`（`--features linux --lib` 从未跑它）
+与 `crates/amos-asr/tests/sherpa_buffer.rs`（`gated-check` 里只有 `cargo build --features sherpa`，
+**建了不跑**）。三处一起修，负控是"改回 `--lib`/删掉步骤 ⇒ 门 EXIT=1 且点名那个文件"。
+
+
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
+
+
+
+
 
 依赖声明（`crates/amos-link/Cargo.toml`，可选依赖、默认构建不拉）：
 
@@ -251,6 +327,8 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
 |---|---|---|
 | `AMOS_LINK_PEER` | 默认节点 id（`--peer` 优先） | `crates/amos-link-cli/src/lib.rs` |
 | `AMOS_LINK_BEACON_ADDR` | LAN 信标目标（`ip:port`，默认 `239.255.42.99:7446`） | `crates/amos-link/src/lan.rs` |
+| `AMOS_LINK_BEACON_IFACE` | LAN 信标**固定到哪个接口**（本机 IPv4 地址，如 `192.168.1.5`；出向 `IP_MULTICAST_IF` + 入向组加入都绑到它）。多网卡板子必须设，否则「内核挑一个」可能让信标从 5G 出去而相机板在 Wi-Fi 上；**错值在启动期拒绝** | `crates/amos-link/src/lan.rs` |
+| `AMOS_LINK_BEACON_LOOP` | 组播回环开关（`1`/`0`，默认 = 平台默认即开）。关掉会让**本机所有进程**都收不到自己的信标（不只自己），因此**不是**正确性机制（对端表才是）| `crates/amos-link/src/lan.rs` |
 | `AMOS_LINK_ZENOH_ENDPOINT` | Zenoh 连接点（逗号分隔，如 `tcp/10.0.0.7:7447`） | `crates/amos-link/src/zenoh.rs` |
 
 **明确不做的事**（避免把边界留给想象）：
@@ -290,6 +368,15 @@ cargo test -p amos-link       # 内核 + 端到端用例（默认构建）
 cargo run -p amos-link-cli -- bench --count 2000 --size 4096
 cargo run -p amos-link-cli -- status   # JSON：含 health 判定与 health_reasons（§3.2）
 cargo run -p amos-link-cli -- motor --action '{"action":"trot","speed":0.5}'
+# 真总线（REQ-A243）：控制器套接字或字符设备；末行报的是**真的写出去的帧数**（§3.5）
+cargo run -p amos-link-cli -- motor --action '{"action":"stand"}' --device /run/motor.sock
+AMOS_LINK_BEACON_IFACE=192.168.1.5 cargo run -p amos-link-cli --features lan -- discover --lan --seconds 9
+# ↑ 多网卡板子固定接口；输出会如实打印 `beacon iface=… loop=…`（应用后的配置，不是请求的）
+cargo test -p amos-link --test hardware_hal           # 真字节流上的 HAL（真实套接字 + CRC16 逐帧解码）
+cargo test -p amos-link --features lan --test lan_multicast   # 真组播：固定接口、自回声、回环开关
+cargo test -p amos-link --test allocation_budget_codec        # 三个分配预算，一个进程一个测量
+cargo test -p amos-link --test allocation_budget_matcher
+cargo test -p amos-link --test allocation_budget_fanout       # 一次发布 ⇒ 8 个订阅者：共享同一缓冲
 cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 5 --timeout-ms 2000   # 末行报告 gaps/missing/stale/loss
 cargo run -p amos-link-cli -- sub --pattern 'amos/*/control/*' --count 1 --timeout-ms 1000  # 档位由 channel 决定（reliable）
 # 注意 `--timeout-ms`：默认 0 = 永远等，没有发布者时这条命令**不会返回**（本文件的示例一律给上界）。
@@ -309,7 +396,9 @@ cargo run -p amos-link-cli -- topics --socket /tmp/amos-ai.sock          # daemo
 cargo run -p amos-link-cli -- pub --socket /tmp/amos-ai.sock \
     --topic amos/dog1/control/joints --action '{"action":"trot"}'
 cargo run -p amos-link-cli -- watch --socket /tmp/amos-ai.sock --seconds 3  # 流式心跳：真的在打拍
-cargo test -p amos-link --features zenoh -- --ignored   # 真实 Zenoh 会话往返（需网络）
+cargo test -p amos-link --features zenoh --lib a_typed_frame_crosses_a_real_session_over_tcp_loopback
+# ↑ 真会话往返（两个 peer + 显式端点 + 关 scouting，走 TCP 环回）——**不再是 #[ignore]**（§3.6）
+cargo test -p amos-link --features zenoh -- --ignored   # 只剩跨主机 scouting（需真网络）
 # 联邦信标节奏 = TTL/3（`federation_period()`，一处规则；默认 TTL 3s ⇒ 每秒 1 个信标）。
 # 此前 `discover --bus` 与 `watch` 硬编码 200ms（5 个/秒），既多打 4 倍信标，又让
 # `published` 看起来像有真实流量 —— 现在三条路径（lan/bus/watch）同一条规则。
