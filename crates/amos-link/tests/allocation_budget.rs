@@ -1,4 +1,5 @@
-//! What a behaviour test cannot see: the codec must not build a second copy of a frame.
+//! What a behaviour test cannot see: the codec must not build a second copy of a frame,
+//! and the topic matcher must not allocate at all.
 //!
 //! The streamed CRC32 and the `[…].concat()` version it replaced produce **identical
 //! bytes**, so no assertion on the wire format — not even a pinned CRC — can tell them
@@ -9,9 +10,13 @@
 //! a frame's peak memory, and on the receive path the copy happened *before* the checksum
 //! had been verified, so a peer's 16 MiB frame made the receiver hold 32 MiB.
 //!
-//! The bound is deliberately generous: a `Vec`'s growth strategy may over-allocate and the
-//! header has to be serialized, so the assertion is "the memory of **one** frame" plus a
-//! 64 KiB allowance — which a second 4 MiB copy cannot hide inside.
+//! The same measurement covers `Topic::matches`, which runs once per matching subscription
+//! per published frame (under the broker's registry lock): it used to `collect()` two
+//! vectors per call while `keyexpr`'s own docs claimed the matcher allocates nothing.
+//!
+//! The bounds are deliberately generous for the frame (a `Vec`'s growth strategy may
+//! over-allocate and the header must be serialized) and exact for the matcher: the
+//! property is "one frame's worth of memory" and "zero allocations", not a byte count.
 //!
 //! This file holds the only test in its binary, so the process-wide counter has no
 //! concurrent user (the measurement is exact, not sampled).
@@ -71,7 +76,10 @@ fn topic() -> Topic {
 }
 
 #[test]
-fn one_large_frame_costs_one_frame_of_memory_to_encode_and_one_to_decode() {
+fn the_codec_and_the_topic_matcher_allocate_only_what_they_must() {
+    // One function with three measurements on purpose: the counter is process-wide, so
+    // two `#[test]`s running in parallel (the default) would each see the other's
+    // allocations and the numbers would mean nothing.
     let payload_len = 4 * 1024 * 1024;
     let envelope = Envelope::new(
         &topic(),
@@ -81,6 +89,7 @@ fn one_large_frame_costs_one_frame_of_memory_to_encode_and_one_to_decode() {
         vec![0xA5; payload_len],
     );
 
+    // 1. Encoding: the frame itself, not a second copy of it for the checksum.
     let before = REQUESTED.load(Ordering::Relaxed);
     let wire = envelope.encode().expect("encode");
     let encoded = REQUESTED.load(Ordering::Relaxed) - before;
@@ -96,6 +105,8 @@ fn one_large_frame_costs_one_frame_of_memory_to_encode_and_one_to_decode() {
         wire.len()
     );
 
+    // 2. Decoding: the payload's own buffer, and never a copy taken *before* the checksum
+    //    has been verified (that copy was the receiver-side amplification).
     let before = REQUESTED.load(Ordering::Relaxed);
     let decoded = Envelope::decode(&wire).expect("decode");
     let decoded_bytes = REQUESTED.load(Ordering::Relaxed) - before;
@@ -105,5 +116,24 @@ fn one_large_frame_costs_one_frame_of_memory_to_encode_and_one_to_decode() {
         "decoding a {}-byte frame asked for {decoded_bytes} bytes: on the receive path a copy \
          is not only wasteful, it happens before the checksum has been verified",
         wire.len()
+    );
+
+    // 3. Matching: the publish path runs it once per matching subscription per frame, so
+    //    it must not allocate at all. (The caller used to `collect()` two vectors per
+    //    call — 1 200 heap allocations a second at 60 Hz with ten subscribers.)
+    let concrete = topic();
+    let pattern = Topic::pattern("amos/*/sensor/*").expect("pattern");
+    assert!(
+        concrete.matches(&pattern),
+        "the fixture must really match, or the measurement below is of nothing"
+    );
+    let before = REQUESTED.load(Ordering::Relaxed);
+    for _ in 0..1_000 {
+        assert!(concrete.matches(&pattern));
+    }
+    let matching = REQUESTED.load(Ordering::Relaxed) - before;
+    assert_eq!(
+        matching, 0,
+        "1000 matches asked for {matching} bytes: the matcher must not allocate"
     );
 }

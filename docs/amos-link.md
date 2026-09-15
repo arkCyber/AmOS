@@ -139,7 +139,7 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 
 **回归证据**（全部可复跑）：
 ```bash
-cargo test -p amos-link                                  # 115 lib + 4 e2e + 2 UDS
+cargo test -p amos-link                                  # 115 lib + 1 分配预算 + 4 e2e + 2 UDS
 cargo test -p amos-link --features amos-link/lan --lib   # 120
 cargo test -p amos-link --features amos-link/zenoh --lib # 117 + 1 ignored
 cargo test -p amos-link-cli                              # 9 parser + 17 process-level
@@ -161,6 +161,39 @@ cargo clippy -p amos-link -p amos-link-cli --all-targets --features lan,zenoh --
 `a_poisoned_sensor_slot_is_a_dead_consumer_not_a_silent_delivery`；`a_watchdog_cut_reports_the_frames_the_bus_took_not_a_guess`
 （1 帧切扭矩的 HAL ⇔ 上报 1）；`arguments_that_used_to_crash_the_process_are_usage_errors_now`
 （进程级：两条负控命令现在 exit 2）；`a_huge_count_still_starts_the_benchmark_…`。
+
+
+### 3.4 对端表与匹配器（第二轮复核，REQ-A242）
+
+> 同一套纪律的第二轮，两个真缺陷：一个**上报了不存在的对端**，一个**在发布热路径上分配**。
+> 两条都有**实测证据**与**负控**（注入回旧行为 ⇒ 新验证变红 ⇒ `cmp` 还原逐字节一致）。
+
+| # | 缺陷（修前） | 实测证据 | 处置 |
+|---|---|---|---|
+| 1 | **节点把自己当成对端**：`discover --lan` 把自己的信标收进来（`IP_MULTICAST_LOOP` 默认开启，组播会回到发送者），而总线路径在源头过滤、LAN 路径没有；`PeerRegistry` 本身没有"我是谁"的概念，两个 CLI 路径还各自 `learn(self)` 播种自己 | `amos-link-cli --features lan -- discover --lan --peer self-test --seconds 4` ⇒ `self-test · tool · 4 beacons`、`peers=1`（"这个 LAN 上有谁"答成了发起者自己） | 不变量下沉到表本身：`PeerRegistry::with_local(ttl, local)` — `observe`/`learn` 一律拒绝**本机 id** 并计数 `self_entries_refused()`；`LinkNode` 的三个构造器都带上自己的身份；CLI 两条路径改用 `with_local`、去掉自我播种，并**如实打印**被过滤的条数（`filtered N entries naming this node itself`）。`spawn_federation` 的源头过滤保留为快路径，其计数从"写了从不读"变成 `FederationTask::self_echoes()`（文档里"可以证明过滤生效"这句话此前**无法成立**） |
+| 2 | **匹配器在发布热路径上分配**：`Topic::matches` 每次 `collect()` 出**两个 `Vec<&str>`**，而 `keyexpr` 模块文档自称匹配"无分配、无回溯"；它每帧对每个匹配订阅者各跑一次，**且在 broker 注册表锁内** | 计数分配器：1000 次匹配 ⇒ **128 000 字节**（每次 128 字节 = 两个 Vec）｜修复后**0 字节** | 两段都走**栈上定长数组**（`[&str; MAX_SEGMENTS]`，与 DP 的两个栈数组同一纪律），`matches` 与调用点一起做到**零分配** |
+
+**修后的实测输出**（同一条命令）：
+
+```text
+discovery=lan target=239.255.42.99:7446 bound=0.0.0.0:7446 announce=1000ms listening 4s
+(no peers)
+filtered 4 entries naming this node itself (a node is not its own peer)
+
+discovery=bus transport=broker peer=amos-node topic=amos/amos-node/telemetry/beacon listening 2s
+no peers announced on this link in 2s (federation still ran: …)
+(no peers)
+filtered 3 entries naming this node itself (a node is not its own peer)
+```
+
+**负控实测**（每次注入后 `cmp` 还原**逐字节一致**）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 删掉 `observe` 的自拒绝 | `a_node_is_never_a_peer_of_itself` ⇒ **FAILED**（自己进了表） |
+| `matches` 改回 `collect()` | 分配预算用例 ⇒ `1000 matches asked for 128000 bytes: the matcher must not allocate` **FAILED** |
+
+**回归证据**：`cargo test -p amos-link`（**117 lib + 1 分配预算 + 4 e2e + 2 UDS**）、`--features lan` **120**、`--features zenoh` **117 + 1 ignored**、`cargo test -p amos-link-cli`（**9 + 17**）。**边界（诚实）**：`with_local` 只认**一个**本机 id（一个进程一个节点，与 `PeerId` 的约定一致）；`PeerRegistry::new`（无身份）仍接受一切 —— 那是单元测试想要的形状，生产构造器一律用 `with_local`；组播回环是**平台默认**（`IP_MULTICAST_LOOP`），本轮不改 socket 选项：**过滤比期望对方不发回来**可靠。
 
 
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）

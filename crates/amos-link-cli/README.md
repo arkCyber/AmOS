@@ -18,6 +18,9 @@ amos-link-cli pub   --topic amos/dog1/control/joints --action '{"action":"trot"}
 amos-link-cli sub   --pattern 'amos/**' --count 3 --timeout-ms 2000   # 0 = wait forever
 amos-link-cli bench --count 2000 --size 4096      # real publish→decode latency
 amos-link-cli discover --peer dog1 --peer mini-brain
+amos-link-cli discover --lan --peer dog1 --seconds 9   # real UDP beacons; the local node
+                                                      # never appears as a peer — the
+                                                      # filtered count is printed instead
 amos-link-cli watch --seconds 5                   # heartbeat + federation: is the link alive
 amos-link-cli state --timeout-ms 2000             # what robots report about themselves
 amos-link-cli motor --action '{"action":"trot","speed":0.5}'   # frames + hex

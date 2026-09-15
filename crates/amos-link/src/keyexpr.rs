@@ -170,11 +170,38 @@ impl Topic {
     /// segment) is what makes the middleware "decentralized": a brain server can
     /// subscribe to `amos/**/sensor/stereo_left` and receive every robot's left
     /// camera without knowing a single peer id up front.
+    ///
+    /// Both sides are walked into **fixed stack arrays**, not `Vec`s: this is the
+    /// *publish* path — once per matching subscription per frame, under the broker's
+    /// registry lock — so "the matcher does not allocate" has to be true of the call
+    /// site too, not just of [`match_segments`]. (It used to `collect()` two vectors
+    /// per call: at 60 Hz with ten subscribers that is 1 200 heap allocations a second
+    /// for a comparison of at most 32 short strings.)
     pub fn matches(&self, pattern: &Topic) -> bool {
-        let topic: Vec<&str> = self.segments().collect();
-        let pat: Vec<&str> = pattern.segments().collect();
-        match_segments(&pat, &topic)
+        let mut pat: [&str; MAX_SEGMENTS] = [""; MAX_SEGMENTS];
+        let mut topic: [&str; MAX_SEGMENTS] = [""; MAX_SEGMENTS];
+        let pat_len = fill_segments(pattern.as_str(), &mut pat);
+        let topic_len = fill_segments(self.as_str(), &mut topic);
+        match_segments(&pat[..pat_len], &topic[..topic_len])
     }
+}
+
+/// Walk a key expression's segments into a fixed stack array; returns how many were
+/// written.
+///
+/// Bounded by construction: a validated `Topic` never has more than [`MAX_SEGMENTS`]
+/// segments, and an over-long input simply stops filling (the matcher then refuses the
+/// pair) — a caller cannot make this function write out of bounds or grow anything.
+fn fill_segments<'a>(expr: &'a str, out: &mut [&'a str; MAX_SEGMENTS]) -> usize {
+    let mut written = 0;
+    for segment in expr.split('/') {
+        if written == MAX_SEGMENTS {
+            break;
+        }
+        out[written] = segment;
+        written += 1;
+    }
+    written
 }
 
 /// Recursive segment matcher: `*` = one segment, `**` = zero or more.

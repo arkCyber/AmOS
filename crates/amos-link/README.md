@@ -36,6 +36,10 @@ Four pieces, in the order data flows:
 - **Discovery** two ways: beacons over the link's own transport (works on any transport,
   filters self-echo) and real UDP multicast beacons behind the `lan` feature, with a
   repeating announcer so a peer that joins later still learns one that booted earlier.
+  A node is **never its own peer**: the table refuses its own id (a multicast
+  announcement reaches its own sender by default) and counts the refusals
+  (`PeerRegistry::self_entries_refused`, `FederationTask::self_echoes`) instead of
+  filtering silently.
 - **Honest counters + a verdict**: `published`/`delivered`/`dropped`/`blocked`/
   `decode_errors`/`encode_errors` never reset and are never estimates; `LinkHealth` folds
   them into `Unknown | Healthy | Degraded{reasons}` — `Unknown` means *no evidence yet*,

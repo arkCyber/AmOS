@@ -88,13 +88,19 @@ impl LinkNode {
         metrics: Arc<LinkMetrics>,
     ) -> Self {
         let started = clock.now();
+        // The table knows whose node this is: a node is not its own peer (a multicast
+        // announcement reaches its own sender by default).
+        let registry = Mutex::new(PeerRegistry::with_local(
+            PeerRegistry::DEFAULT_TTL,
+            peer.clone(),
+        ));
         Self {
             peer,
             kind,
             transport,
             clock,
             metrics,
-            registry: Mutex::new(PeerRegistry::default()),
+            registry,
             peer_ttl: PeerRegistry::DEFAULT_TTL,
             started,
             beat_seq: AtomicU64::new(0),
@@ -108,7 +114,7 @@ impl LinkNode {
     /// less often than it expires would flap in and out of every other node's table.
     pub fn with_peer_ttl(self, ttl: Duration) -> Self {
         Self {
-            registry: Mutex::new(PeerRegistry::new(ttl)),
+            registry: Mutex::new(PeerRegistry::with_local(ttl, self.peer.clone())),
             peer_ttl: ttl,
             ..self
         }
@@ -192,6 +198,10 @@ impl LinkNode {
     }
 
     /// Record a discovery beacon. Returns `true` when the peer is new to the table.
+    ///
+    /// A beacon naming **this node** is refused and counted
+    /// ([`LinkNode::self_entries_refused`]) — a node is not its own peer, and a multicast
+    /// announcement reaches its own sender by default.
     pub async fn observe(&self, beacon: &Beacon) -> bool {
         let now = self.clock.now();
         let mut registry = self.registry.lock().await;
@@ -210,6 +220,9 @@ impl LinkNode {
     /// peer table of a locked-down network — no multicast, no beacons — keeps the
     /// operator's list. It leaves when [`LinkNode::forget_peer`] is called, or when a
     /// beacon from it makes the entry beacon-driven.
+    ///
+    /// Declaring **this node** is refused and counted: a static entry for itself would sit
+    /// in the table forever (nothing evicts a static peer).
     pub async fn learn_peer(&self, info: PeerInfo) -> bool {
         let now = self.clock.now();
         self.registry.lock().await.learn(info, now)
@@ -223,6 +236,15 @@ impl LinkNode {
             tracing::info!(peer = %id, "peer removed from the table");
         }
         forgotten
+    }
+
+    /// How many attempts to record **this node** as its own peer the table has refused
+    /// (its own beacons coming back, or a static entry naming it).
+    ///
+    /// The count is what makes the filter auditable: a table that silently ignores traffic
+    /// looks exactly like a link that carried none.
+    pub async fn self_entries_refused(&self) -> u64 {
+        self.registry.lock().await.self_entries_refused()
     }
 
     /// The fresh peers, most recent evidence first (expired beacon-driven ones are
@@ -380,6 +402,34 @@ mod tests {
             n.topics().await,
             vec!["amos/dog1/control/joints".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_node_never_lists_itself_as_a_peer() {
+        // The registry-level invariant, through the node's own API: a node's table must not
+        // contain that node — its own beacons (a multicast loop) and an operator's
+        // `learn_peer` naming it are both refused, and the refusals are countable.
+        let n = node("dog1", NodeKind::Robot);
+        let me = PeerInfo::new(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let own = Beacon::new(me.clone(), n.clock().now());
+
+        assert!(!n.observe(&own).await, "our own beacon is not a peer");
+        assert!(
+            !n.learn_peer(me).await,
+            "…and neither is a static entry for it"
+        );
+        assert!(n.peers().await.is_empty(), "the table stays empty");
+        assert_eq!(n.self_entries_refused().await, 2);
+        assert!(
+            n.status().await.peers.is_empty(),
+            "the status document (what the control plane serves) agrees"
+        );
+
+        // A foreign peer still lands, and the count does not move for it.
+        let other = PeerInfo::new(PeerId::new("mini-brain").expect("peer"), NodeKind::Brain);
+        assert!(n.observe(&Beacon::new(other, n.clock().now())).await);
+        assert_eq!(n.peers().await.len(), 1);
+        assert_eq!(n.self_entries_refused().await, 2);
     }
 
     #[tokio::test]

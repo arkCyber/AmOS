@@ -1094,12 +1094,15 @@ async fn run_discover(opts: &Opts) -> Result<()> {
     if opts.bus {
         return run_discover_bus(opts).await;
     }
-    // Offline mode: seed a registry with the operator-specified peers plus this node, so
-    // the *table* logic (freshness, TTL, ordering) is visible without a network.
-    let mut registry = PeerRegistry::new(Duration::from_secs(3));
+    // Offline mode: seed a registry with the operator-specified peers so the *table* logic
+    // (freshness, TTL, ordering) is visible without a network.
+    //
+    // This node is **not** seeded: a node is not its own peer, and the table refuses it
+    // (`with_local`) — an earlier version put `amos-node` in the table, where it reads as
+    // "another machine is on the link".
+    let mut registry =
+        PeerRegistry::with_local(Duration::from_secs(3), PeerId::new(opts.peer.clone())?);
     let now = amos_link::codec::Timestamp::now();
-    let me = PeerInfo::new(PeerId::new(opts.peer.clone())?, opts.kind);
-    registry.learn(me, now);
     for peer in &opts.peers {
         let info = PeerInfo::new(PeerId::new(peer.clone())?, NodeKind::Robot);
         registry.learn(info, now);
@@ -1110,7 +1113,21 @@ async fn run_discover(opts: &Opts) -> Result<()> {
         registry.len()
     );
     print_peers(&registry.peers(now));
+    note_self_refusals(registry.self_entries_refused());
     Ok(())
+}
+
+/// Say so when a table refused this node's own identity.
+///
+/// The refusal is deliberate (a node is not its own peer) but must not be silent: without
+/// this line, "we filtered your own beacons" and "the LAN carried nothing" print the same.
+fn note_self_refusals(refused: u64) {
+    if refused > 0 {
+        println!(
+            "filtered {refused} entr{} naming this node itself (a node is not its own peer)",
+            if refused == 1 { "y" } else { "ies" }
+        );
+    }
 }
 
 /// The announce cadence every CLI command uses when it joins the federation.
@@ -1141,8 +1158,11 @@ async fn run_discover_lan(opts: &Opts) -> Result<()> {
     // `Discovery` surface a board uses, not just the inherent methods.
     let discovery: &dyn Discovery = channel.as_ref();
     let me = PeerInfo::new(PeerId::new(opts.peer.clone())?, opts.kind);
-    let mut registry = PeerRegistry::new(Duration::from_secs(3));
-    registry.learn(me.clone(), amos_link::codec::Timestamp::now());
+    // The table knows whose node this is: our own announcements come back to this socket
+    // (`IP_MULTICAST_LOOP` is on by default), and listing the machine we are running on as
+    // a peer of the LAN is exactly the "invented fact" this command exists to avoid —
+    // measured before this fix: `+ peer self-test`, four beacons, `peers=1`.
+    let mut registry = PeerRegistry::with_local(Duration::from_secs(3), me.id.clone());
     // Announce for as long as we listen instead of once at startup: a single beacon is
     // found only by a peer that was already listening, which inverts the question this
     // command exists to answer ("who is on this LAN?"). The cadence follows the rule
@@ -1181,6 +1201,7 @@ async fn run_discover_lan(opts: &Opts) -> Result<()> {
     }
     announcer.stop().await;
     print_peers(&registry.peers(amos_link::codec::Timestamp::now()));
+    note_self_refusals(registry.self_entries_refused());
     Ok(())
 }
 
@@ -1216,11 +1237,15 @@ async fn run_discover_bus(opts: &Opts) -> Result<()> {
         if !peers.is_empty() {
             println!("peers={}", peers.len());
             print_peers(&peers);
+            // Read the filtered count *before* stopping the task that owns it.
+            let self_echoes = task.self_echoes();
             task.stop().await;
+            note_self_refusals(self_echoes);
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let self_echoes = task.self_echoes();
     task.stop().await;
     println!(
         "no peers announced on this link in {}s (federation still ran: this node \
@@ -1228,6 +1253,7 @@ async fn run_discover_bus(opts: &Opts) -> Result<()> {
         opts.seconds.max(1)
     );
     print_peers(&node.peers().await);
+    note_self_refusals(self_echoes);
     Ok(())
 }
 

@@ -406,10 +406,24 @@ impl PeerView {
 /// Deliberately *pure*: every method that depends on time takes `now` as an argument,
 /// so expiry is unit-tested with no sleeps and no clock mocking — the same discipline
 /// the rest of the workspace uses for policy cores.
+///
+/// One invariant lives here rather than at each call site: **a node is not its own
+/// peer**. `IP_MULTICAST_LOOP` is on by default, so a node that announces to a multicast
+/// group receives its own datagram back — `amos-link-cli discover --lan` used to list the
+/// machine it was running on (`+ peer self-test`, four beacons, measured on macOS). The
+/// bus path filters at the source ([`spawn_federation`]); a registry built with
+/// [`PeerRegistry::with_local`] refuses it for *every* consumer, including one that feeds
+/// the table directly.
 #[derive(Debug)]
 pub struct PeerRegistry {
     ttl: Duration,
     peers: BTreeMap<PeerId, Seen>,
+    /// This node's own id, when the registry was told it (see [`PeerRegistry::with_local`]).
+    local: Option<PeerId>,
+    /// How many times this node was refused entry into its own table (its beacons, or a
+    /// hand-declared entry naming it). A filter that is invisible is indistinguishable from
+    /// a link that carried nothing, so the count is part of the API.
+    self_entries_refused: u64,
 }
 
 impl PeerRegistry {
@@ -417,11 +431,43 @@ impl PeerRegistry {
     pub const DEFAULT_TTL: Duration = Duration::from_secs(3);
 
     /// A registry that forgets a peer after `ttl` without a beacon.
+    ///
+    /// Without a local id every peer is accepted, including one that names this node — the
+    /// shape a *test* wants (a table with no identity of its own). Production constructors
+    /// ([`LinkNode`](crate::node::LinkNode), the CLI sweep) use
+    /// [`PeerRegistry::with_local`].
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
             peers: BTreeMap::new(),
+            local: None,
+            self_entries_refused: 0,
         }
+    }
+
+    /// A registry that refuses to record **this node itself** as a peer (see the type docs).
+    pub fn with_local(ttl: Duration, local: PeerId) -> Self {
+        Self {
+            local: Some(local),
+            ..Self::new(ttl)
+        }
+    }
+
+    /// This node's id, when the registry was told it.
+    pub fn local(&self) -> Option<&PeerId> {
+        self.local.as_ref()
+    }
+
+    /// How many attempts to record this node as its own peer were refused: beacons it
+    /// received back from the network (a multicast loop, a reflected frame) and
+    /// hand-declared entries naming it.
+    pub fn self_entries_refused(&self) -> u64 {
+        self.self_entries_refused
+    }
+
+    /// True when `id` is the local node (never a peer of itself).
+    fn is_local(&self, id: &PeerId) -> bool {
+        self.local.as_ref() == Some(id)
     }
 
     /// The eviction TTL.
@@ -446,7 +492,16 @@ impl PeerRegistry {
     /// A beacon also **converts a static entry to a beacon-driven one**: from here on the
     /// entry is governed by the TTL (a peer that talks must keep talking, or it expires —
     /// which is the liveness signal the whole registry exists for).
+    ///
+    /// A beacon naming **this node** is refused (returning `false`) and counted: the table
+    /// of a node must never contain that node. That is not a hypothetical — a multicast
+    /// announcement comes back to its own sender by default.
     pub fn observe(&mut self, beacon: &Beacon, now: Timestamp) -> bool {
+        if self.is_local(&beacon.peer.id) {
+            self.self_entries_refused += 1;
+            tracing::trace!(peer = %beacon.peer.id, "refused our own beacon: a node is not its own peer");
+            return false;
+        }
         match self.peers.get_mut(&beacon.peer.id) {
             Some(seen) => {
                 seen.info = beacon.peer.clone();
@@ -481,7 +536,17 @@ impl PeerRegistry {
     /// Learning also never erases *measured* freshness: an operator correcting a peer's
     /// endpoints must not reset the age of its last beacon (only the advertised facts are
     /// replaced).
+    ///
+    /// Declaring **this node** is refused (and counted) for the same reason its beacons
+    /// are: a static entry for itself would sit in the table forever (a static peer is
+    /// never evicted by the TTL), which is exactly the "phantom peer" the table exists to
+    /// avoid.
     pub fn learn(&mut self, info: PeerInfo, now: Timestamp) -> bool {
+        if self.is_local(&info.id) {
+            self.self_entries_refused += 1;
+            tracing::trace!(peer = %info.id, "refused a static entry for our own id");
+            return false;
+        }
         match self.peers.get_mut(&info.id) {
             Some(seen) => {
                 seen.info = info;
@@ -754,12 +819,25 @@ impl Discovery for MockDiscovery {
 #[derive(Debug)]
 pub struct FederationTask {
     handle: JoinHandle<()>,
+    /// Beacons from this node that the task dropped before they reached the registry (the
+    /// filter's evidence — see [`FederationTask::self_echoes`]).
+    self_echoes: Arc<AtomicU64>,
 }
 
 impl FederationTask {
     /// True once the task ended (the link closed, or the task was aborted).
     pub fn is_finished(&self) -> bool {
         self.handle.is_finished()
+    }
+
+    /// How many of this node's own beacons the task has dropped so far.
+    ///
+    /// The filter at the *source* (never locking the registry for our own frame) would
+    /// otherwise be invisible: a node that receives nothing and a node that receives
+    /// everything-but-itself look identical. The registry counts the same thing for a
+    /// table fed directly ([`PeerRegistry::self_entries_refused`]).
+    pub fn self_echoes(&self) -> u64 {
+        self.self_echoes.load(Ordering::Relaxed)
     }
 
     /// Stop the task and wait for it (the shutdown path: no orphaned publishers).
@@ -778,8 +856,10 @@ impl FederationTask {
 /// never listens populates *other* tables and stays blind itself. Two behaviours that
 /// matter in the field:
 ///
-/// * **self-beacons are filtered** (a node is not its own peer). Counting them rather
-///   than dropping them silently means a test can prove the filter is active.
+/// * **self-beacons are filtered** (a node is not its own peer), and **counted**:
+///   [`FederationTask::self_echoes`] is how a test or an operator sees that the filter is
+///   active rather than assuming it (the registry refuses them as well, so a table fed
+///   directly is covered too).
 /// * the registry's TTL still governs *expiry*: a robot that is switched off disappears
 ///   from its peers' tables after [`PeerRegistry::DEFAULT_TTL`], which is exactly the
 ///   "is this link still alive" question a brain server asks.
@@ -811,6 +891,8 @@ pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<Federa
     let node = Arc::clone(node);
     let peer = node.peer().clone();
     let kind = node.kind();
+    let self_echoes = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&self_echoes);
     let handle = tokio::spawn(async move {
         let discovery = match BusDiscovery::attach(&node).await {
             Ok(d) => d,
@@ -823,7 +905,6 @@ pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<Federa
         // stall would look like a flapping peer to every other table on the link.
         let mut ticker = tokio::time::interval(period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let self_beacons = AtomicU64::new(0);
         // Runs until `stop()` aborts it (shutdown), or the link closes (a `recv` error
         // ends the loop instead of spinning on a dead subscription).
         loop {
@@ -840,8 +921,10 @@ pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<Federa
                 received = discovery.next_beacon() => {
                     match received {
                         Ok(beacon) if beacon.peer.id == peer => {
-                            // Our own beacon came back to us: never a peer.
-                            let n = self_beacons.fetch_add(1, Ordering::Relaxed) + 1;
+                            // Our own beacon came back to us: never a peer. (The registry
+                            // refuses it too — this is the fast path that does not even
+                            // take the lock, and `self_echoes()` makes it visible.)
+                            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             tracing::trace!(peer = %peer, count = n, "filtered our own beacon");
                         }
                         Ok(beacon) => {
@@ -862,7 +945,10 @@ pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<Federa
             }
         }
     });
-    Ok(FederationTask { handle })
+    Ok(FederationTask {
+        handle,
+        self_echoes,
+    })
 }
 
 #[cfg(test)]
@@ -896,6 +982,53 @@ mod tests {
         let default = PeerId::default();
         assert_eq!(PeerId::new(default.as_str()).expect("valid"), default);
         assert_eq!(default.as_str(), "amos-node");
+    }
+
+    #[test]
+    fn a_node_is_never_a_peer_of_itself() {
+        // The measured defect this pins: `discover --lan` listed the machine it ran on
+        // (`+ peer self-test`, 4 beacons) because a multicast announcement comes back to
+        // its own sender (`IP_MULTICAST_LOOP` is on by default) and nothing refused it.
+        let me = PeerId::new("dog1").expect("peer");
+        let mut registry = PeerRegistry::with_local(PeerRegistry::DEFAULT_TTL, me.clone());
+        let now = stamp(1_000);
+        assert_eq!(registry.local(), Some(&me));
+
+        // Our own beacon, arriving back from the network: not a peer, not a repeat, and
+        // the table stays empty.
+        let own = Beacon::new(PeerInfo::new(me.clone(), NodeKind::Robot), now);
+        assert!(
+            !registry.observe(&own, now),
+            "our own beacon is not a new peer"
+        );
+        assert!(!registry.observe(&own, now));
+        assert!(registry.peers(now).is_empty(), "the table stays empty");
+        assert!(registry.is_empty());
+        assert_eq!(
+            registry.self_entries_refused(),
+            2,
+            "both refusals are counted"
+        );
+
+        // A hand-declared entry naming itself is refused too: nothing evicts a static peer,
+        // so it would sit in the table forever.
+        assert!(!registry.learn(PeerInfo::new(me.clone(), NodeKind::Robot), now));
+        assert_eq!(registry.self_entries_refused(), 3);
+        assert!(registry.prune(stamp(9_999)).is_empty());
+
+        // A *foreign* peer is still accepted, and the counter does not move for it.
+        assert!(registry.observe(&Beacon::new(peer("mini-brain"), now), now));
+        assert_eq!(registry.peers(now).len(), 1);
+        assert_eq!(registry.self_entries_refused(), 3);
+
+        // A registry with no identity of its own (`new`) keeps accepting everything — the
+        // shape a table-only unit test wants; production constructors use `with_local`.
+        let mut anonymous = PeerRegistry::new(PeerRegistry::DEFAULT_TTL);
+        assert!(
+            anonymous.observe(&own, now),
+            "without an id, nothing is 'self'"
+        );
+        assert_eq!(anonymous.self_entries_refused(), 0);
     }
 
     /// Build a beacon frame by hand — a valid magic, version, length and CRC32 around a
@@ -1402,6 +1535,21 @@ mod tests {
         let status = dog.status().await;
         assert!(status.has_peers());
         assert_eq!(status.peers.len(), 1);
+
+        // The self-echo filter is **visible**, not assumed: each node saw its own beacon
+        // come back on the bus and dropped it (the table stayed at exactly one peer above,
+        // which is the behavioural half of the same fact).
+        assert!(
+            dog_task.self_echoes() >= 1,
+            "dog1 must have filtered its own beacons: {}",
+            dog_task.self_echoes()
+        );
+        assert!(brain_task.self_echoes() >= 1);
+        assert_eq!(
+            dog.self_entries_refused().await,
+            0,
+            "…and the registry never saw them (the task filters at the source)"
+        );
 
         dog_task.stop().await;
         brain_task.stop().await;

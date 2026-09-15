@@ -471,7 +471,7 @@ fn motor_translates_an_action_into_frames_and_hex() {
 }
 
 #[test]
-fn discover_lists_the_seeded_peer_table() {
+fn discover_lists_the_seeded_peer_table_and_never_the_local_node() {
     let (code, stdout, stderr) = run(&[
         "discover",
         "--peer",
@@ -483,11 +483,31 @@ fn discover_lists_the_seeded_peer_table() {
     ]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("discovery=mock"), "got: {stdout}");
-    assert!(stdout.contains("dog1"), "got: {stdout}");
-    assert!(stdout.contains("mini-brain"), "got: {stdout}");
+    assert!(
+        stdout.contains("dog1"),
+        "the operator's static peer is listed, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("mini-brain"),
+        "a node is not its own peer: the local id must never appear as a peer, got: {stdout}"
+    );
     assert!(
         stdout.contains("seen(ms)"),
         "the table has a header, got: {stdout}"
+    );
+
+    // An operator who names their own node as a peer is told why it is absent — a silent
+    // filter would be indistinguishable from a table that received nothing.
+    let (code, stdout, stderr) =
+        run(&["discover", "--peer", "mini-brain", "--static", "mini-brain"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("filtered 1 entry naming this node itself"),
+        "the refusal names itself, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("mini-brain  "),
+        "…and the local node is still not in the table, got: {stdout}"
     );
 }
 
