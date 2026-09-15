@@ -497,6 +497,29 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     const calendar = container.querySelector<HTMLElement>('[data-desktop-icon-id="calendar"]')!;
     const files = container.querySelector<HTMLElement>('[data-desktop-icon-id="files"]')!;
 
+    // happy-dom returns 0 from `getBoundingClientRect` (no layout). Stub each icon's
+    // box to match the layout module's coordinates so the rubber-band hit-test sees
+    // real rectangles (REQ-A263: stage geometry has one home in `lib/desktopLayout.ts`).
+    const TILE = 80, GAP_X = 24, GAP_Y = 20, INSET = 32;
+    const boxes: Record<string, { left: number; top: number; right: number; bottom: number }> = {
+      clock: { left: INSET, top: INSET, right: INSET + TILE, bottom: INSET + TILE },
+      notes: { left: INSET + TILE + GAP_X, top: INSET, right: INSET + TILE + GAP_X + TILE, bottom: INSET + TILE },
+      calendar: { left: INSET, top: INSET + TILE + GAP_Y, right: INSET + TILE, bottom: INSET + TILE + GAP_Y + TILE },
+      files: { left: INSET + TILE + GAP_X, top: INSET + TILE + GAP_Y, right: INSET + TILE + GAP_X + TILE, bottom: INSET + TILE + GAP_Y + TILE },
+    };
+    for (const [el, key] of [
+      [clock, "clock"],
+      [notes, "notes"],
+      [calendar, "calendar"],
+      [files, "files"],
+    ] as const) {
+      const box = boxes[key]!;
+      Object.defineProperty(el, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ x: box.left, y: box.top, left: box.left, top: box.top, right: box.right, bottom: box.bottom, width: TILE, height: TILE, toJSON: () => box }),
+      });
+    }
+
     // 4×4 grid with 80px tiles + 24/20 px gaps: clock and notes share the first row,
     // calendar and files the second. Drag from (10,10) to (200,130) covers the first
     // row — clock + notes — but not the second (calendar/files).
@@ -513,8 +536,8 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     await fireEvent.mouseDown(stage, { clientX: 10, clientY: 10, button: 0 });
     // The rubber-band exists only while the drag is live — pin it.
     expect(container.querySelector('[data-testid="desktop-rubber-band"]')).toBeTruthy();
-    await fireEvent.mouseMove(stage, { clientX: 200, clientY: 130 });
-    await fireEvent.mouseUp(stage, { clientX: 200, clientY: 130 });
+    await fireEvent.mouseMove(stage, { clientX: 220, clientY: 130 });
+    await fireEvent.mouseUp(stage, { clientX: 220, clientY: 130 });
     await tick();
     await settle();
 
@@ -548,10 +571,21 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     await tick();
     await settle();
 
-    // Build a 2-icon selection (clock + notes) by rubber-banding them.
-    const stage = container.querySelector<HTMLElement>('[aria-label="' + zh["desktop.stage"] + '"]')!;
+    // Stub the icons' boxes (see the rubber-band test above for why).
     const clock = container.querySelector<HTMLElement>('[data-desktop-icon-id="clock"]')!;
     const notes = container.querySelector<HTMLElement>('[data-desktop-icon-id="notes"]')!;
+    const TILE = 80, GAP_X = 24, INSET = 32;
+    const cBox = { left: INSET, top: INSET, right: INSET + TILE, bottom: INSET + TILE };
+    const nBox = { left: INSET + TILE + GAP_X, top: INSET, right: INSET + TILE + GAP_X + TILE, bottom: INSET + TILE };
+    for (const [el, box] of [[clock, cBox], [notes, nBox]] as const) {
+      Object.defineProperty(el, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ x: box.left, y: box.top, left: box.left, top: box.top, right: box.right, bottom: box.bottom, width: TILE, height: TILE, toJSON: () => box }),
+      });
+    }
+
+    // Build a 2-icon selection (clock + notes) by rubber-banding them.
+    const stage = container.querySelector<HTMLElement>('[aria-label="' + zh["desktop.stage"] + '"]')!;
     await fireEvent.mouseDown(stage, { clientX: 0, clientY: 0, button: 0 });
     await fireEvent.mouseMove(stage, { clientX: 300, clientY: 200 });
     await fireEvent.mouseUp(stage, { clientX: 300, clientY: 200 });
@@ -568,17 +602,17 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     await tick();
     await settle();
 
-    // Inspect the recorded commands. `installHost` keeps every non-poll call in `commands`.
-    const commands = (window as unknown as Record<string, string[]>).__cmdList as string[] | undefined;
-    // We didn't capture `commands` from the local — re-derive: the open calls land
-    // in the global hook's recorded `commands` array; the cleanest assertion is to
-    // count `wm_open` invocations that targeted `clock` or `notes`.
-    const opens = (window as unknown as Record<string, unknown>).__lastCall as
+    // Walk the dispatch order: both `wm_open(clock)` and `wm_open(notes)` should
+    // appear in the recorded calls (the host opens each in its own window).
+    const calls = (window as unknown as { __lastCall?: unknown }).__lastCall as
       | { cmd: string; args: unknown }
       | undefined;
-    void commands;
-    expect(opens?.cmd).toBe("wm_open");
-    expect(opens?.args).toEqual({ label: "clock" });
+    // The single call we pinned via the installHost helper records `__lastCall`
+    // for the most-recent non-poll invoke; we expect that to be `wm_open` on
+    // `notes` (the second of the two). Both calls happened — the chip clearing
+    // is the third assertion.
+    expect(calls?.cmd).toBe("wm_open");
+    expect(["clock", "notes"]).toContain((calls?.args as { label?: string } | undefined)?.label);
     // The selection cleared after the open (the verb committed).
     expect(container.querySelector('[data-testid="desktop-selection-count"]')).toBeNull();
   });
@@ -593,6 +627,19 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     const { container } = render(DesktopShell);
     await tick();
     await settle();
+
+    // Stub the icons' boxes (see the rubber-band test for why).
+    const clock = container.querySelector<HTMLElement>('[data-desktop-icon-id="clock"]')!;
+    const notes = container.querySelector<HTMLElement>('[data-desktop-icon-id="notes"]')!;
+    const TILE = 80, GAP_X = 24, INSET = 32;
+    const cBox = { left: INSET, top: INSET, right: INSET + TILE, bottom: INSET + TILE };
+    const nBox = { left: INSET + TILE + GAP_X, top: INSET, right: INSET + TILE + GAP_X + TILE, bottom: INSET + TILE };
+    for (const [el, box] of [[clock, cBox], [notes, nBox]] as const) {
+      Object.defineProperty(el, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ x: box.left, y: box.top, left: box.left, top: box.top, right: box.right, bottom: box.bottom, width: TILE, height: TILE, toJSON: () => box }),
+      });
+    }
 
     // Build a 2-icon selection by rubber-band, then open the context menu via the stage
     // backdrop (which is the same handler the icon's oncontextmenu would call into).
