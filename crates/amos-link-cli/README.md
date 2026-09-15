@@ -23,6 +23,9 @@ amos-link-cli discover --lan --peer dog1 --seconds 9   # real UDP beacons; the l
                                                       # filtered count is printed instead
 amos-link-cli watch --seconds 5                   # heartbeat + federation: is the link alive
 amos-link-cli state --timeout-ms 2000             # what robots report about themselves
+amos-link-cli hz    --pattern 'amos/**' --seconds 10   # the *rate* of every stream (per stream:
+                                                       # frames, span, rate) — and why, instead of
+                                                       # `0 Hz`, when a rate cannot be stated
 amos-link-cli motor --action '{"action":"trot","speed":0.5}'   # frames + hex
 amos-link-cli motor --action '{"action":"stand"}' --device /run/motor.sock  # …onto a real bus
 
