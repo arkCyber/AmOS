@@ -31,9 +31,19 @@
     type BatterySample,
   } from "../lib/batteryStatus";
   import { statusIcons } from "../lib/netStatus";
+  import { deviceChrome } from "../lib/formLayout";
+  import type { FormFactor } from "../lib/wm";
   import { systemHealth, hostBattery } from "../lib/system";
   import { bridged } from "../lib/backend";
   import { t } from "./locale.svelte";
+
+  // Which device class the shell is drawing for. Optional and defaulting to the phone
+  // (no host / preview build ⇒ today's chrome) — the same "a missing payload never
+  // gains a capability" rule `HomeDock`'s grid follows. It decides exactly one thing:
+  // the **Dynamic Island** is an iPhone screen cutout, so it is not drawn on a Mac
+  // (see `lib/formLayout::deviceChrome`).
+  let { form = "phone" }: { form?: FormFactor } = $props();
+  const chrome = $derived(deviceChrome(form));
 
   const settingsStore = createStoreValue<unknown>(SETTINGS_KEY, {});
   const flashStore = createStoreValue<unknown>(FLASHLIGHT_KEY, {});
@@ -145,11 +155,15 @@
 
 <div class="relative flex items-center justify-between px-4 pb-1 pt-3 text-xs font-semibold text-neutral-900 dark:text-neutral-100">
   <span class="tabular-nums">{fmtClock(now)}</span>
-  <!-- Dynamic Island -->
-  <span
-    aria-hidden="true"
-    class="pointer-events-none absolute left-1/2 top-[9px] h-[22px] w-[112px] -translate-x-1/2 rounded-full bg-black shadow-sm"
-  ></span>
+  <!-- Dynamic Island: iPhone hardware (a screen cutout), so it is drawn only for the
+       class that has it. In a macOS window it was an invented black pill. -->
+  {#if chrome.dynamicIsland}
+    <span
+      aria-hidden="true"
+      data-testid="dynamic-island"
+      class="pointer-events-none absolute left-1/2 top-[9px] h-[22px] w-[112px] -translate-x-1/2 rounded-full bg-black shadow-sm"
+    ></span>
+  {/if}
   <span class="flex items-center gap-1 text-[11px] text-neutral-700/90 dark:text-neutral-200/90" aria-label={t("a11y.networkStatus")}>
     {#if alertIcon}
       <span

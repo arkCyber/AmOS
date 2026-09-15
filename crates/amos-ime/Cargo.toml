@@ -13,15 +13,20 @@ description = "AmOS input-method (IME) domain core: a Mandarin pinyin engine (in
 name = "amos_ime"
 path = "src/lib.rs"
 
+[features]
+default = ["predict"]
+# 联想 / next-word prediction: the word-trigram dict (`predict_next_words_context`)
+# plus the word-bigram FSAs that `bigram_boost` feeds to the composition Viterbi.
+# Measured cost in the System UI binary: see `docs/input-method.md` §Deferred
+# (the data is ~18.7 MB of embedded FSTs). Turning it off is a supported build
+# (`--no-default-features`): the crate answers "no predictions" rather than
+# pretending, and every call site here is unconditional (no `cfg` in our code).
+predict = ["inputx-pinyin/bigrams", "inputx-pinyin/trigrams"]
+
 [dependencies]
-# Core engine only: the embedded FST dictionary (~4.4 MB, ~165k pinyin codes)
-# and the segmentation-Viterbi `best_composition` sentence builder. The upstream
-# crate's DEFAULT features add the word-bigram + trigram FSTs (~20 MB) that power
-# `predict_next_words` / `bigram_boost` — deliberately OFF here: nothing in the
-# System UI consumes next-word prediction yet, and a mobile System UI must not pay
-# 20 MB of binary for a model it never queries. Turning them on is a one-line
-# change (see docs/input-method.md §Deferred), not a redesign: the candidate path
-# used here (`Session::candidates` + `best_composition`) is feature-independent.
+# Core engine only by default: the embedded FST dictionary (~4.2 MB, ~165k pinyin
+# codes) and the segmentation-Viterbi `best_composition` sentence builder.
+# The `predict` feature above adds the bigram + trigram FSTs.
 inputx-pinyin = { version = "1.4", default-features = false }
 serde.workspace = true
 serde_json = "1.0"

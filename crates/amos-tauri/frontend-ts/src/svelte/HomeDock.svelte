@@ -31,6 +31,7 @@
     pageCapacity,
     PHONE_GRID,
     type HomeGrid,
+    type HomeTile,
   } from "../lib/formLayout";
   import AppIcon from "./AppIcon.svelte";
   import { fmtClock } from "../lib/time";
@@ -49,6 +50,11 @@
      * "never gain a capability from a missing payload" rule `lib/wm.ts` follows.
      */
     grid?: HomeGrid;
+    /**
+     * How big one tile is on this class (`lib/formLayout::homeTile`). Optional for the
+     * same reason `grid` is: a payload without it keeps today's `regular` tiles.
+     */
+    tile?: HomeTile;
   }
   const home = propsChannel<HomeProps>("home");
 
@@ -67,6 +73,9 @@
   const pulseId = $derived(incoming?.pulseId ?? null);
   /** Icon-grid geometry for this device class (phone 4×3 unless the shell says otherwise). */
   const grid = $derived(incoming?.grid ?? PHONE_GRID);
+  /** Tile size for this class; `regular` keeps the historical 56 px / dock 60 px icons. */
+  const tileSize = $derived(incoming?.tile ?? "regular");
+  const large = $derived(tileSize === "large");
 
   // ---- Reactive notifications + Do-Not-Disturb (live, cross-window) ----
   const notifStore = createStoreValue<Notif[]>(NOTIF_KEY, []);
@@ -454,19 +463,25 @@
     ondragover={inDock ? dockAllowDrop : undefined}
     ondrop={inDock ? (e) => dockDrop(e, id) : undefined}
     class="group flex flex-col items-center gap-1 outline-none {inDock ? 'w-20' : 'w-16'}"
+    data-tile={tileSize}
   >
     <span class="relative">
+      <!-- Sizes are **literal** class strings (one per class × dock/grid): Tailwind
+           purges class names it cannot see statically, and a desktop Launcher wants
+           Launchpad-class tiles rather than 56 px phone icons in a 183 px cell. -->
       <AppIcon
         id={id}
         icon={iconOf(id)}
-        tileClassName={
-          (inDock
-            ? "h-[60px] w-[60px] rounded-[21px]"
+        tileClassName={(inDock
+          ? large
+            ? "h-[76px] w-[76px] rounded-[26px]"
+            : "h-[60px] w-[60px] rounded-[21px]"
+          : large
+            ? "h-20 w-20 rounded-[24px]"
             : "h-14 w-14 rounded-[19px]") +
           " group-hover:-translate-y-0.5 group-active:scale-90" +
-          (pulseId === id ? " animate-pulse ring-2 ring-accent" : "")
-        }
-        glyphClassName={inDock ? "text-[2.7rem]" : "text-[2.5rem]"}
+          (pulseId === id ? " animate-pulse ring-2 ring-accent" : "")}
+        glyphClassName={large ? "text-[3.2rem]" : inDock ? "text-[2.7rem]" : "text-[2.5rem]"}
       />
       {#if unreadOf(id) > 0}
         <span

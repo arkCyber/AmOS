@@ -109,6 +109,13 @@ async fn link_control_plane_is_mounted_on_the_daemon_socket() {
         .await
         .expect("ListTopics #2")
         .into_inner();
+    // The list arrives with its own limit: this caller is *not* on the daemon's transport, so
+    // `complete` is its only way to tell "these are all the topics" from "this is what the node
+    // saw" (the field is the control plane's half of the broker's `topics_complete()`).
+    assert!(
+        after.complete,
+        "a broker that has not hit MAX_TRACKED_TOPICS is the whole truth"
+    );
     assert!(
         after
             .topics

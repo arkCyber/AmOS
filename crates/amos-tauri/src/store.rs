@@ -33,6 +33,15 @@ pub struct StoreUpdated {
 /// The event name the frontend subscribes to.
 pub const STORE_UPDATED_EVENT: &str = "store-updated";
 
+/// The store key for the currently focused app label (desktop TopBar reads this).
+///
+/// This is the **only** channel for that fact: `SharedStore::set` broadcasts
+/// `store-updated` to every window and the desktop chrome re-renders from the key.
+/// A dedicated `app-focused-changed` event used to sit next to it and was removed
+/// (REQ-A254) — `scripts/tauri-event-scan.mjs` flagged it as "emitted by the host
+/// but no screen subscribes to it", which is exactly what it was.
+pub const APP_FOCUSED_KEY: &str = "amos.app_focused";
+
 /// File used when `AMOS_STATE_FILE` is unset: `~/.amos/state.json`.
 const DEFAULT_RELATIVE: &str = ".amos/state.json";
 

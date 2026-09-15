@@ -274,6 +274,9 @@ impl LinkNode {
     pub async fn status(&self) -> NodeStatus {
         let peers = self.peers().await;
         let topics = self.topics().await;
+        // The inventory and its limit are read together (both from the transport), so the
+        // JSON can never present a truncated list as the whole truth.
+        let topics_complete = self.transport.topics_complete().await;
         let metrics = self.metrics.snapshot();
         let clock_synced = self.clock.synced();
         NodeStatus {
@@ -288,6 +291,7 @@ impl LinkNode {
             health: LinkHealth::evaluate(&metrics, &peers, clock_synced, None),
             peers,
             topics,
+            topics_complete,
         }
     }
 
@@ -333,9 +337,44 @@ impl LinkNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broker::{PublishReport, Subscription};
     use crate::discovery::{Beacon, PeerInfo};
+    use crate::error::LinkError;
+    use crate::qos::Qos;
     use crate::telemetry::DEFAULT_HEARTBEAT_PERIOD;
+    use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
+
+    /// A transport that answers like a **network bus**: it can carry frames, but it cannot
+    /// enumerate what other nodes published — so its inventory is empty *and* never complete.
+    /// Standing in for Zenoh here is the point: the same shape (empty list + `false`) is what
+    /// `zenoh.rs` reports, and the `NodeStatus` JSON has to carry both halves.
+    struct BlindTransport;
+
+    #[async_trait]
+    impl Transport for BlindTransport {
+        async fn publish(&self, _topic: &Topic, _frame: Arc<[u8]>) -> Result<PublishReport> {
+            Ok(PublishReport::default())
+        }
+
+        async fn subscribe(&self, _pattern: &Topic, _qos: Qos) -> Result<Subscription> {
+            Err(LinkError::Unsupported(
+                "the blind test transport has no subscribers".to_string(),
+            ))
+        }
+
+        async fn topics(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn topics_complete(&self) -> bool {
+            false
+        }
+
+        fn name(&self) -> &'static str {
+            "blind"
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct MotorCmd {
@@ -465,6 +504,45 @@ mod tests {
         assert!(n.forget_peer(static_peer.id()).await);
         assert!(!n.forget_peer(static_peer.id()).await, "already gone");
         assert_eq!(n.peers().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_inventorys_own_limit_travels_with_the_inventory() {
+        // The gap this pins: `NodeStatus` carried `topics` but not the transport's
+        // `topics_complete` — so `status --json`, the form a *machine* reads, presented an
+        // inventory that had stopped growing (the broker's `MAX_TRACKED_TOPICS`) exactly like
+        // a complete one, and a network bus's empty list exactly like "nothing is published".
+        // The CLI's `topics` command printed the caveat; the JSON could not.
+        let metrics = Arc::new(LinkMetrics::new());
+        let blind = LinkNode::with_parts(
+            PeerId::new("dog1").expect("peer"),
+            NodeKind::Robot,
+            Arc::new(BlindTransport),
+            Arc::new(Clock::host()),
+            metrics,
+        );
+        let status = blind.status().await;
+        assert!(status.topics.is_empty());
+        assert!(
+            !status.topics_complete,
+            "a transport that cannot enumerate must say so"
+        );
+        let json = status.to_json().expect("json");
+        assert!(
+            json.contains("\"topics_complete\": false"),
+            "the limit has to be in the machine-readable form: {json}"
+        );
+
+        // …and the flag is the *transport's* answer, not a constant: a fresh in-process broker
+        // (which really does know every topic it saw, and has not hit its ceiling) says true.
+        let local = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let status = local.status().await;
+        assert!(status.topics_complete);
+        assert!(status
+            .to_json()
+            .expect("json")
+            .contains("\"topics_complete\": true"));
+        assert_eq!(status.topics, local.topics().await);
     }
 
     #[tokio::test]

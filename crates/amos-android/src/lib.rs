@@ -30,5 +30,7 @@ pub use lmk::{
 };
 pub use manager::{AndroidManagerConfig, CacheStats, EnhancedAndroidManager};
 pub use png::icon_png;
-pub use runtime::{auto, AndroidRuntime, DemoRuntime, WaydroidRuntime};
+pub use runtime::{
+    auto, is_demo_runtime, AndroidRuntime, DemoRuntime, WaydroidRuntime, DEMO_RUNTIME_NAME,
+};
 pub use service::AndroidManagerService;

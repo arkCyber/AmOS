@@ -14,7 +14,12 @@
 //! * `clock_synced: false` means the link's latency numbers are **bounds**, not
 //!   measurements (`amos-timesync` has not calibrated the clock);
 //! * the counters are cumulative and never reset — the page says so rather than
-//!   pretending they are a rate.
+//!   pretending they are a rate;
+//! * a reading has **no expiry of its own**: `last_seen_ms` is the age *at the moment the
+//!   daemon answered*. Dating and re-reading is therefore the reader's job, and this bridge's
+//!   only consumer does both — `LinkPage.svelte` prints the read time (`link.probe`), re-reads
+//!   every 10 s while it is open and visible, and drops the numbers when a re-read gets no
+//!   answer instead of leaving a frozen table on screen.
 //!
 //! This is the control plane only: the data plane (stereo frames, joint set points)
 //! never travels through gRPC, and this bridge does not pretend to read it.

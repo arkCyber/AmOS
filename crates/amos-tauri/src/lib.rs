@@ -72,6 +72,14 @@ pub mod translate;
 pub mod tts;
 pub mod watch_backoff;
 pub mod wm;
+// Desktop-only native-application surfaces (runtime availability, never a `cfg`:
+// `wine_is_available` / `linux_is_available` answer for the host they run on).
+#[cfg(desktop)]
+pub mod linux_apps;
+#[cfg(desktop)]
+pub mod wine;
+// The freedesktop `.desktop` entry format, shared by both surfaces above (pure).
+pub mod desktop_entry;
 
 use ai_bridge::AiBridge;
 use std::sync::Arc;
@@ -189,6 +197,7 @@ pub fn run() {
             wm::wm_hide,
             wm::wm_close,
             wm::wm_home,
+            wm::wm_set_shell_title,
             wm::wm_windows,
             wm::wm_layout_snapshot,
             wm::wm_layout_set_screen,
@@ -352,7 +361,19 @@ pub fn run() {
             alarm_sched::scheduler_alarm_register,
             alarm_sched::scheduler_alarm_cancel,
             alarm_sched::scheduler_alarm_poll,
-            real_dial::real_dial
+            real_dial::real_dial,
+            #[cfg(desktop)]
+            wine::wine_is_available,
+            #[cfg(desktop)]
+            wine::wine_apps,
+            #[cfg(desktop)]
+            wine::wine_launch,
+            #[cfg(desktop)]
+            linux_apps::linux_is_available,
+            #[cfg(desktop)]
+            linux_apps::linux_apps,
+            #[cfg(desktop)]
+            linux_apps::linux_launch,
         ])
         .on_window_event(|window, event| {
             // Keep the layout model's screen equal to the **real** window area.
@@ -376,6 +397,24 @@ pub fn run() {
             let state = window.state::<WmState>();
             match state.sync_from_pixels(width, height, scale, window.app_handle()) {
                 Ok(Some(snapshot)) => {
+                    // A **shrunken** screen can leave app windows hanging outside it
+                    // (the user dragged them there, or they were placed when the shell
+                    // was bigger). Pull them back — read from the platform, so no
+                    // host-side ledger can drift — and report how many moved.
+                    match state.reclamp_windows(window.app_handle()) {
+                        Ok(0) => {}
+                        Ok(moved) => tracing::info!(
+                            moved,
+                            screen_w = snapshot.screen_w,
+                            screen_h = snapshot.screen_h,
+                            "app windows were pulled inside the new screen area"
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "amos::wm",
+                            error = %e,
+                            "could not re-clamp app windows after the screen changed"
+                        ),
+                    }
                     // This measurement is post-application by construction (the event
                     // carries the size the window now has), so it is the authoritative
                     // answer to the boot-time shell-size request: say plainly whether the

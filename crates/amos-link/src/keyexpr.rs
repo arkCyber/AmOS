@@ -96,8 +96,20 @@ impl Topic {
     /// Validate a **concrete** topic (no wildcards).
     pub fn new(expr: impl Into<String>) -> Result<Self> {
         let expr = expr.into();
-        validate(&expr, false)?;
+        Self::validate_str(&expr)?;
         Ok(Topic(expr))
+    }
+
+    /// Validate a **concrete** key expression **without building a [`Topic`]**.
+    ///
+    /// [`Topic::new`] calls this, so there is exactly one rule with two entry points.
+    /// The second caller is the codec: a frame header carries its topic as *bytes*, and
+    /// `Deserialize` cannot run a constructor — so a decoder that claims to validate the
+    /// wire has to ask this question again (see `Header::validate`). Doing it without
+    /// building a `Topic` matters because the answer is usually "no": a refused frame must
+    /// not cost an allocation on the receive path.
+    pub fn validate_str(expr: &str) -> Result<()> {
+        validate(expr, false)
     }
 
     /// Validate a **pattern**: like [`Topic::new`], but `*` / `**` are allowed.
@@ -325,6 +337,57 @@ mod tests {
             Topic::new("amos/".to_string() + &vec!["a"; MAX_SEGMENTS + 1].join("/")).is_err(),
             "too many segments refused"
         );
+    }
+
+    #[test]
+    fn the_non_allocating_check_asks_the_same_question_as_the_constructor() {
+        // Two entry points, one rule. `validate_str` exists so the *codec* can re-ask a wire
+        // header's topic without building a `Topic`; if the two ever drifted apart, `decode`
+        // would be accepting (or refusing) what `new` does not — the exact shape of a
+        // boundary that says "validated" while validating something else.
+        for expr in [
+            "amos/dog1/sensor/imu",
+            "amos",
+            "amos/dog1",
+            "amos/dog1/state/mode",
+            "amos//imu",
+            "amos/dog1/sensor/imu/",
+            "",
+            "amos/*/sensor/imu",
+            "amos/**",
+            "other/dog1/sensor/imu",
+            "amos/IMU!",
+            "amos/dog1/nonsense/imu",
+        ] {
+            assert_eq!(
+                Topic::new(expr).is_ok(),
+                Topic::validate_str(expr).is_ok(),
+                "`{expr}`: the constructor and the checker must agree"
+            );
+        }
+        // A wildcard is a *pattern*, never a concrete topic — the check is the strict one.
+        assert!(Topic::validate_str("amos/*/sensor/imu").is_err());
+        assert!(Topic::pattern("amos/*/sensor/imu").is_ok());
+
+        // Same rule ⇒ same reason: a caller that logs the refusal gets the detailed message
+        // (`empty segment`), not a bare bool.
+        let from_new = Topic::new("amos//imu").expect_err("refused").to_string();
+        let from_check = Topic::validate_str("amos//imu")
+            .expect_err("refused")
+            .to_string();
+        assert_eq!(from_new, from_check);
+        assert!(from_check.contains("empty segment"), "got: {from_check}");
+
+        // The over-long shapes are refused by both, including at the exact boundaries.
+        let long_segment = format!("amos/{}", "x".repeat(MAX_SEGMENT + 1));
+        assert!(Topic::validate_str(&long_segment).is_err());
+        assert!(Topic::validate_str(&format!("amos/{}", "x".repeat(MAX_SEGMENT))).is_ok());
+        let deep = "amos/".to_string() + &vec!["a"; MAX_SEGMENTS + 1].join("/");
+        assert!(Topic::validate_str(&deep).is_err());
+        assert!(Topic::validate_str(
+            &("amos/".to_string() + &vec!["a"; MAX_SEGMENTS - 1].join("/"))
+        )
+        .is_ok());
     }
 
     #[test]

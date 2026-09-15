@@ -40,8 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: "Read the pinned Rust toolchain (source: rust-toolchain.toml)"
+        id: rust-pin
+        run: bash .github/scripts/read-rust-pin.sh
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
 
       - name: Install protoc (for tonic-prost-build)
         uses: arduino/setup-protoc@v3

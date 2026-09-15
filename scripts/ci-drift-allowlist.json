@@ -1,0 +1,4 @@
+{
+  "_comment": "Suppressions for scripts/ci-drift-scan.mjs. Every entry needs a non-empty `reason`; an entry that no longer matches anything is reported as stale (a suppression that outlives its cause hides the next regression of the same class). `match` is an optional substring of the finding detail. Empty on purpose: this tree has no accepted CI drift.",
+  "entries": []
+}

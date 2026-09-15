@@ -75,6 +75,8 @@ serde_json = "1.0"
 base64 = "0.21"
 # PTY for the terminal backend; enabled only by the `terminal-pty` feature.
 portable-pty = { version = "0.8", optional = true }
+# dirs: home dir / XDG paths used by wine.rs and linux_apps.rs (both desktop-only modules).
+dirs = "5.0"
 tracing.workspace = true
 
 # Opt-in local streaming ASR: compiles + links the native sherpa-onnx lib.

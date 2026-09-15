@@ -33,6 +33,7 @@
     { "key": "amos.reminderFired", "kind": "derived" },
     { "key": "amos.notesRagIndexed", "kind": "derived" },
     { "key": "amos.notifications", "kind": "derived" },
+    { "key": "amos.app_focused", "kind": "derived" },
     { "key": "amos.recents", "kind": "derived" },
     { "key": "amos.android.recent", "kind": "derived" },
     { "key": "amos.timer", "kind": "derived" },

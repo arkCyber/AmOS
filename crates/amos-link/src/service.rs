@@ -329,8 +329,11 @@ impl RobotLink for LinkService {
     }
 
     async fn list_topics(&self, _request: Request<Empty>) -> Result<Response<TopicList>, Status> {
+        // The list and its own limit travel together (see `TopicList.complete`): the caller
+        // here is *not* on this node's transport, so it cannot find out any other way.
         Ok(Response::new(TopicList {
             topics: self.node.topics().await,
+            complete: self.node.topics_complete().await,
         }))
     }
 
@@ -401,6 +404,11 @@ impl RobotLink for LinkService {
     /// stream a "is the bus alive" signal; `GetStatus` is the place to ask "who exactly".
     /// The forwarding task ends with the client (its receiver is dropped) or with the
     /// node's transport closing — no orphaned task.
+    ///
+    /// Beats are read with [`Subscriber::recv_beat`], so one whose payload names a peer other
+    /// than the frame's own publisher never reaches a client: this stream *is* the answer to
+    /// "which robots are alive", and a frame carrying two identities would put the payload's
+    /// claim in front of every operator while the framing says something else.
     async fn stream_heartbeats(
         &self,
         _request: Request<Empty>,
@@ -418,7 +426,7 @@ impl RobotLink for LinkService {
             // Runs while the RPC client reads and the link is up: the loop ends when the
             // client disconnects (`tx.send` fails) or the subscription closes.
             loop {
-                match subscriber.recv().await {
+                match subscriber.recv_beat().await {
                     Ok(received) => {
                         let beat: Heartbeat = received.message;
                         if tx.send(Ok(proto_heartbeat(&beat))).await.is_err() {

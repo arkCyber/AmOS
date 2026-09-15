@@ -531,9 +531,16 @@ export interface AndroidLaunchResult {
   error?: string;
 }
 
-/** List installed Android apps exposed by the daemon (null outside Tauri). */
-export async function getAndroidApps(): Promise<AndroidApp[] | null> {
-  return invoke<AndroidApp[]>("get_android_apps");
+/** See `lib/android.ts::AndroidAppsReply` — the list plus the runtime behind it. */
+export interface AndroidAppsReply {
+  apps: AndroidApp[];
+  runtime: string;
+  demo: boolean;
+}
+
+/** List installed Android apps + the runtime that answered (null outside Tauri). */
+export async function getAndroidApps(): Promise<AndroidAppsReply | null> {
+  return invoke<AndroidAppsReply>("get_android_apps");
 }
 
 /** Launch a package in the container (registers an external System window). */

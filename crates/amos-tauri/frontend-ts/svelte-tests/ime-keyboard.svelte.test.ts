@@ -251,6 +251,64 @@ describe("ImeKeyboard.svelte — candidate bar", () => {
     expect(button?.textContent).toContain("整句");
   });
 
+  // ---- 联想 / next-word suggestions (REQ-A260) -----------------------------
+
+  test("suggestions render with their own tag and no composition chip", async () => {
+    const oncommit = vi.fn();
+    const host = mount({
+      oncommit,
+      // The host sends them as candidates of kind "predict" with an **empty**
+      // buffer: the user is not composing, the engine is offering the next word.
+      session: state({
+        input: "",
+        composing: false,
+        last_committed: "的",
+        candidates: [
+          { text: "国家", kind: "predict" },
+          { text: "生活", kind: "predict" },
+        ],
+      }),
+    });
+
+    const bar = host.container.querySelector('[data-testid="ime-composition"]');
+    expect(bar, "the candidate bar must show for suggestions too").toBeTruthy();
+    expect(
+      host.container.querySelector('[data-testid="ime-input"]'),
+      "nothing is being composed, so there is no pinyin chip to show",
+    ).toBeNull();
+    expect(host.container.querySelector('[data-testid="ime-composition-clear"]')).toBeNull();
+
+    const shown = host.container.querySelectorAll('[data-testid="ime-candidate"]');
+    expect(shown.length).toBe(2);
+    expect(shown[0]!.textContent).toContain("国家");
+    expect(host.container.querySelectorAll('[data-testid="ime-predict-tag"]').length).toBe(2);
+    expect(shown[0]!.textContent).toContain("联想");
+
+    // Picking one reports its absolute index — the same commit path as a buffer
+    // candidate (the host routes it to the suggestion pick).
+    await fireEvent.click(shown[1]!);
+    expect(oncommit).toHaveBeenCalledWith(1);
+  });
+
+  test("no suggestions and no composition means no candidate bar", () => {
+    const host = mount({ session: state({ input: "", composing: false, candidates: [] }) });
+    expect(host.container.querySelector('[data-testid="ime-composition"]')).toBeNull();
+    expect(host.container.querySelector('[data-testid="ime-candidate"]')).toBeNull();
+  });
+
+  test("typing takes the bar back over from the suggestions", () => {
+    const host = mount({
+      session: state({
+        input: "guo",
+        composing: true,
+        candidates: [{ text: "国", kind: "dict" }],
+      }),
+    });
+    // A buffer candidate is not a suggestion: no 联想 tag, and the code is shown.
+    expect(host.container.querySelector('[data-testid="ime-predict-tag"]')).toBeNull();
+    expect(host.container.querySelector('[data-testid="ime-input"]')?.textContent).toContain("guo");
+  });
+
   test("an empty candidate list says so instead of rendering nothing", () => {
     const host = mount({ session: state({ input: "zzz", composing: true, candidates: [] }) });
     expect(host.container.querySelector('[data-testid="ime-no-candidates"]')).toBeTruthy();

@@ -42,9 +42,9 @@ describe("shellState.svelte (Svelte shell navigation)", () => {
     expect(spotOpen()).toBe(false);
   });
 
-  test("open() enters the app surface and clears overlays", () => {
+  test("open() enters the app surface and clears overlays", async () => {
     setNc(true);
-    open("phone");
+    await open("phone");
     expect(surface()).toEqual({ kind: "app", id: "phone" });
     expect(ncOpen()).toBe(false);
   });
@@ -97,10 +97,10 @@ describe("shellState.svelte (Svelte shell navigation)", () => {
     expect(surface()).toEqual({ kind: "home" });
   });
 
-  test("open() records a recent for built-ins (drives the App Library Frequently Used)", () => {
-    open("phone");
+  test("open() records a recent for built-ins (drives the App Library Frequently Used)", async () => {
+    await open("phone");
     expect(getRecents()[0]).toBe("phone");
-    open("phone");
+    await open("phone");
     expect(getRecents()).toEqual(["phone"]); // dedup: revisit doesn't double it
   });
 });

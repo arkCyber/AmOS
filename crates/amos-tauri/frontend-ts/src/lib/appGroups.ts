@@ -49,6 +49,7 @@ const ASSIGN: Record<string, CategoryId> = {
   android: "system",
   store: "system",
   pwa: "system",
+  nativeapps: "system",
   terminal: "utilities",
 };
 

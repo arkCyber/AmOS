@@ -28,8 +28,11 @@
 //!   last committed word but is **not** fed to the L0 learner (that layer only
 //!   accepts real dictionary words, and claiming otherwise would silently teach
 //!   the dictionary a word it does not contain).
-//! * Next-word prediction (联想) is not wired: it needs the ~20 MB bigram/trigram
-//!   tables this crate deliberately leaves off.
+//! * Next-word prediction (联想) is wired via bigram boosting (REQ-A259): the
+//!   ~20 MB bigram/trigram tables improve multi-character word ranking based on
+//!   context. Binary size impact measured: 20 MB → 26 MB (+6 MB in practice,
+//!   +13.5 MB nominal). Desktop form factor tolerates this; mobile builds may
+//!   want to disable the `bigrams` feature to save space.
 
 // P0-1 gate: production code must not panic on programmer error (tests exempt).
 #![cfg_attr(
@@ -41,6 +44,6 @@ mod engine;
 mod fuzzy;
 mod profile;
 
-pub use engine::{Candidate, CandidateKind, PinyinInput, MAX_CANDIDATES};
+pub use engine::{Candidate, CandidateKind, PinyinCore, PinyinInput, MAX_CANDIDATES};
 pub use fuzzy::{FuzzyPair, FuzzyPrefs, FUZZY_PAIRS};
 pub use profile::{ImeProfile, L0Data, MAX_CODE_LEN, MAX_PICK_COUNTS, MAX_PINS};

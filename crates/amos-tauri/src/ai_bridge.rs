@@ -916,6 +916,23 @@ pub struct AndroidAppInfo {
     pub activity: String,
 }
 
+/// The installed-app list **plus which runtime produced it**.
+///
+/// This used to be a bare `Vec<AndroidAppInfo>`, which made the shell unable to
+/// tell this machine's installed apps from the daemon's built-in fixture. The
+/// fixture is what `AndroidRuntime::auto()` selects on **every host without an
+/// Android container** (any macOS desktop, a Linux box without Waydroid) so the
+/// pipeline stays exercisable — and presenting it as "your apps" is exactly the
+/// silent fabrication the rest of AmOS refuses (docs/android-compat.md §桌面形态).
+#[derive(Serialize)]
+pub struct AndroidAppsOut {
+    pub apps: Vec<AndroidAppInfo>,
+    /// The runtime driver that answered (`waydroid` / `demo`).
+    pub runtime: String,
+    /// True when `apps` is the daemon's fixture, i.e. **not this machine's** apps.
+    pub demo: bool,
+}
+
 /// Result of launching a legacy APK through the Android compat layer.
 #[derive(Serialize)]
 pub struct AndroidLaunchResult {
@@ -938,25 +955,29 @@ fn legacy_surface_label(success: bool, window_id: &str) -> Option<String> {
     (success && !window_id.is_empty()).then(|| format!("legacy:{window_id}"))
 }
 
-/// Tauri command: list installed Android apps (from the container runtime).
+/// Tauri command: list installed Android apps + the runtime that answered.
 #[tauri::command]
-pub async fn get_android_apps(state: State<'_, AiBridge>) -> Result<Vec<AndroidAppInfo>, String> {
+pub async fn get_android_apps(state: State<'_, AiBridge>) -> Result<AndroidAppsOut, String> {
     let mut attempt = 0;
     loop {
         let mut client = state.connect_android().await?;
         match client.get_installed_apps(Empty {}).await {
             Ok(resp) => {
-                return Ok(resp
-                    .into_inner()
-                    .apps
-                    .into_iter()
-                    .map(|a| AndroidAppInfo {
-                        name: a.name,
-                        package_name: a.package_name,
-                        icon_path: a.icon_path,
-                        activity: a.activity,
-                    })
-                    .collect());
+                let r = resp.into_inner();
+                return Ok(AndroidAppsOut {
+                    apps: r
+                        .apps
+                        .into_iter()
+                        .map(|a| AndroidAppInfo {
+                            name: a.name,
+                            package_name: a.package_name,
+                            icon_path: a.icon_path,
+                            activity: a.activity,
+                        })
+                        .collect(),
+                    runtime: r.runtime,
+                    demo: r.demo,
+                });
             }
             Err(e) => {
                 attempt += 1;

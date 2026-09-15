@@ -107,3 +107,36 @@ describe("StatusBar.svelte", () => {
     expect(byAria(container, "do not disturb")).toBeTruthy();
   });
 });
+
+describe("StatusBar.svelte — the Dynamic Island is iPhone hardware (REQ-A249)", () => {
+  const island = (c: HTMLElement) => c.querySelector('[data-testid="dynamic-island"]');
+
+  test("the phone (and an absent host) still draws it — today's chrome is unchanged", async () => {
+    // No `form` prop = the shell had no host answer ⇒ the conservative phone default.
+    const { container } = render(StatusBar);
+    await tick();
+    await settle();
+    expect(island(container)).toBeTruthy();
+
+    const explicit = render(StatusBar, { form: "phone" });
+    await tick();
+    expect(island(explicit.container)).toBeTruthy();
+  });
+
+  test("an iPad and a Mac do not: neither has that screen cutout", async () => {
+    const tablet = render(StatusBar, { form: "tablet" });
+    await tick();
+    await settle();
+    expect(island(tablet.container)).toBeNull();
+    // …and the row's real content is still there (only the pill is gone).
+    expect(tablet.container.textContent ?? "").toMatch(/\d{1,2}:\d{2}/);
+
+    const mac = render(StatusBar, { form: "desktop" });
+    await tick();
+    await settle();
+    expect(island(mac.container)).toBeNull();
+    // The honest battery reading survives the change (no fabricated %).
+    const batt = mac.container.querySelector(`[aria-label="${zh["a11y.batteryLevel"]}"]`);
+    expect(batt?.textContent ?? "").toContain("—");
+  });
+});

@@ -469,6 +469,8 @@ The Tauri System UI never runs an APK directly. It talks to the Amos Rust core o
 | Field | Type | # | Notes |
 |---|---|---|---|
 | `apps` | repeated `AndroidApp` | 1 | — |
+| `runtime` | `string` | 2 | Which Android runtime answered: `waydroid` (a real container on this host) or `demo` (the daemon's built-in fixture). The System UI must be able to say WHICH runtime this host has — presenting one runtime's answer as another's is exactly the kind of silent fabrication the rest of AmOS refuses. |
+| `demo` | `bool` | 3 | True when `apps` is that built-in **fixture** and not what this machine has installed. A host with no Android container (any macOS desktop, a Linux box without Waydroid) selects the demo runtime so the pipeline stays exercisable in dev/CI, and therefore has to tell the user that the list is not theirs. |
 
 **`AndroidApp`**
 
@@ -902,7 +904,7 @@ The AmOS-Link control plane exposed by the daemon (amos-ai mounts it beside AiAg
 | Method | Request | Reply | Kind | Notes |
 |---|---|---|---|---|
 | `GetStatus` | `Empty` | `LinkStatus` | unary | Node identity, uptime, clock freshness, counters and the live peer table. |
-| `ListTopics` | `Empty` | `TopicList` | unary | Every concrete topic the node has seen *published* traffic on, sorted. Subscription patterns are not listed: a pattern is not a topic, and a network transport cannot enumerate what someone else published (it answers empty). |
+| `ListTopics` | `Empty` | `TopicList` | unary | Every concrete topic the node has seen *published* traffic on, sorted, together with whether that list is the whole truth (`TopicList.complete`). Subscription patterns are not listed: a pattern is not a topic, and a network transport cannot enumerate what someone else published (it answers empty — which is exactly why `complete` exists: the caller is not on that transport and cannot find out any other way). |
 | `Publish` | `PublishRequest` | `PublishReply` | unary | Publish a raw payload on a topic. The daemon stamps it with its own peer id, a monotonic sequence number and the (possibly calibrated) clock, so a producer that is not a Rust AmOS-Link node can still inject frames. |
 | `StreamHeartbeats` | `Empty` | `Heartbeat` | server streaming | Server-streaming heartbeat: every peer's beat (including this node's) as it arrives, so a client sees the whole link's liveness rather than a synthetic counter. Use GetStatus for the peer table itself. |
 | `ListActuations` | `Empty` | `ActuationList` | unary | What each robot reports about its own actuation — the control loop's **return path** (`amos/<robot>/state/actuation`, crates/amos-link/src/robot_hal.rs::ActuationState), folded into the control plane so a caller that is NOT on the link (the System UI) can see it too. A robot that has never reported since this control plane subscribed is absent from the list — never a fabricated zero. |
@@ -954,6 +956,7 @@ The AmOS-Link control plane exposed by the daemon (amos-ai mounts it beside AiAg
 | Field | Type | # | Notes |
 |---|---|---|---|
 | `topics` | repeated `string` | 1 | concrete key expressions, sorted |
+| `complete` | `bool` | 2 | False when `topics` is *not* the whole truth, so a caller can never read a partial list as a complete one. Two ways that happens: the in-process broker stops growing at MAX_TRACKED_TOPICS (a diagnostic must not grow without a bound), and any network transport cannot enumerate what other nodes published at all (it answers an empty list). The local CLI prints this caveat for its own node; the field is what lets the control plane carry it to a caller that is not that node. |
 
 **`PublishRequest`**
 

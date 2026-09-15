@@ -30,6 +30,20 @@ Four pieces, in the order data flows:
   **by streaming** the two slices through one hasher — no second copy of a frame is ever
   built (an earlier `[…].concat()` doubled a frame's peak memory, on the receive path
   before the checksum had even been verified; see `docs/amos-link.md` §3.3).
+- **A header off the wire is re-asked, never believed**: `Deserialize` cannot run a
+  constructor, so `Topic::new` / `PeerId::new` / `Timestamp::new` are bypassed by every derive
+  — `Header::validate` asks each question again on `encode` **and** `decode`, `PeerInfo::validate`
+  does the same for a beacon's `peer.id`, and `Heartbeat::validate` for a beat's payload `peer`
+  and `stamp`. A peer cannot put a 400-byte "peer id" into the peer/sequence
+  tables or a `nanos = 4e9` stamp into the latency arithmetic by writing bytes
+  (`docs/amos-link.md` §3.8/§3.9).
+- **A beat names exactly one peer.** Heartbeats are a self-description, so they are read through
+  `Subscriber::recv_beat`: the payload's `peer` must equal the frame's (validated) publisher, or
+  the beat is refused and counted like a frame that does not decode. Without that, one frame
+  carries two identities — the CLI prints the payload's while it counts gaps against the framing's
+  — and the control plane's `StreamHeartbeats` would put the payload's claim in front of every UI
+  (`docs/amos-link.md` §3.9). This is a **consistency** rule, not authentication: see the
+  boundaries below.
 - **ROS-like QoS** reduced to three fields: `Reliability{BestEffort, Reliable}` × `depth` ×
   `DropPolicy{DropNewest, DropOldest}` — sensor streams are latest-wins, control streams
   back-pressure and are counted as `blocked`.
@@ -43,7 +57,9 @@ Four pieces, in the order data flows:
 - **Honest counters + a verdict**: `published`/`delivered`/`dropped`/`blocked`/
   `decode_errors`/`encode_errors` never reset and are never estimates; `LinkHealth` folds
   them into `Unknown | Healthy | Degraded{reasons}` — `Unknown` means *no evidence yet*,
-  deliberately not the same as healthy.
+  deliberately not the same as healthy — and a verdict is never cleaner than the instrument
+  behind it: a sequence tracker that hit its ceiling reports `untracked_frames=N` rather than
+  letting a partial loss figure read as a clean one (`docs/amos-link.md` §3.9).
 - **Robot HAL**: an agent's JSON intent is validated, expanded into a gait pose and
   encoded as CRC-checked motor frames over a `RobotHal` seam, with a latched e-stop and a
   deadman watchdog. A torque cut comes back from the HAL as a **measured** frame count
@@ -70,7 +86,10 @@ Four pieces, in the order data flows:
   caps at `MAX_TRACKED_STREAMS` (and reports `SeqEvent::Untracked` /
   `SeqSummary::is_complete()`). Both keys come off the wire, so a peer could otherwise mint a
   new one per frame — and a bounded table that *admits* it stopped is worth more than an
-  unbounded one or a silent gap.
+  unbounded one or a silent gap. The admission travels with the list it describes: the
+  `NodeStatus` JSON carries `topics_complete`, and the control plane's `TopicList.complete`
+  carries it to a caller that is **not** on this node's transport (which is the only place the
+  local CLI could not print the caveat — `docs/amos-link.md` §3.8).
 
 It is **not**: a scheduler (you own the control thread and its rate), a ROS compatibility
 layer (no `.msg`/IDL, no DDS wire), or a replacement for the daemon's authenticated UDS
@@ -99,11 +118,15 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 
 ```bash
 cargo test -p amos-link                     # unit + e2e + control-plane-over-UDS (offline)
-cargo test -p amos-link --features amos-link/lan --lib    # real UDP beacons on loopback
-cargo test -p amos-link --features amos-link/zenoh --lib  # transport config/env mapping
+cargo test -p amos-link --features lan      # + real UDP multicast beacons on loopback
+cargo test -p amos-link --features zenoh    # + the transport config/env mapping
 cargo clippy -p amos-link --all-targets -- -D warnings
 cargo fmt -p amos-link -- --check
 ```
+
+(These are the same steps `make lint`/`make test` run. They are *not* `--lib`: a whole test
+file behind a feature — `tests/lan_multicast.rs` — is invisible to `--lib`, which is the gate
+blind spot REQ-A243 fixed in the Makefile.)
 
 The Zenoh *session* round trip is `#[ignore]`d on purpose (it needs a real network):
 `cargo test -p amos-link --features zenoh -- --ignored`.
@@ -149,7 +172,9 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
 
 - **Discovery is not authentication.** A `lan` beacon is plaintext and forgeable; it is a
   *hint* telling a peer where to connect. The authenticated path is the daemon's UDS
-  (peer-credential checked), never the beacon.
+  (peer-credential checked), never the beacon. The beat rule above is a **consistency** check
+  in the same spirit: it makes "one frame, one identity" true, but a peer that lies in the frame
+  *header* is outside what any check at this layer can catch.
 - **Not ROS.** No `.msg`/IDL, no `rostopic` compatibility, no DDS wire — a bridge into that
   ecosystem is a separate deployment component.
 - **Not a scheduler.** `RobotBridge::step()` is one explicit step; the control thread and

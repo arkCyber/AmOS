@@ -14,7 +14,12 @@
  *   explains a non-healthy verdict instead of showing a bare "OK";
  * * `clock_synced: false` means every latency number on the link is a **bound**,
  *   not a measurement (`amos-timesync` has not calibrated the clock);
- * * counters are cumulative since the node started and are never reset.
+ * * counters are cumulative since the node started and are never reset;
+ * * a status is a **snapshot**, not a live view: `peers[].last_seen_ms` is an age measured at
+ *   the moment the daemon answered, and nothing here expires. The panel therefore dates it and
+ *   re-reads (`link.probe`, every 10 s while visible) instead of leaving a frozen table on
+ *   screen, and a read that gets no answer is treated as **no reading** — this module never
+ *   caches one to keep the page looking populated.
  */
 import { bridged, invoke } from "./backend";
 
@@ -23,7 +28,8 @@ export interface LinkPeer {
   id: string;
   /** `robot` | `brain` | `sensor` | `actuator` | `tool` | `unknown`. */
   kind: string;
-  /** Transport endpoint, or `null` when the beacon carried none. */
+  /** Transport endpoint, or `null` when the beacon carried none (the panel prints it when
+   * present, and prints nothing — never an empty string or `"null"` — when it is absent). */
   endpoint: string | null;
   last_seen_ms: number;
   /** Beacons observed; `0` = declared by hand (static, never TTL-expired). */

@@ -107,6 +107,45 @@ for pair in "NDK_VERSION=26.1.10909125|ndk-version|26.1.10909125" \
   fi
 done
 
+# --- 4b. FMEA gate: docs/FMEA.md ↔ inventory ↔ 代码三方一致 ----------------
+echo; echo "-- 4b. FMEA inventory gate --"
+if command -v node >/dev/null 2>&1; then
+  if ! node scripts/fmea-gen.mjs --self-test >/dev/null 2>&1; then
+    bad "fmea-gen self-test failed (run: node scripts/fmea-gen.mjs --self-test)"
+  else
+    ok "fmea-gen self-test"
+  fi
+  if ! node scripts/fmea-gen.mjs --check >/dev/null 2>&1; then
+    bad "fmea-gen --check failed (run: node scripts/fmea-gen.mjs --check)"
+  else
+    ok "fmea-gen --check (doc/inventory/code triple consistency)"
+  fi
+  if ! node scripts/fmea-gen.mjs --emit-residual >/dev/null 2>&1; then
+    bad "fmea-gen --emit-residual failed (unsigned residual risks)"
+  else
+    ok "fmea-gen --emit-residual (all residual risks signed)"
+  fi
+else
+  wrn "node not available; skipping FMEA gate"
+fi
+
+# --- 4c. CI-config drift: toolchain pin + runner pins (same rules as `make lint`) --
+echo; echo "-- 4c. CI-config drift (toolchain + runner pins) --"
+if command -v node >/dev/null 2>&1; then
+  if ! node scripts/ci-drift-scan.mjs --selftest >/dev/null 2>&1; then
+    bad "ci-drift-scan self-test failed (run: node scripts/ci-drift-scan.mjs --selftest)"
+  else
+    ok "ci-drift-scan self-test"
+  fi
+  if ! node scripts/ci-drift-scan.mjs >/dev/null 2>&1; then
+    bad "CI-config drift (run: node scripts/ci-drift-scan.mjs)"
+  else
+    ok "ci-drift-scan (toolchain pin + runner pins)"
+  fi
+else
+  wrn "node not available; skipping CI-config drift gate"
+fi
+
 # --- 5. optional docker build of the image ----------------------------------
 echo; echo "-- 5. container build --"
 want_docker=0

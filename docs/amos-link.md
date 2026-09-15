@@ -52,12 +52,12 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 | 模块 | 内容 | 关键点 |
 |---|---|---|
 | `keyexpr` | `Topic` / `Channel`：`amos/<peer>/<channel>/<name>` 校验 + `*`（一段）`**`（零或多段）匹配（**迭代 DP，非递归**）+ `Topic::channel()`（这条键表达式**自称**属于哪个 channel） | 语法与 Zenoh 的 key expression **同构**，所以同一套模式在进程内和跨网两种传输上行为一致。匹配是 `O(n·m) ≤ 32·32` 的**动态规划**（两个栈上定长数组、零分配）：Power of 10 #1 禁递归、#2 要求静态有界，而朴素回溯匹配在 32 段上限下的 `**` 密集模式要探 ~10¹¹ 条路径 —— 那是**拿着 broker 注册表锁**的挂死。`channel()` 让「按主题选 QoS」成为可编程的事：`amos/*/control/*` 自己就说明它是控制流；认不出（通配符在 channel 位 / 路径太短 / 非 `amos` 根）就**如实回答 None**，绝不猜 |
-| `codec` | `Message`（任意 serde 类型，bincode 载荷）、`Envelope`（magic+版本+bincode 头+CRC32）、`Timestamp`、`Clock`；**帧大小上限** `MAX_PAYLOAD_BYTES = 16 MiB` | 头里带 **topic / publisher / seq / 时间戳**：通配订阅者因此知道「这是谁、第几帧、多久之前」。上限在 **encode 与 decode 两侧**都检查，且**先于任何分配**校验头部声称的长度（伪造 4 GiB 头不会让接收端分配）。头里的 `topic` 只是**发布者的声明**：订阅侧拿它与**传输的路由键**逐字比对，不一致即拒（否则一个对端可以在 `amos/evil/…` 上发布却声称自己是 `amos/dog1/…`） |
+| `codec` | `Message`（任意 serde 类型，bincode 载荷）、`Envelope`（magic+版本+bincode 头+CRC32）、`Timestamp`、`Clock`；**帧大小上限** `MAX_PAYLOAD_BYTES = 16 MiB` | 头里带 **topic / publisher / seq / 时间戳**：通配订阅者因此知道「这是谁、第几帧、多久之前」。上限在 **encode 与 decode 两侧**都检查，且**先于任何分配**校验头部声称的长度（伪造 4 GiB 头不会让接收端分配）。头里的 `topic` 只是**发布者的声明**：订阅侧拿它与**传输的路由键**逐字比对，不一致即拒（否则一个对端可以在 `amos/evil/…` 上发布却声称自己是 `amos/dog1/…`）。**头里每个字段都在线缆那一侧被重新问过一遍**（`Header::validate`，§3.8）：`Deserialize` 从不调用 `Topic::new`/`PeerId::new`/`Timestamp::new`，所以 decode 不会发出「自己的构造器会拒绝」的值（400 字节的 `publisher`、`nanos=4e9` 的 `stamp`）——版本号则照旧只认 `VERSION`，其它带具名原因拒绝 |
 | `qos` | `Reliability{BestEffort,Reliable}` × `depth` × `DropPolicy{DropNewest,DropOldest}`，预设 `Qos::sensor()` / `state()` / `control()`，以及 **`Qos::for_channel(Channel)`**（channel → profile 的**唯一**策略表） | 传感器流=`depth 1 + drop-oldest`（**最新帧胜**）；控制流=`Reliable`（**背压，不丢**）。`for_channel` 让「订阅 `amos/*/control/**` 却拿到 best-effort 档」这种**静默丢控制指令**的错误在类型层面就有正解（CLI `sub` 默认即用它，并打印档位来源） |
 | `broker` | `Transport` seam + 进程内 `Broker`：按订阅者独立队列、`Arc<[u8]>` 扇出（不复制大帧）、从不在持有锁时 await；话题清单**有界**（`MAX_TRACKED_TOPICS = 4096`，满了即停止增长且 `topics_complete()` 如实回答 false） | 与 `amos-sensor` 的 provider seam 同一纪律：哑核心 + 可替换后端。有界清单是 Power of 10 #2（静态有界资源）：一个不停发明主题名的发布者不能让诊断集合随进程寿命无限增长；**发布永不因记账上限失败**，而清单**自己声明不完整**（绝不用一个看起来完整的列表撒谎） |
 | `discovery` | `Beacon`（`AMLB │ ver=2 │ body_len │ CRC32 │ bincode` 帧）+ `PeerRegistry`（TTL 过期、按新鲜度排序、**静态对端永不过期**）+ `MockDiscovery` + **`BusDiscovery`/`spawn_federation`**（信标走链路自身传输：`amos/<peer>/telemetry/beacon`） | 注册表是**纯状态机**（时间作为参数传入）。信标帧带**长度 + CRC32**，且**两侧都检查**（`encode` 拒绝自己造出超限帧，`decode` 先于任何反序列化拒绝伪造长度/超限帧/CRC 不符），`PeerInfo::validate` 限制端点数量与长度 ⇒ 一条被损坏的「我是谁、来哪连我」不会变成一条被静默信任的假对端。版本 2 之前的节点会被**按版本拒绝**，而不是喂进另一种布局的 body。**静态对端**（`learn_peer`，锁定网络里没有组播）没有信标可错过，因此**不受 TTL 驱逐**（只会被 `forget_peer` 移除，或被它自己的信标转成被 TTL 管理的动态对端）；`learn_peer` 也**不会抹掉已测得的活跃度**（改端点不会把死板卡变活）。总线联邦让**任何传输**都能填满对端表（含 Zenoh），并**过滤自身回声**（节点绝不把自己当 peer） |
 | `lan`(feature) | `LanDiscovery`：UDP 组播信标（默认 `239.255.42.99:7446`，`AMOS_LINK_BEACON_ADDR` 覆盖），`SO_REUSEADDR/PORT` 让同机多进程共用一个端口；`spawn_announcer` **按周期重复**广播（不是开机喊一次） | 明文、未认证：这是**发现的提示**，不是身份证明（见 §6）。数据报上限（`MAX_DATAGRAM` 1024B）之外还有帧上限 `MAX_BEACON_BYTES = 512`：外来/超限/篡改报文一律被跳过而不是解析。**为什么要重复**：信标是收方唯一的证据，而证据会随 TTL 过期——只喊一次的节点**只有已经在听的**对端能发现（开机跑起来的机器狗、或一分钟后才入网的场边笔记本，都会看不见它）。周期由调用方给（CLI 用 TTL/3，与 `spawn_federation` 同一条规则：喊得比这更稀，别的表就会看到「加入—过期」反复循环 = 一个扑腾的节点）；每拍都带**新的** `Timestamp`（活着的对端不该一直自称"我刚开机的那一秒"） |
-| `telemetry` | `Heartbeat`（`amos/<peer>/telemetry/beat`，1 Hz）+ `NodeStatus`（JSON 自查）+ `spawn_heartbeat` | 心跳是**消息**，走同一条 pub/sub 通道，因此 `topics` 里看得见 |
+| `telemetry` | `Heartbeat`（`amos/<peer>/telemetry/beat`，1 Hz）+ `NodeStatus`（JSON 自查）+ `spawn_heartbeat` | 心跳是**消息**，走同一条 pub/sub 通道，因此 `topics` 里看得见。`NodeStatus` 里的话题清单**与它的完整性同一份值**（`topics` + `topics_complete`，§3.8）：机器读 `status --json` 时，一个撞了 4096 上限而停止增长的清单不会读成「这条链路有 4096 个话题」，网络传输的空列表也不会读成「没人发布」 |
 | `robot_hal` | `parse_command`(JSON 校验) → `plan`(步态→关节位姿) → `MotorFrame`(10 字节/CRC16) → `RobotHal` seam（`MockRobotHal`）；`RobotBridge` 带**死手看门狗 + 闩锁急停**，并可 `reporting()` 把模式**回程**到 `amos/<robot>/state/actuation`（仅模式变化时发） | 大模型只能说 JSON；限位、关节范围、CRC 都由这一侧负责。`JointId` 索引**私有**（只能经 `new` 或在**反序列化时**校验得到），`MotorFrame::validate` 在 **CRC16 总线解码**与 **bincode `Message`** 两条路径上都强制（`MockRobotHal::apply` 也在写总线前拒绝整批）。安全语义见 §3.1 |
 | `sequence` | `SeqTracker` / `SeqEvent` / `SeqSummary`：按**发布者**跟踪 `seq` 高水位 ⇒ `in_order` / `gaps` / `missing` / `stale` | 纯状态机（无 IO、无时钟）。「帧丢了」由**发布者自己的计数器**证明，而不是猜：一次跳变 = 一次 gap 事件，`missing` 记它丢了多少帧；等于/低于高水位的帧算 `stale`（重复/乱序/计数器重启），**不混进「丢帧」**。CLI `sub` / `bench` / `watch` 都用它把丢帧变成数字 |
 | `node` | `LinkNode`：身份 + 传输 + 时钟 + 计数器 + 对端表，`publisher::<T>()` / `subscriber::<T>()` 的唯一入口 | 控制面与 CLI 都是它的薄壳 |
@@ -69,6 +69,10 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 且只增不减；六个计数器在 `NodeStatus` JSON 与控制面 `Metrics` 里都如实出现（不是只活在内核里）。
 `blocked` 尤其重要：`Reliable` 的代价本来是「看不见的慢」，现在它是一个可读的数（`PublishReport.blocked`
 给出**单次**发布是否等了，`metrics.blocked` 给出**累计**次数）。
+每个订阅自己的 `dropped`（`SubscriptionStats`）覆盖**全部**"路由到它、但谁也没拿到"的路径：best-effort
+队列满、一次性槽被更新帧顶掉、以及**消费者在发布中途消失**（关闭或锁中毒）——**REQ-A247 修掉了最后一条**：
+`Reliable` 的一次性槽拒绝路径此前只进 `PublishReport`/`metrics`，**没有**记进该订阅自己的计数器，
+于是 `sub.stats().dropped` 会对一个丢帧的订阅报 0（"计数器由知道事实的那一层写"这句话，当时对这条路径不成立）。
 
 ### 3.1 安全语义（`RobotBridge`，这是产品级机器人的最低要求）
 
@@ -102,7 +106,8 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 
 原因（**固定顺序**，两次报告可直接对比）：`encode_errors=N`（本端发不出去）、`decode_errors=N`（收下来解不开）、
 `back_pressure=N`（可靠消费者比发布者慢）、`frame_loss=N in M gap(s)`（**消费者侧**序列证据，需调用方把
-`SeqSummary` 传进来）、`no_peers`（链路上只有自己）、`clock_unsynced`（延迟数字是**上界**，不是测量）。
+`SeqSummary` 传进来）、`untracked_frames=N`（追踪表撞了上限，这 N 帧**在损失数字之外** —— 判决不得比仪器更
+干净，§3.9）、`no_peers`（链路上只有自己）、`clock_unsynced`（延迟数字是**上界**，不是测量）。
 
 **刻意不算原因：`dropped`。** best-effort 流的丢弃**就是策略在工作**（最新帧胜会覆盖自己的队列），把它算进
 结论会把一台健康机器人判成「降级」—— 结论不替调用方解释丢弃，`metrics.dropped` 原样给出。
@@ -110,8 +115,8 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 **序号是饱和的，不是回绕的。** `telemetry::next_seq`（全 crate 唯一的序号源：`Publisher` 的帧序号、节点心跳、控制面 `Publish`）用 compare-exchange 在 `u64::MAX` 处停住 —— `fetch_add(1) + 1` 在极值处会把存储值回绕成 0，于是「刚盖出去的戳」比计数器还大、后续帧重新用 1、2…，消费端的 `SeqTracker` 会把它读成「发布者重启了」（一个凭空编出来的故事）。饱和则让**盖出去的戳与读到的计数器始终一致**。
 
 **边界**：节点只能看见**自己**的计数器，看不见某个消费者的序列跳变（那是订阅级状态）；CLI `watch`
-手里正好有 beat 的 `SeqTracker`，因此它的结论比 `status` 多一条 `frame_loss` —— 后者需要调用方把
-`SeqSummary` 传进 `evaluate`。控制面 `LinkStatus.health`（枚举）+ `health_reasons`（每条带数字的 token）
+手里正好有 beat 的 `SeqTracker`，因此它的结论比 `status` 多一条 `frame_loss`（以及满表后的 `untracked_frames`）
+—— 后者需要调用方把 `SeqSummary` 传进 `evaluate`。控制面 `LinkStatus.health`（枚举）+ `health_reasons`（每条带数字的 token）
 把同一结论送到非 Rust 客户端。
 
 ### 3.3 分配与算术纪律（航天级加固轮，REQ-A241）
@@ -308,6 +313,116 @@ observe("p0", 2) ⇒ SeqEvent::InOrder（已知对端照常）
 
 **诚实边界（本轮新增）**：`MAX_ACTUATION_FRAMES`/`MAX_WATCHDOG_MS`/`MAX_REFUSAL_REASON_BYTES` 是**工程上界**而非物理定律——一台关节特别多、或做多步规划的机器若真超过 4096 帧/动作，需要在同一处上调（并同步 proto 的 u32 约定）；`SeqTracker` 的 4096 对端同理，满表后的"拒绝"是**有界策略**，不是"丢掉了坏数据"（`untracked` 计数与 `is_complete()` 就是它的如实出口）；线缆校验只覆盖这三个字段，`seq` 是任意的 `u64`（它本来就没有上界语义）。
 
+### 3.8 线缆形态的再校验 + 清单一并声明自己完整与否（第五轮，REQ-A245）
+
+> 本轮审计面是上一轮结尾登记的五个未深读处：`codec` 的解码路径（版本协商 · `Timestamp` 边界）、
+> `keyexpr` 的长度/段数边界、`broker` 中段（`publish` 的队列策略 · `try_recv` 边界）、
+> `telemetry` 的 `NodeStatus` JSON、以及 System UI 侧（`amos-tauri/src/link.rs` + `LinkPage.svelte`）。
+> 两个真缺陷，同一句话就能概括：**类型自称"构造时校验过"，但 `Deserialize` 从不调用构造器**；
+> **清单自称有界，但"是否完整"这句话只走到了一半**。
+
+| # | 缺陷（修前） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **线缆上的头字段绕过各自的构造器**：`Header`（`topic` / `publisher` / `stamp`）与 `Beacon.peer.id` 都 `derive(Deserialize)`，而 `Topic::new`、`PeerId::new`、`Timestamp::new` 的校验**永远不会被执行**。实测（手工写字节，CRC 正确）：`publisher` 放 400 字节、含 `\n`、含 `/` 或空串 ⇒ `decode` 全部 `Ok`；`stamp.nanos = 4 294 967 295` ⇒ `decode` `Ok` | `PeerId` 的文档写着"构造时校验一次，其余代码可当作安全 token"——它是**对端表与追踪表的键**，也是每个 CLI/UI 渲染的字符串；`Timestamp::new` 守着"两种写法不能指向同一瞬间"的不变量（派生 `Ord` 比字段、`as_nanos`/`since` 比数值，只有 `nanos < 1e9` 时两者一致）。这两条承诺在**线缆这一侧**此前都是空的 | 每个带校验构造器的类型加一个**不分配的**检查入口（`Topic::validate_str` / `PeerId::validate_str` / `Timestamp::is_valid`，构造器改为调用它们 ⇒ 一处规则两个入口），`Header::validate` 在 `encode` **与** `decode` 两侧把这三个问题重问一遍，`PeerInfo::validate` 补上 `peer.id`。越界即 `LinkError::Frame` + **具名原因**（哪个字段、越了什么界） |
+| 2 | **清单的"是否完整"只走到一半**：`NodeStatus` 有 `topics` 数组却**没有**完整性字段（CLI 的 `topics` 命令会打印提示，但 `status --json`——机器读的那一份——不会）；控制面的 `TopicList` 连字段都没有，于是**远端 `topics` 只打印条数**，把截断的清单当完整清单呈现 | 本 crate 的纪律是"有界资源必须自己声明"（`MAX_TRACKED_TOPICS` / `MAX_TRACKED_STREAMS` 都照此办理）。而远端调用方**不在那条传输上**，除了这个字段没有任何办法知道：`complete=false` 既可能是 broker 撞了 4096 上限，也可能是 Zenoh 这类网络传输"根本枚举不了"（空列表 ≠ 没流量） | `NodeStatus` 新增 `topics_complete`（与 `topics` 同一次从传输读取，两者不可能不一致）；`TopicList` 新增 `bool complete = 2`，`ListTopics` 用 `node.topics_complete()` 填；远端 `topics` 打印 `(inventory complete|incomplete — …)` |
+
+**实测证据**（默认构建）：
+
+```text
+# (1) 手工写字节的头（tests 里用同布局的 shadow struct + 正确 CRC）：
+publisher = "x"*400 / "amos/dog1" / "dog 1" / "dog1\n" / ""  ⇒ decode Err，原因里点名 `publisher`
+publisher = "x"*63（边界本身）                                ⇒ decode Ok
+stamp.nanos = 1_000_000_000 / 4_294_967_295                   ⇒ decode Err，原因里点名 `sub-second`
+stamp.nanos = 999_999_999                                     ⇒ decode Ok
+topic = "amos//imu" / "not a topic" / "amos/*/sensor/imu"     ⇒ decode Err，原因里点名 `topic`
+# encode 侧同规矩：把 header.topic 改坏 / 把 stamp.nanos 改成 2e9 ⇒ encode Err（"线那边只会表现为什么都没到"）
+# 真链路上的样子（pubsub，真实 broker）：伪造 publisher 的帧先发、正常帧后发 ⇒
+  consumer 拿到的是**正常帧**（seq=2），sub.stats().decode_errors == 1、metrics.decode_errors >= 1
+
+# (2) 完整性随行（节点层 + 控制面）：
+LinkNode::with_parts(自定义传输，topics_complete()==false) ⇒ status().topics_complete == false，
+  status.to_json() 里含 "topics_complete": false；in_process 的 broker ⇒ true 且与 topics() 一致
+服务端 UDS 用例：list_topics() ⇒ topics 正确 **且** complete == true
+cli_smoke（真 UDS + 真二进制）：topics --socket … ⇒ "…(inventory complete)"
+amos-ai 的 link_rpc_e2e（daemon 挂载的真实控制面）：list_topics() ⇒ complete == true
+```
+
+**负控实测**（5/5，每次注入后 `cmp` 还原**逐字节一致**）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 去掉 `decode` 里的 `header.validate()` | `a_header_off_the_wire_is_re_validated_field_by_field` ⇒ **FAILED**；`a_frame_off_the_wire_is_re_validated_before_it_is_believed`（真 broker）同样变红 |
+| 去掉 `Header::validate` 里的 stamp 检查 | 上面两条 + `a_header_this_side_would_refuse_is_never_put_on_the_wire` ⇒ **FAILED**（两侧同规矩） |
+| 去掉 `PeerInfo::validate` 里的 `peer.id` 检查 | `a_beacon_off_the_wire_is_re_validated_too` ⇒ **FAILED** |
+| `NodeStatus::topics_complete` 写成常量 `true` | `the_inventorys_own_limit_travels_with_the_inventory` ⇒ **FAILED** |
+| `ListTopics` 的 `complete` 写成常量 `false` | `control_plane_answers_over_a_unix_domain_socket` 与 cli_smoke 的 `remote_mode_reads_a_running_control_plane_over_a_unix_socket` ⇒ **FAILED** |
+
+**同轮审计过但**（据实记录）**没有真缺陷的部分**：`codec` 的**版本协商**是有意缺失的——解码只认
+`VERSION`，其它版本带具名原因拒绝（数据面不该为一次解帧做往返；用例已覆盖）；`keyexpr` 的长度/段数
+边界自查一致（`MAX_SEGMENT = 64` × `MAX_SEGMENTS = 32`，`validate_str` 与 `new` 逐条对齐，测试用 12 个
+正反例钉住）；`broker` 的 `publish` 在锁内只做"选中 + `Arc` 克隆"、`try_recv` 两条队列形状都如实回答
+（有帧 / 无帧 / 已关闭）；System UI 侧 `link.rs` 的映射不发明任何值（未知枚举 → `"unrecognized"`、
+proto 的 `0`/`""` → `None`）。
+
+**诚实边界（本轮新增）**：
+1. `Header::validate` 里的 **topic 检查对"已投递的帧"是冗余的**——`Subscriber` 在此之前已把帧头声明的
+   topic 与传输的路由键逐字比对（`amos/evil/…` 上发布却声称 `amos/dog1/…` 会被拒）。保留它是为了让
+   **`Envelope::decode` 这个公开入口**也满足"解出来的头是合法的头"，不是"修好了第二个漏洞"。
+2. `encode` 侧的校验只防**本端 bug**（`Header` 的字段是 `pub`，手搓得出来）；对端写字节时当然绕过它——
+   真正起作用的是 `decode` 侧。
+3. `nanos ≥ 1e9` 的**危害是有限的**：时间戳本来就是发布者自报（谎报者可以随便填 `secs`）。修的是
+   "解码器不得发出自己会拒绝的值"，而不是"时间戳可信了"。
+4. 控制面仍未携带**话题清单本身**（`LinkStatus` 无 `topics` 字段，只有 `ListTopics` 有）——那是刻意的：
+   清单是一次查询，不是一个常驻状态；本轮只补上它的完整性。
+5. System UI 的链路面板的**一次读取**已经不是边界（**REQ-A246 已处置**）：读数带**读数时间**（`link.probe`）、
+   打开且可见时每 10 秒重读、重读拿不到答案就**丢掉数字**（不把冻结的读数冒充当前的）。
+   详细处置与负控见 **§6.6**。
+
+
+### 3.9 心跳是第三种「带身份的线缆消息」+ 判决不得超出仪器（第八轮，REQ-A248）
+
+> 起点是上一轮（§3.8）留下的一个**没问完的问题**：那张表只把**两种**「带校验构造器、却被
+> `Deserialize` 绕过」的线缆类型点了出来（`Header` 与 `Beacon.peer.id`）。本轮把「哪些类型带着
+> **构造期不变量**、又在线缆那一侧被解出来」逐个过了一遍 —— **`Heartbeat` 是第三个**；顺带查出
+> 判决（`LinkHealth`）读的是一份**它自己知道不完整**的损失数字。
+
+| # | 缺陷（修前） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **心跳载荷里的身份既没被校验、也没被对齐**：`Heartbeat { peer, seq, stamp, uptime_ms }` 是线缆载荷，`peer` 是 `PeerId`、`stamp` 是 `Timestamp`，而 `PeerId::new`/`Timestamp::new` **在解码路径上永远不会跑** | 两层：**(a)** 一个 `peer` 可以是 400 字节、含 `/`/换行/空串 —— 而它正是 CLI `watch` 打印、控制面 `StreamHeartbeats` 转发给每个 UI 的那个字符串；**(b)** 更实际的一层：心跳是**自描述**消息，而路由键是**话题**（本 crate 的规则：发布者在帧头里，不在话题里），所以一个对端可以在 `amos/dog1/telemetry/beat` 上发布、**让载荷自称 `dog1`**，而它自己的帧归属是另一个 id。CLI 会把**载荷**的 peer 打印出来（`beat peer=…`），却用**帧头**的 publisher 做顺序记账（`missed=`）—— 一帧两个身份；控制面则把载荷的自称送进每一个 UI。REQ-A244 早就为回程定过这条规则（**按帧头 publisher 归属、不信载荷自称**），心跳这条路径漏了 | 新增 `Heartbeat::validate(&self, attributed: &PeerId)`：**先**用 `PeerId::validate_str` 问身份本身（理由里点名 `beat peer`），**再**要求 `beat.peer == attributed`（帧头的、已校验的发布者；理由里同时点名两个 id），最后要求 `stamp` 满足与帧头同一条不变量（`nanos < 1e9`，否则 `age()` 量的是一个 `Ord` 与 `as_nanos` 各说各话的瞬间）。落点在**读取路径**上：新增 `Subscriber<Heartbeat>::recv_beat()`（与 `recv()` 同形：不可信就计数并跳过），控制面 `StreamHeartbeats` 与 CLI `watch` 都改走它 —— 规则只有一处，消费者不可能忘 |
+| 2 | **判决读的是一份自己知道不完整的损失数字**：`LinkHealth::evaluate` 只看 `SeqSummary::has_loss()`，不看 `untracked` | `SeqTracker` 撞上 `MAX_TRACKED_STREAMS` 之后会**拒绝新增并计数**（`SeqSummary::untracked`、`is_complete()`）—— 它**自己声明**「我停止记账了」。而判决在这条路径上仍可能给出 `healthy`：**没有一个理由**，尽管损失数字只覆盖被记账的那部分。这正是本 crate 反复钉住的形状（**有界资源必须随行声明自己完整与否**，REQ-A244/A245 各钉过一次）。CLI 上还留下一个可见的不对称：同一行里 `beats_untracked=3` 与 `health=healthy` 并存 | 新增 `HealthReason::UntrackedFrames { untracked }`（key 与 detail 都是 `untracked_frames=N`），在 `frame_loss` 之后、`no_peers` 之前发出。判决的规则不变（仍是纯函数、每个理由带数字），变的只是它**不再比仪器更干净** |
+
+**实测证据**（默认构建）：
+
+```text
+# (1) 心跳（telemetry::tests / pubsub::tests / tests/service_uds.rs）
+手工写字节的 beat（影子结构体，bincode 布局与 Heartbeat 一致）：
+  peer = "x"*64 / "dog/1" / "dog 1" / "dog1\n" / ""  ⇒ Heartbeat::decode **Ok**（bincode 不校验 id）
+                                                     ⇒ validate(&dog1) Err，理由点名 `beat peer`
+  peer = "dog1"，但帧归属是 impostor                  ⇒ validate Err（理由同时点名 dog1 与 impostor）
+  stamp.nanos = 4e9                                  ⇒ validate Err（`sub-second`）
+真链路上（pubsub，真 broker）：impostor 在 amos/dog1/telemetry/beat 上发一条自称 dog1 的 beat ⇒
+  recv() 拿到的帧：message.peer == dog1、publisher == impostor   ← 这就是修前的两个身份
+  recv_beat() 跳过它：拿到的下一条是 dog2 自己的 beat；sub.stats().decode_errors >= 1、metrics 同步 +1
+控制面（真 UDS）：先发伪造 beat、再发诚实 beat ⇒
+  GetStatus.metrics.decode_errors 先 +1（**这个顺序有意义**：计数发生在伪造帧被取走之后）
+  StreamHeartbeats 的下一条是诚实的（seq 8 / uptime 43）；伪造的（seq 99 / uptime 999）**从未到达客户端**
+
+# (2) 判决不得超出仪器（health::tests）
+SeqSummary{ missing: 0, untracked: 3 } + 有证据的计数器 + 有对端 + 时钟已校准
+  ⇒ Degraded { [UntrackedFrames { untracked: 3 }] }、summary = "degraded: untracked_frames=3"
+  （对照：untracked = 0 时同一条输入仍是 healthy —— 未被触碰的追踪器是一份完整的账）
+```
+
+**负控实测**（4/4，每次注入后 `cmp` 还原**逐字节一致**）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 去掉 `Heartbeat::validate` 里的**归属**检查 | `pubsub::tests::a_beat_that_names_another_peer_is_refused_and_counted`（真 broker）与 `control_plane_answers_over_a_unix_domain_socket`（真 UDS）⇒ **FAILED**（后者停在「伪造帧被计数」那条断言上） |
+| 去掉**身份**检查（`PeerId::validate_str`） | `telemetry::tests::a_beat_off_the_wire_is_re_validated_and_must_name_its_publisher` ⇒ **FAILED**（理由不再点名 `beat peer`） |
+| 去掉 **stamp** 检查 | 同上 ⇒ **FAILED**（理由不再点名 `sub-second`） |
+| 去掉 `untracked` 理由 | `health::tests::a_partial_loss_figure_is_never_called_healthy` 与 `every_reason_fires_with_its_number_in_a_stable_order` ⇒ **FAILED** |
+
+**诚实边界（本轮新增）**：归属检查是**一致性**检查，**不是认证** —— 一个连帧头都敢谎报的对端不在它的射程内（链路没有可诉诸的认证机制；对端表本身的信任边界见 §6 与 crate README 的「Discovery is not authentication」）。它保证的是更弱、但可测的那一条：**一帧一个身份**。心跳的 `stamp` 与帧头一样是**发布者自报**，校验只保证「解码器不会发出自己的构造器会拒绝的值」，不是「时间戳可信了」。`untracked_frames` 只在**调用方手里有 `SeqSummary`** 时可能出现（`GetStatus` 拿不到消费者侧的追踪器），所以它出现在 CLI `watch`/`sub` 这类**同进程消费者**的报告里，而不是控制面的判决里。**同轮如实记录**：`Heartbeat` 之外，还逐个核对了其余会走线缆的载荷类型（`Header`、`Beacon`/`PeerInfo`、`ActuationState`、`MotorFrame`/`JointId`/`RefusalReason`），它们各自的构造期不变量都已有线缆侧入口 —— 本轮没有再发现第四个。
 
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
 
@@ -330,7 +445,7 @@ zenoh = { version = "1.10", default-features = false,
 | Zenoh 能力 | 用了吗 | 本仓的位置 / 说明 |
 |---|---|---|
 | **Session（`zenoh::open`）** | ✅ 用 | `ZenohTransport::open()`：`Config::default()`（**不 pin 模式、不写死 endpoint**，让 Zenoh 自己解析默认的 peer 模式 + 组播 scouting） |
-| **Key expression 语法（`*` / `**`）** | ✅ 用（同构复用） | `keyexpr.rs` 自己实现并校验同一套语法，**原样交给 Zenoh**：进程内 broker 与跨网 Zenoh 对同一模式给出同一行为 |
+| **Key expression 语法（`*` / `**`）** | ✅ 用（同构复用） | `keyexpr.rs` 自己实现并校验同一套语法，**原样交给 Zenoh**：进程内 broker 与跨网 Zenoh 对同一模式给出同一行为。**长度也实测钉住**（REQ-A247）：本 crate 允许的最长键（32 段 / ~2 KiB，`MAX_SEGMENT = 64` × `MAX_SEGMENTS = 32`）与同形模式都能跨真会话往返（`the_longest_key_expression_we_accept_crosses_a_real_session`）——此前只核对了**语法**，长度是没验证的（Zenoh 0.x 把键表达式限制在 255 字节，而那会让一个本地合法的键**在线上**失败）；实测 Zenoh 1.10.1 无此上限，且该用例会在未来引入上限时变红 |
 | **`Session::put`（发布）** | ✅ 用 | `Transport::publish`：一次 `put`，无长生命周期 publisher（控制话题 1 Hz，不值得为它维持句柄） |
 | **`declare_subscriber` + Handler** | ✅ 用（**QoS 映射的真实落点**） | `Reliability::BestEffort → RingChannel`（满则丢，与「最新帧胜」一致）、`Reliability::Reliable → FifoChannel`（满则阻塞 Zenoh 线程 = 背压） |
 | **组播 scouting（无 IP 列表发现）** | ✅ 用（默认开启） | 跨节点发现的本体；`AMOS_LINK_ZENOH_ENDPOINT` 可显式指定 `tcp/host:port` 列表用于锁定网络 |
@@ -353,9 +468,9 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
 | RPC | 作用 | 关键实现细节 |
 |---|---|---|
 | `GetStatus` | 身份/角色/版本/uptime/时钟是否已校准/计数器/对端表/**健康判定与原因**（§3.2） | 由 `LinkNode::status()` 直出，`clock_synced` 决定「延迟数字能不能当真」；`health` 在**没有证据**时是 `UNKNOWN`，绝不冒充健康 |
-| `ListTopics` | 传输见过流量的话题清单 | 网络传输回答「不知道」（`Vec::new()`），不伪造空列表 |
+| `ListTopics` | 传输见过流量的话题清单 | 网络传输回答「不知道」（`Vec::new()`），不伪造空列表。清单与**它的完整性**一起返回（`TopicList.complete`，§3.8）：调用方不在那条传输上，「这些就是全部」与「这是这台节点恰好看到的」只能靠这个字段区分——CLI 远端因此也打印 `(inventory complete\|incomplete …)` |
 | `Publish` | 由非 Rust 节点注入原始负载 | daemon 用自己的 peer id、独立序号与（已校准的）时钟封装成真正的 `Envelope`，因此**类型化订阅者照样能解** |
-| `StreamHeartbeats` | 服务端流式心跳 | 直接把 `amos/*/telemetry/beat`（**每个** peer 的心跳，含自己）的订阅转发给 gRPC 客户端——传输的是链路上**真的收到过**的帧，不是合成计数器；「到底谁在线」由 `GetStatus` 的对端表回答。**「含自己」是实装的**：`LinkService::with_heartbeat`（`mock_server()` 用的就是这个形状）会为挂载的节点起心跳任务，所以 daemon 自己也真的在 `amos/amos-daemon/telemetry/beat` 上打拍——否则这条流**一帧都发不出来**，而「没有证据」与「链路健康但安静」在流上长得一模一样（证据：`crates/amos-ai/tests/link_rpc_e2e.rs::the_daemon_link_node_beats…`） |
+| `StreamHeartbeats` | 服务端流式心跳 | 直接把 `amos/*/telemetry/beat`（**每个** peer 的心跳，含自己）的订阅转发给 gRPC 客户端——传输的是链路上**真的收到过**的帧，不是合成计数器；「到底谁在线」由 `GetStatus` 的对端表回答。**心跳按 `Subscriber::recv_beat` 读取**（§3.9）：载荷自称的 peer 必须等于帧头的 publisher，否则**拒绝并计入 `decode_errors`**，绝不送进客户端 —— 这条流**就是**「哪些机器人活着」的答案，一帧两个身份会把载荷的自称摆到每个操作员面前。**「含自己」是实装的**：`LinkService::with_heartbeat`（`mock_server()` 用的就是这个形状）会为挂载的节点起心跳任务，所以 daemon 自己也真的在 `amos/amos-daemon/telemetry/beat` 上打拍——否则这条流**一帧都发不出来**，而「没有证据」与「链路健康但安静」在流上长得一模一样（证据：`crates/amos-ai/tests/link_rpc_e2e.rs::the_daemon_link_node_beats…`） |
 | `ListActuations` | **回程**：每个机器人自报的 `armed`/`estopped`(+原因)/`gait`/最近一次拒绝 | 数据面在 `amos/<robot>/state/actuation`，控制面**订阅并折叠**它们（`LinkService::with_heartbeat` 起的 watcher），让**不在链路上**的调用方（System UI、CLI）也能读到。三个诚实点：**(a) 按帧头 `publisher` 归属**（谁发布谁是机器人），不信负载自称；**(b) 一张快照表，按 id 排序**，同一机器人后来的报告覆盖旧的；**(c) 没上报过的机器人是「不在列表里」，不是「空闲」**——`mock_server` 刚起来时它是空的，而空 ≠ 全员空闲 |
 
 挂载点：`amos-ai/src/server.rs` 的 `serve()` 里 `.add_service(amos_link::service::mock_server())`，
@@ -398,7 +513,26 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
    **诚实边界**：面板读的是守护进程**控制面**的状态；数据面（传感器帧、关节设定点）不经过它，
    也不经过任何 gRPC —— 回程能被看到，是因为**守护进程订阅了数据面并把它折叠进控制面**，而不是因为 UI 自己上了链路。
    **同步改口的地方**：`amos-link/src/service.rs` 的模块文档、`amos-link-cli` 的 `run_watch` 文档、
-   `link_rpc_e2e.rs` 的用例注释（它们原先都写着"没有 GUI 消费者"）。
+   `link_rpc_e2e.rs` 的用例注释（它们原先都写着「没有 GUI 消费者」）。
+6. **链路面板的读数是「一次读取」——已处置（第二轮，REQ-A246）**。曾经的缺口：面板只在挂载时读一次，
+   `peers[].last_seen_ms` 是**那次读取当时**的年龄，页面上**没有「读数时间」**，因此一个开着不动的页面会把
+   「三分钟前的 300 ms」一直显示成 300 ms —— 数字确实来自守护进程（没有撒谎），但**陈旧的读数与新鲜读数
+   无法区分**。现在的处置与其余设置页同形（`settings.aiProbe`/`aboutProbe` 的纪律）：
+   **(a) 读数带时间**——每次成功读取记下时刻，页面打印 `link.probe`（「最近读数：HH:MM:SS（每 10 秒重读）」），
+   并且**失败的读取没有可标注的读数**（时间戳随数字一起清空，而不是留一个看起来新鲜的旧时刻）；
+   **(b) 打开期间按周期重读**——每 10 秒（`LINK_PROBE_MS`；`document.visibilityState === "visible"` 才读，页面销毁时清掉定时器），
+   所以「陈旧」本身被消灭，而不只是被标注（**注意**：文案里写明了「每 10 秒重读」，与常量必须一起改——与
+   `settings.aiProbe`/`aboutProbe` 同一条惯例，改周期时记得改两处 locale）；**(c) 重读拿不到答案就丢数字**——判据是 `linkLevel(null) === "offline"`，
+   上一轮的计数与对端表**不会**留在屏幕上冒充活的链路（与 AboutPage 的「失败的探测回到诚实的 '—'」同一条规则）；
+   **(d) 顺带补全**：对端行现在显示信标带来的**传输端点**（`peer.endpoint`；`null` 就什么都不显示，
+   不伪造地址、也不渲染 `"null"`）——这个字段由桥接映射、`link.rs` 的文档专门交代过，此前 UI 取了不用。
+   **实测**（`bunx vitest run svelte-tests/link-page.svelte.test.ts`，9 例）：假定时器推进 10 秒 ⇒ `link_status`
+   被再调一次且**新的计数**上屏；守护进程中途失联 ⇒ verdict 变「守护进程未连接」、计数与对端表**消失**、
+   `link-read-at` 也消失（没有读数就没有读数时间）；端点渲染与 `null` 不渲染；`link.probe` 匹配
+   `最近读数：\d\d:\d\d:\d\d（每 10 秒重读）`。
+   **负控 4/4**（每次注入后 `cmp` 还原逐字节一致）：去掉定时器 ⇒ 「打开期间重读」「失联就丢数字」两条 FAILED；
+   去掉端点渲染 ⇒ 对端断言 FAILED；时间戳写成常量 ⇒ 读数时间断言 FAILED；失败时保留旧读数 ⇒
+   「失联就丢数字」FAILED。
 
 ## 7. 验证入口
 
@@ -418,6 +552,20 @@ cargo test -p amos-link --features lan --test lan_multicast   # 真组播：固�
 cargo test -p amos-link --test allocation_budget_codec        # 三个分配预算，一个进程一个测量
 cargo test -p amos-link --test allocation_budget_matcher
 cargo test -p amos-link --test allocation_budget_fanout       # 一次发布 ⇒ 8 个订阅者：共享同一缓冲
+# 线缆形态的再校验（§3.8）：手工写字节的头（正确 CRC）在 decode 与 encode 两侧都被拒，
+# 真 broker 上的伪造帧被跳过并计入 decode_errors；清单的完整性随 JSON 与控制面一起走。
+cargo test -p amos-link --lib codec::tests::a_header_off_the_wire_is_re_validated_field_by_field
+cargo test -p amos-link --lib discovery::tests::a_beacon_off_the_wire_is_re_validated_too
+cargo test -p amos-link --lib pubsub::tests::a_frame_off_the_wire_is_re_validated_before_it_is_believed
+cargo test -p amos-link --lib node::tests::the_inventorys_own_limit_travels_with_the_inventory
+# 心跳（第八轮，§3.9）：线缆上的 beat 必须与帧头的归属一致（第三个带身份的线缆类型），
+# 且判决不得比仪器更干净（满表后的 untracked_frames）。
+cargo test -p amos-link --lib telemetry::tests::a_beat_off_the_wire_is_re_validated_and_must_name_its_publisher
+cargo test -p amos-link --lib pubsub::tests::a_beat_that_names_another_peer_is_refused_and_counted
+cargo test -p amos-link --test service_uds     # StreamHeartbeats 不转发一帧两个身份的 beat
+cargo test -p amos-link --lib health::tests::a_partial_loss_figure_is_never_called_healthy
+cargo test -p amos-link --test service_uds                 # ListTopics ⇒ topics **且** complete
+cargo test -p amos-link-cli --test cli_smoke               # 远端 topics 打印 (inventory complete|incomplete)
 cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 5 --timeout-ms 2000   # 末行报告 gaps/missing/stale/loss
 cargo run -p amos-link-cli -- sub --pattern 'amos/*/control/*' --count 1 --timeout-ms 1000  # 档位由 channel 决定（reliable）
 # 注意 `--timeout-ms`：默认 0 = 永远等，没有发布者时这条命令**不会返回**（本文件的示例一律给上界）。

@@ -87,12 +87,25 @@ impl Timestamp {
     /// Build a timestamp; a `nanos` of `1e9` or more is refused (it would make two
     /// encodings of the same instant compare differently).
     pub fn new(secs: u64, nanos: u32) -> Result<Self> {
-        if nanos >= 1_000_000_000 {
+        let stamp = Self { secs, nanos };
+        if !stamp.is_valid() {
             return Err(LinkError::Codec(format!(
                 "nanos {nanos} is not a sub-second value"
             )));
         }
-        Ok(Self { secs, nanos })
+        Ok(stamp)
+    }
+
+    /// True when this is a well-formed stamp: `nanos` is a real sub-second part (`< 1e9`).
+    ///
+    /// [`Timestamp::new`] refuses anything else, but a `Deserialize` cannot run a
+    /// constructor — so a stamp that arrived as *bytes* (a frame header, a beacon) has to be
+    /// asked the same question again, and this is that question without a `Result` in the
+    /// way. The invariant is not cosmetic: the derived `Ord` compares `(secs, nanos)` while
+    /// [`Timestamp::as_nanos`] compares the value, and those two orders agree only while
+    /// `nanos < 1e9` — `1.5s` and `2.0s` may not sort as the same instant's two spellings.
+    pub fn is_valid(&self) -> bool {
+        self.nanos < 1_000_000_000
     }
 
     /// The host wall clock, right now.
@@ -249,6 +262,45 @@ pub struct Header {
     pub payload_len: u32,
 }
 
+impl Header {
+    /// Re-ask, of a header that arrived **as bytes**, every question its field types ask
+    /// locally.
+    ///
+    /// This exists because `Deserialize` cannot run a constructor: `Topic::new`,
+    /// `PeerId::new` and `Timestamp::new` all validate, and every one of them is bypassed by
+    /// the derive. `Envelope::decode` therefore used to hand out headers the crate's own
+    /// types would refuse — a `publisher` that is not a peer id (the table keys on it and
+    /// every CLI/UI prints it), a stamp whose `nanos` is not sub-second (then `Ord` and
+    /// `as_nanos` disagree about which of two instants came first), or a topic no
+    /// `Topic::new` would accept.
+    ///
+    /// Also called by [`Envelope::encode`]: a frame this side cannot re-read is a bug the
+    /// far side would report as "nothing arrives", the same reason the size ceiling is
+    /// checked on both sides. Non-allocating, so a refused frame costs nothing on the
+    /// receive path.
+    pub fn validate(&self) -> Result<()> {
+        Topic::validate_str(&self.topic).map_err(|e| {
+            LinkError::Frame(format!(
+                "header topic `{}` is not a concrete key expression: {e}",
+                self.topic
+            ))
+        })?;
+        PeerId::validate_str(self.publisher.as_str()).map_err(|e| {
+            LinkError::Frame(format!(
+                "header publisher `{}` is not a peer id: {e}",
+                self.publisher
+            ))
+        })?;
+        if !self.stamp.is_valid() {
+            return Err(LinkError::Frame(format!(
+                "header stamp {}.{:09} is not well formed: nanos {} is not a sub-second value",
+                self.stamp.secs, self.stamp.nanos, self.stamp.nanos
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// A framed AmOS-Link message: header + payload + CRC32.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
@@ -308,6 +360,11 @@ impl Envelope {
                 self.payload.len()
             )));
         }
+        // The header's *shape* is checked on this side too: a topic/publisher/stamp this
+        // crate's own constructors would refuse must not reach the wire, where the far side
+        // can only report it as "nothing arrives" (and where a hostile peer would, of
+        // course, skip this check entirely).
+        self.header.validate()?;
         let header =
             bincode::serialize(&self.header).map_err(|e| LinkError::Codec(e.to_string()))?;
         if header.len() > MAX_HEADER_BYTES {
@@ -392,6 +449,9 @@ impl Envelope {
         }
         let header: Header =
             bincode::deserialize(header_bytes).map_err(|e| LinkError::Frame(e.to_string()))?;
+        // Every field of this header is peer-chosen bytes: re-ask what the local
+        // constructors ask (see `Header::validate`) before the header is handed out.
+        header.validate()?;
         if header.payload_len as usize != payload.len() {
             return Err(LinkError::Frame(format!(
                 "header says {} payload bytes, frame carries {}",
@@ -441,6 +501,37 @@ mod tests {
             Timestamp::new(1_700_000_000, 123_456_789).expect("valid stamp"),
             payload,
         )
+    }
+
+    /// A header **as an attacker writes one**: a shadow struct with [`Header`]'s bincode
+    /// layout, so `publisher` is a plain `String` and `topic`/`stamp` are whatever bytes
+    /// were chosen. This is the honest shape of the attack — a peer writes bytes, not Rust
+    /// values, so `PeerId::new`/`Topic::new`/`Timestamp::new` are never on its path.
+    #[derive(Clone, serde::Serialize)]
+    struct WireHeader {
+        topic: String,
+        publisher: String,
+        seq: u64,
+        stamp: Timestamp,
+        payload_len: u32,
+    }
+
+    /// Frame a hand-written header the way the transport does: same prefix, same CRC, so the
+    /// header's *shape* is the only possible reason to refuse it.
+    fn frame_of_wire_header(header: &WireHeader, payload: &[u8]) -> Vec<u8> {
+        let header_bytes = bincode::serialize(header).expect("header");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC);
+        frame.push(VERSION);
+        frame.extend_from_slice(
+            &u32::try_from(header_bytes.len())
+                .expect("header len")
+                .to_le_bytes(),
+        );
+        frame.extend_from_slice(&header_bytes);
+        frame.extend_from_slice(&crc32_over(&header_bytes, payload).to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
     }
 
     #[test]
@@ -496,6 +587,122 @@ mod tests {
     }
 
     #[test]
+    fn a_header_off_the_wire_is_re_validated_field_by_field() {
+        // The defect this pins: `Header` derives `Deserialize`, so `Topic::new`,
+        // `PeerId::new` and `Timestamp::new` were **never asked** about a frame that arrived
+        // from a peer — `decode` handed out headers the crate's own constructors refuse, and
+        // the `publisher` id keys the peer/sequence tables and is printed by every UI.
+        let payload = DepthFrame {
+            seq: 1,
+            width: 1,
+            height: 1,
+            points: vec![7],
+        }
+        .encode()
+        .expect("payload");
+        let good = WireHeader {
+            topic: "amos/dog1/sensor/stereo_left".to_string(),
+            publisher: "dog1".to_string(),
+            seq: 1,
+            stamp: Timestamp {
+                secs: 1_700_000_000,
+                nanos: 123_456_789,
+            },
+            payload_len: payload.len() as u32,
+        };
+        // Positive control: the hand-written builder is *correct* — a well-formed header it
+        // writes really does decode, so a refusal below is about the field, not the framing.
+        let decoded = Envelope::decode(&frame_of_wire_header(&good, &payload)).expect("decode");
+        assert_eq!(decoded.header.publisher.as_str(), "dog1");
+
+        // (a) a publisher that is not a peer id: over-long, illegal charset, a path, empty.
+        for bad in [
+            "x".repeat(PeerId::MAX_LEN + 1),
+            "dog 1".to_string(),
+            "amos/dog1".to_string(),
+            "dog1\n".to_string(),
+            String::new(),
+        ] {
+            let hostile = WireHeader {
+                publisher: bad.clone(),
+                ..good.clone()
+            };
+            let err = Envelope::decode(&frame_of_wire_header(&hostile, &payload))
+                .expect_err("a non-peer-id publisher must be refused");
+            assert!(matches!(err, LinkError::Frame(_)), "{bad:?} ⇒ {err:?}");
+            assert!(
+                err.to_string().contains("publisher"),
+                "{bad:?} must be named as the reason: {err}"
+            );
+        }
+        // …and the boundary itself is legal (exactly `PeerId::MAX_LEN` bytes), so the check
+        // cannot be an off-by-one that refuses workable ids.
+        let boundary = WireHeader {
+            publisher: "x".repeat(PeerId::MAX_LEN),
+            ..good.clone()
+        };
+        assert!(Envelope::decode(&frame_of_wire_header(&boundary, &payload)).is_ok());
+
+        // (b) a stamp whose `nanos` is not sub-second: `as_nanos`/`since` (the value) and the
+        // derived `Ord` (the fields) then disagree about which instant came first.
+        for nanos in [1_000_000_000u32, 4_294_967_295] {
+            let hostile = WireHeader {
+                stamp: Timestamp {
+                    secs: 1_700_000_000,
+                    nanos,
+                },
+                ..good.clone()
+            };
+            let err = Envelope::decode(&frame_of_wire_header(&hostile, &payload))
+                .expect_err("a non-sub-second nanos must be refused");
+            assert!(err.to_string().contains("sub-second"), "{nanos} ⇒ {err}");
+        }
+        let last_valid = WireHeader {
+            stamp: Timestamp {
+                secs: 1_700_000_000,
+                nanos: 999_999_999,
+            },
+            ..good.clone()
+        };
+        assert!(Envelope::decode(&frame_of_wire_header(&last_valid, &payload)).is_ok());
+
+        // (c) a topic no `Topic::new` accepts (empty segment, illegal characters, or a
+        // *pattern* — a publisher names one topic, never a wildcard).
+        for bad in ["amos//imu", "not a topic", "amos/*/sensor/imu", ""] {
+            let hostile = WireHeader {
+                topic: bad.to_string(),
+                ..good.clone()
+            };
+            let err = Envelope::decode(&frame_of_wire_header(&hostile, &payload))
+                .expect_err("an illegal topic must be refused");
+            assert!(err.to_string().contains("topic"), "{bad:?} ⇒ {err}");
+        }
+    }
+
+    #[test]
+    fn a_header_this_side_would_refuse_is_never_put_on_the_wire() {
+        // The other half of the same rule: "nothing arrives on the far side" is the worst way
+        // to discover a bad header, exactly as the payload ceiling is checked before a frame
+        // is built. Both fields here are reachable from safe Rust (they are `pub`), so this is
+        // a local-bug guard, not an attack.
+        let wire = envelope().encode().expect("encode");
+        let mut env = Envelope::decode(&wire).expect("decode");
+
+        env.header.topic = "amos//imu".to_string();
+        assert!(matches!(env.encode(), Err(LinkError::Frame(_))));
+        env.header.topic = "amos/dog1/sensor/stereo_left".to_string();
+        assert!(env.encode().is_ok(), "the restored header encodes again");
+
+        env.header.stamp = Timestamp {
+            secs: 1,
+            nanos: 2_000_000_000,
+        };
+        assert!(env.encode().is_err());
+        env.header.stamp = Timestamp { secs: 1, nanos: 0 };
+        assert!(env.encode().is_ok());
+    }
+
+    #[test]
     fn timestamps_validate_and_measure_age() {
         assert!(Timestamp::new(1, 999_999_999).is_ok());
         assert!(Timestamp::new(1, 1_000_000_000).is_err());
@@ -509,6 +716,36 @@ mod tests {
         assert_eq!(Timestamp::from_system_time(UNIX_EPOCH).unix_ms(), 0);
         assert_eq!(a.to_string(), "10.000000000");
         assert!(Timestamp::now().as_nanos() > 0);
+
+        // A *well-formed* stamp is exactly a sub-second `nanos`; `new` and the wire check
+        // (`is_valid`) must answer the same question.
+        assert!(Timestamp::new(1, 999_999_999).expect("valid").is_valid());
+        assert!(!Timestamp {
+            secs: 0,
+            nanos: 1_000_000_000
+        }
+        .is_valid());
+
+        // …and here is *why* the boundary matters: for an out-of-range `nanos` the derived
+        // `Ord` (which compares the fields) and the value (`as_nanos`, which `since` uses)
+        // disagree about the same instant — two spellings of 2.5 s that sort the wrong way.
+        let spelled_out = Timestamp {
+            secs: 1,
+            nanos: 1_500_000_000,
+        };
+        let carried = Timestamp {
+            secs: 2,
+            nanos: 500_000_000,
+        };
+        assert_eq!(spelled_out.as_nanos(), carried.as_nanos());
+        assert!(
+            spelled_out < carried,
+            "the derived order compares fields, not the instant they denote"
+        );
+        assert!(!spelled_out.is_valid() && carried.is_valid());
+        // The display helper is total either way (it saturates), which is why the value could
+        // travel this far before anyone noticed it was not a timestamp.
+        assert_eq!(spelled_out.to_string(), "1.1500000000");
 
         // A stamp is a *wire* value, so the rendering helpers must be total: an absurd
         // `secs` from a hostile header saturates instead of overflowing (a debug panic).

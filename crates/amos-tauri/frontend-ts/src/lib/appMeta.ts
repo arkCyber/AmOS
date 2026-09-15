@@ -38,6 +38,7 @@ export const APP_META: AppMeta[] = [
   { id: "mail", titleKey: "app.mail", icon: "✉️" },
   { id: "store", titleKey: "app.store", icon: "🛍️" },
   { id: "pwa", titleKey: "app.pwa", icon: "📦" },
+  { id: "nativeapps", titleKey: "app.nativeapps", icon: "🪟" },
   { id: "privacy", titleKey: "app.privacy", icon: "🛡️" },
   { id: "contacts", titleKey: "app.contacts", icon: "👥" },
   { id: "magnifier", titleKey: "app.magnifier", icon: "🔍" },

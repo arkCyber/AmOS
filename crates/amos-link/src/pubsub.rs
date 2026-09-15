@@ -25,6 +25,7 @@ use crate::error::{LinkError, Result};
 use crate::keyexpr::Topic;
 use crate::metrics::LinkMetrics;
 use crate::qos::Qos;
+use crate::telemetry::Heartbeat;
 
 /// The publishing half of a topic.
 ///
@@ -210,6 +211,41 @@ impl<T: Message> Subscriber<T> {
             &self.subscription,
             &self.metrics,
         ))
+    }
+}
+
+/// The beat reader: [`Subscriber::recv_beat`], the receive path for the one link message
+/// whose payload names its own author.
+impl Subscriber<Heartbeat> {
+    /// The next **attributable** beat (see [`Heartbeat::validate`]).
+    ///
+    /// Beats are a *self-description*, so they are the one message whose payload can disagree
+    /// with the frame that carried it: a peer may publish on `amos/dog1/telemetry/beat` — the
+    /// routing key is a **topic**, and this crate's rule is that the publishing peer is the
+    /// frame header's, never the topic's — while its payload `peer` says `dog1`. Every
+    /// operator-facing view reads the payload, so such a beat is refused **here**, counted
+    /// exactly like a frame that does not decode into `T` (it does not: it is not a beat this
+    /// node accepts) and skipped. The alternative shapes are a stream where one frame has two
+    /// identities (`watch` prints one and counts gaps against the other) or a subscription that
+    /// dies on the first liar — and neither is acceptable for the message that answers "is the
+    /// robot alive".
+    ///
+    /// This is the beat path this crate's own consumers use (the control plane's
+    /// `StreamHeartbeats` and the CLI's `watch`); a caller reaching for [`Subscriber::recv`]
+    /// still gets the raw frame, unfiltered, exactly like any other `T`.
+    pub async fn recv_beat(&mut self) -> Result<Received<Heartbeat>> {
+        loop {
+            let received = self.recv().await?;
+            match received.message.validate(&received.publisher) {
+                Ok(()) => return Ok(received),
+                Err(e) => report_decode_error(
+                    &self.subscription,
+                    &self.metrics,
+                    &received.topic,
+                    &e.to_string(),
+                ),
+            }
+        }
     }
 }
 
@@ -512,6 +548,162 @@ mod tests {
         );
         assert_eq!(got.message.seq, 2);
         assert!(sub.stats().decode_errors >= 1, "the spoof was counted");
+        assert!(r.metrics.snapshot().decode_errors >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_frame_off_the_wire_is_re_validated_before_it_is_believed() {
+        // A peer writes **bytes**, not Rust values. This frame is framed correctly, routes on a
+        // legal topic and carries a perfectly decodable `Depth` payload — only its `publisher`
+        // is not a peer id (400 bytes against a 63-byte ceiling, and a newline for good
+        // measure). `Deserialize` cannot run `PeerId::new`, so without `Header::validate` the
+        // consumer would receive that token, the sequence tracker would key on it and every
+        // CLI/UI would print it.
+        #[derive(serde::Serialize)]
+        struct WireHeader {
+            topic: String,
+            publisher: String,
+            seq: u64,
+            stamp: Timestamp,
+            payload_len: u32,
+        }
+        let r = rig();
+        let topic = sensor_topic();
+        let mut sub = Subscriber::<Depth>::subscribe(
+            Arc::clone(&r.transport),
+            Topic::pattern("amos/**").expect("pattern"),
+            // A buffered profile on purpose: a *delivered* forged frame would be handed over
+            // first, so both the message and the counter catch a regression.
+            Qos::state(),
+            Arc::clone(&r.metrics),
+        )
+        .await
+        .expect("subscribe");
+
+        let payload = Depth {
+            seq: 1,
+            points: vec![1],
+        }
+        .encode()
+        .expect("payload");
+        let header = bincode::serialize(&WireHeader {
+            topic: topic.as_str().to_string(),
+            publisher: "x".repeat(400),
+            seq: 1,
+            stamp: r.clock.now(),
+            payload_len: payload.len() as u32,
+        })
+        .expect("header");
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&crate::codec::MAGIC);
+        forged.push(crate::codec::VERSION);
+        forged.extend_from_slice(&u32::try_from(header.len()).expect("len").to_le_bytes());
+        forged.extend_from_slice(&header);
+        forged.extend_from_slice(&crate::codec::crc32_over(&header, &payload).to_le_bytes());
+        forged.extend_from_slice(&payload);
+        r.transport
+            .publish(&topic, Arc::from(forged.into_boxed_slice()))
+            .await
+            .expect("publish");
+
+        // A legitimate frame afterwards: the subscriber skipped the forged one and kept working.
+        let good = depth_publisher(&r, topic.clone());
+        good.publish(&Depth {
+            seq: 2,
+            points: vec![],
+        })
+        .await
+        .expect("publish");
+
+        let got = sub.recv().await.expect("recv");
+        assert_eq!(
+            got.message.seq, 2,
+            "the forged frame was refused, not handed to the consumer"
+        );
+        assert_eq!(
+            got.publisher.as_str(),
+            "dog1",
+            "the real publisher's own id"
+        );
+        assert!(sub.stats().decode_errors >= 1, "the refusal was counted");
+        assert!(r.metrics.snapshot().decode_errors >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_beat_that_names_another_peer_is_refused_and_counted() {
+        // The frame is **legal**: right magic, right CRC, a topic it is allowed to publish on,
+        // and a perfectly decodable `Heartbeat` payload. Only the payload names a peer other
+        // than the frame's publisher — the routing key is a *topic* (this crate's rule is that
+        // the publishing peer is the header's, never the topic's), so a peer may publish on
+        // `amos/dog1/telemetry/beat` while being somebody else. Every operator-facing view reads
+        // the **payload** and the sequence accounting keys on the **framing**, so without
+        // `recv_beat` one frame carries two identities.
+        let r = rig();
+        let pattern = crate::telemetry::heartbeat_pattern().expect("pattern");
+        let mut trusting = Subscriber::<Heartbeat>::subscribe(
+            Arc::clone(&r.transport),
+            pattern.clone(),
+            // Buffered on purpose: latest-wins (`Qos::sensor`) would overwrite the forged
+            // frame before the reader ever saw it, and this test is about what the reader does.
+            Qos::state(),
+            Arc::clone(&r.metrics),
+        )
+        .await
+        .expect("subscribe");
+        let mut beats = Subscriber::<Heartbeat>::subscribe(
+            Arc::clone(&r.transport),
+            pattern,
+            Qos::state(),
+            Arc::clone(&r.metrics),
+        )
+        .await
+        .expect("subscribe");
+
+        let dog1 = PeerId::new("dog1").expect("peer");
+        let dog2 = PeerId::new("dog2").expect("peer");
+        let impostor = PeerId::new("impostor").expect("peer");
+        let beat_from = |peer: PeerId, topic_peer: &str| {
+            Publisher::<Heartbeat>::new(
+                Arc::clone(&r.transport),
+                Topic::channel_topic(topic_peer, Channel::Telemetry, "beat").expect("topic"),
+                peer,
+                Arc::clone(&r.clock),
+                Arc::clone(&r.metrics),
+            )
+        };
+
+        // The impostor publishes on dog1's beat topic, claiming to be dog1 in the payload.
+        let liar = beat_from(impostor.clone(), "dog1");
+        liar.publish(&Heartbeat::new(dog1.clone(), 1, Timestamp::now(), 0))
+            .await
+            .expect("publish");
+
+        // The raw path believes the payload: `recv` hands over a frame whose payload says
+        // `dog1` while its publisher is `impostor` — exactly the two identities that used to be
+        // printed side by side (the `peer=` column from the payload, `missed=` from the framing).
+        let raw = trusting.recv().await.expect("recv");
+        assert_eq!(raw.message.peer, dog1, "the payload's claim…");
+        assert_eq!(raw.publisher, impostor, "…against the frame's attribution");
+
+        // A real beat from dog2, on its own topic, from its own publisher.
+        let real = beat_from(dog2.clone(), "dog2");
+        real.publish(&Heartbeat::new(dog2.clone(), 7, Timestamp::now(), 42))
+            .await
+            .expect("publish");
+
+        // `recv_beat` skips the liar — counted like a frame that does not decode, because it is
+        // not a beat this node accepts — and yields the honest one.
+        let got = beats.recv_beat().await.expect("recv_beat");
+        assert_eq!(
+            got.message.peer, dog2,
+            "the honest beat is what came through"
+        );
+        assert_eq!(
+            got.publisher, got.message.peer,
+            "a delivered beat has one identity, not two"
+        );
+        assert_eq!(got.message.uptime_ms, 42);
+        assert!(beats.stats().decode_errors >= 1, "the refusal is counted");
         assert!(r.metrics.snapshot().decode_errors >= 1);
     }
 

@@ -24,6 +24,7 @@ interface HomeProps {
   ext: StoreTile[];
   pulseId: string | null;
   grid?: { cols: number; rows: number };
+  tile?: "regular" | "large";
 }
 
 const channel = (): PropsChannel<HomeProps> => propsChannel<HomeProps>("home");
@@ -278,6 +279,53 @@ describe("HomeDock.svelte — form-factor grid (tablet is not a stretched phone)
       "grid-template-columns:repeat(6,",
     );
     expect(container.querySelectorAll('button[data-testid="home-dot"]').length).toBe(0);
+  });
+
+  test("a desktop plan is the Launchpad-class grid AND bigger tiles (REQ-A249)", async () => {
+    // The plan the shell computes for a maximized Mac window (1496×881 ⇒ 8×4), plus
+    // the tile size: a 56 px phone tile in a 183 px cell reads as a phone screenshot
+    // pasted onto a desktop.
+    channel().set({
+      layout: layout(allApps, ["phone"]),
+      ext: [],
+      pulseId: null,
+      grid: { cols: 8, rows: 4 },
+      tile: "large",
+    });
+    const { container } = render(HomeDock);
+    await tick();
+
+    const grid = container.querySelector('[data-testid="home-grid"]') as HTMLElement;
+    expect(grid.getAttribute("data-cols")).toBe("8");
+    expect(grid.getAttribute("data-rows")).toBe("4");
+    expect((grid.getAttribute("style") ?? "").replace(/\s/g, "")).toContain(
+      "grid-template-columns:repeat(8,",
+    );
+    // 16 apps fit on one page of 32 → no paging dots (the desktop pages less).
+    expect(container.querySelectorAll('button[data-testid="home-dot"]').length).toBe(0);
+
+    const tile = byLabel(container, label("app.clock"));
+    expect(tile?.getAttribute("data-tile")).toBe("large");
+    expect(tile?.innerHTML).toContain("h-20"); // the large grid icon
+    expect(tile?.innerHTML).not.toContain("h-14"); // …not the phone's
+    // The dock scales with it (one tile size per class, not per surface). Queried on
+    // the dock container: the grid has a `phone` tile too, so a label lookup would
+    // find that one first.
+    const dock = container.querySelector(".dock-mag") as HTMLElement;
+    expect(dock.querySelector("button")?.getAttribute("data-tile")).toBe("large");
+    expect(dock.innerHTML).toContain("h-[76px]");
+  });
+
+  test("no `tile` in the payload ⇒ today's regular tiles (never a gained capability)", async () => {
+    // Same rule as the missing `grid`: an older/preview payload keeps the phone-size
+    // icons instead of inventing the larger ones.
+    channel().set({ layout: layout(allApps, []), ext: [], pulseId: null, grid: { cols: 8, rows: 4 } });
+    const { container } = render(HomeDock);
+    await tick();
+    const tile = byLabel(container, label("app.clock"));
+    expect(tile?.getAttribute("data-tile")).toBe("regular");
+    expect(tile?.innerHTML).toContain("h-14");
+    expect(tile?.innerHTML).not.toContain("h-20");
   });
 });
 

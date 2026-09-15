@@ -11,6 +11,8 @@
  */
 import { saveLayout, pushRecent, getLayout, defaultLayout, type HomeLayout } from "../lib/amosStore";
 import { appTitleKey, appIds } from "../lib/appMeta";
+import { invoke } from "../lib/backend";
+import type { LayoutSnapshot } from "../lib/wm";
 
 export type Surface =
   | { kind: "home" }
@@ -46,6 +48,9 @@ function seededHome(): HomeLayout {
 const initialLayout: HomeLayout = seededHome();
 let _layout = $state<HomeLayout>(initialLayout);
 
+// Track form factor to decide SPA vs multi-window (desktop).
+let _layoutSnap = $state<LayoutSnapshot | null>(null);
+
 // Svelte 5 forbids exporting reassigned $state from a module, so expose getters.
 export function surface(): Surface {
   return _surface;
@@ -66,6 +71,11 @@ export function layout(): HomeLayout {
   return _layout;
 }
 
+/** Update the layout snapshot (called by Shell.svelte on host updates). */
+export function setLayoutSnapshot(snap: LayoutSnapshot | null): void {
+  _layoutSnap = snap;
+}
+
 function clearOverlays() {
   _ncOpen = false;
   _recentsOpen = false;
@@ -74,10 +84,24 @@ function clearOverlays() {
 
 /** Open an app screen (from dock/grid/recents/library). Records a recent (built-ins
  * only — third-party ids don't pollute the frequently-used set) so the App Library
- * "Frequently Used" group stays live, mirroring the shell's `open`. */
-export function open(id: string): void {
+ * "Frequently Used" group stays live, mirroring the shell's `open`.
+ * 
+ * Desktop form factor: calls `wm_open` to create a real OS window (REQ-A249).
+ * Phone/tablet: SPA routing (existing behavior, zero change).
+ */
+export async function open(id: string): Promise<void> {
   if (appTitleKey(id) !== null) pushRecent(id);
   clearOverlays();
+  
+  // Desktop form factor: multi-window (each app is a real WebviewWindow).
+  if (_layoutSnap?.form === "desktop") {
+    await invoke("wm_open", { label: id });
+    // Desktop stays on home after opening an app window (macOS behavior).
+    _surface = { kind: "home" };
+    return;
+  }
+  
+  // Phone/tablet: single-window SPA routing (no change).
   _surface = { kind: "app", id };
 }
 
@@ -158,6 +182,7 @@ export function resetShellState(): void {
   // Same non-empty seeding as module init (see seededHome): a fresh / empty
   // persisted home must not blank the launcher grid + dock.
   _layout = seededHome();
+  _layoutSnap = null;
 }
 
 

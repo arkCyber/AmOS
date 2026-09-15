@@ -287,7 +287,14 @@ impl AndroidManager for AndroidManagerService {
         _request: Request<Empty>,
     ) -> Result<Response<AppListResponse>, Status> {
         match self.manager.list_apps().await {
-            Ok(apps) => Ok(Response::new(AppListResponse { apps })),
+            Ok(apps) => Ok(Response::new(AppListResponse {
+                apps,
+                // Which runtime answered travels with the answer. Without this the
+                // shell cannot tell "your installed apps" from the fixture every
+                // container-less host selects (`docs/android-compat.md`).
+                runtime: self.manager.runtime_name().to_string(),
+                demo: self.manager.is_demo(),
+            })),
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
@@ -746,6 +753,37 @@ mod tests {
             .into_inner();
         assert_eq!(reply.apps.len(), 4);
         assert_eq!(reply.apps[0].package_name, "com.tencent.mm");
+    }
+
+    /// The list must say **which** runtime answered (REQ-A255): a host with no
+    /// Android container is served by the fixture, and a shell that cannot tell
+    /// that apart from "your installed apps" shows fabricated data as fact.
+    #[tokio::test]
+    async fn the_list_carries_the_runtime_that_answered() {
+        let demo = AndroidManagerService::with_runtime(Arc::new(DemoRuntime::new()));
+        let demo_reply = demo
+            .get_installed_apps(Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(demo_reply.runtime, "demo");
+        assert!(
+            demo_reply.demo,
+            "the fixture must identify itself as the fixture"
+        );
+
+        let real = AndroidManagerService::with_runtime(Arc::new(WaydroidRuntime::with_runner(
+            OkWaydroid {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        )));
+        let real_reply = real
+            .get_installed_apps(Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(real_reply.runtime, "waydroid");
+        assert!(!real_reply.demo, "a real container is not the fixture");
     }
 
     #[tokio::test]

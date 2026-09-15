@@ -145,3 +145,29 @@ App 分组/用户可选的图标（App Library 组图标、联系人头像占位
   `settings-pages.svelte.test.ts` 曾为未跟踪），为避免把进行中的工作卷入提交，涉及这类文件时
   要么跳过、要么先由归属人提交后再继续。
 - 图标为 best-effort 的 `currentColor` 矢量，**需按第 7 节清单肉眼复核**造型/线宽与 SF Symbols 的差距。
+
+---
+
+## 9. macOS 桌面（不是 iOS）：用户诉求驱动的第二轮对齐（2026-09-15，REQ-A249）
+
+> 前面八节审的是**手机/平板**（iOS/iPadOS）。用户诉求换了一个对象：**"100% 对齐苹果电脑的界面"**——
+> 也就是这个壳跑在 macOS 上、窗口已被 `ShellFit::Maximize` 最大化（REQ-A233，实测 1496×881）之后，
+> **窗口里的内容**像不像一台 Mac。结论：**窗口对了，内容没对**——两处真缺陷。
+
+| # | 缺陷（修前） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **主屏在 Mac 上是手机密度**：`HomeDock` 的栅格几何只区分 phone/tablet（REQ-A234），desktop 走 phone 的 4×3 = 12/页 | 窗口已被最大化到 1496×881，内容却是"手机主屏放大贴上去"；REQ-A234 当时把 desktop **刻意排除**并写了测试钉住——本轮是用户诉求把这个决定推翻（`LayoutPolicy` 给的是"窗口能做什么"，**内容怎么排**从来没人按 Mac 做过） | `lib/formLayout.ts` 的 `homeGrid` 新增 desktop 分支：由**实测窗口**按 pitch 算（列 170 px、行 140 px，扣掉状态行+组件头+分页点+Dock 的 284 px 与左右 `px-4`），**双向夹紧** `[phone, 8] × [phone, 6]`；1496×881 ⇒ **8×4 = 32/页**。新增 `homeTile(form)`：桌面用 Launchpad 级**大图标**（栅格 80 px / Dock 76 px；字面类名写死，Tailwind 才看得见），其余类别逐字节不变 |
+| 2 | **窗口里画着 iPhone 的硬件与手势**：`StatusBar` 的 **Dynamic Island**（绝对居中的黑胶囊 = iPhone 屏幕开孔）与 app 面底部 iOS **home indicator**，都是无条件渲染 | 这两样在 macOS 上**不存在**：时间/无线/电量由 Mac 菜单栏回答，Mac 窗口没有手势条。它们不是"风格偏好"，而是**断言了不存在的硬件与手势**——与本仓"不把不存在的东西说成事实"同一条纪律 | 新增 `deviceChrome(form)`：`dynamicIsland` **只**给 phone（iPad 也没有这个开孔），`homeIndicator` 只给**触屏类别**（phone/tablet）；`Shell` 把 3 处 `<StatusBar>` 接上 `form`、app 面底部手势条 `{#if}`；回到主屏的路**没有**被删——工具栏的返回控件（+ Esc、通知中心、硬件 home）仍在 |
+
+**证据**（离线可复跑）：`bun test src/__tests__/formLayout.test.ts`（**15 例**：桌面 8×4 是**数字**而非仅性质、小窗口不比手机少、巨屏封顶、单调、未测量 ⇒ 手机栅格、`homeTile`、四类别的 `deviceChrome`）；`vitest` 的 `svelte-tests/shell.svelte.test.ts`（桌面宿主 ⇒ app 面无 `home-indicator`、无 `dynamic-island`，**且返回控件仍然回主屏**；`layout-changed` 推 desktop ⇒ 两者当场消失）、`statusbar.svelte.test.ts`（phone/无宿主仍有岛，iPad/Mac 没有）、`home-dock.svelte.test.ts`（8×4 栅格 + `data-tile="large"` + `h-20`/`h-[76px]`；缺 `tile` 的载荷仍是 `h-14`）。
+
+**真机实测（同一台 Mac，debug 二进制 + 真 vite 服务）**：宿主日志 `form="desktop" source="build-default"` → `requested a desktop-aligned (maximized) shell window` → `width=1496 height=882 scale=2.0 columns=4`（这就是 `homeGrid("desktop", 1496, 882) = 8×4` 的输入）。屏幕截图（Retina 2×）里：**修前 vs 修后两张全屏截图只在 x=1382..1610 / y=140..188（228×48 px，正是灵动岛的位置与尺寸）这一块不同** —— 修后的那张在该带"最长纯黑连续 run = **0 px**"，注入旧行为的 **218 px**；同一张截图里图标列聚类 = **8 列**，列心间距实测 ≈ **366 物理 px ≈ 183 逻辑 px** = `(1496−32)/8`（旧版 4 列由单测/注入负控证明，未在真机回放对照）。
+
+**诚实边界**：①**"100% 对齐 macOS"字面上做不到也不该做**——菜单栏、Dock、窗口圆角与红绿灯属于宿主，本应用是 macOS 里的一个窗口；本轮做的是"窗口里不再出现 Mac 上不存在的像素"；②桌面**状态行本身保留**（它是 AmOS 自己的设备状态）——"时间与菜单栏重复，是否连它一起去掉"是另一个可见决定，未做、登记为候选；③pitch/pad/chrome 三个常量是**本仓设计常量**，不是对 Apple Launchpad 的实测；④桌面**侧栏 / 菜单栏镜像**仍未做（没有 per-app 导航模型）；⑤真机证据止于**渲染事实**（像素/几何/列数）：大图标的**观感**、Dock 磁吸放大在大图标下的手感、浅/暗两套主题的对比度**仍是肉眼复核项**（见第 7 节）；⑥真机验证走的是 **debug 二进制 + vite dev**（与 `make app-open` 的 `.app` 是两条链路），本轮**没有**重新打 `.app`。
+
+### 9.1 接管与后续（2026-09-15，REQ-A250）
+
+- **桌面「内容」已由专用桌面壳接管**：`svelte/DesktopShell.svelte` + (`TopBar` / `Launchpad` / `Dock` / `SpotlightOverlay` / `MissionControl`) + `lib/desktopLayout.ts`（详见 `docs/PC_DESKTOP_ARCHITECTURE.md`）；`Shell.svelte` 在 launcher 分支之前判 `form === "desktop"`。
+- **因此第 9 节的上一条里，"桌面主屏密度/大图标"部分已不可达**（只剩单测），而**同一个类别存在两套几何数字**（`LAUNCHPAD_ROWS_DEFAULT=5` / `DOCK_ICON_SIZE=56` vs 本地实测窗口算出的 **4 行** / **76 px** Dock 图标）——**谁拥有桌面几何是需要落地方决定的事**，已登记在 `docs/multi-window.md` §1.5 与 `CHANGELOG.md`（REQ-A250）。
+- **本节新增的可复用一条**：**窗口标题**必须跟随你在看的东西（macOS 的标题栏约定）。本轮补上：`wm_set_shell_title` + `normalize_shell_title`（一行/非空/有界 + 字符级截断加可见 `…`），`None` 表示恢复宿主配置的标题（产品名不复制到 UI）；`deviceChrome.titleBar` 保证**只有有标题栏的类别**才会去命名。
+- **标题的第二个来源（登记，未擅动）**：并发落地的桌面壳在 `wm.rs` 里另有 `app_window_title(label)` —— **28 条英文常量**，供 `wm_open` 建真实应用窗时用（注释自陈与前端 `APP_META` 重复）。脚本交叉核对：该表**今天**覆盖 `APP_META` 全部 28 个 id（无缺无余），因此不是"标题错"，而是**同一数据两个源、其中一个不懂语言**（中文界面下弹出的应用窗标题是 `Settings`，而壳窗口是 `设置`）。唯一来源应由落地方决定（推荐让 `wm_open` 也从同一来源取标题）。

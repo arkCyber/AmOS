@@ -4,6 +4,7 @@ import {
   ANDROID_RECENT_KEY,
   bytesToDataUri,
   displayName,
+  normalizeAppsReply,
   readRecents,
   runTierForPackage,
 } from "../lib/android";
@@ -86,7 +87,11 @@ describe("android backend bridge", () => {
       invoke: async (cmd: string, args?: Record<string, unknown>) => {
         calls.push({ cmd, args: args ?? {} });
         if (cmd === "get_android_apps") {
-          return [{ name: "WeChat", package_name: "com.tencent.mm", activity: "Main" }];
+          return {
+            apps: [{ name: "WeChat", package_name: "com.tencent.mm", activity: "Main" }],
+            runtime: "waydroid",
+            demo: false,
+          };
         }
         if (cmd === "launch_android_app") return { success: true, window_id: "7" };
         if (cmd === "get_android_app_icon") return [1, 2, 3];
@@ -95,8 +100,10 @@ describe("android backend bridge", () => {
       listen: async () => async () => {},
     };
     setWindow(new Map(), tauri);
-    const apps = await getAndroidApps();
-    expect(apps?.[0]?.package_name).toBe("com.tencent.mm");
+    const reply = await getAndroidApps();
+    expect(reply?.apps[0]?.package_name).toBe("com.tencent.mm");
+    expect(reply?.runtime).toBe("waydroid");
+    expect(reply?.demo).toBe(false);
     const res = await launchAndroidApp("com.tencent.mm");
     expect(res?.success).toBe(true);
     const icon = await getAndroidAppIcon("com.tencent.mm");
@@ -108,5 +115,60 @@ describe("android backend bridge", () => {
     ]);
     expect(calls[1]!.args.packageName).toBe("com.tencent.mm");
     expect(calls[2]!.args.packageName).toBe("com.tencent.mm");
+  });
+});
+
+/**
+ * The daemon reports WHICH Android runtime answered (`AppListResponse.runtime` /
+ * `.demo`). These tests pin the two directions that matter: a positive `demo` is
+ * honoured (the UI must warn), and anything unreadable degrades to "unknown"
+ * without inventing either an empty machine or a fake runtime (REQ-A255).
+ */
+describe("normalizeAppsReply", () => {
+  test("keeps the runtime identity the daemon reported", () => {
+    const r = normalizeAppsReply({
+      apps: [{ name: "微信", package_name: "com.tencent.mm" }],
+      runtime: "demo",
+      demo: true,
+    });
+    expect(r.demo).toBe(true);
+    expect(r.runtime).toBe("demo");
+    expect(r.apps).toHaveLength(1);
+  });
+
+  test("a real container is not accused of being the fixture", () => {
+    const r = normalizeAppsReply({ apps: [], runtime: "waydroid", demo: false });
+    expect(r.demo).toBe(false);
+    expect(r.runtime).toBe("waydroid");
+  });
+
+  test("a missing demo flag reads as unknown, never as `true`", () => {
+    // Only a positive claim triggers the "this is not your machine's apps" banner.
+    expect(normalizeAppsReply({ apps: [], runtime: "waydroid" }).demo).toBe(false);
+    expect(normalizeAppsReply({ apps: [], runtime: "waydroid", demo: "yes" }).demo).toBe(false);
+  });
+
+  test("the pre-reply array shape still yields apps (runtime unknown)", () => {
+    const r = normalizeAppsReply([{ name: "WeChat", package_name: "com.tencent.mm" }]);
+    expect(r.apps.map((a) => a.package_name)).toEqual(["com.tencent.mm"]);
+    expect(r.runtime).toBe("");
+    expect(r.demo).toBe(false);
+  });
+
+  test("junk payloads are empty, not crashes", () => {
+    for (const junk of [null, undefined, 42, "apps", { apps: "nope" }]) {
+      const r = normalizeAppsReply(junk);
+      expect(r.apps).toEqual([]);
+      expect(r.demo).toBe(false);
+    }
+  });
+
+  test("rows without a package name are dropped", () => {
+    const r = normalizeAppsReply({
+      apps: [{ name: "nameless" }, null, { package_name: "com.ok", name: "ok" }],
+      runtime: "waydroid",
+      demo: false,
+    });
+    expect(r.apps.map((a) => a.package_name)).toEqual(["com.ok"]);
   });
 });

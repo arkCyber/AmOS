@@ -59,6 +59,53 @@ impl Heartbeat {
     pub fn age(&self) -> Duration {
         Timestamp::now().since(&self.stamp)
     }
+
+    /// Re-ask, of a beat that arrived **as bytes**, every question its field types ask
+    /// locally — plus the one question the *frame* answers.
+    ///
+    /// A beat is a **self-description**: it is the one link message whose payload names its
+    /// own author. `Heartbeat` derives `Deserialize`, so `PeerId::new` never runs for a beat
+    /// off the wire (the hole [`Header::validate`](crate::codec::Header::validate) and
+    /// [`PeerInfo::validate`](crate::discovery::PeerInfo::validate) close for the other two
+    /// wire types that carry a peer id) and `Timestamp::new` never runs for the payload's
+    /// `stamp`, which [`Heartbeat::age`] then measures against the local clock.
+    ///
+    /// The second check is what makes a beat *attributable*: `attributed` is the frame's own
+    /// publisher — the **validated** header field, and the key every consumer's sequence
+    /// accounting uses. A beat whose payload names a different peer is refused, because the
+    /// two candidate identities ("who published this frame" and "who does this beat claim to
+    /// be") must not be rendered side by side as one fact: the CLI's `watch` prints the
+    /// payload's `peer` while it computes `missed` from the header's publisher, and the
+    /// control plane forwards the payload's claim to every UI (see
+    /// [`Subscriber::recv_beat`](crate::pubsub::Subscriber::recv_beat)). The crate's rule for
+    /// a self-declaration is older than this method: the actuation fold attributes a report
+    /// by the frame's publisher and does not believe what the payload calls itself.
+    ///
+    /// Non-allocating, so a refused beat costs nothing on the receive path. Honest boundary:
+    /// an attribution check is a *consistency* check, not authentication — a peer that already
+    /// lies about its own identity in the frame header is out of scope here (the link has no
+    /// authentication to appeal to; see the §6 boundary table in `docs/amos-link.md`). What it
+    /// does guarantee is the weaker, testable invariant: **one beat, one identity**.
+    pub fn validate(&self, attributed: &PeerId) -> Result<()> {
+        // The id first, so a beat whose `peer` is not a peer id is refused for *that* reason
+        // rather than for disagreeing with the frame (the two are different defects).
+        PeerId::validate_str(self.peer.as_str()).map_err(|e| {
+            LinkError::Frame(format!("beat peer `{}` is not a peer id: {e}", self.peer))
+        })?;
+        if self.peer != *attributed {
+            return Err(LinkError::Frame(format!(
+                "beat claims peer `{}` but the frame that carried it is attributed to `{}`",
+                self.peer, attributed
+            )));
+        }
+        if !self.stamp.is_valid() {
+            return Err(LinkError::Frame(format!(
+                "beat stamp {}.{:09} is not well formed: nanos {} is not a sub-second value",
+                self.stamp.secs, self.stamp.nanos, self.stamp.nanos
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Everything the node can say about itself, in one value.
@@ -87,6 +134,16 @@ pub struct NodeStatus {
     pub peers: Vec<PeerView>,
     /// The topics this transport has seen *published* traffic on.
     pub topics: Vec<String>,
+    /// True when [`NodeStatus::topics`] is the whole truth — the inventory's own limit,
+    /// travelling **with** the list (see
+    /// [`Transport::topics_complete`](crate::broker::Transport::topics_complete)).
+    ///
+    /// The list and this flag are one value on purpose: this JSON is what the CLI prints and
+    /// a machine reads, so an inventory that stopped growing at
+    /// [`MAX_TRACKED_TOPICS`](crate::broker::MAX_TRACKED_TOPICS) must not read as "this link
+    /// has 4096 topics" from a machine's side, and a network transport (which cannot
+    /// enumerate what other nodes publish at all) must not read as "nothing is published".
+    pub topics_complete: bool,
 }
 
 impl NodeStatus {
@@ -210,6 +267,83 @@ pub(crate) fn next_seq(counter: &AtomicU64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::Message;
+
+    /// A beat **as a peer writes one**: a shadow struct with [`Heartbeat`]'s bincode layout,
+    /// so `peer` is a plain `String` and `stamp` is whatever bytes were chosen —
+    /// `PeerId::new`/`Timestamp::new` are never on an attacker's path.
+    #[derive(serde::Serialize)]
+    struct WireBeat {
+        peer: String,
+        seq: u64,
+        stamp: Timestamp,
+        uptime_ms: u64,
+    }
+
+    fn wire_beat(peer: &str, nanos: u32) -> Vec<u8> {
+        bincode::serialize(&WireBeat {
+            peer: peer.to_string(),
+            seq: 3,
+            stamp: Timestamp {
+                secs: 1_700_000_000,
+                nanos,
+            },
+            uptime_ms: 9,
+        })
+        .expect("bytes")
+    }
+
+    #[test]
+    fn a_beat_off_the_wire_is_re_validated_and_must_name_its_publisher() {
+        // The defect this pins: `Heartbeat` derives `Deserialize`, so the **third** wire type
+        // that carries a peer id was the one nothing re-asked. Its payload `peer` is what the
+        // CLI prints and what the control plane forwards to every UI, and its payload `stamp`
+        // is what `Heartbeat::age()` measures against.
+        let dog1 = PeerId::new("dog1").expect("peer");
+        let honest = Heartbeat::decode(&wire_beat("dog1", 500)).expect("bincode decodes it");
+        assert!(honest.validate(&dog1).is_ok(), "an honest beat is accepted");
+        assert_eq!(honest.peer, dog1, "…and it is the peer the frame names");
+
+        // (1) The id itself, exactly as `Header::validate`/`PeerInfo::validate` ask it.
+        for bad in [
+            "x".repeat(PeerId::MAX_LEN + 1),
+            "dog/1".to_string(),
+            "dog 1".to_string(),
+            "dog1\n".to_string(),
+            String::new(),
+        ] {
+            let beat =
+                Heartbeat::decode(&wire_beat(&bad, 0)).expect("bincode does not validate ids");
+            let error = beat
+                .validate(&dog1)
+                .expect_err("an id `PeerId::new` refuses must be refused here too");
+            assert!(
+                error.to_string().contains("beat peer"),
+                "the refusal names the field it is about: {error}"
+            );
+        }
+
+        // (2) Attribution: the frame's publisher is the identity, so a beat may not name
+        // another one. This is the check that keeps "who is alive" (the payload, printed) and
+        // "which stream is this" (the framing, accounted) from being two different answers.
+        let impostor = PeerId::new("impostor").expect("peer");
+        let error = honest
+            .validate(&impostor)
+            .expect_err("a beat may not claim another peer");
+        assert!(
+            error.to_string().contains("dog1") && error.to_string().contains("impostor"),
+            "both identities are named: {error}"
+        );
+
+        // (3) The payload's stamp obeys the same invariant as the header's: `nanos` below 1e9,
+        // or `as_nanos` and `Ord` disagree about the instant `age()` measures from.
+        let bad_stamp =
+            Heartbeat::decode(&wire_beat("dog1", 4_000_000_000)).expect("bincode decodes it");
+        let error = bad_stamp
+            .validate(&dog1)
+            .expect_err("a stamp is not a sub-second one");
+        assert!(error.to_string().contains("sub-second"), "got: {error}");
+    }
 
     #[test]
     fn the_sequence_counter_saturates_at_its_ceiling() {

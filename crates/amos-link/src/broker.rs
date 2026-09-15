@@ -97,11 +97,17 @@ impl SubCounters {
 /// The live counters of one subscription: what it got, what it lost, what it could
 /// not parse. A subscriber that reports `dropped > 0` is *working* (best-effort
 /// policy doing its job); one that reports `decode_errors > 0` is a version skew.
+///
+/// `dropped` covers **every** way a frame this subscription was routed can fail to arrive:
+/// a full best-effort queue, a replaced one-slot frame, and a consumer that went away
+/// mid-publish (closed *or* poisoned). It is not restricted to QoS-policy drops — a frame
+/// that reached nobody is lost, whatever the reason — and the publish report plus the
+/// node-wide `metrics.dropped` count the same frames, so the two never disagree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionStats {
     /// Frames handed to the consumer.
     pub received: u64,
-    /// Frames dropped by this subscription's QoS policy.
+    /// Frames routed here that reached nobody (QoS policy, or a consumer that went away).
     pub dropped: u64,
     /// Frames that arrived but could not be decoded.
     pub decode_errors: u64,
@@ -241,27 +247,44 @@ impl LatestSlot {
         // Terminates when the slot is free (stored), or when it cannot ever be (closed).
         loop {
             if self.is_closed() {
-                return Err(LinkError::Closed(
+                return Err(self.count_refusal(LinkError::Closed(
                     "subscriber dropped while publishing".to_string(),
-                ));
+                )));
             }
             match pending.take() {
-                Some(ing) => match self.try_put(ing)? {
-                    None => {
+                Some(ing) => match self.try_put(ing) {
+                    Ok(None) => {
                         self.filled.notify_waiters();
                         return Ok(waited);
                     }
-                    Some(back) => {
+                    Ok(Some(back)) => {
                         waited = true;
                         pending = Some(back);
                     }
+                    // A poisoned lock (see `try_put`): the frame reached nobody either.
+                    Err(e) => return Err(self.count_refusal(e)),
                 },
                 None => {
-                    return Err(LinkError::Closed("publish aborted".to_string()));
+                    return Err(
+                        self.count_refusal(LinkError::Closed("publish aborted".to_string()))
+                    );
                 }
             }
             self.taken.notified().await;
         }
+    }
+
+    /// Count a frame that reached nobody, and hand back the error that refused it.
+    ///
+    /// The **slot** owns this subscription's counters, so the slot is what records the loss —
+    /// exactly the rule [`LatestSlot::offer`] already follows when it replaces a pending frame.
+    /// The broker keeps its own accounting (the publish report and the node-wide `metrics`),
+    /// which is the same division of labour the buffered sink uses. This path used to record
+    /// nothing on the subscription, so a `Reliable` latest-only subscription could report
+    /// `dropped: 0` for every frame the broker's own report called dropped.
+    fn count_refusal(&self, err: LinkError) -> LinkError {
+        self.counters.record_dropped();
+        err
     }
 
     async fn recv(&self) -> Option<Ingress> {
@@ -1110,6 +1133,38 @@ mod tests {
             0,
             "nothing was handed to the consumer"
         );
+        // …and the refusal is counted on **this subscription**: the broker records the same
+        // frame in the publish report and in the node-wide `metrics`, but a subscriber must
+        // not be told that every frame it lost was delivered (`offer` already counts the
+        // frames it replaces; the reliable seek was the one path that did not).
+        assert_eq!(
+            counters.snapshot().dropped,
+            1,
+            "a frame that reached nobody is a dropped frame"
+        );
+
+        // A **poisoned** lock is a closed consumer by the same rule, and is counted the same way.
+        let counters = Subscription::counters();
+        let poisoned = Arc::new(LatestSlot::new(Arc::clone(&counters)));
+        let poisoner = Arc::clone(&poisoned);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.slot.lock().expect("a fresh lock");
+            panic!("poison the slot's lock on purpose");
+        })
+        .join();
+        assert!(
+            poisoned.is_closed(),
+            "a poisoned lock is a closed consumer (REQ-A241)"
+        );
+        assert!(poisoned
+            .offer_blocking(Ingress {
+                topic: topic("amos/dog1/control/joints"),
+                frame: frame(2),
+            })
+            .await
+            .is_err());
+        assert_eq!(counters.snapshot().dropped, 1);
+        assert_eq!(counters.snapshot().received, 0);
     }
 
     #[tokio::test]

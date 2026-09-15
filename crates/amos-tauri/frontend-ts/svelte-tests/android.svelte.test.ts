@@ -46,6 +46,7 @@ describe("AndroidApp.svelte (bridged lifecycle tiers)", () => {
       if (cmd === "get_android_apps") return apps;
       if (cmd === "android_lmk_tasks") return tasks;
       if (cmd === "get_android_app_icon") return []; // no icon bytes -> emoji
+      if (cmd === "launch_android_app") return { success: true, window_id: "w1" };
       return null;
     };
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
@@ -53,6 +54,79 @@ describe("AndroidApp.svelte (bridged lifecycle tiers)", () => {
       listen: async () => () => {},
     };
   }
+
+  /**
+   * The daemon's fixture (`runtime: "demo"`) is what every host without an Android
+   * container is served. Presenting it as "your installed apps" — and reporting a
+   * launch as "已启动" — is the fabrication REQ-A255 removed.
+   */
+  test("a fixture runtime is announced, and a tap never claims a real launch", async () => {
+    let launches = 0;
+    const invoke = async (cmd: string) => {
+      if (cmd === "get_android_apps") {
+        return {
+          apps: [{ name: "微信", package_name: "com.tencent.mm" }],
+          runtime: "demo",
+          demo: true,
+        };
+      }
+      if (cmd === "launch_android_app") {
+        launches += 1;
+        return { success: true, window_id: "waydroid_demo_com.tencent.mm" };
+      }
+      if (cmd === "android_lmk_tasks") return [];
+      if (cmd === "get_android_app_icon") return [];
+      return null;
+    };
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke,
+      listen: async () => () => {},
+    };
+
+    const host = render(AndroidApp);
+    await settle();
+    const banner = host.container.querySelector("[data-testid='android-demo-banner']");
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent ?? "").toContain("内置演示数据");
+    expect(
+      host.container.querySelector("[data-testid='android-demo-runtime']")?.textContent ?? "",
+    ).toContain("demo");
+
+    const tile = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("微信"),
+    );
+    expect(tile).toBeTruthy();
+    await fireEvent.click(tile as HTMLElement);
+    await settle();
+
+    expect(launches).toBe(1);
+    const body = txt(host);
+    expect(body).toContain("未启动真实应用");
+    expect(body).not.toContain("已启动");
+    // …and nothing entered "recently launched": that history would be a fiction.
+    expect(body).not.toContain("最近启动");
+  });
+
+  test("a real container gets no banner and does report the launch", async () => {
+    installBridge(
+      {
+        apps: [{ name: "微信", package_name: "com.tencent.mm" }],
+        runtime: "waydroid",
+        demo: false,
+      },
+      [{ package_name: "com.tencent.mm", state: "resumed", window_id: "w1" }],
+    );
+    const host = render(AndroidApp);
+    await settle();
+    expect(host.container.querySelector("[data-testid='android-demo-banner']")).toBeNull();
+
+    const tile = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("微信"),
+    );
+    await fireEvent.click(tile as HTMLElement);
+    await settle();
+    expect(txt(host)).toContain("已启动");
+  });
 
   test("labels running vs background apps from the LMK snapshot", async () => {
     installBridge(

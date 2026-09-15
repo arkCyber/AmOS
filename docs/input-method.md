@@ -12,8 +12,8 @@ AmOS domain core so the ranking stays in one place and the UI only renders it.
 
 | Layer | Where | Responsibility |
 | --- | --- | --- |
-| Engine | `crates/amos-ime` | Pinyin buffer, candidate composition, fuzzy-pair preferences, per-user learner (pins + pick counts), profile (de)serialization. **No I/O, no Tauri.** |
-| Bridge | `crates/amos-tauri/src/ime.rs` | The nine `ime_*` Tauri commands, the session (`Mutex<ImeInner>`) and the `amos-ime.json` profile file (atomic temp+rename write, next to the blocklist/SMS stores). |
+| Engine | `crates/amos-ime` | `PinyinCore` (the **process-wide** dictionary + L0 learner + fuzzy preferences) and `PinyinInput` (**one window's** buffer over a core); candidate composition; profile (de)serialization. **No I/O, no Tauri.** |
+| Bridge | `crates/amos-tauri/src/ime.rs` | The nine `ime_*` Tauri commands, the per-window session map (`Mutex<ImeInner { core, windows: HashMap<label, _> }>`) and the `amos-ime.json` profile file (atomic temp+rename write, next to the blocklist/SMS stores). |
 | Client | `crates/amos-tauri/frontend-ts/src/lib/ime.ts` | One `invoke` wrapper per command + the pure helpers (`isTextEntry`, `insertTextAtCursor`, `deleteBeforeCaret`, key layouts, candidate pager). |
 | UI | `.../src/svelte/ImeKeyboard.svelte`, `.../ImeOverlay.svelte` | `ImeKeyboard` is presentation only; `ImeOverlay` owns focus tracking, the zh/en mode, insertion into the focused field, and the fuzzy-settings panel. Mounted by `Shell.svelte`, so every app gets it. |
 
@@ -190,17 +190,93 @@ the user's pinned words would be silently gone (the same defect
 `amos-appstore::atomic` fixed with its own `STAGING_SEQ`). A staging file left
 behind by a failed rename is reported, not inherited by the next writer.
 
+The per-window split (REQ-A258) does not multiply the file: the dictionary and
+learner live in **one** shared core, and every `persist()` snapshots that core
+(preferences + L0) under its lock — so two windows committing at the same moment
+cannot write two diverging learners, the last atomic replace simply carries the
+newest shared state. Before the split each window would have owned a learner, and
+"last writer wins" would have silently dropped the other window's pinned words.
+
 Honest limit: this guarantees the replace is **atomic**, not **durable** — the last
 write is not `fsync`ed, so an abrupt power loss can still lose the newest state
 (never leave a half file).
 
+## Next-word suggestions (联想)
+
+After a commit the buffer is empty — and that is exactly when the engine can offer
+the **next word**. The keyboard shows the suggestions in the same candidate bar,
+tagged 联想 (`ime.predict`).
+
+| Layer | What it does |
+| --- | --- |
+| Engine (`crates/amos-ime`) | `PinyinInput::predictions(limit)` — the crate's **context** path (`PinyinDict::predict_next_words_context`, a word-trigram hit) over the last **two** committed words of *this window*. Empty while a code is composing, and empty with nothing/one word of context. |
+| Bridge (`crates/amos-tauri/src/ime.rs`) | With an empty buffer the state's `candidates` **are** the suggestions, each with `kind: "predict"`; `ime_commit(index)` on that list inserts the suggestion (`commit_prediction`) **without** teaching the learner and records it as the newest commit, so the chain can continue. |
+| UI (`ImeKeyboard.svelte`) | Renders the bar when `composing \|\| suggesting`; the pinyin chip and the clear button only exist while composing (there is no code to clear when a suggestion is showing). |
+
+Three decisions worth their reasons:
+
+* **The context path, not the bigram one.** `inputx-pinyin` ships two prediction
+  APIs; upstream documents the bigram-only `predict_next_words` as too noisy to ship
+  (it produced "在年月日年月日…" chains on a real device) and added
+  `predict_next_words_context` — trigram-only, `count ≥ 15` — precisely to replace it.
+  We call the context one, so a **cold start offers nothing**: one word is not
+  context, and "no suggestion" is a better answer than a guess. (The bigram FSAs are
+  still linked: they are what `bigram_boost` feeds into the composition Viterbi, i.e.
+  they improve the *sentence* candidate — not the exact-code list, which is
+  frequency + L0 only.)
+* **One index space.** A suggestion is a candidate (`kind: "predict"`), so the
+  keyboard's pager and `ime_commit(index)` keep exactly one meaning. The kind is
+  explicit rather than inferred from "the buffer happens to be empty" — it decides
+  which operation a pick is.
+* **A pick is not typing.** Committing a suggestion inserts the text but **never**
+  records it in the L0 learner, and leaves no "undo this word" hint: the dictionary
+  only learns words the user actually composed, and a suggestion has no pinyin code
+  to forget.
+
+Cost, **measured** (not estimated), on this machine:
+
+```text
+# 1) isolated engine probe (crates/amos-ime/examples/size_probe.rs)
+cargo build --release -p amos-ime --example size_probe            # with the FSTs
+cargo build --release -p amos-ime --no-default-features --example size_probe
+  without:  4,833,200 B   (prints suggestions = [])
+  with:    24,449,456 B   (prints ["国家", "生活", "工作", "社会"])
+  delta:  +19,616,256 B
+
+# 2) the whole System UI binary, same tree, only the feature differs
+cargo clean -p amos-tauri && cargo build --release -p amos-tauri  # twice
+  without: 21,012,144 B   (byte probes for both FSTs: 0/2 found)
+  with:    40,628,464 B   (byte probes: 2/2 found)
+  delta:  +19,616,320 B   ≈ +19.6 MB (18.7 MiB)
+
+# the two FST files themselves: 13,517,480 B (trigrams) + 4,462,261 B (bigrams) = 18.0 MB
+```
+
+Both measurements agree, and the byte probes (`python3`-style: take two windows out of each
+FST file and look for them in the binary) prove the data really is linked in — the number is
+not an estimate of what "should" happen.
+
+Honest provenance: the **first** attempt at the app-level A/B compared a stale binary (the
+"without" build had not been relinked, so both sides read ~40.6 MB and the probes found the
+data on both); it was discarded and redone with `cargo clean -p amos-tauri`, which is what
+produced the 21.0 MB figure above. A size claim that cannot survive a rebuild is not a
+measurement.
+
+`amos-ime`'s `predict` feature (default **on**) is the single switch. A
+size-constrained build passes `--no-default-features`; every call site in *our* code
+is unconditional (no `cfg`), and the engine answers "no suggestions" instead of
+pretending.
+
 ## Honest boundaries
 
-* **Next-word prediction (联想) is not wired.** It needs `inputx-pinyin`'s word
-  bigram + trigram FSTs (~20 MB of embedded data) which this crate deliberately
-  leaves off (`default-features = false`); nothing in the UI consumes them yet, so
-  turning them on would only grow the binary. The candidate path used here
-  (`Session::candidates` + `best_composition`) does not change if they are enabled.
+* **联想 is a *context* feature, and it says so.** Suggestions need two committed
+  words of context and a trigram hit in the embedded corpus, so there is nothing
+  after the first word, nothing for rare word pairs, and nothing while a code is
+  being composed. It suggests, it does not decide: the user picks every word. Chains
+  are user-driven for the same reason — each picked suggestion is a keystroke.
+* **The FST data costs ~19.6 MB of binary** (measured; breakdown and the reproducible
+  probe in §Next-word suggestions). It is only spent if the build enables `predict`
+  (the default), and a build without it offers no suggestions rather than pretending.
 * **The keyboard is a letters/digits/punctuation keyboard.** There is no emoji or
   full symbol plane, no long-press accents, no swipe typing, and shift is a
   one-shot key that only affects English mode (it is **disabled** in Chinese mode;
@@ -224,24 +300,84 @@ write is not `fsync`ed, so an abrupt power loss can still lose the newest state
 * **No engine ⇒ literal typing.** When the bridge does not answer at all, the
   keyboard drops to English and disables the two engine-dependent controls instead
   of offering a Chinese keyboard that would swallow every letter.
+* **A fuzzy-preference change keeps what you taught it.** `FuzzyConfig` is baked
+  into the engine at construction, so `PinyinInput::set_prefs` **rebuilds** the
+  engine — and the L0 learner lives *inside* that engine's dictionary. It did not
+  carry the learner across, so flipping one fuzzy pair dropped every pinned word
+  **and** (because the bridge persists right after a toggle) wrote the emptied
+  learner over the good `amos-ime.json`. Found in REQ-A254 by the regression test
+  `changing_fuzzy_preferences_keeps_the_learned_words` (it failed with
+  `learned_pins: 0` before the fix). The in-flight **buffer** is still cleared: the
+  ranking rules for it really did change.
+* **One engine, one buffer per window (the G1 gap, closed in REQ-A258).** The bridge
+  used to own a single `Mutex<ImeInner>` — one dictionary, one learner **and one
+  pinyin buffer** for the whole process — and the `ime_*` commands carried no window
+  label. That was exactly right when AmOS had one WebView. Once the desktop shell
+  opened one real `WebviewWindow` per app (`docs/multi-window.md` §6) *and*
+  `Shell.svelte` mounted the keyboard overlay in every window, two windows composed
+  into the **same** buffer: window A's candidate bar showed what was typed in window
+  B, and a commit in B consumed A's code (`docs/DESKTOP_ECOSYSTEM_GAP_AUDIT.md` G1).
+  The two scopes are now split the way they should have been:
+  * the **dictionary + L0 learner + fuzzy preferences are process-wide**
+    (`Arc<PinyinCore>`); a word taught in one window therefore ranks first in the
+    other, the learner is counted once, and the profile has a single source —
+    `PinyinInput::new` still gives a self-contained session, `with_core` gives the
+    per-window one;
+  * the **in-flight buffer, its "just committed" hint and its undo code belong to the
+    window** that typed them. Every command takes the caller as
+    `window: tauri::WebviewWindow` (the host injects it — the JS side passes nothing,
+    the `clipboard.rs` precedent) and files its buffer under `window.label()`.
+  Device-wide actions stay device-wide **and say so**: a fuzzy-preference change swaps
+  the engine for every window at once and abandons every window's in-flight buffer
+  (the ranking rules really did change) — logged with the count, never silent. The
+  per-window map is **bounded** (`MAX_IME_SESSIONS = 64`): at the cap, windows holding
+  nothing a user could miss (empty buffer, no undo code, no commit hint) are dropped
+  first; only when every window is mid-composition is the least-recently-used one
+  evicted, and that one is `warn!`ed because a half-typed code really can be lost.
+  The shared engine also means one dictionary and one learner in memory instead of one
+  per window.
+* **The buffer is per *window*, not per app.** Two windows of the same app do not share
+  a composition — in this shell each window *is* an app (`#window=<label>`). A
+  "resume the composition in another window" feature would be a new product decision,
+  not a side effect.
 
 ## Tests
 
-* `crates/amos-ime` — 32 unit tests: candidate composition, commit/L0 learning,
-  fuzzy toggles, profile JSON validation and caps, the transient commit hint.
-* `crates/amos-tauri/src/ime.rs` — 21 tests: the command surface, persistence
-  round-trip across a simulated restart, corrupt/newer profile handling, the
-  per-word undo (only a dictionary pick is undoable, and the next word retires it),
-  and the write path: unique staging names + concurrent persists never publishing a
-  torn profile.
+* `crates/amos-ime` — **42** unit tests: candidate composition, commit/L0 learning,
+  fuzzy toggles, profile JSON validation and caps, the transient commit hint, **a fuzzy
+  change never wiping the learner** (REQ-A254), the shared-core contract
+  (REQ-A258): two sessions over one `PinyinCore` keep their own buffers, a commit in
+  one does not eat the other's code, a word learned in one ranks first in the other, a
+  preference change reaches every session and keeps the learner, and four threads can
+  compose over one core (the host keeps it in managed state, which is `Send + Sync`);
+  and the 联想 contract (REQ-A260): two words of context are required, suggestions are
+  silent while composing, a picked suggestion continues the chain **without** teaching
+  the learner, an out-of-range pick is a no-op, and the context is per session.
+* `crates/amos-tauri/src/ime.rs` — **31** tests: the command surface, persistence
+  round-trip across a simulated restart, corrupt/newer profile handling, the per-word
+  undo (only a dictionary pick is undoable, and the next word retires it), **a fuzzy
+  toggle not erasing the learner on disk** (REQ-A254), the write path (unique staging
+  names + concurrent persists never publishing a torn profile), the per-window split
+  (REQ-A258): two windows do not share a composition buffer, a commit in one
+  leaves the other's code and undo hint alone, the learner/ranking is shared, an undo
+  belongs to the window that committed, a preference change applies to every window and
+  abandons their buffers, the window map is bounded and prunes what holds nothing, and
+  two windows answer from one profile; and the 联想 surface (REQ-A260): an empty buffer
+  offers `kind: "predict"` suggestions for what *this* window committed, picking one
+  inserts it and teaches nothing (no undo was invented), and suggestions are per window.
+* `crates/amos-ime/examples/size_probe.rs` — the reproducible size measurement quoted
+  in §Next-word suggestions: build it with and without `--no-default-features` and
+  compare; it also prints whether the engine still composes and what it suggests.
 * `frontend-ts/src/__tests__/ime.test.ts` — 15 tests: the wire contract (command
   names + camelCase args), field detection, caret insertion/deletion (including a
   field with no caret, a field **at its `maxlength`** and a clamp that never splits
   a surrogate pair), paging.
-* `frontend-ts/svelte-tests/ime-keyboard.svelte.test.ts` (27) and
+* `frontend-ts/svelte-tests/ime-keyboard.svelte.test.ts` (30) and
   `ime-overlay.svelte.test.ts` (39) — the key grid, candidate bar, pager (clamped,
   ends disabled), settings panel with the dictionary/mode readout, commit hint,
-  the bridge-failure notice, and the behavior contract (compose → commit at the
+  the bridge-failure notice, the 联想 bar (tagged suggestions render with an empty
+  buffer and no pinyin chip, picking one reports its absolute index, and typing takes
+  the bar back), and the behavior contract (compose → commit at the
   caret, backspace order, symbols while composing, page reset, English mode +
   shift, read-only refusal, Escape cancelling the composition, the no-engine
   degradation, live store sync with the Settings switch, the **physical keyboard**

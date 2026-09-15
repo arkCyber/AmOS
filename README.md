@@ -267,7 +267,7 @@ can ask a *running* node what it sees on the link.
 | transport | in-process `Broker` (`Arc` fan-out, never awaits while holding the lock) + optional **Zenoh** across boards (`--features zenoh`) |
 | QoS | `Reliability{BestEffort,Reliable} × depth × DropPolicy` from **one strategy table per channel**: sensor streams are latest-wins, control streams back-press and are counted as `blocked` — never silently dropped |
 | discovery | beacons over the link's own transport (works on **any** transport, incl. Zenoh) + real UDP multicast behind `--features lan`, announcing repeatedly so a peer that joins later still learns one that booted earlier; a node is **never its own peer** (self-echoes are refused and **counted**, not filtered away silently). On a multi-NIC board the channel is **pinned to one interface** (`AMOS_LINK_BEACON_IFACE` — outgoing datagram *and* group join), because "the kernel picks one" is how a beacon leaves through the 5G modem while the camera board listens on Wi-Fi |
-| health | `published`/`delivered`/`dropped`/`blocked`/`decode_errors` are measured, never estimates; `LinkHealth` folds them into `Unknown \| Healthy \| Degraded{reasons}` — `Unknown` means *no evidence yet* and is deliberately not the same as "healthy". Bookkeeping that is keyed by wire-supplied strings is **bounded and says when it stops**: the topic inventory (`topics_complete()`) and the per-publisher sequence tracker (`SeqEvent::Untracked`, `is_complete()`) both refuse to grow without end, because their keys can otherwise be minted per frame by a peer |
+| health | `published`/`delivered`/`dropped`/`blocked`/`decode_errors` are measured, never estimates; `LinkHealth` folds them into `Unknown \| Healthy \| Degraded{reasons}` — `Unknown` means *no evidence yet* and is deliberately not the same as "healthy". Bookkeeping that is keyed by wire-supplied strings is **bounded and says when it stops**: the topic inventory (`topics_complete()`) and the per-publisher sequence tracker (`SeqEvent::Untracked`, `is_complete()`) both refuse to grow without end, because their keys can otherwise be minted per frame by a peer. A verdict is never cleaner than the instrument behind it: a tracker that refused frames reports `untracked_frames=N` rather than letting a partial loss figure read as `healthy` |
 | robot HAL | an agent's JSON intent → a validated gait pose → CRC16-checked motor frames, with a latched e-stop and a deadman watchdog whose torque cut is reported as a **measured** frame count (it used to be assumed as "one frame per joint"). `MockRobotHal` is for tests; **`StreamRobotHal` writes the same frames to a real descriptor** — a controller's Unix socket or a serial/UART device — with the whole batch validated *before* the first byte, and `armed()` folded from the ops in wire order (it used to be an order-blind "was there an Enable anywhere in the batch?", which could report a re-armed robot as dead) |
 | return path | a policy can report its own mode on `amos/<robot>/state/actuation` (armed / e-stopped + why / gait / last refusal) — published on change **and** replayed periodically, so the very peer whose link died sees the watchdog stop, and a late-joining brain still learns a steady gait. The report comes from **another peer**, so it validates on decode: a frame count, deadman period or refusal reason outside its bound is refused (and counted as a decode error), never stored, rendered, or silently truncated into a `u32` on the way to the UI |
 
@@ -300,19 +300,23 @@ panic/abort the process).
 | `GetStatus` | identity, uptime, clock-calibrated?, cumulative counters, the live peer table, and the daemon's **own** `health` verdict + reasons |
 | `ListTopics` | the topic inventory the transport really saw (a network transport answers "unknown" instead of fabricating an empty list) |
 | `Publish` | let a non-Rust node inject a payload — the daemon stamps its own peer id, independent sequence and calibrated clock, so typed subscribers still decode it |
-| `StreamHeartbeats` | server-streaming heartbeat, forwarding the beats actually received on `amos/*/telemetry/beat` (the node's own included) |
+| `StreamHeartbeats` | server-streaming heartbeat, forwarding the beats actually received on `amos/*/telemetry/beat` (the node's own included) — a beat is a *self-description*, so its payload `peer` must equal the frame's (validated) publisher or it is refused and counted: one frame, one identity |
 | `ListActuations` | the return path folded into the control plane: each robot's armed / torque-cut(+reason) / gait / last refusal, attributed by frame publisher — a robot that never reported is **absent, not idle** |
 
 The System UI mirrors this read-only: **Settings →「机器人链路 / Robot Link」**
 (`frontend-ts/src/svelte/settings/LinkPage.svelte` over `crates/amos-tauri/src/link.rs`) shows the
-daemon's verdict, its reasons, cumulative counters, the live peer table and the robots' self-reported
-modes. It has **no toggle** — the CLI owns publishing; the page observes.
+daemon's verdict, its reasons, cumulative counters, the live peer table (id · how to reach it, when
+the beacon said) and the robots' self-reported modes. It has **no toggle** — the CLI owns
+publishing; the page observes. And the readout is **dated, not just refreshed**: every number is a
+snapshot taken at a printed read time, the page re-reads every 10 s while it is open and visible,
+and a re-read that gets no answer **drops the numbers** instead of leaving frozen ones on screen.
 
 Honest boundaries, all of them enforced in code: **not ROS** (no `.msg`/DDS wire — a bridge into that
 ecosystem is a separate deployment component), **not a scheduler** (`RobotBridge::step()` is one
 explicit step; the control thread and its frequency are the caller's), **discovery is not
 authentication** (plaintext beacons are a hint telling a peer where to connect — the authenticated path
-is the daemon's UDS), `zenoh-pico`/MCU firmware is out of scope, and cross-board multicast on a real
+is the daemon's UDS; the beat rule above is a *consistency* check in the same spirit: it makes "one
+frame, one identity" true, not the link trustworthy), `zenoh-pico`/MCU firmware is out of scope, and cross-board multicast on a real
 switch (IGMP, Wi-Fi power save) is still a field-verification item. See
 [`docs/amos-link.md`](./docs/amos-link.md) · [`crates/amos-link/README.md`](./crates/amos-link/README.md) ·
 [`crates/amos-link-cli/README.md`](./crates/amos-link-cli/README.md).
@@ -370,10 +374,12 @@ Apple-inspired tile icons** (`AppIcon.tsx` `isBespokeTile`) instead of the gener
 emoji-on-gradient tile; every other app keeps the uniform tonal face.
 
 **Settings** also carries a read-only **「机器人链路 / Robot Link」** page (🦿): the daemon's own
-AmOS-Link verdict and reasons, cumulative counters, the live peer table, and each robot's
-self-reported actuation mode (`RobotLink.ListActuations`). A robot that has not reported since the
-daemon started watching is named **absent, never idle**. There is no toggle — the page observes; the
-CLI owns publishing (see [Robot link](#robot-link-amos-link)).
+AmOS-Link verdict and reasons, cumulative counters, the live peer table (id, and the endpoint the
+beacon carried), and each robot's self-reported actuation mode (`RobotLink.ListActuations`). A robot
+that has not reported since the daemon started watching is named **absent, never idle**. The numbers
+are **dated** (the page prints when the reading was taken and re-reads every 10 s while open; a read
+that gets no answer drops them rather than freezing them). There is no toggle — the page observes;
+the CLI owns publishing (see [Robot link](#robot-link-amos-link)).
 
 The **status bar** (and lock screen / System Monitor / About) shows a **real
 battery** reading, layered daemon `system_health` → desktop-host OS battery
@@ -532,6 +538,8 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) — Community guidelines
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
+- [docs/PC_DESKTOP_AUDIT.md](./docs/PC_DESKTOP_AUDIT.md) — PC desktop (macOS) form-factor audit + roadmap
+- [docs/PC_DESKTOP_ARCHITECTURE.md](./docs/PC_DESKTOP_ARCHITECTURE.md) — PC desktop (macOS) shell architecture: `DesktopShell` + TopBar/Dock/Launchpad/Spotlight/MissionControl + multi-window stage
 - [docs/clipboard-container-sync.md](./docs/clipboard-container-sync.md) — Cross-boundary global-clipboard sync (host↔Waydroid/Android container): two-topology decision + shared framed protocol + host transport + guest-side agent crate + offline link/backoff supervisor (`amos-clipboard`, all implemented/tested); device channel bridge planned
 - [docs/clipboard-device-runbook.md](./docs/clipboard-device-runbook.md) — Connected-phone runbook: detect retail / no-UI-base / Waydroid, `adb push` + run the `amos-clipboard` on-device self-check, and which clipboard layers are really testable per device shape
 - [docs/android-compat.md](./docs/android-compat.md) — Waydroid/APK compatibility (dev/prototype; product = no-UI Android base)

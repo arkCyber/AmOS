@@ -14,6 +14,7 @@ import { resetPropsChannels, propsChannel } from "../src/svelte/propsBus";
 import {
   applyLayout,
   enterEdit,
+  goHome,
   lock,
   open,
   resetShellState,
@@ -27,16 +28,62 @@ import {
 import { moveBefore, readStoreValue, writeStoreValue, RECENTS_KEY } from "../src/lib/amosStore";
 import { CONTACTS_KEY } from "../src/lib/contacts";
 import { NOTIF_KEY } from "../src/lib/settings";
+import { LAYOUT_CHANGED_EVENT, type LayoutSnapshot } from "../src/lib/wm";
+import { setFormFactor } from "../src/lib/desktopApps";
 import { zh } from "../src/i18n/locales/zh";
+
+/** A host snapshot of the class under test (the shape `wm_layout_snapshot` returns). */
+const snap = (over: Partial<LayoutSnapshot> = {}): LayoutSnapshot => ({
+  screen_w: 1496,
+  screen_h: 881,
+  split: null,
+  candidates: [],
+  form: "desktop",
+  columns: 4,
+  multi_window: true,
+  free_resize: true,
+  divider_gap: 8,
+  ...over,
+});
+
+type Listener = (e: { payload: unknown }) => void;
+
+/** Every bridge call the shell made, in order (command + args) — so a test can assert
+ * *what* the shell asked for, not merely that it asked. */
+let bridgeCalls: Array<{ cmd: string; args?: Record<string, unknown> }>;
+
+/** Install a fake host so the shell's own class-dependent chrome can be driven. */
+function installHost(answer: () => unknown) {
+  const listeners = new Map<string, Listener>();
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+    invoke: async (cmd: string, args?: Record<string, unknown>) => {
+      bridgeCalls.push({ cmd, args });
+      if (cmd === "wm_layout_snapshot") return answer();
+      if (cmd === "wm_set_shell_title") return (args?.title as string | null) ?? "Amos";
+      return null;
+    },
+    listen: async (channel: string, handler: Listener) => {
+      listeners.set(channel, handler);
+      return () => listeners.delete(channel);
+    },
+  };
+  return {
+    push: (s: LayoutSnapshot) => listeners.get(LAYOUT_CHANGED_EVENT)?.({ payload: s }),
+  };
+}
 
 beforeEach(() => {
   window.localStorage.clear();
   resetPropsChannels();
   resetShellState();
+  setFormFactor(null);
+  bridgeCalls = [];
 });
 afterEach(() => {
   resetPropsChannels();
   resetShellState();
+  setFormFactor(null);
+  delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 });
 
 describe("Shell.svelte (surface decision tree)", () => {
@@ -79,7 +126,7 @@ describe("Shell.svelte (surface decision tree)", () => {
   });
 
   test("app surface shows chrome + Back returns home", async () => {
-    open("phone");
+    await open("phone");
     const { container } = render(Shell);
     await tick();
     expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
@@ -93,7 +140,7 @@ describe("Shell.svelte (surface decision tree)", () => {
   test("an id with no screen shows an honest message, never a blank frame", async () => {
     // An unknown id can still reach `open()` (a link, a persisted layout, a
     // manifest). The surface must say so rather than render nothing.
-    open("nope-not-an-app");
+    await open("nope-not-an-app");
     const { container } = render(Shell);
     await tick();
     expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
@@ -104,7 +151,7 @@ describe("Shell.svelte (surface decision tree)", () => {
   });
 
   test("app surface hosts a scrollable region so tall content-flow apps can be paged", async () => {
-    open("settings");
+    await open("settings");
     const { container } = render(Shell);
     await tick();
     const surface = container.querySelector('[data-testid="app-surface"]');
@@ -163,7 +210,7 @@ describe("Shell.svelte (surface decision tree)", () => {
   });
 
   test("app surface Home indicator returns to the home surface", async () => {
-    open("phone");
+    await open("phone");
     const { container } = render(Shell);
     await tick();
     const home = container.querySelector('button[data-testid="home-indicator"]') as HTMLButtonElement | null;
@@ -172,6 +219,112 @@ describe("Shell.svelte (surface decision tree)", () => {
     await tick();
     expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
   });
+
+  test("a macOS window renders DesktopShell (TopBar + Dock + Stage) instead of the iOS surface (PC_DESKTOP_ARCHITECTURE.md)", async () => {
+    // The PC desktop form factor (Phase 3 alignment) renders an entirely different
+    // shell — a TopBar / Dock / Stage layout that mirrors macOS Aqua. The iOS
+    // shape's app-surface element no longer exists in this shell: app windows are
+    // independent WebviewWindow instances that the host opens via `wm_open("<id>")`
+    // rather than a single SPA surface. The host is the only authority on the form
+    // factor; the shell never guesses from the viewport.
+    installHost(() => snap({ form: "desktop" }));
+    await open("phone");
+    const { container } = render(Shell);
+    await tick();
+    // Wait for `wm_layout_snapshot()` round-trip + onLayoutChanged push to settle.
+    // DesktopShell needs the snapshot before it can route, and the Shell needs the
+    // 40 ms tick to give the promises time.
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Desktop shell renders its own chrome — TopBar / Dock / 启动台入口 / spotlight.
+    expect(container.querySelector('[data-testid="app-surface"]')).toBeNull();
+    expect(container.querySelector('button[data-testid="home-indicator"]')).toBeNull();
+    expect(container.querySelector('[data-testid="dynamic-island"]')).toBeNull();
+    // macOS shell: TopBar (aria-label uses i18n key) and Dock (role=toolbar) are
+    // present; together they're the unambiguous DesktopShell signature.
+    const topbar = container.querySelector(
+      '[aria-label="顶部菜单栏"], [aria-label="Top Menu Bar"]',
+    );
+    expect(topbar).toBeTruthy();
+    const dock = container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]');
+    expect(dock).toBeTruthy();
+  });
+
+  test("a touch class keeps both, and a layout push flips them live (REQ-A249)", async () => {
+    // The same shell, told it is a phone: today's chrome is unchanged. Then the host
+    // re-classes it as a desktop on `layout-changed` — the chrome must follow that
+    // push, not the value read at startup.
+    const host = installHost(() => snap({ form: "phone", screen_w: 480, screen_h: 820 }));
+    await open("phone");
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(container.querySelector('button[data-testid="home-indicator"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="dynamic-island"]')).toBeTruthy();
+
+    host.push(snap({ form: "desktop" }));
+    await tick();
+    expect(container.querySelector('button[data-testid="home-indicator"]')).toBeNull();
+    expect(container.querySelector('[data-testid="dynamic-island"]')).toBeNull();
+  });
+  test("the window's name follows what is on screen (REQ-A250)", async () => {
+    // The defect this pins: the shell window carried the configured title for every
+    // surface, so a Mac's title bar (and the window menu, and the Dock's window list)
+    // said "Amos · AI System UI" while the window showed Settings.
+    installHost(() => snap({ form: "desktop" }));
+    await open("phone");
+    render(Shell);
+    await tick();
+    // Wait longer for wm_open to complete and title to be set
+    await new Promise((r) => setTimeout(r, 100));
+
+    const asked = () =>
+      bridgeCalls.filter((c) => c.cmd === "wm_set_shell_title").map((c) => c.args?.title);
+
+    // The app on screen, by its localized name — the same string the in-window chrome
+    // shows, so the title bar and the window cannot disagree.
+    expect(asked()).toContain(zh["app.phone"]);
+
+    // Back to the launcher — whichever surface the desktop class renders (this test is
+    // about the *title*, not about which component owns the desktop): the shell asks for
+    // `null`, i.e. "restore the title the host was configured with". The product name is
+    // not duplicated in the UI (REQ-A234's rule).
+    bridgeCalls = [];
+    goHome();
+    await tick();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(asked().length).toBeGreaterThan(0);
+    expect(asked().every((t) => t === null)).toBe(true);
+  });
+
+  test("no title is sent where there is no title bar (REQ-A250)", async () => {
+    // A phone/tablet app is fullscreen, and renaming an Android activity's label would
+    // rename the app in the task switcher — so the shell asks for nothing there.
+    installHost(() => snap({ form: "phone", screen_w: 480, screen_h: 820 }));
+    await open("phone");
+    render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(bridgeCalls.filter((c) => c.cmd === "wm_set_shell_title")).toEqual([]);
+  });
+
+  test("a desktop shell hides the phone dialer (REQ-A251: desktop cannot dial)", async () => {
+    // Desktop form factor + the user clicks the phone tile (it is not in the dock on
+    // desktop, but the surface could still try to mount it via `open("phone")`).
+    // The shell must NOT mount `PhoneApp` — desktop has no SIM.
+    installHost(() => snap({ form: "desktop" }));
+    await open("phone");
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 80));
+    // The phone app must be unavailable — the loader returns undefined on desktop,
+    // so Shell's app loader effect can never produce a real `<AppComp>` for it.
+    expect(container.querySelector('[data-testid="app-surface"]')).toBeNull();
+    // The desktop shell renders instead (TopBar + Dock signature, plus our new stage).
+    expect(container.querySelector('[aria-label="顶部菜单栏"], [aria-label="Top Menu Bar"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]')).toBeTruthy();
+  });
+
 
 
   test("tapping a HomeDock dock icon opens the app surface via Shell", async () => {
@@ -183,8 +336,10 @@ describe("Shell.svelte (surface decision tree)", () => {
     ) as HTMLButtonElement | null;
     expect(phone).toBeTruthy();
     await fireEvent.click(phone!);
-    await tick();
-    expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+    // Wait for async open() to complete
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+    });
   });
 
   test("tapping the monitor dock tile opens the System Monitor app surface", async () => {
@@ -196,15 +351,17 @@ describe("Shell.svelte (surface decision tree)", () => {
     ) as HTMLButtonElement | null;
     expect(tile).toBeTruthy();
     await fireEvent.click(tile!);
-    await tick();
+    // Wait for async open() to complete
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+    });
     const surf = container.querySelector('[data-testid="app-surface"]');
-    expect(surf).toBeTruthy();
     // The app chrome shows the localized title (registry resolved `monitor`).
     expect(surf!.textContent ?? "").toContain(zh["app.monitor"]);
   });
 
   test("opening the calendar app really mounts its month grid through the registry", async () => {
-    open("calendar");
+    await open("calendar");
     const { container } = render(Shell);
     await tick();
     const surf = container.querySelector('[data-testid="app-surface"]');
@@ -260,8 +417,10 @@ describe("Shell.svelte (surface decision tree)", () => {
     ) as HTMLButtonElement | null;
     expect(row).toBeTruthy();
     await fireEvent.click(row!);
-    await tick();
-    expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+    // Wait for async open() to complete
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+    });
   });
 
 
@@ -474,7 +633,8 @@ describe("Shell.svelte (store tiles)", () => {
   /** Bridge that reports one installed store app, with a runnable web bundle. */
   function bridgeWithInstalled(entry?: { url: string; start: string } | "reject") {
     (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
-      invoke: async (cmd: string) => {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        bridgeCalls.push({ cmd, args });
         if (cmd === "appstore_installed") {
           return [
             {
@@ -495,6 +655,8 @@ describe("Shell.svelte (store tiles)", () => {
           if (entry === "reject") throw new Error("no web install dir (set AMOS_APPSTORE_INSTALL_DIR)");
           return entry ?? { url: "amos-app://org.amos.demo/index.html", start: "index.html" };
         }
+        // wm_* commands should not be called in phone mode, but return safely if they are
+        if (cmd.startsWith("wm_")) return null;
         return null;
       },
       listen: async () => () => {},
@@ -517,7 +679,7 @@ describe("Shell.svelte (store tiles)", () => {
     bridgeWithInstalled();
     const host = render(Shell);
     await tick();
-    open("store:org.amos.demo");
+    await open("store:org.amos.demo");
     await vi.waitFor(() => {
       expect(host.container.querySelector('[data-testid="ext-app-frame"]')).toBeTruthy();
     });
@@ -539,7 +701,7 @@ describe("Shell.svelte (store tiles)", () => {
     bridgeWithInstalled("reject");
     const host = render(Shell);
     await tick();
-    open("store:org.amos.demo");
+    await open("store:org.amos.demo");
     await vi.waitFor(() => {
       expect(host.container.querySelector('[data-testid="ext-app-failed"]')).toBeTruthy();
     });

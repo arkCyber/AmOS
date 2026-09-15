@@ -98,6 +98,16 @@ impl<R: CommandRunner> AndroidRuntime for WaydroidRuntime<R> {
     }
 }
 
+/// The runtime name that denotes the built-in **fixture** rather than a real
+/// container. One spelling, in the module that owns the drivers, so the daemon's
+/// service layer and any future driver agree on which one is not real.
+pub const DEMO_RUNTIME_NAME: &str = "demo";
+
+/// Is `name` the fixture runtime (i.e. this host has **no** Android container)?
+pub fn is_demo_runtime(name: &str) -> bool {
+    name == DEMO_RUNTIME_NAME
+}
+
 /// In-process demo runtime: works without Waydroid so the OS is usable on the
 /// host and in tests. Maintains a real app list and records launches + stops.
 pub struct DemoRuntime {
@@ -163,7 +173,7 @@ impl DemoRuntime {
 
 impl AndroidRuntime for DemoRuntime {
     fn name(&self) -> &'static str {
-        "demo"
+        DEMO_RUNTIME_NAME
     }
 
     fn list_apps(&self) -> Result<Vec<AndroidApp>, String> {

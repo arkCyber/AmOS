@@ -65,19 +65,41 @@ export function stripComments(src) {
 /**
  * Command names from a `generate_handler![…]` block: every entry's **last** path
  * segment (`wm::open` → `open`, `open` → `open`).
+ *
+ * The list is delimited by **balanced brackets**, not by "the first `]`". A
+ * per-entry attribute is normal Rust (`#[cfg(desktop)]` in front of a
+ * desktop-only command) and carries its own `]`; a naive `indexOf("]")` therefore
+ * ended the list at the first attribute and reported every command after it as
+ * "declared but NOT registered" — two false failures in this repo until the
+ * scanner learned to count brackets.
  */
 export function parseRegistered(src) {
   const start = src.indexOf("generate_handler!");
   if (start < 0) return [];
   const open = src.indexOf("[", start);
-  const close = src.indexOf("]", open);
-  if (open < 0 || close < 0) return [];
+  if (open < 0) return [];
+  const close = matchingBracket(src, open);
+  if (close < 0) return [];
   return stripComments(src.slice(open + 1, close))
     .split(",")
     .map((e) => e.trim())
     .filter((e) => e !== "")
     .map((e) => e.split("::").pop().trim())
     .filter((e) => /^[A-Za-z_]\w*$/.test(e));
+}
+
+/** Index of the `]` that closes the `[` at `open`, or -1 when unbalanced. */
+export function matchingBracket(src, open) {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === "[") depth++;
+    else if (c === "]") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
 }
 
 /** Names carrying `#[tauri::command]` (attributes may sit between it and the fn). */
@@ -128,6 +150,28 @@ export function runSelftest() {
   ok("keeps a plain name", reg.includes("plain"));
   ok("ignores the macro name itself", !reg.includes("generate_handler"));
   ok("missing macro → empty", parseRegistered("pub fn x() {}").length === 0);
+
+  // A per-entry attribute carries its own `]`; the list must survive it (the
+  // regression this scanner shipped: `#[cfg(desktop)]` truncated the list at the
+  // first attribute, so every command after it looked unregistered).
+  const withAttrs = [
+    "..generate_handler![",
+    "  ai::ask,",
+    "  #[cfg(desktop)]",
+    "  wine::wine_apps,",
+    "  #[cfg(desktop)]",
+    "  linux_apps::linux_apps,",
+    "]",
+    "..",
+  ].join("\n");
+  const regAttrs = parseRegistered(withAttrs);
+  ok("keeps entries after a per-entry attribute", regAttrs.length === 3);
+  ok(
+    "names both attributed entries",
+    regAttrs.includes("wine_apps") && regAttrs.includes("linux_apps"),
+  );
+  ok("balanced-bracket scan finds the real close", matchingBracket("a[#[x]]b", 1) === 6);
+  ok("unbalanced brackets → -1", matchingBracket("a[#[x]", 1) === -1);
 
   const decls = parseDeclared(
     [

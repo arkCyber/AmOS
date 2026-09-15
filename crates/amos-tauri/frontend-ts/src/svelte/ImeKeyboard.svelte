@@ -86,6 +86,11 @@
   // otherwise a visible candidate would report an index that commits nothing.
   const current = $derived(Math.min(Math.max(0, page), pages - 1));
   const visible = $derived(pageCandidates(candidates, current));
+  // 联想: the engine's next-word suggestions for what this window has committed.
+  // They arrive as candidates of kind "predict" **with an empty buffer** (the host
+  // composes both lists into one index space), so the bar below shows when either
+  // source has something to offer.
+  const suggesting = $derived(candidates.some((c) => c.kind === "predict"));
   const learned = $derived((session?.learned_pins ?? 0) + (session?.learned_pending ?? 0));
 
   // A one-shot modifier must not outlive the mode it belongs to: leaving English
@@ -206,22 +211,25 @@
         {t("ime.bridgeError")}
       </div>
     {/if}
-    <!-- Candidate bar: the raw pinyin + the engine's candidates (paged). -->
-    {#if session?.composing}
+    <!-- Candidate bar: the raw pinyin + the engine's candidates (paged), or — with
+         an empty buffer — the 联想 suggestions for what this window committed. -->
+    {#if session?.composing || suggesting}
       <div
         class="flex items-center gap-2 border-b border-black/10 px-2 py-1.5 dark:border-white/10"
         data-testid="ime-composition"
       >
-        <button
-          type="button"
-          aria-label={t("ime.clear")}
-          data-testid="ime-composition-clear"
-          onclick={onclear}
-          class="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/70 text-xs dark:bg-white/10"
-        >
-          ✕
-        </button>
-        <span class="shrink-0 font-mono text-sm tracking-wide" data-testid="ime-input">{session.input}</span>
+        {#if session?.composing}
+          <button
+            type="button"
+            aria-label={t("ime.clear")}
+            data-testid="ime-composition-clear"
+            onclick={onclear}
+            class="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/70 text-xs dark:bg-white/10"
+          >
+            ✕
+          </button>
+          <span class="shrink-0 font-mono text-sm tracking-wide" data-testid="ime-input">{session.input}</span>
+        {/if}
         {#if visible.length > 0}
           <div class="flex min-w-0 flex-1 gap-1 overflow-x-auto">
             {#each visible as c, i (c.text + i)}
@@ -231,7 +239,7 @@
                 onclick={() => oncommit(current * IME_CANDIDATE_PAGE_SIZE + i)}
                 class="shrink-0 rounded-lg bg-white px-3 py-1 text-[15px] shadow-sm dark:bg-neutral-700"
               >
-                {c.text}{#if c.kind === "sentence"}<span class="ml-1 align-middle text-[10px] opacity-60">{t("ime.sentence")}</span>{/if}
+                {c.text}{#if c.kind === "sentence"}<span class="ml-1 align-middle text-[10px] opacity-60">{t("ime.sentence")}</span>{:else if c.kind === "predict"}<span class="ml-1 align-middle text-[10px] opacity-60" data-testid="ime-predict-tag">{t("ime.predict")}</span>{/if}
               </button>
             {/each}
           </div>

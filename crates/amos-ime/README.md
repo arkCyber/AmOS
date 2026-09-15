@@ -26,9 +26,15 @@ not draw a candidate bar, and handles Mandarin pinyin only.
 
 | file | what |
 |---|---|
-| `src/engine.rs` | `PinyinInput`, `Candidate`, `CandidateKind`, `MAX_CANDIDATES` |
+| `src/engine.rs` | `PinyinCore` (the process-wide dictionary + learner + fuzzy prefs), `PinyinInput` (one typing session over it), `Candidate`, `CandidateKind`, `MAX_CANDIDATES` |
 | `src/fuzzy.rs` | `FuzzyPair`, `FuzzyPrefs`, `FUZZY_PAIRS` |
 | `src/profile.rs` | `ImeProfile` (learning + pins) and its caps |
+
+## Features
+
+| feature | default | what it buys |
+|---|---|---|
+| `predict` | **on** | 联想 / next-word suggestions: the word-trigram + word-bigram FSTs behind `PinyinInput::predictions()` (context path) and the `bigram_boost` the composition Viterbi uses. Costs **+19.6 MB** of binary (measured) — `--no-default-features` builds without it, and the engine then answers "no suggestions" instead of pretending. |
 
 ## Build & test
 
@@ -36,6 +42,8 @@ not draw a candidate bar, and handles Mandarin pinyin only.
 cargo test -p amos-ime
 cargo clippy -p amos-ime --all-targets -- -D warnings
 cargo fmt -p amos-ime -- --check
+# the feature explicitly (CI does this too, so it cannot rot silently):
+cargo clippy -p amos-ime --all-targets --features predict -- -D warnings
 ```
 
 ## Examples
@@ -43,11 +51,16 @@ cargo fmt -p amos-ime -- --check
 ```bash
 # Type "nihao": candidates, a fuzzy variant, a picked-and-learned re-ranking.
 cargo run -p amos-ime --example typing_session
+
+# What the 联想 FSTs cost in binary size (build it twice, with and without them).
+cargo build --release -p amos-ime --example size_probe
+cargo build --release -p amos-ime --no-default-features --example size_probe
 ```
 
 | example | shows |
 |---|---|
 | `typing_session` | a few codes typed through `PinyinInput`, the candidates (with kind), a fuzzy pair flipping on and changing the order, and the profile learning a pick so the next type ranks it differently |
+| `size_probe` | the honest cost of the `predict` feature: build it with and without, compare the two binaries; it also prints what the engine composes and which suggestions it returns (empty without the data) |
 
 ## Honest boundaries
 
@@ -55,6 +68,10 @@ cargo run -p amos-ime --example typing_session
   candidate is a data problem, not a silent heuristic.
 - **Learning is local and bounded**: `ImeProfile` caps are enforced at insert time.
 - **No cloud prediction** and no user-text upload — the input method is offline by design.
+- **联想 needs context**: `predictions()` returns nothing until two words have been committed
+  in that session (the upstream engine's context path is trigram-based on purpose — the
+  bigram-only path produced "在年月日年月日…" chain noise), and nothing while a code is being
+  composed. A picked suggestion is inserted but **not** taught to the learner.
 - **No platform IME glue here**: registering with Android's input framework is the host's
   job (and is a device verification item).
 

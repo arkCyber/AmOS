@@ -66,6 +66,23 @@ export function wmLayoutSnapshot(): Promise<LayoutSnapshot | null> {
   return invoke<LayoutSnapshot>("wm_layout_snapshot");
 }
 
+/**
+ * Name the shell window — on macOS, what its **title bar** shows.
+ *
+ * `title` is the localized name of the app that is on screen, or `null` for the
+ * surfaces that are the shell itself (launcher / lock / edit / library). `null` does
+ * **not** mean "empty": the host restores the title it was configured with, so the
+ * product name lives in exactly one place (`tauri.conf.json`) instead of a second copy
+ * here — the same rule REQ-A234 applied to the launcher label.
+ *
+ * Resolves to the title the host actually applied (a long third-party display name is
+ * truncated host-side, with a visible `…`), or `null` when there is no host / the call
+ * failed: a caller that asked for a name can then tell whether it got that name.
+ */
+export function wmSetShellTitle(title: string | null): Promise<string | null> {
+  return invoke<string>("wm_set_shell_title", { title });
+}
+
 /** Set the full window area the split layout sub-divides. */
 export function wmLayoutSetScreen(width: number, height: number): Promise<LayoutSnapshot | null> {
   return invoke<LayoutSnapshot>("wm_layout_set_screen", { width, height });
@@ -358,3 +375,23 @@ export function describeSplit(sp: SplitLayoutInfo | null): string {
   if (!sp) return "fullscreen";
   return `${sp.primary} ⇆ ${sp.secondary} · ${sp.axis} @ ${sp.percent}%`;
 }
+
+/**
+ * The shared-store key the **host** writes when window focus changes
+ * (`crates/amos-tauri/src/store.rs::APP_FOCUSED_KEY`, written on
+ * `WmEvent::FocusChanged`).
+ *
+ * It lives here — next to `LAYOUT_CHANGED_EVENT`, in the module that owns the wm
+ * protocol — so the desktop chrome (TopBar) imports the name instead of spelling
+ * the literal a second time (a re-spelled key is how `amos.files.fav` drifted away
+ * from `FILES_FAV_KEY` and silently missed every backup; see
+ * `scripts/store-scan.mjs`).
+ *
+ * The host writes this key on every focus change; the desktop chrome reads **the
+ * store** (not an event): one source, and `createStoreValue` already re-renders on
+ * the `store-updated` broadcast. A dedicated `app-focused-changed` event used to be
+ * emitted alongside it and was removed in REQ-A254 — `tauri-event-scan` reported it
+ * as emitted-without-subscriber, and an exported `APP_FOCUSED_EVENT` constant here
+ * had already been failed by `unwired-scan` for the same reason.
+ */
+export const APP_FOCUSED_KEY = "amos.app_focused";

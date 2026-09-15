@@ -75,18 +75,25 @@ impl PeerId {
     /// Longest accepted id.
     pub const MAX_LEN: usize = 63;
 
-    /// Validate a peer id: `A-Za-z0-9._-`, 1..=63 bytes.
-    pub fn new(id: impl Into<String>) -> Result<Self> {
-        let id = id.into();
+    /// Validate a peer id **without building one**: `A-Za-z0-9._-`, 1..=63 bytes.
+    ///
+    /// [`PeerId::new`] calls this, so there is exactly one rule with two entry points. The
+    /// second caller is a **wire decoder**: a frame header's `publisher` and a beacon's
+    /// `peer.id` arrive as bytes, and `Deserialize` cannot run a constructor — so without
+    /// this check the type's promise ("validated once, at construction, so the rest of the
+    /// crate can treat it as a safe token") would hold for locally built ids only, and not
+    /// for the ids a peer chose. That promise is load-bearing: the id keys the peer table
+    /// and the per-publisher sequence tracker, and every CLI/UI render prints it.
+    pub fn validate_str(id: &str) -> Result<()> {
         if id.is_empty() {
             return Err(LinkError::KeyExpr {
-                expr: id,
+                expr: id.to_string(),
                 reason: "empty peer id".to_string(),
             });
         }
         if id.len() > Self::MAX_LEN {
             return Err(LinkError::KeyExpr {
-                expr: id,
+                expr: id.to_string(),
                 reason: format!("peer id longer than {} bytes", Self::MAX_LEN),
             });
         }
@@ -95,10 +102,17 @@ impl PeerId {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         {
             return Err(LinkError::KeyExpr {
-                expr: id,
+                expr: id.to_string(),
                 reason: "peer ids allow only A-Za-z0-9._-".to_string(),
             });
         }
+        Ok(())
+    }
+
+    /// Validate a peer id: `A-Za-z0-9._-`, 1..=63 bytes.
+    pub fn new(id: impl Into<String>) -> Result<Self> {
+        let id = id.into();
+        Self::validate_str(&id)?;
         Ok(PeerId(id))
     }
 
@@ -222,6 +236,12 @@ impl PeerInfo {
     /// never emits a beacon another node would refuse, and never accepts one padded past
     /// the frame ceiling an attacker controls.
     pub fn validate(&self) -> Result<()> {
+        // The id is a **wire value here too** (`PeerInfo` derives `Deserialize`, which
+        // cannot run `PeerId::new`): a beacon must not be able to put a token into the peer
+        // table that the id's own constructor would refuse. `Beacon::decode` calls this
+        // *before* the entry reaches `PeerRegistry`, which keys the table by this id and
+        // prints it in every CLI/UI view.
+        PeerId::validate_str(self.id.as_str())?;
         if self.endpoints.len() > MAX_ENDPOINTS {
             return Err(LinkError::Frame(format!(
                 "peer `{}` advertises {} endpoints (the ceiling is {MAX_ENDPOINTS})",
@@ -989,6 +1009,42 @@ mod tests {
     }
 
     #[test]
+    fn the_non_allocating_id_check_asks_the_same_question_as_the_constructor() {
+        // One rule, two entry points: the wire decoders use `validate_str` (they have bytes,
+        // not a `PeerId`), `new` wraps it. If the two drifted, a header or beacon would be
+        // checked against a rule the constructor does not have.
+        for id in [
+            "dog1".to_string(),
+            "mini-brain_2.local".to_string(),
+            String::new(),
+            "dog 1".to_string(),
+            "dog1\n".to_string(),
+            "amos/dog1".to_string(),
+            "Dog1".to_string(),
+            "x".repeat(PeerId::MAX_LEN),
+            "x".repeat(PeerId::MAX_LEN + 1),
+        ] {
+            assert_eq!(
+                PeerId::new(id.as_str()).is_ok(),
+                PeerId::validate_str(&id).is_ok(),
+                "`{id}`: the constructor and the checker must agree"
+            );
+        }
+        // Same rule ⇒ same reason (a decoder logs it), including the byte-count boundary.
+        let from_new = PeerId::new("x".repeat(64))
+            .expect_err("refused")
+            .to_string();
+        let from_check = PeerId::validate_str(&"x".repeat(64))
+            .expect_err("refused")
+            .to_string();
+        assert_eq!(from_new, from_check);
+        assert!(
+            from_check.contains("longer than 63 bytes"),
+            "got: {from_check}"
+        );
+    }
+
+    #[test]
     fn default_peer_id_is_valid() {
         // The fallback identity must itself pass validation, or every topic built from
         // it would be refused later.
@@ -1141,7 +1197,66 @@ mod tests {
         );
     }
 
-    /// A deterministic totality sweep for the beacon decoder: 2 000 pseudo-random byte
+    #[test]
+    fn a_beacon_off_the_wire_is_re_validated_too() {
+        // The beacon's `peer.id` is a **wire** value: `PeerInfo` derives `Deserialize`, so
+        // `PeerId::new` never runs for a datagram off the network. An attacker writes bytes
+        // (here: a shadow struct with the beacon's bincode layout), and the id must be refused
+        // *before* it can key the peer table or be printed by a UI.
+        #[derive(serde::Serialize)]
+        struct WirePeer {
+            id: String,
+            kind: NodeKind,
+            endpoints: Vec<String>,
+        }
+        #[derive(serde::Serialize)]
+        struct WireBeacon {
+            version: u8,
+            peer: WirePeer,
+            stamp: Timestamp,
+        }
+        let wire_frame = |id: &str| -> Vec<u8> {
+            let body = bincode::serialize(&WireBeacon {
+                version: BEACON_VERSION,
+                peer: WirePeer {
+                    id: id.to_string(),
+                    kind: NodeKind::Robot,
+                    endpoints: vec!["tcp/10.0.0.7:7447".to_string()],
+                },
+                stamp: stamp(100),
+            })
+            .expect("body");
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&BEACON_MAGIC);
+            frame.push(BEACON_VERSION);
+            frame.extend_from_slice(&u32::try_from(body.len()).expect("len").to_le_bytes());
+            frame.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+            frame.extend_from_slice(&body);
+            frame
+        };
+
+        // Positive control: the hand-written builder is correct — a legal id decodes.
+        let legal = Beacon::decode(&wire_frame("dog1")).expect("a legal beacon");
+        assert_eq!(legal.peer.id.as_str(), "dog1");
+
+        // Over-long, empty, and json/terminal-unsafe ids are all refused with the id's own
+        // rule (the same one `PeerId::new` applies locally).
+        for bad in [
+            "x".repeat(PeerId::MAX_LEN + 1),
+            String::new(),
+            "dog 1".to_string(),
+            "dog1\n\u{1b}[31m".to_string(),
+            "amos/dog1".to_string(),
+        ] {
+            let err = Beacon::decode(&wire_frame(&bad))
+                .expect_err("an id `PeerId::new` refuses must be refused here too");
+            assert!(
+                matches!(err, LinkError::KeyExpr { .. }),
+                "{bad:?} ⇒ {err:?}"
+            );
+        }
+    }
+
     /// strings plus random single-byte mutations of a real frame must all come back as
     /// `Err` (or decode consistently) — **never** as a panic. This decoder is fed raw
     /// datagrams straight off the network, so “total on arbitrary input” is the property

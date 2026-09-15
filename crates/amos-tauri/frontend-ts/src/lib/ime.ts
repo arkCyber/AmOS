@@ -7,6 +7,11 @@
  *    command the Rust bridge registers. The engine, the candidate ranking and the
  *    per-user learner all live in Rust (`amos-ime`); the WebView never ranks
  *    anything itself, so the UI cannot drift from the engine's dictionary.
+ *    The session is **per window** (REQ-A258): the host files each buffer under the
+ *    calling `WebviewWindow`'s label, and injects that window itself — so these
+ *    wrappers deliberately take no window argument (the `clipboard.ts` precedent).
+ *    The dictionary + learner are process-wide: a word learned in one window ranks
+ *    first in the other.
  *  • **Pure helpers** (`isTextEntry`, `insertTextAtCursor`, the key layouts, the
  *    candidate pager): everything about *where* text goes and *what keys exist*,
  *    headless-testable without a backend.

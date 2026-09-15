@@ -11,9 +11,11 @@
   import { t } from "./locale.svelte";
   import type { HomeLayout } from "../lib/amosStore";
   import { moveBefore, addAppsToDock, readStoreValue, writeStoreValue } from "../lib/amosStore";
-  import { homeGrid, PHONE_GRID, type HomeGrid } from "../lib/formLayout";
-  import { onLayoutChanged, wmLayoutSnapshot, type LayoutSnapshot } from "../lib/wm";
+  import { amosWarn } from "../lib/debugLog";
+  import { homeGrid, homeTile, deviceChrome, PHONE_GRID, type HomeGrid, type HomeTile } from "../lib/formLayout";
+  import { onLayoutChanged, wmLayoutSnapshot, wmSetShellTitle, type LayoutSnapshot } from "../lib/wm";
   import { CONTACTS_KEY, seedContacts } from "../lib/contacts";
+  import { setFormFactor } from "../lib/desktopApps";
   import {
     applyLayout,
     enterEdit,
@@ -29,12 +31,14 @@
     setNc,
     setRecents,
     setSpot,
+    setLayoutSnapshot,
     softLaunch,
     spotOpen,
     surface,
     unlock,
   } from "./shellState.svelte";
   import LockScreen from "./LockScreen.svelte";
+  import DesktopShell from "./DesktopShell.svelte";
   import { startTimerWatcher } from "./osTimerWatcher";
   import { startAlarmWatcher } from "./osAlarmWatcher";
   import { startReminderWatcher } from "./osReminderWatcher";
@@ -78,6 +82,9 @@
      * The shell owns it because the shell is what reads the host's authority; the
      * grid is pushed down the same reactive channel as the layout, in place. */
     grid: HomeGrid;
+    /** How big one tile is on this class (`lib/formLayout::homeTile`). Pushed with the
+     * grid for the same reason: it is the host's class, not the component's guess. */
+    tile: HomeTile;
   }
 
   // The host's layout authority (`form` + the **measured** screen). The shell reads
@@ -90,6 +97,35 @@
   const homeGridPlan = $derived(
     layoutSnap ? homeGrid(layoutSnap.form, layoutSnap.screen_w, layoutSnap.screen_h) : PHONE_GRID,
   );
+  // The class itself, for the chrome decisions below. No host ⇒ phone, the
+  // conservative default (the same rule the grid follows).
+  const shellForm = $derived(layoutSnap?.form ?? "phone");
+  // Device chrome (REQ-A249): the Dynamic Island is iPhone hardware and the home
+  // indicator is an iOS gesture bar — neither exists on a Mac, and both used to be
+  // drawn in a maximized macOS window (`lib/formLayout::deviceChrome`).
+  const chrome = $derived(deviceChrome(shellForm));
+  // Tile size for the launcher: a Mac window's Launcher wants Launchpad-class tiles
+  // (a 56 px tile in a 183 px cell reads as a phone screenshot pasted onto a desktop).
+  const homeTilePlan = $derived(homeTile(shellForm));
+
+  // The window's own name (REQ-A250). On a class with an OS title bar, the bar answers
+  // "what am I looking at": the app that is on screen, or — via `null` — the title the
+  // host was configured with, for the surfaces that are the shell itself. Nothing is
+  // sent where there is no such chrome (a mobile app is fullscreen; renaming an Android
+  // activity's label would rename the app in the task switcher instead).
+  $effect(() => {
+    if (!chrome.titleBar) return;
+    const s = surface();
+    const asked = s.kind === "app" ? appTitle(s.id) : null;
+    void wmSetShellTitle(asked).then((applied) => {
+      // The host bounds what it hands the OS (a third-party display name is truncated
+      // with a visible `…`). Report a difference instead of hiding it — a title bar
+      // that silently says something else is the class of thing this crate surfaces.
+      if (asked !== null && applied !== null && applied !== asked) {
+        amosWarn("wm", "the host applied a different window title", { asked, applied });
+      }
+    });
+  });
 
   // Store-installed (third-party) tiles live in the module cache in
   // `lib/storeApps`, which only `loadStoreTiles` ever populates — and the Store
@@ -110,6 +146,7 @@
         ext,
         pulseId: pulseId(),
         grid: homeGridPlan,
+        tile: homeTilePlan,
       });
     }
   });
@@ -247,11 +284,19 @@
     // this is not a poll). A `null` answer (no bridge, or a failed command — recorded
     // in the diagnostics ledger by `lib/backend`) leaves the phone plan in place
     // rather than keeping a stale tablet reading (`WindowPage`'s honesty rule).
+    // The same snapshot also feeds `setFormFactor` so the app registry hides
+    // phone-only apps (e.g. `phone` dialer) on desktop — desktop has no SIM.
     void wmLayoutSnapshot().then((s) => {
-      if (s) layoutSnap = s;
+      if (s) {
+        layoutSnap = s;
+        setFormFactor(s.form);
+        setLayoutSnapshot(s); // Initialize shellState with layout snapshot
+      }
     });
     void onLayoutChanged((s) => {
       layoutSnap = s;
+      setFormFactor(s.form);
+      setLayoutSnapshot(s); // Update shellState on layout changes
     }).then((stop) => {
       if (layoutDisposed) stop();
       else stopLayoutWatch = stop;
@@ -318,6 +363,10 @@
     for (const name of ["home", "editHome", "appLibrary", "lock", "recents", "spotlight", "nc"]) {
       disposePropsChannel(name);
     }
+    // Clear the form-factor signal so a torn-down shell can never leave a stale
+    // `desktop` answer in the app registry (which would hide phone-only apps on
+    // the next mount if the next shell booted on a phone/tablet).
+    setFormFactor(null);
   });
 
   const s = $derived(surface());
@@ -410,6 +459,10 @@
   {#if ready}
     {#if s.kind === "lock"}
       <LockScreen />
+    {:else if layoutSnap?.form === "desktop"}
+      <!-- 桌面形态（PC / macOS）：UI 拓扑走 DesktopShell，顶栏 + Dock + 舞台 + 浮层。
+           手机/平板形态保持原 shell 不变。 -->
+      <DesktopShell />
     {:else}
       {#if s.kind === "edit"}
         <EditHome />
@@ -417,7 +470,7 @@
         <div class="flex h-full flex-col">
           <Backdrop />
           <div class="relative z-10 flex h-full flex-col">
-            <StatusBar />
+            <StatusBar form={shellForm} />
             <div class="min-h-0 flex-1">
               <AppLibrary />
             </div>
@@ -428,7 +481,7 @@
           class="flex h-full flex-col text-neutral-900 dark:text-neutral-100"
           data-testid="app-surface"
         >
-          <StatusBar />
+          <StatusBar form={shellForm} />
           <div class="flex items-center justify-between border-b border-neutral-200/70 bg-white/50 px-3 py-3 backdrop-blur-md dark:border-neutral-800 dark:bg-white/5">
             <button
               onclick={goHome}
@@ -471,26 +524,30 @@
               {/if}
             {/key}
           </div>
-          <!-- Home indicator: a horizontal bar (iOS-style); tapping returns to the
-               shell home. The whole strip is the touch target (44px tall for touch). -->
-          <div class="flex justify-center pb-2 pt-1">
-            <button
-              aria-label={t("a11y.home")}
-              data-testid="home-indicator"
-              title={t("a11y.home")}
-              onclick={goHome}
-              class="grid w-40 cursor-pointer place-items-center py-2"
-            >
-              <span class="block h-1.5 w-16 rounded-full bg-neutral-800/80 ring-1 ring-white/10 dark:bg-neutral-200/90 dark:ring-black/10"></span>
-            </button>
-          </div>
+          <!-- Home affordance. On a **touch** class this is the iOS home-indicator bar
+               (its gesture bar). A macOS window has no such gesture → the bar is not
+               drawn there; the way back is the toolbar's back control above (plus Esc,
+               plus the hardware/NC surfaces) — see `lib/formLayout::deviceChrome`. -->
+          {#if chrome.homeIndicator}
+            <div class="flex justify-center pb-2 pt-1">
+              <button
+                aria-label={t("a11y.home")}
+                data-testid="home-indicator"
+                title={t("a11y.home")}
+                onclick={goHome}
+                class="grid w-40 cursor-pointer place-items-center py-2"
+              >
+                <span class="block h-1.5 w-16 rounded-full bg-neutral-800/80 ring-1 ring-white/10 dark:bg-neutral-200/90 dark:ring-black/10"></span>
+              </button>
+            </div>
+          {/if}
         </div>
       {:else}
         <!-- home surface -->
         <div class="flex h-full flex-col">
           <Backdrop />
           <div class="relative z-10 flex h-full flex-col">
-            <StatusBar />
+            <StatusBar form={shellForm} />
             <div class="min-h-0 flex-1">
               <HomeDock />
             </div>

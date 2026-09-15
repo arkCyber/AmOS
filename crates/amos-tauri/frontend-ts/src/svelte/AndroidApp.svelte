@@ -16,6 +16,7 @@
     addRecent,
     bytesToDataUri,
     displayName,
+    normalizeAppsReply,
     readRecents,
     runTierForPackage,
     type AndroidApp,
@@ -33,6 +34,13 @@
   let recent = $state<AndroidRecent[]>(readRecents());
   let status = $state("");
   let pkg = $state("");
+  // Which Android runtime the daemon answered with. `demo` is the daemon's
+  // built-in fixture, which is what **every host without an Android container**
+  // (any macOS desktop, a Linux box without Waydroid) is served — the list then
+  // is not this machine's apps and a launch starts nothing real, so both the list
+  // and the launch status have to say so (docs/android-compat.md §桌面形态).
+  let runtime = $state("");
+  let demo = $state(false);
 
   $effect(() => {
     if (!online) {
@@ -41,9 +49,12 @@
     }
     let alive = true;
     getAndroidApps()
-      .then((list) => {
+      .then((reply) => {
         if (!alive) return;
-        if (!list || !list.length) {
+        const { apps: list, runtime: rt, demo: isDemo } = normalizeAppsReply(reply);
+        runtime = rt;
+        demo = isDemo;
+        if (!reply || !list.length) {
           status = t("android.empty");
           return;
         }
@@ -145,6 +156,14 @@
       return;
     }
     if (r.success) {
+      if (demo) {
+        // The daemon's fixture "launched" nothing: no app process exists and the
+        // registered `legacy:waydroid_demo_*` surface has no compositor behind it
+        // on this host. Saying "已启动" here would be a plain lie, and a recents
+        // entry would be a history of something that never happened.
+        status = t("android.demoLaunched");
+        return;
+      }
       recent = addRecent(readRecents(), { package_name: name, name, ts: Date.now() });
       status = t("android.launched") + (r.window_id ? " · " + r.window_id : "");
       // The container now holds this app as foreground — refresh the tiers so the
@@ -158,6 +177,20 @@
 </script>
 
 <div class="flex h-full flex-col p-3">
+  {#if demo}
+    <!-- The daemon answered with its built-in fixture, i.e. this host has no
+         Android container at all. Say so before the grid: the tiles below are not
+         this machine's apps, and a launch starts nothing real. -->
+    <div
+      class="mb-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+      data-testid="android-demo-banner"
+    >
+      <p class="text-xs font-semibold">{t("android.demoNotice")}</p>
+      <p class="mt-0.5 font-mono text-[10px] opacity-60" data-testid="android-demo-runtime">
+        runtime: {runtime}
+      </p>
+    </div>
+  {/if}
   <p class="text-sm opacity-70">{status || t("android.loading")}</p>
 
   {#if recent.length > 0}

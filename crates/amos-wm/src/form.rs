@@ -35,7 +35,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{Size, SplitAxis};
+use crate::layout::{at_least, Bounds, Size, SplitAxis};
 
 /// The environment variable an operator uses to override the detected class.
 ///
@@ -151,6 +151,29 @@ pub fn resolve_hint(
     }
 }
 
+/// Why a class refused one more app window ([`LayoutPolicy::check_app_window`]).
+///
+/// A refusal is data, not a string: the host turns it into the operator-visible
+/// sentence (`Display`), and a caller that needs to *decide* can match on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppWindowRefusal {
+    /// The class that refused.
+    pub form: FormFactor,
+    /// How many app windows this host already had when it was asked.
+    pub open: usize,
+}
+
+impl fmt::Display for AppWindowRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "form factor '{}' does not allow multiple app windows \
+             (multi_window=false); {} app window(s) already open",
+            self.form, self.open
+        )
+    }
+}
+
 /// What the host should do with the **shell window** at boot (see
 /// [`LayoutPolicy::shell_fit`]).
 ///
@@ -170,6 +193,20 @@ pub enum ShellFit {
     /// it runs on instead of sitting in a fixed 1024×720 slab (measured: that slab
     /// overhung a 1496×967 desktop's right edge and covered half of it — REQ-A233).
     Maximize,
+}
+
+/// Cap one edge to what `available` can actually show.
+///
+/// `available` is raised to 1 first: a not-yet-measured screen (0×0 — see
+/// `columns_for(0) == 1`) must not produce a zero-size window, and a window can
+/// never be wider than the screen it is drawn on.
+const fn cap_edge(preferred: u32, available: u32) -> u32 {
+    let available = at_least(available, 1);
+    if preferred > available {
+        available
+    } else {
+        preferred
+    }
 }
 
 /// What the windowing shell may do on a given form factor.
@@ -285,6 +322,60 @@ impl LayoutPolicy {
         } else {
             SplitAxis::Horizontal
         }
+    }
+
+    /// May this class host **one more app window**, given `open_app_windows` already
+    /// open ones?
+    ///
+    /// `multi_window == false` means *one app window at a time* — a handset is a
+    /// single fullscreen surface, and a headless board has no screen at all — so a
+    /// **second** app window is refused. The refusal carries the class and the count
+    /// instead of a bare "no", and it is a `Result` (not a bool) so the host cannot
+    /// forget to say why.
+    ///
+    /// This is the **one** place the rule lives: both the host's register path and
+    /// its Tauri window-creation path ask this, and the answer is whatever the
+    /// caller already counted — no second counting rule to drift.
+    pub const fn check_app_window(self, open_app_windows: usize) -> Result<(), AppWindowRefusal> {
+        if self.multi_window || open_app_windows == 0 {
+            Ok(())
+        } else {
+            Err(AppWindowRefusal {
+                form: self.form,
+                open: open_app_windows,
+            })
+        }
+    }
+
+    /// Fit a window whose preferred size is `preferred` onto `screen`.
+    ///
+    /// One rule used by **both** "where does a new window open"
+    /// ([`LayoutPolicy::initial_window_in`]) and "where must an existing window be
+    /// pulled back to" (the host's re-clamp): if the two disagreed, a window could be
+    /// created at a size the re-clamp would immediately refuse.
+    ///
+    /// Authority order: `preferred` → `min_pane` (never below the class minimum) →
+    /// `screen` (never larger than the surface it is drawn on; the screen wins over
+    /// `min_pane` because it is a physical fact) → fully inside the screen.
+    pub const fn fit_window(self, preferred: Size, screen: Bounds) -> Bounds {
+        let grown = Bounds::new(0, 0, preferred.width, preferred.height).enforce_min(self.min_pane);
+        let capped = Bounds::new(
+            grown.x,
+            grown.y,
+            cap_edge(grown.width, screen.width),
+            cap_edge(grown.height, screen.height),
+        );
+        capped.clamp_into(screen)
+    }
+
+    /// Where a **new app window** opens on `screen`.
+    ///
+    /// The class's `initial_window` is only a *preference*: it is grown to `min_pane`
+    /// and capped by the screen ([`LayoutPolicy::fit_window`]). A window larger than
+    /// the screen cannot be shown at all, and the user would otherwise see
+    /// `initial_window`'s 1024x720 slab hanging off a small desktop.
+    pub const fn initial_window_in(self, screen: Bounds) -> Bounds {
+        self.fit_window(self.initial_window, screen)
     }
 
     /// What to do with the shell window `current` (logical px) when the config declares
@@ -600,6 +691,88 @@ mod tests {
                 > LayoutPolicy::of(FormFactor::Tablet).initial_window.width,
             "a tablet window opens portrait"
         );
+    }
+    /// The multi-window gate: `multi_window == false` means **one app window at a
+    /// time**, and the refusal says which class and how many were already open.
+    #[test]
+    fn a_class_without_multi_window_refuses_the_second_app_window() {
+        let phone = LayoutPolicy::of(FormFactor::Phone);
+        assert_eq!(
+            phone.check_app_window(0),
+            Ok(()),
+            "the first window is fine"
+        );
+
+        let refusal = phone
+            .check_app_window(1)
+            .expect_err("the second is refused");
+        assert_eq!(refusal.form, FormFactor::Phone);
+        assert_eq!(refusal.open, 1);
+        let text = refusal.to_string();
+        assert!(text.contains("phone"), "{text}");
+        assert!(text.contains("multi_window=false"), "{text}");
+        assert!(text.contains("1 app window"), "{text}");
+
+        // A headless class carries the same flag, so it is the same answer.
+        assert!(LayoutPolicy::of(FormFactor::Robot)
+            .check_app_window(1)
+            .is_err());
+
+        // Classes that *do* allow several never refuse on the count.
+        for f in [FormFactor::Tablet, FormFactor::Desktop] {
+            let p = LayoutPolicy::of(f);
+            assert!(p.multi_window, "{f} is a multi-window class");
+            for open in [0, 1, 7, 1_000] {
+                assert_eq!(p.check_app_window(open), Ok(()), "{f} with {open} open");
+            }
+        }
+    }
+
+    /// A new window opens at the class's size, never below its own minimum pane,
+    /// and never hanging off the screen — in that order of authority.
+    #[test]
+    fn a_new_window_opens_on_screen_and_at_least_min_pane() {
+        let desktop = LayoutPolicy::of(FormFactor::Desktop);
+        let big = Bounds::new(0, 0, 1920, 1080);
+        let opened = desktop.initial_window_in(big);
+        assert_eq!((opened.x, opened.y), (0, 0));
+        assert_eq!(
+            (opened.width, opened.height),
+            (desktop.initial_window.width, desktop.initial_window.height),
+            "on a screen that fits it, the class preference is honoured"
+        );
+
+        // A small screen caps it: a 1024×720 slab must not hang off a 800×600 area.
+        let small = Bounds::new(0, 0, 800, 600);
+        let capped = desktop.initial_window_in(small);
+        assert_eq!((capped.width, capped.height), (800, 600));
+        assert!(capped.right() <= small.right() && capped.bottom() <= small.bottom());
+
+        // A screen *smaller* than `min_pane` wins over the minimum: it is a physical
+        // fact, `min_pane` is a preference. (Still never zero-sized.)
+        let tiny = Bounds::new(0, 0, 100, 40);
+        let squeezed = desktop.initial_window_in(tiny);
+        assert_eq!((squeezed.width, squeezed.height), (100, 40));
+        assert!(squeezed.width >= 1 && squeezed.height >= 1);
+
+        // A screen that has not been measured (0×0) yields a 1×1 window, not a
+        // zero-size one — the same "unmeasured ⇒ most conservative" rule
+        // `columns_for(0) == 1` follows.
+        let unmeasured =
+            LayoutPolicy::of(FormFactor::Phone).initial_window_in(Bounds::new(0, 0, 0, 0));
+        assert_eq!((unmeasured.width, unmeasured.height), (1, 1));
+
+        // An offset screen slides the window inside it (`clamp_into`)…
+        let offset = Bounds::new(100, 50, 400, 300);
+        let placed = LayoutPolicy::of(FormFactor::Tablet).initial_window_in(offset);
+        assert!(placed.x >= offset.x && placed.y >= offset.y, "{placed:?}");
+        assert!(placed.right() <= offset.right() && placed.bottom() <= offset.bottom());
+
+        // …and `min_pane` still grows a *class* preference that is too small: the
+        // phone's 480×820 on a wide screen keeps its class minimum.
+        let phone = LayoutPolicy::of(FormFactor::Phone);
+        let grown = phone.initial_window_in(Bounds::new(0, 0, 4000, 4000));
+        assert!(grown.width >= phone.min_pane.width && grown.height >= phone.min_pane.height);
     }
 
     #[test]

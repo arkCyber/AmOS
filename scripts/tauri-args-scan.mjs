@@ -168,19 +168,40 @@ export function parseCommandArgs(src) {
   return out;
 }
 
-/** Command names from a `generate_handler![…]` block (last path segment). */
+/**
+ * Command names from a `generate_handler![…]` block (last path segment).
+ *
+ * Delimited by **balanced brackets**: a per-entry attribute (`#[cfg(desktop)]`)
+ * carries its own `]`, and stopping at the first one truncated the list — which
+ * reported every desktop-only command as "declared but NOT registered"
+ * (`tauri-command-scan.mjs` had the same defect; both now count brackets).
+ */
 export function parseRegistered(src) {
   const start = src.indexOf("generate_handler!");
   if (start < 0) return [];
   const open = src.indexOf("[", start);
-  const close = src.indexOf("]", open);
-  if (open < 0 || close < 0) return [];
+  if (open < 0) return [];
+  const close = matchingBracket(src, open);
+  if (close < 0) return [];
   return stripComments(src.slice(open + 1, close))
     .split(",")
     .map((e) => e.trim())
     .filter((e) => e !== "")
     .map((e) => e.split("::").pop().trim())
     .filter((e) => /^[A-Za-z_]\w*$/.test(e));
+}
+
+/** Index of the `]` that closes the `[` at `open`, or -1 when unbalanced. */
+export function matchingBracket(src, open) {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === "[") depth++;
+    else if (src[i] === "]") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
 }
 
 /**

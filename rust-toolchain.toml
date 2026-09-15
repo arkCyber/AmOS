@@ -1,3 +1,17 @@
 [toolchain]
-channel = "stable"
+# Pinned on purpose (2026-09-15): `stable` floats, and rustfmt/clippy change between
+# releases — a maintainer's Mac on last month's stable and a fresh runner would
+# disagree about `cargo fmt --check` and which lints exist. That was the real cause
+# of the recorded "make lint's fmt check was failing" churn, so `ci.yml`,
+# `.github/actions/prep-android` and `release.yml` now read THIS file
+# (`.github/scripts/read-rust-pin.sh` → `dtolnay/rust-toolchain@master`), and
+# `.github/docker/ci-android/Dockerfile` mirrors it. Guarded by
+# `scripts/ci-drift-scan.mjs` (rules R1/R3/R4).
+#
+# Bump procedure: change the channel here, then run
+#   cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
+# and `node scripts/ci-drift-scan.mjs` (it fails until the Dockerfile ARG mirrors
+# the new number). One number, one place.
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
+

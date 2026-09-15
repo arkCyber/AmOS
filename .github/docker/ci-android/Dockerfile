@@ -28,7 +28,9 @@ ARG BUILD_TOOLS_VERSION=34.0.0
 ARG ANDROID_CMDLINE_VERSION=latest
 ARG PROTOBUF_VERSION=28.3            # matches the tonic/prost stack we pin
 ARG CARGO_NDK_VERSION=4.1.2          # must equal prep-android input cargo-ndk-version
-ARG RUST_CHANNEL=stable              # rust-toolchain.toml is also `stable`
+ARG RUST_CHANNEL=1.98.0            # must equal rust-toolchain.toml's channel
+                                   # (scripts/ci-drift-scan.mjs rule R4; the image
+                                   # MIRRORS the pin, it never sets a second one)
 
 # The CI runner + the prebuilt NDK/protoc/cmdline-tools we install are all x86_64.
 # Pinning the platform here means an arm64 (Apple Silicon) build host still

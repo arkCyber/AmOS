@@ -82,6 +82,18 @@ message AppInstallResponse {
 
 message AppListResponse {
   repeated AndroidApp apps = 1;
+
+  // Which Android runtime answered: `waydroid` (a real container on this host)
+  // or `demo` (the daemon's built-in fixture). The System UI must be able to say
+  // WHICH runtime this host has — presenting one runtime's answer as another's is
+  // exactly the kind of silent fabrication the rest of AmOS refuses.
+  string runtime = 2;
+
+  // True when `apps` is that built-in **fixture** and not what this machine has
+  // installed. A host with no Android container (any macOS desktop, a Linux box
+  // without Waydroid) selects the demo runtime so the pipeline stays exercisable
+  // in dev/CI, and therefore has to tell the user that the list is not theirs.
+  bool demo = 3;
 }
 
 message AndroidApp {

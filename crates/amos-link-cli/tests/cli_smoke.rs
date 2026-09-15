@@ -166,6 +166,13 @@ fn remote_mode_reads_a_running_control_plane_over_a_unix_socket() {
         stdout.contains("seen by the daemon's transport"),
         "the inventory says whose it is, got: {stdout}"
     );
+    // …and whether it is the whole truth. The count alone presented an incomplete list (a
+    // broker past `MAX_TRACKED_TOPICS`, or any network transport) exactly like a complete one
+    // to a caller that is not on that node's transport and cannot find out any other way.
+    assert!(
+        stdout.contains("(inventory complete)"),
+        "the remote inventory carries its own limit, got: {stdout}"
+    );
 
     let (code, stdout, stderr) = run(&[
         "pub",

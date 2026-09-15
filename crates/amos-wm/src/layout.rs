@@ -20,6 +20,20 @@ pub struct Size {
     pub height: u32,
 }
 
+/// `value`, but never below `floor`.
+///
+/// Written out rather than `Ord::max`, which is **not yet const-stable** — and
+/// every rule in this module is a `const fn` so the policy arithmetic in
+/// [`crate::form`] stays compile-time (the same discipline
+/// [`crate::form::LayoutPolicy::columns_for`] follows with explicit `if`s).
+pub const fn at_least(value: u32, floor: u32) -> u32 {
+    if value > floor {
+        value
+    } else {
+        floor
+    }
+}
+
 impl Size {
     pub const fn new(width: u32, height: u32) -> Self {
         Self { width, height }
@@ -50,38 +64,39 @@ impl Bounds {
     }
 
     /// Right edge as a signed 64-bit coordinate (avoids overflow when adding).
-    pub fn right(self) -> i64 {
-        i64::from(self.x) + i64::from(self.width)
+    ///
+    /// `const` so the domain's composition stays compile-time (`LayoutPolicy`
+    /// arithmetic is all `const fn`; see `form::initial_window_in`).
+    pub const fn right(self) -> i64 {
+        self.x as i64 + self.width as i64
     }
 
     /// Bottom edge as a signed 64-bit coordinate (avoids overflow when adding).
-    pub fn bottom(self) -> i64 {
-        i64::from(self.y) + i64::from(self.height)
+    pub const fn bottom(self) -> i64 {
+        self.y as i64 + self.height as i64
     }
 
     /// Grow the frame up to `min` (origin preserved) — the "free resize never
     /// shrinks a window below its minimum" rule.
-    pub fn enforce_min(self, min: Size) -> Bounds {
+    pub const fn enforce_min(self, min: Size) -> Bounds {
         Bounds {
             x: self.x,
             y: self.y,
-            width: self.width.max(min.width.max(1)),
-            height: self.height.max(min.height.max(1)),
+            width: at_least(self.width, at_least(min.width, 1)),
+            height: at_least(self.height, at_least(min.height, 1)),
         }
     }
 
     /// Slide the frame so it sits entirely inside `screen` (size unchanged), used
     /// to keep a window on-screen after a free resize/drag. No-op if it fits.
-    pub fn clamp_into(self, screen: Bounds) -> Bounds {
+    pub const fn clamp_into(self, screen: Bounds) -> Bounds {
         let mut x = self.x;
         let mut y = self.y;
-        let s_right = screen.right();
-        let s_bottom = screen.bottom();
-        if self.right() > s_right {
-            x = (s_right - i64::from(self.width)) as i32;
+        if self.right() > screen.right() {
+            x = (screen.right() - self.width as i64) as i32;
         }
-        if self.bottom() > s_bottom {
-            y = (s_bottom - i64::from(self.height)) as i32;
+        if self.bottom() > screen.bottom() {
+            y = (screen.bottom() - self.height as i64) as i32;
         }
         if x < screen.x {
             x = screen.x;

@@ -686,12 +686,20 @@ async fn run_remote(opts: &Opts, socket: PathBuf) -> Result<()> {
             for topic in &list.topics {
                 println!("{topic}");
             }
-            // Who this inventory is *of*: the daemon's own transport can only enumerate
-            // what it saw on that transport (docs/amos-link.md §5) — a board link has no
-            // way to list what a remote peer published.
+            // Who this inventory is *of*, and — the half that used to be lost over the control
+            // plane — whether it is the whole truth: the daemon's own transport can only
+            // enumerate what it saw there (docs/amos-link.md §5), and its list stops growing at
+            // MAX_TRACKED_TOPICS. `TopicList.complete` is the field that says so; printing only
+            // the count would present both cases as a complete list.
             println!(
-                "remote={remote}: {} topic(s) seen by the daemon's transport",
-                list.topics.len()
+                "remote={remote}: {} topic(s) seen by the daemon's transport (inventory {})",
+                list.topics.len(),
+                if list.complete {
+                    "complete"
+                } else {
+                    "incomplete — a network transport cannot enumerate what others publish, \
+                     and a full broker inventory stops growing"
+                }
             );
         }
         Cmd::Pub => run_remote_pub(opts, &mut link, &remote).await?,
@@ -1498,6 +1506,11 @@ async fn run_state(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
 /// clean exit reports “no peers yet” as a fact rather than failing: a lone tool on a quiet
 /// link is a normal state, not an error.
 ///
+/// Beats are read through `Subscriber::recv_beat`, so a beat whose payload names a peer other
+/// than the frame's own publisher is refused and counted (never printed): the `peer=` column
+/// and the `missed=` column come from the *same* identity, instead of one being printed from
+/// the payload and the other accounted for from the framing.
+///
 /// With `--socket` this is also the terminal twin of the System UI's Settings
 /// 「机器人链路 / Robot Link」 page (`amos-tauri`'s `link_status` reads the same
 /// `GetStatus`): both answer "is the robot on the link" from the *daemon's* node,
@@ -1534,7 +1547,7 @@ async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
     // Bounded by `--seconds`: an inspection window, not a daemon.
     while Instant::now() < deadline {
         tokio::select! {
-            received = beats.recv() => {
+            received = beats.recv_beat() => {
                 let received = received.context("the heartbeat subscription closed")?;
                 seen += 1;
                 // Measured before the payload is moved out of the frame.

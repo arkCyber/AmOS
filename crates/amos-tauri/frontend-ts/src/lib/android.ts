@@ -16,6 +16,22 @@ export interface AndroidApp {
   activity?: string;
 }
 
+/**
+ * What `get_android_apps` answers: the list **plus which runtime produced it**.
+ *
+ * A host with no Android container (any macOS desktop, a Linux box without
+ * Waydroid) is served by the daemon's built-in fixture, and the UI must say so —
+ * presenting fixture data as "apps installed on this machine" is the exact
+ * fabrication the rest of AmOS refuses.
+ */
+export interface AndroidAppsReply {
+  apps: AndroidApp[];
+  /** The runtime driver that answered (`waydroid` / `demo`); `""` when unknown. */
+  runtime: string;
+  /** True when `apps` is the built-in fixture, not this machine's apps. */
+  demo: boolean;
+}
+
 /** Result of `launch_android_app`. */
 export interface AndroidLaunchResult {
   success: boolean;
@@ -50,6 +66,49 @@ export function bytesToDataUri(bytes: ArrayLike<number>): string {
   let bin = "";
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i] ?? 0);
   return "data:image/png;base64," + btoa(bin);
+}
+
+/**
+ * Normalize a `get_android_apps` reply. **Total** (never throws): an unknown
+ * payload degrades to an empty list, and a malformed row is dropped rather than
+ * rendered as a nameless tile.
+ *
+ * The `demo` flag is taken **only** from a literal `true`: an older daemon (or a
+ * hand-written fixture) that omits it means "unknown", and `false` is the safe
+ * reading there — the banner accuses the host of serving fixture data, so it must
+ * follow a positive claim, never a missing field.
+ */
+export function normalizeAppsReply(raw: unknown): AndroidAppsReply {
+  // A bare array (the pre-`AndroidAppsReply` shape) is still accepted: one less
+  // way for a caller to be left with nothing, and `runtime` stays unknown.
+  if (Array.isArray(raw)) {
+    return { apps: normalizeAppRows(raw), runtime: "", demo: false };
+  }
+  const obj = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : null;
+  if (!obj) return { apps: [], runtime: "", demo: false };
+  return {
+    apps: normalizeAppRows(obj["apps"]),
+    runtime: typeof obj["runtime"] === "string" ? obj["runtime"] : "",
+    demo: obj["demo"] === true,
+  };
+}
+
+function normalizeAppRows(rows: unknown): AndroidApp[] {
+  if (!Array.isArray(rows)) return [];
+  const out: AndroidApp[] = [];
+  for (const row of rows) {
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    const pkg = typeof r["package_name"] === "string" ? r["package_name"] : "";
+    if (pkg === "") continue;
+    out.push({
+      name: typeof r["name"] === "string" ? r["name"] : "",
+      package_name: pkg,
+      icon_path: typeof r["icon_path"] === "string" ? r["icon_path"] : undefined,
+      activity: typeof r["activity"] === "string" ? r["activity"] : undefined,
+    });
+  }
+  return out;
 }
 
 /** A friendly tile label: the app name when present, else its package. */

@@ -128,3 +128,63 @@ container or used to control the Rust `WindowManager` (see `docs/multi-window.md
   并**真下发容器 `am force-stop`**(`WaydroidRuntime` 走 `waydroid shell am force-stop`;
   `DemoRuntime` 记录;离线用注入的 `CommandRunner` 断言)。仍属后续真机接线:向 `amos-wm`
   拆除 `legacy` 表面窗口、no-UI 基座 SurfaceControl teardown(`docs/lmk-proxy.md` §7)。
+
+---
+
+## 桌面形态的诚实边界：这台机器上到底有没有安卓运行时（REQ-A255）
+
+「桌面操作系统应该也能兼容安卓 APP」是对的，但**它不是一句能力声明，而是一道平台选择题**——
+安卓运行时需要一个 Linux 内核，而三种落地形态的内核归属完全不同：
+
+| 宿主形态 | 安卓在哪跑 | 内核 | AmOS 今天的路径 |
+|---|---|---|---|
+| **Linux 桌面** | Waydroid（LXC 容器）**共享宿主内核** | 宿主自己 | ✅ 已实现（`WaydroidRuntime`，`waydroid` 在 `$PATH` 即自动选中） |
+| **Android 真机（产品本体）** | 原生 Android 进程，**没有容器** | 设备内核 | 🟡 设计已定稿（`docs/no-ui-android.md` 的 no-UI 基座），驱动待接 |
+| **macOS 桌面** | ❌ **没有可用的安卓容器** | 需要 Linux 内核；macOS 既无 KVM 也无 LXC，Waydroid 在这里构造上不可能 | ⛔ **未做**（见下方"要真做需要什么"） |
+
+### 那么 macOS 上今天会发生什么（这一条曾经是缺陷）
+
+`AndroidRuntime::auto()` 在**没有容器的主机**上回退到 `DemoRuntime`——一个**内置夹具**：
+4 个写死的包名（微信 / 抖音 / 淘宝 / 高德）+ 合成窗口 id。它存在的理由是让整条管线
+（前端 → gRPC → daemon → runtime）在开发机与 CI 上可端到端跑通。
+
+问题在于这个「演示」此前**没有出口**：`GetInstalledApps` 只回 `apps`，于是 macOS 上的
+「安卓应用」页把这 4 个应用**当成这台机器上装好的应用**列出来，点按后宿主还回报
+「已启动 · waydroid_demo_com.tencent.mm」——而 `open_surface` 登记的
+`legacy:waydroid_demo_*` 外部表面在这个宿主上**没有任何合成器在画**。
+
+REQ-A255 的处置（三处，都在"谁能说这句话"的层面）：
+
+1. **线缆带上身份**：`AppListResponse` 新增 `runtime`（`waydroid` / `demo`）与 `demo`
+   （`bool`），由 `EnhancedAndroidManager::runtime_name()` / `is_demo()` 填充。
+2. **界面自报家门**：`AndroidAppsReply.demo === true` 时，「安卓应用」页顶部出现横幅——
+   *「本机没有 Android 运行时（Waydroid）：下面列出的是内置演示数据，不是这台机器上安装的
+   应用，点按也不会启动任何真实应用」*，并显示 `runtime: demo` 供诊断。
+3. **不再谎报成功**：演示模式下点按**不**显示「已启动」，也**不**写入「最近启动」
+   （那份历史是假的）。`demo` 只认字面 `true`：字段缺失 = 未知，**不会**反过来冤枉真实容器。
+
+> 真实容器（Linux + Waydroid）走的是同一条路径的另一半：没有横幅、`runtime: waydroid`、
+> 启动照常报告并记录。两侧都有测试钉住（`cargo test -p amos-android` 的
+> `the_list_carries_the_runtime_that_answered` + `vitest` 的 demo/real 两例）。
+
+### 要真做需要什么（**新能力，未做**）
+
+| 方案 | 代价 | 备注 |
+|---|---|---|
+| macOS 里跑 Android **VM**（Android Studio 模拟器 / Genymotion / Anbox-in-VM） | 每台机几 GB 磁盘 + 显著内存；首次启动分钟级 | 内核是**虚拟机里的** Linux，与宿主共享不了；`AndroidRuntime` 需要一个新驱动（adb / gRPC 控制通道），但**表面合成**要另想办法（VD 输出 → 纹理 → Tauri 窗口） |
+| **远程 adb 设备 / 设备农场** | 需要网络与信任边界设计（谁能连、传什么） | 与 AmOS 的"先连上再说"相性不合：它意味着把 APK 执行权交给远端 |
+| **不提供**（macOS 上如实为空） | 用户拿不到 Android 应用 | 今天就是这个状态，但**必须是"说清的为空"**，而不是"演示列表假装" |
+
+三条都不在"顺手补一下"的量级：第一条要新驱动 + 像素通路，第二条要安全评审。本轮做的是
+**把现状说清楚**（这是可以做完的部分），并把选择留给产品决策（登记为
+`docs/DESKTOP_ECOSYSTEM_GAP_AUDIT.md` §3 的 **G8**）。
+
+### 顺带如实说明的两件事
+
+* `legacy:<window_id>` 外部表面在**没有容器合成器**的宿主上只是一条状态机记录：
+  `wm.rs::open_surface` 不创建 `WebviewWindow`，也没有人把容器像素贴进来。看到
+  `legacy:waydroid_demo_*` 出现在"窗口与形态"调试卡里，**只**说明宿主把它登记进了
+  z 序/焦点模型，不说明屏幕上有那个应用。
+* `AMOS_ANDROID_RUNTIME=waydroid` 只能**强制指定**驱动；它不会让 `waydroid` 凭空出现——
+  不存在时 `WaydroidRuntime` 的每一次调用都会如实失败（而不是悄悄换成夹具）。
+

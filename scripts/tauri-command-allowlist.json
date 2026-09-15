@@ -8,14 +8,6 @@
     "reason": "Developer/test seam for the hardware-button path (`buttons.rs` doc: \"lets desktop dev / tests drive the same path\"). No screen simulates a physical key."
   },
   {
-    "name": "wm_open",
-    "reason": "Multi-window host (`windows`). The Svelte shell renders apps in its **own single surface** (it never asks the WM to open/focus/hide a real app window); the split controls added in REQ-A224 drive `wm_split*` against windows that already exist, but nothing opens a second window yet (docs/multi-window.md)."
-  },
-  {
-    "name": "wm_focus",
-    "reason": "Multi-window host; same missing surface as `wm_open` (docs/multi-window.md)."
-  },
-  {
     "name": "wm_hide",
     "reason": "Multi-window host; same missing surface as `wm_open` (docs/multi-window.md)."
   },

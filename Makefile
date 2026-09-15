@@ -185,6 +185,18 @@ fmt:
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	# The lock must still match the manifests (see the `--locked` note below): a CI
+	# that silently re-resolves is not reproducing the committed dependency set, and
+	# the local `cargo build` that assumed the committed one is then the odd one out.
+	cargo metadata --locked --format-version 1 > /dev/null
+	# CI-config drift (see scripts/ci-drift-scan.mjs): the toolchain the two lines
+	# above run on must come from ONE pin (`rust-toolchain.toml`), and every job must
+	# pin its runner. `dtolnay/rust-toolchain@stable` overrides that file and
+	# `ubuntu-latest` moves underneath us — the two recorded causes of this repo's
+	# recurring CI red (docs/ci-engineering.md §6). The device-free half of the check
+	# runs here, in the job that would be affected first.
+	node scripts/ci-drift-scan.mjs --selftest
+	node scripts/ci-drift-scan.mjs
 	# Feature surfaces that no other step compiles (REQ-A191). The line above builds the
 	# *default* features, and cargo **silently skips** a target whose `required-features`
 	# are unmet — so code behind a feature nobody enables is invisible to every gate in
@@ -204,6 +216,11 @@ lint:
 	cargo clippy -p amos-link --all-targets --features lan -- -D warnings
 	cargo clippy -p amos-link --all-targets --features zenoh -- -D warnings
 	cargo clippy -p amos-link-cli --all-targets --features lan,zenoh -- -D warnings
+	# amos-ime's `predict` (the 联想 FSTs) is on by default, but it is named here
+	# explicitly so the feature keeps a step of its own: flipping the default later
+	# must not silently drop the data *and* the code that consumes it
+	# (scripts/feature-surface-scan.mjs reports a feature no step enables).
+	cargo clippy -p amos-ime --all-targets --features predict -- -D warnings
 	cd crates/amos-tauri/frontend-ts && bun run typecheck
 	# Lint-input integrity (see scripts/lint-inputs-scan.mjs): every file the steps
 	# below invoke (`node scripts/*.mjs` plus the allow-lists/baselines they read) must
@@ -339,6 +356,21 @@ lint:
 	# links and 404'd). `--selftest` pins the strip/extract/classify logic first.
 	node scripts/docs-link-scan.mjs --selftest
 	node scripts/docs-link-scan.mjs
+	# ENV central registry integrity (see scripts/env-doc-gen.mjs): docs/ENV_VARIABLES.md
+	# must list every `AMOS_*` env var the Rust code declares (env::var / option_env! /
+	# read_env / env_flag / ... and `pub const FOO: &str = "AMOS_*"` plus a usage),
+	# and must not list any env that no Rust file references. Two-way sync so the
+	# configuration matrix never drifts from the runtime code. `--selftest` pins the
+	# parser/extract logic so the gate cannot silently rot.
+	node scripts/env-doc-gen.mjs --self-test
+	node scripts/env-doc-gen.mjs --check
+	# FMEA inventory integrity (see scripts/fmea-gen.mjs): docs/FMEA.md must list every
+	# failure mode the inventory knows about, and each documented failure must have its
+	# mitigation code actually present in the named files. Two-way sync so the safety
+	# table never claims a mitigation that doesn't exist or misses a known failure.
+	# `--selftest` pins the verifyMitigation logic so a false-green is impossible.
+	node scripts/fmea-gen.mjs --self-test
+	node scripts/fmea-gen.mjs --check
 	# Crate-door documentation (see scripts/crate-readme-scan.mjs): every workspace member
 	# ships a README.md in the standard shape — title naming the crate, a link back to the
 	# root README, the six sections, and its own `-p <crate>` command — and its `examples/`

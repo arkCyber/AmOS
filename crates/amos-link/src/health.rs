@@ -20,6 +20,7 @@
 //! | `decode_errors` | frames arrived that could not be decoded | a version skew or a broken/hostile producer |
 //! | `back_pressure` | a reliable consumer was slower than the publisher | the policy working, but the link is not keeping up |
 //! | `frame_loss` | the publisher's own counter says a frame never arrived | the only consumer-side loss evidence there is |
+//! | `untracked_frames` | the tracker refused a publisher (its table was full) | a bounded instrument must not present a clean-looking loss figure it knows is partial |
 //! | `no_peers` | nobody else is on the link | a brain with no robot (or the reverse) is worth saying out loud |
 //! | `clock_unsynced` | latency figures are bounds, not measurements | a caveat on the *numbers*, not a fault |
 //!
@@ -65,6 +66,11 @@ pub enum HealthReason {
         /// How many separate jumps accounted for them.
         gaps: u64,
     },
+    /// Frames from publishers the sequence tracker **refused to add** (its table was full).
+    UntrackedFrames {
+        /// How many frames are outside the loss figures.
+        untracked: u64,
+    },
     /// No other peer is fresh in the table.
     NoPeers,
     /// The clock was never calibrated, so latencies are bounds.
@@ -79,6 +85,7 @@ impl HealthReason {
             HealthReason::DecodeErrors { .. } => "decode_errors",
             HealthReason::BackPressure { .. } => "back_pressure",
             HealthReason::FrameLoss { .. } => "frame_loss",
+            HealthReason::UntrackedFrames { .. } => "untracked_frames",
             HealthReason::NoPeers => "no_peers",
             HealthReason::ClockUnsynced => "clock_unsynced",
         }
@@ -92,6 +99,9 @@ impl HealthReason {
             HealthReason::BackPressure { blocked } => format!("back_pressure={blocked}"),
             HealthReason::FrameLoss { missing, gaps } => {
                 format!("frame_loss={missing} in {gaps} gap(s)")
+            }
+            HealthReason::UntrackedFrames { untracked } => {
+                format!("untracked_frames={untracked}")
             }
             HealthReason::NoPeers => "no_peers".to_string(),
             HealthReason::ClockUnsynced => "clock_unsynced".to_string(),
@@ -150,6 +160,15 @@ impl LinkHealth {
                 reasons.push(HealthReason::FrameLoss {
                     missing: sequence.missing,
                     gaps: sequence.gaps,
+                });
+            }
+            // The tracker's ceiling is how *it* says "I stopped accounting"
+            // (`SeqSummary::is_complete`). A verdict that stayed `Healthy` while frames were
+            // outside the figures would claim more than the instrument supports — the same
+            // rule that makes a bounded topic inventory travel with its completeness flag.
+            if sequence.untracked > 0 {
+                reasons.push(HealthReason::UntrackedFrames {
+                    untracked: sequence.untracked,
                 });
             }
         }
@@ -249,6 +268,13 @@ mod tests {
         }
     }
 
+    /// A summary of a tracker that hit its ceiling: the loss figures cover only the part of
+    /// the stream it kept accounting for.
+    fn with_untracked(mut summary: SeqSummary, untracked: u64) -> SeqSummary {
+        summary.untracked = untracked;
+        summary
+    }
+
     #[test]
     fn a_silent_node_is_unknown_not_healthy() {
         // The one verdict that must never be invented: with no evidence at all there is
@@ -309,7 +335,8 @@ mod tests {
             dropped: 7,
             ..busy()
         };
-        let health = LinkHealth::evaluate(&metrics, &[], false, Some(&loss(6, 2)));
+        let health =
+            LinkHealth::evaluate(&metrics, &[], false, Some(&with_untracked(loss(6, 2), 5)));
         let reasons = health.reasons();
         assert_eq!(
             reasons,
@@ -321,6 +348,7 @@ mod tests {
                     missing: 6,
                     gaps: 2
                 },
+                HealthReason::UntrackedFrames { untracked: 5 },
                 HealthReason::NoPeers,
                 HealthReason::ClockUnsynced,
             ],
@@ -329,7 +357,7 @@ mod tests {
         assert_eq!(
             health.summary(),
             "degraded: encode_errors=2, decode_errors=3, back_pressure=4, \
-             frame_loss=6 in 2 gap(s), no_peers, clock_unsynced"
+             frame_loss=6 in 2 gap(s), untracked_frames=5, no_peers, clock_unsynced"
         );
         assert_eq!(health.label(), "degraded");
         assert!(!health.is_healthy());
@@ -362,6 +390,47 @@ mod tests {
             }]
         );
         assert_eq!(health.summary(), "degraded: frame_loss=3 in 1 gap(s)");
+    }
+
+    #[test]
+    fn a_partial_loss_figure_is_never_called_healthy() {
+        // The defect this pins: `LinkHealth::evaluate` read `SeqSummary::has_loss()` and
+        // nothing else, so a consumer whose tracker had hit `MAX_TRACKED_STREAMS` — the
+        // ceiling exists because the publisher key comes off the wire — could be told
+        // `healthy` while frames were knowingly **outside** the loss figures. The tracker
+        // says so itself (`untracked` / `is_complete`); the verdict must not claim more than
+        // the instrument can support, which is the same rule that makes a bounded topic
+        // inventory travel with its own completeness flag.
+        let metrics = busy();
+        assert!(
+            LinkHealth::evaluate(&metrics, &[peer("dog1")], true, Some(&loss(0, 0))).is_healthy(),
+            "an untouched tracker is a complete account: nothing to report"
+        );
+
+        let health = LinkHealth::evaluate(
+            &metrics,
+            &[peer("dog1")],
+            true,
+            Some(&with_untracked(loss(0, 0), 3)),
+        );
+        assert_eq!(
+            health.reasons(),
+            [HealthReason::UntrackedFrames { untracked: 3 }],
+            "no gap was seen, but three frames never entered the accounting"
+        );
+        assert_eq!(health.summary(), "degraded: untracked_frames=3");
+        assert_eq!(health.label(), "degraded");
+        assert!(!health.is_healthy());
+        // The reason is the *same* one a caller sees for a lost frame — a verdict, not a
+        // judgement: the number says how much of the stream is unaccounted for.
+        assert_eq!(
+            HealthReason::UntrackedFrames { untracked: 3 }.key(),
+            "untracked_frames"
+        );
+        assert_eq!(
+            HealthReason::UntrackedFrames { untracked: 3 }.detail(),
+            "untracked_frames=3"
+        );
     }
 
     #[test]

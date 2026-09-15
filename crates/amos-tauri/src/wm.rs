@@ -23,6 +23,8 @@ use amos_wm::{WindowId, WindowKind, WindowManager, WmEvent};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+use crate::store::{SharedStore, APP_FOCUSED_KEY};
+
 /// Window area the layout model uses **until the real OS window has been
 /// measured** (`WmState::sync_window_layout`). It is not a claim about the screen:
 /// an unmeasured host used to keep this 1080×1920 phone rectangle forever, which
@@ -64,6 +66,47 @@ fn window_maximize(w: &tauri::WebviewWindow) {
 #[cfg(not(desktop))]
 fn window_maximize(_w: &tauri::WebviewWindow) {
     /* mobile: single always-fullscreen window — nothing to restore */
+}
+
+/// Human-readable title for an app window.
+///
+/// Falls back to `"Amos"` for unknown labels; the actual names live in
+/// the frontend's `APP_META` and would require a cross-process lookup.
+/// Kept as a simple map rather than a dependency to avoid pulling
+/// the frontend metadata into the Rust host.
+fn app_window_title(label: &str) -> &'static str {
+    match label {
+        "clock" => "Clock",
+        "settings" => "Settings",
+        "calculator" => "Calculator",
+        "weather" => "Weather",
+        "notes" => "Notes",
+        "reminders" => "Reminders",
+        "calendar" => "Calendar",
+        "vmemos" => "Voice Memos",
+        "photos" => "Photos",
+        "files" => "Files",
+        "android" => "Android",
+        "messages" => "Messages",
+        "phone" => "Phone",
+        "music" => "Music",
+        "player" => "Player",
+        "maps" => "Maps",
+        "camera" => "Camera",
+        "ai" => "AI Assistant",
+        "interpreter" => "Interpreter",
+        "mail" => "Mail",
+        "store" => "App Store",
+        "pwa" => "PWA Hub",
+        "privacy" => "Privacy",
+        "contacts" => "Contacts",
+        "magnifier" => "Magnifier",
+        "monitor" => "System Monitor",
+        "devocare" => "Device Care",
+        "terminal" => "Terminal",
+        // Launcher and any unrecognized label.
+        _ => "Amos",
+    }
 }
 
 /// Shared state: the transport-agnostic `WindowManager` plus a registry that
@@ -267,12 +310,96 @@ pub fn shell_fit_reading(
     Some((was, fit))
 }
 
+/// Where a window at `current` must move to sit inside `screen` under `policy` —
+/// `None` when it is already fine (no call, no event, no windowing churn).
+///
+/// The **size** comes from the same domain rule that decides where a new window
+/// opens (`LayoutPolicy::fit_window`), so the two cannot disagree; the **position**
+/// is the user's (a drag must be respected unless it put the window off screen).
+/// Pure, so the rule is testable without a window.
+fn reclamp_target(policy: LayoutPolicy, current: Bounds, screen: Bounds) -> Option<Bounds> {
+    let sized = policy.fit_window(Size::new(current.width, current.height), screen);
+    let placed = Bounds::new(current.x, current.y, sized.width, sized.height).clamp_into(screen);
+    (placed != current).then_some(placed)
+}
+
+/// A believable **signed** edge (logical px) or `None`: NaN/infinite/absurd
+/// readings must never be turned into a window position (the unsigned counterpart
+/// is [`sane_edge`], used for sizes).
+fn sane_signed_edge(v: f64) -> Option<i32> {
+    if !v.is_finite() {
+        return None;
+    }
+    let rounded = v.round();
+    let bound = f64::from(MAX_SCREEN_EDGE);
+    if rounded < -bound || rounded > bound {
+        return None;
+    }
+    Some(rounded as i32)
+}
+
 /// Is `label` the window that defines the **OS screen area** the layout
 /// sub-divides? Only the Launcher/main window does: app windows (including split
 /// panes) are placed *inside* that area, so a pane resize must never be mistaken
 /// for a screen change — which would also make the pane-writing loop feed itself.
 pub fn is_screen_window(label: &str) -> bool {
     label == LAUNCHER_LABEL
+}
+
+/// Longest title the shell may hand to the OS, in **characters** (not bytes).
+///
+/// A macOS title bar elides a long title on its own, so this is not about the
+/// pixels: it bounds what the *window object* carries (and what the window menu,
+/// the Dock's window list and a screen reader are handed) when the string did not
+/// come from our own i18n — a store-installed app's display name comes from its
+/// manifest (`lib/storeApps`), i.e. from a third party.
+///
+/// Characters rather than bytes on purpose: 120 CJK glyphs are a reasonable title,
+/// 120 bytes of CJK would be 40.
+pub const MAX_SHELL_TITLE_CHARS: usize = 120;
+
+/// Normalize a title the shell asked the window to carry (pure; no I/O).
+///
+/// Rules, each with a named refusal instead of a silent edit:
+///
+/// * **trimmed** — leading/trailing whitespace is not part of a title;
+/// * **empty refused** — a window with no title is worse than one with the previous
+///   title: macOS draws an empty title bar, and the window menu/the Dock would show
+///   a nameless window;
+/// * **control characters refused** — a title is rendered on **one line** by the OS
+///   (and read aloud by a screen reader): `\n`, `\t` or an escape sequence in a
+///   title is either a bug or an injection. Refused with the offending `U+XXXX`, so
+///   the cause is visible instead of a title that looks fine and behaves oddly;
+/// * **truncated at [`MAX_SHELL_TITLE_CHARS`], with a visible `…`** — the one place
+///   this function edits rather than refuses, and deliberately so: refusing a long
+///   name would leave the *previous* app's name in the title bar while this app is
+///   on screen, which is a wrong statement rather than a short one. The ellipsis is
+///   the statement that something was left out.
+///
+/// Honest boundary: this is *shape* validation, not sanitization of meaning — the
+/// host cannot know whether "Settings" is the right name; it only guarantees that
+/// the string the OS renders is one line, non-empty and bounded.
+pub fn normalize_shell_title(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "a window title may not be empty (the OS draws an empty title bar)".to_string(),
+        );
+    }
+    if let Some(bad) = trimmed.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "a window title may not contain a control character (U+{:04X}): the OS renders a title as one line",
+            bad as u32
+        ));
+    }
+    let mut title: String = trimmed.chars().take(MAX_SHELL_TITLE_CHARS).collect();
+    if trimmed.chars().count() > MAX_SHELL_TITLE_CHARS {
+        // Keep the last char slot for the marker, so the result is bounded *and*
+        // visibly incomplete.
+        title = title.chars().take(MAX_SHELL_TITLE_CHARS - 1).collect();
+        title.push('…');
+    }
+    Ok(title)
 }
 
 /// Decode a window event into the **(physical width, physical height, new DPI)**
@@ -379,6 +506,11 @@ impl WmState {
         self.inner.lock().map_err(|e| e.to_string())
     }
 
+    #[cfg(test)]
+    pub fn new_for_test(form: FormFactor) -> Self {
+        Self::with_form_factor(form)
+    }
+
     /// Label for a window id, if registered.
     fn label_for(&self, id: WindowId) -> Result<String, String> {
         self.lock()?
@@ -394,6 +526,142 @@ impl WmState {
             .ok_or_else(|| format!("window '{label}' does not exist"))
     }
 
+    /// How many **app** windows this host currently has registered.
+    ///
+    /// The Launcher and external container surfaces are not app windows: a phone's
+    /// single fullscreen app window is the rule, and neither the shell nor a
+    /// container surface is one.
+    fn app_window_count(core: &WmCore) -> usize {
+        let app = WindowKind::App.to_string();
+        core.kinds.values().filter(|k| **k == app).count()
+    }
+
+    /// May this host register one more app window?
+    ///
+    /// The answer comes from the class's policy ([`LayoutPolicy::check_app_window`])
+    /// and nowhere else; the message names the class and the count (a bare "no" is
+    /// not a refusal an operator can act on). Called by **both** the production path
+    /// ([`WmState::open`]) and the test seam ([`WmState::register_app`]) so they
+    /// cannot drift, and called **before** any registration so a refusal leaves no
+    /// state behind.
+    fn check_new_app_window(core: &WmCore) -> Result<(), String> {
+        core.policy
+            .check_app_window(Self::app_window_count(core))
+            .map_err(|refusal| refusal.to_string())
+    }
+
+    /// Keep every visible app window inside a (possibly shrunken) screen.
+    ///
+    /// `Ok(n)` = how many windows were moved/resized; `Ok(0)` = nothing had to move.
+    ///
+    /// Why read the platform instead of keeping a per-window ledger: the user can drag
+    /// and resize an app window themselves, so a ledger the host maintains would be a
+    /// second truth that drifts the moment the user touches a window. The platform is
+    /// the only source that is *already* right.
+    ///
+    /// Boundaries (honest):
+    ///   * the Launcher **is** the screen, so it is never moved;
+    ///   * external container surfaces own their geometry (Wayland/DMA-BUF) — skipped;
+    ///   * hidden windows are skipped (nothing on screen to rescue);
+    ///   * an unreadable/garbage geometry is skipped and **counted** in the log rather
+    ///     than being replaced by a guess.
+    pub fn reclamp_windows(&self, app: &AppHandle) -> Result<usize, String> {
+        let (screen, policy, targets) = {
+            let core = self.lock()?;
+            let targets: Vec<(WindowId, String)> = core
+                .wm
+                .windows()
+                .into_iter()
+                .filter(|id| !core.external.contains(id))
+                .filter(|id| core.wm.state_of(*id) != Some(amos_wm::WindowState::Hidden))
+                .filter_map(|id| core.labels.get(&id).map(|l| (id, l.clone())))
+                .filter(|(_, label)| !is_screen_window(label))
+                .collect();
+            (core.screen, core.policy, targets)
+        };
+
+        let mut moved = 0usize;
+        let mut unreadable = 0usize;
+        for (_id, label) in targets {
+            let Some(window) = app.get_webview_window(&label) else {
+                unreadable += 1;
+                continue;
+            };
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let Some(size) = window
+                .inner_size()
+                .ok()
+                .and_then(|s| logical_size_of(f64::from(s.width), f64::from(s.height), scale))
+            else {
+                unreadable += 1;
+                continue;
+            };
+            let Some(pos) = window.outer_position().ok().map(|p| {
+                let effective = if scale.is_finite() && scale > 0.0 {
+                    scale
+                } else {
+                    1.0
+                };
+                (p.x as f64 / effective, p.y as f64 / effective)
+            }) else {
+                unreadable += 1;
+                continue;
+            };
+            let Some(x) = sane_signed_edge(pos.0) else {
+                unreadable += 1;
+                continue;
+            };
+            let Some(y) = sane_signed_edge(pos.1) else {
+                unreadable += 1;
+                continue;
+            };
+
+            let current = Bounds::new(x, y, size.width, size.height);
+            let Some(target) = reclamp_target(policy, current, screen) else {
+                continue; // already fully on screen and no smaller than the class minimum
+            };
+            let applied = window
+                .set_position(tauri::LogicalPosition::new(
+                    f64::from(target.x),
+                    f64::from(target.y),
+                ))
+                .and_then(|()| {
+                    window.set_size(tauri::LogicalSize::new(
+                        f64::from(target.width),
+                        f64::from(target.height),
+                    ))
+                });
+            match applied {
+                Ok(()) => {
+                    moved += 1;
+                    tracing::info!(
+                        window = %label,
+                        from_x = current.x,
+                        from_y = current.y,
+                        to_x = target.x,
+                        to_y = target.y,
+                        width = target.width,
+                        height = target.height,
+                        "an app window was pulled back inside the shrunken screen"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    window = %label,
+                    error = %e,
+                    "an app window is outside the screen and could not be moved"
+                ),
+            }
+        }
+
+        if unreadable > 0 {
+            tracing::warn!(
+                unreadable,
+                "some app windows could not be measured; they were left where they are"
+            );
+        }
+        Ok(moved)
+    }
+
     /// Open (create-if-needed + focus) the window addressed by `label`.
     pub fn open(&self, app: &AppHandle, label: &str) -> Result<Vec<WmEvent>, String> {
         let events = {
@@ -401,8 +669,13 @@ impl WmState {
             let (id, mut events) = match core.by_label.get(label) {
                 Some(id) => (*id, Vec::new()),
                 None => {
-                    // First time this label is referenced: register an App window
-                    // and bind it to the label before applying the events.
+                    // The class may host only so many app windows (`multi_window`),
+                    // and this is asked **before** anything is registered: a refused
+                    // window must leave no trace in the model. (An earlier version
+                    // checked after registering, so the state machine kept an app
+                    // window with no real window behind it — and returned an error
+                    // on top of that.)
+                    Self::check_new_app_window(&core)?;
                     let (id, created) = core.wm.register(WindowKind::App);
                     core.labels.insert(id, label.to_string());
                     core.by_label.insert(label.to_string(), id);
@@ -555,6 +828,11 @@ impl WmState {
         if core.by_label.contains_key(label) {
             return Ok(());
         }
+
+        // The same policy question `open` asks (one rule, one place): a test cannot
+        // register a window the real host would refuse.
+        Self::check_new_app_window(&core)?;
+
         let (id, _created) = core.wm.register(WindowKind::App);
         core.labels.insert(id, label.to_string());
         core.by_label.insert(label.to_string(), id);
@@ -573,16 +851,36 @@ impl WmState {
                     }
                     let label = self.label_for(id)?;
                     if app.get_webview_window(&label).is_none() {
-                        // The class decides how big a new app window opens: a PC
-                        // must not open a 480×820 handset slab (the value was
-                        // hard-coded here before the form-factor domain).
-                        let initial = self.lock()?.policy.initial_window;
-                        // Load the app entry with a `#window=<label>` fragment so
-                        // the boot script auto-navigates to that app's screen.
+                        // The class decides how big a new app window opens: a PC must
+                        // not open a 480×820 handset slab (the value was hard-coded
+                        // here before the form-factor domain), and the window never
+                        // exceeds the screen it will be drawn on. One lock for both
+                        // facts, so they cannot disagree.
+                        let (policy, screen) = {
+                            let core = self.lock()?;
+                            (core.policy, core.screen)
+                        };
+                        let opens_at = policy.initial_window_in(screen);
+
+                        // Load the app entry with a `#window=` fragment so the boot
+                        // script auto-navigates to that app's screen.
                         let url = WebviewUrl::App(format!("{APP_ENTRY}#window={label}").into());
-                        WebviewWindowBuilder::new(app, label.clone(), url)
-                            .title("Amos")
-                            .inner_size(f64::from(initial.width), f64::from(initial.height))
+                        // On desktop, hide the native title bar so the app window
+                        // renders edge-to-edge (REQ-A249 / PC_DESKTOP_ARCHITECTURE.md §4.3).
+                        let mut builder = WebviewWindowBuilder::new(app, label.clone(), url)
+                            .title(app_window_title(&label))
+                            .inner_size(f64::from(opens_at.width), f64::from(opens_at.height))
+                            // G5: the class decides whether the user may freely
+                            // resize, and how small the window may get.
+                            .resizable(policy.free_resize)
+                            .min_inner_size(
+                                f64::from(policy.min_pane.width),
+                                f64::from(policy.min_pane.height),
+                            );
+                        if policy.form == FormFactor::Desktop {
+                            builder = builder.title_bar_style(tauri::TitleBarStyle::Overlay);
+                        }
+                        builder
                             .build()
                             .map_err(|e| format!("failed to create window '{label}': {e}"))?;
                     }
@@ -620,6 +918,23 @@ impl WmState {
                         continue;
                     }
                     let _ = self.real_window(app, id)?.set_focus();
+                    // Write the focused app label to the shared store so the desktop
+                    // TopBar can render the active app's menu.  This mirrors the same
+                    // pattern the System UI already uses for settings / notifications:
+                    // the host owns the authoritative store, not any one WebView.
+                    if let Some(label) = self.lock()?.labels.get(&id).cloned() {
+                        if let Some(store) = app.try_state::<SharedStore>() {
+                            // One source: `SharedStore::set` already broadcasts
+                            // `store-updated` to every window, and the desktop
+                            // TopBar reads the key from there
+                            // (`lib/wm.ts::APP_FOCUSED_KEY` → `createStoreValue`).
+                            // A second, purpose-built `emit` was tried and removed:
+                            // `scripts/tauri-event-scan.mjs` reported it as "emitted
+                            // by the host but no screen subscribes to it" — and it
+                            // was right, the frontend deliberately reads the store.
+                            store.set(app, APP_FOCUSED_KEY, serde_json::json!(&label).to_string());
+                        }
+                    }
                 }
                 // Nothing focused: leave windowing as-is (Launcher stays visible).
                 WmEvent::FocusChanged(None) => {}
@@ -984,10 +1299,16 @@ impl WmState {
     /// there is no active split. Best-effort — a window that fails to resize is
     /// **reported** rather than aborting the whole layout (REQ-A147): the layout model
     /// then says the split is in place while the screen shows the old geometry.
+    ///
+    /// G5: enforces `min_pane` constraint on every pane rect before applying it.
     pub fn apply_split_to_real(&self, app: &AppHandle) -> Result<(), String> {
         let snapshot = self.layout_snapshot()?;
         let Some(info) = &snapshot.split else {
             return Ok(());
+        };
+        let min_pane = {
+            let core = self.lock()?;
+            core.policy.min_pane
         };
         for pane in &info.panes {
             let Some(window) = app.get_webview_window(&pane.label) else {
@@ -1001,12 +1322,19 @@ impl WmState {
                 );
                 continue;
             };
+            // G5: enforce minimum pane size (REQ-A256)
+            let bounds = amos_wm::layout::Bounds::new(pane.x, pane.y, pane.width, pane.height);
+            let enforced = bounds.enforce_min(min_pane);
+
             let resized = window
-                .set_position(tauri::LogicalPosition::new(pane.x as f64, pane.y as f64))
+                .set_position(tauri::LogicalPosition::new(
+                    enforced.x as f64,
+                    enforced.y as f64,
+                ))
                 .and_then(|()| {
                     window.set_size(tauri::LogicalSize::new(
-                        pane.width as f64,
-                        pane.height as f64,
+                        enforced.width as f64,
+                        enforced.height as f64,
                     ))
                 });
             if let Err(e) = resized {
@@ -1550,6 +1878,57 @@ pub fn system_peek_context(
     Ok(state.peek(&target_window))
 }
 
+/// Tauri command: name the shell window — what the OS puts in its **title bar**.
+///
+/// On macOS the title bar answers "what am I looking at": this shell is one window
+/// that shows the launcher, the lock screen or an app, and it used to carry the
+/// configured `Amos · AI System UI` for all of them (so the window menu, the Dock's
+/// window list and a screen reader said the same thing no matter what was on
+/// screen). The shell now sends the **localized name of the app** it is showing, or
+/// `None` for the surfaces that are the shell itself — and `None` deliberately does
+/// **not** mean "empty": it means *restore what the host was configured with*, read
+/// from the live config rather than from a second copy of the product name in the UI
+/// (REQ-A234's "do not duplicate `LAUNCHER_LABEL`" rule, applied to the title).
+///
+/// Returns the title that was actually applied, so a caller can tell an applied
+/// title from the one it asked for (a long third-party name is truncated, see
+/// [`normalize_shell_title`]) — a silently different title is exactly the class of
+/// thing this crate reports instead of hiding.
+#[tauri::command]
+pub fn wm_set_shell_title(app: AppHandle, title: Option<String>) -> Result<String, String> {
+    let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
+        return Err(format!(
+            "no `{LAUNCHER_LABEL}` window to name (the shell is not mounted)"
+        ));
+    };
+    let wanted = match title {
+        Some(asked) => normalize_shell_title(&asked)?,
+        None => configured_shell_title(&app),
+    };
+    window
+        .set_title(&wanted)
+        .map_err(|e| format!("the platform refused the title: {e}"))?;
+    Ok(wanted)
+}
+
+/// The title the launcher window was **configured** with (`tauri.conf.json`),
+/// falling back to the product name, then to the label.
+///
+/// Read from `AppHandle::config()` on every call: one source of truth, no cached
+/// copy that can drift from the config the window was actually created with.
+fn configured_shell_title(app: &AppHandle) -> String {
+    let config = app.config();
+    config
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == LAUNCHER_LABEL)
+        .map(|w| w.title.clone())
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| config.product_name.clone().filter(|t| !t.trim().is_empty()))
+        .unwrap_or_else(|| LAUNCHER_LABEL.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1793,6 +2172,87 @@ mod tests {
                 "{other:?} is not the screen window"
             );
         }
+    }
+
+    #[test]
+    fn a_shell_title_is_trimmed_and_an_honest_one_passes_unchanged() {
+        // The macOS title bar is what the window menu / Dock window list read, so the
+        // ordinary path must be a *no-op* on a normal localized name — otherwise this
+        // "validation" would be a rewriter that changes names it has no business in.
+        for honest in ["Settings", "设置", "照片", "Amos"] {
+            assert_eq!(
+                normalize_shell_title(honest).expect("honest"),
+                honest,
+                "{honest} must survive untouched"
+            );
+        }
+        assert_eq!(
+            normalize_shell_title("  设置  ").expect("trimmed"),
+            "设置",
+            "surrounding whitespace is not part of a title"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_control_character_title_is_refused_by_name() {
+        // Empty: macOS would draw an empty title bar and the window menu a nameless
+        // window. Control characters: the OS renders a title as ONE line, so a `\n`
+        // or an escape sequence is a bug or an injection — refused with the code
+        // point, so the cause is visible.
+        for empty in ["", "   ", "\t"] {
+            let err = normalize_shell_title(empty).expect_err("empty refused");
+            assert!(err.contains("empty"), "{err}");
+        }
+        for (raw, code) in [
+            ("Settings\nmore", "U+000A"),
+            ("Set\ttings", "U+0009"),
+            ("\u{1b}[31mred", "U+001B"),
+            ("bell\u{7}mid", "U+0007"),
+        ] {
+            let err = normalize_shell_title(raw).expect_err("control char refused");
+            assert!(
+                err.contains(code) && err.contains("one line"),
+                "the refusal names the code point ({code}): {err}"
+            );
+        }
+        // Trimming happens first, so a *trailing* newline is whitespace (not an
+        // injection): `"Settings\n"` is the title "Settings". Only a control character
+        // that would survive into the middle of the rendered line is refused.
+        assert_eq!(
+            normalize_shell_title("Settings\n").expect("trimmed"),
+            "Settings"
+        );
+    }
+
+    #[test]
+    fn a_long_title_is_truncated_to_a_bounded_string_with_a_visible_marker() {
+        // A store app's display name comes from its manifest, i.e. from a third party.
+        // Truncating (rather than refusing) is deliberate: refusing would leave the
+        // *previous* app's name in the title bar while this app is on screen — a wrong
+        // statement instead of a short one. The `…` is the statement.
+        let long = "x".repeat(500);
+        let cut = normalize_shell_title(&long).expect("truncated");
+        assert_eq!(cut.chars().count(), MAX_SHELL_TITLE_CHARS);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(cut.starts_with(&"x".repeat(MAX_SHELL_TITLE_CHARS - 1)));
+
+        // …and the bound is in **characters**: 121 CJK glyphs are a long-ish title, not
+        // 363. (A byte-based cap would cut Chinese titles at 40 glyphs.)
+        let cjk = "机".repeat(MAX_SHELL_TITLE_CHARS + 1);
+        let cut = normalize_shell_title(&cjk).expect("truncated");
+        assert_eq!(cut.chars().count(), MAX_SHELL_TITLE_CHARS);
+        assert_eq!(
+            cut.chars().filter(|c| *c == '机').count(),
+            MAX_SHELL_TITLE_CHARS - 1
+        );
+        assert!(
+            cjk.len() > MAX_SHELL_TITLE_CHARS * 3,
+            "the test is about bytes≠chars"
+        );
+
+        // The boundary itself is legal, unchanged (no off-by-one in the cap).
+        let exact = "y".repeat(MAX_SHELL_TITLE_CHARS);
+        assert_eq!(normalize_shell_title(&exact).expect("boundary"), exact);
     }
 
     #[test]
@@ -2111,13 +2571,71 @@ mod tests {
     fn a_headless_class_refuses_to_split() {
         let s = WmState::with_form_factor(FormFactor::Robot);
         s.register_app("a").unwrap();
-        s.register_app("b").unwrap();
-        let err = s.enter_split("a", "b", "auto").unwrap_err();
+        // A headless class hosts **one** app window at most (`multi_window=false`),
+        // so the second participant is an external container surface — which is the
+        // pair a robot board actually has, and it must not become a way around the
+        // rule just because it is not an app window.
+        s.open_surface("legacy:x").unwrap();
+        let err = s.enter_split("a", "legacy:x", "auto").unwrap_err();
         assert!(
             err.contains("robot") && err.contains("no user interface"),
             "the refusal names the class: {err}"
         );
         assert!(s.layout_snapshot().unwrap().split.is_none());
+    }
+
+    /// The refusal must happen **before** anything is registered (REQ-A257): a
+    /// window that exists in the model but has no real window behind it is the
+    /// failure shape REQ-A227 was about.
+    #[test]
+    fn a_refused_app_window_leaves_no_trace_in_the_model() {
+        let s = WmState::with_form_factor(FormFactor::Phone);
+        s.register_app("a").unwrap();
+        let err = s.register_app("b").unwrap_err();
+        assert!(err.contains("phone"), "{err}");
+
+        let labels: Vec<String> = s
+            .snapshot()
+            .unwrap()
+            .windows
+            .into_iter()
+            .map(|w| w.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["main".to_string(), "a".to_string()],
+            "the refused window is not in the model at all"
+        );
+    }
+
+    #[test]
+    fn closing_the_single_app_window_frees_the_slot() {
+        let s = WmState::with_form_factor(FormFactor::Phone);
+        s.register_app("a").unwrap();
+        assert!(s.register_app("b").is_err(), "one app window at a time");
+        s.close_core("a").unwrap();
+        s.register_app("b").unwrap();
+        assert_eq!(
+            s.snapshot()
+                .unwrap()
+                .windows
+                .into_iter()
+                .filter(|w| w.label == "b")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn container_surfaces_do_not_consume_an_app_window_slot() {
+        // A phone may show its one app window *beside* a composited container
+        // surface (the Android path): the surface is a `System` window, so it must
+        // not eat the single app slot.
+        let s = WmState::with_form_factor(FormFactor::Phone);
+        s.open_surface("legacy:waydroid_0").unwrap();
+        s.register_app("calculator").unwrap();
+        let err = s.register_app("settings").unwrap_err();
+        assert!(err.contains("1 app window"), "{err}");
     }
 
     #[test]
@@ -2205,6 +2723,161 @@ mod tests {
         ] {
             assert_eq!(resize_reading(&event), None, "{event:?} is not a resize");
         }
+    }
+
+    /// A refused app window must leave **no trace**, and a window that is already on
+    /// screen (or bigger than the class minimum) must not be touched at all: the
+    /// re-clamp runs on every real screen change, so "no call when nothing moved" is
+    /// what keeps it from fighting the user (REQ-A257).
+    #[test]
+    fn reclamp_target_moves_only_windows_that_need_it() {
+        let screen = Bounds::new(0, 0, 800, 600);
+        let policy = LayoutPolicy::of(FormFactor::Desktop); // min_pane 360×480
+
+        // Fully inside and above the minimum → no call at all.
+        assert_eq!(
+            reclamp_target(policy, Bounds::new(10, 10, 400, 500), screen),
+            None
+        );
+        assert_eq!(
+            reclamp_target(policy, Bounds::new(0, 0, 800, 600), screen),
+            None
+        );
+
+        // Hanging off the bottom-right → pulled back inside, size kept.
+        let off = reclamp_target(policy, Bounds::new(700, 550, 400, 500), screen)
+            .expect("a window half off the screen must move");
+        assert!(off.right() <= screen.right() && off.bottom() <= screen.bottom());
+        assert_eq!((off.width, off.height), (400, 500), "size is untouched");
+
+        // Negative origin → slid to the screen's origin.
+        let neg = reclamp_target(policy, Bounds::new(-50, -30, 400, 500), screen).expect("moves");
+        assert_eq!((neg.x, neg.y), (0, 0));
+
+        // Smaller than the class minimum → grown (the rule `free_resize` cannot
+        // violate), and still inside the screen.
+        let tiny = reclamp_target(policy, Bounds::new(10, 10, 100, 100), screen).expect("moves");
+        assert_eq!((tiny.width, tiny.height), (360, 480));
+
+        // **Larger** than the screen → shrunk to the screen (same rule that decides
+        // where a new window opens; a window can never be bigger than its screen).
+        let over = reclamp_target(policy, Bounds::new(0, 0, 3000, 2000), screen).expect("moves");
+        assert_eq!((over.width, over.height), (800, 600));
+
+        // A screen *smaller* than the minimum wins (physical fact), and the window is
+        // never left zero-sized.
+        let squeezed = reclamp_target(
+            policy,
+            Bounds::new(0, 0, 900, 900),
+            Bounds::new(0, 0, 100, 40),
+        )
+        .expect("moves");
+        assert_eq!((squeezed.width, squeezed.height), (100, 40));
+        assert!(squeezed.width >= 1 && squeezed.height >= 1);
+    }
+
+    #[test]
+    fn only_a_believable_reading_becomes_a_window_position() {
+        assert_eq!(sane_signed_edge(0.0), Some(0));
+        assert_eq!(sane_signed_edge(-120.4), Some(-120));
+        assert_eq!(sane_signed_edge(1496.6), Some(1497));
+        for junk in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.0e9, -1.0e9] {
+            assert_eq!(sane_signed_edge(junk), None, "{junk} is not a position");
+        }
+    }
+
+    #[test]
+    fn phone_form_factor_refuses_second_app_window() {
+        // G5: multi_window=false must be enforced at window creation (REQ-A256).
+        let state = WmState::new_for_test(FormFactor::Phone);
+
+        // First app window succeeds (register without building real Tauri window)
+        state.register_app("calculator").unwrap();
+
+        // Second app window is refused with an honest error
+        let result = state.register_app("settings");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("phone"),
+            "error mentions the form factor: {}",
+            err
+        );
+        assert!(
+            err.contains("multi_window=false"),
+            "error cites the policy: {}",
+            err
+        );
+        assert!(
+            err.contains("1 app window"),
+            "error reports the count: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn desktop_form_factor_allows_multiple_app_windows() {
+        // G5: multi_window=true must allow concurrent app windows (REQ-A256).
+        let state = WmState::new_for_test(FormFactor::Desktop);
+
+        // Open three app windows — all succeed
+        for label in ["calculator", "settings", "notes"] {
+            state.register_app(label).unwrap();
+        }
+
+        let snapshot = state.snapshot().unwrap();
+        let app_windows: Vec<_> = snapshot
+            .windows
+            .iter()
+            .filter(|w| w.kind == "App")
+            .collect();
+        assert_eq!(app_windows.len(), 3, "desktop allows three app windows");
+    }
+
+    #[test]
+    fn tablet_form_factor_allows_multiple_app_windows() {
+        // G5: tablet also has multi_window=true (REQ-A256).
+        let state = WmState::new_for_test(FormFactor::Tablet);
+
+        state.register_app("calculator").unwrap();
+        state.register_app("settings").unwrap();
+
+        let snapshot = state.snapshot().unwrap();
+        let app_windows: Vec<_> = snapshot
+            .windows
+            .iter()
+            .filter(|w| w.kind == "App")
+            .collect();
+        assert_eq!(app_windows.len(), 2, "tablet allows two app windows");
+    }
+
+    #[test]
+    fn enforce_min_is_applied_to_split_panes() {
+        // G5: split pane geometry must respect min_pane (REQ-A256).
+        use amos_wm::layout::{Bounds, Size};
+
+        let min = Size::new(360, 480);
+
+        // A pane smaller than minimum is grown
+        let small = Bounds::new(0, 0, 200, 300);
+        let enforced = small.enforce_min(min);
+        assert_eq!(enforced.width, 360, "width enforced to minimum");
+        assert_eq!(enforced.height, 480, "height enforced to minimum");
+        assert_eq!(enforced.x, 0, "origin preserved");
+
+        // A pane already above minimum is unchanged
+        let ok = Bounds::new(10, 20, 500, 600);
+        let enforced = ok.enforce_min(min);
+        assert_eq!(enforced, ok, "already-valid pane unchanged");
+
+        // Zero-size input is clamped to at least 1×1
+        let zero = Bounds::new(5, 5, 0, 0);
+        let enforced = zero.enforce_min(Size::new(0, 0));
+        assert!(
+            enforced.width >= 1 && enforced.height >= 1,
+            "enforce_min never returns zero-size: {:?}",
+            enforced
+        );
     }
 
     #[test]

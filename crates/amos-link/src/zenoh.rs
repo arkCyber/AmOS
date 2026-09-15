@@ -14,7 +14,7 @@
 //!   Subscriber<T> ◄── forwarding task ◄── declare_subscriber("amos/**/sensor/…")
 //! ```
 //!
-//! Three honest notes:
+//! Four honest notes:
 //!
 //! * **`topics()` is empty and `matched` is `None`.** A network bus cannot enumerate
 //!   the topics someone else published, nor count remote subscribers — the control
@@ -27,6 +27,16 @@
 //!   which is what makes LAN discovery work with no configuration. A deployment that
 //!   needs a fixed endpoint sets `AMOS_LINK_ZENOH_ENDPOINT=tcp/10.0.0.7:7447` (or
 //!   `$ZENOH_CONFIG`, which Zenoh itself reads).
+//! * **The key expression is handed over unchanged — including its length.** The syntax
+//!   claim ("the same grammar as `keyexpr.rs`") was cross-checked from the start; the
+//!   *length* was not, and a ceiling there would be the worst kind of boundary: a key that
+//!   validates locally and then fails on the wire. Measured against the pinned Zenoh
+//!   (1.10.1): the longest key this crate accepts (32 segments, ~2 KiB) and a pattern of the
+//!   same shape both cross a real session
+//!   (`the_longest_key_expression_we_accept_crosses_a_real_session`), so the identity claim
+//!   holds for the whole local domain — and a future Zenoh that reintroduced a limit
+//!   (Zenoh 0.x capped key expressions at 255 bytes) would turn that test red instead of
+//!   silently dropping frames in the field.
 
 use std::sync::Arc;
 
@@ -381,6 +391,97 @@ mod tests {
         assert_eq!(received.publisher.as_str(), "dog1");
         // A network transport cannot enumerate what other nodes publish: it says so.
         assert!(listener.topics().await.is_empty(), "network bus: unknown");
+    }
+
+    /// The longest key expression **our** validator accepts, carried across a real session.
+    ///
+    /// The docs claim the mapping onto Zenoh is the identity for key expressions ("同一套语法,
+    /// 原样交给 Zenoh"). The *grammar* was cross-checked; the **length** never was — and a
+    /// length ceiling is exactly the kind of boundary that hides in a claim like that: Zenoh
+    /// 0.x capped a key expression at 255 bytes, while this crate's own limits
+    /// (`MAX_SEGMENT = 64` × `MAX_SEGMENTS = 32`) allow ~2 KiB. An unverified ceiling there
+    /// would mean a key that validates locally and then fails *on the wire* — the failure
+    /// mode the whole crate is written to avoid.
+    ///
+    /// So this pins the property at the largest key the validator accepts: a 32-segment,
+    /// ~2 KiB concrete topic and a pattern of the same shape both cross a real TCP session.
+    /// If a future Zenoh (or a config) reintroduces a ceiling, this goes red instead of
+    /// turning into a "publish silently reaches nobody" report in the field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_longest_key_expression_we_accept_crosses_a_real_session() {
+        let port = free_tcp_port();
+        let listens = format!("tcp/127.0.0.1:{port}");
+        let listener = ZenohTransport::open_with(peer_config("listen/endpoints", &listens))
+            .await
+            .expect("the listening session opens");
+        let dialer = ZenohTransport::open_with(peer_config("connect/endpoints", &listens))
+            .await
+            .expect("the connecting session opens");
+
+        // The largest *concrete* key this crate can hold: 32 segments of 64 bytes each.
+        let segment = "x".repeat(64);
+        let mut long_topic = String::from("amos");
+        for _ in 1..32 {
+            long_topic.push('/');
+            long_topic.push_str(&segment);
+        }
+        // …and a pattern of the same shape (32 segments, the last one `*`), which matches it.
+        // `len() - 65` drops the final `/` **and** its 64-byte segment, so swapping in `*`
+        // keeps the segment count at 32 (off-by-one here would test a 33-segment key).
+        let long_pattern = format!("{}/{}", &long_topic[..long_topic.len() - 65], "*");
+        let topic = Topic::new(long_topic.clone()).expect("our validator accepts it");
+        let pattern = Topic::pattern(long_pattern.clone()).expect("our validator accepts it");
+        assert_eq!(
+            topic.len(),
+            32,
+            "the segment count this test is about (our maximum)"
+        );
+        assert!(
+            topic.matches(&pattern),
+            "the pattern really matches the topic"
+        );
+        assert!(
+            long_topic.len() > 255,
+            "the length this test is about is past Zenoh 0.x's 255-byte ceiling: {} bytes",
+            long_topic.len()
+        );
+
+        // Declared on the *listener* side, published from the connecting one — so the key (and
+        // the pattern) both have to survive the session boundary, not just a local lookup.
+        let mut sub = crate::pubsub::Subscriber::<crate::telemetry::Heartbeat>::subscribe(
+            listener.clone().shared(),
+            pattern,
+            Qos::sensor(),
+            Arc::new(crate::metrics::LinkMetrics::new()),
+        )
+        .await
+        .expect("Zenoh accepts our longest pattern");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let peer = crate::discovery::PeerId::new("dog1").expect("peer");
+        let publisher = crate::pubsub::Publisher::new(
+            dialer.clone().shared(),
+            topic.clone(),
+            peer.clone(),
+            Arc::new(crate::codec::Clock::host()),
+            Arc::new(crate::metrics::LinkMetrics::new()),
+        );
+        let beat = crate::telemetry::Heartbeat::new(peer, 1, crate::codec::Timestamp::now(), 5);
+        publisher
+            .publish(&beat)
+            .await
+            .expect("Zenoh accepts our longest concrete topic");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
+            .await
+            .expect("a frame on the longest key crosses the session")
+            .expect("recv");
+        assert_eq!(received.message, beat, "the payload survives the wire");
+        assert_eq!(
+            received.topic.as_str(),
+            long_topic,
+            "the routing key is the long topic, not a truncated one"
+        );
     }
 
     /// Scouting: two peers that were *not* told about each other find each other on the LAN.

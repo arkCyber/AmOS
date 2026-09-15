@@ -59,7 +59,11 @@ const STATUS = {
     decode_errors: 0,
     encode_errors: 0,
   },
-  peers: [{ id: "dog1", kind: "robot", endpoint: null, last_seen_ms: 300, beacons: 7 }],
+  peers: [
+    { id: "dog1", kind: "robot", endpoint: "tcp/10.0.0.7:7447", last_seen_ms: 300, beacons: 7 },
+    // A peer whose beacon carried no endpoint: absent, never `""` or `"null"`.
+    { id: "mini-brain", kind: "brain", endpoint: null, last_seen_ms: 40, beacons: 3 },
+  ],
 };
 
 describe("LinkPage (never dresses a quiet link up as a working one)", () => {
@@ -97,10 +101,19 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
     expect(host.container.querySelector('[data-testid="link-counters"]')?.textContent).toContain(
       "published=12",
     );
-    // The peer table names who is on the link.
-    expect(host.container.querySelector('[data-testid="link-peers"]')?.textContent).toContain(
-      "dog1 (robot)",
-    );
+    // The peer table names who is on the link, and how to reach them when the beacon said so.
+    const peers = host.container.querySelector('[data-testid="link-peers"]')?.textContent ?? "";
+    expect(peers).toContain("dog1 (robot)");
+    expect(peers).toContain("mini-brain (brain)");
+    const rows = host.container.querySelector('[data-testid="link-peer-rows"]')?.textContent ?? "";
+    expect(rows).toContain("tcp/10.0.0.7:7447");
+    // …and a peer that advertised no endpoint shows none (no fabricated address, no "null").
+    expect(host.container.textContent ?? "").not.toContain("null");
+
+    // Every number on screen is a *dated* reading: the panel says when it was taken
+    // (`link.probe`), which is what makes an old readout distinguishable from a fresh one.
+    const stamp = host.container.querySelector('[data-testid="link-read-at"]')?.textContent ?? "";
+    expect(stamp).toMatch(/最近读数：\d\d:\d\d:\d\d（每 10 秒重读）/);
   });
 
   test("no evidence yet is never rendered as healthy", async () => {
@@ -131,6 +144,63 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
     await vi.waitFor(() =>
       expect(calls.filter((c) => c === "link_status").length).toBeGreaterThan(before),
     );
+  });
+
+  test("re-reads the daemon while the page is open — the readout cannot sit there frozen", async () => {
+    // The defect this pins: the panel read *once* on mount, so a page left open showed a
+    // three-minute-old `last_seen_ms` (and old counters) as if it were current — nothing on
+    // screen told the operator the reading had stopped moving.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let calls = 0;
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd !== "link_status") return null;
+        calls += 1;
+        return { ...STATUS, metrics: { ...STATUS.metrics, published: 12 + calls } };
+      },
+      listen: async () => () => {},
+    };
+    const host = render(LinkPage);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0); // flush the initial read
+    expect(calls).toBe(1);
+    expect(host.container.querySelector('[data-testid="link-counters"]')?.textContent).toContain(
+      "published=13",
+    );
+    expect(host.container.querySelector('[data-testid="link-read-at"]')).toBeTruthy();
+
+    // One interval later the panel asks the *daemon* again, and the new number is rendered.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toBe(2);
+    expect(host.container.querySelector('[data-testid="link-counters"]')?.textContent).toContain(
+      "published=14",
+    );
+  });
+
+  test("a re-read that gets no answer drops the numbers instead of freezing them", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let online = true;
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => (cmd === "link_status" && online ? STATUS : null),
+      listen: async () => () => {},
+    };
+    const host = render(LinkPage);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(host.container.querySelector('[data-testid="link-counters"]')).toBeTruthy();
+
+    // The daemon goes away between reads: the stale counters/peers must not stay on screen
+    // looking like a live link (the verdict is the daemon's, and there is no daemon).
+    online = false;
+    await vi.advanceTimersByTimeAsync(10_000);
+    const verdict = host.container.querySelector('[data-testid="link-verdict"]')?.textContent ?? "";
+    expect(verdict).toContain("守护进程未连接");
+    expect(verdict).not.toContain("可用，但有可测的问题");
+    expect(host.container.querySelector('[data-testid="link-counters"]')).toBeNull();
+    expect(host.container.querySelector('[data-testid="link-peers"]')).toBeNull();
+    // …and no reading is dated, because there is no reading.
+    expect(host.container.querySelector('[data-testid="link-read-at"]')).toBeNull();
+    expect(host.container.textContent ?? "").toContain("守护进程没有在共享套接字上应答");
   });
 
   test("robot rows show what each robot reports about itself", async () => {

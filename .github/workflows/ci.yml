@@ -25,9 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable + fmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+      - name: "Read the pinned Rust toolchain (source: rust-toolchain.toml)"
+        id: rust-pin
+        run: bash .github/scripts/read-rust-pin.sh
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
           components: rustfmt, clippy
 
       - name: Install protoc (for tonic-prost-build)
@@ -60,8 +65,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: "Read the pinned Rust toolchain (source: rust-toolchain.toml)"
+        id: rust-pin
+        run: bash .github/scripts/read-rust-pin.sh
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
 
       - name: Install protoc (for tonic-prost-build)
         uses: arduino/setup-protoc@v3
@@ -104,9 +115,16 @@ jobs:
             "${{ vars.CI_ANDROID_IMAGE }}" \
             bash -lc 'make gated-check'
 
-      - name: Install Rust
+      - name: "Read the pinned Rust toolchain (source: rust-toolchain.toml)"
         if: vars.CI_ANDROID_IMAGE == ''
-        uses: dtolnay/rust-toolchain@stable
+        id: rust-pin
+        run: bash .github/scripts/read-rust-pin.sh
+
+      - name: Install the pinned Rust toolchain
+        if: vars.CI_ANDROID_IMAGE == ''
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
 
       - name: Install protoc (for tonic-prost-build)
         if: vars.CI_ANDROID_IMAGE == ''

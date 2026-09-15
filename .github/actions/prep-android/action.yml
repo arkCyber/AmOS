@@ -20,9 +20,15 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Install Rust (stable + rustfmt + clippy)
-      uses: dtolnay/rust-toolchain@stable
+    - name: "Read the pinned Rust toolchain (source: rust-toolchain.toml)"
+      id: rust-pin
+      shell: bash
+      run: bash .github/scripts/read-rust-pin.sh
+
+    - name: Install the pinned Rust toolchain (+rustfmt +clippy)
+      uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: ${{ steps.rust-pin.outputs.channel }}
         components: rustfmt, clippy
 
     - name: Install pinned protoc (for tonic-prost-build)

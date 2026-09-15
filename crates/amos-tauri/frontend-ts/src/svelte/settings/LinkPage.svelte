@@ -7,6 +7,9 @@
   //   • `unknown` (no evidence yet) is kept apart from `healthy`;
   //   • an uncalibrated clock is called out, because it makes every latency a bound;
   //   • counters are shown as cumulative, not as a rate.
+  // The readout is **dated and re-read**: every number on screen is a snapshot taken at
+  // `readAt` (printed as `link.probe`), the page re-reads while it is open and visible, and a
+  // re-read that gets no answer drops the numbers instead of leaving frozen ones on screen.
   // There is no toggle: this page observes, it does not command (the CLI owns
   // publishing; docs/amos-link.md §6).
   import { onMount } from "svelte";
@@ -25,16 +28,25 @@
   import { t } from "../locale.svelte";
   import { GROUP, H2, HINT, LABEL, ROW, SUB, VALUE } from "./kit";
 
+  /** How often the panel re-reads the daemon while it is open and visible. */
+  const LINK_PROBE_MS = 10_000;
+
   let status = $state<LinkStatus | null>(null);
   let loading = $state(false);
   let loaded = $state(false);
+  /** When the reading on screen was taken (epoch ms); `0` before the first answer. */
+  let readAt = $state(0);
 
   const level = $derived(linkLevel(status));
 
   const refresh = async () => {
     loading = true;
     try {
-      status = await linkStatus();
+      const next = await linkStatus();
+      status = next;
+      // The stamp belongs to the *answer*: a failed read has no reading to date, so it resets
+      // to 0 and the numbers go with it (a frozen readout would look exactly like a fresh one).
+      readAt = next ? Date.now() : 0;
     } finally {
       loading = false;
       loaded = true;
@@ -42,7 +54,29 @@
   };
 
   onMount(() => {
-    void refresh();
+    let alive = true;
+    const probe = async () => {
+      if (!alive) return;
+      await refresh();
+    };
+    void probe();
+    // The same shape the other settings pages use (`settings.aiProbe`): re-read on a period
+    // while the page is visible, never in the background, and stop with the page.
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") void probe();
+    }, LINK_PROBE_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  });
+
+  /** Local wall-clock of the reading on screen (`""` when there is none to date). */
+  const readStamp = $derived.by(() => {
+    if (!readAt) return "";
+    const d = new Date(readAt);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   });
 </script>
 
@@ -70,6 +104,9 @@
           {t("link.uptime")}: {formatUptime(status.uptime_ms)} ·
           {status.clock_synced ? t("link.clockSynced") : t("link.clockUnsynced")}
         </p>
+      {/if}
+      {#if readStamp}
+        <p class={HINT} data-testid="link-read-at">{t("link.probe", { time: readStamp })}</p>
       {/if}
     </div>
   </section>
@@ -104,10 +141,12 @@
           <p class="mt-1.5 text-sm opacity-80" data-testid="link-peers">
             {peerSummary(status.peers)}
           </p>
-          <ul class="mt-1.5 space-y-1 text-xs opacity-60">
+          <ul class="mt-1.5 space-y-1 text-xs opacity-60" data-testid="link-peer-rows">
             {#each status.peers as peer (peer.id)}
               <li class="flex justify-between gap-3">
-                <span class="truncate">{peer.id}</span>
+                <span class="truncate">
+                  {peer.id}{#if peer.endpoint} · {peer.endpoint}{/if}
+                </span>
                 <span class="shrink-0">
                   {peer.last_seen_ms}ms · {peer.beacons}×
                 </span>

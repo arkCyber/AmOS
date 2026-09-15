@@ -147,6 +147,20 @@ impl EnhancedAndroidManager {
         }
     }
 
+    /// Which runtime driver is behind this manager (`waydroid` / `demo`).
+    ///
+    /// The daemon reports this on the wire (`AppListResponse.runtime`): a host with
+    /// no Android container answers with the fixture, and the System UI has to be
+    /// able to say so instead of presenting fixture data as "your apps".
+    pub fn runtime_name(&self) -> &'static str {
+        self.runtime.name()
+    }
+
+    /// True when this manager's runtime is the built-in fixture (no container).
+    pub fn is_demo(&self) -> bool {
+        crate::runtime::is_demo_runtime(self.runtime.name())
+    }
+
     /// Launch an app with timeout protection.
     pub async fn launch_app(&self, package_name: &str) -> Result<String> {
         self.increment_ops().await;

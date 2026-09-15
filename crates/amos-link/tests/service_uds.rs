@@ -141,6 +141,13 @@ async fn control_plane_answers_over_a_unix_domain_socket() {
         .expect("list_topics")
         .into_inner();
     assert_eq!(topics.topics, vec!["amos/dog1/control/joints".to_string()]);
+    // The list arrives with its own limit: the caller is *not* on this node's transport, so
+    // `complete` is the only way it can tell "these are all the topics" from "this is what the
+    // node happened to see, and its inventory may have stopped growing".
+    assert!(
+        topics.complete,
+        "a fresh broker that has not hit its ceiling is the whole truth"
+    );
 
     // …and the node now has evidence, so its verdict stops being `UNKNOWN` and names why:
     // no peer has beaconed on this link, and the clock was never calibrated.
@@ -225,6 +232,93 @@ async fn control_plane_answers_over_a_unix_domain_socket() {
     assert_eq!(peer_beat.seq, 7);
     assert_eq!(peer_beat.uptime_ms, 42);
     peer_beater.await.expect("peer beater task");
+
+    // 6. A beat whose **payload** names a peer other than the frame's publisher never reaches
+    //    a client. The stream *is* the answer to "which robots are alive", so a frame carrying
+    //    two identities would put the payload's claim in front of every operator while the
+    //    framing said something else (and the CLI's `watch`, which reads the same beats
+    //    locally, would print one identity while counting gaps against the other).
+    let decode_errors_before = client
+        .get_status(Empty {})
+        .await
+        .expect("get_status")
+        .into_inner()
+        .metrics
+        .expect("metrics")
+        .decode_errors;
+    // A fresh binding for the same id: the one above was moved into the step-5 task.
+    let dog2 = PeerId::new("dog2").expect("peer");
+    let forger = {
+        let node = Arc::clone(&node);
+        let claimed = dog2.clone();
+        tokio::spawn(async move {
+            let topic = Topic::channel_topic("dog2", Channel::Telemetry, "beat").expect("topic");
+            // The topic is dog2's, the payload claims dog2 — only the *frame* says otherwise.
+            let publisher = amos_link::pubsub::Publisher::<Heartbeat>::new(
+                Arc::clone(node.transport()),
+                topic,
+                PeerId::new("impostor").expect("peer"),
+                Arc::new(Clock::host()),
+                Arc::new(LinkMetrics::new()),
+            );
+            let beat = Heartbeat::new(claimed, 99, amos_link::codec::Timestamp::now(), 999);
+            let _ = publisher.publish(&beat).await;
+        })
+    };
+    forger.await.expect("forger task");
+
+    // The refusal is **counted** first, and only then is an honest beat published: the two
+    // facts are ordered, so the latest-wins beat subscription cannot be blamed for the forged
+    // frame's absence. `decode_errors` is the same number `GetStatus` has always reported for
+    // a frame this node could not accept.
+    let mut decode_errors = decode_errors_before;
+    for _ in 0..200 {
+        decode_errors = client
+            .get_status(Empty {})
+            .await
+            .expect("get_status")
+            .into_inner()
+            .metrics
+            .expect("metrics")
+            .decode_errors;
+        if decode_errors > decode_errors_before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        decode_errors > decode_errors_before,
+        "the forged beat was refused and counted ({decode_errors_before} ⇒ {decode_errors})"
+    );
+
+    // …and the next item the stream yields is the honest beat, not the liar.
+    let honest_beater = {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move {
+            let topic = Topic::channel_topic("dog2", Channel::Telemetry, "beat").expect("topic");
+            let publisher = amos_link::pubsub::Publisher::<Heartbeat>::new(
+                Arc::clone(node.transport()),
+                topic,
+                dog2.clone(),
+                Arc::new(Clock::host()),
+                Arc::new(LinkMetrics::new()),
+            );
+            let beat = Heartbeat::new(dog2.clone(), 8, amos_link::codec::Timestamp::now(), 43);
+            let _ = publisher.publish(&beat).await;
+        })
+    };
+    let after = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the honest beat arrives")
+        .expect("the stream yields an item")
+        .expect("the item is Ok");
+    assert_eq!(after.peer, "dog2");
+    assert_eq!(
+        after.seq, 8,
+        "the forged claim (seq 99) never reached a client"
+    );
+    assert_eq!(after.uptime_ms, 43, "nor did its uptime");
+    honest_beater.await.expect("honest beater task");
 
     server.abort();
     let _ = std::fs::remove_file(&socket);
