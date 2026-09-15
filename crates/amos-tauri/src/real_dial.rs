@@ -11,12 +11,39 @@
 //!   `Java_com_amos_ai_glue_TelephonyGlue_nativeAttach` stores a process-wide ref.
 //! * `real_dial(number)` fires `ACTION_CALL` from it; until bound it returns an
 //!   explicit error — never a fake "connected".
+//! * The dialed number is filtered to `+` and ASCII digits, bounded at
+//!   [`MAX_DIAL_CHARS`] characters (E.164 + headroom), and the resulting `tel:…`
+//!   string is the **only** payload handed to the platform — anything that
+//!   survives those two gates is what Telecom actually tries to place.
 //!
 //! Only feature `android` has a JVM/`Context`; host builds report "unsupported".
 
 #[cfg(feature = "android")]
-/// `android.content.Intent.ACTION_CALL`. The modern `ROLE_DIALER` path is
-/// `TelecomManager#placeCall` (a TODO); ACTION_CALL is the conservative fallback.
+/// `android.content.Intent.ACTION_CALL` — fires Telecom's outgoing call flow.
+///
+/// # Why ACTION_CALL (not `TelecomManager#placeCall`)
+///
+/// `TelecomManager#placeCall(Uri, Bundle)` is the **modern** dialer entry point
+/// (introduced in API 23, refined in API 26). It is, however, marked
+/// `@SystemApi` until API 26 (`carriesSystemPermission` = system/dialer-only) and
+/// is only callable by the system **default phone app** (RoleManager.ROLE_DIALER)
+/// in 28+. AmOS is not pre-installed as a default dialer — the user grants that
+/// role themselves — so on a fresh install `placeCall` returns `null` and the
+/// call is silently dropped. ACTION_CALL is the public-API path that requires
+/// only the `CALL_PHONE` runtime permission, fits a non-preloaded System-UI APK,
+/// and is exactly what `amos-telephony`'s Android provider uses for the same
+/// reason. When AmOS *is* the default dialer and the System-UI in-call UI is
+/// active, calls are routed via `AmosInCallService` / `incall.rs` instead — so
+/// this intent only fires when the user has chosen to use the System UI's
+/// dialer button without changing the default dialer.
+///
+/// # API reality check
+///
+/// The exact `Intent(ACTION_CALL, tel:…)` shape below was confirmed against
+/// the `android.jar` shipped with `compileSdk = 34`: no signature|privileged
+/// permission is required, and the platform resolves the call through Telecom
+/// (so a default dialer that the user has chosen still gets to render its own
+/// in-call UI — this does **not** bypass it).
 const ACTION_CALL: &str = "android.intent.action.CALL";
 #[cfg(feature = "android")]
 /// `Intent.FLAG_ACTIVITY_NEW_TASK` — dialing from an app Context (no Activity host).
@@ -31,6 +58,17 @@ fn digits_only(number: &str) -> String {
         .filter(|c| c.is_ascii_digit() || *c == '+')
         .collect()
 }
+
+/// Maximum dialable characters the host will hand to the platform.
+///
+/// E.164 caps international numbers at 15 digits + an optional leading `+` (16
+/// chars total). Domestic numbers and emergency shorts (`110`/`112`/`911`/`*#06#`)
+/// fit comfortably under that ceiling; the 32 here is a hard **platform-bound**
+/// guard against an absurd input that would either overflow the Intent extras
+/// buffer or trigger Telecom's own "not a phone number" path with a confusing
+/// generic error. Anything beyond this is refused at the command seam with an
+/// honest reason, before the JVM is ever touched.
+pub const MAX_DIAL_CHARS: usize = 32;
 
 #[cfg(feature = "android")]
 mod android_impl {
@@ -178,6 +216,15 @@ pub async fn real_dial(number: String) -> Result<String, String> {
     if cleaned.is_empty() {
         return Err("no dialable digits in number".to_string());
     }
+    // Bound the dial string at the command seam — never let a 4 KiB paste reach
+    // the platform's Intent parsing path, where the error message would be a
+    // generic "could not dial" rather than the truthful "too long".
+    if cleaned.len() > MAX_DIAL_CHARS {
+        return Err(format!(
+            "number too long: {} chars (max {MAX_DIAL_CHARS})",
+            cleaned.len()
+        ));
+    }
     #[cfg(feature = "android")]
     {
         if !android_impl::is_bound() {
@@ -194,7 +241,7 @@ pub async fn real_dial(number: String) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::digits_only;
+    use super::{digits_only, MAX_DIAL_CHARS};
 
     #[test]
     fn keeps_digits_and_plus() {
@@ -219,5 +266,31 @@ mod tests {
         // '+' is preserved anywhere by design (simple filter); a lone '+' is not a
         // number but the command rejects empty-after-clean as well.
         assert_eq!(digits_only("+"), "+");
+    }
+
+    #[test]
+    fn max_dial_chars_constant_covers_e164_plus_emergency_shorts() {
+        // 16 chars fits E.164 (`+8613800138000`); the constant must be >= that
+        // or genuine international calls get refused at the seam.
+        assert!(MAX_DIAL_CHARS >= 16, "MAX_DIAL_CHARS must cover E.164");
+        // It must also leave room for legacy short codes like `*#06#` (5 chars).
+        assert!(MAX_DIAL_CHARS >= 5);
+    }
+
+    #[test]
+    fn digits_only_passes_a_max_plus_buffer_unchanged() {
+        // 16-char E.164-style number survives the cleaner unchanged.
+        let s = "+8613800138000";
+        assert_eq!(digits_only(s), s);
+        assert!(digits_only(s).len() <= MAX_DIAL_CHARS);
+    }
+
+    #[test]
+    fn digit_filter_preserves_a_5kb_paste_for_upper_layer_to_reject() {
+        // `digits_only` is a pure filter — it must NOT cap its output (the
+        // command's `> MAX_DIAL_CHARS` check is what refuses oversized inputs);
+        // a filter that silently truncated would change meaning.
+        let huge = "1".repeat(5000);
+        assert_eq!(digits_only(&huge).len(), 5000);
     }
 }

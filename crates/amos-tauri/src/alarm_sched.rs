@@ -22,6 +22,15 @@ use amos_scheduler::JobId;
 use serde::Serialize;
 use tauri::State;
 
+/// Maximum bytes in a scheduler alarm `id` the WebView hands in via
+/// `scheduler_alarm_register` / `_cancel`.
+///
+/// Real alarm ids are user-facing labels (`"wakeup"`, `"medication-8h"`,
+/// ≤32 chars). 256 B mirrors `MAX_MAIL_NAME_BYTES` — well above any legitimate
+/// label and tight enough that a paste-sized caller cannot inflate the
+/// ledger's id set.
+pub const MAX_ALARM_ID_BYTES: usize = 256;
+
 /// Wall-clock epoch (ms) now, never panicking / never negative.
 fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -91,6 +100,7 @@ pub fn scheduler_alarm_register(
     id: String,
     at_ms: u64,
 ) -> Result<(), String> {
+    check_alarm_id(&id)?;
     state.register(id, at_ms);
     Ok(())
 }
@@ -101,7 +111,25 @@ pub fn scheduler_alarm_cancel(
     state: State<'_, AlarmSchedState>,
     id: String,
 ) -> Result<bool, String> {
+    check_alarm_id(&id)?;
     Ok(state.cancel(&id))
+}
+
+/// Bound a scheduler alarm id at the command seam so the ledger keys never
+/// spill into multi-megabyte strings (a paste-sized id would inflate the
+/// `next_at` lookup every poll). Refused ids are honest errors — the caller
+/// learns why the registration is rejected instead of silently dropping it.
+fn check_alarm_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > MAX_ALARM_ID_BYTES {
+        return Err(format!(
+            "scheduler alarm id invalid: {} bytes (max {MAX_ALARM_ID_BYTES})",
+            id.len()
+        ));
+    }
+    if id.chars().any(|c| c.is_control() || c == '\0') {
+        return Err("scheduler alarm id contains control characters".to_string());
+    }
+    Ok(())
 }
 
 /// Fire & return the ids due by `nowMs` (defaults to the host wall clock).
@@ -164,5 +192,24 @@ mod tests {
         // The caller re-arms the next day.
         s.register("daily".into(), 2 * 86_400_000);
         assert_eq!(s.next_at(86_400_001), Some(2 * 86_400_000));
+    }
+
+    /// `check_alarm_id` is the single gate the command seam runs before
+    /// reaching the ledger; a paste-sized id would inflate `next_at` and `poll`
+    /// lookups for the lifetime of the alarm.
+    #[test]
+    fn check_alarm_id_accepts_real_ids_and_rejects_oversized() {
+        for ok in [
+            "wake",
+            "medication-8h",
+            "x".repeat(MAX_ALARM_ID_BYTES).as_str(),
+        ] {
+            assert!(check_alarm_id(ok).is_ok(), "{ok:?} is a real id");
+        }
+        assert!(check_alarm_id("").is_err(), "empty id is refused");
+        let huge = "x".repeat(MAX_ALARM_ID_BYTES + 1);
+        assert!(check_alarm_id(&huge).is_err(), "oversized id is refused");
+        assert!(check_alarm_id("wake\0").is_err(), "NUL is refused");
+        assert!(check_alarm_id("wake\n").is_err(), "newline is refused");
     }
 }

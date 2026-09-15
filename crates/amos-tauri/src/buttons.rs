@@ -14,6 +14,37 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// Tauri event name carrying a pressed hardware button.
 pub const HARDWARE_BUTTON_EVENT: &str = "hardware-button";
 
+/// Upper bound on a button name coming in from the wire / CLI / JNI.
+///
+/// Real names are ≤ 32 B (`home`, `voice`, `ai_assistant`); a 256 B cap is a
+/// generous ceiling that still rejects a paste-sized input as a misroute —
+/// `simulate_button` would otherwise spend unbounded work tokenising a giant
+/// string and the DOM dispatch below would build a `CustomEvent` whose payload
+/// is a megabyte of attacker text (a JS heap pressure primitive).
+pub const MAX_BUTTON_NAME_BYTES: usize = 256;
+
+/// Upper bound on the DOM `CustomEvent` payload one press hands to every
+/// webview window (`"hardware-button"` with `detail.name`). The full string is
+/// always `…'detail: {name: \"<name>\"}…'`; 512 B is comfortably larger than
+/// the largest legitimate name (`MAX_BUTTON_NAME_BYTES` + framing) and refuses
+/// the pathological case.
+pub const MAX_DOM_PAYLOAD_BYTES: usize = 512;
+
+/// Stability codes the caller can branch on without parsing human strings.
+///
+/// These are the **wire vocabulary** for the `buttons` module's failure surface,
+/// kept alongside the constants so a frontend i18n layer can render an honest
+/// "why" without ever inspecting the message text. A consumer should always
+/// pattern-match on `code`, not on `message`.
+pub mod codes {
+    /// Caller-supplied button name could not be parsed into any known button.
+    pub const UNKNOWN_BUTTON: &str = "amos.buttons.unknown";
+    /// Caller-supplied button name exceeds [`super::MAX_BUTTON_NAME_BYTES`].
+    pub const NAME_TOO_LONG: &str = "amos.buttons.name_too_long";
+    /// Frontend bridge could not be reached on a registered listener.
+    pub const DELIVERY_FAILED: &str = "amos.buttons.delivery_failed";
+}
+
 /// The three physical buttons exposed to the System UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -31,13 +62,42 @@ pub enum HardwareButton {
 
 impl HardwareButton {
     /// Parse a button name from the wire / CLI. Case-insensitive.
+    ///
+    /// Returns [`None`] on an unknown verb; an **oversized** name is also
+    /// rejected (and surfaced as a separate [`ErrorCode`] by [`Self::parse`])
+    /// so a paste-sized input never reaches the DOM dispatch path.
     pub fn from_name(s: &str) -> Option<Self> {
+        if s.len() > MAX_BUTTON_NAME_BYTES {
+            return None;
+        }
         match s.trim().to_ascii_lowercase().as_str() {
             "home" => Some(Self::Home),
             "voice" => Some(Self::Voice),
             "ai" | "ai_assistant" | "assistant" | "aibutton" => Some(Self::AiAssistant),
             _ => None,
         }
+    }
+
+    /// Parse with an explicit error envelope (the caller can render the code,
+    /// not just the message). The size cap is checked **first** so a megabyte
+    /// string is rejected before any tokenising work runs.
+    pub fn parse(s: &str) -> Result<Self, crate::error::AmosError> {
+        if s.len() > MAX_BUTTON_NAME_BYTES {
+            return Err(crate::error::AmosError::new(
+                crate::error::ErrorCode::ButtonsNameTooLong,
+                format!(
+                    "button name is {} bytes (limit {})",
+                    s.len(),
+                    MAX_BUTTON_NAME_BYTES
+                ),
+            ));
+        }
+        Self::from_name(s).ok_or_else(|| {
+            crate::error::AmosError::new(
+                crate::error::ErrorCode::ButtonsUnknown,
+                format!("unknown button: {s}"),
+            )
+        })
     }
 }
 
@@ -106,6 +166,7 @@ impl HardwareButtons {
             tracing::warn!(
                 target: "amos::buttons",
                 event = HARDWARE_BUTTON_EVENT,
+                code = codes::DELIVERY_FAILED,
                 error = %e,
                 "hardware-button event could not be delivered to the UI"
             );
@@ -161,6 +222,19 @@ fn dispatch_dom(app: &tauri::AppHandle, button: HardwareButton) {
     let js = format!(
         "window.dispatchEvent(new CustomEvent('hardware-button', {{detail: {{name: '{name}'}}}}));"
     );
+    // The DOM payload is small by construction (a literal 70-ish B), but the cap is
+    // here as defence in depth against a future change that interpolates
+    // caller-controlled text into the JS. The string is always ASCII letters +
+    // `_` from the match above, so this is a cheap assertion.
+    if js.len() > MAX_DOM_PAYLOAD_BYTES {
+        tracing::warn!(
+            target: "amos::buttons",
+            payload_bytes = js.len(),
+            limit = MAX_DOM_PAYLOAD_BYTES,
+            "refusing to dispatch an over-sized DOM payload"
+        );
+        return;
+    }
     for w in app.webview_windows().values() {
         // The eval is the delivery path that works on-device (the Tauri event system does
         // not reach the webview there — that is why this exists at all), so a window that
@@ -170,6 +244,7 @@ fn dispatch_dom(app: &tauri::AppHandle, button: HardwareButton) {
             tracing::warn!(
                 target: "amos::buttons",
                 window = %w.label(),
+                code = codes::DELIVERY_FAILED,
                 error = %e,
                 "hardware-button DOM event could not be evaluated in this window"
             );
@@ -178,14 +253,19 @@ fn dispatch_dom(app: &tauri::AppHandle, button: HardwareButton) {
 }
 
 /// Tauri command: simulate a hardware button press (desktop dev / tests).
+///
+/// Returns an [`AmosError`] envelope so a caller can branch on the stable code
+/// (e.g. render "button not recognized" vs "name too long") without parsing the
+/// human-readable message. The size cap is enforced **before** parsing, so a
+/// paste-sized input is rejected with [`ErrorCode::ButtonsNameTooLong`] in O(1)
+/// time.
 #[tauri::command]
 pub fn simulate_button(
     app: AppHandle,
     state: State<'_, HardwareButtons>,
     button: String,
-) -> Result<(), String> {
-    let b =
-        HardwareButton::from_name(&button).ok_or_else(|| format!("unknown button: {button}"))?;
+) -> Result<(), crate::error::AmosError> {
+    let b = HardwareButton::parse(&button)?;
     state.press(&app, b);
     Ok(())
 }
@@ -317,5 +397,60 @@ mod tests {
         // Without an AppHandle we can't emit, but last() is still updated in the
         // real press(); here we verify default is None.
         assert_eq!(b.last(), None);
+    }
+
+    #[test]
+    fn oversized_button_name_is_rejected_before_parsing() {
+        // A paste-sized input is refused by `from_name` (cheap branch on length)
+        // and surfaced as a distinct `ButtonsNameTooLong` envelope by `parse`.
+        let huge = "x".repeat(MAX_BUTTON_NAME_BYTES + 1);
+        assert_eq!(HardwareButton::from_name(&huge), None);
+        let err = HardwareButton::parse(&huge).expect_err("oversized is rejected");
+        assert_eq!(err.code, crate::error::ErrorCode::ButtonsNameTooLong);
+        assert!(
+            err.message.contains("limit"),
+            "the message names the cap: {err:?}"
+        );
+
+        // Exactly at the cap is still refused (the cap is exclusive — see the doc).
+        let at_cap = "x".repeat(MAX_BUTTON_NAME_BYTES);
+        assert_eq!(HardwareButton::from_name(&at_cap), None);
+    }
+
+    #[test]
+    fn parse_returns_a_typed_envelope_for_unknown_buttons() {
+        let err = HardwareButton::parse("volume").expect_err("unknown is rejected");
+        assert_eq!(err.code, crate::error::ErrorCode::ButtonsUnknown);
+        assert!(
+            err.message.contains("volume"),
+            "the message keeps the offending name for diagnostics: {err:?}"
+        );
+
+        // Whitespace alone does NOT become a default button; it is unknown on purpose.
+        let err = HardwareButton::parse("   ").expect_err("whitespace is unknown");
+        assert_eq!(err.code, crate::error::ErrorCode::ButtonsUnknown);
+    }
+
+    #[test]
+    fn known_button_names_still_parse_through_the_envelope() {
+        for (input, expected) in [
+            ("home", HardwareButton::Home),
+            ("Voice", HardwareButton::Voice),
+            ("ai_assistant", HardwareButton::AiAssistant),
+            ("assistant", HardwareButton::AiAssistant),
+        ] {
+            assert_eq!(HardwareButton::parse(input).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn error_codes_for_buttons_are_distinct_stability_keys() {
+        // The `code()` is the wire vocabulary; a UI branches on it, so it must
+        // be a stable string AND different per failure mode.
+        let too_long = HardwareButton::parse(&"x".repeat(MAX_BUTTON_NAME_BYTES + 1)).unwrap_err();
+        let unknown = HardwareButton::parse("nope").unwrap_err();
+        assert_ne!(too_long.code, unknown.code);
+        assert!(too_long.code().starts_with("amos.buttons."));
+        assert!(unknown.code().starts_with("amos.buttons."));
     }
 }

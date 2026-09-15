@@ -128,10 +128,11 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_LINK_PEER` | string | (随机生成) | `→ random` | 本节点 peer 标识 |
-| `AMOS_LINK_BEACON_ADDR` | url | `239.0.0.1:7447` | `→ default-mcast` | UDP 多播发现地址 |
+| `AMOS_LINK_PEER` | string | `amos-node`（`bench`/`watch`/`motor` 各有默认） | `→ cli-default` | 本节点 peer 标识(仅 CLI 读取, `--peer` 优先) |
+| `AMOS_LINK_ENDPOINT` | url 列表 | (none) | `→ no-address` | **本节点广播的地址**(逗号分隔; 仅 `watch`/`discover --lan\|--bus` 读取, `--endpoint` 优先)。留空 = 不广播地址; 界与信标同源(≤8 项、每项 ≤128 字节、整帧 ≤512 字节), 越界在启动期拒绝 |
+| `AMOS_LINK_BEACON_ADDR` | url | `239.255.42.99:7446` | `→ default-mcast` | UDP 多播发现地址 |
 | `AMOS_LINK_BEACON_IFACE` | string | (none) | `→ kernel-pick` | 绑定多播的网卡接口(多 NIC 必填) |
-| `AMOS_LINK_BEACON_LOOP` | bool | `1` | `→ kernel-default` | 是否启用多播回环(开发期 `0` 关) |
+| `AMOS_LINK_BEACON_LOOP` | bool | (平台默认, 通常开) | `→ kernel-default` | 是否启用多播回环(开发期 `0` 关; 关掉会让**本机所有进程**都收不到自己的信标) |
 | `AMOS_LINK_ZENOH_ENDPOINT` | url | (none) | `→ bus-only` | Zenoh inter-board 端点 |
 
 ---
@@ -174,6 +175,8 @@
 | `AMOS_MAIL_STORE` | path | (none) | `→ empty` | 邮件存储路径 |
 | `AMOS_FORM_FACTOR` | enum | `auto` | `→ auto` | 形态因子:`auto`/`desktop`/`mobile` |
 | `AMOS_ROOT` | path | (none) | `→ cwd` | 应用根目录 |
+| `AMOS_DESKTOP_SHORTCUTS` | enum | `enabled` | `→ enabled` | 系统快捷键(`⌘W` / `⌘M` / `⌘H` / `⌘,`)作用于焦点窗口的开关:`enabled`(默认)/`disabled`。`disabled` ⇒ `DesktopShell.handleSystemShortcut` 直接返回,焦点窗口仍可关,但**前端不抢键**(适合 WebView/宿主 OS 已经接管的场景,如 macOS 真机上的 `⌘H`) |
+| `AMOS_DOCK_CONTEXT_MENU` | enum | `enabled` | `→ enabled` | Dock 右键菜单开关:`enabled`(默认)/`disabled`。`disabled` ⇒ Dock 的 `oncontextmenu` 不弹 `DockContextMenu`(调试 / 自动化截图时用) |
 
 ---
 

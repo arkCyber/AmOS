@@ -26,6 +26,35 @@ use tauri::State;
 /// Default demo identity used as the account sender.
 const ACCOUNT_EMAIL: &str = "me@amos.local";
 
+/// Maximum bytes in a `mail_send` subject line.
+///
+/// E-mail subjects are traditionally kept under 78 chars by clients, and a UI
+/// that paste-attacks a multi-megabyte subject into the bridge is far outside
+/// any reasonable use case. 4 KiB is a generous ceiling.
+pub const MAX_MAIL_SUBJECT_BYTES: usize = 4 << 10;
+
+/// Maximum bytes in a `mail_send` body.
+///
+/// 4 MiB is two orders of magnitude above any real e-mail body; beyond that the
+/// command is almost certainly a paste attack or a loop, and the right answer
+/// is to refuse at the seam rather than let a giant body accumulate in memory
+/// or stall the JSON store rewrite.
+pub const MAX_MAIL_BODY_BYTES: usize = 4 << 20;
+
+/// Maximum bytes in a mailbox / message id / target label the WebView hands in.
+///
+/// Real mailbox names are `INBOX` / `Sent` / `Drafts` / `<10 chars>`. The 256 B
+/// cap mirrors `MAX_SESSION_ID_BYTES` — well above any legitimate value, but
+/// tight enough that a paste-sized caller cannot inflate storage keys.
+pub const MAX_MAIL_NAME_BYTES: usize = 256;
+
+/// Maximum recipients in `mail_send` (to + cc combined).
+///
+/// Recipients are individually validated by `Address::bare`; this cap is the
+/// extra ceiling a single compose-call may carry, so a runaway loop cannot ship
+/// an enormous recipient list through the engine.
+pub const MAX_MAIL_RECIPIENTS: usize = 256;
+
 /// Managed mail engine state.
 pub struct MailBridge {
     client: MailClient<MockMailProvider>,
@@ -149,6 +178,7 @@ pub async fn mail_list(
     mailbox: String,
     limit: Option<usize>,
 ) -> Result<Vec<EmailSummary>, String> {
+    check_mail_name(&mailbox)?;
     state
         .client
         .list(&mailbox, limit)
@@ -163,6 +193,13 @@ pub async fn mail_search(
     mailbox: String,
     query: String,
 ) -> Result<Vec<EmailSummary>, String> {
+    check_mail_name(&mailbox)?;
+    if query.len() > MAX_MAIL_NAME_BYTES {
+        return Err(format!(
+            "mail_search query too long: {} bytes (max {MAX_MAIL_NAME_BYTES})",
+            query.len()
+        ));
+    }
     state
         .client
         .search(&mailbox, &query, None)
@@ -177,6 +214,8 @@ pub async fn mail_read(
     mailbox: String,
     id: String,
 ) -> Result<Email, String> {
+    check_mail_name(&mailbox)?;
+    check_mail_name(&id)?;
     let email = state
         .client
         .read(&mailbox, &id)
@@ -195,6 +234,27 @@ pub async fn mail_send(
     body: String,
     cc: Option<Vec<String>>,
 ) -> Result<SendReceipt, String> {
+    // Bound at the command seam — `body` reaching multi-megabytes would inflate
+    // both the in-memory mock store and the JSON persistence on every mutation,
+    // and `subject` is meant to be a one-line header.
+    if subject.len() > MAX_MAIL_SUBJECT_BYTES {
+        return Err(format!(
+            "subject too long: {} bytes (max {MAX_MAIL_SUBJECT_BYTES})",
+            subject.len()
+        ));
+    }
+    if body.len() > MAX_MAIL_BODY_BYTES {
+        return Err(format!(
+            "body too long: {} bytes (max {MAX_MAIL_BODY_BYTES})",
+            body.len()
+        ));
+    }
+    let total = to.len() + cc.as_ref().map(|c| c.len()).unwrap_or(0);
+    if total > MAX_MAIL_RECIPIENTS {
+        return Err(format!(
+            "too many recipients: {total} (max {MAX_MAIL_RECIPIENTS})"
+        ));
+    }
     let mut draft: SendDraft = state.client.compose(&subject, &body);
     for raw in &to {
         let a = Address::bare(raw).map_err(|e| e.to_string())?;
@@ -229,6 +289,8 @@ pub async fn mail_set_flagged(
     id: String,
     flagged: bool,
 ) -> Result<(), String> {
+    check_mail_name(&mailbox)?;
+    check_mail_name(&id)?;
     state
         .client
         .set_flagged(&mailbox, &id, flagged)
@@ -246,6 +308,8 @@ pub async fn mail_set_seen(
     id: String,
     seen: bool,
 ) -> Result<(), String> {
+    check_mail_name(&mailbox)?;
+    check_mail_name(&id)?;
     state
         .client
         .set_seen(&mailbox, &id, seen)
@@ -262,6 +326,8 @@ pub async fn mail_delete(
     mailbox: String,
     id: String,
 ) -> Result<(), String> {
+    check_mail_name(&mailbox)?;
+    check_mail_name(&id)?;
     state
         .client
         .delete(&mailbox, &id)
@@ -279,12 +345,30 @@ pub async fn mail_move(
     id: String,
     target: String,
 ) -> Result<(), String> {
+    check_mail_name(&mailbox)?;
+    check_mail_name(&id)?;
+    check_mail_name(&target)?;
     state
         .client
         .move_to(&mailbox, &id, &target)
         .await
         .map_err(|e| e.to_string())?;
     state.persist_best_effort();
+    Ok(())
+}
+
+/// Bound a mailbox / message id / target label at the command seam so a
+/// paste-sized caller cannot inflate the engine's persistent storage keys.
+fn check_mail_name(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("mail name is empty".to_string());
+    }
+    if s.len() > MAX_MAIL_NAME_BYTES {
+        return Err(format!(
+            "mail name too long: {} bytes (max {MAX_MAIL_NAME_BYTES})",
+            s.len()
+        ));
+    }
     Ok(())
 }
 

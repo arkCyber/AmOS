@@ -1,5 +1,25 @@
 # 🎉 AmOS 桌面生态系统 — 最终交付报告
 
+> ⚠️ **本文件是过程快照，不是真源；"已完整实现"的口径需要按其内容逐条更正如下（复核：REQ-A260 / REQ-A261）。**
+>
+> * **G4（联想）不是 REQ-A259 交付的**：REQ-A259 只开了 `bigrams`，而联想真正要用的
+>   `predict_next_words_context` 读的是**词三元** FST（`trigrams` 未开）、候选栏也只在组字时渲染 ⇒
+>   用户什么也看不到。真正的接线是 **REQ-A260**（`predict` 特性 + 域侧 `predictions()`/`commit_prediction()`
+>   + 宿主 `kind:"predict"` 候选 + 键盘标签），实测体积 **+19.6 MB**（隔离探针与整机二进制两条路径互证）。
+>   详见 [`input-method.md`](./input-method.md) §Next-word suggestions 与
+>   [`DESKTOP_ECOSYSTEM_GAP_AUDIT.md`](./DESKTOP_ECOSYSTEM_GAP_AUDIT.md) 的 G4 行。
+> * **"shellModule 架构"是 REQ-A261 交付的**（本文件把它列进了自己的清单）：契约 `lib/shellModule.ts`
+>   （**87 行**，不是 150）、外观唯一处 `lib/shellChrome.ts`、注册表 `svelte/shellModules.ts`、挂件
+>   `svelte/modules/*`、以及 `chrome-widgets` / `topbar-container` 两个测试。**只做了顶栏右侧槽位**；
+>   左侧组与 stage/dock/overlay 槽位（P1/P2）、第三方挂件（P3，需清单校验 + 能力白名单 + 安全评审）
+>   **未做**，见 [`PC_DESKTOP_ARCHITECTURE.md`](./PC_DESKTOP_ARCHITECTURE.md) §4.11。
+> * **"完整实现 → 可以推送"过头了**：G2 / G3 / G6 / G8 仍是登记缺口；G6 也只是"部分收口"
+>   （壳 chrome 已模块化 + 修掉一个**真缺陷**：顶栏「控制中心」原本是"有名字、能聚焦、点了没反应"的
+>   按钮，现为 disabled + 说明性名字）。真机/肉眼项（玻璃感、Dock 磁吸曲线、状态行去留、多窗口 e2e、
+>   联想真机复核）**都还在**。
+> * 保留本文件是因为它记录了这次交付的**清单与顺序**（文件列表基本准确，可作为索引）；
+>   **验收以 REQ-A260 / REQ-A261 的追溯行与各真源文档为准。**
+
 **日期**: 2026-09-15  
 **工程师**: arkSong  
 **会话ID**: b24d5569-6fab-4682-8047-e866bbdec091  

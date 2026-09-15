@@ -12,15 +12,11 @@
     bridged,
     flashlightSet,
     flashlightStatus,
-    radioControl,
-    radioOpenSettings,
-    radioSet,
-    radioStatus,
     type FlashlightPayload,
     type RadioControlReply,
-    type RadioPayload,
   } from "../lib/backend";
-  import { radioManagedState, radioRefusalView, type RadioRefusalView } from "../lib/radioControl";
+  import { radioManagedState, type RadioRefusalView } from "../lib/radioControl";
+  import { readManagedSwitches, openRadioSettings, syncQuickRadios, tapRadio } from "../lib/quickRadio";
   import { attachFocusTrap } from "../lib/focusTrap";
   import { iconSvg, quickIcon } from "../lib/sysIcons";
   import { propsChannel } from "./propsBus";
@@ -41,7 +37,6 @@
     flipFlashlight,
     flipLocation,
     flipQuick,
-    flipRadio,
     locationEnabled,
     normalizeFlashlight,
     normalizeNotifs,
@@ -99,8 +94,8 @@
     if (radioRead || !bridged()) return;
     radioRead = true;
     void (async () => {
-      const live = await radioStatus();
-      if (live) persistSettings(mergeRadio(settings, live));
+      const next = await syncQuickRadios(settings);
+      if (next) persistSettings(next);
     })();
   });
 
@@ -119,11 +114,7 @@
     if (ctlRead || !bridged()) return;
     ctlRead = true;
     void (async () => {
-      const keys: RadioKey[] = ["wifi", "bluetooth", "airplane", "hotspot"];
-      const answers = await Promise.all(keys.map((k) => radioControl(k)));
-      const next = { ...radioCtl };
-      keys.forEach((k, i) => (next[k] = answers[i] ?? null));
-      radioCtl = next;
+      radioCtl = await readManagedSwitches();
     })();
   });
 
@@ -179,17 +170,11 @@
     return attachFocusTrap(rootEl, close);
   });
 
-  const mergeRadio = (s: QuickSettings, r: RadioPayload): QuickSettings => ({
-    ...s,
-    wifi: r.wifi,
-    bluetooth: r.bluetooth,
-    airplane: r.airplane,
-    hotspot: r.hotspot,
-  });
   const mergeFlash = (p: FlashlightPayload): FlashlightStore => ({
     on: p.on,
     torch_present: p.torch_present,
   });
+
   const persistSettings = (next: QuickSettings) => writeStoreValue(SETTINGS_KEY, next);
 
   const toggle = async (key: QuickKey) => {
@@ -210,55 +195,35 @@
     persistSettings(flipQuick(settings, key));
   };
 
-  // Radio tiles go through the real backend when bridged; otherwise the same
-  // local policy (incl. airplane cascade) so offline behaves identically.
+  /**
+   * Radio tiles: the rules (airplane gate, platform-owned switches, refusals, the re-read
+   * after a failed write) live in `lib/quickRadio.ts` — one implementation shared with the
+   * Settings screen and the desktop's Control Center. This screen only says what happened.
+   */
   const toggleRadio = async (key: RadioKey) => {
-    if (key !== "airplane" && settings.airplane) return; // gated no-op under APM
-    // A switch the platform owns must not be *attempted* (REQ-A202): `radio_set` would
-    // refuse it before touching the device, and `invoke` would hand back `null` — the tile
-    // would just not move, with nothing on screen explaining why. Hand the user to the
-    // system surface instead, and say what happened.
-    if (bridged() && managed(key).managed) {
-      const opened = await radioOpenSettings(key);
+    const out = await tapRadio({ key, settings, host: bridged(), managed: managed(key) });
+    if (out.kind === "managed") {
       // A failed open must be visible: the alternative is a tile that silently does
-      // nothing, which is exactly what this change removes (REQ-A202).
-      managedFailed = !opened;
-      return;
+      // nothing, which is exactly what REQ-A202 removed.
+      managedFailed = !out.opened;
+    } else if (out.kind === "applied") {
+      managedFailed = false;
+      refused = null;
+      refusedKey = null;
+    } else if (out.kind === "refused") {
+      refused = out.refusal;
+      refusedKey = out.refusal.noteKey ? key : null;
     }
-    const on = !!settings[key];
-    if (bridged()) {
-      const res = await radioSet(key, !on);
-      if (res) {
-        managedFailed = false;
-        if (res.applied) {
-          // The write landed: mirror the authoritative snapshot into the store.
-          refused = null;
-          refusedKey = null;
-          if (res.state) persistSettings(mergeRadio(settings, res.state));
-          return;
-        }
-        // Refused (REQ-A203): mirror the freshly **read** state so no bit lies, and
-        // show the sentence the refusal's tokens map to — with the system surface to
-        // offer when the platform owns the switch. Nothing is persisted: the store
-        // keeps the intent it had, the device kept its state.
-        if (res.state) settings = mergeRadio(settings, res.state);
-        refused = radioRefusalView(res.refusal, key);
-        refusedKey = refused.noteKey ? key : null;
-        return;
-      }
-      // The command itself failed (or never arrived): fall back to a fresh read.
-      const live = await radioStatus();
-      if (live) settings = mergeRadio(settings, live);
-      return;
-    }
-    persistSettings(flipRadio(settings, key));
+    // Only a confirmed write is persisted; otherwise the store keeps the user's intent
+    // while the tiles show the device's state (see `RadioTapOutcome`).
+    if (out.persist) persistSettings(out.next);
+    else settings = out.next;
   };
 
   /** Offer the real switch for the refused radio (only when a surface is known). */
   const openRefusedSettings = async () => {
     if (!refusedKey) return;
-    const opened = await radioOpenSettings(refusedKey);
-    managedFailed = !opened;
+    managedFailed = !(await openRadioSettings(refusedKey));
   };
 
   const toggleFlash = async () => {

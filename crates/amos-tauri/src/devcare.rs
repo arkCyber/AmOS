@@ -444,6 +444,14 @@ pub const AUTHORITY_DAEMON: &str = "daemon";
 /// "nothing is granted".
 pub const AUTHORITY_UNAVAILABLE: &str = "unavailable";
 
+/// Maximum bytes in an app `id` the WebView hands in via `devcare_uninstall`
+/// / `devcare_apps`.
+///
+/// Real Android `package_name`s are ≤64 chars; 256 B mirrors the rest of the
+/// bridge and prevents a paste-sized caller from inflating every audit log
+/// entry (the id is recorded verbatim in the trail).
+pub const MAX_DEVCARE_ID_BYTES: usize = 256;
+
 /// The permission review the manager renders.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PermReviewOut {
@@ -1286,6 +1294,15 @@ pub async fn devcare_apps(app: AppHandle) -> Result<Vec<AppOut>, String> {
 /// policy cannot be bypassed by a UI (or a bug) and every removal is auditable.
 #[tauri::command]
 pub async fn devcare_uninstall(app: AppHandle, id: String) -> Result<UninstallOut, String> {
+    // Bound the id at the seam — a paste-sized caller would inflate every audit
+    // log entry (the id is recorded verbatim) and the policy guard's lookup
+    // keys. 256 B mirrors the rest of the bridge modules.
+    if id.is_empty() || id.len() > MAX_DEVCARE_ID_BYTES {
+        return Err(format!(
+            "devcare id invalid: {} bytes (max {MAX_DEVCARE_ID_BYTES})",
+            id.len()
+        ));
+    }
     let (mut out, event) = offload(move || {
         let bridge = app.state::<DevCareBridge>();
         match bridge.packages() {

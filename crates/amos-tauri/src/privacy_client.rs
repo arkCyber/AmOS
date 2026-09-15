@@ -23,6 +23,27 @@ async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
 
+/// Maximum bytes in an `app_id` / `resource` string handed in from the WebView.
+///
+/// Real ids are reverse-DNS (`org.amos.app`, ~16 chars); real resource names
+/// are one of a fixed small set (`microphone`, `camera`, …, ≤16 chars). 128 B is
+/// comfortably above any real value and prevents a paste-sized caller from
+/// shipping a 10 MB string into the daemon's gRPC header.
+pub const MAX_PRIVACY_ID_BYTES: usize = 128;
+
+/// Maximum `limit` value for `perm_recent_audit` / `perm_recent_trail`.
+///
+/// The daemon returns at most this many records; an unbounded `limit` would be
+/// a vector an attacker can pump to gigabytes via repeated calls. 1 000 covers
+/// a generous UI review surface; anything larger must be paginated.
+pub const MAX_PRIVACY_AUDIT_LIMIT: u32 = 1000;
+
+/// Upper bound on the number of records a single `perm_record_audit` call may
+/// ship (`Vec<PermissionAudit>`). Symmetric with [`MAX_PRIVACY_AUDIT_LIMIT`]
+/// (the read-side cap) so the daemon never sees a write batch larger than the
+/// read window it serves.
+pub const MAX_PRIVACY_AUDIT_BATCH: usize = 1000;
+
 /// Serializable mirror of one normalized daemon audit record.
 ///
 /// `Deserialize` too: it doubles as the **ingest** shape for
@@ -50,6 +71,8 @@ pub struct AuditTrail {
 /// The authoritative decision for one app+resource access request.
 #[tauri::command]
 pub async fn perm_authorize(app_id: String, resource: String) -> Result<bool, String> {
+    check_privacy_id(&app_id)?;
+    check_privacy_id(&resource)?;
     let mut client = PrivacyServiceClient::new(build_channel().await?);
     let reply = client
         .authorize(ResourceRef { app_id, resource })
@@ -62,6 +85,8 @@ pub async fn perm_authorize(app_id: String, resource: String) -> Result<bool, St
 /// Grant one sensitive resource to an app (persists when the daemon has a state file).
 #[tauri::command]
 pub async fn perm_grant(app_id: String, resource: String) -> Result<(), String> {
+    check_privacy_id(&app_id)?;
+    check_privacy_id(&resource)?;
     let mut client = PrivacyServiceClient::new(build_channel().await?);
     client
         .grant(GrantRequest { app_id, resource })
@@ -73,6 +98,8 @@ pub async fn perm_grant(app_id: String, resource: String) -> Result<(), String> 
 /// Revoke one sensitive resource from an app.
 #[tauri::command]
 pub async fn perm_revoke(app_id: String, resource: String) -> Result<(), String> {
+    check_privacy_id(&app_id)?;
+    check_privacy_id(&resource)?;
     let mut client = PrivacyServiceClient::new(build_channel().await?);
     client
         .revoke(GrantRequest { app_id, resource })
@@ -84,6 +111,7 @@ pub async fn perm_revoke(app_id: String, resource: String) -> Result<(), String>
 /// The resources an app currently holds (sorted; empty = deny-by-default).
 #[tauri::command]
 pub async fn perm_granted(app_id: String) -> Result<Vec<String>, String> {
+    check_privacy_id(&app_id)?;
     let mut client = PrivacyServiceClient::new(build_channel().await?);
     let reply = client
         .granted(AppRef { app_id })
@@ -142,6 +170,13 @@ pub async fn perm_recent_audit(
     resource: Option<String>,
     limit: u32,
 ) -> Result<Vec<PermissionAudit>, String> {
+    if let Some(s) = app_id.as_deref() {
+        check_privacy_id(s)?;
+    }
+    if let Some(s) = resource.as_deref() {
+        check_privacy_id(s)?;
+    }
+    check_privacy_limit(limit)?;
     let mut client = PrivacyServiceClient::new(build_channel().await?);
     let reply = client
         .recent_audit(AuditQuery {
@@ -169,6 +204,13 @@ pub async fn perm_recent_trail(
     resource: Option<String>,
     limit: u32,
 ) -> Result<AuditTrail, String> {
+    if let Some(s) = principal.as_deref() {
+        check_privacy_id(s)?;
+    }
+    if let Some(s) = resource.as_deref() {
+        check_privacy_id(s)?;
+    }
+    check_privacy_limit(limit)?;
     let mut client = PrivacyServiceClient::new(build_channel().await?);
     let reply = client
         .recent_trail(AuditQuery {
@@ -211,6 +253,16 @@ pub struct AuditIngest {
 /// The daemon's `ts` is authoritative and the `ts` sent here is a placeholder.
 #[tauri::command]
 pub async fn perm_record_audit(records: Vec<PermissionAudit>) -> Result<AuditIngest, String> {
+    // Bound the batch at the seam: a runaway caller shipping thousands of
+    // records in one `invoke` would block the daemon's gRPC thread (each record
+    // is a separate unary call here). 1000 mirrors `MAX_PRIVACY_AUDIT_LIMIT` —
+    // the read side's batch ceiling — and is the natural symmetric write cap.
+    if records.len() > MAX_PRIVACY_AUDIT_BATCH {
+        return Err(format!(
+            "perm_record_audit batch too large: {} records (max {MAX_PRIVACY_AUDIT_BATCH})",
+            records.len()
+        ));
+    }
     let total = records.len() as u32;
     let mut client = PrivacyServiceClient::new(build_channel().await?);
     let mut recorded = 0u32;
@@ -248,4 +300,76 @@ pub async fn perm_record_audit(records: Vec<PermissionAudit>) -> Result<AuditIng
         total,
         error,
     })
+}
+
+/// Bound an `app_id` / `resource` string and refuse NUL/control characters and
+/// path-traversal shapes. Mirrors the spirit of [`crate::appstore::check_appstore_id`]
+/// (a resource id is a routing key, not a path segment — but a paste-sized id
+/// reaching the daemon's gRPC header is enough of a concern to bound it at the
+/// command seam). The same `valid_id` regex the daemon enforces is documented but
+/// not duplicated here; the seam is `len() ≤ MAX` + no NUL/control.
+fn check_privacy_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("privacy id is empty".to_string());
+    }
+    if id.len() > MAX_PRIVACY_ID_BYTES {
+        return Err(format!(
+            "privacy id too long: {} bytes (max {MAX_PRIVACY_ID_BYTES})",
+            id.len()
+        ));
+    }
+    if id.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err("privacy id contains control characters".to_string());
+    }
+    Ok(())
+}
+
+/// Cap the `limit` field of audit/trail queries so a caller cannot ask for an
+/// unbounded number of records. The daemon itself enforces a per-call ceiling,
+/// but the bridge clamps here so an over-limit request is rejected with a clear
+/// reason instead of the daemon's generic "bad request".
+fn check_privacy_limit(limit: u32) -> Result<(), String> {
+    if limit > MAX_PRIVACY_AUDIT_LIMIT {
+        return Err(format!(
+            "limit too large: {limit} (max {MAX_PRIVACY_AUDIT_LIMIT})"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_privacy_id, check_privacy_limit, MAX_PRIVACY_AUDIT_LIMIT};
+
+    #[test]
+    fn privacy_id_accepts_normal_shapes() {
+        for ok in [
+            "org.amos.app",
+            "microphone",
+            "x".repeat(super::MAX_PRIVACY_ID_BYTES).as_str(),
+        ] {
+            assert!(
+                check_privacy_id(ok).is_ok(),
+                "{ok:?} is a legitimate privacy id"
+            );
+        }
+    }
+
+    #[test]
+    fn privacy_id_rejects_nul_and_oversized() {
+        // The byte cap, not the char cap, is the authoritative bounds check —
+        // a multi-byte glyph id still fits if its UTF-8 length is within the cap.
+        let huge = "x".repeat(super::MAX_PRIVACY_ID_BYTES + 1);
+        assert!(check_privacy_id(&huge).is_err());
+        assert!(check_privacy_id("a\0b").is_err(), "NUL must be refused");
+        assert!(check_privacy_id("a\nb").is_err(), "newline control refused");
+    }
+
+    #[test]
+    fn privacy_limit_caps_huge_values() {
+        // The cap has headroom for the UI's "review all" surface (1000 rows)
+        // but rejects the obvious memory pumping shapes.
+        assert!(check_privacy_limit(MAX_PRIVACY_AUDIT_LIMIT).is_ok());
+        assert!(check_privacy_limit(u32::MAX).is_err());
+    }
 }

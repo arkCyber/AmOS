@@ -80,6 +80,14 @@ impl LinkNode {
 
     /// A node over a caller-provided transport (a shared broker, the Zenoh transport)
     /// with a caller-provided clock and counter set.
+    ///
+    /// **`metrics` must be the transport's own set** ([`Transport::metrics`]): a transport is
+    /// where "this frame left the machine" and "this frame reached a subscriber queue" are
+    /// known, so it records `published`/`delivered`/`dropped`; the node's `status`, `watch` and
+    /// the health fold read them. Passing a *different* set leaves this node reporting zeros
+    /// while frames move — which is what every Zenoh node did until round 15 (nothing outside
+    /// the in-process broker recorded anything, and the two sets could not be compared). The
+    /// mismatch is now **warned about** instead of being invisible.
     pub fn with_parts(
         peer: PeerId,
         kind: NodeKind,
@@ -87,6 +95,15 @@ impl LinkNode {
         clock: Arc<Clock>,
         metrics: Arc<LinkMetrics>,
     ) -> Self {
+        if !Arc::ptr_eq(&metrics, &transport.metrics()) {
+            tracing::warn!(
+                peer = %peer,
+                transport = transport.name(),
+                "this node's counters are not its transport's: `published`/`delivered` are \
+                 recorded by the transport, so `status` will under-report (build the transport \
+                 with the node's counters — see `Transport::metrics`)"
+            );
+        }
         let started = clock.now();
         // The table knows whose node this is: a node is not its own peer (a multicast
         // announcement reaches its own sender by default).
@@ -329,6 +346,25 @@ impl LinkNode {
         crate::discovery::spawn_federation(self, period)
     }
 
+    /// Join the peer federation **announcing where this node can be reached**
+    /// (`amos/<peer>/telemetry/beacon`, see
+    /// [`spawn_federation_advertising`](crate::discovery::spawn_federation_advertising)).
+    ///
+    /// `endpoints` is what every other node's peer table will show for this one (its primary
+    /// entry, the same collapse `proto.Peer` and the System UI perform) — so this is how a
+    /// deployment says "connect to me here". A bad advertisement is refused **here**, before
+    /// the task starts: the per-field bounds and the beacon frame it has to fit in are both
+    /// checked, because a node whose beacons cannot be encoded is invisible on the link with
+    /// nothing but a `debug!` line to show for it. Pass an empty list (or use
+    /// [`LinkNode::spawn_federation`]) when the transport self-discovers.
+    pub fn spawn_federation_advertising(
+        self: &Arc<Self>,
+        period: Duration,
+        endpoints: Vec<String>,
+    ) -> Result<FederationTask> {
+        crate::discovery::spawn_federation_advertising(self, period, endpoints)
+    }
+
     /// The default federation period (1 Hz, like the heartbeat: cheap and fast enough
     /// that a [`PeerRegistry`] TTL of three periods notices a dead board in seconds).
     pub const FEDERATION_PERIOD: Duration = Duration::from_secs(1);
@@ -349,7 +385,20 @@ mod tests {
     /// enumerate what other nodes published — so its inventory is empty *and* never complete.
     /// Standing in for Zenoh here is the point: the same shape (empty list + `false`) is what
     /// `zenoh.rs` reports, and the `NodeStatus` JSON has to carry both halves.
-    struct BlindTransport;
+    ///
+    /// It owns a counter set (`Transport::metrics`) because every transport does — a node over
+    /// it reports those counters, exactly as a node over the broker or Zenoh does.
+    struct BlindTransport {
+        metrics: Arc<LinkMetrics>,
+    }
+
+    impl BlindTransport {
+        fn new() -> Self {
+            Self {
+                metrics: Arc::new(LinkMetrics::new()),
+            }
+        }
+    }
 
     #[async_trait]
     impl Transport for BlindTransport {
@@ -369,6 +418,12 @@ mod tests {
 
         async fn topics_complete(&self) -> bool {
             false
+        }
+
+        /// A transport owns a counter set even when it counts nothing (see
+        /// [`Transport::metrics`]) — and a node over it must report *these*.
+        fn metrics(&self) -> Arc<LinkMetrics> {
+            Arc::clone(&self.metrics)
         }
 
         fn name(&self) -> &'static str {
@@ -514,10 +569,11 @@ mod tests {
         // a complete one, and a network bus's empty list exactly like "nothing is published".
         // The CLI's `topics` command printed the caveat; the JSON could not.
         let metrics = Arc::new(LinkMetrics::new());
+        let blind_transport = BlindTransport::new();
         let blind = LinkNode::with_parts(
             PeerId::new("dog1").expect("peer"),
             NodeKind::Robot,
-            Arc::new(BlindTransport),
+            Arc::new(blind_transport),
             Arc::new(Clock::host()),
             metrics,
         );

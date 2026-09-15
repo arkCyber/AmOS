@@ -35,7 +35,7 @@
 //!   sides, and `lan` (feature) is the real UDP channel.
 //! * [`telemetry`] — [`Heartbeat`] + [`NodeStatus`]: liveness on the link and one JSON
 //!   document for an operator.
-//! * [`sequence`] — [`SeqTracker`]: per-publisher sequence accounting, so “a gap means a
+//! * [`sequence`] — [`SeqTracker`]: per-**stream** sequence accounting, so “a gap means a
 //!   dropped frame” is a number (`gaps` / `missing` / `stale`) instead of a comment.
 //! * [`robot_hal`] — the agent→motors boundary: JSON intent is validated, expanded into
 //!   a gait pose, and encoded as CRC-checked motor frames over a [`RobotHal`] seam.
@@ -67,6 +67,7 @@ pub mod keyexpr;
 pub mod metrics;
 pub mod node;
 pub mod pubsub;
+pub mod rate;
 pub mod qos;
 pub mod robot_hal;
 pub mod sequence;
@@ -99,7 +100,7 @@ pub use robot_hal::{
     StreamRobotHal, ACTUATION_NAME, DEFAULT_REPORT_REFRESH, MAX_ACTUATION_FRAMES,
     MAX_REFUSAL_REASON_BYTES, MAX_WATCHDOG_MS,
 };
-pub use sequence::{SeqEvent, SeqSummary, SeqTracker, MAX_TRACKED_STREAMS};
+pub use sequence::{SeqEvent, SeqSummary, SeqTracker, StreamKey, MAX_TRACKED_STREAMS};
 pub use telemetry::{
     heartbeat_pattern, Heartbeat, HeartbeatTask, NodeStatus, DEFAULT_HEARTBEAT_PERIOD,
 };

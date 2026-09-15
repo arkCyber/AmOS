@@ -34,15 +34,25 @@
 //! [`SeqTracker`](crate::sequence::SeqTracker) passes its summary in (the CLI's `watch`
 //! does exactly that), and only then can `frame_loss` appear.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::discovery::PeerView;
 use crate::metrics::MetricsSnapshot;
 use crate::sequence::SeqSummary;
 
 /// One measured fact that keeps a link from being called healthy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// The JSON form of a reason is its **stable token** (`decode_errors=3`, `frame_loss=6 in 2
+/// gap(s)`): the same string the control plane carries in `health_reasons`, the CLI prints in
+/// `watch`/`status`, and the System UI renders. The structured fields (`count`, `missing`,
+/// `gaps`, `blocked`, `untracked`) stay in Rust, where they are the reason's own numbers.
+///
+/// `Deserialize` is deliberately absent: a verdict travels *out* of the node and is rendered —
+/// nothing turns a document back into a verdict — and a derived `Deserialize` would describe the
+/// shape this type used to emit (`{"decode_errors":{"count":3}}`), i.e. a round-trip that does
+/// not exist. The old test that asserted that shape *and* that round-trip was replaced by
+/// `the_verdict_json_is_the_control_planes_vocabulary`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HealthReason {
     /// This node failed to encode a frame it was asked to publish.
     EncodeErrors {
@@ -109,8 +119,26 @@ impl HealthReason {
     }
 }
 
+impl Serialize for HealthReason {
+    /// One token, not a Rust struct: `"decode_errors=3"`.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.detail())
+    }
+}
+
 /// The link's verdict.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON: `{"state":"unknown"}` | `{"state":"healthy"}` | `{"state":"degraded","reasons":[…]}`,
+/// where each reason is its [`HealthReason::detail`] token — the same words the control plane's
+/// `health`/`health_reasons` and the CLI print, so one verdict has one spelling everywhere.
+///
+/// `Deserialize` is deliberately absent for the same reason as [`HealthReason`]'s: this is a
+/// rendering. (It was derived before, which is how a stale round-trip test kept the old shape
+/// alive.)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum LinkHealth {
     /// Nothing has been published, delivered or observed: no evidence to judge on.
@@ -433,29 +461,65 @@ mod tests {
         );
     }
 
+    /// The verdict's JSON is the **control plane's vocabulary**, not Rust's.
+    ///
+    /// One verdict had three spellings: the proto carries `health` (an enum) + `health_reasons`
+    /// (`"decode_errors=3"` tokens), the CLI's `watch`/`status --socket` print those same tokens,
+    /// and the System UI renders them — while the status document's derived form nested the
+    /// number under a **Rust field name** (`{"decode_errors":{"count":3}}`, measured below).
+    /// That contradicts `HealthReason::key`'s own doc ("Stable key (JSON, CLI, logs)"): the outer
+    /// key was stable, the *shape* was Rust's, so a script reading `status --json` had to know
+    /// Rust internals (which reason carries `count`, which carries `missing`+`gaps`, which
+    /// carries `blocked`) to read a verdict the proto already spelled as one token.
+    ///
+    /// **This test replaced one that pinned the old shape.** The old test also asserted a
+    /// round-trip ("a UI can send it back") — a direction nothing in the workspace has: a
+    /// verdict travels *out* of the daemon and is rendered. A rendering must not claim to
+    /// round-trip, so the types are `Serialize`-only now (see the derives).
     #[test]
-    fn the_verdict_serialises_for_the_status_document() {
-        let healthy = LinkHealth::evaluate(&busy(), &[peer("dog1")], true, None);
-        let json = serde_json::to_string(&healthy).expect("json");
-        assert_eq!(json, r#"{"state":"healthy"}"#);
+    fn the_verdict_json_is_the_control_planes_vocabulary() {
+        assert_eq!(
+            serde_json::to_string(&LinkHealth::Unknown).expect("json"),
+            r#"{"state":"unknown"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LinkHealth::Healthy).expect("json"),
+            r#"{"state":"healthy"}"#
+        );
+        let degraded = LinkHealth::Degraded {
+            reasons: vec![
+                HealthReason::EncodeErrors { count: 1 },
+                HealthReason::DecodeErrors { count: 3 },
+                HealthReason::BackPressure { blocked: 2 },
+                HealthReason::FrameLoss {
+                    missing: 6,
+                    gaps: 2,
+                },
+                HealthReason::UntrackedFrames { untracked: 4 },
+                HealthReason::NoPeers,
+                HealthReason::ClockUnsynced,
+            ],
+        };
+        assert_eq!(
+            serde_json::to_string(&degraded).expect("json"),
+            r#"{"state":"degraded","reasons":["encode_errors=1","decode_errors=3","back_pressure=2","frame_loss=6 in 2 gap(s)","untracked_frames=4","no_peers","clock_unsynced"]}"#
+        );
 
-        let degraded = LinkHealth::evaluate(
-            &MetricsSnapshot {
-                decode_errors: 1,
-                ..busy()
-            },
-            &[peer("dog1")],
-            true,
-            None,
-        );
-        let json = serde_json::to_string(&degraded).expect("json");
-        assert!(
-            json.contains(r#""state":"degraded""#)
-                && json.contains(r#""decode_errors":{"count":1}"#),
-            "got: {json}"
-        );
-        // …and it round-trips (a UI can send it back).
-        let back: LinkHealth = serde_json::from_str(&json).expect("round trip");
-        assert_eq!(back, degraded);
+        // Every reason's JSON is exactly the `detail()` token the CLI and the proto carry, and
+        // that token begins with the stable key — one rule, three consumers, no drift.
+        for reason in degraded.reasons() {
+            assert_eq!(
+                serde_json::to_string(reason).expect("json"),
+                format!("\"{}\"", reason.detail()),
+                "the JSON form of {} is its detail token",
+                reason.key()
+            );
+            assert!(
+                reason.detail().starts_with(reason.key()),
+                "`{}` must begin with its stable key `{}`",
+                reason.detail(),
+                reason.key()
+            );
+        }
     }
 }

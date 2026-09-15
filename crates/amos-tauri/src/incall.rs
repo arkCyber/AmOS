@@ -137,3 +137,82 @@ pub fn real_answer() -> Result<bool, String> {
 pub fn real_hang_up() -> Result<bool, String> {
     call_static_bool("hangUpActive")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The JNI trampolines themselves need a real JVM to exercise, but the payload
+    // shape and the `TelephonyCallPayload` fields the bridge hands the WebView
+    // are pure logic and must hold their guarantees without one. The on-device
+    // `VM`/`APP` OnceLocks are process-global and a parallel test could
+    // legitimately populate them (the `lib.rs` setup does so on Android), so the
+    // JVM-not-captured assertion is **not** a unit test — it is a property the
+    // code holds in isolation, observed in a freshly-spawned process. Skipping it
+    // here is intentional; the device-side `scripts/android-glue-check` gate is
+    // where that scenario lives.
+
+    #[test]
+    fn empty_direction_is_preserved_and_forwarded_as_is() {
+        // `read_string` returns `""` for a null jstring — the payload carries that
+        // empty string through (the frontend classifies it via its own state
+        // machine), rather than silently turning it into "Outgoing".
+        let payload = TelephonyCallPayload {
+            id: "real".to_string(),
+            peer: String::new(),
+            state: String::new(),
+            direction: String::new(),
+            emergency: false,
+            recording: "Off".to_string(),
+        };
+        assert_eq!(payload.direction, "");
+        assert_eq!(payload.state, "");
+        assert_eq!(payload.peer, "");
+        assert_eq!(payload.recording, "Off", "recording defaults to Off");
+        assert!(!payload.emergency);
+    }
+
+    #[test]
+    fn payload_round_trips_through_serde() {
+        // The Tauri event bus serializes via serde_json; a malformed payload that
+        // doesn't serialize would fail silently at emit time and leave the UI
+        // frozen. Verify the public wire shape.
+        let p = TelephonyCallPayload {
+            id: "real".into(),
+            peer: "+8613800138000".into(),
+            state: "Active".into(),
+            direction: "Outgoing".into(),
+            emergency: false,
+            recording: "On".into(),
+        };
+        let j = serde_json::to_string(&p).expect("serialize");
+        // Every field the WebView's `IncomingCall` overlay reads must be present.
+        for needle in [
+            "\"id\":\"real\"",
+            "\"peer\":\"+8613800138000\"",
+            "\"state\":\"Active\"",
+            "\"direction\":\"Outgoing\"",
+            "\"emergency\":false",
+            "\"recording\":\"On\"",
+        ] {
+            assert!(j.contains(needle), "missing {needle} in payload: {j}");
+        }
+    }
+
+    #[test]
+    fn payload_emergency_round_trip_is_honest() {
+        // The Kotlin in-call service may flag emergency lines; the bridge must
+        // carry that bit through unchanged (it is used by the UI to suppress the
+        // record button on emergency calls).
+        let p = TelephonyCallPayload {
+            id: "real".into(),
+            peer: "110".into(),
+            state: "Active".into(),
+            direction: "Incoming".into(),
+            emergency: true,
+            recording: "Off".into(),
+        };
+        let j = serde_json::to_string(&p).expect("serialize");
+        assert!(j.contains("\"emergency\":true"));
+    }
+}

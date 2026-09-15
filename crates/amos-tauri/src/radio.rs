@@ -429,12 +429,26 @@ pub async fn bluetooth_pair(
     bridge: State<'_, RadioBridge>,
     address: String,
 ) -> Result<bool, String> {
+    if address.is_empty() || address.len() > MAX_BT_ADDRESS_BYTES {
+        return Err(format!(
+            "bluetooth address too long or empty: {} bytes (max {MAX_BT_ADDRESS_BYTES})",
+            address.len()
+        ));
+    }
     bridge
         .manager
         .bluetooth_pair(&address)
         .await
         .map_err(|e| e.to_string())
 }
+
+/// Maximum bytes in a Bluetooth MAC address handed in via `bluetooth_pair`.
+///
+/// Real MACs are `XX:XX:XX:XX:XX:XX` (17 ASCII chars). 64 bytes is the
+/// platform's own BluetoothClass limit on a sane MAC-string length, and is
+/// large enough for any future shape ("`LE:<MAC>`" etc.) while keeping the
+/// command seam safe from a paste attack.
+pub const MAX_BT_ADDRESS_BYTES: usize = 64;
 
 /// The platform's answer to "may an **app** switch this radio?" (REQ-A202).
 ///

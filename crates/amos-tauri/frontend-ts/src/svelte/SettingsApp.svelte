@@ -22,7 +22,6 @@
   import {
     SETTINGS_KEY,
     dndActive,
-    flipRadio,
     normalizeQuick,
     type QuickSettings,
     type RadioKey,
@@ -33,8 +32,9 @@
   import { readCloud } from "../lib/cloud";
   import { AMOS_UI_VERSION } from "../lib/version";
   import { readImeEnabled } from "../lib/ime";
-  import { bridged, radioSet, radioStatus } from "../lib/backend";
-  import { radioRefusalView, type RadioRefusalView } from "../lib/radioControl";
+  import { bridged } from "../lib/backend";
+  import { type RadioRefusalView } from "../lib/radioControl";
+  import { syncQuickRadios, tapRadio } from "../lib/quickRadio";
   import { t, locale } from "./locale.svelte";
   import { GROUP, ROW, LABEL, VALUE, SUB, CHEVRON, H1, ROW_ACTIVE } from "./settings/kit";
   import { settingsChannel } from "./appLinks";
@@ -189,24 +189,14 @@
   const readQuick = (): QuickSettings => normalizeQuick(readStoreValue<unknown>(SETTINGS_KEY, {}));
   let qs = $state<QuickSettings>(readQuick());
   const airplaneOn = $derived(qs.airplane === true);
-  const mergeRadio = (
-    s: QuickSettings,
-    r: { wifi: boolean; bluetooth: boolean; airplane: boolean; hotspot: boolean },
-  ) => ({
-    ...s,
-    wifi: r.wifi,
-    bluetooth: r.bluetooth,
-    airplane: r.airplane,
-    hotspot: r.hotspot,
-  });
   const persistQuick = (next: QuickSettings) => {
     qs = next;
     writeStoreValue(SETTINGS_KEY, next);
   };
   /**
    * The last **refused write** (REQ-A203): `radio_set` answers `applied: false` plus
-   * machine tokens instead of failing into `null`, so the sub pages can say "the
-   * device did not accept this" instead of a toggle that silently does nothing.
+   * machine tokens instead of failing into `null`, so the sub pages can say "the device
+   * did not accept this" instead of a toggle that silently does nothing.
    */
   let radioRefusal = $state<RadioRefusalView | null>(null);
   // Mount-time **device truth** (REQ-A185): the tiles show the persisted quick
@@ -219,33 +209,23 @@
     if (radioRead || !bridged()) return;
     radioRead = true;
     void (async () => {
-      const live = await radioStatus();
-      if (live) persistQuick(mergeRadio(readQuick(), live));
+      const next = await syncQuickRadios(readQuick());
+      if (next) persistQuick(next);
     })();
   });
+  /**
+   * One tap, one implementation: the rules (airplane gate, refusal, re-read) live in
+   * `lib/quickRadio.ts` and are shared with the notification centre and the desktop's
+   * Control Center — this screen only decides how to *say* what happened.
+   */
   const toggleRadio = async (key: RadioKey) => {
-    if (key !== "airplane" && qs.airplane) return; // gated no-op under airplane mode
-    const on = !!qs[key];
-    if (bridged()) {
-      const res = await radioSet(key, !on);
-      if (res) {
-        if (res.applied) {
-          // The write landed: mirror the authoritative snapshot into the store.
-          radioRefusal = null;
-          if (res.state) persistQuick(mergeRadio(qs, res.state));
-          return;
-        }
-        // Refused (REQ-A203): show the **read** state (no bit may lie), keep the
-        // user's persisted intent, and let the sub page say why + offer the way out.
-        if (res.state) qs = mergeRadio(qs, res.state);
-        radioRefusal = radioRefusalView(res.refusal, key);
-        return;
-      }
-      const live = await radioStatus();
-      if (live) persistQuick(mergeRadio(qs, live));
-      return;
-    }
-    persistQuick(flipRadio(qs, key));
+    const out = await tapRadio({ key, settings: qs, host: bridged() });
+    if (out.kind === "applied") radioRefusal = null;
+    if (out.kind === "refused") radioRefusal = out.refusal;
+    // Only a confirmed write is persisted; otherwise the screen shows the device's state
+    // while the store keeps the user's intent (see `RadioTapOutcome`).
+    if (out.persist) persistQuick(out.next);
+    else qs = out.next;
   };
 
   /* ---- Live subtitles for index rows (driven by stores + locale) ---- */

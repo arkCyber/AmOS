@@ -56,6 +56,27 @@ const LAUNCHER_LABEL: &str = "main";
 /// Web path (relative to `frontendDist`) every app window loads.
 const APP_ENTRY: &str = "index.html";
 
+/// Maximum bytes in a system-context text entry (selected text for AI injection).
+///
+/// This text is merged into `AgentRequest.context` under `system_selection`, so a
+/// malicious app window could try to stuff a huge string here to inflate the AI
+/// prompt beyond `MAX_AI_PROMPT_BYTES`. The 32 KiB cap covers a long document
+/// selection while keeping the total prompt well under the AI model's limit.
+pub const MAX_CONTEXT_TEXT_BYTES: usize = 32 << 10;
+
+/// Maximum bytes in a shell window title.
+///
+/// Titles appear in window decorations, screen-reader announcements, and the OS task
+/// bar; a title beyond 256 bytes is almost certainly a misbehaving app. The cap
+/// also prevents a huge title from exceeding platform limits.
+pub const MAX_SHELL_TITLE_BYTES: usize = 256;
+
+/// Maximum bytes in a `target_window` / `source_window` label in
+/// `system_set_context` (the context map keys itself on these labels, and they
+/// show up in every `system-context-updated` broadcast — a paste-sized label
+/// would inflate every consumer of that event).
+pub const MAX_CONTEXT_LABEL_BYTES: usize = 256;
+
 /// Restore a window to "full" screen. Desktop Tauri has a real `maximize`; on
 /// Android (the System UI APK) windows are always fullscreen, and `WebviewWindow`
 /// has no `maximize`, so this is a cross-target no-op that still compiles.
@@ -1854,6 +1875,30 @@ pub fn system_set_context(
     source_window: String,
     text: String,
 ) -> Result<(), String> {
+    // Bound the labels at the seam — they key the context map and ride on every
+    // `system-context-updated` broadcast, so a paste-sized label would inflate
+    // every consumer of that event.
+    if target_window.is_empty() || target_window.len() > MAX_CONTEXT_LABEL_BYTES {
+        return Err(format!(
+            "context target_window invalid: {} bytes (max {MAX_CONTEXT_LABEL_BYTES})",
+            target_window.len()
+        ));
+    }
+    if source_window.is_empty() || source_window.len() > MAX_CONTEXT_LABEL_BYTES {
+        return Err(format!(
+            "context source_window invalid: {} bytes (max {MAX_CONTEXT_LABEL_BYTES})",
+            source_window.len()
+        ));
+    }
+    // Bound the text so a malicious app cannot flood the AI context: the selected
+    // text is injected into the prompt, and unbounded injection would defeat the
+    // prompt cap `MAX_AI_PROMPT_BYTES` at the `ask_ai_agent` seam.
+    if text.len() > MAX_CONTEXT_TEXT_BYTES {
+        return Err(format!(
+            "context text too long: {} bytes (max {MAX_CONTEXT_TEXT_BYTES})",
+            text.len()
+        ));
+    }
     state.set(&target_window, &source_window, &text);
     Ok(())
 }
@@ -1864,6 +1909,12 @@ pub fn system_clear_context(
     state: State<'_, SystemContext>,
     target_window: String,
 ) -> Result<(), String> {
+    if target_window.is_empty() || target_window.len() > MAX_CONTEXT_LABEL_BYTES {
+        return Err(format!(
+            "context target_window invalid: {} bytes (max {MAX_CONTEXT_LABEL_BYTES})",
+            target_window.len()
+        ));
+    }
     state.clear(&target_window);
     Ok(())
 }
@@ -1875,6 +1926,12 @@ pub fn system_peek_context(
     state: State<'_, SystemContext>,
     target_window: String,
 ) -> Result<Option<SystemContextEntry>, String> {
+    if target_window.is_empty() || target_window.len() > MAX_CONTEXT_LABEL_BYTES {
+        return Err(format!(
+            "context target_window invalid: {} bytes (max {MAX_CONTEXT_LABEL_BYTES})",
+            target_window.len()
+        ));
+    }
     Ok(state.peek(&target_window))
 }
 
@@ -1902,7 +1959,15 @@ pub fn wm_set_shell_title(app: AppHandle, title: Option<String>) -> Result<Strin
         ));
     };
     let wanted = match title {
-        Some(asked) => normalize_shell_title(&asked)?,
+        Some(asked) => {
+            if asked.len() > MAX_SHELL_TITLE_BYTES {
+                return Err(format!(
+                    "title too long: {} bytes (max {MAX_SHELL_TITLE_BYTES})",
+                    asked.len()
+                ));
+            }
+            normalize_shell_title(&asked)?
+        }
         None => configured_shell_title(&app),
     };
     window

@@ -35,6 +35,15 @@
 
 use std::sync::{Arc, Mutex};
 
+/// Upper bound on one camera-frame payload from the WebView side.
+///
+/// 12 MP (4032 × 3024) RGBA = ~48 MiB; 4K NV21 = ~33 MiB. We cap at 50 MiB —
+/// sufficient for the largest standard sensor, and well below what a malicious or
+/// runaway caller might try to push. The inner `bus.record_frame` then checks
+/// the payload against the *advertised* camera's expected size, so any mismatch
+/// is a second-layer rejection.
+pub const MAX_FRAME_BYTES: usize = 50 << 20;
+
 use amos_sensor::{
     CameraConfig, CameraFrame, CameraId, ImuSample, LiveSensorProvider, PixelFormat, Resolution,
     SensorKind, SensorManager, SensorMode, SensorProvider, StreamChange, Vec3,
@@ -654,6 +663,13 @@ pub fn sensor_host_record_imu(
 }
 
 /// Tauri command: validate + push the newest camera frame (NV21/RGBA8 bytes).
+///
+/// [`MAX_FRAME_BYTES`] bounds the caller's payload at the command seam, so a
+/// buggy / malicious WebView producer cannot pour a huge buffer through the
+/// bus and exhaust the process heap. The inner `bus.record_frame` then checks
+/// the payload against the *advertised* camera config's expected byte count —
+/// those two checks together mean: a frame larger than the advertised camera
+/// is rejected, and a frame larger than the seam cap is also rejected.
 #[tauri::command]
 pub fn sensor_host_record_frame(
     host: State<'_, SensorHost>,
@@ -664,6 +680,12 @@ pub fn sensor_host_record_frame(
     fps: u32,
     bytes: Vec<u8>,
 ) -> Result<(), String> {
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(format!(
+            "camera frame too large: {} bytes (max {MAX_FRAME_BYTES})",
+            bytes.len()
+        ));
+    }
     host.record_frame_bytes(camera_id, width, height, &format, fps, bytes)
 }
 

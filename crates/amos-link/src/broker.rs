@@ -76,7 +76,7 @@ impl SubCounters {
         self.received.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_dropped(&self) {
+    pub(crate) fn record_dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -94,6 +94,57 @@ impl SubCounters {
     }
 }
 
+/// The two counter sets one *forwarded* frame can move, in one place.
+///
+/// A frame that crosses a network session is handled by a forwarding task, not by the broker,
+/// so the broker's division of labour has to be re-stated — and it was not: until round 17 the
+/// Zenoh relay recorded a delivery (or the terminal "consumer is gone") on the **node's**
+/// counters only. Nothing ever touched the subscription's own, so a network consumer's
+/// `stats().dropped` read `0` for its whole life while its queue was dropping, and the rule
+/// stated on [`SubscriptionStats`] ("the publish report plus the node-wide `metrics.dropped`
+/// count the same frames, so the two never disagree") was false off-process
+/// (`docs/amos-link.md` §3.18).
+///
+/// Three outcomes, matching the broker's publish path one for one:
+///
+/// * [`RelayCounters::stored`] — the frame went into the consumer's queue (node `delivered`);
+/// * [`RelayCounters::replaced`] — a one-slot queue overwrote a pending frame. The **slot**
+///   already counted the subscription side (it owns that counter — see [`LatestSlot::offer`]),
+///   so only the node's `dropped` moves here: calling [`RelayCounters::lost`] instead would
+///   count one loss twice;
+/// * [`RelayCounters::lost`] — the frame reached nobody (a full best-effort queue, or a
+///   consumer that went away): **both** counters move, because the operator reading the node's
+///   totals and the developer reading this subscription's stats are asking the same question.
+#[cfg(feature = "zenoh")]
+#[derive(Debug, Clone)]
+pub(crate) struct RelayCounters {
+    sub: Arc<SubCounters>,
+    node: Arc<LinkMetrics>,
+}
+
+#[cfg(feature = "zenoh")]
+impl RelayCounters {
+    pub(crate) fn new(sub: Arc<SubCounters>, node: Arc<LinkMetrics>) -> Self {
+        Self { sub, node }
+    }
+
+    /// The frame entered the consumer's queue.
+    pub(crate) fn stored(&self) {
+        self.node.record_delivered(1);
+    }
+
+    /// A one-slot queue overwrote a pending frame (the subscription side is already counted).
+    pub(crate) fn replaced(&self) {
+        self.node.record_dropped(1);
+    }
+
+    /// The frame reached nobody.
+    pub(crate) fn lost(&self) {
+        self.sub.record_dropped();
+        self.node.record_dropped(1);
+    }
+}
+
 /// The live counters of one subscription: what it got, what it lost, what it could
 /// not parse. A subscriber that reports `dropped > 0` is *working* (best-effort
 /// policy doing its job); one that reports `decode_errors > 0` is a version skew.
@@ -103,6 +154,12 @@ impl SubCounters {
 /// mid-publish (closed *or* poisoned). It is not restricted to QoS-policy drops — a frame
 /// that reached nobody is lost, whatever the reason — and the publish report plus the
 /// node-wide `metrics.dropped` count the same frames, so the two never disagree.
+///
+/// **On both transports** (round 17): a networked subscription is fed by a forwarding task,
+/// not by the broker, so its counters are moved by [`RelayCounters`] — the same three
+/// outcomes the broker records in-process. Until then the relay updated only the node's set,
+/// so a remote subscriber reported `dropped: 0` for its whole life while its queue dropped
+/// (`docs/amos-link.md` §3.18).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionStats {
     /// Frames handed to the consumer.
@@ -139,6 +196,16 @@ pub trait Transport: Send + Sync + 'static {
     /// presents the inventory must present this caveat with it.
     async fn topics_complete(&self) -> bool;
 
+    /// The counters this transport reports into — `published`/`delivered`/`dropped` are
+    /// recorded *here*, where the fact happens, so this is the set a node over this transport
+    /// must report ([`LinkNode::with_parts`](crate::node::LinkNode::with_parts)).
+    ///
+    /// The method exists so the invariant is **checkable rather than only documented**: a
+    /// node whose counters are a *different* set from its transport's reports zeros while
+    /// frames move (round 15 — that is exactly what every Zenoh node did, because nothing
+    /// outside the in-process broker recorded anything).
+    fn metrics(&self) -> Arc<LinkMetrics>;
+
     /// Which implementation this is (`"broker"`, `"zenoh"`).
     fn name(&self) -> &'static str;
 }
@@ -159,7 +226,7 @@ pub const MAX_TRACKED_TOPICS: usize = 4096;
 /// is the consumer side. Two [`Notify`]s keep the two directions independent, so a
 /// producer never spins and a consumer never misses a wake-up.
 #[derive(Debug)]
-struct LatestSlot {
+pub(crate) struct LatestSlot {
     slot: StdMutex<Option<Ingress>>,
     /// Signalled when a frame becomes available.
     filled: Notify,
@@ -217,7 +284,7 @@ impl LatestSlot {
     /// `false` means "this frame reached nobody": the slot was already occupied by a newer
     /// frame, or its lock is poisoned. Either way the caller counts a drop — a poisoned
     /// slot must not be reported as a delivery (see [`LatestSlot::try_put`]).
-    fn offer(&self, ingress: Ingress) -> bool {
+    pub(crate) fn offer(&self, ingress: Ingress) -> bool {
         let replaced = match self.slot.lock() {
             Ok(mut g) => {
                 let replaced = g.is_some();
@@ -241,7 +308,7 @@ impl LatestSlot {
     /// Bounded by construction: it waits only while the slot is provably alive. A closed
     /// slot (the consumer dropped, or the lock is poisoned) ends the call with a typed
     /// error instead of a wait nothing can end.
-    async fn offer_blocking(&self, ingress: Ingress) -> Result<bool> {
+    pub(crate) async fn offer_blocking(&self, ingress: Ingress) -> Result<bool> {
         let mut pending = Some(ingress);
         let mut waited = false;
         // Terminates when the slot is free (stored), or when it cannot ever be (closed).
@@ -428,6 +495,36 @@ impl Subscription {
             counters,
             registry: None,
         }
+    }
+
+    /// Build the **latest-only** remote subscription: a one-slot queue a forwarding task feeds
+    /// with [`LatestSlot::offer`]/[`offer_blocking`].
+    ///
+    /// This is the network twin of what [`Broker::subscribe`] builds for
+    /// [`Qos::is_latest_only`](crate::qos::Qos::is_latest_only) — and it exists because the
+    /// remote path used to be built *only* as an `mpsc`, so a `Qos::sensor()` subscription over
+    /// Zenoh was a one-frame buffer fed by a blocking task: a lagging consumer woke up holding
+    /// the **oldest** frame of its stall instead of the newest, and the frames overwritten in
+    /// between were counted nowhere (`docs/amos-link.md` §3.18). The profile's whole point —
+    /// "a consumer that was busy for 10 frames wakes up holding frame 10" — is a property of
+    /// the *sink*, so the sink has to be the same one.
+    #[cfg(feature = "zenoh")]
+    pub(crate) fn remote_latest(
+        pattern: Topic,
+        qos: Qos,
+        counters: Arc<SubCounters>,
+    ) -> (Self, Arc<LatestSlot>) {
+        let slot = LatestSlot::new(Arc::clone(&counters));
+        let subscription = Self {
+            id: 0,
+            pattern,
+            qos,
+            rx: None,
+            slot: Some(Arc::clone(&slot)),
+            counters,
+            registry: None,
+        };
+        (subscription, slot)
     }
 
     /// The per-subscription counters handle a transport wraps into its subscription.
@@ -729,6 +826,11 @@ impl Transport for Broker {
 
     async fn topics_complete(&self) -> bool {
         !self.inner.lock().await.topics_capped
+    }
+
+    /// The counters this broker writes into (see [`Transport::metrics`]).
+    fn metrics(&self) -> Arc<LinkMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     fn name(&self) -> &'static str {

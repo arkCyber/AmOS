@@ -29,7 +29,7 @@ use amos_link::robot_hal::{
     actuation_topic, ActuationState, AgentAction, BridgeEvent, EstopReason, Gait, MockRobotHal,
     MotorOp, RobotBridge, RobotHal, JOINTS,
 };
-use amos_link::sequence::{SeqEvent, SeqTracker};
+use amos_link::sequence::{SeqEvent, SeqTracker, StreamKey};
 use serde::{Deserialize, Serialize};
 
 /// The depth frame a stereo pair publishes (a stand-in for the real payload type: any
@@ -282,11 +282,15 @@ async fn a_best_effort_lag_is_visible_as_a_sequence_gap() {
     assert_eq!(summary.stale, 0);
     assert!(summary.has_loss());
     assert!(summary.loss_ratio() > 0.0);
-    // The stream is keyed by *publisher*, not by topic: `amos/dog1/…` is published here by
+    // The stream is keyed by **(publisher, topic)** — who is talking *and* on which topic —
+    // because that is what the frame stamps a counter for: `amos/dog1/…` is published here by
     // the brain node (`mini-brain`), which is exactly how a decentralized bus stays honest
-    // about who is talking.
+    // about who is talking, and the same peer's *other* topics stay separate streams.
     assert_eq!(
-        tracker.highest(&PeerId::new("mini-brain").expect("peer")),
+        tracker.highest(&StreamKey::new(
+            PeerId::new("mini-brain").expect("peer"),
+            camera.topic().clone(),
+        )),
         Some(12)
     );
     assert_eq!(tracker.streams(), 1);

@@ -920,6 +920,109 @@ WiFi·电池）连同它们的状态（每秒 tick 的定时器、`amos.settings
 **disabled + 说明性名字**（`desktop.controlCenterUnavailable`），等面板落地再恢复；
 ④模糊/观感项（玻璃感、Dock 磁吸曲线、per-app 菜单模型）仍属 G6 的设备/肉眼复核，不因拆分而消失。
 
+### 4.11.1 第二轮：五个槽位各有容器，注册表就是快捷键表（REQ-A262）
+
+上面那条"诚实边界"里的 ②（左侧组内联）、③（其余槽位）是第二轮做的；同一轮还顺手修掉了
+两类**真缺陷**——`lib/shellChrome.ts` 的注释写着"⌘Space/F4 are bound"**而 F4 从未绑定**
+（F-SH-003），以及 `DesktopShell` 听 `desktop:placeholder` **而处理器是空的**（F-SH-004）。
+
+**契约（`src/lib/shellModule.ts`）新增的纯函数**
+
+| 函数 | 作用 |
+|---|---|
+| `normalizeKey(key)` | `" "` → `"Space"`（表里写 `Space`，浏览器报 `" "`，两边归一到一处判定） |
+| `shortcutMatches(event, s)` | **严格**匹配：绑定未列出的修饰键必须缺席，`F4` 不会被 `⌘F4` 触发 |
+| `formatShortcut(s)` | 人看的标签：`⌘Space` / `⇧⌘⇥` / `F4`（Apple 修饰键顺序 ⌥⇧⌘） |
+| `shortcutAria(s)` | `aria-keyshortcuts` 的写法：`Meta+Space` / `F4` |
+| `moduleForShortcut(slot, modules, e)` | 键处理器**唯一**要调的东西：返回该键所属的注册表行（按渲染顺序，冲突因此是确定的） |
+| `overlayShortcutHint(modules, id)` | 挂件的 tooltip 提示（`⌘Space`）与 ARIA 形态，来自**同一行**；没有绑定或没有这个浮层 ⇒ `null`，不猜 |
+
+**`ShellModule` 上的三个"布局数据"字段**（这一轮加的都是**数据**，不是模板分支）
+
+| 字段 | 槽位 | 含义 |
+|---|---|---|
+| `shortcuts` | overlay | 哪些键开这个浮层（`launchpad`: `F4`；`spotlight`: `⌘Space`；`mission-control`: `F3` + `⌘Tab`）。**所有绑定都从这几行来**——键处理器查它、挂件的 tooltip/ARIA 读它，两处不可能不一致 |
+| `separatorBefore` | dock | dock 那一条分隔线画在哪一项之前（macOS：应用 │ 废纸篓）。它是数据，所以"顺序 + 分组"能在一屏里读完 |
+| `windowLabel` | dock | 这一项的"正在运行"白点看哪个**窗口标签**（`dock-finder` 是布局 id，不是窗口名，所以不能靠 id 猜） |
+
+**这一轮的文件与职责**
+
+| 文件 | 职责 |
+|---|---|
+| `src/lib/shellModule.ts` | 契约（上表）+ `modulesFor` + `ShellChromeApi`。把手这一轮**加了一个** `lockScreen()`——只有壳能做，这正是"把手由壳注入"的理由 |
+| `src/lib/shellChrome.ts` | 外观唯一处，新增 dock 瓦片（`DOCK_ITEM_TILE`）、运行点（`DOCK_RUNNING_DOT`）、分隔线、`+N` 芯片、菜单面板/菜单项（`CHROME_MENU_*`）。两个菜单（Apple 菜单、桌面右键菜单）现在共用它们 |
+| `src/svelte/shellModules.ts` | 注册表：**16 项覆盖五个槽位**（顶栏左 3 / 顶栏右 6 / 舞台 1 / dock 3 / 浮层 3） |
+| `src/svelte/TopBar.svelte` | 容器：玻璃面 + 左/右槽位。**不再持有任何状态**（`MENU_KEYS`、`amos.app_focused` 订阅都搬进了挂件） |
+| `src/svelte/modules/TopbarAppleMenu.svelte` | 🍎 + **真菜单**：系统设置…（`wm_open("settings")`）、锁定屏幕（把手 `lockScreen()`）；做不到的三条是**灰项 + 原因** |
+| `src/svelte/modules/TopbarAppName.svelte` | 当前 app 名（自己订阅 `APP_FOCUSED_KEY`；空 ⇒ `lib/version.ts` 的产品名） |
+| `src/svelte/modules/TopbarMainMenu.svelte` | 五个菜单标题：**disabled + 说明性名字**（per-app 菜单模型没有 ⇒ 不能假装有） |
+| `src/svelte/Dock.svelte` | 容器：用户 app（home layout，**不是**注册表）+ 注册表系统项 + 分隔线（数据）+ 容量/`+N` + 放大镜（**实测**每个 item 中心） |
+| `src/svelte/modules/Dock{TileButton,LaunchpadItem,FinderItem,TrashItem,AppItem}.svelte` | dock 瓦片的**一份实现**（`DockTileButton`）与四个使用者；废纸篓是灰项 |
+| `src/svelte/DesktopStage.svelte` | 容器：壁纸 + 桌面图标 + stage 槽位 + 右键菜单（三个动作两条是真的，做不到的是灰项） |
+| `src/svelte/modules/StageClock.svelte` | 舞台时钟（搬出舞台后，舞台不再每秒重渲染） |
+| `src/svelte/DesktopShell.svelte` | 桌面壳：**注入把手**（一次）+ 按注册表渲染打开的浮层 + 从注册表匹配快捷键（捕获阶段，消费即 `stopPropagation`）+ Esc 只关最上层 |
+
+**怎么加一个挂件**（三步不变，第二轮的验收标准是"五个槽位都试过"）：在 `modules/` 写组件
+（需要动作时 `getContext(SHELL_CHROME_API)` 拿把手）→ 在 `shellModules.ts` 加一行（id / slot /
+order / titleKey / testId，必要时 `shortcuts` / `separatorBefore` / `windowLabel`）→ 两个 locale 加
+`titleKey`。**不需要**改任何容器。
+
+**怎么加一个快捷键**：在对应的浮层行加一个 `shortcuts` 条目。**只有这一处**——键处理器、
+tooltip、`aria-keyshortcuts` 都读它。
+
+**门禁怎么钉住它**：`unwired-scan`（每个模块必须被注册表引用、每个 lib 导出必须有生产调用点）、
+`i18n-scan`（`titleKey` 与菜单文案必须解析且中英齐备，**死键会被报出**——本轮因此删掉了随废纸篓与
+「新建文件夹」一起失用的 `desktop.trash` / `desktop.ctxNewFolder`）、`store-scan`、`write-scan`，
+外加 `shellModule.test.ts`（不变量 + **每个槽位非空** + 绑定唯一 + 匹配集合恰为
+`F3/F4/Meta+Space/Meta+Tab` + 标签来自同一行）、`chrome-widgets.svelte.test.ts` /
+`dock-widgets.svelte.test.ts`（**每个挂件单独挂载**）、`topbar-container.svelte.test.ts`
+（容器自身 markup 只有两个槽位）、`desktop-shell.svelte.test.ts`（**端到端**：触发器的点击、
+Apple 菜单的真动作、F4/F3 的开合、Esc 只关最上层、右键菜单的可点/灰项）。
+
+**这一轮的诚实边界**：①放大镜**曲线没动**（仍是线性 `dockIconScale`，其余常数也没变）——本轮只是
+让"改曲线"变成一处改动（函数 + token），磁吸手感仍是肉眼项；②Apple 菜单有 Escape / 点外部关闭，
+**没有**方向键导航与子菜单；③F3/F4 会不会被宿主或 WebView 先截获（浏览器把 F3 当"查找下一个"）
+只能在真机上验证；④per-app 菜单模型、玻璃感、桌面状态行去留、多窗口真机 e2e 仍是 G6 项；
+⑤第三方挂件（P3：清单校验 + 能力白名单 + 安全评审）未做；⑥**可见变化如实列出**：主菜单五个标题变灰、
+Dock 废纸篓变灰、右键「新建文件夹」变灰、Apple 菜单会弹出、F4/F3 生效、左上角产品名由 `Amos`
+改为 `version.ts` 的 `AmOS`。
+
+### 4.11.2 第三轮：控制中心落地，以及"规则"与"视图"的分界（REQ-A263）
+
+第三轮从一个面板开始（顶栏 ⚙️ 一直是个灰按钮），但**第一件事是修掉挡在它前面的重复**：同一套
+"点一下无线电开关"的规则当时写在两个组件里，而两个屏的行为已经不一致（只有通知中心知道"这个开关
+平台接管了"）。如果直接加面板，就会变成三份。
+
+**规则的唯一处：`src/lib/quickRadio.ts`**
+
+| 导出 | 作用 |
+|---|---|
+| `RadioCommands` / `HOST_RADIO_COMMANDS` | 命令是**端口**：`set` / `status` / `control` / `openSettings`。真实实现就是原来的四条 `radio_*`；测试注入假端口，于是**每条分支**都能在没有宿主的情况下跑 |
+| `tapRadio(input) → RadioTapOutcome` | 一次点击的**全部**规则：飞行模式闸门（`gated`）、无宿主走本地策略（`offline`）、平台接管的开关**只送到系统设置**（`managed`）、写入成功则以设备快照为准（`applied`）、被拒绝显示设备状态但不落 store（`refused`）、命令失败就重读（`unread`） |
+| `RadioTapOutcome.persist` | 一条规则：**只有设备确认过的写才落 store**（`applied` / `offline`）。`refused` / `unread` 只显示设备当前状态——把没被接受的写持久化会抹掉屏幕正在解释的原因（REQ-A203） |
+| `syncQuickRadios` / `readManagedSwitches` / `openRadioSettings` | 挂载时的设备真值、平台所有权的询问、系统界面的打开（都带端口参数） |
+
+**"规则"与"视图"的分界**：三个屏（桌面控制中心 / 通知中心 / 设置）各自保留措辞、布局与状态，
+**共用的只有规则**。把视图也统一是另一轮的事，本轮不做、也不假装做了。
+
+**浮层与把手（第三轮新增）**
+
+| 能力 | 为什么要成对 |
+|---|---|
+| `toggleOverlay(id)` | macOS 的菜单栏项是**同一个点击开/关**；只能打开的触发器会留下一个用户无法用同样方式关掉的面板 |
+| `isOverlayOpen(id)` | 只读，喂 `aria-expanded`。一个面板开着而控件不说自己在开着，和"不可用控件假装可用"是同一族缺陷（F-SH-006） |
+
+**层的顺序**：壳按**打开顺序**包层并给 `z-index = 100 + index`（包裹层 `pointer-events-none`，
+命中区仍归各浮层）。此前每个浮层自带写死的 `z-index`，"后打开的在上"只在恰好对上那对组合时成立。
+
+**几何归属（第三轮）**：桌面图标栅格的 6 个常量与 2 个纯函数搬进 `lib/desktopLayout.ts`
+（舞台此前是**唯一**还在模板里算几何的界面，同一个 80/24 写了两遍）。**数值一个没改**；
+"这些数字该是多少"仍是未决的产品决定（见 `docs/multi-window.md` §1.5），但从此只有一处可改。
+
+**怎么加一个面板**（这套拆分第三次兑现）：写组件（`svelte/`）→ 注册表加一行（slot `overlay`，
+可以**没有** `shortcuts`，如控制中心）→ 触发器调 `toggleOverlay(id)` 并用 `isOverlayOpen(id)` 报状态。
+`ControlCenterButton` 从"灰按钮"变回真开关，改动就是这一个文件加注册表一行。
+
 ## 5. Shell 路由：桌面 vs. 手机
 
 `Shell.svelte` 根据 `LayoutSnapshot.form` 选择渲染哪个 Shell：

@@ -221,6 +221,7 @@
 ### 10.2 同轮查出并修掉的缺陷
 
 1. **Dock 的可访问名吐的是 i18n key**：`label: appTitleKey(id)` ⇒ 读屏软件念 `app.clock`；系统项 `Launchpad`/`Finder`/`Trash` 是英文硬编码。现在全部走 `t()`（新增 `desktop.finder`/`desktop.trash`/`desktop.appleMenu`/`desktop.mainMenu`/`desktop.menu.*`/`desktop.dockOverflow*`）。
+   —— *后续（REQ-A262）*：`desktop.trash` 已被 `desktop.trashUnavailable` 取代（废纸篓是**灰项**：没有废纸篓视图，不能假装点了会开），`desktop.ctxNewFolder` 同理改为 `desktop.ctxNewFolderUnavailable`；两个旧键已从字典删除（`i18n-scan` 的死键门禁要求如此）。
 2. **分隔线画在废纸篓之后**（Dock 唯一的分组视觉是错的）→ 改为「用户 app + 启动台/访达 ‖ 废纸篓」。
 3. **`SpotlightOverlay` 的 `$effect` 嵌套在另一个 `$effect` 里**（Svelte 5 不推荐、依赖图错误）→ 收敛为单个 effect。
 4. **交互内容被 `aria-hidden="true"`**（读屏用户看不到对话框）→ 外层 `role="presentation"`、内层 `role="dialog"`+`aria-modal`+`aria-label`+`tabindex="-1"`，Esc 在背景板上也真的关闭；`MissionControl` 同样补上对话框语义。

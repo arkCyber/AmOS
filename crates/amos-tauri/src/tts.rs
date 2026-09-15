@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use amos_int::language::Language;
+use amos_int::language::{Language, MAX_LANG_TAG_BYTES};
 #[cfg(feature = "piper-tts")]
 use amos_tts::PiperProvider;
 use amos_tts::{MockTtsProvider, TtsProvider};
@@ -23,6 +23,15 @@ pub struct TtsAudioPayload {
     pub channels: u16,
     pub samples: Vec<f32>,
 }
+
+/// Maximum bytes in a TTS text input handed in via `tts_synthesize`.
+///
+/// Real TTS inputs are one utterance / one translated sentence (≤ 2 KiB). A
+/// 32 KiB cap mirrors `MAX_AI_PROMPT_BYTES` and `MAX_INTERPRET_TEXT_BYTES`
+/// and keeps a single TTS call bounded by a sensible upper bound (Piper / onnx
+/// memory is per-phoneme; a paste-sized text input would tip past seconds of
+/// audio and balloon the response payload sent to the WebView).
+pub const MAX_TTS_TEXT_BYTES: usize = 32 << 10;
 
 /// App-managed TTS backend.
 pub struct TtsBridge {
@@ -90,7 +99,20 @@ pub async fn tts_synthesize(
     text: String,
     lang: Option<String>,
 ) -> Result<TtsAudioPayload, String> {
-    let lang = Language::new(lang.unwrap_or_else(|| "zh".to_string()));
+    if text.len() > MAX_TTS_TEXT_BYTES {
+        return Err(format!(
+            "tts text too long: {} bytes (max {MAX_TTS_TEXT_BYTES})",
+            text.len()
+        ));
+    }
+    let lang_raw = lang.unwrap_or_else(|| "zh".to_string());
+    if lang_raw.len() > MAX_LANG_TAG_BYTES {
+        return Err(format!(
+            "tts lang too long: {} bytes (max {MAX_LANG_TAG_BYTES})",
+            lang_raw.len()
+        ));
+    }
+    let lang = Language::new(lang_raw);
     let audio = state
         .provider
         .synthesize(&text, &lang)

@@ -109,7 +109,15 @@ impl Heartbeat {
 }
 
 /// Everything the node can say about itself, in one value.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// The JSON document this renders (`to_json`) is the CLI's `status`, and it speaks the control
+/// plane's vocabulary: a **flat** peer table (the same keys as `proto.Peer`) and a verdict whose
+/// reasons are [`HealthReason::detail`] tokens.
+///
+/// `Serialize`-only: a status is produced by a node and read by a human or a script; nothing in
+/// the workspace turns a document back into a `NodeStatus`, and claiming a round-trip for a
+/// rendering is how the old peer/verdict shapes stayed alive.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct NodeStatus {
     /// This node's id.
     pub peer: PeerId,
@@ -382,5 +390,70 @@ mod tests {
             beacons.len(),
             "same shape, one segment deeper"
         );
+    }
+
+    /// The status document — the JSON a machine reads from `status` — carries the **same two
+    /// vocabularies** the control plane and the CLI already speak: a flat peer table (the proto's
+    /// `Peer`) and a verdict whose reasons are the `detail()` tokens. Before this, the document
+    /// was the *only* producer using a different spelling for both, so a script that read a
+    /// remote `status` and a local `status` had to handle two shapes.
+    #[test]
+    fn the_status_document_speaks_the_control_planes_peer_and_verdict_shapes() {
+        use crate::discovery::{NodeKind, PeerId, PeerInfo, PeerView};
+        use crate::health::{HealthReason, LinkHealth};
+        use crate::metrics::MetricsSnapshot;
+
+        let mut snapshot = MetricsSnapshot {
+            published: 4,
+            delivered: 4,
+            ..Default::default()
+        };
+        snapshot.decode_errors = 2;
+        let status = NodeStatus {
+            peer: PeerId::new("amos-daemon").expect("peer"),
+            kind: NodeKind::Tool,
+            version: "0.1.0".to_string(),
+            uptime_ms: 1_500,
+            clock_synced: false,
+            metrics: snapshot,
+            health: LinkHealth::Degraded {
+                reasons: vec![HealthReason::DecodeErrors { count: 2 }],
+            },
+            peers: vec![PeerView {
+                info: PeerInfo::new(PeerId::new("dog1").expect("peer"), NodeKind::Robot)
+                    .with_endpoint("udp/10.0.0.9:7446"),
+                last_seen_ms: 12,
+                beacons: 3,
+            }],
+            topics: vec!["amos/dog1/telemetry/beat".to_string()],
+            topics_complete: true,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&status.to_json().expect("json")).expect("json");
+
+        // The peer table: the proto's `Peer`, not a nested `info` wrapper.
+        assert_eq!(
+            value["peers"][0],
+            serde_json::json!({
+                "id": "dog1",
+                "kind": "robot",
+                "endpoint": "udp/10.0.0.9:7446",
+                "last_seen_ms": 12,
+                "beacons": 3,
+            })
+        );
+
+        // The verdict: a state plus the same tokens the proto's `health_reasons` carries.
+        assert_eq!(value["health"]["state"], "degraded");
+        assert_eq!(
+            value["health"]["reasons"],
+            serde_json::json!(["decode_errors=2"]),
+            "a reason's JSON is its `detail()` token"
+        );
+
+        // The counters and the inventory's own limit travel unchanged (the two fields this
+        // round does not touch, asserted so a refactor cannot quietly drop them).
+        assert_eq!(value["metrics"]["decode_errors"], 2);
+        assert_eq!(value["topics_complete"], true);
     }
 }

@@ -32,6 +32,23 @@ use amos_appstore::{
 use serde::Serialize;
 use tauri::State;
 
+/// Maximum bytes in an appstore app id handed in by the WebView.
+///
+/// The id is appended to `<install-root>/` to form the on-disk install directory,
+/// so any caller-supplied id is also a **path segment** (and ".." / absolute paths
+/// would escape the install root). The same `AppManifest::valid_id` rule that
+/// gates installs is enforced here at the command seam — installs use the same
+/// validator internally, but `appstore_uninstall` and `appstore_upgrade` accept a
+/// bare id and previously had no equivalent guard.
+pub const MAX_APPSTORE_ID_BYTES: usize = 128;
+
+/// Upper bound on the `appstore_search` query string.
+///
+/// Real queries are 1–3 keywords (`"pomodoro"`, `"note markdown"`); 256 B is
+/// comfortably above any plausible value and tight enough that a paste-sized
+/// caller cannot inflate the catalog RPC.
+pub const MAX_APPSTORE_QUERY_BYTES: usize = 256;
+
 #[cfg(feature = "appstore-live")]
 use amos_appstore::HttpStoreProvider;
 
@@ -310,6 +327,14 @@ pub async fn appstore_search(
     state: State<'_, StoreBridge>,
     query: String,
 ) -> Result<Vec<AppManifest>, String> {
+    // Bound the query at the seam — a paste-sized caller would inflate every
+    // search round-trip to the catalog.
+    if query.len() > MAX_APPSTORE_QUERY_BYTES {
+        return Err(format!(
+            "appstore search query too long: {} bytes (max {MAX_APPSTORE_QUERY_BYTES})",
+            query.len()
+        ));
+    }
     state.store.search(&query).await.map_err(|e| e.to_string())
 }
 
@@ -342,6 +367,7 @@ pub async fn appstore_status(
     state: State<'_, StoreBridge>,
     id: String,
 ) -> Result<AppStatus, String> {
+    check_appstore_id(&id)?;
     state.store.status(&id).await.map_err(|e| e.to_string())
 }
 
@@ -351,6 +377,7 @@ pub async fn appstore_install(
     state: State<'_, StoreBridge>,
     id: String,
 ) -> Result<InstalledApp, String> {
+    check_appstore_id(&id)?;
     let app = state.store.install(&id).await.map_err(|e| e.to_string())?;
     state.persist_best_effort();
     Ok(app)
@@ -362,6 +389,7 @@ pub async fn appstore_upgrade(
     state: State<'_, StoreBridge>,
     id: String,
 ) -> Result<InstalledApp, String> {
+    check_appstore_id(&id)?;
     let app = state.store.upgrade(&id).await.map_err(|e| e.to_string())?;
     state.persist_best_effort();
     Ok(app)
@@ -370,8 +398,41 @@ pub async fn appstore_upgrade(
 /// Uninstall `id`.
 #[tauri::command]
 pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> Result<(), String> {
+    check_appstore_id(&id)?;
     state.store.uninstall(&id).map_err(|e| e.to_string())?;
     state.persist_best_effort();
+    Ok(())
+}
+
+/// Bound the caller-supplied app id at the command seam and refuse path-segment
+/// metacharacters (`..` / `/` / `\`) so an id cannot escape `<install-root>/`.
+/// Mirrors the same `valid_id` rule the install/upgrade paths use internally —
+/// exposes it here so a UI bug cannot slip an unvalidated id to the on-disk
+/// `dir_for(id)` join in `webinstall`.
+fn check_appstore_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("appstore id is empty".to_string());
+    }
+    if id.len() > MAX_APPSTORE_ID_BYTES {
+        return Err(format!(
+            "appstore id too long: {} bytes (max {MAX_APPSTORE_ID_BYTES})",
+            id.len()
+        ));
+    }
+    // A reverse-DNS id is `[a-z0-9._-]`; reject any path separator or
+    // `..` segment up front so a paste attack cannot turn an app id into
+    // a directory traversal payload.
+    if id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+        || id == "."
+        || id == ".."
+        || id.starts_with("../")
+        || id.contains("/../")
+        || id.ends_with("/..")
+    {
+        return Err(format!("appstore id is not a valid id: {id:?}"));
+    }
     Ok(())
 }
 
@@ -490,7 +551,30 @@ pub fn protocol_response(reply: ProtocolReply) -> tauri::http::Response<Vec<u8>>
 /// outside the window can read.
 #[tauri::command]
 pub fn csp_probe(report: String) {
-    eprintln!("[csp-probe] {report}");
+    // Bound the report at the command seam: an empty / paste-sized `report`
+    // would either be silently dropped by the shell's stderr buffer (a real
+    // CSP violation report itself is < 1 KiB) or flood the diagnostic log.
+    const MAX_CSP_REPORT_BYTES: usize = 16 << 10;
+    if report.is_empty() {
+        return;
+    }
+    let preview = if report.len() > MAX_CSP_REPORT_BYTES {
+        // We deliberately keep the head of the violation — the violated-directive
+        // / blocked-uri fields live in the first bytes; truncating there keeps
+        // the diagnostic signal while bounding the log volume.
+        let mut end = MAX_CSP_REPORT_BYTES;
+        while !report.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            "{}… <truncated {} bytes>",
+            &report[..end],
+            report.len() - end
+        )
+    } else {
+        report
+    };
+    eprintln!("[csp-probe] {preview}");
 }
 
 /// The base URL the WebView must use to reach the PWA index on **this** platform
@@ -967,5 +1051,59 @@ mod tests {
         assert!(String::from_utf8_lossy(&no_root.body).contains("AMOS_APPSTORE_INSTALL_DIR"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `check_appstore_id` seam is the single place that decides whether an
+    /// id may proceed to the on-disk `dir_for(id)` join. The unit tests below
+    /// pin down what is (and is not) acceptable, so a future relaxation is a
+    /// conscious change rather than a silent drift toward "anything goes".
+    #[test]
+    fn check_appstore_id_accepts_well_formed_ids() {
+        for ok in [
+            "org.amos.pomodoro",
+            "a",
+            "a-b_c.d",
+            "com.example.My_App-1",
+            "x".repeat(MAX_APPSTORE_ID_BYTES).as_str(),
+        ] {
+            assert!(
+                check_appstore_id(ok).is_ok(),
+                "legitimate id {ok:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn check_appstore_id_rejects_path_traversal() {
+        // Without this refusal, `dir_for(id)` would escape the install root.
+        for evil in [
+            "..",
+            "../etc",
+            "../etc/passwd",
+            "..\\etc\\passwd",
+            "../../../root/.ssh",
+            "a/b",
+            "a\\b",
+            "/etc",
+            "good/../bad",
+            "good/..",
+            "good/../bad/x",
+        ] {
+            assert!(
+                check_appstore_id(evil).is_err(),
+                "path-traversal-shaped id {evil:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn check_appstore_id_rejects_empty_and_oversized() {
+        assert!(check_appstore_id("").is_err(), "empty id must be refused");
+        let huge = "x".repeat(MAX_APPSTORE_ID_BYTES + 1);
+        assert!(
+            check_appstore_id(&huge).is_err(),
+            "id past MAX_APPSTORE_ID_BYTES must be refused"
+        );
+        assert!(check_appstore_id("x\0y").is_err(), "NUL must be refused");
     }
 }

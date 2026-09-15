@@ -1,7 +1,9 @@
 <script lang="ts">
   // Launchpad.svelte — macOS Launchpad 全屏覆盖层。
   //
-  // 桌面形态下，由 Dock 的"Launchpad"图标点击触发（DesktopShell 传 `on:launchpad`）。
+  // 桌面形态下，它是一个**注册表里的浮层**：`shellModules.ts` 的 `launchpad` 行（F4）决定
+  // 它什么时候被渲染，`DesktopShell` 渲染它并把 `onclose` 传进来。入口有三个（顶栏 🚀、
+  // Dock 🚀、F4），三个都汇到壳的同一个意图上。
   // 不创建新的 OS 窗口，而是作为 DesktopShell 内部的浮层叠加（`z-50`）。
   //
   // 行为：
@@ -11,7 +13,7 @@
   //   - 编辑模式：点击"编辑"按钮 → app 图标出现减号，点击可从 Dock 隐藏
   //
   // 数据：实时读 home layout（page + dock，去重） → APP_META 元信息。
-  import { createEventDispatcher, onMount } from "svelte";
+  import { onMount } from "svelte";
   import { invoke } from "../lib/backend";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import { LAYOUT_KEY, type HomeLayout, getLayout, saveLayout } from "../lib/amosStore";
@@ -21,7 +23,11 @@
   import { wmLayoutSnapshot } from "../lib/wm";
   import { createStoreValue } from "./store";
 
-  const dispatch = createEventDispatcher<{ close: void }>();
+  // 关闭由**壳**决定：浮层从注册表渲染（`DesktopShell`），壳把 `onclose` 传进来。
+  // 旧写法是 `createEventDispatcher` + `on:close`，而注册表驱动的渲染无法为每一行
+  // 单独绑定事件——而且 Svelte 5 里 `$on()` 已移除，测试也订阅不到。改成 props 之后
+  // 浮层可以脱离壳单独挂载（这正是"每个浮层可独立交付"的前提）。
+  let { onclose }: { onclose?: () => void } = $props();
 
   // ─── 布局参数（自适配窗口尺寸）──────────────────────────────────────────────
   // Start from the module's documented defaults (the wide-screen design values),
@@ -95,7 +101,7 @@
     } catch {
       /* ignore */
     }
-    dispatch("close");
+    onclose?.();
   }
 
   // ─── 隐藏 app（编辑模式：从 home layout 中删除，落盘）───────────────────────
@@ -112,7 +118,7 @@
   // ─── 键盘处理：Esc 关闭 ───────────────────────────────────────────────────
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {
-      dispatch("close");
+      onclose?.();
     }
   }
 
@@ -133,6 +139,7 @@
 -->
 <div
   class="pointer-events-none fixed inset-0 z-50 flex flex-col overflow-hidden"
+  data-testid="launchpad-overlay"
   style="
     background: rgba(15, 15, 15, 0.92);
     backdrop-filter: blur(40px) saturate(200%);
@@ -145,7 +152,7 @@
     role="presentation"
     aria-hidden="true"
     onclick={(e) => {
-      if (e.target === e.currentTarget) dispatch("close");
+      if (e.target === e.currentTarget) onclose?.();
     }}
     onkeydown={() => { /* no-op; close via keyboard is handled at the document level */ }}
   ></div>

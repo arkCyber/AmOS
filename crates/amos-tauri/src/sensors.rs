@@ -17,9 +17,35 @@ use amos_proto::amos_sensor::{
 };
 use serde::Serialize;
 
+use crate::error::{AmosError, ErrorCode};
+
 async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
+
+/// Wire vocabulary for the sensor bridge. The UI i18n layer branches on these;
+/// renaming a variant is a wire break.
+pub mod codes {
+    /// Caller asked for a sensor mode the daemon does not know.
+    pub const UNKNOWN_MODE: &str = "amos.sensors.unknown_mode";
+    /// Caller asked for a sensor kind the daemon does not know.
+    pub const UNKNOWN_KIND: &str = "amos.sensors.unknown_kind";
+    /// Caller asked for a stream rate outside the supported range.
+    pub const RATE_OUT_OF_RANGE: &str = "amos.sensors.rate_out_of_range";
+    /// Any sensor RPC failed (daemon unreachable / rejected).
+    pub const RPC_FAILED: &str = "amos.sensors.rpc_failed";
+}
+
+/// Upper bound on a single sensor stream's `rate_hz`.
+///
+/// Real camera/IMU streams run at 30–200 Hz; 4 KiB-class numbers are a caller
+/// bug (or a probe of "what happens if I pass u32::MAX"). The cap is well
+/// above any legitimate value but small enough to refuse the pathological one.
+pub const MAX_SENSOR_RATE_HZ: u32 = 4_096;
+
+/// Lower bound on a stream's `rate_hz`. Zero is not a meaningful "off" — it
+/// asks the daemon to do a div-by-zero in any periodic accounting.
+pub const MIN_SENSOR_RATE_HZ: u32 = 1;
 
 /// Serializable one-camera summary (prost structs are not `Serialize`).
 #[derive(Clone, Debug, Serialize)]
@@ -189,29 +215,56 @@ pub async fn sensor_snapshot() -> Result<SensorSnapshot, String> {
 }
 
 /// Switch the daemon energy mode (`performance` | `balanced` | `power_save`).
+///
+/// Returns a typed [`AmosError`] so the UI i18n layer can branch on
+/// [`ErrorCode::SensorsUnknownMode`] / [`ErrorCode::SensorsRpcFailed`].
 #[tauri::command]
-pub async fn sensor_set_mode(mode: String) -> Result<String, String> {
-    let proto_mode = mode_from_str(&mode)
-        .ok_or_else(|| format!("unknown sensor mode '{mode}' (performance|balanced|power_save)"))?;
-    let mut client = SensorClient::new(build_channel().await?);
+pub async fn sensor_set_mode(mode: String) -> Result<String, AmosError> {
+    let proto_mode = mode_from_str(&mode).ok_or_else(|| {
+        AmosError::new(
+            ErrorCode::SensorsUnknownMode,
+            format!("unknown sensor mode '{mode}' (performance|balanced|power_save)"),
+        )
+    })?;
+    let mut client =
+        SensorClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::SensorsRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let reply = client
         .set_mode(SetModeRequest { mode: proto_mode })
         .await
-        .map_err(|e| format!("sensor set_mode failed: {e}"))?
+        .map_err(|e| AmosError::with_cause(ErrorCode::SensorsRpcFailed, codes::RPC_FAILED, e))?
         .into_inner();
     Ok(mode_label(reply.mode))
 }
 
 /// Ask the daemon to allow a continuous stream (`kind` = camera|gnss|imu).
+///
+/// The `rate_hz` argument is bounded by [`MIN_SENSOR_RATE_HZ`] /
+/// [`MAX_SENSOR_RATE_HZ`] — out-of-range is refused with a typed error so the
+/// caller can render an honest "rate out of range" without parsing the message.
 #[tauri::command]
-pub async fn sensor_acquire(kind: String, rate_hz: u32) -> Result<SensorAcquireResult, String> {
-    let kind = kind_from_str(&kind)
-        .ok_or_else(|| format!("unknown sensor kind '{kind}' (camera|gnss|imu)"))?;
-    let mut client = SensorClient::new(build_channel().await?);
+pub async fn sensor_acquire(kind: String, rate_hz: u32) -> Result<SensorAcquireResult, AmosError> {
+    let kind = kind_from_str(&kind).ok_or_else(|| {
+        AmosError::new(
+            ErrorCode::SensorsUnknownKind,
+            format!("unknown sensor kind '{kind}' (camera|gnss|imu)"),
+        )
+    })?;
+    if !(MIN_SENSOR_RATE_HZ..=MAX_SENSOR_RATE_HZ).contains(&rate_hz) {
+        return Err(AmosError::new(
+            ErrorCode::SensorsRateOutOfRange,
+            format!("rate_hz {rate_hz} outside [{MIN_SENSOR_RATE_HZ}, {MAX_SENSOR_RATE_HZ}]"),
+        ));
+    }
+    let mut client =
+        SensorClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::SensorsRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let reply = client
         .acquire_stream(AcquireRequest { kind, rate_hz })
         .await
-        .map_err(|e| format!("sensor acquire_stream failed: {e}"))?
+        .map_err(|e| AmosError::with_cause(ErrorCode::SensorsRpcFailed, codes::RPC_FAILED, e))?
         .into_inner();
     Ok(SensorAcquireResult {
         allowed: reply.allowed,
@@ -319,5 +372,47 @@ mod tests {
         assert_eq!(p.accel_x, 0.0);
         assert_eq!(p.accel_y, 0.0);
         assert_eq!(p.accel_z, 0.0);
+    }
+
+    #[test]
+    fn sensor_codes_are_stable_string_keys() {
+        assert_eq!(codes::UNKNOWN_MODE, "amos.sensors.unknown_mode");
+        assert_eq!(codes::UNKNOWN_KIND, "amos.sensors.unknown_kind");
+        assert_eq!(codes::RATE_OUT_OF_RANGE, "amos.sensors.rate_out_of_range");
+        assert_eq!(codes::RPC_FAILED, "amos.sensors.rpc_failed");
+    }
+
+    #[test]
+    fn sensor_rate_bounds_are_sane_for_real_streams() {
+        // Real streams run 30–200 Hz; the cap is well above that but refuses
+        // the u32::MAX probe (a div-by-zero or "what if I pass max" canary).
+        assert!(MIN_SENSOR_RATE_HZ >= 1);
+        assert!(MAX_SENSOR_RATE_HZ >= 1000, "real high-rate streams fit");
+        assert!(MAX_SENSOR_RATE_HZ < u32::MAX, "pathological max refused");
+        // The window is inclusive on both ends.
+        assert!((MIN_SENSOR_RATE_HZ..=MAX_SENSOR_RATE_HZ).contains(&30));
+        assert!((MIN_SENSOR_RATE_HZ..=MAX_SENSOR_RATE_HZ).contains(&200));
+        // Outside the window: refused.
+        assert!(!((MIN_SENSOR_RATE_HZ..=MAX_SENSOR_RATE_HZ).contains(&0)));
+        assert!(!((MIN_SENSOR_RATE_HZ..=MAX_SENSOR_RATE_HZ).contains(&u32::MAX)));
+    }
+
+    #[test]
+    fn the_kind_and_mode_strings_cover_every_known_legitimate_value() {
+        // The kind/mode enums have a closed set; anything else is an
+        // honest "unknown" (the daemon returns `mode=99` for new unrecognised
+        // values, never a fake label).
+        for label in ["performance", "balanced", "power_save"] {
+            assert!(mode_from_str(label).is_some());
+        }
+        assert_eq!(mode_from_str("turbo"), None);
+
+        for kind in ["camera", "gnss", "imu"] {
+            assert!(kind_from_str(kind).is_some());
+        }
+        assert_eq!(kind_from_str("barometer"), None);
+        // And the unknown bit round-trips as "unknown" so the UI never shows
+        // a stale label.
+        assert_eq!(mode_label(99), "unknown");
     }
 }

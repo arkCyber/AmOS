@@ -16,11 +16,19 @@
 //!                    └─────────────────────────────────────────────────┘
 //! ```
 //!
-//! [`Qos::sensor`] is the "latest sample wins" profile (`DropOldest` + depth 1): the
-//! broker keeps exactly one slot per subscriber and overwrites it, so a consumer that
+//! [`Qos::sensor`] is the "latest sample wins" profile (`DropOldest` + depth 1): **every
+//! transport** keeps exactly one slot per subscriber and overwrites it, so a consumer that
 //! was busy for 10 frames wakes up holding frame 10 — never a backlog of 10 stale
 //! ones. [`Qos::control`] is the opposite: reliable, 64 deep, and a slow actuator
 //! back-pressures the publisher instead of silently losing a set point.
+//!
+//! **QoS is a property of the subscription, not of one transport** (`docs/amos-link.md`
+//! §3.18, round 17). That sentence used to say "the broker keeps exactly one slot", and the
+//! qualifier was hiding a real difference: `ZenohTransport` built *every* remote subscription
+//! as a bounded queue fed by a blocking relay, so a `Qos::sensor()` consumer on a network link
+//! woke up holding the **oldest** frame of its stall and the overwritten ones were counted
+//! nowhere. The sink is now chosen by the profile on both transports (`Broker::subscribe`,
+//! `Subscription::remote_latest`), and the drop counting follows it.
 //!
 //! `DropOldest` with a depth > 1 is refused by [`Qos::validate`] rather than silently
 //! behaving like `DropNewest` — the honest option, since overwriting only makes sense

@@ -24,6 +24,26 @@ async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
 
+/// Maximum bytes in a `rag_index` passage.
+///
+/// Real indexed chunks are RAG-sized paragraphs / note bodies (~1–8 KiB). A
+/// 4 MiB ceiling is two orders of magnitude above that and prevents a
+/// malicious UI from handing the daemon a 100 MiB blob to embed + persist.
+pub const MAX_RAG_TEXT_BYTES: usize = 4 << 20;
+
+/// Maximum bytes in a `rag_index` / `rag_remove` id.
+///
+/// Indexed ids are note slugs; 256 B is well above any realistic id and bounds
+/// the daemon's per-id storage index.
+pub const MAX_RAG_ID_BYTES: usize = 256;
+
+/// Maximum bytes in a `rag_query` query string.
+///
+/// A query is a sentence the embedder turns into one vector — 4 KiB is plenty
+/// (longer than any natural-language retrieval query), and tight enough that
+/// the daemon's embedder cannot be wedged by a paste-sized payload.
+pub const MAX_RAG_QUERY_BYTES: usize = 4 << 10;
+
 /// Serializable mirror of one daemon `RagStatusReply`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RagStatusOut {
@@ -91,6 +111,19 @@ fn to_query(r: &RagQueryReply) -> RagQueryOut {
 /// Index (or re-index on edit) a passage under an id in the daemon.
 #[tauri::command]
 pub async fn rag_index(id: String, text: String) -> Result<RagIndexOut, String> {
+    // Bound at the command seam — same rationale as `ask_ai_agent`'s prompt cap.
+    if id.len() > MAX_RAG_ID_BYTES {
+        return Err(format!(
+            "rag id too long: {} bytes (max {MAX_RAG_ID_BYTES})",
+            id.len()
+        ));
+    }
+    if text.len() > MAX_RAG_TEXT_BYTES {
+        return Err(format!(
+            "rag text too long: {} bytes (max {MAX_RAG_TEXT_BYTES})",
+            text.len()
+        ));
+    }
     let mut client = RagClient::new(build_channel().await?);
     let reply = client
         .index(RagIndexRequest { id, text })
@@ -106,6 +139,12 @@ pub async fn rag_index(id: String, text: String) -> Result<RagIndexOut, String> 
 /// Drop an indexed passage from retrieval in the daemon.
 #[tauri::command]
 pub async fn rag_remove(id: String) -> Result<RagRemoveOut, String> {
+    if id.len() > MAX_RAG_ID_BYTES {
+        return Err(format!(
+            "rag id too long: {} bytes (max {MAX_RAG_ID_BYTES})",
+            id.len()
+        ));
+    }
     let mut client = RagClient::new(build_channel().await?);
     let reply = client
         .remove(RagRemoveRequest { id })
@@ -120,6 +159,12 @@ pub async fn rag_remove(id: String) -> Result<RagRemoveOut, String> {
 /// Retrieve the nearest indexed passages to `query` (embed + top-k in the daemon).
 #[tauri::command]
 pub async fn rag_query(query: String, top_k: u32) -> Result<RagQueryOut, String> {
+    if query.len() > MAX_RAG_QUERY_BYTES {
+        return Err(format!(
+            "rag query too long: {} bytes (max {MAX_RAG_QUERY_BYTES})",
+            query.len()
+        ));
+    }
     let mut client = RagClient::new(build_channel().await?);
     let reply = client
         .query(RagQueryRequest { query, top_k })

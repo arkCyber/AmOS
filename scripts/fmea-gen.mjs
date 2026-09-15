@@ -71,6 +71,20 @@ const KNOWN_FAILURES = [
   // 桌面壳 chrome (前端): 模块契约与"可用性=真行为"
   { id: 'F-SH-001', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/ControlCenterButton.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/modules/ChromeIconButton.svelte'], markers: ['disabled', 'aria-disabled'], severity: 2 },
   { id: 'F-SH-002', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/shellModules.ts', 'crates/amos-tauri/frontend-ts/src/lib/shellModule.ts'], markers: ['modulesFor', 'slot'], severity: 2 },
+  // REQ-A262: "声称的能力" 与 "真的能力" 必须一致 —— 快捷键不再是注释里的承诺
+  { id: 'F-SH-003', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/shellModule.ts', 'crates/amos-tauri/frontend-ts/src/svelte/shellModules.ts'], markers: ['moduleForShortcut', 'shortcuts'], severity: 2 },
+  // REQ-A262: 跨组件通道的目的端不能是空的 —— 两条 desktop:* window 事件已删,意图走把手
+  { id: 'F-SH-004', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopStage.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/DesktopShell.svelte'], markers: ['ctxNewFolderUnavailable', 'SHELL_CHROME_API'], severity: 2 },
+  // REQ-A263: 同一套设备交互规则不能有第二份实现 —— 三个屏共用 lib/quickRadio.ts
+  { id: 'F-SH-005', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/quickRadio.ts', 'crates/amos-tauri/frontend-ts/src/svelte/ControlCenter.svelte'], markers: ['tapRadio', 'RadioCommands'], severity: 3 },
+  // REQ-A263: 开关型控件必须成对 —— 能开也能关,并且说得出自己的状态
+  { id: 'F-SH-006', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/shellModule.ts', 'crates/amos-tauri/frontend-ts/src/svelte/modules/ControlCenterButton.svelte'], markers: ['toggleOverlay', 'isOverlayOpen'], severity: 2 },
+  // REQ-A263: 浮层层序按打开顺序,而不是组件里写死的 z-index
+  { id: 'F-SH-007', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopShell.svelte'], markers: ['openOverlays', 'z-index'], severity: 2 },
+  // REQ-A273: 系统快捷键作用于焦点窗口 —— 不能把 "main" / undefined 漏给 wm_close
+  { id: 'F-SH-008', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopShell.svelte'], markers: ['handleSystemShortcut', 'focusedWindowLabel'], severity: 3 },
+  // REQ-A273: Dock 右键菜单的 props 在 onclose 之后访问会抛 —— 必须在 await 之前把 label 读到局部
+  { id: 'F-SH-009', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/DockContextMenu.svelte'], markers: ['targetLabel', 'Prop-read ordering'], severity: 3 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
@@ -93,6 +107,17 @@ const KNOWN_FAILURES = [
   { id: 'F-LK-008', module: 'amos-link', files: ['crates/amos-link/src/service.rs'], markers: ['count_to_u32', 'saturating'], severity: 3 },
   { id: 'F-LK-009', module: 'amos-link', files: ['crates/amos-link-cli/src/lib.rs'], markers: ['deadline_after', 'exit 2'], severity: 4 },
   { id: 'F-LK-010', module: 'amos-link', files: ['crates/amos-link/src/service.rs', 'crates/amos-link-cli/src/lib.rs'], markers: ['StreamRobotHal', 'motor --device'], severity: 5 },
+  // REQ-A268: 一个「发不出信标」的节点在 LAN 上静默不可见 —— 逐字段界不够(8×128B > 512B 帧),
+  // 公告因此在启动期被校验(探针编码),而不是在 emit 路径上被 debug! 静默丢掉
+  { id: 'F-LK-011', module: 'amos-link', files: ['crates/amos-link/src/discovery.rs', 'crates/amos-link-cli/src/lib.rs'], markers: ['PeerInfo::advertising', 'parse_endpoints', '--endpoint'], severity: 4 },
+  // REQ-A269: 时钟不一致（戳在未来）被读成 0 延迟 —— 帧的年龄必须说 unknown，bench 必须计数而不是采样
+  { id: 'F-LK-012', module: 'amos-link-cli', files: ['crates/amos-link-cli/src/lib.rs', 'crates/amos-link/src/pubsub.rs'], markers: ['age_between', 'skewed', 'InTheFuture'], severity: 3 },
+  // REQ-A270: 仪器在真网络上失明 —— 传输不计数 ⇒ 节点终生报 published=0（而 0 被读成「没发过」）
+  { id: 'F-LK-013', module: 'amos-link', files: ['crates/amos-link/src/zenoh.rs', 'crates/amos-link/src/broker.rs', 'crates/amos-link/src/node.rs'], markers: ['record_published', 'fn metrics(&self) -> Arc<LinkMetrics>', 'not its transport'], severity: 4 },
+  // REQ-A271: 老 daemon 少一个 RPC ⇒ 整个页面/命令被拖下水，而文档承诺的只是「少显示一栏」
+  { id: 'F-LK-014', module: 'amos-tauri', files: ['crates/amos-tauri/src/link.rs', 'crates/amos-link-cli/src/lib.rs'], markers: ['Unimplemented', 'returnPathLevel', 'actuations: Option'], severity: 3 },
+  // REQ-A272: QoS 只在进程内成立 —— 网络传输上「最新帧赢」变成「最老帧」、DropNewest 从不生效、订阅计数器恒为 0
+  { id: 'F-LK-015', module: 'amos-link', files: ['crates/amos-link/src/zenoh.rs', 'crates/amos-link/src/broker.rs'], markers: ['remote_latest', 'RelayCounters', 'forward_latest'], severity: 4 },
 
   // 数据完整性
   { id: 'F-DA-001', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/amosStore.ts'], markers: ['readJson', 'corrupt'], severity: 3 },

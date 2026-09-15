@@ -63,6 +63,53 @@ export const SPOTLIGHT_INPUT_HEIGHT = 56;
 /** Spotlight 浮层最大高度（px）。 */
 export const SPOTLIGHT_HEIGHT = 400;
 
+// ─── 桌面图标栅格（舞台）──────────────────────────────────────────────────────
+// REQ-A263: these numbers used to exist **only inside `DesktopStage.svelte`'s template**
+// (`grid-cols-4`, `h-20 w-20`, `gap-x-6 gap-y-5`, `left-8 top-8`, plus a
+// `width: calc(4 * 80px + 3 * 24px)` line) — so the same 80/24 was written twice, and the
+// stage was the one surface left making its own geometry decisions outside this module
+// (REQ-A249's rule: geometry has exactly one home). They live here now, with **no value
+// changed**: the look is pixel-identical. What "the right numbers are" is still an **open
+// product decision** (two sets exist in this repo — see `docs/multi-window.md` §1.5 and
+// `docs/PC_DESKTOP_AUDIT.md`), but it is now a decision in one place, with a test.
+
+/** Desktop icon tile edge (px) — the same size as the home screen's large tile. */
+export const DESKTOP_TILE_SIZE = 80;
+
+/** Gap between desktop icon columns (px). */
+export const DESKTOP_TILE_GAP_X = 24;
+
+/** Gap between desktop icon rows (px). */
+export const DESKTOP_TILE_GAP_Y = 20;
+
+/** Inset of the icon grid from the stage's top-left corner (px). */
+export const DESKTOP_GRID_INSET = 32;
+
+/** Desktop icon grid columns (the rest of the apps live in Launchpad — as on a Mac). */
+export const DESKTOP_GRID_COLS = 4;
+
+/** Desktop icon grid rows. */
+export const DESKTOP_GRID_ROWS = 4;
+
+/**
+ * How many icons the grid holds (columns × rows). Non-finite input yields 0: this function
+ * does not guess a size, because its caller already knows that "how many fit on a desktop"
+ * is a design decision, not a measurement.
+ */
+export function desktopIconCapacity(
+  cols = DESKTOP_GRID_COLS,
+  rows = DESKTOP_GRID_ROWS,
+): number {
+  if (!Number.isFinite(cols) || !Number.isFinite(rows)) return 0;
+  return Math.max(0, Math.trunc(cols) * Math.trunc(rows));
+}
+
+/** The grid's pixel width — the one source for the `calc()` the stage template used to spell. */
+export function desktopGridWidth(cols = DESKTOP_GRID_COLS): number {
+  const n = Number.isFinite(cols) && cols > 0 ? Math.trunc(cols) : DESKTOP_GRID_COLS;
+  return n * DESKTOP_TILE_SIZE + (n - 1) * DESKTOP_TILE_GAP_X;
+}
+
 // ─── 纯决策函数 ───────────────────────────────────────────────────────────────
 
 /**

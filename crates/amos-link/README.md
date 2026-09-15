@@ -46,7 +46,13 @@ Four pieces, in the order data flows:
   boundaries below.
 - **ROS-like QoS** reduced to three fields: `Reliability{BestEffort, Reliable}` × `depth` ×
   `DropPolicy{DropNewest, DropOldest}` — sensor streams are latest-wins, control streams
-  back-pressure and are counted as `blocked`.
+  back-pressure and are counted as `blocked`. **The profile is the subscription's, not one
+  transport's**: the in-process broker and the Zenoh transport build the *same* two sinks
+  (a one-slot latest-wins queue for `DropOldest` + depth 1, a bounded queue otherwise), so
+  `Qos::sensor()` means "the consumer wakes up holding the newest frame" on a network link too
+  — and the frames a full best-effort queue drops are counted on the subscription *and* the node
+  (round 17 measured the opposite on a real TCP session: the network consumer got the **oldest**
+  frame of its stall and both counters read 0; `docs/amos-link.md` §3.18).
 - **Discovery** two ways: beacons over the link's own transport (works on any transport,
   filters self-echo) and real UDP multicast beacons behind the `lan` feature, with a
   repeating announcer so a peer that joins later still learns one that booted earlier.
@@ -82,7 +88,7 @@ Four pieces, in the order data flows:
   and never folded into the control plane's table — instead of being stored, rendered and
   silently truncated into a `u32` on the way to the UI.
 - **Bounded bookkeeping, and it says when it stops**: the broker's topic inventory caps at
-  `MAX_TRACKED_TOPICS` (and reports `topics_complete()`); the per-publisher sequence tracker
+  `MAX_TRACKED_TOPICS` (and reports `topics_complete()`); the per-**stream** sequence tracker
   caps at `MAX_TRACKED_STREAMS` (and reports `SeqEvent::Untracked` /
   `SeqSummary::is_complete()`). Both keys come off the wire, so a peer could otherwise mint a
   new one per frame — and a bounded table that *admits* it stopped is worth more than an
@@ -90,6 +96,36 @@ Four pieces, in the order data flows:
   `NodeStatus` JSON carries `topics_complete`, and the control plane's `TopicList.complete`
   carries it to a caller that is **not** on this node's transport (which is the only place the
   local CLI could not print the caveat — `docs/amos-link.md` §3.8).
+- **A beacon can say *where to connect* — when a deployment says so.** `spawn_federation_advertising`
+  (and `PeerInfo::advertising`, which it uses) is the one path that fills a beacon's `endpoints`:
+  the list is bounded twice, by `parse_endpoints` (per field: ≤8 endpoints, ≤128 bytes each) **and**
+  by encoding the beacon it would emit — because those per-field bounds do not add up to the 512-byte
+  frame, and a node whose beacons cannot be encoded would be invisible on the link with a `debug!`
+  line as the only trace. Until this existed, `PeerInfo::with_endpoint` was called by **no** production
+  code, so every peer table in every deployment rendered "no address" (`docs/amos-link.md` §3.14).
+  The default is unchanged: an empty list advertises nothing, which is the only sound choice for a
+  transport that self-discovers (Zenoh scouting, `lan` multicast).
+- **The counters live in the transport, and the transport is the same object on every path.**
+  `published`/`delivered`/`dropped` are recorded where the fact happens — `Broker` **and**
+  `ZenohTransport` (round 15: until then only the broker counted, so a node on a real network
+  reported `published=0 delivered=0` for its whole life while frames crossed the session in
+  front of it). `Transport::metrics()` is how a node and its transport can be checked to share
+  **one** counter set, and `LinkNode::with_parts` warns when they do not; an honest boundary
+  remains: a drop *inside* Zenoh (a full `RingChannel`, a lost UDP datagram) is invisible from
+  this side, so a network node's `dropped` is a **lower bound** (`docs/amos-link.md` §3.16).
+- **An age is a measurement, and `0` is not a way to say "unknown".** `Received::age()` saturates
+  to zero when a stamp is **ahead of this clock** (right for a *duration*, wrong for a
+  *measurement*: `0` reads as "just now"), and every renderer owes the reader two things: state
+  that the age is unknown rather than `0`, and say when `clock_synced` is false (every age is
+  then a **bound**). The kernel cannot keep those promises for a caller, so it writes them down
+  where the fact and the caveat meet (`docs/amos-link.md` §3.15).
+- **A sequence number belongs to a stream — `(publisher, topic)` — and the loss figures say so.**
+  `LinkNode::publisher::<T>(topic)` hands out a **counter per publisher object**, i.e. per topic,
+  so a node that publishes a camera *and* an IMU (or that beats *and* publishes) reports several
+  independent counters under one peer id. `SeqTracker` keys by that pair, which is what the frame
+  stamps: keying by the publisher alone read a healthy multi-topic peer as a restarting one
+  (`stale` runs) and — the half nobody could see — let a busy stream's high-water mark swallow a
+  quiet stream's genuine `missing` frame (`docs/amos-link.md` §3.13).
 
 It is **not**: a scheduler (you own the control thread and its rate), a ROS compatibility
 layer (no `.msg`/IDL, no DDS wire), or a replacement for the daemon's authenticated UDS
@@ -104,11 +140,11 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 | `src/qos.rs` | `Qos::sensor()/state()/control()` + `Qos::for_channel` |
 | `src/broker.rs` | `Transport` seam + the in-process `Broker` (`Arc<[u8]>` fan-out, bounded topic inventory) |
 | `src/pubsub.rs` | `Publisher<T>` / `Subscriber<T>` / `Received<T>` |
-| `src/discovery.rs` | `Beacon`, `PeerRegistry` (TTL), `MockDiscovery`, `BusDiscovery`, `spawn_federation` |
+| `src/discovery.rs` | `Beacon`, `PeerRegistry` (TTL), `MockDiscovery`, `BusDiscovery`, `spawn_federation` / `spawn_federation_advertising`, `parse_endpoints` + `PeerInfo::advertising` (the only path that fills a beacon's endpoint list) |
 | `src/lan.rs` | *(feature `lan`)* real UDP multicast beacons + `spawn_announcer` |
 | `src/zenoh.rs` | *(feature `zenoh`)* the inter-board transport |
 | `src/telemetry.rs` | `Heartbeat` + `NodeStatus` + `spawn_heartbeat` |
-| `src/sequence.rs` | `SeqTracker`: per-publisher gaps/duplicates, so "a frame was lost" is a number |
+| `src/sequence.rs` | `SeqTracker`: per-**stream** `(publisher, topic)` gaps/duplicates, so "a frame was lost" is a number — and it names the stream it happened on |
 | `src/robot_hal.rs` | `AgentAction` → `plan()` → `MotorFrame` (CRC16) → `RobotHal`; `RobotBridge` with e-stop + watchdog, and `reporting()` for the mode return path |
 | `src/health.rs` | `LinkHealth::evaluate` — the fold from counters to a verdict |
 | `src/node.rs` | `LinkNode`: identity + transport + clock + counters + peer table |
@@ -170,11 +206,31 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
 
 ## Honest boundaries
 
+- **One peer table, one verdict vocabulary — and the render types are `Serialize`-only.**
+  `NodeStatus`, `PeerView`, `LinkHealth` and `HealthReason` are *renderings*: the status JSON a
+  machine reads has a **flat** peer (`id`/`kind`/`endpoint`/`last_seen_ms`/`beacons` — the same five
+  fields `proto.Peer` and the System UI carry) and a verdict whose reasons are the `detail()` tokens
+  (`"decode_errors=3"`), i.e. the control plane's own words. They no longer derive `Deserialize`: a
+  rendering that claimed to round-trip is how two spellings for one verdict stayed alive (see
+  `docs/amos-link.md` §3.11). A consumer that needs to *read a document back* must define its own
+  shape deliberately.
+- **A peer's JSON carries its primary endpoint, not the list.** `PeerInfo.endpoints` stays in the
+  Rust API; the document follows the proto (`endpoint`, one field). More endpoints would be a proto
+  change first.
+- **A robot's report is dated, and an age you cannot state is not printed as `0`.** The return path
+  (`amos/<robot>/state/actuation`) reports `armed` / `estopped` / `gait` — claims about *right now* —
+  so both renderers carry the report's age: the CLI prints `age=…` and its JSON carries `age_ms`
+  beside the raw `stamp_ms`. A stamp of `0` (the proto's sentinel, not 1970) or one **in the future**
+  (two unsynchronised clocks) yields `age=unknown(…)` / `age_ms: null`, never a number that would
+  read as "just now". The age is a difference between *the reporter's* clock and the reader's, so on a
+  link without a shared clock it is a **bound**, like every latency (`clock_synced: false`).
 - **Discovery is not authentication.** A `lan` beacon is plaintext and forgeable; it is a
-  *hint* telling a peer where to connect. The authenticated path is the daemon's UDS
-  (peer-credential checked), never the beacon. The beat rule above is a **consistency** check
-  in the same spirit: it makes "one frame, one identity" true, but a peer that lies in the frame
-  *header* is outside what any check at this layer can catch.
+  *hint* telling a peer where to connect — and that hint can now actually carry an address
+  (`--endpoint`/`AMOS_LINK_ENDPOINT`, `docs/amos-link.md` §3.14), which makes the sentence
+  *truer*, not safer: an address in a peer table is a **claim by that peer**. The authenticated
+  path is the daemon's UDS (peer-credential checked), never the beacon. The beat rule above is a
+  **consistency** check in the same spirit: it makes "one frame, one identity" true, but a peer
+  that lies in the frame *header* is outside what any check at this layer can catch.
 - **Not ROS.** No `.msg`/IDL, no `rostopic` compatibility, no DDS wire — a bridge into that
   ecosystem is a separate deployment component.
 - **Not a scheduler.** `RobotBridge::step()` is one explicit step; the control thread and
@@ -201,7 +257,7 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
   `MAX_WATCHDOG_MS` (1 h) and `MAX_REFUSAL_REASON_BYTES` (512) are generous for the reference
   quadruped; a machine that legitimately exceeds one must raise it *here* (and keep the proto's
   `u32` in mind). The tracker's `MAX_TRACKED_STREAMS` is the same kind of number: past it the
-  tracker refuses new publishers and says so, rather than growing without bound.
+  tracker refuses new streams `(publisher, topic)` and says so, rather than growing without bound.
 
 ## Related
 

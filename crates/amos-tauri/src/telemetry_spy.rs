@@ -26,6 +26,32 @@ use crate::daemon;
 /// Tauri event name carrying one [`SpyHitPayload`] per daemon `Watch` hit.
 pub const SPY_HIT_EVENT: &str = "telemetry-spy-hit";
 
+/// Upper bound on the number of identifier hits one [`SpyHitPayload`] carries.
+///
+/// Real hits carry 1–4 hits; 64 is a generous ceiling that still refuses a
+/// runaway producer (the daemon is the producer today, but the watch stream is
+/// a one-way pipe and an upstream bug could otherwise emit a payload with
+/// thousands of `IdentifierHit` rows that we then `app.emit` to every window).
+pub const MAX_HITS_PER_EVENT: usize = 64;
+
+/// Largest single wire field (bytes) one emitted payload may contain.
+///
+/// Real IP/iface strings are < 64 B; 4 KiB is a small-known cap that pins the
+/// contract — a megabyte-class payload is refused before the JSON serialiser
+/// allocates a megabyte-class `String`.
+pub const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
+
+/// Wire vocabulary for the telemetry-spy module. The UI i18n layer branches
+/// on these; renaming a variant is a wire break.
+pub mod codes {
+    /// `TelemetrySpyService.Watch` could not be opened (daemon down / RPC error).
+    pub const WATCH_OPEN_FAILED: &str = "amos.telemetry_spy.watch_open_failed";
+    /// The watch stream returned an error mid-flight.
+    pub const STREAM_ERROR: &str = "amos.telemetry_spy.stream_error";
+    /// A spy hit could not be delivered to the UI.
+    pub const EMIT_FAILED: &str = "amos.telemetry_spy.emit_failed";
+}
+
 /// One graded identifier hit, serializable for the WebView.
 #[derive(Clone, Debug, Serialize)]
 pub struct SpyIdentifierHit {
@@ -109,7 +135,56 @@ fn identifier_payload(h: &IdentifierHit) -> SpyIdentifierHit {
 }
 
 /// Map a daemon `EgressHit` to the shell-facing payload.
+///
+/// The mapping enforces the boundary contracts: identifier-hit list is capped
+/// at [`MAX_HITS_PER_EVENT`] (defence against a runaway producer) and any
+/// oversized wire field is rejected silently (a megabyte-class IP/iface
+/// string is a bug somewhere up the chain).
 pub fn spy_payload(evt: &EgressHit) -> SpyHitPayload {
+    // Pre-flight check: refuse to even build a payload whose wire fields are
+    // larger than the contract permits. The downstream `app.emit` does not
+    // refuse JSON for us; a 10 MB iface string would just sit in the IPC queue.
+    let field_too_big = |name: &str, len: usize| {
+        if len > MAX_PAYLOAD_BYTES {
+            tracing::warn!(
+                target: "amos::spy",
+                field = name,
+                bytes = len,
+                limit = MAX_PAYLOAD_BYTES,
+                code = codes::STREAM_ERROR,
+                "dropping an egress hit with an over-sized wire field"
+            );
+            true
+        } else {
+            false
+        }
+    };
+    if field_too_big("iface", evt.iface.len())
+        || field_too_big("src_ip", evt.src_ip.len())
+        || field_too_big("dst_ip", evt.dst_ip.len())
+        || field_too_big("severity", evt.severity.len())
+    {
+        return SpyHitPayload {
+            ts_ms: evt.ts_ms,
+            iface: String::new(),
+            src_ip: String::new(),
+            src_port: None,
+            dst_ip: String::new(),
+            dst_port: None,
+            protocol: "unknown".to_string(),
+            hits: Vec::new(),
+            payload_bytes: evt.payload_bytes,
+            severity: "unknown".to_string(),
+            confidence: "unknown".to_string(),
+        };
+    }
+
+    let hits: Vec<SpyIdentifierHit> = evt
+        .hits
+        .iter()
+        .take(MAX_HITS_PER_EVENT)
+        .map(identifier_payload)
+        .collect();
     SpyHitPayload {
         ts_ms: evt.ts_ms,
         iface: evt.iface.clone(),
@@ -118,7 +193,7 @@ pub fn spy_payload(evt: &EgressHit) -> SpyHitPayload {
         dst_ip: evt.dst_ip.clone(),
         dst_port: evt.dst_port.map(|p| p as u16),
         protocol: protocol_str(evt.protocol),
-        hits: evt.hits.iter().map(identifier_payload).collect(),
+        hits,
         payload_bytes: evt.payload_bytes,
         severity: evt.severity.clone(),
         confidence: confidence_str(evt.confidence),
@@ -133,19 +208,35 @@ async fn spy_round(app: AppHandle) -> Result<(), String> {
     let mut stream = client
         .watch(Empty {})
         .await
-        .map_err(|e| format!("telemetry-spy watch open failed: {e}"))?
+        .map_err(|e| {
+            // Stable code on the *log* line — the function still returns a
+            // String for backoff-loop compat; the code is documented at the
+            // module's `codes` re-export.
+            tracing::warn!(
+                target: "amos::spy",
+                code = codes::WATCH_OPEN_FAILED,
+                error = %e,
+                "telemetry-spy watch open failed"
+            );
+            format!("telemetry-spy watch open failed: {e}")
+        })?
         .into_inner();
-    while let Some(evt) = stream
-        .message()
-        .await
-        .map_err(|e| format!("telemetry-spy watch stream error: {e}"))?
-    {
+    while let Some(evt) = stream.message().await.map_err(|e| {
+        tracing::warn!(
+            target: "amos::spy",
+            code = codes::STREAM_ERROR,
+            error = %e,
+            "telemetry-spy watch stream error"
+        );
+        format!("telemetry-spy watch stream error: {e}")
+    })? {
         // A failed delivery means a registered spy listener missed this hit (no listener is
         // `Ok` in Tauri) — the privacy surface would silently stay quiet.
         if let Err(e) = app.emit(SPY_HIT_EVENT, spy_payload(&evt)) {
             tracing::warn!(
                 target: "amos::spy",
                 event = SPY_HIT_EVENT,
+                code = codes::EMIT_FAILED,
                 error = %e,
                 "telemetry-spy hit could not be delivered to the UI"
             );
@@ -227,5 +318,46 @@ mod tests {
         assert_eq!(p.protocol, "unknown");
         assert_eq!(p.confidence, "unknown");
         assert_eq!(p.hits[0].kind, "unknown");
+    }
+
+    #[test]
+    fn payload_caps_hits_at_the_documented_bound() {
+        // A runaway producer with thousands of identifier hits would otherwise
+        // emit a megabyte-class JSON payload. The cap is here so the
+        // privacy UI receives a small known shape.
+        let mut h = hit();
+        h.hits = (0..MAX_HITS_PER_EVENT + 50)
+            .map(|_| IdentifierHit {
+                kind: IdentifierKind::KindSerial as i32,
+                occurrences: 1,
+                confidence: Confidence::Low as i32,
+            })
+            .collect();
+        let p = spy_payload(&h);
+        assert_eq!(p.hits.len(), MAX_HITS_PER_EVENT);
+    }
+
+    #[test]
+    fn payload_refuses_an_oversized_wire_field_instead_of_emit_blasting_it() {
+        // A 10 MiB `iface` string is a bug up the chain; the bridge drops the
+        // hit's fields rather than pass a megabyte-class payload through to
+        // `app.emit` (which would just queue it in the IPC pipe).
+        let mut h = hit();
+        h.iface = "x".repeat(MAX_PAYLOAD_BYTES + 1);
+        let p = spy_payload(&h);
+        assert_eq!(p.iface, "", "the bad field is dropped");
+        assert_eq!(p.src_ip, "", "the rest of the hit is also dropped");
+        assert_eq!(p.severity, "unknown");
+        assert!(p.hits.is_empty());
+    }
+
+    #[test]
+    fn telemetry_spy_codes_are_stable_string_keys() {
+        assert_eq!(
+            codes::WATCH_OPEN_FAILED,
+            "amos.telemetry_spy.watch_open_failed"
+        );
+        assert_eq!(codes::STREAM_ERROR, "amos.telemetry_spy.stream_error");
+        assert_eq!(codes::EMIT_FAILED, "amos.telemetry_spy.emit_failed");
     }
 }

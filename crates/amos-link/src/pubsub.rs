@@ -122,8 +122,22 @@ impl<T> Received<T> {
     /// How long ago the frame was published, measured against the local clock.
     ///
     /// With a calibrated `Clock` (the supervisor's `timesync` instance) this is true
-    /// one-way latency; with an unsynced host clock it is a bound — which is why the
-    /// node reports `clock_synced` beside it.
+    /// one-way latency; with an unsynced host clock it is a bound — which is why the node
+    /// reports `clock_synced` beside it.
+    ///
+    /// **Two obligations for a renderer, both of them the caller's** (the kernel cannot keep
+    /// them for you, because the fact and its caveat live in different places):
+    ///
+    /// 1. a stamp **ahead of this clock** saturates to [`Duration::ZERO`] here — the right
+    ///    answer for a *duration*, and the wrong one for a *measurement*, because `0` reads as
+    ///    "just now". An age that the two clocks disagree about must be reported as unknown,
+    ///    never as `0` (the CLI's `amos_link_cli::run` does that in one rule,
+    ///    `age_between`, for both the return path and the frames — see
+    ///    `docs/amos-link.md` §3.15);
+    /// 2. `clock_synced: false` means every age on a line is a **bound**, so the line has to
+    ///    say so (the CLI prints that caveat, and `status` carries the flag).
+    ///
+    /// This is the one place the two halves meet, so it is the one place they are written down.
     pub fn age(&self) -> Duration {
         Timestamp::now().since(&self.stamp)
     }

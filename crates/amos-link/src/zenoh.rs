@@ -20,9 +20,13 @@
 //!   the topics someone else published, nor count remote subscribers — the control
 //!   plane reports "unknown" rather than a fabricated zero. The in-process broker is
 //!   what knows its subscribers; over Zenoh the *peer table* is the inventory.
-//! * **QoS is mapped, not invented.** The local queue depth becomes the FIFO handler's
-//!   capacity and `Reliability::Reliable` is what Zenoh's reliable link mode means.
-//!   Drop policies describe *our consumer queue*, not the network.
+//! * **QoS is mapped, not invented.** The typed subscriber's **sink** is chosen by the profile
+//!   exactly as the broker chooses it — a one-slot latest-wins queue for `DropOldest` + depth 1,
+//!   a bounded queue otherwise — and the handler capacity follows `depth` (capped at
+//!   [`FORWARD_CHANNEL`]). `Reliability::Reliable` is the reliable variant of that sink *and* the
+//!   Zenoh handler that blocks instead of dropping. Drop policies describe **our consumer
+//!   queue**, not the network (round 17 closed the gap where they were ignored here:
+//!   `docs/amos-link.md` §3.18).
 //! * **The default config is peer mode + multicast scouting** (`zenoh::Config::default`),
 //!   which is what makes LAN discovery work with no configuration. A deployment that
 //!   needs a fixed endpoint sets `AMOS_LINK_ZENOH_ENDPOINT=tcp/10.0.0.7:7447` (or
@@ -56,18 +60,30 @@ pub const ENV_ENDPOINT: &str = "AMOS_LINK_ZENOH_ENDPOINT";
 /// Capacity of the channel between the Zenoh subscriber and the typed subscriber.
 const FORWARD_CHANNEL: usize = 64;
 
-/// Forward every sample of a declared Zenoh subscriber into the typed subscriber's
-/// channel.
+/// Forward every sample of a declared Zenoh subscriber into the typed subscriber's **buffered**
+/// queue, applying the subscriber's QoS at that boundary (round 17).
+///
+/// `$reliable` decides the policy exactly as the broker does in-process: a **best-effort** queue
+/// drops the arriving frame when it is full and *counts it*, a **reliable** one waits for room
+/// (`send().await`). Before this, the loop did a blocking `send` for *every* reliability, so
+/// `DropPolicy::DropNewest` never fired on the network path — a depth-2 best-effort subscription
+/// back-pressured the link instead of dropping, and `stats().dropped` read `0` while frames went
+/// missing (`docs/amos-link.md` §3.18).
 ///
 /// A macro rather than a function because Zenoh's handler types (`FifoChannelHandler`,
-/// `RingChannelHandler`, …) share no common trait for `recv_async`, yet the forwarding
-/// loop is identical for all of them. The task ends when the typed subscriber is dropped
-/// (its receiver closes and `send` fails) or when the session closes — no orphan.
+/// `RingChannelHandler`, …) share no common trait for `recv_async`, yet the forwarding loop is
+/// identical for all of them. The task ends when the typed subscriber is dropped (its receiver
+/// closes) or when the session closes — no orphan.
 macro_rules! forward_samples {
-    ($subscriber:expr, $tx:expr) => {
+    ($subscriber:expr, $tx:expr, $relay:expr, $reliable:expr) => {{
+        // Everything is evaluated in the **caller's** scope and then moved into the task: a
+        // `&self.metrics` borrow evaluated *inside* the `'static` task would escape the method
+        // body (the compiler caught exactly that while round 15 was being written).
+        let subscriber = $subscriber;
+        let tx = $tx;
+        let relay = $relay;
+        let reliable = $reliable;
         tokio::spawn(async move {
-            let subscriber = $subscriber;
-            let tx = $tx;
             // Runs while the typed subscriber lives or the session is up.
             loop {
                 let sample: Sample = match subscriber.recv_async().await {
@@ -84,34 +100,155 @@ macro_rules! forward_samples {
                 };
                 let frame: Arc<[u8]> =
                     Arc::from(sample.payload().to_bytes().to_vec().into_boxed_slice());
-                if tx.send(Ingress { topic, frame }).await.is_err() {
-                    tracing::debug!("typed subscriber dropped: forwarding task ends");
-                    return;
+                let ingress = Ingress { topic, frame };
+                if reliable {
+                    // `try_send` first, then wait: only the *counters* need the distinction
+                    // between "accepted now" and "had to wait", and it is what the broker does.
+                    // (A network node's `blocked` stays 0 by design: this is *our* consumer
+                    // waiting, not our publish path — see `network_reliability_note`.)
+                    match tx.try_send(ingress) {
+                        Ok(()) => relay.stored(),
+                        Err(mpsc::error::TrySendError::Full(ingress)) => {
+                            match tx.send(ingress).await {
+                                Ok(()) => relay.stored(),
+                                Err(_) => {
+                                    relay.lost();
+                                    tracing::debug!("typed subscriber dropped: relay ends");
+                                    return;
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            relay.lost();
+                            tracing::debug!("typed subscriber dropped: relay ends");
+                            return;
+                        }
+                    }
+                } else {
+                    // Best-effort: a full queue *is* the policy working — drop and say so, never
+                    // throttle the link.
+                    match tx.try_send(ingress) {
+                        Ok(()) => relay.stored(),
+                        Err(_) => relay.lost(),
+                    }
                 }
             }
         });
-    };
+    }};
+}
+
+/// Forward every sample into a **one-slot latest-only** queue (the sensor profile), the network
+/// twin of what the broker does in-process (round 17).
+///
+/// `$reliable` picks the store, exactly like the broker: best-effort overwrites the pending frame
+/// ([`LatestSlot::offer`], which counts the replaced frame on the subscription) and reliable
+/// waits for the consumer ([`LatestSlot::offer_blocking`]). See [`forward_samples`] for why this
+/// is a macro.
+macro_rules! forward_latest {
+    ($subscriber:expr, $slot:expr, $relay:expr, $reliable:expr) => {{
+        let subscriber = $subscriber;
+        let slot = $slot;
+        let relay = $relay;
+        let reliable = $reliable;
+        tokio::spawn(async move {
+            loop {
+                let sample: Sample = match subscriber.recv_async().await {
+                    Ok(sample) => sample,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "zenoh subscriber closed");
+                        return;
+                    }
+                };
+                let key = sample.key_expr().as_str().to_string();
+                let Ok(topic) = Topic::new(key.clone()) else {
+                    tracing::debug!(key, "ignoring a Zenoh sample on a foreign key expression");
+                    continue;
+                };
+                let frame: Arc<[u8]> =
+                    Arc::from(sample.payload().to_bytes().to_vec().into_boxed_slice());
+                let ingress = Ingress { topic, frame };
+                if reliable {
+                    match slot.offer_blocking(ingress).await {
+                        Ok(_waited) => relay.stored(),
+                        Err(_) => {
+                            relay.lost();
+                            tracing::debug!("typed subscriber dropped: relay ends");
+                            return;
+                        }
+                    }
+                } else if slot.offer(ingress) {
+                    relay.stored();
+                } else {
+                    // The slot recorded the subscription-side drop for the frame it replaced;
+                    // this moves the node's counter only (see `RelayCounters::replaced`).
+                    relay.replaced();
+                }
+            }
+        });
+    }};
 }
 
 /// A [`Transport`] over a Zenoh session.
+///
+/// It owns a counter set — the same [`LinkMetrics`] the node over it reports
+/// (`LinkNode::with_parts`) — because a transport is where "this frame reached the wire" is
+/// known. Until round 15 it held none: `record_published`/`record_delivered` were called by the
+/// in-process broker **and by nothing else**, so every node on a real network (`--transport
+/// zenoh`, i.e. every board in the field) reported `published=0 delivered=0` for its whole life
+/// while frames crossed the session in front of it — and `status`, `watch`, the health fold and
+/// the System UI's 「机器人链路」 page all read those numbers.
 #[derive(Debug, Clone)]
 pub struct ZenohTransport {
     session: Session,
+    /// The counters this transport reports into (shared with its node — see the type docs).
+    metrics: Arc<crate::metrics::LinkMetrics>,
 }
 
 impl ZenohTransport {
     /// Open a session with the default config (peer mode + multicast scouting) plus the
-    /// `AMOS_LINK_ZENOH_ENDPOINT` override, if set.
+    /// `AMOS_LINK_ZENOH_ENDPOINT` override, if set, reporting into a **fresh** counter set.
+    ///
+    /// A caller that also builds a [`LinkNode`](crate::node::LinkNode) over this transport must
+    /// hand it *these* counters ([`ZenohTransport::metrics`]) — or use
+    /// [`ZenohTransport::open_with_metrics`] — so the node's `status` counts what the transport
+    /// really did.
     pub async fn open() -> Result<Self> {
         Self::open_with(config_from_env()?).await
     }
 
-    /// Open a session with a caller-provided config.
+    /// The counters this transport reports into.
+    pub fn metrics(&self) -> &Arc<crate::metrics::LinkMetrics> {
+        &self.metrics
+    }
+
+    /// Adopt a counter set (builder form) — the node's, so one set describes one node.
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::LinkMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Open a session with a caller-provided config, reporting into `metrics`.
+    ///
+    /// This is the constructor a deployment wants: the counters a node reports and the counters
+    /// its transport writes must be **the same set**, or the node's `published` stays 0 while
+    /// frames leave the machine.
+    pub async fn open_with_metrics(
+        config: zenoh::Config,
+        metrics: Arc<crate::metrics::LinkMetrics>,
+    ) -> Result<Self> {
+        Ok(Self::open_with(config).await?.with_metrics(metrics))
+    }
+
+    /// Open a session with a caller-provided config (fresh counters — see
+    /// [`ZenohTransport::open_with_metrics`]).
     pub async fn open_with(config: zenoh::Config) -> Result<Self> {
         let session = zenoh::open(config)
             .await
             .map_err(|e| LinkError::Transport(format!("opening the Zenoh session: {e}")))?;
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            metrics: Arc::new(crate::metrics::LinkMetrics::new()),
+        })
     }
 
     /// The underlying session (for query/reply and liveliness, which this crate's pub/sub
@@ -191,6 +328,13 @@ impl Transport for ZenohTransport {
         // (the frame went out) and leave `matched` unknown. `put` either returns once the
         // frame is handed to the session or fails, so nothing here was back-pressured on
         // *our* side — the network's own flow control is not ours to count.
+        //
+        // The counters move here, where the fact happens: `published` is one for one put that
+        // returned `Ok`, and `delivered` follows the report's own meaning for this transport
+        // ("put on the wire", see `PublishReport`). Until round 15 this function touched no
+        // counter at all, so a node on a network transport reported zeros for its whole life.
+        self.metrics.record_published(1);
+        self.metrics.record_delivered(1);
         Ok(PublishReport {
             matched: None,
             delivered: 1,
@@ -201,29 +345,21 @@ impl Transport for ZenohTransport {
 
     async fn subscribe(&self, pattern: &Topic, qos: Qos) -> Result<Subscription> {
         qos.validate()?;
-        let (tx, rx) = mpsc::channel(qos.depth().min(FORWARD_CHANNEL));
         let counters = Subscription::counters();
-        let capacity = qos.depth().min(FORWARD_CHANNEL);
-
+        let relay =
+            crate::broker::RelayCounters::new(Arc::clone(&counters), Arc::clone(&self.metrics));
         // The handler implements the subscriber's QoS at the Zenoh boundary:
-        // `RingChannel` drops when full (best-effort — a stale stereo frame is worth
-        // less than the newest one), `FifoChannel` blocks the Zenoh thread (reliable —
-        // a set point must not be lost). Both are then handed to the *same* forwarding
-        // task, which is why the loop lives in a macro instead of naming two handler
-        // types.
-        match qos.reliability {
-            Reliability::BestEffort => {
-                let subscriber = self
-                    .session
-                    .declare_subscriber(pattern.as_str())
-                    .with(RingChannel::new(capacity))
-                    .await
-                    .map_err(|e| {
-                        LinkError::Transport(format!("declaring subscriber {pattern}: {e}"))
-                    })?;
-                forward_samples!(subscriber, tx);
-            }
-            Reliability::Reliable => {
+        // `RingChannel` never blocks the delivery thread (best-effort — a stale stereo frame is
+        // worth less than the newest one), `FifoChannel` blocks it (reliable — a set point must
+        // not be lost). The typed subscriber's **sink** is then chosen by the profile, not by
+        // the transport: a one-slot latest-wins queue for `DropOldest` depth 1 (the sensor
+        // profile), a bounded queue otherwise — the same two shapes the broker builds, so the
+        // same QoS means the same thing on both transports (`docs/amos-link.md` §3.18).
+        let reliable = qos.reliability == Reliability::Reliable;
+        if qos.is_latest_only() {
+            let capacity = qos.depth().min(FORWARD_CHANNEL);
+            let (subscription, slot) = Subscription::remote_latest(pattern.clone(), qos, counters);
+            if reliable {
                 let subscriber = self
                     .session
                     .declare_subscriber(pattern.as_str())
@@ -232,8 +368,43 @@ impl Transport for ZenohTransport {
                     .map_err(|e| {
                         LinkError::Transport(format!("declaring subscriber {pattern}: {e}"))
                     })?;
-                forward_samples!(subscriber, tx);
+                forward_latest!(subscriber, slot, relay, true);
+            } else {
+                let subscriber = self
+                    .session
+                    .declare_subscriber(pattern.as_str())
+                    .with(RingChannel::new(capacity))
+                    .await
+                    .map_err(|e| {
+                        LinkError::Transport(format!("declaring subscriber {pattern}: {e}"))
+                    })?;
+                forward_latest!(subscriber, slot, relay, false);
             }
+            return Ok(subscription);
+        }
+
+        let capacity = qos.depth().min(FORWARD_CHANNEL);
+        let (tx, rx) = mpsc::channel(capacity);
+        if reliable {
+            let subscriber = self
+                .session
+                .declare_subscriber(pattern.as_str())
+                .with(FifoChannel::new(capacity))
+                .await
+                .map_err(|e| {
+                    LinkError::Transport(format!("declaring subscriber {pattern}: {e}"))
+                })?;
+            forward_samples!(subscriber, tx, relay, true);
+        } else {
+            let subscriber = self
+                .session
+                .declare_subscriber(pattern.as_str())
+                .with(RingChannel::new(capacity))
+                .await
+                .map_err(|e| {
+                    LinkError::Transport(format!("declaring subscriber {pattern}: {e}"))
+                })?;
+            forward_samples!(subscriber, tx, relay, false);
         }
         Ok(Subscription::remote(pattern.clone(), qos, rx, counters))
     }
@@ -241,6 +412,15 @@ impl Transport for ZenohTransport {
     async fn topics(&self) -> Vec<String> {
         // Documented boundary: a network bus does not know the topics others publish.
         Vec::new()
+    }
+
+    /// The counters this transport writes into (see [`Transport::metrics`]) — the same set a
+    /// node over it must report: build the transport with
+    /// [`ZenohTransport::open_with_metrics`] (or attach them with
+    /// [`ZenohTransport::with_metrics`]) and pass that set to
+    /// [`LinkNode::with_parts`](crate::node::LinkNode::with_parts).
+    fn metrics(&self) -> Arc<crate::metrics::LinkMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     async fn topics_complete(&self) -> bool {
@@ -256,6 +436,173 @@ impl Transport for ZenohTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener/dialer pair on TCP loopback with explicit endpoints (`peer_config`) — the
+    /// setup every cross-session test in this module needs, in one place.
+    ///
+    /// Returns `(listener, dialer)`: the listener is the side a subscription usually lives on
+    /// (so a published frame really crosses the session boundary).
+    async fn loopback_pair() -> (ZenohTransport, ZenohTransport) {
+        loopback_pair_with(Arc::new(crate::metrics::LinkMetrics::new())).await
+    }
+
+    /// The same pair, with the **listener** reporting into `metrics`.
+    ///
+    /// A network relay records into *its transport's* counter set, so a test that wants to read
+    /// the node's counters has to hand the transport the same set its subscriber uses — the rule
+    /// `docs/amos-link.md` §3.16 states (one counter set per node, `LinkNode::with_parts` warns
+    /// when they differ). Building the pair without it is how a test can "prove" that the node's
+    /// `dropped` is 0 while its consumer is dropping frames: it is reading the wrong set.
+    async fn loopback_pair_with(
+        metrics: Arc<crate::metrics::LinkMetrics>,
+    ) -> (ZenohTransport, ZenohTransport) {
+        let port = free_tcp_port();
+        let listens = format!("tcp/127.0.0.1:{port}");
+        let listener =
+            ZenohTransport::open_with_metrics(peer_config("listen/endpoints", &listens), metrics)
+                .await
+                .expect("the listening session opens");
+        let dialer = ZenohTransport::open_with(peer_config("connect/endpoints", &listens))
+            .await
+            .expect("the connecting session opens");
+        (listener, dialer)
+    }
+
+    /// Publish `seq = 1..=count` heartbeats from a *dialer* transport, with a gap between
+    /// frames.
+    ///
+    /// The gap is what makes these tests deterministic: it is longer than a loopback TCP
+    /// round trip by three orders of magnitude, so "the consumer was asleep while *n* frames
+    /// crossed the session" is a fact rather than a race.
+    async fn publish_beats(dialer: &ZenohTransport, topic: &str, count: u64) {
+        let shared = dialer.clone().shared();
+        let peer = crate::discovery::PeerId::new("dog1").expect("peer");
+        let publisher = crate::pubsub::Publisher::new(
+            shared,
+            Topic::new(topic).expect("topic"),
+            peer.clone(),
+            Arc::new(crate::codec::Clock::host()),
+            Arc::new(crate::metrics::LinkMetrics::new()),
+        );
+        for seq in 1..=count {
+            let beat = crate::telemetry::Heartbeat::new(
+                peer.clone(),
+                seq,
+                crate::codec::Timestamp::now(),
+                5,
+            );
+            publisher.publish(&beat).await.expect("publish the beat");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// **The sensor profile means the same thing on both transports**: latest sample wins.
+    ///
+    /// `Qos::sensor()` is `DropOldest` + depth 1, and the reason it exists is the sentence in
+    /// `qos.rs`: *"a consumer that was busy for 10 frames wakes up holding frame 10 — never a
+    /// backlog of 10 stale ones"*. In-process that is exactly what `LatestSlot` does. Over
+    /// Zenoh it **was not**: `ZenohTransport::subscribe` built the remote subscription with no
+    /// slot (`Subscription::remote`), so a depth-1 `DropOldest` consumer got a one-slot `mpsc`
+    /// fed by a **blocking** `send` — it woke up holding the frame that had been pulled into
+    /// the forwarding channel *first* (the oldest of the stall), and every frame replaced in
+    /// between was counted **nowhere** (`stats().dropped` stayed 0, and so did the node's
+    /// `dropped`: the relay only recorded a delivery, or the terminal "consumer is gone").
+    ///
+    /// That is the ROS 2 parity question in its sharpest form — KEEP_LAST(1) has to mean "the
+    /// most recent sample" whichever transport is underneath — and it is the *camera → brain*
+    /// link, i.e. the one this profile was written for (`docs/amos-link.md` §3.18).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_latest_only_subscription_over_a_real_session_keeps_the_newest_frame() {
+        let metrics = Arc::new(crate::metrics::LinkMetrics::new());
+        let (listener, dialer) = loopback_pair_with(Arc::clone(&metrics)).await;
+        let mut sub = crate::pubsub::Subscriber::<crate::telemetry::Heartbeat>::subscribe(
+            listener.clone().shared(),
+            Topic::pattern("amos/**/telemetry/beat").expect("pattern"),
+            Qos::sensor(),
+            Arc::clone(&metrics),
+        )
+        .await
+        .expect("subscribe");
+        assert!(sub.qos().is_latest_only(), "the profile under test");
+        // The session has to be routed before a `put` can reach the subscriber.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        publish_beats(&dialer, "amos/dog1/telemetry/beat", 5).await;
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
+            .await
+            .expect("a frame crosses the session")
+            .expect("recv");
+        assert_eq!(
+            got.message.seq, 5,
+            "the *newest* frame wins on a network transport too (the broker's contract)"
+        );
+        assert_eq!(sub.stats().received, 1);
+        assert_eq!(
+            sub.stats().dropped,
+            4,
+            "…and the replaced frames are accounted, not silently lost"
+        );
+        assert_eq!(
+            metrics.snapshot().dropped,
+            4,
+            "…and the node's own counter agrees with the subscription's (the \
+             `SubscriptionStats` rule: the two never disagree)"
+        );
+    }
+
+    /// **A best-effort queue is allowed to drop — and must say how many.** The other half of
+    /// the same defect: on the network path the relay did a **blocking** `send` for *every*
+    /// reliability, so `DropPolicy::DropNewest` never fired. A depth-2 best-effort subscription
+    /// that could hold two frames instead held the whole stream (back-pressure into the
+    /// forwarding task), so the consumer's `dropped` read `0` while frames went missing — the
+    /// "`0` is not a way to say *unknown*" rule, broken on the transport every board in the
+    /// field uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_best_effort_queue_over_a_real_session_drops_the_newest_and_counts_it() {
+        use crate::qos::DropPolicy;
+
+        let metrics = Arc::new(crate::metrics::LinkMetrics::new());
+        let (listener, dialer) = loopback_pair_with(Arc::clone(&metrics)).await;
+        let qos = Qos::new(Reliability::BestEffort, 2, DropPolicy::DropNewest);
+        let mut sub = crate::pubsub::Subscriber::<crate::telemetry::Heartbeat>::subscribe(
+            listener.clone().shared(),
+            Topic::pattern("amos/**/telemetry/beat").expect("pattern"),
+            qos,
+            Arc::clone(&metrics),
+        )
+        .await
+        .expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        publish_beats(&dialer, "amos/dog1/telemetry/beat", 5).await;
+
+        // The queue kept the *first* two (drop-newest: the arriving frame is the sacrifice)…
+        for expected in [1u64, 2] {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap_or_else(|_| panic!("frame {expected} was queued"))
+                .expect("recv");
+            assert_eq!(got.message.seq, expected);
+        }
+        // …and the three that did not fit are gone, not waiting.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), sub.recv())
+                .await
+                .is_err(),
+            "a full best-effort queue drops; it does not back-pressure the link"
+        );
+        assert_eq!(
+            sub.stats().dropped,
+            3,
+            "the subscription counts its own loss"
+        );
+        assert_eq!(
+            metrics.snapshot().dropped,
+            3,
+            "…and so does the node's counter, on a real session"
+        );
+    }
 
     #[test]
     fn reliability_is_documented_for_the_network_path() {
@@ -348,14 +695,7 @@ mod tests {
     /// found out. A test that cannot run is not a boundary; it is a gap with a note on it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_typed_frame_crosses_a_real_session_over_tcp_loopback() {
-        let port = free_tcp_port();
-        let listens = format!("tcp/127.0.0.1:{port}");
-        let listener = ZenohTransport::open_with(peer_config("listen/endpoints", &listens))
-            .await
-            .expect("the listening session opens");
-        let dialer = ZenohTransport::open_with(peer_config("connect/endpoints", &listens))
-            .await
-            .expect("the connecting session opens");
+        let (listener, dialer) = loopback_pair().await;
         assert_eq!(dialer.name(), "zenoh");
 
         // The subscriber lives on the *listening* side, the publisher on the connecting one:
@@ -409,14 +749,7 @@ mod tests {
     /// turning into a "publish silently reaches nobody" report in the field.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_longest_key_expression_we_accept_crosses_a_real_session() {
-        let port = free_tcp_port();
-        let listens = format!("tcp/127.0.0.1:{port}");
-        let listener = ZenohTransport::open_with(peer_config("listen/endpoints", &listens))
-            .await
-            .expect("the listening session opens");
-        let dialer = ZenohTransport::open_with(peer_config("connect/endpoints", &listens))
-            .await
-            .expect("the connecting session opens");
+        let (listener, dialer) = loopback_pair().await;
 
         // The largest *concrete* key this crate can hold: 32 segments of 64 bytes each.
         let segment = "x".repeat(64);
@@ -482,6 +815,95 @@ mod tests {
             long_topic,
             "the routing key is the long topic, not a truncated one"
         );
+    }
+
+    /// **A node on a real network counts what it publishes.**
+    ///
+    /// The counters (`published`/`delivered`/`dropped`/`blocked`) are the numbers an operator
+    /// reads: `status --json`, the `watch` line, the System UI's 「机器人链路」 page and the
+    /// health fold all come from them, and `docs/amos-link.md` promises they are "cumulative,
+    /// never reset, never faked". They were recorded by the **in-process broker and by nothing
+    /// else** — so a node whose transport is Zenoh (i.e. every board in the field, and the
+    /// CLI's `--transport zenoh`) reported `published=0 delivered=0` for its whole life while
+    /// frames were crossing the session in front of it.
+    ///
+    /// The shape under test is the one the CLI builds: one `LinkMetrics` set shared by the
+    /// transport and the node (`LinkNode::with_parts`), a real TCP session between two peers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_over_a_real_session_counts_what_it_publishes() {
+        let port = free_tcp_port();
+        let listens = format!("tcp/127.0.0.1:{port}");
+
+        // The subscriber side: **one** counter set for the transport and the node's
+        // subscriber, which is the invariant [`Transport::metrics`] documents (a transport
+        // records deliveries, so the node must report its set).
+        let subscriber_metrics = Arc::new(crate::metrics::LinkMetrics::new());
+        let listener = ZenohTransport::open_with_metrics(
+            peer_config("listen/endpoints", &listens),
+            Arc::clone(&subscriber_metrics),
+        )
+        .await
+        .expect("the listening session opens");
+        let mut sub = crate::pubsub::Subscriber::<crate::telemetry::Heartbeat>::subscribe(
+            listener.clone().shared(),
+            Topic::pattern("amos/**/telemetry/beat").expect("pattern"),
+            Qos::sensor(),
+            Arc::clone(&subscriber_metrics),
+        )
+        .await
+        .expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The publisher side: a node over the dialing transport, **sharing one counter set**
+        // with it — exactly the `build_zenoh_node` shape in the CLI.
+        let metrics = Arc::new(crate::metrics::LinkMetrics::new());
+        let dialer = ZenohTransport::open_with_metrics(
+            peer_config("connect/endpoints", &listens),
+            Arc::clone(&metrics),
+        )
+        .await
+        .expect("the connecting session opens");
+        let node = crate::node::LinkNode::with_parts(
+            crate::discovery::PeerId::new("dog1").expect("peer"),
+            crate::discovery::NodeKind::Robot,
+            dialer.clone().shared(),
+            Arc::new(crate::codec::Clock::host()),
+            Arc::clone(&metrics),
+        );
+        let publisher = node.publisher::<crate::telemetry::Heartbeat>(
+            Topic::new("amos/dog1/telemetry/beat").expect("topic"),
+        );
+        publisher
+            .publish(&crate::telemetry::Heartbeat::new(
+                crate::discovery::PeerId::new("dog1").expect("peer"),
+                1,
+                crate::codec::Timestamp::now(),
+                5,
+            ))
+            .await
+            .expect("publish");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
+            .await
+            .expect("a frame crosses the session")
+            .expect("recv");
+        assert_eq!(received.seq, 1);
+
+        // The frame really left this node (a `put` that returned Ok)…
+        assert_eq!(
+            metrics.snapshot().published,
+            1,
+            "a node on a network transport must count the frames it publishes — `status` and \
+             `watch` show this number, and it used to be 0 forever"
+        );
+        // …and the peer's forwarding task counted the delivery on its side.
+        assert!(
+            subscriber_metrics.snapshot().delivered >= 1,
+            "the receiving node counts the frame it handed to its subscriber queue: {:?}",
+            subscriber_metrics.snapshot()
+        );
+        // The node's own status document carries the same number (the path an operator reads).
+        assert_eq!(node.status().await.metrics.published, 1);
     }
 
     /// Scouting: two peers that were *not* told about each other find each other on the LAN.

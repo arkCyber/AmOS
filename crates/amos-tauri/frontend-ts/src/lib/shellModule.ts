@@ -22,29 +22,162 @@
  *
  * Pure data + pure functions: no Svelte, no IPC — the registry and its ordering
  * are unit-testable without rendering anything.
+ *
+ * Round 2 (REQ-A262) finished the story the first round only started: **all five
+ * slots are now rendered by a container from this table** (top bar left/right, the
+ * stage, the dock, the overlays) and the **overlay list is also the shortcut list** —
+ * F4 / ⌘Space / F3 / ⌘Tab are matched out of the same entries the shell renders,
+ * instead of a `switch` in the key handler next to a comment claiming the bindings
+ * exist (`lib/shellChrome.ts` said "⌘Space/F4 are bound" while F4 was bound nowhere).
  */
 import type { Component } from "svelte";
 
-/** Where a widget can live. Exactly one container renders each slot. */
+/**
+ * Where a widget can live. Exactly one container renders each slot:
+ * `topbar-left` + `topbar-right` → `TopBar.svelte`, `stage` → `DesktopStage.svelte`,
+ * `dock` → `Dock.svelte`, `overlay` → `DesktopShell.svelte`.
+ */
 export type ShellSlot = "topbar-left" | "topbar-right" | "stage" | "dock" | "overlay";
+
+/**
+ * A key binding, as **data**: one entry serves both the matcher (below) and the
+ * label a user reads (⌘Space), so the two can never disagree — which is exactly how
+ * the "F4 is bound" claim in the docs drifted away from the code.
+ *
+ * No i18n key: a shortcut label is Apple's glyph vocabulary (⌘ ⇧ ⌥ ⌃ ⇥), the same
+ * string in every language, and it is *derived* from the fields here rather than
+ * spelled a second time.
+ */
+export interface ShellShortcut {
+  /** `KeyboardEvent.key`, normalised — `"Space"`, not `" "` (see `normalizeKey`). */
+  key: string;
+  /** ⌘ on an Apple keyboard (`ctrlKey` counts too — the shell already treated it so). */
+  meta?: boolean;
+  shift?: boolean;
+  alt?: boolean;
+}
+
+/** The structural slice of a `KeyboardEvent` the matcher needs (no DOM in this file). */
+export interface ShortcutEvent {
+  key: string;
+  metaKey?: boolean;
+  ctrlKey?: boolean;
+  shiftKey?: boolean;
+  altKey?: boolean;
+}
+
+/**
+ * What a shortcut label shows for a key. Only the keys the chrome binds need an
+ * entry; anything else renders as-is (`F4`), which is already how a user writes it.
+ */
+const KEY_GLYPHS: Record<string, string> = {
+  Space: "Space",
+  Tab: "⇥",
+  Enter: "↩",
+  Escape: "⎋",
+  Backspace: "⌫",
+  Delete: "⌦",
+  ArrowUp: "↑",
+  ArrowDown: "↓",
+  ArrowLeft: "←",
+  ArrowRight: "→",
+  PageUp: "⇞",
+  PageDown: "⇟",
+  Home: "↖",
+  End: "↘",
+};
+
+/** `" "` (what a browser reports for the space bar) → `"Space"`; everything else untouched. */
+export function normalizeKey(key: string): string {
+  return key === " " || key === "Spacebar" ? "Space" : key;
+}
+
+/**
+ * Does this event trigger this shortcut? **Strict**: an unmodified `F4` must not fire
+ * on ⌘F4, so every modifier the binding does not list must be absent.
+ */
+export function shortcutMatches(e: ShortcutEvent, s: ShellShortcut): boolean {
+  if (normalizeKey(e.key) !== s.key) return false;
+  if (Boolean(s.meta) !== Boolean(e.metaKey || e.ctrlKey)) return false;
+  if (Boolean(s.shift) !== Boolean(e.shiftKey)) return false;
+  if (Boolean(s.alt) !== Boolean(e.altKey)) return false;
+  return true;
+}
+
+/** The human label for a binding: `"⌘Space"`, `"⇥"`, `"F4"`. Modifier order is Apple's. */
+export function formatShortcut(s: ShellShortcut): string {
+  let out = "";
+  if (s.alt) out += "⌥";
+  if (s.shift) out += "⇧";
+  if (s.meta) out += "⌘";
+  return out + (KEY_GLYPHS[s.key] ?? s.key);
+}
+
+/**
+ * The same binding for `aria-keyshortcuts` (WAI-ARIA spelling: `"Meta+Space"`), so a
+ * screen reader can announce it — a tooltip alone is invisible to one.
+ */
+export function shortcutAria(s: ShellShortcut): string {
+  const parts: string[] = [];
+  if (s.alt) parts.push("Alt");
+  if (s.shift) parts.push("Shift");
+  if (s.meta) parts.push("Meta");
+  parts.push(s.key);
+  return parts.join("+");
+}
+
+/** What a widget shows for its own shortcut: a tooltip label plus the ARIA form. */
+export interface ShortcutHint {
+  label: string;
+  aria: string;
+}
 
 /**
  * What a chrome widget may ask the shell to do.
  *
  * A **handle, not the shell**: a widget cannot reach `shellState`, the layout
  * snapshot or another widget through it. Every capability here is an intent the
- * container translates into what the shell already does (TopBar re-dispatches it),
- * so the widgets stay testable without a shell.
+ * shell translates into what it already does, and the handle is provided **once, by
+ * the shell** (`DesktopShell.svelte`) — not by each container. That correction to
+ * round 1 matters: `lockScreen` is something only the shell can do (it owns
+ * `shellState`), so a handle per container would have meant two implementations of
+ * the same capability set and a widget whose behaviour depended on which slot it was
+ * placed in.
  */
 export interface ShellChromeApi {
   /** Ask for the Launchpad overlay. */
   openLaunchpad: () => void;
   /** Ask for the Spotlight overlay. */
   openSpotlight: () => void;
+  /** Ask the shell for the lock screen (the Apple menu's 锁定屏幕). */
+  lockScreen: () => void;
+  /**
+   * The shortcut of an overlay, for a tooltip / `aria-keyshortcuts`
+   * (`overlayId` is the registry id, e.g. `"spotlight"`). `null` when that overlay
+   * has no binding — a widget must render no hint rather than invent one.
+   */
+  overlayShortcut: (overlayId: string) => ShortcutHint | null;
+  /**
+   * Show an overlay, or hide it if it is already up.
+   *
+   * This is what a **panel** trigger needs (macOS's Control Center item toggles its own
+   * popover; a trigger that can only open leaves a panel the user cannot dismiss with the
+   * same click). `overlayId` is a registry id.
+   */
+  toggleOverlay: (overlayId: string) => void;
+  /**
+   * Is that overlay currently up?
+   *
+   * Read-only, and deliberately part of the handle: a trigger must be able to say so
+   * (`aria-expanded`) instead of showing a state that may be wrong — an icon that never
+   * looks pressed while its panel is open is the same family as an inert control
+   * (`docs/FMEA.md` F-SH-001).
+   */
+  isOverlayOpen: (overlayId: string) => boolean;
 }
 
 /**
- * The context key the container provides and widgets read (`getContext`).
+ * The context key the shell provides and widgets read (`getContext`).
  *
  * Deliberately **not** named `amos.*`: that namespace is reserved for SharedStore
  * keys, and `scripts/store-scan.mjs` (rightly) treats every `"amos.*"` literal in
@@ -72,7 +205,29 @@ export interface ShellModule {
    * may never be opened at all).
    */
   component: Component;
+  /**
+   * Keys that toggle this widget's surface. **Overlay slot only** in practice: the
+   * shell matches these *and* lists them, and the first entry is the one a trigger
+   * shows. Two entries exist for one overlay where macOS has two bindings for the
+   * same thing (F3 and ⌘Tab both open Mission Control on a Mac).
+   */
+  shortcuts?: readonly ShellShortcut[];
+  /**
+   * **Dock slot only.** Draw the dock's separator *before* this widget. macOS puts
+   * one separator between the apps and the Trash; keeping it in the table (instead of
+   * an `{#if}` in the template) is what lets the item order and the grouping be read
+   * off one screen.
+   */
+  separatorBefore?: boolean;
+  /**
+   * **Dock slot only.** The window label whose `wm_windows` state draws this item's
+   * running dot. Absent ⇒ this dock item never shows one: Launchpad is not a window,
+   * and the Trash has nothing to run. (Without this the container would have to guess
+   * from the module id, which is a layout id — `dock-finder` is not a window label.)
+   */
+  windowLabel?: string;
 }
+
 
 /**
  * The modules of one slot, in render order. Pure; ties keep registry order, so
@@ -84,4 +239,38 @@ export function modulesFor<T extends ShellModule>(slot: ShellSlot, modules: read
     .filter(({ m }) => m.slot === slot)
     .sort((a, b) => a.m.order - b.m.order || a.index - b.index)
     .map(({ m }) => m);
+}
+
+/**
+ * The module in `slot` whose binding this event triggers, or `undefined`.
+ *
+ * This is the whole shortcut layer: the shell's key handler calls it and does whatever
+ * the returned module says (`toggle` its overlay), so **adding a binding is a row in
+ * the registry** and cannot disagree with the list the UI shows. It searches in render
+ * order, so the first match wins deterministically when two modules claim one key.
+ */
+export function moduleForShortcut<T extends ShellModule>(
+  slot: ShellSlot,
+  modules: readonly T[],
+  e: ShortcutEvent,
+): T | undefined {
+  return modulesFor(slot, modules).find((m) => m.shortcuts?.some((s) => shortcutMatches(e, s)));
+}
+
+/**
+ * The shortcut hint for an overlay id (`"spotlight"` → `{ label: "⌘Space", aria:
+ * "Meta+Space" }`), or `null` when that overlay exists with no binding **or** does not
+ * exist at all.
+ *
+ * One implementation for every trigger that shows a hint (the top bar's Launchpad /
+ * Spotlight widgets and the Dock's Launchpad item), because "which key opens what" is
+ * exactly the fact that used to live in a comment.
+ */
+export function overlayShortcutHint<T extends ShellModule>(
+  modules: readonly T[],
+  overlayId: string,
+): ShortcutHint | null {
+  const overlay = modulesFor("overlay", modules).find((m) => m.id === overlayId);
+  const first = overlay?.shortcuts?.[0];
+  return first ? { label: formatShortcut(first), aria: shortcutAria(first) } : null;
 }

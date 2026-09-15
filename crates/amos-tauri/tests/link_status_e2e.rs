@@ -32,6 +32,7 @@ use amos_link::service::LinkService;
 use amos_proto::amos_link::robot_link_server::RobotLinkServer;
 use amos_tauri_lib::link::link_status;
 use tokio_stream::wrappers::UnixListenerStream;
+use tonic::{Request, Response, Status};
 
 /// `AMOS_SOCKET` is **process-global**, so the two scenarios below must not interleave: one
 /// would talk to the other's socket. Tests in one binary run in parallel by default, hence an
@@ -81,9 +82,12 @@ async fn link_status_reads_a_real_control_plane_and_serializes_the_ui_contract()
     assert!(status.peers.is_empty(), "a fresh node has no peers");
     assert_eq!(status.metrics.dropped, 0);
     assert_eq!(status.metrics.decode_errors, 0);
-    // Nobody has reported an actuation: an empty list, not an invented idle robot.
-    assert!(
-        status.actuations.is_empty(),
+    // Nobody has reported an actuation: the daemon *answered* with an empty list, which is a
+    // different fact from 「it does not answer the return-path question at all」 (`None`, the
+    // older-daemon case pinned by the last test in this file).
+    assert_eq!(
+        status.actuations.as_deref(),
+        Some(&[][..]),
         "an unreported fleet stays absent"
     );
 
@@ -205,7 +209,12 @@ async fn link_status_carries_the_robots_own_actuation_reports() {
         bridge.step().await.expect("step");
         tokio::time::sleep(Duration::from_millis(30)).await;
         let status = link_status().await.expect("link_status");
-        if let Some(found) = status.actuations.into_iter().find(|a| a.robot == "dog1") {
+        if let Some(found) = status
+            .actuations
+            .expect("this daemon answers the return path")
+            .into_iter()
+            .find(|a| a.robot == "dog1")
+        {
             trotting = Some(found);
             break;
         }
@@ -236,7 +245,11 @@ async fn link_status_carries_the_robots_own_actuation_reports() {
     let mut stopped = None;
     for _ in 0..20 {
         let status = link_status().await.expect("link_status");
-        let robot = status.actuations.into_iter().find(|a| a.robot == "dog1");
+        let robot = status
+            .actuations
+            .expect("this daemon answers the return path")
+            .into_iter()
+            .find(|a| a.robot == "dog1");
         if robot.as_ref().is_some_and(|a| a.last_refusal.is_some()) {
             stopped = robot;
             break;
@@ -254,6 +267,124 @@ async fn link_status_carries_the_robots_own_actuation_reports() {
         refusal.reason.contains("re-arm"),
         "the panel can tell the user how to recover: {}",
         refusal.reason
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
+/// **A daemon that does not answer the return path must not take the panel down.**
+///
+/// `docs/amos-link.md` §6.5 promises exactly this: "老版本的 daemon 没有这个 RPC 时，界面只是少显示
+/// 一栏、不报错" — an older daemon has no `ListActuations`, and the panel should show one fewer
+/// section. The bridge did the opposite: `link_status` propagated the RPC failure with `?`, so
+/// the **whole page** became 「守护进程未连接」 and the status, the peer table and the verdict —
+/// all of which *were* available — disappeared.
+///
+/// The stub below is that older daemon: it implements `GetStatus` and leaves the rest to the
+/// trait's `Unimplemented` default (which is precisely what a daemon built before the RPC
+/// answers).
+struct WithoutListActuations;
+
+#[tonic::async_trait]
+impl amos_proto::amos_link::robot_link_server::RobotLink for WithoutListActuations {
+    async fn get_status(
+        &self,
+        _request: Request<amos_proto::amos_link::Empty>,
+    ) -> Result<Response<amos_proto::amos_link::LinkStatus>, Status> {
+        Ok(Response::new(amos_proto::amos_link::LinkStatus {
+            peer: "amos-daemon".into(),
+            kind: "tool".into(),
+            version: "0.1.0".into(),
+            uptime_ms: 7,
+            clock_synced: true,
+            metrics: None,
+            health: amos_proto::amos_link::HealthState::HealthUnknown as i32,
+            health_reasons: vec![],
+            peers: vec![],
+        }))
+    }
+
+    // Everything this daemon does not have answers `Unimplemented` — which is exactly what a
+    // daemon built before `ListActuations` existed does (the trait's own default is not
+    // generated, so an older build is the same shape: the RPC is *absent*, not empty).
+    async fn list_topics(
+        &self,
+        _request: Request<amos_proto::amos_link::Empty>,
+    ) -> Result<Response<amos_proto::amos_link::TopicList>, Status> {
+        Err(Status::unimplemented("an older daemon has no ListTopics"))
+    }
+
+    async fn publish(
+        &self,
+        _request: Request<amos_proto::amos_link::PublishRequest>,
+    ) -> Result<Response<amos_proto::amos_link::PublishReply>, Status> {
+        Err(Status::unimplemented("an older daemon has no Publish"))
+    }
+
+    type StreamHeartbeatsStream =
+        tokio_stream::wrappers::ReceiverStream<Result<amos_proto::amos_link::Heartbeat, Status>>;
+
+    async fn stream_heartbeats(
+        &self,
+        _request: Request<amos_proto::amos_link::Empty>,
+    ) -> Result<Response<Self::StreamHeartbeatsStream>, Status> {
+        Err(Status::unimplemented(
+            "an older daemon has no StreamHeartbeats",
+        ))
+    }
+
+    async fn list_actuations(
+        &self,
+        _request: Request<amos_proto::amos_link::Empty>,
+    ) -> Result<Response<amos_proto::amos_link::ActuationList>, Status> {
+        Err(Status::unimplemented(
+            "this daemon predates the return path (no ListActuations)",
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_without_the_return_path_still_answers_the_panel() {
+    let _guard = env_lock().lock().await;
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-tauri-link-no-actuations-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var("AMOS_SOCKET", &path);
+
+    let socket = path.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RobotLinkServer::new(WithoutListActuations))
+            .serve_with_incoming(UnixListenerStream::new(
+                tokio::net::UnixListener::bind(socket).expect("bind uds"),
+            ))
+            .await
+            .expect("the older control plane served");
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let status = link_status()
+        .await
+        .expect("a daemon without ListActuations must still answer the status");
+    // What *was* answered is on screen…
+    assert_eq!(status.peer, "amos-daemon");
+    assert!(status.clock_synced, "the daemon's own reading travels");
+    assert!(status.peers.is_empty());
+    // …and the return path is **absent**, which is not the same fact as 「nobody reported」:
+    // `null` says "this daemon does not answer that question", `[]` would be a claim about the
+    // fleet (the page's whole doctrine is 「absent, not idle」).
+    let json = serde_json::to_value(&status).expect("serialize");
+    assert_eq!(
+        json["actuations"],
+        serde_json::Value::Null,
+        "an unanswered return path must be absent, never an empty fleet"
+    );
+    assert_eq!(
+        json["peers"],
+        serde_json::json!([]),
+        "…while the peer table is still an answered (empty) list"
     );
 
     server.abort();

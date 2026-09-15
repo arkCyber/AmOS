@@ -37,6 +37,48 @@ pub fn ensure_loadable(len: u64) -> Result<()> {
     }
 }
 
+/// Maximum bytes in a `MediaProvider::save` `name`.
+///
+/// Real file names are ≤ 255 chars (the EXT4 / VFAT ceiling). 4 KiB is well
+/// above any realistic value and tight enough that a paste-sized caller cannot
+/// blow out the provider's path handling with a multi-megabyte blob.
+pub const MAX_SAVE_NAME_BYTES: usize = 4 << 10;
+
+/// Reject any `name` that is not a plain file name: empty (after trim), `.`,
+/// `..`, or containing a path separator. Pure, total, and **shared by every
+/// backend** so a path-traversal payload is refused at the same seam regardless
+/// of which provider is in use.
+///
+/// This is the **trait-level guard** — `HostFsProvider` runs the same rule
+/// (its on-disk join would otherwise let `..` escape the collection root);
+/// `MockMediaProvider` and the Android glue go through it too so the test
+/// surface and the device surface agree on the rejection.
+pub fn validate_save_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(MediaError::InvalidArguments(
+            "cannot save media with an empty name".to_string(),
+        ));
+    }
+    if trimmed.len() > MAX_SAVE_NAME_BYTES {
+        return Err(MediaError::InvalidArguments(format!(
+            "media name too long: {} bytes (max {MAX_SAVE_NAME_BYTES})",
+            trimmed.len()
+        )));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err(MediaError::InvalidArguments(
+            "media name must not be '.' or '..'".to_string(),
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(MediaError::InvalidArguments(
+            "media name must not contain a path separator".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// The external seam to the platform's media storage. Implementations must be
 /// [`Send`] + [`Sync`]; methods are synchronous and single-shot, cheap to test.
 pub trait MediaProvider: Send + Sync {
@@ -244,12 +286,10 @@ impl MediaProvider for MockMediaProvider {
         name: &str,
         data: &[u8],
     ) -> Result<MediaItem> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(MediaError::InvalidArguments(
-                "cannot save media with an empty name".to_string(),
-            ));
-        }
+        // The trait-level name guard runs **before** any state mutation, so an
+        // "empty / `..` / path-traversal" name is refused identically across
+        // every backend — including the Mock used by tests / CI.
+        let name = validate_save_name(name)?;
         let len = data.len() as u64;
         if len > MAX_SAVE_BYTES {
             return Err(MediaError::TooLarge {
@@ -415,5 +455,61 @@ mod tests {
             None => panic!("seeded camera item"),
         };
         assert!(seeded.read_range(&item, 0, 4).is_err());
+    }
+
+    /// `validate_save_name` is the trait-level guard every backend runs before
+    /// persisting bytes: it must accept plain file names and refuse anything
+    /// that could be turned into a directory traversal at the on-disk join.
+    #[test]
+    fn validate_save_name_accepts_well_formed_file_names() {
+        for ok in ["photo.jpg", "IMG_2026-09-15_20-13-04.png", "备忘录.md"] {
+            assert!(
+                validate_save_name(ok).is_ok(),
+                "legitimate name {ok:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_save_name_rejects_path_traversal_and_oversized() {
+        // Path traversal: every one of these would escape `<base>/<dir>/<name>`
+        // if it reached the on-disk `join`.
+        for evil in [
+            "",
+            ".",
+            "..",
+            "../etc",
+            "../etc/passwd",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "good/../bad",
+        ] {
+            assert!(
+                validate_save_name(evil).is_err(),
+                "unsafe name {evil:?} must be refused"
+            );
+        }
+        // Past the byte cap.
+        let huge = "x".repeat(MAX_SAVE_NAME_BYTES + 1);
+        assert!(validate_save_name(&huge).is_err());
+    }
+
+    /// The Mock backend must run the same path-traversal guard — it is the test
+    /// surface for the trait and would otherwise let a unit test exercise a
+    /// "successful" save that the production backend refuses.
+    #[test]
+    fn mock_provider_refuses_unsafe_names_at_the_trait_guard() {
+        let p = MockMediaProvider::empty();
+        let data = b"hello";
+        assert!(p
+            .save(StandardDir::Pictures, MediaKind::Image, "../escape", data)
+            .is_err());
+        assert!(p
+            .save(StandardDir::Pictures, MediaKind::Image, "good/../bad", data)
+            .is_err());
+        assert!(p
+            .save(StandardDir::Pictures, MediaKind::Image, "photo.jpg", data)
+            .is_ok());
     }
 }

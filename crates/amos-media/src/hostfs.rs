@@ -134,8 +134,10 @@ impl MediaProvider for HostFsProvider {
         name: &str,
         data: &[u8],
     ) -> Result<MediaItem> {
-        let name = sanitize_name(name)
-            .ok_or_else(|| MediaError::InvalidArguments("unsafe or empty file name".to_string()))?;
+        // The trait-level `validate_save_name` is the single source of truth on
+        // what counts as a valid save name; the on-disk `dir_path.join(&name)`
+        // below then cannot escape the collection root.
+        let name = crate::provider::validate_save_name(name)?;
         // Enforce the shared save ceiling (same contract as Mock / MediaStore).
         let len = data.len() as u64;
         if len > MAX_SAVE_BYTES {
@@ -203,18 +205,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// Reject anything that isn't a plain file name: empty, `.`, `..`, or containing a
-/// path separator (so a caller can never traverse out of the collection).
-fn sanitize_name(name: &str) -> Option<String> {
-    if name.is_empty() || name == "." || name == ".." {
-        return None;
-    }
-    if name.contains('/') || name.contains('\\') {
-        return None;
-    }
-    Some(name.to_string())
 }
 
 #[cfg(test)]

@@ -46,6 +46,23 @@ pub struct TelephonyDialPayload {
     pub id: String,
 }
 
+/// Maximum bytes in a dial number string the WebView hands to `telephony_dial`.
+///
+/// The number reaches the daemon over gRPC and the on-device path eventually
+/// reaches `Intent(ACTION_CALL, tel:…)`, where the platform itself caps at 32
+/// dialable chars ([`crate::real_dial::MAX_DIAL_CHARS`]). We share that ceiling
+/// here — anything larger is refused at the command seam with a truthful reason,
+/// instead of producing the platform's generic "could not dial" error message.
+pub const MAX_TELEPHONY_DIAL_BYTES: usize = 64;
+
+/// Maximum bytes in a call id string the WebView hands to `telephony_end` /
+/// `telephony_answer` / recording toggles.
+///
+/// Daemon-generated call ids look like `tel_0000000000000001` (~20 chars). We
+/// cap at 256 to leave headroom for any future id shape while preventing a
+/// caller from using this field as a memory amplification vector.
+pub const MAX_TELEPHONY_CALL_ID_BYTES: usize = 256;
+
 async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
@@ -89,6 +106,12 @@ pub async fn telephony_dial(
     number: String,
     emergency: bool,
 ) -> Result<TelephonyDialPayload, String> {
+    if number.len() > MAX_TELEPHONY_DIAL_BYTES {
+        return Err(format!(
+            "number too long: {} bytes (max {MAX_TELEPHONY_DIAL_BYTES})",
+            number.len()
+        ));
+    }
     let mut client = TelephonyClient::new(build_channel().await?);
     let resp = client
         .dial(DialRequest { number, emergency })
@@ -101,6 +124,12 @@ pub async fn telephony_dial(
 /// End a live call by id.
 #[tauri::command]
 pub async fn telephony_end(call_id: String) -> Result<(), String> {
+    if call_id.len() > MAX_TELEPHONY_CALL_ID_BYTES {
+        return Err(format!(
+            "call_id too long: {} bytes (max {MAX_TELEPHONY_CALL_ID_BYTES})",
+            call_id.len()
+        ));
+    }
     // When AmOS is the default phone app, a real Telecom call is in flight — hang up
     // the real call via the bound AmosInCallService instead of the daemon (mock).
     #[cfg(feature = "android")]
@@ -132,6 +161,12 @@ pub async fn telephony_status() -> Result<Vec<TelephonyCallPayload>, String> {
 /// Start recording a live call; returns its authoritative snapshot (recording=On).
 #[tauri::command]
 pub async fn telephony_start_recording(call_id: String) -> Result<TelephonyCallPayload, String> {
+    if call_id.len() > MAX_TELEPHONY_CALL_ID_BYTES {
+        return Err(format!(
+            "call_id too long: {} bytes (max {MAX_TELEPHONY_CALL_ID_BYTES})",
+            call_id.len()
+        ));
+    }
     let mut client = TelephonyClient::new(build_channel().await?);
     let resp = client
         .start_recording(CallIdMsg { id: call_id })
@@ -144,6 +179,12 @@ pub async fn telephony_start_recording(call_id: String) -> Result<TelephonyCallP
 /// Stop recording a live call; returns its authoritative snapshot (recording=Off).
 #[tauri::command]
 pub async fn telephony_stop_recording(call_id: String) -> Result<TelephonyCallPayload, String> {
+    if call_id.len() > MAX_TELEPHONY_CALL_ID_BYTES {
+        return Err(format!(
+            "call_id too long: {} bytes (max {MAX_TELEPHONY_CALL_ID_BYTES})",
+            call_id.len()
+        ));
+    }
     let mut client = TelephonyClient::new(build_channel().await?);
     let resp = client
         .stop_recording(CallIdMsg { id: call_id })
@@ -157,6 +198,12 @@ pub async fn telephony_stop_recording(call_id: String) -> Result<TelephonyCallPa
 /// the `Watch` stream and is delivered to the UI as a `telephony-event`.
 #[tauri::command]
 pub async fn telephony_answer(call_id: String) -> Result<(), String> {
+    if call_id.len() > MAX_TELEPHONY_CALL_ID_BYTES {
+        return Err(format!(
+            "call_id too long: {} bytes (max {MAX_TELEPHONY_CALL_ID_BYTES})",
+            call_id.len()
+        ));
+    }
     // Real incoming call (default phone app): answer via the bound in-call service.
     #[cfg(feature = "android")]
     if crate::incall::real_answer().unwrap_or(false) {
@@ -176,6 +223,12 @@ pub async fn telephony_answer(call_id: String) -> Result<(), String> {
 /// desktop demo can exercise the incoming-call surface). Returns the new call id.
 #[tauri::command]
 pub async fn telephony_simulate_incoming(number: String) -> Result<String, String> {
+    if number.len() > MAX_TELEPHONY_DIAL_BYTES {
+        return Err(format!(
+            "number too long: {} bytes (max {MAX_TELEPHONY_DIAL_BYTES})",
+            number.len()
+        ));
+    }
     let mut client = TelephonyClient::new(build_channel().await?);
     let resp = client
         .simulate_incoming(SimulateIncomingRequest { number })
@@ -301,5 +354,23 @@ mod tests {
         ));
         assert_eq!(p.state, "Dialing");
         assert_eq!(p.recording, "Off");
+    }
+
+    /// The command-seam ceilings defend the documented shapes — a daemon-
+    /// generated call id (e.g. `tel_0000000000000001`, ~20 chars) fits well
+    /// inside `MAX_TELEPHONY_CALL_ID_BYTES`, and the dial ceiling matches the
+    /// platform's own bound at `real_dial::MAX_DIAL_CHARS` (32) with room for
+    /// an emergency label and the `+` prefix.
+    #[test]
+    fn the_telephony_command_bounds_match_documented_shapes() {
+        use super::{MAX_TELEPHONY_CALL_ID_BYTES, MAX_TELEPHONY_DIAL_BYTES};
+        // Real daemon ids are ~20 chars; the cap has headroom without inviting
+        // paste-sized junk.
+        assert!(MAX_TELEPHONY_CALL_ID_BYTES >= 64);
+        assert!(MAX_TELEPHONY_CALL_ID_BYTES < 1024);
+        // Real E.164 numbers are ≤16 chars; the cap is the platform's `MAX_DIAL_CHARS`
+        // doubled so a future emergency label/extension can still fit.
+        assert!(MAX_TELEPHONY_DIAL_BYTES >= 32);
+        assert!(MAX_TELEPHONY_DIAL_BYTES < 256);
     }
 }

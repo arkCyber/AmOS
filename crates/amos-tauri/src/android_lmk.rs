@@ -22,6 +22,19 @@ use crate::watch_backoff::{next_backoff_ms, WATCH_BACKOFF_BASE_MS};
 /// Tauri event name carrying one [`LmkSurfacePayload`] per daemon `WatchLmk` event.
 pub const LMK_SURFACE_EVENT: &str = "lmk-surface";
 
+/// Maximum bytes in a `package_name` / `window_id` the WebView hands in via the
+/// LMK debug command.
+///
+/// Same rationale as `ai_bridge::MAX_ANDROID_PACKAGE_BYTES` — real names are
+/// reverse-DNS / short ids (≤64 chars), and 256 B is well above any legitimate
+/// value while bounding the gRPC `package_name` field.
+pub const MAX_LMK_PACKAGE_BYTES: usize = 256;
+
+/// Upper bound on the `budget` field of `android_lmk_debug` (number of victims
+/// the daemon may reclaim in one round). The daemon has its own ceiling;
+/// 1 000 matches the audit-trail / privacy review `MAX_PRIVACY_AUDIT_LIMIT`.
+pub const MAX_LMK_BUDGET: u64 = 1000;
+
 /// Serializable description of one container LMK decision (prost structs are not
 /// `Serialize`). The shell uses `window_id` to address the `legacy:<window_id>`
 /// surface and `close_surface` to decide whether to tear it down.
@@ -186,6 +199,12 @@ pub async fn android_lmk_debug(
     if let Some(host) = action_to_host(act) {
         let pkg =
             package_name.ok_or_else(|| format!("lmk debug '{action}' requires a package_name"))?;
+        if pkg.len() > MAX_LMK_PACKAGE_BYTES {
+            return Err(format!(
+                "lmk package_name too long: {} bytes (max {MAX_LMK_PACKAGE_BYTES})",
+                pkg.len()
+            ));
+        }
         client
             .apply_host_decision(with_client_id(HostActionRequest {
                 package_name: pkg.clone(),
@@ -200,10 +219,16 @@ pub async fn android_lmk_debug(
     }
 
     // LMK trigger: ask the daemon to reclaim victims this round.
+    let budget = budget.unwrap_or(1);
+    if budget > MAX_LMK_BUDGET {
+        return Err(format!(
+            "lmk budget too large: {budget} (max {MAX_LMK_BUDGET})"
+        ));
+    }
     let resp: LmkResponse = client
         .trigger_lmk(with_client_id(LmkRequest {
             pressure: MemoryPressure::Critical as i32,
-            budget: budget.unwrap_or(1),
+            budget,
         }))
         .await
         .map_err(|e| format!("trigger_lmk failed: {e}"))?

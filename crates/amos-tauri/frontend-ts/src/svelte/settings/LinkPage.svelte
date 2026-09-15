@@ -14,12 +14,17 @@
   // publishing; docs/amos-link.md §6).
   import { onMount } from "svelte";
   import {
+    actuationAgeMs,
     counterSummary,
     formatUptime,
     healthKey,
     linkLevel,
     linkStatus,
     peerSummary,
+    reportAgeKey,
+    reportAgeText,
+    returnPathKey,
+    returnPathLevel,
     robotLevel,
     robotLevelKey,
     robotSummary,
@@ -162,9 +167,26 @@
     <section class={GROUP}>
       <div class="px-4 py-3">
         <p class={H2}>{t("link.robotsHeading")}</p>
-        {#if (status.actuations ?? []).length > 0}
+        <!--
+          Three states, three renderings (see `returnPathLevel`): `unavailable` = the daemon did
+          not answer this question (an older build without `ListActuations`) — which is *not*
+          「nobody reported」, so it gets its own sentence; `none` = it answered and nobody has
+          reported; `reported` = the list below.
+        -->
+        {#if returnPathLevel(status) === "unavailable"}
+          <p class="mt-1.5 text-sm opacity-70" data-testid="link-robots-unavailable">
+            {t(returnPathKey("unavailable"))}
+          </p>
+        {:else if (status.actuations ?? []).length > 0}
           <ul class="mt-1.5 space-y-2" data-testid="link-robots">
             {#each status.actuations ?? [] as robot (robot.robot)}
+              <!--
+                The report's own age: `armed` / `estopped` are claims about *right now*, and the
+                page's `link.probe` dates the read, not the report. An age that cannot be stated
+                (no stamp, or a stamp from the robot's unsynchronised clock) says so instead of
+                printing a number.
+              -->
+              {@const ageMs = actuationAgeMs(robot, readAt)}
               <li class="text-sm">
                 <div class="flex justify-between gap-3">
                   <span class="truncate">{robotSummary(robot)}</span>
@@ -172,6 +194,9 @@
                     {t(robotLevelKey(robotLevel(robot)))}
                   </span>
                 </div>
+                <p class="text-xs opacity-60" data-testid="link-robot-age">
+                  {t(reportAgeKey(ageMs), { age: reportAgeText(ageMs ?? 0) })}
+                </p>
                 {#if robot.last_refusal}
                   <p class="text-xs opacity-60" data-testid="link-robot-refusal">
                     {t("link.robotRefused", { seq: robot.last_refusal.seq })}:

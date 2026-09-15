@@ -204,6 +204,9 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
   });
 
   test("robot rows show what each robot reports about itself", async () => {
+    // The stamps are what the *robots* reported; the fixture gives one a fresh report and one a
+    // three-hour-old one, because the row must say which is which (see the age assertions below).
+    const now = Date.now();
     bridgeReturning({
       ...STATUS,
       actuations: [
@@ -217,7 +220,7 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
           estop_reason: null,
           watchdog_ms: 1000,
           last_refusal: null,
-          stamp_ms: 1,
+          stamp_ms: now - 2_500,
         },
         {
           robot: "dog2",
@@ -232,7 +235,7 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
             seq: 14,
             reason: 'e-stop latched: send {"action":"arm"} to re-arm',
           },
-          stamp_ms: 2,
+          stamp_ms: now - 3 * 3_600_000,
         },
       ],
     });
@@ -246,11 +249,63 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
     expect(rows).toContain("dog2 · estop · #13");
     // The watchdog cut is the headline fact for that row, not "armed".
     expect(rows).toContain("已切扭矩");
+    // Each report carries **its own age**: a fresh one and a three-hour-old one are not the same
+    // claim about the world, and `armed` from three hours ago is not "armed now".
+    const ages = host.container.querySelectorAll('[data-testid="link-robot-age"]');
+    expect(ages.length).toBe(2);
+    expect(ages[0]?.textContent ?? "").toContain("2s 前上报");
+    expect(ages[1]?.textContent ?? "").toContain("3h 00m 前上报");
     // The refusal carries the robot's own words (how to recover), not a UI paraphrase.
     const refusal =
       host.container.querySelector('[data-testid="link-robot-refusal"]')?.textContent ?? "";
     expect(refusal).toContain("#14");
     expect(refusal).toContain("re-arm");
+  });
+
+  test("a report whose stamp is unusable says so instead of guessing an age", async () => {
+    // Two ways a robot's report cannot be dated: no stamp at all (`0` is the proto's sentinel,
+    // not 1970 — which would render as a 56-year-old report), and a stamp *from the future*
+    // (two clocks that disagree). Neither may be shown as a number.
+    bridgeReturning({
+      ...STATUS,
+      actuations: [
+        {
+          robot: "dog1",
+          seq: 12,
+          gait: "trot",
+          frames: 13,
+          armed: true,
+          estopped: false,
+          estop_reason: null,
+          watchdog_ms: null,
+          last_refusal: null,
+          stamp_ms: 0,
+        },
+        {
+          robot: "dog2",
+          seq: 13,
+          gait: "trot",
+          frames: 13,
+          armed: true,
+          estopped: false,
+          estop_reason: null,
+          watchdog_ms: null,
+          last_refusal: null,
+          stamp_ms: Date.now() + 60_000,
+        },
+      ],
+    });
+    const host = render(LinkPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="link-robots"]')).toBeTruthy(),
+    );
+    const ages = [...host.container.querySelectorAll('[data-testid="link-robot-age"]')];
+    expect(ages.length).toBe(2);
+    for (const age of ages) {
+      expect(age.textContent ?? "").toContain("上报时间未知");
+      // …and no invented figure sneaks in beside it.
+      expect(age.textContent ?? "").not.toContain("前上报");
+    }
   });
 
   test("no reports is stated as such, never as 'all robots idle'", async () => {
@@ -263,19 +318,40 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
     expect(host.container.querySelector('[data-testid="link-robots"]')).toBeNull();
   });
 
-  test("a daemon older than the RPC does not break the panel", async () => {
-    // Version skew: an older daemon simply omits `actuations`. The panel must show less,
-    // never throw — and the rest of the status still renders.
-    const older: Record<string, unknown> = { ...STATUS };
-    delete older.actuations;
+  test("a daemon that does not answer the return path says so — never 'nobody reported'", async () => {
+    // Version skew, the case `docs/amos-link.md` §6.5 promises the panel survives: an older
+    // daemon has no `ListActuations`, so the bridge reports `actuations: null`. The panel must
+    // show less, never throw — **and never render the absence of an answer as 「nobody
+    // reported」**: "we were not told" is not a fact about the fleet.
+    //
+    // This test replaced one that pinned the opposite (it asserted `link-robots-none` for an
+    // older daemon, i.e. it had the conflation built in).
+    const older: Record<string, unknown> = { ...STATUS, actuations: null };
     bridgeReturning(older);
     const host = render(LinkPage);
     await vi.waitFor(() =>
       expect(host.container.querySelector('[data-testid="link-counters"]')).toBeTruthy(),
     );
     expect(
-      host.container.querySelector('[data-testid="link-robots-none"]'),
+      host.container.querySelector('[data-testid="link-robots-unavailable"]'),
     ).toBeTruthy();
+    expect(host.container.textContent ?? "").toContain("这个守护进程不上报回程");
+    expect(host.container.querySelector('[data-testid="link-robots-none"]')).toBeNull();
     expect(host.container.querySelector('[data-testid="link-robots"]')).toBeNull();
+    // Everything the daemon *did* answer is still on screen.
+    expect(host.container.textContent ?? "").toContain("published=12");
+
+    // An **older bridge** (the field simply absent) is the same version skew in the other
+    // direction: `undefined` must read as 「not answered」 too.
+    const omitted: Record<string, unknown> = { ...STATUS };
+    delete omitted.actuations;
+    bridgeReturning(omitted);
+    const second = render(LinkPage);
+    await vi.waitFor(() =>
+      expect(
+        second.container.querySelector('[data-testid="link-robots-unavailable"]'),
+      ).toBeTruthy(),
+    );
+    expect(second.container.querySelector('[data-testid="link-robots-none"]')).toBeNull();
   });
 });

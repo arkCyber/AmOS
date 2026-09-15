@@ -45,6 +45,23 @@ pub const APP_FOCUSED_KEY: &str = "amos.app_focused";
 /// File used when `AMOS_STATE_FILE` is unset: `~/.amos/state.json`.
 const DEFAULT_RELATIVE: &str = ".amos/state.json";
 
+/// Maximum bytes in one store value written via `store_set`.
+///
+/// The state file (`~/.amos/state.json`) is loaded on every boot and parsed as JSON.
+/// A value much larger than this would make boot slow and could exhaust memory on a
+/// low-end device. 256 KiB comfortably covers any real settings payload (toggle
+/// states, layout hints, notification counts); the few legitimately large values (e.g.
+/// a screenshot preview in a notification) should use a file path key instead.
+pub const MAX_STORE_VALUE_BYTES: usize = 256 << 10;
+
+/// Maximum bytes in a store key.
+///
+/// Real keys look like `amos.app_focused`, `amos.wifi`, `<16 chars>` — well under
+/// 256 B. The cap protects the JSON state file's key space from a paste-sized
+/// caller (every key is loaded on every boot, so megabyte keys make boot slow
+/// even though each one individually is tiny).
+pub const MAX_STORE_KEY_BYTES: usize = 256;
+
 /// Thread-safe shared key/value store — the **durable** source of truth for the
 /// `amos.*` keys the frontend writes through (`amos.settings`, notifications,
 /// home layout, …). It mirrors every mutation to a JSON file on disk so state
@@ -265,19 +282,56 @@ pub fn object_for_merge(
 /// Tauri command: read a single key.
 #[tauri::command]
 pub fn store_get(state: State<'_, SharedStore>, key: String) -> Option<String> {
+    if !check_store_key(&key) {
+        return None;
+    }
     state.get(&key)
 }
 
 /// Tauri command: write a key (broadcasts `store-updated`).
 #[tauri::command]
 pub fn store_set(app: AppHandle, state: State<'_, SharedStore>, key: String, value: String) {
+    // Bound the value at the command seam so a misbehaving / malicious frontend
+    // cannot inflate the state file to tens of megabytes and slow boot.
+    if value.len() > MAX_STORE_VALUE_BYTES {
+        tracing::warn!(
+            target: "amos::store",
+            key = %key,
+            bytes = value.len(),
+            "store value capped — use a file path key for large payloads"
+        );
+        return;
+    }
+    if !check_store_key(&key) {
+        return;
+    }
     state.set(&app, &key, value);
 }
 
 /// Tauri command: remove a key (broadcasts `store-updated`).
 #[tauri::command]
 pub fn store_remove(app: AppHandle, state: State<'_, SharedStore>, key: String) {
+    if !check_store_key(&key) {
+        return;
+    }
     state.remove(&app, &key);
+}
+
+/// Bound a store key at the command seam — the key is reused in every JSON
+/// read/write of the durable state file, so a paste-sized key would inflate
+/// every iteration of the on-disk store. The same `valid` predicate is shared
+/// by `store_get` / `_set` / `_remove` so a refused key is a consistent no-op
+/// regardless of which command reaches it (real call sites only call one).
+fn check_store_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > MAX_STORE_KEY_BYTES {
+        return false;
+    }
+    // A control-character key would corrupt the JSON file (it is loaded as JSON
+    // on every boot; escaped control chars are legal but useless).
+    if key.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    true
 }
 
 /// Tauri command: snapshot the whole store (window hydration on boot).
@@ -418,5 +472,31 @@ mod tests {
         let again = SharedStore::from_file(&path);
         assert_eq!(again.get("amos.settings").as_deref(), Some("{}"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `check_store_key` is the single gate for the durable JSON store's keys;
+    /// accept well-formed settings keys and refuse empty / oversized / control
+    /// ones so a paste-sized JS caller cannot inflate the state file.
+    #[test]
+    fn store_keys_are_bounded_at_the_command_seam() {
+        for ok in [
+            "amos.app_focused",
+            "amos.wifi",
+            "settings.notifications.dnd",
+            "x".repeat(MAX_STORE_KEY_BYTES).as_str(),
+        ] {
+            assert!(
+                check_store_key(ok),
+                "real key {ok:?} (≤{MAX_STORE_KEY_BYTES} bytes) is accepted"
+            );
+        }
+        // Empty is never a valid store key.
+        assert!(!check_store_key(""));
+        // Past the byte cap.
+        let huge = "x".repeat(MAX_STORE_KEY_BYTES + 1);
+        assert!(!check_store_key(&huge));
+        // Control characters cannot be a valid JSON key fragment.
+        assert!(!check_store_key("amos.\nbad"));
+        assert!(!check_store_key("amos.\0bad"));
     }
 }

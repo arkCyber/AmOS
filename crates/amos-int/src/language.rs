@@ -11,11 +11,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Language(String);
 
+/// Maximum length of a BCP-47 language tag in bytes.
+///
+/// Real tags are 2–5 ASCII letters (sometimes with a `-` region subtag),
+/// totalling well under 16 bytes. We cap at 32 to absorb anything reasonable;
+/// anything longer is either a paste attack or a bug and would propagate as a
+/// giant string into the translation daemon's gRPC header.
+pub const MAX_LANG_TAG_BYTES: usize = 32;
+
 impl Language {
     /// Build a language tag, normalising to lower-case. `"auto"` is reserved
     /// for language detection.
+    ///
+    /// The tag is bounded to [`MAX_LANG_TAG_BYTES`] bytes; longer input is
+    /// truncated to the prefix so a paste-attack caller cannot inflate every
+    /// downstream gRPC header — same rationale as `MAX_AI_PROMPT_BYTES` at the
+    /// `ask_ai_agent` seam.
     pub fn new(tag: impl Into<String>) -> Self {
-        Self(tag.into().to_ascii_lowercase())
+        let raw = tag.into();
+        let truncated: String = if raw.len() > MAX_LANG_TAG_BYTES {
+            raw.chars().take(MAX_LANG_TAG_BYTES).collect()
+        } else {
+            raw
+        };
+        Self(truncated.to_ascii_lowercase())
     }
 
     pub fn as_str(&self) -> &str {
@@ -124,5 +143,33 @@ mod tests {
         let pair = LanguagePair::new("en", "zh");
         let resolved = pair.resolve(Some(&Language::new("ja")));
         assert_eq!(resolved.source, Language::new("en"));
+    }
+
+    /// Past the [`MAX_LANG_TAG_BYTES`] cap the tag is truncated, so a paste
+    /// attack cannot inflate every downstream gRPC header — the tag stays
+    /// well-formed ASCII, just bounded.
+    #[test]
+    fn oversized_tags_are_truncated_to_the_cap() {
+        // A normal real tag is well under the cap.
+        assert_eq!(Language::new("zh-Hant-HK").as_str(), "zh-hant-hk");
+        // A paste / buggy caller with a huge tag is clipped, not propagated.
+        let huge = "x".repeat(MAX_LANG_TAG_BYTES * 4);
+        let bounded = Language::new(huge);
+        assert_eq!(bounded.as_str().len(), MAX_LANG_TAG_BYTES);
+        assert!(
+            bounded.as_str().chars().all(|c| c == 'x'),
+            "truncation keeps the prefix intact"
+        );
+    }
+
+    /// Real BCP-47 tags and the cap: room for a longest plausible tag (e.g. a
+    /// private-use `x-…` subtag), but no headroom for a multi-kilobyte junk
+    /// string to slip through.
+    #[test]
+    fn the_lang_tag_constant_has_real_headroom() {
+        // Real longest tag is `zh-Hant-HK` (11 ASCII chars) — comfortably inside
+        // the cap; the cap itself is short enough to fit in any reasonable log line.
+        assert!(MAX_LANG_TAG_BYTES >= 12);
+        assert!(MAX_LANG_TAG_BYTES < 256);
     }
 }

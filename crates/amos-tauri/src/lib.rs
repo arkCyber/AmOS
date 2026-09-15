@@ -40,6 +40,10 @@ pub mod devcare;
 #[cfg(feature = "android")]
 pub mod devcare_device;
 pub mod display;
+/// Typed error envelope shared across the System UI Rust core. See
+/// [`error::ErrorCode`] for the wire vocabulary and [`error::AmosError`] for the
+/// serializable failure shape returned by every `#[tauri::command]`.
+pub mod error;
 pub mod flashlight;
 pub mod host_battery;
 pub mod host_log;

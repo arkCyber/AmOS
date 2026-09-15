@@ -390,6 +390,27 @@ impl Envelope {
     /// Decode a frame, refusing a foreign magic, an unknown version, a truncated
     /// frame, an implausible length, a bad CRC, or a size beyond [`MAX_PAYLOAD_BYTES`].
     pub fn decode(frame: &[u8]) -> Result<Self> {
+        let (header, payload) = Self::decode_header(frame)?;
+        Ok(Self {
+            header,
+            payload: payload.to_vec(),
+        })
+    }
+
+    /// Decode **just the header**, borrowing the payload's bytes.
+    ///
+    /// `decode` copies the payload (`payload.to_vec()`) because its caller wants the bytes; a
+    /// consumer that only needs the envelope's routing/timing metadata — the arrival-rate
+    /// instrument (`crate::rate`), a topic counter, a forwarder deciding where a frame goes —
+    /// would pay a copy of the whole frame (up to 16 MiB, at whatever rate the stream runs) for a
+    /// header it already has in hand. That is the same rule the checksum follows: **the receive
+    /// path never builds a second copy of a frame** (`docs/amos-link.md` §3.3). The returned
+    /// slice is a borrow, so a caller that discards it allocates only the header.
+    ///
+    /// This is the **one** parser: `decode` is written on top of it, so the magic/version/length
+    /// ceiling/CRC/header-validation checks cannot drift between the two paths — they are the
+    /// checks that keep a hostile frame out, and a second copy of them would be a second opinion.
+    pub fn decode_header(frame: &[u8]) -> Result<(Header, &[u8])> {
         if frame.len() < PREFIX_LEN + 4 {
             return Err(LinkError::Frame(format!(
                 "frame of {} bytes is shorter than the fixed header",
@@ -459,10 +480,7 @@ impl Envelope {
                 payload.len()
             )));
         }
-        Ok(Self {
-            header,
-            payload: payload.to_vec(),
-        })
+        Ok((header, payload))
     }
 }
 
@@ -532,6 +550,58 @@ mod tests {
         frame.extend_from_slice(&crc32_over(&header_bytes, payload).to_le_bytes());
         frame.extend_from_slice(payload);
         frame
+    }
+
+    #[test]
+    fn the_header_only_reader_borrows_and_refuses_exactly_what_decode_refuses() {
+        // One parser, two shapes: `decode` (payload owned) is written on top of `decode_header`
+        // (payload borrowed), so the checks that keep a hostile frame out cannot drift apart.
+        let frame = envelope().encode().expect("encode");
+        let (header, payload) = Envelope::decode_header(&frame).expect("header-only decode");
+        assert_eq!(header, envelope().header);
+        // The payload is a **borrow** of the input buffer, not a copy: this is the whole reason
+        // the method exists (a rate instrument must not memcpy a 16 MiB depth frame per frame).
+        let offset = payload.as_ptr() as usize - frame.as_ptr() as usize;
+        assert_eq!(
+            offset + payload.len(),
+            frame.len(),
+            "the borrow is the frame's tail, not a new buffer"
+        );
+        assert_eq!(payload, &frame[offset..]);
+        assert!(
+            core::ptr::eq(payload.as_ptr(), frame[frame.len() - payload.len()..].as_ptr()),
+            "the returned slice must point *into* the frame"
+        );
+        // Same bytes through the owning path: same header, same payload.
+        let owned = Envelope::decode(&frame).expect("decode");
+        assert_eq!(owned.header, header);
+        assert_eq!(owned.payload, payload);
+
+        // Every refusal `decode` makes, `decode_header` makes identically — the CRC, the magic,
+        // the version, the truncation, the length ceilings.
+        let mut broken: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut flipped = frame.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xff;
+        broken.push(("a bit flipped in the middle", flipped));
+        let mut magic = frame.clone();
+        magic[0] ^= 0xff;
+        broken.push(("a foreign magic", magic));
+        let mut version = frame.clone();
+        version[4] = version[4].wrapping_add(1);
+        broken.push(("an unknown version", version));
+        broken.push(("a truncated frame", frame[..frame.len() - 1].to_vec()));
+        broken.push(("an empty frame", Vec::new()));
+        for (what, bytes) in broken {
+            let owned = Envelope::decode(&bytes).expect_err(&format!("{what}: decode must refuse"));
+            let only = Envelope::decode_header(&bytes)
+                .expect_err(&format!("{what}: decode_header must refuse"));
+            assert_eq!(
+                format!("{owned}"),
+                format!("{only}"),
+                "{what}: the two paths must refuse with the same reason"
+            );
+        }
     }
 
     #[test]

@@ -41,6 +41,11 @@ const MAX_HTML_LEN: usize = 2 << 20;
 const MAX_IMAGE_B64_LEN: usize = 24 << 20;
 /// Upper bound on the number of URIs in a single copy.
 const MAX_URIS: usize = 64;
+/// Upper bound on a clipboard `source` label the WebView hands in via
+/// `clipboard_write` (the label is mirrored into every clipboard history entry
+/// and broadcast on `clipboard-changed`, so a paste-sized label would inflate
+/// every subsequent notice).
+const MAX_CLIPBOARD_SOURCE_BYTES: usize = 256;
 
 /// One copy operation's payload. The OS clipboard is multi-format: one copy can
 /// carry several representations, and the pasting app picks the richest one it
@@ -477,6 +482,12 @@ pub fn clipboard_write(
 ) -> Result<ClipboardEntry, String> {
     let caller = window.label().to_string();
     let src = source.unwrap_or_else(|| caller.clone());
+    if src.len() > MAX_CLIPBOARD_SOURCE_BYTES {
+        return Err(format!(
+            "clipboard source too long: {} bytes (max {MAX_CLIPBOARD_SOURCE_BYTES})",
+            src.len()
+        ));
+    }
     let entry = state.write(&src, &caller, payload)?;
     // Best-effort sync to the platform (container) clipboard + notify UIs with a
     // metadata-only notice (full content is fetched via foreground-gated read).

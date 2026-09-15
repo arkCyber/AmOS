@@ -1,11 +1,12 @@
-//! Per-publisher sequence accounting: turning “a gap means a dropped frame” into numbers.
+//! Per-**stream** sequence accounting: turning “a gap means a dropped frame” into numbers.
 //!
-//! Every frame carries `(publisher, seq)` — a **1-based, per-publisher monotonic**
-//! counter stamped by [`Publisher`](crate::pubsub::Publisher). That is the cheapest loss
-//! detector a robot link can have: no acknowledgements, no round trip, just arithmetic
-//! on metadata that already travels with the payload. This module does that arithmetic
-//! and nothing else — it is a pure state machine (no I/O, no clock, one map entry per
-//! peer), so it is deterministic under test.
+//! Every frame carries `(topic, publisher, seq)` — a **1-based, per-stream monotonic** counter
+//! stamped by [`Publisher`](crate::pubsub::Publisher), where a stream is one publisher *on one
+//! topic* (the producer hands out a fresh counter per `Publisher`, i.e. per topic). That is the
+//! cheapest loss detector a robot link can have: no acknowledgements, no round trip, just
+//! arithmetic on metadata that already travels with the payload. This module does that arithmetic
+//! and nothing else — it is a pure state machine (no I/O, no clock, one map entry per stream), so
+//! it is deterministic under test.
 //!
 //! What an operator learns from it, and why each number is separate:
 //!
@@ -17,19 +18,23 @@
 //!   that restarted its counter. It is **not** folded into “lost”, because “the same
 //!   frame twice” and “a frame never arrived” are different facts.
 //!
-//! Honest boundary: counters are per publisher (their sequences are independent), so two
-//! publishers on one topic are tracked separately, and a publisher that reboots to
-//! sequence 1 looks like a run of `stale` frames until [`SeqTracker::reset`] is called.
+//! Honest boundary: counters are per **stream** (a publisher's sequences on *different* topics
+//! are independent), so a peer that publishes two topics — or that beats *and* publishes — is
+//! tracked as several streams, and a publisher that reboots to sequence 1 looks like a run of
+//! `stale` frames until [`SeqTracker::reset`] is called. Keying by the publisher alone used to
+//! *invent* duplicates on such a peer and, worse, let a busy stream's high-water mark swallow a
+//! quiet stream's real gap (both cases are pinned by tests in this module).
 //! And the table is **bounded** ([`MAX_TRACKED_STREAMS`]) because its keys come off the
-//! wire: past the ceiling a new publisher is refused and *counted*
+//! wire: past the ceiling a new stream is refused and *counted*
 //! (`SeqEvent::Untracked`, [`SeqSummary::is_complete`]) — the alternative shapes are an
-//! unbounded map (a peer could mint a publisher per frame) or a silent stop (a loss figure
+//! unbounded map (a peer could mint a topic per frame) or a silent stop (a loss figure
 //! that looks clean because nothing was accounted for).
 
 use std::collections::BTreeMap;
 
 use crate::codec::Message;
 use crate::discovery::PeerId;
+use crate::keyexpr::Topic;
 use crate::pubsub::Received;
 
 /// What one arriving frame says about its publisher's stream.
@@ -102,7 +107,7 @@ pub const MAX_TRACKED_STREAMS: usize = 4096;
 /// The running totals of a [`SeqTracker`] (a snapshot an operator or a UI reads).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SeqSummary {
-    /// How many distinct publishers have been observed.
+    /// How many distinct streams `(publisher, topic)` have been observed.
     pub streams: usize,
     /// Frames that arrived exactly in order.
     pub in_order: u64,
@@ -154,11 +159,64 @@ impl SeqSummary {
     }
 }
 
-/// Per-publisher sequence accounting: one high-water mark per publisher, four counters.
+/// What a sequence number identifies: **one stream** — one publisher on one topic.
+///
+/// The frame header carries `(topic, publisher, seq)`, and the producer stamps a **fresh 1-based
+/// counter per `Publisher`**, which `LinkNode::publisher::<T>(topic)` hands out per topic: a node
+/// that publishes a camera *and* an IMU (or that beats *and* publishes) reports two counters under
+/// one peer id. Keying the tracker by the publisher alone therefore read a healthy peer as a
+/// restarting one (`stale` runs) and, worse, let a fast stream's high-water mark swallow a slow
+/// stream's genuine gap — see `one_peers_two_topics_are_two_streams_not_one_restarting` and
+/// `a_fast_stream_does_not_hide_a_slow_streams_real_gap`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StreamKey {
+    publisher: PeerId,
+    topic: Topic,
+}
+
+impl StreamKey {
+    /// The stream of one publisher on one topic.
+    pub fn new(publisher: PeerId, topic: Topic) -> Self {
+        Self { publisher, topic }
+    }
+
+    /// The stream one received frame belongs to (what its own header says).
+    pub fn of<T: Message>(received: &Received<T>) -> Self {
+        Self {
+            publisher: received.publisher.clone(),
+            topic: received.topic.clone(),
+        }
+    }
+
+    /// The publisher of this stream.
+    pub fn publisher(&self) -> &PeerId {
+        &self.publisher
+    }
+
+    /// The topic of this stream.
+    pub fn topic(&self) -> &Topic {
+        &self.topic
+    }
+}
+
+/// Per-**stream** sequence accounting: one high-water mark per `(publisher, topic)`, four counters.
 #[derive(Debug, Default)]
 pub struct SeqTracker {
-    highest: BTreeMap<PeerId, u64>,
+    streams: BTreeMap<StreamKey, StreamState>,
     summary: SeqSummary,
+}
+
+/// What the tracker remembers about one stream: where its counter got to, and what it cost.
+///
+/// The two per-stream costs are kept beside the mark (three `u64`s in an entry that is already
+/// bounded by [`MAX_TRACKED_STREAMS`]) because a *total* `missing=3` does not tell an operator
+/// **which** stream leaked — and with a wildcard pattern (`sub --pattern 'amos/**'`) there can be
+/// dozens. See [`SeqTracker::streams_with_loss`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StreamState {
+    highest: u64,
+    gaps: u64,
+    missing: u64,
 }
 
 impl SeqTracker {
@@ -167,28 +225,35 @@ impl SeqTracker {
         Self::default()
     }
 
-    /// Observe one incoming frame's `(publisher, seq)` pair.
+    /// Observe one incoming frame's `(stream, seq)` pair.
     ///
     /// Total and panic-free for **any** input, including `seq == u64::MAX` (after which
     /// no “next” exists, so every later frame is `Stale` rather than an overflow).
     ///
-    /// A publisher the tracker has never seen is added **unless** the table is full
+    /// A stream the tracker has never seen is added **unless** the table is full
     /// ([`MAX_TRACKED_STREAMS`]): the ceiling exists because the key comes off the wire, so it
-    /// is the one place a peer can make this map grow without bound. Past it the frame is
+    /// is the one place a peer can make this map grow without bound — and a stream key is even
+    /// easier to mint than a publisher id (one peer, many topics). Past the ceiling the frame is
     /// returned as [`SeqEvent::Untracked`] and counted — a bounded tracker that *says it
     /// stopped*, rather than one that either grows forever or silently drops the evidence.
-    pub fn observe(&mut self, publisher: &PeerId, seq: u64) -> SeqEvent {
-        let Some(highest) = self.highest.get_mut(publisher) else {
-            if self.highest.len() >= MAX_TRACKED_STREAMS {
+    pub fn observe(&mut self, stream: &StreamKey, seq: u64) -> SeqEvent {
+        let Some(state) = self.streams.get_mut(stream) else {
+            if self.streams.len() >= MAX_TRACKED_STREAMS {
                 self.summary.untracked += 1;
                 return SeqEvent::Untracked { seq };
             }
-            self.highest.insert(publisher.clone(), seq);
-            self.summary.streams = self.highest.len();
+            self.streams.insert(
+                stream.clone(),
+                StreamState {
+                    highest: seq,
+                    ..Default::default()
+                },
+            );
+            self.summary.streams = self.streams.len();
             self.summary.in_order += 1;
             return SeqEvent::First { seq };
         };
-        let last = *highest;
+        let last = state.highest;
         let event = match last.checked_add(1) {
             Some(expected) if seq == expected => SeqEvent::InOrder { seq },
             Some(expected) if seq > expected => SeqEvent::Gap {
@@ -205,6 +270,9 @@ impl SeqTracker {
             SeqEvent::Gap { missing, .. } => {
                 self.summary.gaps += 1;
                 self.summary.missing += missing;
+                // …and the same figures, per stream, so the total can be attributed.
+                state.gaps += 1;
+                state.missing += missing;
             }
             SeqEvent::Stale { .. } => self.summary.stale += 1,
             SeqEvent::InOrder { .. } => self.summary.in_order += 1,
@@ -213,14 +281,16 @@ impl SeqTracker {
             SeqEvent::First { .. } | SeqEvent::Untracked { .. } => {}
         }
         if seq > last {
-            *highest = seq;
+            state.highest = seq;
         }
         event
     }
 
-    /// Observe a decoded frame (the convenience form of [`SeqTracker::observe`]).
+    /// Observe a decoded frame (the convenience form of [`SeqTracker::observe`]): the stream is
+    /// read off the frame itself, so a consumer of a wildcard pattern gets one entry per
+    /// `(publisher, topic)` instead of one per publisher.
     pub fn observe_received<T: Message>(&mut self, received: &Received<T>) -> SeqEvent {
-        self.observe(&received.publisher, received.seq)
+        self.observe(&StreamKey::of(received), received.seq)
     }
 
     /// The counters so far.
@@ -228,14 +298,29 @@ impl SeqTracker {
         self.summary
     }
 
-    /// The highest sequence seen from one publisher (`None` = never seen).
-    pub fn highest(&self, publisher: &PeerId) -> Option<u64> {
-        self.highest.get(publisher).copied()
+    /// The highest sequence seen on one stream (`None` = never seen).
+    pub fn highest(&self, stream: &StreamKey) -> Option<u64> {
+        self.streams.get(stream).map(|state| state.highest)
     }
 
-    /// How many publishers are tracked.
+    /// How many streams `(publisher, topic)` are tracked.
     pub fn streams(&self) -> usize {
-        self.highest.len()
+        self.streams.len()
+    }
+
+    /// The streams that **lost frames**, with `(stream, missing, gaps)`, in key order.
+    ///
+    /// A total `missing=3` says the link dropped frames; it does not say *where*, and a wildcard
+    /// pattern (`sub --pattern 'amos/**'`, the CLI's default) can cover dozens of streams. The
+    /// attribution costs three `u64` per entry in a table that is already bounded
+    /// ([`MAX_TRACKED_STREAMS`]), and it is sorted (by publisher, then topic) so two runs of the
+    /// same link print the same lines. Empty means nothing was lost.
+    pub fn streams_with_loss(&self) -> Vec<(StreamKey, u64, u64)> {
+        self.streams
+            .iter()
+            .filter(|(_, state)| state.missing > 0)
+            .map(|(stream, state)| (stream.clone(), state.missing, state.gaps))
+            .collect()
     }
 
     /// True when no frame has been refused for want of table space
@@ -245,7 +330,7 @@ impl SeqTracker {
         self.summary.is_complete()
     }
 
-    /// Frames from publishers that were refused (see [`MAX_TRACKED_STREAMS`]).
+    /// Frames from streams that were refused (see [`MAX_TRACKED_STREAMS`]).
     pub fn untracked(&self) -> u64 {
         self.summary.untracked
     }
@@ -253,7 +338,7 @@ impl SeqTracker {
     /// Forget every stream and counter (what a consumer does after a deliberate
     /// reconnect or a publisher restart, so the stale run is not blamed on the link).
     pub fn reset(&mut self) {
-        self.highest.clear();
+        self.streams.clear();
         self.summary = SeqSummary::default();
     }
 }
@@ -266,6 +351,15 @@ mod tests {
 
     fn peer(id: &str) -> PeerId {
         PeerId::new(id).expect("peer id")
+    }
+
+    /// The stream the module's tests mean by default: one peer on the `imu` topic. A sequence
+    /// number belongs to a **stream** — the same peer's other topics are other streams.
+    fn stream(publisher: &str) -> StreamKey {
+        StreamKey::new(
+            peer(publisher),
+            Topic::new("amos/dog1/sensor/imu").expect("topic"),
+        )
     }
 
     /// A frame snapshot as a subscriber hands it to a consumer (all fields public, so a
@@ -285,12 +379,12 @@ mod tests {
     fn a_clean_stream_is_all_in_order() {
         let mut tracker = SeqTracker::new();
         assert_eq!(
-            tracker.observe(&peer("dog1"), 1),
+            tracker.observe(&stream("dog1"), 1),
             SeqEvent::First { seq: 1 }
         );
         for seq in 2..=5 {
             assert_eq!(
-                tracker.observe(&peer("dog1"), seq),
+                tracker.observe(&stream("dog1"), seq),
                 SeqEvent::InOrder { seq }
             );
         }
@@ -299,23 +393,23 @@ mod tests {
         assert_eq!(s.observed(), 5);
         assert!(!s.has_loss(), "nothing was lost");
         assert_eq!(s.loss_ratio(), 0.0);
-        assert_eq!(tracker.highest(&peer("dog1")), Some(5));
+        assert_eq!(tracker.highest(&stream("dog1")), Some(5));
     }
 
     #[test]
     fn a_jump_is_one_gap_counting_every_missing_frame() {
         let mut tracker = SeqTracker::new();
-        tracker.observe(&peer("dog1"), 1);
+        tracker.observe(&stream("dog1"), 1);
         // 2 and 3 never arrived.
         assert_eq!(
-            tracker.observe(&peer("dog1"), 4),
+            tracker.observe(&stream("dog1"), 4),
             SeqEvent::Gap {
                 expected: 2,
                 seq: 4,
                 missing: 2
             }
         );
-        tracker.observe(&peer("dog1"), 5);
+        tracker.observe(&stream("dog1"), 5);
         let s = tracker.summary();
         assert_eq!(s.gaps, 1, "one burst is one event");
         assert_eq!(s.missing, 2, "but two frames were lost");
@@ -328,15 +422,15 @@ mod tests {
     #[test]
     fn duplicates_and_reorders_are_stale_not_lost() {
         let mut tracker = SeqTracker::new();
-        tracker.observe(&peer("dog1"), 7);
+        tracker.observe(&stream("dog1"), 7);
         // The same frame twice (a duplicate) ...
         assert_eq!(
-            tracker.observe(&peer("dog1"), 7),
+            tracker.observe(&stream("dog1"), 7),
             SeqEvent::Stale { seq: 7, last: 7 }
         );
         // ... and an older one arriving late (a reordering carry path).
         assert_eq!(
-            tracker.observe(&peer("dog1"), 5),
+            tracker.observe(&stream("dog1"), 5),
             SeqEvent::Stale { seq: 5, last: 7 }
         );
         // Neither is loss, and the high-water mark never goes backwards.
@@ -344,10 +438,10 @@ mod tests {
         assert_eq!(s.stale, 2);
         assert_eq!(s.missing, 0);
         assert!(!s.has_loss());
-        assert_eq!(tracker.highest(&peer("dog1")), Some(7));
+        assert_eq!(tracker.highest(&stream("dog1")), Some(7));
         // The stream keeps working after a reorder.
         assert_eq!(
-            tracker.observe(&peer("dog1"), 8),
+            tracker.observe(&stream("dog1"), 8),
             SeqEvent::InOrder { seq: 8 }
         );
     }
@@ -355,12 +449,12 @@ mod tests {
     #[test]
     fn publishers_are_tracked_independently() {
         let mut tracker = SeqTracker::new();
-        tracker.observe(&peer("dog1"), 1);
-        tracker.observe(&peer("dog2"), 1);
+        tracker.observe(&stream("dog1"), 1);
+        tracker.observe(&stream("dog2"), 1);
         assert_eq!(tracker.streams(), 2);
         // dog2 is at 1, so 3 is a gap for dog2 alone.
         assert_eq!(
-            tracker.observe(&peer("dog2"), 3),
+            tracker.observe(&stream("dog2"), 3),
             SeqEvent::Gap {
                 expected: 2,
                 seq: 3,
@@ -369,7 +463,7 @@ mod tests {
         );
         // dog1 is unaffected: its next frame is 2, in order.
         assert_eq!(
-            tracker.observe(&peer("dog1"), 2),
+            tracker.observe(&stream("dog1"), 2),
             SeqEvent::InOrder { seq: 2 }
         );
         assert_eq!(tracker.summary().streams, 2);
@@ -380,20 +474,20 @@ mod tests {
     fn the_end_of_the_sequence_space_is_not_an_overflow() {
         let mut tracker = SeqTracker::new();
         assert_eq!(
-            tracker.observe(&peer("dog1"), u64::MAX),
+            tracker.observe(&stream("dog1"), u64::MAX),
             SeqEvent::First { seq: u64::MAX }
         );
         // There is no frame after `u64::MAX`: every later one is `Stale`, and computing
         // an “expected next” must not wrap (or panic).
         assert_eq!(
-            tracker.observe(&peer("dog1"), 0),
+            tracker.observe(&stream("dog1"), 0),
             SeqEvent::Stale {
                 seq: 0,
                 last: u64::MAX
             }
         );
         assert_eq!(
-            tracker.observe(&peer("dog1"), u64::MAX),
+            tracker.observe(&stream("dog1"), u64::MAX),
             SeqEvent::Stale {
                 seq: u64::MAX,
                 last: u64::MAX
@@ -439,15 +533,16 @@ mod tests {
     }
 
     #[test]
-    fn a_full_tracker_refuses_a_new_publisher_and_says_so() {
-        // The defect this pins: the table is keyed by `envelope.header.publisher`, i.e. by a
-        // string **off the wire**, and it had no ceiling — a peer that mints a fresh id per
-        // frame (`p1`, `p2`, …) grew a long-running consumer's memory without bound. The
+    fn a_full_tracker_refuses_a_new_stream_and_says_so() {
+        // The defect this pins: the table is keyed by a string **off the wire** — an
+        // `(envelope.header.publisher, topic)` pair — and it had no ceiling — a peer that mints a
+        // fresh key per frame (`p1`, `p2`, …; or one topic per frame) grew a long-running
+        // consumer's memory without bound. The
         // broker's topic inventory has had a ceiling (and a `topics_complete()` flag) since
         // the first hardening round; this map is the same shape of resource.
         let mut tracker = SeqTracker::new();
         for index in 0..MAX_TRACKED_STREAMS {
-            let event = tracker.observe(&peer(&format!("p{index}")), 1);
+            let event = tracker.observe(&stream(&format!("p{index}")), 1);
             assert_eq!(event, SeqEvent::First { seq: 1 }, "filling frame {index}");
         }
         assert_eq!(tracker.streams(), MAX_TRACKED_STREAMS);
@@ -456,8 +551,8 @@ mod tests {
             "nothing has been refused yet, so the summary is still the whole truth"
         );
 
-        // One publisher too many: refused, counted, and the map does not grow.
-        let refused = tracker.observe(&peer("one-too-many"), 1);
+        // One stream too many: refused, counted, and the map does not grow.
+        let refused = tracker.observe(&stream("one-too-many"), 1);
         assert!(
             refused.is_untracked(),
             "the event says what happened, not just that nothing was delivered"
@@ -466,19 +561,19 @@ mod tests {
         assert_eq!(
             tracker.streams(),
             MAX_TRACKED_STREAMS,
-            "the ceiling holds: the new publisher was not inserted"
+            "the ceiling holds: the new stream was not inserted"
         );
         assert_eq!(tracker.summary().untracked, 1);
         assert!(
             !tracker.is_complete(),
             "the loss figure no longer describes every frame that arrived"
         );
-        assert_eq!(tracker.highest(&peer("one-too-many")), None);
+        assert_eq!(tracker.highest(&stream("one-too-many")), None);
 
         // …and a *known* publisher is still tracked normally at the ceiling: the bound must
         // not break healthy accounting for the streams that are already there.
         assert_eq!(
-            tracker.observe(&peer("p0"), 2),
+            tracker.observe(&stream("p0"), 2),
             SeqEvent::InOrder { seq: 2 }
         );
         assert_eq!(tracker.summary().in_order, MAX_TRACKED_STREAMS as u64 + 1);
@@ -498,17 +593,144 @@ mod tests {
     #[test]
     fn reset_forgets_streams_and_counters() {
         let mut tracker = SeqTracker::new();
-        tracker.observe(&peer("dog1"), 1);
-        tracker.observe(&peer("dog1"), 5);
+        tracker.observe(&stream("dog1"), 1);
+        tracker.observe(&stream("dog1"), 5);
         assert!(tracker.summary().has_loss());
         tracker.reset();
         assert_eq!(tracker.streams(), 0);
         assert_eq!(tracker.summary(), SeqSummary::default());
-        assert_eq!(tracker.highest(&peer("dog1")), None);
+        assert_eq!(tracker.highest(&stream("dog1")), None);
         // After a reset the next frame opens the stream again (a restarted publisher).
         assert_eq!(
-            tracker.observe(&peer("dog1"), 1),
+            tracker.observe(&stream("dog1"), 1),
             SeqEvent::First { seq: 1 }
+        );
+    }
+
+    /// One peer, two topics, two counters: **not** one stream that keeps restarting.
+    ///
+    /// A stream is what a sequence number identifies on the wire — `(publisher, topic)`: the
+    /// frame header carries the topic, and `LinkNode::publisher::<T>(topic)` hands out a
+    /// `Publisher` **per topic**, each stamping its own 1-based counter under the same peer id (a
+    /// node that beats *and* publishes has two counters for the same reason). A subscriber
+    /// matching both topics (`sub --pattern 'amos/**'`, the CLI's default) therefore sees
+    /// `1, 1, 2, 2 …`, and a tracker keyed by publisher alone reads every one of those as a jump
+    /// backwards — **inventing loss on a link where nothing was lost**.
+    ///
+    /// The tracker is the crate's loss instrument and it may not be *more pessimistic* than the
+    /// wire either: `missing`/`gaps` have to mean "frames that never arrived", so the key must be
+    /// the stream, not the peer.
+    #[test]
+    fn one_peers_two_topics_are_two_streams_not_one_restarting() {
+        let on = |topic: &str, seq: u64| Received {
+            message: seq,
+            topic: Topic::new(topic).expect("topic"),
+            publisher: peer("dog1"),
+            seq,
+            stamp: Timestamp::new(100, 0).expect("stamp"),
+            frame_len: 42,
+        };
+        let cam = "amos/dog1/sensor/camera";
+        let imu = "amos/dog1/sensor/imu";
+
+        let mut tracker = SeqTracker::new();
+        // Two independent streams, both starting at 1 (each Publisher has its own counter).
+        assert_eq!(
+            tracker.observe_received(&on(cam, 1)),
+            SeqEvent::First { seq: 1 }
+        );
+        assert_eq!(
+            tracker.observe_received(&on(imu, 1)),
+            SeqEvent::First { seq: 1 },
+            "the other topic's counter is a different stream, not a restart"
+        );
+        assert_eq!(
+            tracker.observe_received(&on(cam, 2)),
+            SeqEvent::InOrder { seq: 2 },
+            "…and each stream keeps counting where *it* left off"
+        );
+        assert_eq!(
+            tracker.observe_received(&on(imu, 2)),
+            SeqEvent::InOrder { seq: 2 }
+        );
+
+        let summary = tracker.summary();
+        assert_eq!(summary.streams, 2, "two (publisher, topic) pairs");
+        assert_eq!(summary.gaps, 0, "nothing was lost: {summary:?}");
+        assert_eq!(summary.missing, 0);
+        assert_eq!(summary.stale, 0, "and nothing is a duplicate either");
+        assert!(!summary.has_loss(), "{summary:?}");
+
+        // A *real* gap on one stream is still reported — for that stream alone.
+        tracker.observe_received(&on(cam, 2));
+        assert_eq!(
+            tracker.observe_received(&on(cam, 4)),
+            SeqEvent::Gap {
+                expected: 3,
+                seq: 4,
+                missing: 1
+            }
+        );
+        assert_eq!(
+            tracker.observe_received(&on(imu, 3)),
+            SeqEvent::InOrder { seq: 3 },
+            "the other stream is untouched by its neighbour's loss"
+        );
+        assert_eq!(tracker.summary().missing, 1);
+    }
+
+    /// …and the same mistake **hides** real loss: a fast stream's counter drags the shared
+    /// high-water mark past a slow stream, so the slow stream's frames all land "at or below the
+    /// mark" and a genuinely missing frame on it is never counted.
+    ///
+    /// This is the half that matters: an instrument that reads a healthy peer as "stale" is
+    /// noisy, but an instrument that reads a *lost* frame as "fine" is wrong in the direction
+    /// nobody can see.
+    #[test]
+    fn a_fast_stream_does_not_hide_a_slow_streams_real_gap() {
+        let on = |topic: &str, seq: u64| Received {
+            message: seq,
+            topic: Topic::new(topic).expect("topic"),
+            publisher: peer("dog1"),
+            seq,
+            stamp: Timestamp::new(100, 0).expect("stamp"),
+            frame_len: 42,
+        };
+        let slow = "amos/dog1/sensor/lidar";
+        let fast = "amos/dog1/sensor/imu";
+
+        let mut tracker = SeqTracker::new();
+        tracker.observe_received(&on(slow, 1));
+        // The IMU runs far ahead (200 Hz vs the lidar's 10 Hz).
+        for seq in 1..=5 {
+            tracker.observe_received(&on(fast, seq));
+        }
+        // The lidar's frame 2 arrives, then 4 — its frame 3 never made it.
+        assert_eq!(
+            tracker.observe_received(&on(slow, 2)),
+            SeqEvent::InOrder { seq: 2 },
+            "the lidar's own counter, not the IMU's high-water mark"
+        );
+        assert_eq!(
+            tracker.observe_received(&on(slow, 4)),
+            SeqEvent::Gap {
+                expected: 3,
+                seq: 4,
+                missing: 1
+            },
+            "a lost lidar frame is loss, however busy the IMU is"
+        );
+        assert_eq!(tracker.summary().missing, 1);
+        assert!(tracker.summary().has_loss());
+        // …and the loss is **attributable**: the total says "one frame", this says which stream.
+        assert_eq!(
+            tracker.streams_with_loss(),
+            vec![(
+                StreamKey::new(peer("dog1"), Topic::new(slow).expect("topic")),
+                1,
+                1
+            )],
+            "the quiet stream that lost a frame, by name"
         );
     }
 }

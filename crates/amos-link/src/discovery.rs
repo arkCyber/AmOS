@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
@@ -62,6 +63,58 @@ pub const MAX_BEACON_BYTES: usize = 512;
 pub const MAX_ENDPOINTS: usize = 8;
 /// Longest accepted single endpoint string.
 pub const MAX_ENDPOINT_LEN: usize = 128;
+
+/// Parse an **operator-supplied advertisement**: `tcp/10.0.0.7:7447,udp/239.255.42.99:7446`.
+///
+/// The one place a comma-separated endpoint list is read. It splits, trims, drops empty
+/// entries, and enforces the beacon's *per-field* bounds ([`MAX_ENDPOINTS`],
+/// [`MAX_ENDPOINT_LEN`]) — here, where the error is still the operator's, rather than on the
+/// emit path.
+///
+/// Why this function exists at all: `PeerInfo::endpoints` was bounded, wire-validated,
+/// tested, rendered by the CLI (`discover`'s `endpoint` column), carried by the control plane
+/// (`proto.Peer.endpoint`), drawn by the System UI — and set by **no production code**: both
+/// producers ([`spawn_federation`] and the CLI's `discover --lan`) built their beacon with
+/// `PeerInfo::new`, so every real peer table said `endpoint: null` while the docs described
+/// the beacon as a hint telling a peer *where to connect*. An advertisement that can only be
+/// expressed by a test is not a feature.
+///
+/// An empty (or all-whitespace, or all-empty-entries) value is **no advertisement** — the
+/// default of every node — not an error, so a deployment template may set
+/// `AMOS_LINK_ENDPOINT=` and mean "nothing".
+///
+/// The per-field bounds are only *half* the check: [`MAX_ENDPOINTS`] × [`MAX_ENDPOINT_LEN`]
+/// is more than the whole beacon frame ([`MAX_BEACON_BYTES`]), so a list that passes here can
+/// still be an announcement this crate could never emit. [`PeerInfo::advertising`] is where
+/// that second half is asked, by encoding the beacon it would send.
+pub fn parse_endpoints(raw: &str) -> Result<Vec<String>> {
+    let endpoints: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    if endpoints.len() > MAX_ENDPOINTS {
+        return Err(LinkError::Frame(format!(
+            "a peer may advertise at most {MAX_ENDPOINTS} endpoints, got {}",
+            endpoints.len()
+        )));
+    }
+    // The offending *index and length* are named, not the offending value: a 4 KiB typo must
+    // not be echoed back into a log line (the same reason a refusal reason is bounded).
+    if let Some((index, bad)) = endpoints
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.len() > MAX_ENDPOINT_LEN)
+    {
+        return Err(LinkError::Frame(format!(
+            "endpoint #{} is {} bytes, over the {MAX_ENDPOINT_LEN}-byte ceiling",
+            index + 1,
+            bad.len()
+        )));
+    }
+    Ok(endpoints)
+}
 
 /// A stable, human-readable node identifier (`dog1`, `mini-brain`, `cam-front`).
 ///
@@ -223,6 +276,38 @@ impl PeerInfo {
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoints.push(endpoint.into());
         self
+    }
+
+    /// A peer that announces **where it can be reached**.
+    ///
+    /// The only production path that fills [`PeerInfo::endpoints`] (see [`parse_endpoints`] for
+    /// why that matters). Two checks, and both of them are needed:
+    ///
+    /// 1. [`PeerInfo::validate`] — the per-field bounds (`MAX_ENDPOINTS`, `MAX_ENDPOINT_LEN`),
+    ///    the same ones a *receiver* enforces on a peer we did not choose;
+    /// 2. **encode the beacon this peer would emit** — because those bounds are not the whole
+    ///    frame: 8 endpoints of 127 bytes each is 1016 bytes of advertisement in a frame that
+    ///    may be [`MAX_BEACON_BYTES`]. Without this second check a deployment could set a
+    ///    legal-looking advertisement and then have *every* beacon refused on the emit path of
+    ///    a spawned task — i.e. the node would be invisible on the LAN with a `debug!` line as
+    ///    the only trace. Here the error goes back to the caller, at startup, with the byte
+    ///    count that did not fit.
+    ///
+    /// [`MAX_ENDPOINTS`]: crate::discovery::MAX_ENDPOINTS
+    /// [`MAX_ENDPOINT_LEN`]: crate::discovery::MAX_ENDPOINT_LEN
+    /// [`MAX_BEACON_BYTES`]: crate::discovery::MAX_BEACON_BYTES
+    pub fn advertising(id: PeerId, kind: NodeKind, endpoints: Vec<String>) -> Result<Self> {
+        let info = Self {
+            id,
+            kind,
+            endpoints,
+        };
+        info.validate()?;
+        // A probe beacon: the frame itself is what has to fit, and encoding it here is the
+        // only check that covers the endpoint list *and* the id/kind/stamp around it (the
+        // timestamp is ours, so no peer input is involved in choosing it).
+        Beacon::new(info.clone(), Timestamp::now()).encode()?;
+        Ok(info)
     }
 
     /// The first advertised endpoint, if any.
@@ -397,7 +482,21 @@ fn age_ms(seen: &Seen, now: Timestamp) -> u64 {
 }
 
 /// A peer as the registry reports it: identity + freshness.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Serialized as the **flat** peer the control plane carries (`proto.Peer`) and the System UI
+/// renders (`LinkPeerOut`): `id`, `kind`, `endpoint`, `last_seen_ms`, `beacons`. One table, one
+/// JSON spelling — see the `a_peer_view_serializes_as_the_flat_peer_the_control_plane_carries`
+/// test for the exact document.
+///
+/// Two honest notes about the collapse: the announced *list* of endpoints becomes its primary
+/// one (`PeerInfo::endpoint()` — the same collapse `proto.Peer` and the UI already perform), and
+/// `beacons: 0` is how a hand-declared (static) peer is told apart from a beaconed one, exactly
+/// as the proto documents, so no extra `static` key is invented here.
+///
+/// `Deserialize` is deliberately absent: a peer table is *rendered* out of a registry, never read
+/// back into one — deriving `Deserialize` for a shape this type no longer emits would advertise a
+/// round-trip that does not exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerView {
     /// The peer's identity (id, role, endpoints).
     pub info: PeerInfo,
@@ -407,6 +506,21 @@ pub struct PeerView {
     /// How many beacons this node has accepted from the peer (0 = learned by hand, so
     /// the entry is static and never expires on its own).
     pub beacons: u64,
+}
+
+impl Serialize for PeerView {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut peer = serializer.serialize_struct("Peer", 5)?;
+        peer.serialize_field("id", self.info.id.as_str())?;
+        peer.serialize_field("kind", self.info.kind.key())?;
+        peer.serialize_field("endpoint", &self.info.endpoint())?;
+        peer.serialize_field("last_seen_ms", &self.last_seen_ms)?;
+        peer.serialize_field("beacons", &self.beacons)?;
+        peer.end()
+    }
 }
 
 impl PeerView {
@@ -898,7 +1012,31 @@ impl FederationTask {
 ///   "is this link still alive" question a brain server asks.
 ///
 /// The returned task runs until it is stopped or the link closes.
+///
+/// This is [`spawn_federation_advertising`] with **nothing to advertise**: a node that names
+/// no address (the default, and the only sound choice for a transport that self-discovers,
+/// such as Zenoh scouting). A deployment that owns a fixed endpoint passes it to
+/// [`spawn_federation_advertising`] instead — until this round *no* production path passed
+/// one, so the beacon's endpoint list was always empty and every peer table in every
+/// deployment rendered "no address", while the docs called the beacon a connect hint.
 pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<FederationTask> {
+    spawn_federation_advertising(node, period, Vec::new())
+}
+
+/// [`spawn_federation`], announcing **where this node can be reached**.
+///
+/// `endpoints` is what the peer table of every other node will show for this one (the primary
+/// endpoint is the first entry — the collapse `proto.Peer` and the System UI already do). It
+/// is validated **here, before the task starts**, in two ways: the per-field bounds
+/// ([`parse_endpoints`]) and the frame it has to fit in ([`PeerInfo::advertising`] encodes a
+/// probe beacon). The alternative — discovering on the emit path that a beacon cannot be
+/// encoded — makes a node invisible on the link with a `debug!` line as the only trace,
+/// which is exactly the silent failure this crate keeps designing out.
+pub fn spawn_federation_advertising(
+    node: &Arc<LinkNode>,
+    period: Duration,
+    endpoints: Vec<String>,
+) -> Result<FederationTask> {
     // A zero period would panic inside the spawned task (`tokio::time::interval(0)`), and
     // the caller would hold a handle to a task that never announced anything — refuse it
     // here, where the error is still visible to the caller.
@@ -921,9 +1059,11 @@ pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<Federa
             ttl.as_millis()
         )));
     }
+    // The announcement this node will emit, assembled and checked once — not per tick, and
+    // not after the caller has been handed a task that cannot say anything.
+    let me = PeerInfo::advertising(node.peer().clone(), node.kind(), endpoints)?;
     let node = Arc::clone(node);
-    let peer = node.peer().clone();
-    let kind = node.kind();
+    let peer = me.id.clone();
     let self_echoes = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&self_echoes);
     let handle = tokio::spawn(async move {
@@ -943,10 +1083,9 @@ pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<Federa
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let beacon = Beacon::new(
-                        PeerInfo::new(peer.clone(), kind),
-                        node.clock().now(),
-                    );
+                    // A fresh timestamp per beat: a live peer must not keep claiming the
+                    // second it booted. The advertisement is the one validated above.
+                    let beacon = Beacon::new(me.clone(), node.clock().now());
                     if let Err(e) = discovery.announce(&beacon).await {
                         tracing::debug!(peer = %peer, error = %e, "beacon announce failed");
                     }
@@ -965,6 +1104,7 @@ pub fn spawn_federation(node: &Arc<LinkNode>, period: Duration) -> Result<Federa
                                 tracing::info!(
                                     peer = %beacon.peer.id,
                                     kind = beacon.peer.kind.key(),
+                                    endpoint = beacon.peer.endpoint().unwrap_or("-"),
                                     "peer joined the link"
                                 );
                             }
@@ -1683,5 +1823,247 @@ mod tests {
 
         dog_task.stop().await;
         brain_task.stop().await;
+    }
+
+    /// The advertisement an operator supplies is parsed and bounded **before** a beacon is
+    /// built — and the two bounds are not the same bound.
+    ///
+    /// `PeerInfo::endpoints` was bounded, wire-checked, rendered by two front ends and set by
+    /// nobody: both producers built their beacon with `PeerInfo::new`, so every peer table in
+    /// every deployment said "no address". These are the rules the producers now go through,
+    /// each pinned where it can fail.
+    #[test]
+    fn an_advertisement_is_parsed_and_bounded_before_a_beacon_is_built() {
+        // (1) The parse: split, trim, drop empty entries — and the empty value means "nothing
+        // to advertise", not an error (a deployment template may set the variable empty).
+        assert_eq!(parse_endpoints("").expect("empty"), Vec::<String>::new());
+        assert_eq!(
+            parse_endpoints("  , ").expect("blank"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_endpoints(" tcp/10.0.0.7:7447 ,udp/10.0.0.7:7446, ").expect("list"),
+            vec![
+                "tcp/10.0.0.7:7447".to_string(),
+                "udp/10.0.0.7:7446".to_string()
+            ]
+        );
+
+        // (2) Too many, and too long: each refused with *its own* numbers (the count / the
+        // index and byte length), never by echoing a 4 KiB typo back.
+        let greedy = (0..=MAX_ENDPOINTS)
+            .map(|i| format!("tcp/10.0.0.{i}:7447"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = parse_endpoints(&greedy).expect_err("one over the ceiling");
+        assert!(
+            err.to_string().contains(&format!("{MAX_ENDPOINTS}")),
+            "{err}"
+        );
+
+        let long = format!("tcp/{}", "x".repeat(MAX_ENDPOINT_LEN));
+        let err = parse_endpoints(&format!("tcp/a:1,{long}")).expect_err("too long");
+        let text = err.to_string();
+        assert!(text.contains("endpoint #2"), "{text}");
+        assert!(
+            text.contains(&(MAX_ENDPOINT_LEN + "tcp/".len()).to_string()),
+            "the refusal carries the byte length, not the value: {text}"
+        );
+        assert!(
+            !text.contains(&"x".repeat(32)),
+            "the value itself is not echoed: {text}"
+        );
+
+        // (3) The bound the *fields* cannot express: `MAX_ENDPOINTS × MAX_ENDPOINT_LEN` is
+        // twice the whole beacon frame, so a list that passes `parse_endpoints` can still be
+        // an announcement this crate could never emit. `advertising` catches it by encoding
+        // the beacon — the failure that would otherwise appear as an invisible node and a
+        // `debug!` line on the emit path.
+        let wide = (0..MAX_ENDPOINTS)
+            .map(|_| "t".repeat(MAX_ENDPOINT_LEN))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_endpoints(&wide.join(",")).expect("each field is legal"),
+            wide,
+            "…so the per-field check alone would let this through"
+        );
+        let err = PeerInfo::advertising(
+            PeerId::new("dog1").expect("peer"),
+            NodeKind::Robot,
+            wide.clone(),
+        )
+        .expect_err("the frame cannot carry it");
+        let text = err.to_string();
+        assert!(text.contains("beacon of"), "{text}");
+        assert!(text.contains(&format!("{MAX_BEACON_BYTES}-byte")), "{text}");
+
+        // A realistic advertisement — the shape a board actually has (a dialable transport
+        // endpoint, optionally a second one) — is accepted and travels verbatim.
+        let ok = PeerInfo::advertising(
+            PeerId::new("dog1").expect("peer"),
+            NodeKind::Robot,
+            parse_endpoints("tcp/10.0.0.7:7447,udp/239.0.0.1:7446").expect("parse"),
+        )
+        .expect("a board can say where it is");
+        assert_eq!(ok.endpoint(), Some("tcp/10.0.0.7:7447"));
+        let wire = Beacon::new(ok.clone(), stamp(7)).encode().expect("encode");
+        assert_eq!(Beacon::decode(&wire).expect("decode").peer, ok);
+    }
+
+    /// The thing this round was about, end to end: a federating node's **advertisement reaches
+    /// another node's peer table**.
+    ///
+    /// Before this, no production beacon carried an endpoint — so nothing could have caught its
+    /// absence; this test fails the moment the federation goes back to `PeerInfo::new`.
+    #[tokio::test]
+    async fn a_federating_node_announces_the_endpoints_it_was_given() {
+        use crate::broker::Broker;
+        use crate::codec::Clock;
+        use crate::metrics::LinkMetrics;
+
+        let metrics = Arc::new(LinkMetrics::new());
+        let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+        let clock = Arc::new(Clock::host());
+        let dog = Arc::new(LinkNode::with_parts(
+            PeerId::new("dog1").expect("peer"),
+            NodeKind::Robot,
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&metrics),
+        ));
+        // The observer announces **nothing**: the address in the table below can only have
+        // come from the robot's own beacon.
+        let brain = Arc::new(LinkNode::with_parts(
+            PeerId::new("mini-brain").expect("peer"),
+            NodeKind::Brain,
+            Arc::clone(&transport),
+            clock,
+            metrics,
+        ));
+
+        let advertised = vec![
+            "tcp/10.0.0.7:7447".to_string(),
+            "udp/239.0.0.1:7446".to_string(),
+        ];
+        let dog_task = dog
+            .spawn_federation_advertising(Duration::from_millis(20), advertised.clone())
+            .expect("federate with an advertisement");
+        let brain_task = brain
+            .spawn_federation(Duration::from_millis(20))
+            .expect("federate");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let peers = brain.peers().await;
+            if let Some(dog_view) = peers.iter().find(|p| p.info.id.as_str() == "dog1") {
+                assert_eq!(
+                    dog_view.info.endpoints, advertised,
+                    "the advertisement crossed the bus intact (the *list*, not only the one \
+                     endpoint the renderers collapse to)"
+                );
+                assert_eq!(dog_view.info.endpoint(), Some("tcp/10.0.0.7:7447"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the beacon never arrived: {peers:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // …and it is what the JSON/control-plane consumers read (the primary endpoint, the
+        // same collapse `proto.Peer` performs).
+        let status = brain.status().await;
+        let value: serde_json::Value =
+            serde_json::from_str(&status.to_json().expect("json")).expect("json");
+        assert_eq!(
+            value["peers"][0]["endpoint"], "tcp/10.0.0.7:7447",
+            "the peer table's endpoint column has something in it now: {value}"
+        );
+
+        dog_task.stop().await;
+        brain_task.stop().await;
+    }
+
+    /// An advertisement that cannot be emitted is refused **at startup**, not by an invisible
+    /// node: the caller never gets a task.
+    #[tokio::test]
+    async fn an_unemittable_advertisement_is_refused_before_the_task_starts() {
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let wide = (0..MAX_ENDPOINTS)
+            .map(|_| "t".repeat(MAX_ENDPOINT_LEN))
+            .collect::<Vec<_>>();
+        let err = node
+            .spawn_federation_advertising(Duration::from_millis(20), wide)
+            .expect_err("a beacon that cannot be encoded must not start a federation");
+        assert!(err.to_string().contains("beacon of"), "{err}");
+
+        // …and the two pre-existing refusals still happen (a zero period, a period the peer
+        // TTL would under-cut): one constructor, not a second code path.
+        assert!(matches!(
+            node.spawn_federation_advertising(Duration::ZERO, Vec::new()),
+            Err(LinkError::Unsupported(_))
+        ));
+        assert!(matches!(
+            node.spawn_federation_advertising(Duration::from_secs(9), Vec::new()),
+            Err(LinkError::Unsupported(_))
+        ));
+    }
+
+    /// One peer table, one JSON shape — the **same one** the control plane carries.
+    ///
+    /// The table existed in four spellings: this crate's `NodeStatus` (nested:
+    /// `{"info":{"id":…,"endpoints":[…]},…}`), the CLI's `discover --json`
+    /// (`{"peer":…,"seen_ms":…,"static":…}`), the CLI's remote `status --json` (a bare *number*),
+    /// and the proto's `Peer` / the System UI's `LinkPeerOut`
+    /// (`id`, `kind`, `endpoint`, `last_seen_ms`, `beacons`). Three vocabularies for one table
+    /// means a script must know which of the four it is reading.
+    ///
+    /// This pins the proto's spelling (it is the wire contract). The one honest difference from
+    /// `PeerInfo`: the *list* of endpoints collapses to the primary one (the same collapse the
+    /// proto and the UI already do), which is why the key is `endpoint`, not `endpoints`.
+    #[test]
+    fn a_peer_view_serializes_as_the_flat_peer_the_control_plane_carries() {
+        let view = PeerView {
+            info: PeerInfo::new(PeerId::new("dog1").expect("peer"), NodeKind::Robot)
+                .with_endpoint("udp/10.0.0.9:7446"),
+            last_seen_ms: 42,
+            beacons: 7,
+        };
+        let value = serde_json::to_value(&view).expect("json");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": "dog1",
+                "kind": "robot",
+                "endpoint": "udp/10.0.0.9:7446",
+                "last_seen_ms": 42,
+                "beacons": 7,
+            }),
+            "the peer table's JSON is the proto's `Peer`"
+        );
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["beacons", "endpoint", "id", "kind", "last_seen_ms"],
+            "exactly the proto's fields, no `info` wrapper and no aliases"
+        );
+
+        // A peer that announced nothing is `null` — never `[]`, `\"\"`, or a missing key
+        // (a machine must be able to tell "no address" from an empty one).
+        let bare = PeerView {
+            info: PeerInfo::new(PeerId::new("cam-front").expect("peer"), NodeKind::Sensor),
+            last_seen_ms: 0,
+            beacons: 0,
+        };
+        let value = serde_json::to_value(&bare).expect("json");
+        assert_eq!(value["endpoint"], serde_json::Value::Null);
+        assert_eq!(value["beacons"], 0, "0 = declared by hand, never beaconed");
     }
 }

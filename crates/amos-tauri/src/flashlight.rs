@@ -27,6 +27,30 @@ use tauri::{AppHandle, State};
 /// sync (distinct from the `amos.settings` preference quick-toggles).
 pub const FLASHLIGHT_KEY: &str = "amos.flashlight";
 
+/// Upper bound on the persisted `amos.flashlight` JSON value (bytes).
+///
+/// Real values are two booleans (~32 B); 4 KiB is generous defence-in-depth —
+/// `store::MAX_STORE_VALUE_BYTES` is 256 KiB and reserved for screenshots in
+/// notification previews; this torch key would never legitimately carry that
+/// much, so a megabyte-class payload is refused before the merge step (the
+/// earlier path silently kept the old `on`/`torch_present` in place and
+/// *appended* new keys to the corrupt value, turning a poisoned write into a
+/// poisoned read on the next boot).
+pub const MAX_FLASHLIGHT_VALUE_BYTES: usize = 4 * 1024;
+
+/// Wire vocabulary for the flashlight / torch module. The UI i18n layer
+/// branches on these; renaming a variant is a wire break.
+pub mod codes {
+    /// The stored `amos.flashlight` value is neither missing nor a JSON object;
+    /// the next write replaces it from scratch (the corruption is logged
+    /// **before** the overwrite, so a forensic read of the log shows what was
+    /// lost).
+    pub const STORED_SHAPE_INVALID: &str = "amos.flashlight.stored_shape_invalid";
+    /// Torch request reached the provider, but the device did not confirm the
+    /// change (Android: `setTorchMode` returned false / silent failure).
+    pub const PROVIDER_UNCONFIRMED: &str = "amos.flashlight.provider_unconfirmed";
+}
+
 /// Serializable snapshot of the torch (prost-free; plain bools).
 #[derive(Clone, Debug, Serialize)]
 pub struct FlashlightPayload {
@@ -338,7 +362,40 @@ pub fn seed_from_settings(settings_json: Option<&str>) -> FlashlightState {
 /// Mirror the authoritative snapshot back into the `amos.flashlight` store.
 /// Uses `SharedStore::set` so the `store-updated` broadcast keeps every window
 /// in sync (matching how the frontend's plain quick-toggles already write).
+///
+/// A stored value larger than [`MAX_FLASHLIGHT_VALUE_BYTES`] is refused — the
+/// write path cannot keep a megabyte JSON object healthy, and the cost of
+/// silently accepting it (boot-time parse failure, slow `set` per keystroke)
+/// outweighs the cost of logging the refusal and falling back to a clean
+/// write.
 fn persist_flashlight(app: &AppHandle, store: &SharedStore, snap: FlashlightState) {
+    // `FlashlightPayload` is two `bool`s — serialisation is total. A failure
+    // here would mean the serde data model itself broke, which is a programmer
+    // bug, not a runtime one; log and bail (the previous snapshot is still in
+    // the store, so the next press will simply retry).
+    let raw = match serde_json::to_string(&FlashlightPayload::from(snap)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "amos::flashlight",
+                error = %e,
+                code = codes::STORED_SHAPE_INVALID,
+                "FlashlightPayload failed to serialise — torch state NOT mirrored to the store"
+            );
+            return;
+        }
+    };
+    if raw.len() > MAX_FLASHLIGHT_VALUE_BYTES {
+        tracing::warn!(
+            target: "amos::flashlight",
+            key = FLASHLIGHT_KEY,
+            bytes = raw.len(),
+            limit = MAX_FLASHLIGHT_VALUE_BYTES,
+            code = codes::STORED_SHAPE_INVALID,
+            "refusing to persist an oversized torch value — staying with the previous snapshot"
+        );
+        return;
+    }
     let (mut map, unusable) = crate::store::object_for_merge(store, FLASHLIGHT_KEY);
     if unusable {
         // The stored value is not a JSON object, so nothing in it can be preserved: the write
@@ -346,14 +403,39 @@ fn persist_flashlight(app: &AppHandle, store: &SharedStore, snap: FlashlightStat
         tracing::warn!(
             target: "amos::flashlight",
             key = FLASHLIGHT_KEY,
+            code = codes::STORED_SHAPE_INVALID,
             "stored flashlight state is not a JSON object — rewriting it from scratch"
         );
     }
     map.insert("on".to_string(), Value::Bool(snap.on));
     map.insert("torch_present".to_string(), Value::Bool(snap.torch_present));
-    if let Ok(text) = serde_json::to_string(&Value::Object(map)) {
-        store.set(app, FLASHLIGHT_KEY, text);
+    let text = match serde_json::to_string(&Value::Object(map)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "amos::flashlight",
+                error = %e,
+                code = codes::STORED_SHAPE_INVALID,
+                "merged flashlight JSON failed to serialise — torch state NOT mirrored"
+            );
+            return;
+        }
+    };
+    if text.len() > MAX_FLASHLIGHT_VALUE_BYTES {
+        // The merge step can grow the value past the cap (e.g. the stored
+        // shape was *valid* JSON but loaded with extra keys we never asked
+        // for). Refuse rather than silently push the limit.
+        tracing::warn!(
+            target: "amos::flashlight",
+            key = FLASHLIGHT_KEY,
+            bytes = text.len(),
+            limit = MAX_FLASHLIGHT_VALUE_BYTES,
+            code = codes::STORED_SHAPE_INVALID,
+            "merged torch value exceeds the size cap — keeping the previous shape"
+        );
+        return;
     }
+    store.set(app, FLASHLIGHT_KEY, text);
 }
 
 /// Read the current flashlight state.
@@ -431,6 +513,46 @@ mod tests {
         assert!(
             snap.torch_present,
             "desktop demo seed has a torch but is off"
+        );
+    }
+
+    #[test]
+    fn flashlight_codes_are_stable_string_keys() {
+        // The wire vocabulary is the i18n layer's contract; this pins it.
+        assert_eq!(
+            codes::STORED_SHAPE_INVALID,
+            "amos.flashlight.stored_shape_invalid"
+        );
+        assert_eq!(
+            codes::PROVIDER_UNCONFIRMED,
+            "amos.flashlight.provider_unconfirmed"
+        );
+    }
+
+    #[test]
+    fn the_flashlight_size_cap_is_well_under_the_general_store_cap() {
+        // Real values are ~32 B; the cap is small but generous, AND it is
+        // deliberately much smaller than `store::MAX_STORE_VALUE_BYTES` (256
+        // KiB) so an oversized payload is refused BEFORE it can pollute the
+        // boot-time JSON parse.
+        assert!(
+            MAX_FLASHLIGHT_VALUE_BYTES <= 4096,
+            "the torch key has no legitimate use for a 256 KiB value: got {MAX_FLASHLIGHT_VALUE_BYTES}"
+        );
+    }
+
+    #[test]
+    fn the_flashlight_payload_size_stays_well_below_the_cap() {
+        // The serialised payload is a small known shape; if a future change
+        // grows it past the cap, the `persist_flashlight` refusal path is the
+        // only thing keeping the boot-time parse healthy. This is the tripwire.
+        let payload = FlashlightPayload::from(FlashlightState::on_with_torch());
+        let text = serde_json::to_string(&payload).unwrap();
+        assert!(
+            text.len() < MAX_FLASHLIGHT_VALUE_BYTES,
+            "real payload {bytes} B is over the cap {cap} B",
+            bytes = text.len(),
+            cap = MAX_FLASHLIGHT_VALUE_BYTES
         );
     }
 }

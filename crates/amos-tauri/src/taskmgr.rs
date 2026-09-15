@@ -25,6 +25,13 @@ async fn connect() -> Result<GovernorClient<crate::daemon::DaemonChannel>, Strin
     Ok(GovernorClient::new(build_channel().await?))
 }
 
+/// Maximum bytes in a task-manager `app_id` / `job_id` the WebView hands in.
+///
+/// Real ids are reverse-DNS / short hashes (`org.amos.app`, `job_<digits>`,
+/// ≤64 chars). 256 B is the same ceiling the rest of the bridge modules use
+/// and prevents a paste-sized caller from inflating the daemon's id keys.
+pub const MAX_TASKMGR_ID_BYTES: usize = 256;
+
 /// One tracked app/process in the lifecycle registry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TaskApp {
@@ -117,6 +124,24 @@ fn action_to_state(a: AppAction) -> Option<i32> {
     }
 }
 
+/// Bound a task-manager id at the command seam: the daemon's gRPC `app_id` /
+/// `job_id` is opaque to the bridge, so a paste-sized id would inflate every
+/// downstream log line and look-up. The same `valid` rule is shared by
+/// `taskmgr_app_action` and `taskmgr_job_action` — `what` names which field was
+/// checked for the error message.
+fn check_taskmgr_id(id: &str, what: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > MAX_TASKMGR_ID_BYTES {
+        return Err(format!(
+            "taskmgr {what} invalid: {} bytes (max {MAX_TASKMGR_ID_BYTES})",
+            id.len()
+        ));
+    }
+    if id.chars().any(|c| c.is_control() || c == '\0') {
+        return Err(format!("taskmgr {what} contains control characters"));
+    }
+    Ok(())
+}
+
 /// Pure mapper from a proto `GovernorState` into a serializable [`TaskSnapshot`].
 pub fn task_snapshot(s: &amos_proto::amos_governor::GovernorState) -> TaskSnapshot {
     TaskSnapshot {
@@ -164,6 +189,7 @@ pub async fn taskmgr_snapshot() -> Result<TaskSnapshot, String> {
 /// Tauri command: drive a per-app lifecycle action, then return the fresh snapshot.
 #[tauri::command]
 pub async fn taskmgr_app_action(app_id: String, action: String) -> Result<TaskSnapshot, String> {
+    check_taskmgr_id(&app_id, "app_id")?;
     let act =
         parse_action(&action).ok_or_else(|| format!("unknown task-manager action '{action}'"))?;
     let mut client = connect().await?;
@@ -199,6 +225,7 @@ pub async fn taskmgr_app_action(app_id: String, action: String) -> Result<TaskSn
 /// snapshot.
 #[tauri::command]
 pub async fn taskmgr_job_action(job_id: String, action: String) -> Result<TaskSnapshot, String> {
+    check_taskmgr_id(&job_id, "job_id")?;
     if action != "cancel" {
         return Err(format!(
             "unknown task-manager job action '{action}' (only 'cancel')"
@@ -303,5 +330,25 @@ mod tests {
         assert!(s.apps.is_empty());
         assert!(s.jobs.is_empty());
         assert!(s.decision.is_none());
+    }
+
+    /// `check_taskmgr_id` is the single gate the command seam runs before
+    /// reaching the daemon's gRPC `app_id` / `job_id`. Empty / oversized /
+    /// control-character ids are refused with a structured reason so the UI
+    /// learns why a click was a no-op instead of being told "ok, you killed it"
+    /// while nothing happened.
+    #[test]
+    fn check_taskmgr_id_accepts_real_ids_and_rejects_oversized() {
+        for ok in [
+            "org.amos.app",
+            "job_42",
+            "x".repeat(MAX_TASKMGR_ID_BYTES).as_str(),
+        ] {
+            assert!(check_taskmgr_id(ok, "id").is_ok(), "{ok:?} is a real id");
+        }
+        assert!(check_taskmgr_id("", "app_id").is_err());
+        assert!(check_taskmgr_id("x\0", "app_id").is_err());
+        let huge = "x".repeat(MAX_TASKMGR_ID_BYTES + 1);
+        assert!(check_taskmgr_id(&huge, "job_id").is_err());
     }
 }

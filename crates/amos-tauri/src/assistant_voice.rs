@@ -28,6 +28,24 @@ use crate::ai_bridge::{with_client_id, AiBridge};
 /// Tauri event name for every assistant-voice status/reply frame.
 pub const VOICE_EVENT: &str = "assistant-voice-event";
 
+/// Maximum bytes one wire audio frame may carry.
+///
+/// Wire format is mono 16 kHz little-endian f32 → **64 000 B/s**. A single
+/// chunk the recognizer expects is normally 100 ms (~6.4 KiB). We allow up to
+/// roughly 1 MiB (≈16 seconds worth, comfortably larger than any VAD window),
+/// so the command seam can refuse a paste / buggy producer that tries to push
+/// 100 MiB at once — same rationale as `ime::MAX_KEY_CHARS` and
+/// `real_dial::MAX_DIAL_CHARS`: a malicious or stuck caller cannot turn the
+/// voice pipe into a memory exhaustion vector.
+pub const MAX_AUDIO_FRAME_BYTES: usize = 1 << 20;
+
+/// Maximum bytes in a voice session id (echoed in every `VoiceEvent` payload).
+///
+/// Real ids look like `device-mic` / `webview` / `webview-1700000000` — well
+/// under 64 bytes. The 256 cap mirrors `MAX_SESSION_ID_BYTES` on the AI bridge
+/// and prevents a paste-sized label from inflating every outbound event.
+pub const MAX_VOICE_SESSION_ID_BYTES: usize = 256;
+
 /// One event the voice link relays to its consumer (WebView or a headless test).
 #[derive(Clone, Debug, PartialEq)]
 pub enum VoiceEvent {
@@ -281,6 +299,14 @@ pub async fn assistant_voice_start(
     session_id: Option<String>,
 ) -> Result<(), String> {
     let session = session_id.unwrap_or_else(|| "default".to_string());
+    // Bound the session id before opening the bidi stream (the daemon echoes
+    // it back on every chunk — a paste-sized id would inflate every event).
+    if session.len() > MAX_VOICE_SESSION_ID_BYTES {
+        return Err(format!(
+            "voice session_id too long: {} bytes (max {MAX_VOICE_SESSION_ID_BYTES})",
+            session.len()
+        ));
+    }
 
     // Tear down any previous active voice session first: opening a new one must
     // not orphan the previous reader task or run two listeners that emit events
@@ -308,6 +334,14 @@ pub async fn assistant_voice_feed(
     voice: State<'_, VoiceSession>,
     frame: Vec<u8>,
 ) -> Result<(), String> {
+    // Bound the frame at the command seam: a buggy / hostile producer cannot
+    // pour an unbounded buffer into the outbound mpsc and wedge the recognizer.
+    if frame.len() > MAX_AUDIO_FRAME_BYTES {
+        return Err(format!(
+            "voice frame too large: {} bytes (max {MAX_AUDIO_FRAME_BYTES})",
+            frame.len()
+        ));
+    }
     voice.feed(frame).await
 }
 
@@ -435,7 +469,16 @@ pub async fn device_mic_start(
     let label = platform.backend_label();
     let native_rate = platform.native_rate();
 
+    // Bound session_id at the command seam (the id is echoed in every `VoiceEvent`
+    // payload and crosses to the daemon — a paste-sized label cannot be allowed
+    // to inflate either side).
     let session = session_id.unwrap_or_else(|| "device-mic".to_string());
+    if session.len() > MAX_VOICE_SESSION_ID_BYTES {
+        return Err(format!(
+            "voice session_id too long: {} bytes (max {MAX_VOICE_SESSION_ID_BYTES})",
+            session.len()
+        ));
+    }
     let app = app.clone();
     let emit = move |e: VoiceEvent| {
         let _ = app.emit(VOICE_EVENT, to_payload(&e));

@@ -18,6 +18,14 @@ import {
   LAUNCHPAD_ICON_SIZE,
   LAUNCHPAD_ICON_GAP,
   LAUNCHPAD_SEARCH_HEIGHT,
+  DESKTOP_GRID_COLS,
+  DESKTOP_GRID_INSET,
+  DESKTOP_GRID_ROWS,
+  DESKTOP_TILE_GAP_X,
+  DESKTOP_TILE_GAP_Y,
+  DESKTOP_TILE_SIZE,
+  desktopGridWidth,
+  desktopIconCapacity,
   SPOTLIGHT_WIDTH,
   SPOTLIGHT_HEIGHT,
   launchpadCols,
@@ -216,5 +224,34 @@ describe("dockIconScale", () => {
   test("非法输入 → 1.0（安全降级）", () => {
     expect(dockIconScale(NaN, 100)).toBe(1.0);
     expect(dockIconScale(100, NaN)).toBe(1.0);
+  });
+});
+
+describe("desktop icon grid (REQ-A263: the stage's geometry moved into the one geometry module)", () => {
+  test("the grid holds columns × rows icons — the stage used to hard-code 16", () => {
+    expect(DESKTOP_GRID_COLS * DESKTOP_GRID_ROWS).toBe(16);
+    expect(desktopIconCapacity()).toBe(16);
+    expect(desktopIconCapacity(8, 2)).toBe(16);
+    expect(desktopIconCapacity(3.9, 2.9)).toBe(6); // truncates rather than rounding up
+  });
+
+  test("a size we cannot believe yields no icons (never a guessed row count)", () => {
+    expect(desktopIconCapacity(NaN, 4)).toBe(0);
+    expect(desktopIconCapacity(4, Infinity)).toBe(0);
+    expect(desktopIconCapacity(-2, 4)).toBe(0);
+  });
+
+  test("the grid width is what the template used to spell as calc(4 * 80px + 3 * 24px)", () => {
+    expect(desktopGridWidth()).toBe(4 * 80 + 3 * 24); // 392 px
+    expect(desktopGridWidth(1)).toBe(80); // one column has no gap
+    expect(desktopGridWidth(0)).toBe(392); // invalid ⇒ the documented default
+    expect(desktopGridWidth(NaN)).toBe(392);
+  });
+
+  test("the numbers match the look that shipped (no value was changed by the move)", () => {
+    expect(DESKTOP_TILE_SIZE).toBe(80);
+    expect(DESKTOP_TILE_GAP_X).toBe(24); // gap-x-6
+    expect(DESKTOP_TILE_GAP_Y).toBe(20); // gap-y-5
+    expect(DESKTOP_GRID_INSET).toBe(32); // left-8 / top-8
   });
 });

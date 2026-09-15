@@ -22,6 +22,56 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Maximum bytes in one `ask_ai_agent` / `chat_agent` prompt string.
+///
+/// A reasonable AI prompt for a mobile assistant is 1–4 KiB (describing context,
+/// constraints, the question). The 256 KiB ceiling is deliberately generous: it
+/// covers a multi-paragraph screenshot description, a long email draft, or a
+/// multi-message conversation snippet — all plausible use cases. Beyond this the
+/// request is almost certainly a misbehaving client / a prompt injection loop,
+/// and rejecting it at the command seam is better than sending it to the daemon
+/// (where it would either time out the generation or consume excessive tokens).
+pub const MAX_AI_PROMPT_BYTES: usize = 256 << 10;
+
+/// Maximum bytes in a session id string.
+///
+/// Session ids come from the WebView; a sane id is ≤64 bytes. This prevents a
+/// malicious caller from using a session id as a memory amplification vector
+/// (e.g. a 10 MiB string as a session label in logs/traces).
+pub const MAX_SESSION_ID_BYTES: usize = 256;
+
+/// Maximum bytes in an Android `package_name` handed in via the
+/// `launch_android_app` / `get_android_app_icon` commands.
+///
+/// Real package names look like `org.amos.pomodoro` (≤32 chars); 256 B is
+/// comfortably above any legitimate value and prevents a paste-sized caller
+/// from inflating the gRPC `package_name` field.
+pub const MAX_ANDROID_PACKAGE_BYTES: usize = 256;
+
+/// Maximum bytes in the `ai_backend_switch` provider id.
+///
+/// Real provider ids are `"local"`, `"mock"`, `"ollama"`, `"openai"`,
+/// `"deepseek"`, `"custom"` (≤8 chars). 64 B mirrors the same seam width used
+/// by `radio::MAX_BT_ADDRESS_BYTES` — well above any preset and tight enough
+/// that a paste-sized caller cannot inflate the daemon's config.
+pub const MAX_AI_BACKEND_ID_BYTES: usize = 64;
+
+/// Maximum bytes in an `api_key` handed in via `ai_backend_switch`.
+///
+/// OpenAI/DeepSeek-style keys are 50–80 chars; 4 KiB leaves comfortable
+/// headroom for long-lived bearer tokens / JWTs the user might paste in,
+/// while preventing a paste-sized caller from inflating the credentials
+/// file and the env var the daemon inherits.
+pub const MAX_AI_API_KEY_BYTES: usize = 4 << 10;
+
+/// Maximum bytes in an `ai_backend_switch` model / endpoint string.
+///
+/// Model ids (`gpt-4o-mini`, `qwen2.5:7b`) and endpoints
+/// (`https://api.openai.com/v1`) are ≤128 chars. 512 B is well above any
+/// real value while bounding the daemon's env.
+pub const MAX_AI_MODEL_BYTES: usize = 512;
+pub const MAX_AI_ENDPOINT_BYTES: usize = 512;
+
 /// Wrap an outbound RPC payload in a `Request` carrying the caller identity, so
 /// the daemon's security layer can apply per-client rate limits and attribute
 /// each audit entry to this System UI client.
@@ -225,6 +275,37 @@ pub async fn ai_backend_switch(
     model: Option<String>,
     endpoint: Option<String>,
 ) -> Result<String, String> {
+    // Bound the inputs at the seam: a paste-sized `api_key` would be persisted
+    // to the credentials file and broadcast on the live switcher, and an
+    // unbounded `model` / `endpoint` would inflate the daemon's env.
+    if provider.is_empty() || provider.len() > MAX_AI_BACKEND_ID_BYTES {
+        return Err(format!(
+            "ai backend provider invalid: {} bytes (max {MAX_AI_BACKEND_ID_BYTES})",
+            provider.len()
+        ));
+    }
+    if api_key.len() > MAX_AI_API_KEY_BYTES {
+        return Err(format!(
+            "ai api_key too long: {} bytes (max {MAX_AI_API_KEY_BYTES})",
+            api_key.len()
+        ));
+    }
+    if let Some(m) = model.as_deref() {
+        if m.len() > MAX_AI_MODEL_BYTES {
+            return Err(format!(
+                "ai model too long: {} bytes (max {MAX_AI_MODEL_BYTES})",
+                m.len()
+            ));
+        }
+    }
+    if let Some(e) = endpoint.as_deref() {
+        if e.len() > MAX_AI_ENDPOINT_BYTES {
+            return Err(format!(
+                "ai endpoint too long: {} bytes (max {MAX_AI_ENDPOINT_BYTES})",
+                e.len()
+            ));
+        }
+    }
     let root = repo_root();
     let script = root.join("scripts").join("ai-backend.sh");
     let script_s = script.display().to_string();
@@ -685,6 +766,21 @@ pub async fn ask_ai_agent(
 ) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "default".to_string());
 
+    // Bound the prompt at the command seam so a misbehaving / malicious caller
+    // cannot flood the daemon with a multi-megabyte prompt injection or a loop.
+    if prompt.len() > MAX_AI_PROMPT_BYTES {
+        return Err(format!(
+            "prompt too long: {} bytes (max {MAX_AI_PROMPT_BYTES})",
+            prompt.len()
+        ));
+    }
+    if sid.len() > MAX_SESSION_ID_BYTES {
+        return Err(format!(
+            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+            sid.len()
+        ));
+    }
+
     // Merge the system-wide selection context (addressed to this window) into
     // the request before it crosses the wire, falling back to the global
     // clipboard's newest text when no per-window entry is attached.
@@ -788,6 +884,12 @@ pub async fn remove_ai_session(
     state: State<'_, AiBridge>,
     session_id: String,
 ) -> Result<bool, String> {
+    if session_id.len() > MAX_SESSION_ID_BYTES {
+        return Err(format!(
+            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+            session_id.len()
+        ));
+    }
     remove_session(&state, &session_id).await
 }
 
@@ -797,6 +899,12 @@ pub async fn get_ai_session_history(
     state: State<'_, AiBridge>,
     session_id: String,
 ) -> Result<SessionHistory, String> {
+    if session_id.len() > MAX_SESSION_ID_BYTES {
+        return Err(format!(
+            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+            session_id.len()
+        ));
+    }
     get_session_history(&state, &session_id).await
 }
 
@@ -826,6 +934,20 @@ pub async fn chat_agent(
 ) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "default".to_string());
     let target = target_window.unwrap_or_else(|| "ai".to_string());
+
+    // Bound the prompt at the command seam (same rationale as `ask_ai_agent`).
+    if prompt.len() > MAX_AI_PROMPT_BYTES {
+        return Err(format!(
+            "prompt too long: {} bytes (max {MAX_AI_PROMPT_BYTES})",
+            prompt.len()
+        ));
+    }
+    if sid.len() > MAX_SESSION_ID_BYTES {
+        return Err(format!(
+            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+            sid.len()
+        ));
+    }
 
     // Inject the system-wide selection context addressed to this window,
     // preferring it over the global clipboard's newest text.
@@ -998,6 +1120,12 @@ pub async fn launch_android_app(
     wm: State<'_, WmState>,
     package_name: String,
 ) -> Result<AndroidLaunchResult, String> {
+    if package_name.is_empty() || package_name.len() > MAX_ANDROID_PACKAGE_BYTES {
+        return Err(format!(
+            "android package_name invalid: {} bytes (max {MAX_ANDROID_PACKAGE_BYTES})",
+            package_name.len()
+        ));
+    }
     let mut attempt = 0;
     loop {
         let mut client = state.connect_android().await?;
@@ -1054,6 +1182,12 @@ pub async fn get_android_app_icon(
     state: State<'_, AiBridge>,
     package_name: String,
 ) -> Result<Option<Vec<u8>>, String> {
+    if package_name.is_empty() || package_name.len() > MAX_ANDROID_PACKAGE_BYTES {
+        return Err(format!(
+            "android package_name invalid: {} bytes (max {MAX_ANDROID_PACKAGE_BYTES})",
+            package_name.len()
+        ));
+    }
     let mut attempt = 0;
     loop {
         let mut client = state.connect_android().await?;

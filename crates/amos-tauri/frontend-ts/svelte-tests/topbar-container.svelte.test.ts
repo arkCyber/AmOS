@@ -1,98 +1,111 @@
 /**
- * DOM tests for the top bar **as a container** (REQ-A261).
+ * DOM tests for the top bar **as a container** (REQ-A261, extended by REQ-A262).
  *
- * The bar no longer knows its widgets: it renders whatever the registry says, in
- * the registry's order. So these tests check the two halves of that contract —
- * that the slot is filled from the table (and only from the table), and that the
- * widgets' intents still reach the shell as the same events `DesktopShell` has
- * always bound (`on:launchpad` / `on:spotlight`).
+ * The bar no longer knows its widgets: **both** slots render whatever the registry says,
+ * in the registry's order — including the left group, which round 1 left inlined in the
+ * template (Apple menu, app name, the five menu titles, and the store subscription
+ * behind the app name).
  *
- * Deliberately *not* re-testing each widget's internals: those live next to the
- * widget (`chrome-widgets.svelte.test.ts`), which is the point of the split — a
- * widget's own rendering must not need the whole bar mounted.
+ * Deliberately *not* re-tested here:
+ *   • each widget's own rendering — that lives next to the widget
+ *     (`chrome-widgets.svelte.test.ts`), which is the point of the split;
+ *   • the intent path (click a trigger → chrome handle → shell). The handle belongs to
+ *     the **shell** now (`DesktopShell` provides it once for every slot), so a bar
+ *     mounted on its own has none and its widgets deliberately do nothing rather than
+ *     throw. That path is asserted end-to-end in `desktop-shell.svelte.test.ts`, where a
+ *     real shell is present — including the cross-check that the same registry row both
+ *     labels a trigger's tooltip and binds the key.
  */
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import TopBar from "../src/svelte/TopBar.svelte";
 import { setLocale } from "../src/svelte/locale.svelte";
 import { modulesFor } from "../src/lib/shellModule";
 import { SHELL_MODULES } from "../src/svelte/shellModules";
+import { APP_FOCUSED_KEY } from "../src/lib/wm";
+import { writeStoreValue } from "../src/lib/amosStore";
+import { AMOS_OS_NAME } from "../src/lib/version";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
 afterEach(() => setLocale("zh"));
+beforeEach(() => window.localStorage.clear());
+afterEach(() => window.localStorage.clear());
 
-/** Mount the bar; the shell hands it the two intents it cares about. */
-function mount(handlers: { onlaunchpad?: () => void; onspotlight?: () => void } = {}) {
-  return render(TopBar, { props: handlers });
-}
+const testIds = (slot: "topbar-left" | "topbar-right") =>
+  modulesFor(slot, SHELL_MODULES).map((m) => m.testId);
 
 describe("TopBar as a chrome container", () => {
-  test("renders one node per registered module, in registry order", async () => {
-    const host = mount();
+  test("renders one node per registered module, in registry order, in each slot", async () => {
+    const host = render(TopBar);
     await tick();
 
-    const slot = host.container.querySelector('[data-testid="topbar-right-slot"]');
-    expect(slot, "the right-hand slot must exist").toBeTruthy();
-    const ids = [...slot!.children].map((el) => el.getAttribute("data-testid"));
-    expect(ids).toEqual(modulesFor("topbar-right", SHELL_MODULES).map((m) => m.testId));
-  });
-
-  test("the container's own markup carries no widget glyphs — the widgets do", async () => {
-    const host = mount();
-    await tick();
-    const bar = host.container.querySelector('[aria-label="顶部菜单栏"]')!;
-    // The bar's *own* children: the left group (Apple menu, app name, main menu).
-    // Its right-hand sibling is the slot, whose contents come from the registry —
-    // checking the bar's whole `innerHTML` would include them and prove nothing.
-    const left = bar.firstElementChild as HTMLElement;
-    expect(left.textContent).toContain("Amos");
-    for (const glyph of ["🚀", "🔍", "⚙️"]) {
-      expect(left.innerHTML, `the container itself must not carry ${glyph}`).not.toContain(glyph);
+    for (const slot of ["topbar-left", "topbar-right"] as const) {
+      const el = host.container.querySelector(`[data-testid="${slot}-slot"]`);
+      expect(el, `the ${slot} slot must exist`).toBeTruthy();
+      const ids = [...el!.children].map((c) => c.getAttribute("data-testid"));
+      expect(ids).toEqual(testIds(slot));
     }
-    // …and the slot *does* carry them, because the widgets do.
-    const slot = bar.lastElementChild as HTMLElement;
-    expect(slot.innerHTML).toContain("🚀");
   });
 
-  test("the launchpad widget asks the shell through the chrome handle", async () => {
-    const onlaunchpad = vi.fn();
-    const host = mount({ onlaunchpad });
+  test("the container's own markup is only the two slots (no glyphs, no labels)", async () => {
+    const host = render(TopBar);
     await tick();
-
-    await fireEvent.click(host.container.querySelector('[data-testid="chrome-launchpad"]')!);
-    expect(onlaunchpad).toHaveBeenCalledTimes(1);
+    const bar = host.container.querySelector(`[aria-label="${zh["desktop.topbar"]}"]`)!;
+    // The container's own children are the two slot divs and nothing else: a bar that
+    // renders a widget itself is the defect this split removed.
+    expect(bar.children.length).toBe(2);
+    expect([...bar.children].map((c) => c.getAttribute("data-testid"))).toEqual([
+      "topbar-left-slot",
+      "topbar-right-slot",
+    ]);
+    // …and none of the bar's *own* markup is a control or a glyph: everything visible in
+    // the bar arrives from inside a slot (the widgets the registry names).
+    expect(bar.querySelectorAll(":scope > button, :scope > span, :scope > nav, :scope > a").length).toBe(0);
   });
 
-  test("the spotlight widget asks the shell through the chrome handle", async () => {
-    const onspotlight = vi.fn();
-    const host = mount({ onspotlight });
+  test("the left group is three widgets in the order macOS shows them", async () => {
+    const host = render(TopBar);
     await tick();
-
-    await fireEvent.click(host.container.querySelector('[data-testid="chrome-spotlight"]')!);
-    expect(onspotlight).toHaveBeenCalledTimes(1);
+    const left = host.container.querySelector('[data-testid="topbar-left-slot"]')!;
+    expect([...left.children].map((c) => c.getAttribute("data-testid"))).toEqual([
+      "menu-apple",
+      "menu-app-name",
+      "menu-main",
+    ]);
   });
 
-  test("the control-centre widget is honestly disabled, not an inert button", async () => {
-    const host = mount();
+  test("the app name is the product name until the host reports a focused app", async () => {
+    const host = render(TopBar);
     await tick();
-    const button = host.container.querySelector<HTMLButtonElement>(
-      '[data-testid="chrome-control-center"]',
-    )!;
-    expect(button.disabled).toBe(true);
-    expect(button.getAttribute("aria-disabled")).toBe("true");
-    // …and it still has a name that says so (never a nameless disabled control).
-    expect(button.getAttribute("aria-label")).toContain("控制中心");
+    const name = () => host.container.querySelector('[data-testid="menu-app-name"]')!.textContent;
+    expect(name()).toBe(AMOS_OS_NAME);
+
+    writeStoreValue(APP_FOCUSED_KEY, "files");
+    await tick();
+    expect(name()).toBe("Files");
   });
 
-  test("the clock and the battery are rendered by their own widgets", async () => {
-    const host = mount();
+  test("the five app menus are disabled and named with the reason (no inert buttons)", async () => {
+    const host = render(TopBar);
     await tick();
-    expect(host.container.querySelector('[data-testid="chrome-clock"]')?.textContent).toMatch(
-      /\d/,
-    );
-    expect(host.container.querySelector('[data-testid="chrome-battery"]')?.textContent).toContain(
-      "—",
-    );
+    const nav = host.container.querySelector('[data-testid="menu-main"]')!;
+    const buttons = [...nav.querySelectorAll("button")];
+    expect(buttons.map((b) => b.textContent?.trim())).toEqual([
+      zh["desktop.menu.file"],
+      zh["desktop.menu.edit"],
+      zh["desktop.menu.view"],
+      zh["desktop.menu.window"],
+      zh["desktop.menu.help"],
+    ]);
+    for (const b of buttons) {
+      expect((b as HTMLButtonElement).disabled).toBe(true);
+      expect(b.getAttribute("aria-disabled")).toBe("true");
+      // A disabled control whose name is just "文件" explains nothing: the name carries
+      // the reason, which is the only useful information here.
+      expect(b.getAttribute("aria-label")).toContain(zh["desktop.menuUnavailable"]);
+      expect(b.getAttribute("title")).toBe(zh["desktop.menuUnavailable"]);
+    }
   });
 });

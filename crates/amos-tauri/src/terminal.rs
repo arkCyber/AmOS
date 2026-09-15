@@ -37,6 +37,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "terminal-pty")]
 use std::sync::Arc;
 
+/// Upper bound on the `cwd` string the WebView hands in to `term_spawn`.
+///
+/// `cmd.cwd(&dir)` does no validation — an empty string / a path of gigabytes
+/// would either silently default to the current dir or, worse, panic inside
+/// the PTY backend's path lookup. 4 KiB is the platform's own `PATH_MAX` and
+/// gives the caller headroom for any legitimate absolute path.
+pub const MAX_TERM_CWD_BYTES: usize = 4 << 10;
+
+/// Upper bound on a `term_write` data payload.
+///
+/// The PTY is a byte stream: the writer's send window can stall if a runaway
+/// caller pumps an unbounded buffer. 1 MiB covers any one-shot paste-sized
+/// input and bounds the per-call allocation.
+pub const MAX_TERM_WRITE_BYTES: usize = 1 << 20;
+
+/// Upper bound on one binary name in a `term_spawn` allowlist.
+///
+/// Real allowlists have 1–5 entries (`["git", "ls", "grep"]`); 256 B per
+/// entry is well above any legitimate value and tight enough that a
+/// paste-sized caller cannot inflate the per-call lookup.
+pub const MAX_TERM_ALLOW_BYTES: usize = 256;
+
+/// Upper bound on the **number** of binaries in one allowlist.
+pub const MAX_TERM_ALLOW_LEN: usize = 64;
+
 /// Uniform result envelope for every terminal bridge call.
 #[derive(Debug, Clone, Serialize)]
 pub struct TermOut {
@@ -141,7 +166,34 @@ pub async fn term_spawn(cwd: Option<String>, allowlist: Option<Vec<String>>) -> 
     if allowlist.is_none() {
         return err("terminal: refusing an unrestricted shell — pass an explicit allowlist");
     }
+    // Bound the allowlist at the seam: a runaway caller shipping megabytes of
+    // binary names would force every keystroke to scan a giant Vec.
+    if let Some(list) = allowlist.as_ref() {
+        if list.len() > MAX_TERM_ALLOW_LEN {
+            return err(format!(
+                "terminal: allowlist too long: {} entries (max {MAX_TERM_ALLOW_LEN})",
+                list.len()
+            ));
+        }
+        for (i, b) in list.iter().enumerate() {
+            if b.is_empty() || b.len() > MAX_TERM_ALLOW_BYTES {
+                return err(format!(
+                    "terminal: allowlist[{i}] too long or empty: {} bytes (max {MAX_TERM_ALLOW_BYTES})",
+                    b.len()
+                ));
+            }
+        }
+    }
     let dir = cwd.unwrap_or_else(|| "/".to_string());
+    // `cmd.cwd(&dir)` does no validation; reject an empty / oversized cwd at
+    // the seam instead of letting it silently default or panic inside the
+    // PTY backend's path lookup.
+    if dir.is_empty() || dir.len() > MAX_TERM_CWD_BYTES {
+        return err(format!(
+            "terminal: cwd too long or empty: {} bytes (max {MAX_TERM_CWD_BYTES})",
+            dir.len()
+        ));
+    }
     #[cfg(feature = "terminal-pty")]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -217,6 +269,15 @@ pub async fn term_spawn(cwd: Option<String>, allowlist: Option<Vec<String>>) -> 
 /// Write bytes to a live session's stdin.
 #[tauri::command]
 pub async fn term_write(session: u64, data: String) -> TermOut {
+    // Bound the write at the command seam: a runaway loop that pumps megabytes
+    // per call would saturate the writer before the user notices anything is
+    // wrong. 1 MiB covers a paste-sized paste and bounds the per-call memcpy.
+    if data.len() > MAX_TERM_WRITE_BYTES {
+        return err(format!(
+            "terminal: write too large: {} bytes (max {MAX_TERM_WRITE_BYTES})",
+            data.len()
+        ));
+    }
     #[cfg(feature = "terminal-pty")]
     {
         let mut guard = registry_guard();

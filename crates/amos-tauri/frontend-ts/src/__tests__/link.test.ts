@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
+  actuationAgeMs,
   counterSummary,
   formatUptime,
   healthKey,
   linkLevel,
   peerSummary,
+  reportAgeKey,
+  reportAgeText,
+  returnPathKey,
+  returnPathLevel,
   robotLevel,
   robotLevelKey,
   robotSummary,
@@ -30,11 +35,44 @@ const DEGRADED: LinkStatus = {
     encode_errors: 0,
   },
   peers: [],
+  actuations: [],
 };
 
 describe("robot-link client (pure helpers)", () => {
   test("no answer from the daemon is offline", () => {
     expect(linkLevel(null)).toBe("offline");
+  });
+
+  test("the return path has three states, and 'not answered' is not 'nobody reported'", () => {
+    // `null` = the daemon did not answer `ListActuations` (an older build) — the panel knows
+    // nothing about the fleet, so it must not say 「nobody reported」. This is the shape the
+    // bridge produces for a daemon without the RPC (`docs/amos-link.md` §6.5).
+    expect(returnPathLevel({ ...DEGRADED, actuations: null })).toBe("unavailable");
+    expect(returnPathKey("unavailable")).toBe("link.returnPathUnavailable");
+    // `[]` = it answered and nobody has reported yet.
+    expect(returnPathLevel(DEGRADED)).toBe("none");
+    expect(returnPathKey("none")).toBe("link.noReports");
+    // A report makes it `reported`, and the copy is a different sentence again. (Built inline:
+    // the `robot(...)` fixture of the second suite is scoped to that suite.)
+    const reported: LinkActuation = {
+      robot: "dog1",
+      seq: 12,
+      gait: "trot",
+      frames: 13,
+      armed: true,
+      estopped: false,
+      estop_reason: null,
+      watchdog_ms: null,
+      last_refusal: null,
+      stamp_ms: 1,
+    };
+    expect(returnPathLevel({ ...DEGRADED, actuations: [reported] })).toBe("reported");
+    expect(returnPathKey("reported")).not.toBe(returnPathKey("none"));
+    // An **older bridge** omits the field entirely; that is the same version skew in the other
+    // direction, so it reads as 「not answered」 too (never as an empty fleet).
+    const skew: Partial<LinkStatus> = { ...DEGRADED };
+    delete skew.actuations;
+    expect(returnPathLevel(skew as LinkStatus)).toBe("unavailable");
   });
 
   test("the daemon's own verdict is passed through, not re-judged", () => {
@@ -133,5 +171,32 @@ describe("robot rows (the control loop's return path)", () => {
     expect(robotSummary(robot())).toBe("dog1 · trot · #12");
     // `null` is "the robot did not report it", never a made-up zero.
     expect(robotSummary(robot({ gait: null, seq: null }))).toBe("dog1 · - · #-");
+  });
+
+  test("a report's age is computed from the reader's clock, or refused", () => {
+    // What the row needs to answer "is this *still* true?": `armed` from two hours ago is not
+    // "armed now". The age is `now - stamp_ms`, and the two cases that must not produce a number
+    // are named instead of being folded into `0` (which would read as brand new).
+    const now = 1_700_000_000_000;
+    expect(actuationAgeMs(robot({ stamp_ms: now - 2_500 }), now)).toBe(2_500);
+    expect(actuationAgeMs(robot({ stamp_ms: now - 3 * 3_600_000 }), now)).toBe(3 * 3_600_000);
+    // A stamp of 0 is the proto's "absent", not 1970 (which would read as 56 years old).
+    expect(actuationAgeMs(robot({ stamp_ms: 0 }), now)).toBeNull();
+    // A stamp in the future means two unsynchronised clocks — an age would be a guess.
+    expect(actuationAgeMs(robot({ stamp_ms: now + 5_000 }), now)).toBeNull();
+    // A just-now report is `0`, which is a *real* age (unlike the two above).
+    expect(actuationAgeMs(robot({ stamp_ms: now }), now)).toBe(0);
+  });
+
+  test("the age is rendered in the same shapes the CLI uses", () => {
+    expect(reportAgeKey(250)).toBe("link.reportedNow");
+    expect(reportAgeKey(2_000)).toBe("link.reportedAgo");
+    expect(reportAgeKey(3 * 3_600_000)).toBe("link.reportedAgo");
+    // …and an age that cannot be stated gets its own sentence, never a number.
+    expect(reportAgeKey(null)).toBe("link.reportedUnknown");
+    expect(reportAgeText(250)).toBe("250ms");
+    expect(reportAgeText(2_500)).toBe("2s");
+    expect(reportAgeText(125_000)).toBe("2m 05s");
+    expect(reportAgeText(3 * 3_600_000)).toBe("3h 00m");
   });
 });

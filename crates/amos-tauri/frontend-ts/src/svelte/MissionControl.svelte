@@ -6,13 +6,14 @@
   // 点击窗口 → wm_focus(id) → 关闭。
   //
   // 数据：wm_windows → 过滤 App 类、非 Hidden 的窗口；用 label 反查 i18n 显示名。
-  import { createEventDispatcher, onMount } from "svelte";
+  import { onMount } from "svelte";
   import { invoke } from "../lib/backend";
   import { appIcon, appTitleKey } from "../lib/appMeta";
   import { shouldShowMissionControl } from "../lib/desktopLayout";
   import { t } from "./locale.svelte";
 
-  const dispatch = createEventDispatcher<{ close: void }>();
+  // 关闭由壳决定（浮层从注册表渲染，壳传 `onclose`）——见 Launchpad.svelte 的同一处说明。
+  let { onclose }: { onclose?: () => void } = $props();
 
   // ─── 已打开窗口列表 ──────────────────────────────────────────────────────
   interface WmWindow {
@@ -54,12 +55,12 @@
     } catch {
       /* ignore */
     }
-    dispatch("close");
+    onclose?.();
   }
 
   // ─── 键盘处理 ───────────────────────────────────────────────────────────
   function onKeyDown(e: KeyboardEvent) {
-    if (e.key === "Escape") dispatch("close");
+    if (e.key === "Escape") onclose?.();
   }
 
   onMount(() => {
@@ -98,8 +99,8 @@
     class="pointer-events-auto absolute inset-0"
     role="presentation"
     aria-hidden="true"
-    onclick={() => dispatch("close")}
-    onkeydown={(e) => { if (e.key === "Escape") dispatch("close"); }}
+    onclick={() => onclose?.()}
+    onkeydown={(e) => { if (e.key === "Escape") onclose?.(); }}
   ></div>
 
   <!-- 窗口列表 -->

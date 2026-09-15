@@ -89,13 +89,21 @@ export interface LinkStatus {
   metrics: LinkMetrics;
   peers: LinkPeer[];
   /**
-   * What each robot reports about itself, sorted by id. Empty means **nobody has reported** —
-   * which is not the same as "all robots are idle", and the panel says so.
+   * What each robot reports about itself, sorted by id — the control loop's **return path**.
    *
-   * Optional because a daemon older than the `ListActuations` RPC simply omits it: the panel
-   * must not throw on a version skew, it must show less.
+   * **Three states, three facts** (the panel's doctrine is 「absent, not idle」):
+   *
+   * * `null` — the daemon **did not answer** this question (a build older than the
+   *   `ListActuations` RPC, or a bridge that predates the field). The panel must say so, never
+   *   render it as 「nobody reported」: it knows nothing about the fleet;
+   * * `[]` — the daemon answered and **nobody has reported yet**;
+   * * `[…]` — those robots have reported.
+   *
+   * `null` is the wire's shape for 「not answered」 (`Option::None` on the Rust side, `null` in
+   * JSON); `undefined` is accepted too, because an *older bridge* talking to a newer panel is
+   * the same version skew in the other direction.
    */
-  actuations?: LinkActuation[];
+  actuations: LinkActuation[] | null;
 }
 
 /** Read the running daemon's link status. Null offline / on a failed command. */
@@ -170,6 +178,35 @@ export function counterSummary(m: LinkMetrics): string {
 export type RobotLevel = "estopped" | "armed" | "idle";
 
 /**
+ * The state of the **return path** in one status document (pure, unit-tested).
+ *
+ * `unavailable` is the one a version skew produces: the daemon answered the link status but not
+ * the robots' reports (an older build, no `ListActuations`). It must never be rendered like
+ * `none` — "we were not told" and "nobody reported" are different facts, and the panel's whole
+ * doctrine is 「a robot that has not reported is absent, not idle」.
+ */
+export type ReturnPathLevel = "unavailable" | "none" | "reported";
+
+/** Classify the return path of a status (pure). `undefined` counts as `null` (older bridge). */
+export function returnPathLevel(s: LinkStatus): ReturnPathLevel {
+  const list = s.actuations ?? null;
+  if (list === null) return "unavailable";
+  return list.length > 0 ? "reported" : "none";
+}
+
+/** The i18n key for a return-path level (pure). */
+export function returnPathKey(level: ReturnPathLevel): string {
+  switch (level) {
+    case "unavailable":
+      return "link.returnPathUnavailable";
+    case "reported":
+      return "link.robotsReported";
+    default:
+      return "link.noReports";
+  }
+}
+
+/**
  * Classify one robot's report (pure, unit-tested).
  *
  * `estopped` wins over `armed`: a latched e-stop is the fact a user must see first, and the
@@ -199,4 +236,44 @@ export function robotSummary(a: LinkActuation): string {
   const mode = a.gait ?? "-";
   const seq = a.seq === null ? "-" : String(a.seq);
   return `${a.robot} · ${mode} · #${seq}`;
+}
+
+/**
+ * How long ago a robot *reported* — or `null` when that cannot be said.
+ *
+ * The panel dates its own reading (`link.probe`), but that says nothing about when the robot
+ * spoke: a robot that reported `armed: true` and then died would keep showing "armed" with a
+ * fresh read time next to it. `armed` / `estopped` are claims about *right now*, so the report
+ * carries its own age.
+ *
+ * Two stamps cannot yield an age, and neither is folded into `0` (which would read as "just
+ * now"): a missing stamp (`0` is the proto's sentinel), and one **in the future** — the
+ * reporter's clock is not this clock, which is exactly when an age would be a guess. The age is
+ * computed from `now`, so the caller must re-render (this page re-reads every 10 s) for it to
+ * stay true.
+ */
+export function actuationAgeMs(a: LinkActuation, now: number): number | null {
+  if (!Number.isFinite(a.stamp_ms) || a.stamp_ms <= 0) return null;
+  if (a.stamp_ms > now) return null;
+  return now - a.stamp_ms;
+}
+
+/** The i18n key for a report's age (`null` = it could not be stated). */
+export function reportAgeKey(ageMs: number | null): string {
+  if (ageMs === null) return "link.reportedUnknown";
+  // Below a second a robot is *reporting*, not *stale*: same sentence, different figure, so the
+  // key stays one and the copy does not have to guess.
+  return ageMs < 1_000 ? "link.reportedNow" : "link.reportedAgo";
+}
+
+/**
+ * A report's age as text: `250ms`, `2s`, `2m 05s`, `3h 04m`, `2d 03h`.
+ *
+ * The same shapes the CLI's `format_age_ms` prints, so a terminal and this panel describe an age
+ * alike (and the same shapes as {@link formatUptime}: an age *is* a duration).
+ */
+export function reportAgeText(ageMs: number): string {
+  if (!Number.isFinite(ageMs) || ageMs < 0) return formatUptime(0);
+  if (ageMs < 1_000) return `${Math.floor(ageMs)}ms`;
+  return formatUptime(ageMs);
 }

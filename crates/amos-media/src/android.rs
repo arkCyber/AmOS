@@ -123,11 +123,15 @@ impl MediaProvider for AndroidMediaProvider {
         name: &str,
         data: &[u8],
     ) -> Result<MediaItem> {
+        // Same guard the trait / Mock apply — a paste-sized or `..`-shaped name
+        // is rejected before it reaches the Kotlin glue (which has its own
+        // MediaStore logic, but the seam here is the single source of truth).
+        let name = crate::provider::validate_save_name(name)?;
         let mut env = self.attach()?;
         let glue = self.glue.0.as_obj();
         let mk = |s: &str| env.new_string(s).map_err(jerr);
         let tag: JObject = mk(dir.tag())?.into();
-        let nm: JObject = mk(name)?.into();
+        let nm: JObject = mk(&name)?.into();
         let kd: JObject = mk(kind.as_str())?.into();
         let mi: JObject = mk(mime_for(kind))?.into();
         let b64: JObject = mk(&STANDARD.encode(data))?.into();

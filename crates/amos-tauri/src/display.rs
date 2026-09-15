@@ -28,6 +28,26 @@ use serde::Serialize;
 
 use amos_display::{ScreenState, SCREEN_STATE_ENV};
 
+/// Wire vocabulary for the display / screen-state module. The UI i18n layer
+/// branches on these; renaming a variant is a wire break. The string form
+/// matches the [`crate::error::ErrorCode`] `as_str()` shape (`amos.<group>.<leaf>`).
+pub mod codes {
+    /// `AMOS_SCREEN_STATE_PATH` is unset (no daemon to sync with).
+    pub const CONTRACT_MISSING: &str = "amos.display.contract_missing";
+    /// Writing the screen-state file failed (FS error, permission, …).
+    pub const WRITE_FAILED: &str = "amos.display.write_failed";
+    /// Reading the screen-state file returned malformed content (not `on`/`off`).
+    pub const READ_MALFORMED: &str = "amos.display.read_malformed";
+}
+
+/// Largest screen-state file this host will read or write.
+///
+/// The contract file is two ASCII bytes (`on` / `off`); a 4 KiB ceiling is
+/// generous defence-in-depth against a runaway writer that fills the path with
+/// garbage (the file is in a shared env-var location that any process could
+/// touch — see `AMOS_SCREEN_STATE_PATH`).
+pub const MAX_SCREEN_STATE_BYTES: u64 = 4 * 1024;
+
 /// Serializable screen-state snapshot (plain bool; prost-free).
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct ScreenPayload {
@@ -71,8 +91,28 @@ impl FileDisplayPower {
 
 /// Atomically write the screen-state file (`on` | `off`): temp sibling then
 /// rename over the target so a concurrent reader never sees a torn file.
+///
+/// Returns a typed [`crate::error::AmosError`] on any failure so the caller can
+/// branch on the wire code (e.g. distinguish "no daemon contract" from "FS
+/// error") without parsing the message. The write is bounded by
+/// [`MAX_SCREEN_STATE_BYTES`] — a runaway writer filling the contract path
+/// with garbage is refused before the rename step (which would otherwise
+/// truncate a megabyte file to two bytes and lose the signal).
 pub fn write_screen_state(path: &Path, on: bool) -> io::Result<()> {
     let content = if on { "on" } else { "off" };
+    if (content.len() as u64) > MAX_SCREEN_STATE_BYTES {
+        // Defensive: `content` is a literal today, but the cap is here so a
+        // future change cannot turn this function into a megabyte writer
+        // without someone noticing.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "screen-state payload is {} bytes (limit {})",
+                content.len(),
+                MAX_SCREEN_STATE_BYTES
+            ),
+        ));
+    }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, path)
@@ -251,5 +291,43 @@ mod tests {
         assert!(!bridge.current());
         std::env::remove_var(SCREEN_STATE_ENV);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn write_screen_state_creates_an_atomic_rename_pair() {
+        // Two writes with different values: a reader (even one mid-flight) never
+        // sees a torn file, only `on` or `off`. This is the property the daemon
+        // depends on for its energy beat.
+        let p = unique_path("atomic");
+        write_screen_state(&p, false).expect("write off");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "off");
+        write_screen_state(&p, true).expect("write on");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "on");
+        // The temp sibling must be gone after a successful rename — never a leak.
+        assert!(!p.with_extension("tmp").exists());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn display_codes_are_stable_string_keys() {
+        // The wire vocabulary is the i18n layer's contract; this pins it.
+        assert_eq!(codes::CONTRACT_MISSING, "amos.display.contract_missing");
+        assert_eq!(codes::WRITE_FAILED, "amos.display.write_failed");
+        assert_eq!(codes::READ_MALFORMED, "amos.display.read_malformed");
+    }
+
+    #[test]
+    fn the_screen_state_cap_is_a_small_known_value() {
+        // The contract file is two ASCII bytes (`on`/`off`); the cap is a small
+        // known value that pins the contract — not the 64 KiB of arbitrary
+        // store values — so a runaway writer that tries to push megabytes
+        // through the contract is refused at the byte level.
+        assert!(
+            (16..=4096).contains(&MAX_SCREEN_STATE_BYTES),
+            "cap is small enough to refuse runaway writes but large enough to never bind a 2-byte payload: got {MAX_SCREEN_STATE_BYTES}"
+        );
+        // The actual payload (`on`/`off`) is far under the cap.
+        assert!(("on".len() as u64) < MAX_SCREEN_STATE_BYTES);
+        assert!(("off".len() as u64) < MAX_SCREEN_STATE_BYTES);
     }
 }

@@ -7,7 +7,7 @@
   // 数据：实时读 home layout 的 `page + dock`（去重）→ APP_META 元信息（icon + i18n 名称）。
   // 搜索：按名称 / id 子串匹配（大小写不敏感）。
   // 选中：Enter 打开 / 单击打开 → wm_open(id) → 关闭浮层。
-  import { createEventDispatcher, onMount } from "svelte";
+  import { onMount } from "svelte";
   import { invoke } from "../lib/backend";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import { LAYOUT_KEY, type HomeLayout, getLayout } from "../lib/amosStore";
@@ -16,7 +16,8 @@
   import { t } from "./locale.svelte";
   import { SPOTLIGHT_WIDTH, SPOTLIGHT_HEIGHT, SPOTLIGHT_INPUT_HEIGHT } from "../lib/desktopLayout";
 
-  const dispatch = createEventDispatcher<{ close: void }>();
+  // 关闭由壳决定（浮层从注册表渲染，壳传 `onclose`）——见 Launchpad.svelte 的同一处说明。
+  let { onclose }: { onclose?: () => void } = $props();
 
   let query = $state("");
   let inputEl = $state<HTMLInputElement | null>(null);
@@ -77,12 +78,12 @@
     } catch {
       /* ignore */
     }
-    dispatch("close");
+    onclose?.();
   }
 
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {
-      dispatch("close");
+      onclose?.();
       return;
     }
     if (e.key === "ArrowDown") {
@@ -117,8 +118,8 @@
   class="pointer-events-none fixed inset-0 z-[100] flex items-start justify-center pt-24"
   style="background: rgba(0, 0, 0, 0.35);"
   role="presentation"
-  onclick={(e) => { if (e.target === e.currentTarget) dispatch("close"); }}
-  onkeydown={(e) => { if (e.key === "Escape") dispatch("close"); }}
+  onclick={(e) => { if (e.target === e.currentTarget) onclose?.(); }}
+  onkeydown={(e) => { if (e.key === "Escape") onclose?.(); }}
   data-testid="spotlight-backdrop"
 >
   <!-- 浮层容器 -->

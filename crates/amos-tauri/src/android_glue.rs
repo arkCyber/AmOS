@@ -54,8 +54,35 @@ pub fn is_armed() -> bool {
     bus().is_some()
 }
 
+/// Whether every finite value in `accel`, `gyro`, and `temperature_c` is in
+/// range. A real `SensorEvent` can report `NaN` when the underlying HAL is in a
+/// transient state (a hardware FIFO overrun mid-read, a calibration reset), and
+/// the Sensor API deliberately hands the value through unchanged — the caller
+/// is responsible for filtering it. **A `NaN`/`±Inf` sample reaching the bus
+/// would propagate to every downstream consumer**: a `Vec3` whose x is NaN
+/// defeats gravity-normalised orientation, and a NaN temperature would corrupt
+/// every `mean_power_mw` window. Refusing the whole sample is the conservative
+/// answer — the bus keeps its previous value.
+fn finite_sample(accel: [f64; 3], gyro: [f64; 3], temperature_c: f32) -> bool {
+    accel.iter().all(|v| v.is_finite())
+        && gyro.iter().all(|v| v.is_finite())
+        && temperature_c.is_finite()
+}
+
 /// Push one fused IMU sample (accel + gyro, body frame) into the bus.
 fn push_imu(ts_ms: i64, accel: [f64; 3], gyro: [f64; 3], temperature_c: f32) {
+    if !finite_sample(accel, gyro, temperature_c) {
+        // A NaN/Inf would propagate downstream and corrupt orientation +
+        // thermal readings — refuse the whole sample so the bus keeps its
+        // previous good value. Reported per sample (REQ-A187): a stuck HAL
+        // would otherwise be invisible, because the bus would just stop updating.
+        tracing::warn!(
+            target: "amos::sensors",
+            ts_ms,
+            "android IMU sample rejected: NaN/Inf component"
+        );
+        return;
+    }
     if let Some(b) = bus() {
         let sample = ImuSample::new(
             ts_ms.max(0) as u64,
@@ -226,5 +253,55 @@ mod tests {
         assert_eq!(f.seq, 1);
         assert!(f.payload_is_valid());
         assert!(bus.record_frame(cfg, vec![0u8; 23]).is_err());
+    }
+
+    #[test]
+    fn finite_sample_accepts_normal_accel_gyro_temp() {
+        // Free-fall in body frame (~9.8 m/s² downward) + a 35 °C die temp:
+        // exactly the shape `SensorEvent` produces at rest.
+        assert!(finite_sample([0.0, -9.81, 0.02], [0.0, 0.0, 0.0], 35.0));
+    }
+
+    #[test]
+    fn finite_sample_rejects_nan_or_inf_in_any_axis() {
+        // A NaN in any accel axis must reject the whole sample (a partial good
+        // reading is still a poisoned reading — the bus keeps its previous
+        // value rather than ship a Vec3 with a NaN component downstream).
+        assert!(!finite_sample(
+            [f64::NAN, -9.81, 0.0],
+            [0.0, 0.0, 0.0],
+            30.0
+        ));
+        assert!(!finite_sample(
+            [0.0, -9.81, 0.0],
+            [f64::INFINITY, 0.0, 0.0],
+            30.0
+        ));
+        assert!(!finite_sample([0.0, -9.81, 0.0], [0.0, 0.0, 0.0], f32::NAN));
+        assert!(!finite_sample(
+            [0.0, -9.81, 0.0],
+            [0.0, 0.0, 0.0],
+            f32::NEG_INFINITY
+        ));
+    }
+
+    #[test]
+    fn push_imu_rejects_nan_sample_and_does_not_record_to_the_bus() {
+        // `push_imu` is private but accessible from this `tests` submodule
+        // (submodules see the parent module's private items). We assert the
+        // **finite-check** property without a bus — the "previous good value"
+        // assertion is covered by the device-side run, where the OnceLock'd
+        // bus is armed by `lib.rs::setup` and the same property is observed.
+        // Here we prove the function returns without panicking on a NaN-laden
+        // payload: a panic in the hot motion path would freeze the sensor
+        // listener thread and silently stop the live feed.
+        push_imu(1, [f64::NAN, 0.0, 0.0], [0.0, 0.0, 0.0], 30.0);
+        push_imu(2, [0.0, -9.81, 0.0], [f64::INFINITY, 0.0, 0.0], 30.0);
+        push_imu(3, [0.0, -9.81, 0.0], [0.0, 0.0, 0.0], f32::NAN);
+        push_imu(4, [0.0, -9.81, 0.0], [0.0, 0.0, 0.0], f32::NEG_INFINITY);
+        // A finite sample must succeed (no panic). Without an armed bus it is a
+        // quiet no-op — the function must always return without crashing the
+        // listener thread.
+        push_imu(5, [0.0, -9.81, 0.0], [0.0, 0.0, 0.0], 30.0);
     }
 }

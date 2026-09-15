@@ -147,8 +147,17 @@ pub struct LinkStatusOut {
     pub metrics: LinkMetricsOut,
     pub peers: Vec<LinkPeerOut>,
     /// What each robot says about itself (the return path, folded by the daemon) — sorted by
-    /// robot id. Empty means **nobody has reported**, which is not the same as idle.
-    pub actuations: Vec<LinkActuationOut>,
+    /// robot id.
+    ///
+    /// **Three states, and they are not the same fact** (the panel's whole doctrine is
+    /// 「absent, not idle」):
+    ///
+    /// * `Some(vec![])` — the daemon answered and nobody has reported yet;
+    /// * `Some([…])` — those robots have reported;
+    /// * `None` — the daemon **did not answer this question** (a build that predates
+    ///   `ListActuations`), which is why the panel must show 「this daemon does not report the
+    ///   return path」 rather than 「no robots reported」. `null` in the JSON, never `[]`.
+    pub actuations: Option<Vec<LinkActuationOut>>,
 }
 
 /// Map the wire enum to a stable display token.
@@ -194,7 +203,12 @@ pub fn metrics_out(metrics: Option<&Metrics>) -> LinkMetricsOut {
 }
 
 /// Map a full wire status, with the robots' reports the daemon folded in beside it.
-pub fn status_out(status: &LinkStatus, actuations: Vec<LinkActuationOut>) -> LinkStatusOut {
+///
+/// `actuations` is `Option` on purpose: `None` = this daemon did not answer the return-path
+/// question (see [`LinkStatusOut::actuations`]), `Some(vec![])` = it answered and nobody has
+/// reported. Collapsing the two would make the panel claim things about a fleet it never heard
+/// about.
+pub fn status_out(status: &LinkStatus, actuations: Option<Vec<LinkActuationOut>>) -> LinkStatusOut {
     LinkStatusOut {
         peer: status.peer.clone(),
         kind: status.kind.clone(),
@@ -214,6 +228,17 @@ pub fn status_out(status: &LinkStatus, actuations: Vec<LinkActuationOut>) -> Lin
 ///
 /// A daemon that is not running is an `Err` the UI renders as "not connected" — this command
 /// never fabricates a link status, and it never claims the data plane.
+///
+/// **One RPC that a daemon may not have is not a reason to take the page down.** `ListActuations`
+/// arrived with the return path; a daemon built before it answers `Unimplemented`, and
+/// `docs/amos-link.md` §6.5 promises the panel then shows 「one fewer section」 rather than an
+/// error. Until this round the `?` below did the opposite: the page became 「守护进程未连接」 and
+/// the status, peer table and verdict — all of which *were* available — vanished with it. So:
+///
+/// * `Unimplemented` ⇒ the return path is **absent** (`actuations: None`, a warn in the log) —
+///   "this daemon does not answer that question";
+/// * any other failure ⇒ an `Err`, because a daemon that *has* the RPC and cannot serve it is a
+///   real fault and must not be folded into 「older daemon」.
 #[tauri::command]
 pub async fn link_status() -> Result<LinkStatusOut, String> {
     let mut client = RobotLinkClient::new(daemon::channel().await?);
@@ -222,16 +247,24 @@ pub async fn link_status() -> Result<LinkStatusOut, String> {
         .await
         .map_err(|e| format!("robot-link status failed: {e}"))?
         .into_inner();
-    let robots = client
-        .list_actuations(Empty {})
-        .await
-        .map_err(|e| format!("robot-link ListActuations failed: {e}"))?
-        .into_inner()
-        .robots;
-    Ok(status_out(
-        &reply,
-        robots.iter().map(actuation_out).collect(),
-    ))
+    let actuations = match client.list_actuations(Empty {}).await {
+        Ok(list) => Some(
+            list.into_inner()
+                .robots
+                .iter()
+                .map(actuation_out)
+                .collect::<Vec<_>>(),
+        ),
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            tracing::warn!(
+                "this daemon has no ListActuations (an older build): the return path is \
+                 reported as absent, not as an empty fleet"
+            );
+            None
+        }
+        Err(e) => return Err(format!("robot-link ListActuations failed: {e}")),
+    };
+    Ok(status_out(&reply, actuations))
 }
 
 #[cfg(test)]
@@ -268,7 +301,7 @@ mod tests {
 
     #[test]
     fn maps_a_status_verbatim() {
-        let out = status_out(&status(), Vec::new());
+        let out = status_out(&status(), Some(Vec::new()));
         assert_eq!(out.peer, "amos-daemon");
         assert_eq!(out.kind, "brain");
         assert_eq!(out.uptime_ms, 4200);
@@ -298,6 +331,44 @@ mod tests {
         assert_eq!(peer_out(&p).endpoint.as_deref(), Some("tcp/1.2.3.4:7447"));
     }
 
+    /// The peer a WebView receives is the **same five fields** the terminal prints and the proto
+    /// carries (`id`, `kind`, `endpoint`, `last_seen_ms`, `beacons`) — one peer table, one spelling
+    /// across the CLI, the control plane and this bridge.
+    ///
+    /// It pins the *serialized* form, not the struct: `LinkPeerOut` is what the frontend parses,
+    /// and the CLI's `PeerRow` (`crates/amos-link-cli/src/lib.rs`) is asserted to the same key set
+    /// in its own tests. `beacons: 0` is how both sides say "declared by hand, never beaconed"
+    /// (the proto's rule) — no `static` key is invented in either.
+    #[test]
+    fn a_peer_serializes_to_the_same_five_fields_the_cli_prints() {
+        let value = serde_json::to_value(peer_out(&Peer {
+            id: "dog1".into(),
+            kind: "robot".into(),
+            endpoint: "udp/10.0.0.9:7446".into(),
+            last_seen_ms: 12,
+            beacons: 3,
+        }))
+        .expect("json");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": "dog1",
+                "kind": "robot",
+                "endpoint": "udp/10.0.0.9:7446",
+                "last_seen_ms": 12,
+                "beacons": 3,
+            })
+        );
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["beacons", "endpoint", "id", "kind", "last_seen_ms"]);
+    }
+
     #[test]
     fn unknown_enum_bits_are_never_guessed_into_a_verdict() {
         // A newer daemon's verdict this build does not know must not be folded into
@@ -315,7 +386,7 @@ mod tests {
         let mut s = status();
         s.metrics = None;
         assert_eq!(
-            status_out(&s, Vec::new()).metrics,
+            status_out(&s, Some(Vec::new())).metrics,
             LinkMetricsOut::default()
         );
     }
@@ -333,7 +404,7 @@ mod tests {
             health: HealthState::HealthUnknown as i32,
             health_reasons: Vec::new(),
         };
-        let out = status_out(&s, Vec::new());
+        let out = status_out(&s, Some(Vec::new()));
         assert!(out.peers.is_empty());
         assert_eq!(out.health, "unknown");
         assert!(out.health_reasons.is_empty());

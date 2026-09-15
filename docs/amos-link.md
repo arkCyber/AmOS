@@ -117,7 +117,8 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 **边界**：节点只能看见**自己**的计数器，看不见某个消费者的序列跳变（那是订阅级状态）；CLI `watch`
 手里正好有 beat 的 `SeqTracker`，因此它的结论比 `status` 多一条 `frame_loss`（以及满表后的 `untracked_frames`）
 —— 后者需要调用方把 `SeqSummary` 传进 `evaluate`。控制面 `LinkStatus.health`（枚举）+ `health_reasons`（每条带数字的 token）
-把同一结论送到非 Rust 客户端。
+把同一结论送到非 Rust 客户端 —— 而**这套 token 词汇现在也是内核 `status --json` 与 CLI `watch --json` 的词汇**
+（§3.11：一处判决只有一种拼法）。
 
 ### 3.3 分配与算术纪律（航天级加固轮，REQ-A241）
 
@@ -424,10 +425,622 @@ SeqSummary{ missing: 0, untracked: 3 } + 有证据的计数器 + 有对端 + 时
 
 **诚实边界（本轮新增）**：归属检查是**一致性**检查，**不是认证** —— 一个连帧头都敢谎报的对端不在它的射程内（链路没有可诉诸的认证机制；对端表本身的信任边界见 §6 与 crate README 的「Discovery is not authentication」）。它保证的是更弱、但可测的那一条：**一帧一个身份**。心跳的 `stamp` 与帧头一样是**发布者自报**，校验只保证「解码器不会发出自己的构造器会拒绝的值」，不是「时间戳可信了」。`untracked_frames` 只在**调用方手里有 `SeqSummary`** 时可能出现（`GetStatus` 拿不到消费者侧的追踪器），所以它出现在 CLI `watch`/`sub` 这类**同进程消费者**的报告里，而不是控制面的判决里。**同轮如实记录**：`Heartbeat` 之外，还逐个核对了其余会走线缆的载荷类型（`Header`、`Beacon`/`PeerInfo`、`ActuationState`、`MotorFrame`/`JointId`/`RefusalReason`），它们各自的构造期不变量都已有线缆侧入口 —— 本轮没有再发现第四个。
 
+### 3.10 CLI 的参数面：`--json` 处处兑现 + 「不能用的旗标不是静默忽略」（第九轮，REQ-A264）
+
+> 起点是**没有测试背书的三句话**：USAGE 写「`--json`：`sub`/`watch`/`status --socket`」，
+> README 写「`--device` 只属于 `motor`——别处是用法错误（exit 2），**绝不静默忽略**」，
+> 而 `--device` 之外**再没有任何一条旗标受过同一条规则的约束**。本轮把这三句话都拿到真二进制上
+> 核对了一遍：第一句是**不完整的承诺**，后两句把缺陷的形状指了出来。
+>
+> 结论一句话：**一个旗标要么被兑现、要么被拒绝，不能既被接受又什么都不做** —— 因为后者的失败
+> 模式是**静默的**：命令照跑、退出码 0，而操作员以为刚刚发生的事从未发生。
+
+| # | 缺陷（修前，均有真二进制实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **`--json` 被 5 条命令静默忽略**：`topics --json` 打印散文句、`pub --json` 打印人类行、`bench --json` 打印人类报表、`motor --json` 打印十六进制日志、`discover --json` 打印表格（远端 `topics`/`pub` 同）。而 USAGE 与 README 只说它属于 `sub`/`watch`/`status --socket` | 解析器**接受**它（不报错），所以脚本无从察觉：`topics --json \| jq .topics` 拿到的是 `(no traffic yet — publish or subscribe first)`，`jq` 报的是语法错，而不是「这个旗标没人管」。这正是本仓库反复钉住的形状：**接受了一个请求，却没有回应它** | `--json` 升为**全局旗标**（与 `-h`/`-V` 同位）：每个会打印结果的命令都兑现它。一次性命令出**一份文档**（`status`/`topics`/`bench`/`motor`/`discover`），流式命令出**一行一个对象**（`sub`/`state`/`watch`）。细节都有理由：`topics` 的文档把 `topics` 与 `complete` 放在一起（脚本只读数组就不会把截断清单读成全部真相）；`bench` 的 `latency_us` 是嵌套对象、**没有样本时为 `null`**（空跑不是零延迟）；`motor` 的 `frames` 是数组、`device` 为 `null` 表示 mock 总线；`discover` 的 `endpoint` 用 `null` 而不是人类表的 `-`；远端 `topics`/`pub` 的文档带 `remote`（答案永远写明是谁给的） |
+| 2 | **`--count 0` 是静默空跑**：`pub --count 0` **一行都不打印**、退出 0，与「发布成功但没输出」不可区分；`sub --count 0` 打印「waiting for 0 frame(s)」 | 一个既不发布也不等待的运行**什么都报告不了**，所以退出 0 不是「成功」而是「没有信息」；操作员无法从任何输出判断自己是不是写错了 | 解析期拒绝（exit 2）：`--count 0` 在 `pub`/`sub`/`bench`/`state` 上是用法错误，消息点名 `--count 0` 与命令；`--count 1` 仍是最小的合法运行 |
+| 3 | **不能用的旗标被静默忽略**（`--device` 之外的全部）：`sub --hz 5` 跑了、`bench --pattern 'amos/**'` 跑了、`motor --topic amos/x` 跑了、`status --seconds 9` 跑了 —— 全部退出 0 且旗标**不起任何作用**；远端 `status --socket X --peer dog1` 看起来像过滤器，实际什么都没过滤（应答的是**守护进程**的身份）；`discover --transport zenoh`（无 `--bus`）也不起作用 | 与 `--device` 完全同形，而 `--device` 的规则早已写进 README（「绝不静默忽略」）。区别只在后果的可见度：写错的 `--device` 会让人以为字节进了总线，写错的 `--pattern` 会让人以为过滤生效了 —— 两者都是**关于刚刚发生了什么的一句假话** | 新增一张表 `honors(cmd, flag)`（唯一的真源）+ `check_flag_scope`：解析期末尾按「命令行上真正出现过的旗标」逐个核对，不属于本命令的一律 exit 2，消息点名**旗标**与**命令**，并说清它属于谁（`--pattern` → `` `sub` and `state` ``）。跨模式的两条也在同一处：`--socket` 运行时，`--peer`/`--kind`/`--transport` 被拒（守护进程的身份不是从这一行设的）；`discover --transport` 只在 `--bus` 下被读（`--lan` 走 UDP、离线走种子表）。`--socket` 本身**刻意留到运行期**：它对数据面命令的拒绝是**能力**声明（exit 1，`needs a local data-plane node`），不是拼错了别的命令的旗标 |
+
+**实测证据**（真二进制，`./target/debug/amos-link-cli`）：
+
+```text
+# (1) --json 处处兑现：每条命令的输出**逐行**都能被 JSON 解析器吃下
+topics  --json                      ⇒ {"complete":true,"topics":[]}                    （1 行）
+pub     --json --count 2            ⇒ {"event":"published","seq":1,…} / {"…","seq":2}  （2 行）
+bench   --json --count 5            ⇒ {"frames":5,"sent":5,"latency_us":{"min":5,"p50":6,"p99":6,"max":33},…}
+motor   --action '{"action":"arm"}' --json
+                                    ⇒ {"applied":12,"armed":true,"hal":"mock","device":null,
+                                       "frames":[{"joint":0,"leg":0,"part":0,"op":"Enable","arg":0,"hex":"aa5500…"},…]}
+discover --static dog1 --json        ⇒ {"discovery":"mock","peers":[{"peer":"dog1","kind":"robot","static":true,"endpoint":null}],"ttl_ms":3000}
+discover --bus --seconds 1 --json    ⇒ {"discovery":"bus","transport":"broker","seconds":1,"self_refused":2,"ttl_ms":3000}（1 行：横幅被抑制）
+topics  --socket <UDS> --json        ⇒ {"complete":true,"remote":"/tmp/…sock","topics":[…]}
+
+# (2) --count 0：拒绝（exit 2），且**没有任何结果行**
+pub --topic amos/x --text hi --count 0
+  ⇒ --count 0 would leave `pub` with nothing to do: give a positive count (…)     [exit 2, stdout 为空]
+
+# (3) 不能用的旗标：exit 2 + 点名两者 + 说清归属
+sub    --pattern 'amos/**' --hz 5          ⇒ --hz is not a `sub` flag: it belongs to `pub` and `bench`
+bench  --count 3 --pattern 'amos/**'       ⇒ --pattern is not a `bench` flag: it belongs to `sub` and `state`
+topics --topic amos/x                      ⇒ --topic is not a `topics` flag: it belongs to `pub` and `bench`
+watch  --seconds 1 --count 2               ⇒ --count is not a `watch` flag: it belongs to `pub`, `sub`, `bench` and `state`
+motor  --action '{"action":"stand"}' --topic amos/x
+                                           ⇒ --topic is not a `motor` flag: it belongs to `pub` and `bench`
+status --device /tmp/x.sock                ⇒ --device is not a `status` flag: it belongs to `motor`
+status --socket X --peer dog1              ⇒ --peer configures *this* process's node, but --socket reads the running daemon's …
+discover --transport zenoh                 ⇒ --transport selects the link that `discover --bus` federates over; this sweep is offline/`--lan`
+```
+
+**负控实测**（注入后 `cmp` 逐字节复原）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| `honors("--hz")` 改回「处处为真」（即回到静默忽略） | **第一次注入暴露了测试自身的弱点**：`tests::no_flag_is_silently_ignored_on_any_command` **仍然通过** —— 它比较的是「解析器 ⟺ `honors`」，而当 `honors` 自己变成「处处为真」时，两者**一起**变，断言自然成立（**用被测对象做期望的自指测试**）。因此补上硬编码的那条 `the_scope_table_refuses_what_the_docs_say_it_refuses`（17 组 `(旗标, 必须拒绝的命令, 必须接受的命令)`）：再注入时它 **FAILED**（`["sub", "--hz", "1"] must be refused`），进程级 `a_flag_the_command_cannot_use_is_a_usage_error_not_a_silent_no_op` 同轮 **FAILED**（期望 exit 2，实得 0）。**顺带修**：该进程级用例原先的 `sub --hz 5` **没有上界**，注入后它真的会去等帧（负控时挂住 300 s）⇒ 现在每个用例都带 `--count`/`--timeout-ms`/`--seconds`，负控能**快速变红** |
+| 去掉 `--count 0` 的解析期拒绝 | `tests::a_count_of_zero_is_refused_instead_of_doing_nothing` ⇒ **FAILED**（`--count 0 must be refused: Opts { count: Some(0), … }`）；进程级 `a_flag_the_command_cannot_use_is_a_usage_error_not_a_silent_no_op` ⇒ **FAILED**（`pub --count 0` 又变回「退出 0、stdout 为空」，只剩断言在响） |
+| 把 `topics` 的 `--json` 分支改回人类输出 | `json_is_honored_by_every_command_that_prints` ⇒ **FAILED**（`printed a non-JSON line "(no traffic yet — publish or subscribe first)"`） |
+| 去掉远端 `--peer`/`--kind`/`--transport` 的相斥检查 | `remote_mode_refuses_flags_that_only_configure_a_local_node` ⇒ **FAILED**（`status --socket … --peer dog1` 被接受）；进程级 `a_socket_run_refuses_the_flags_that_would_configure_a_local_node` ⇒ **FAILED** |
+
+**诚实边界（本轮新增）**：
+
+1. **`--json` 不是稳定 schema 的承诺**：字段名是**当前**的机器可读形式，没有版本号、没有 JSON Schema、
+   也没有兼容性保证（本 CLI 是**同机工具**，不是对外 API）。真正有契约的是控制面
+   （`proto/robot_link.proto`）。字段一旦改名，靠它拼出来的脚本会断 —— 这一点写在这里，而不是留给别人猜。
+2. **~~`--json` 只保证「能解析」，不保证「整个输出流都是 JSON」~~ —— 已处置（第十三轮，REQ-A268，§3.14 缺陷 3）**：
+   此前 `sub`/`state`/`watch` 的**首行就是散文**（`subscribed …` / `watching …` / `watching transport=…`，本地与 `--socket` 两种形态都是），
+   末尾还有散文的 `timeout …`/`stats …`/`watched …`，所以「流式命令一行一个对象」这句承诺在**第一行**就不成立。
+   现在三条命令的每一行都是**带 `event` 的事件对象**（`subscribed`/`frame`/`timeout`/`stats`、`watching`/`report`/`timeout`/`stats`、
+   `watching`/`heartbeat`/`status`/`summary`），**人形态逐字节不变**。这条边界到此结束，字段名不是 schema 的那条（边界 #1）仍然有效。
+3. **作用域表是「命令 × 旗标」，不含值的语义**：`bench --size 0`（空载荷）与 `--size 1024` 一样合法，
+   表只回答「本命令读不读这个旗标」；`--qos` 的**值**是否与话题的 channel 一致仍由运行期决定
+   （`sub` 从模式推导档位并打印来源，`--qos` 只是覆盖它）。
+4. **刻意保留的「忽略」**：`AMOS_LINK_*` 环境变量在对应旗标给出时被忽略（`--peer` 优先），
+   这是文档写明的优先级，不是缺陷；`status`（本地）的 `--json` 是**同义**的 ——
+   它本来就只输出 JSON，没有另一种形态可切换，因此「兑现」与「忽略」在这里是同一件事。
+5. **真机观感复核未做**：本轮的证据全部来自真二进制与真 UDS（`mock_server` 控制面），
+   没有在真机器狗/真总线（`--device`）上复核过；作用域表也没有覆盖 `AMOS_LINK_BEACON_*`
+   这类只在 `--lan` 路径读取的**环境变量**（本轮只处理旗标）。
+
+### 3.11 一份对端表、一种判决词汇：`status` 与 `status --socket` 是「同一份文档 + 谁答的」（第十轮，REQ-A265）
+
+> 起点是上一轮（§3.10）自己登记的那条边界：**"`sub`/`state` 的横幅行仍是散文"** 之外，还有一条更
+> 值钱的问题没问 —— **同一个命令的两种模式（本地 / `--socket`）输出的到底是"一份文档"还是"两种方言"？**
+> 答案是后者，而且不止一处：**同名的键在两种模式下有两种类型**。
+>
+> 一句话：**键名相同而类型不同，比键名不同更坏** —— 前者会让一个脚本在另一种模式下**静默读错**。
+
+| # | 缺陷（修前，均有真二进制实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **`status --socket` 把对端表整个丢掉了**：`GetStatus` 返回 `repeated Peer peers`（id/kind/endpoint/last_seen_ms/beacons），System UI（`amos-tauri/src/link.rs`）逐字段渲染，而 CLI 只打印 `peers={metrics.peers}`（一个**数字**），`--json` 里也把那个数字放在 `peers` 键上 | 控制面**已经答了**「谁在链路上」，而操作员拿来问这个问题的工具（终端）只能给出人数。RPC 上有的字段，只有终端这一个消费者看不见 —— 与"消费者拿不到答案"相反的形状：**答案到了，被扔了** | `status --socket` 改读 `status.peers`：人类形态多一栏对端表（`print_peer_rows`，与本地 `discover` 同一个渲染器），`--json` 的 `peers` 变成**数组**（同一个 `PeerRow` 形状）。人类形态同时补上清单行（`topics (N): inventory complete\|incomplete`），因为 JSON 里有这两个键 |
+| 2 | **同名键、两种类型**：本地 `status` 的 `peers` 是**对象数组**、`health` 是**对象**（`{"state","reasons"}`）、计数器**嵌在 `metrics` 下**；远端 `status --socket --json` 的 `peers` 是**数字**、`health` 是**裸字符串**、计数器**平铺在顶层** | 两种模式只差一个 `--socket`，键名却一个都没改 —— 于是 `jq .peers[0].id` 在本地能用、在远端**静默**拿到 `null`（数字没有 `[0]`）。这不是"另一种格式"，这是**同一个名字下的两种类型**，任何脚本都无法同时正确 | 远端文档改为**本地文档 + `remote` + `actuations`**（`remote_status_json`：逐键按本地的形状抄，新增两个键，不删一个键）。为了让 `topics`/`topics_complete` 也在，`status --socket` 多调一次 `ListTopics`（同一条 UDS，一次往返）。**判据是可执行的**：`the_remote_status_document_is_the_local_document_plus_who_answered` 用**同一组事实**分别构造内核文档与远端文档，逐键断言相等；进程级 `status_json_is_one_document_locally_and_over_a_socket` 用真二进制跑两种模式，断言键集 = 本地键集 + 两个 |
+| 3 | **一份对端表，四种渲染**：内核 `NodeStatus`（serde 派生）`{"info":{"id","kind","endpoints":[…]},"last_seen_ms","beacons"}`（嵌套 + 复数数组）／CLI `discover --json` `{"peer","kind","seen_ms","static","endpoint"}`（**另一套键名**）／CLI 远端 `status --json`（**一个数字**）／proto `Peer` 与 UI `LinkPeerOut`（扁平五字段） | 同一个概念在工作区里有三套词汇，而终端用的那套（`peer`/`seen_ms`）与控制面契约（`id`/`last_seen_ms`）和 UI 用的那套都不一致。脚本必须知道"我现在读的是哪一种" | 统一为**控制面契约的那一套**（proto 是线上真源）：`id`/`kind`/`endpoint`/`last_seen_ms`/`beacons`。内核 `PeerView` 改为手写 `Serialize`（扁平；端点列表折叠为首选端点，与 proto/UI 同一条规则；`beacons: 0` 即"手工声明"，不再另发明 `static` 键）；CLI 新增 `PeerRow`（唯一的行类型，`from_view`/`from_proto` 两个来源 + 一个 `to_json`），`discover`/`status`/`status --socket` 都走它 |
+| 4 | **同一个 CLI 里判决有两种拼法**：本地 `status` 是 `{"state":"degraded","reasons":[{"decode_errors":{"count":3}}]}`（**Rust 字段名**嵌在里面），`watch --json` 是 `{"health":"degraded","health_reasons":["decode_errors=3"]}`，远端 `status` 是 `"health":"degraded"` + 同款 token 数组 | `HealthReason::key()` 的文档写着"Stable key (JSON, CLI, logs)"，而 JSON 里从来不是它 —— 里面是 Rust 的字段名（`count`/`missing`+`gaps`/`blocked`/`untracked`），也就是**跨语言读者要懂 Rust 内部**才能读判决。而 proto 与 CLI 另外两条路径早就在用 `detail()` token | `HealthReason` 的 JSON = 它的 **detail token**（`"decode_errors=3"`），`LinkHealth` 保留下 `{"state":…,"reasons":[token,…]}`；CLI 三处（`status`、`status --socket`、`watch`）统一走 `health_json_labeled`/`health_json`。**顺带**：`HealthReason`/`LinkHealth`/`NodeStatus`/`PeerView` 改为**只 `Serialize`**（去掉 `Deserialize`）—— 它们是**渲染**，不是线缆类型；旧测试还断言过"UI 能把它送回来"这种**工作区里不存在**的往返 |
+
+**实测证据**（真二进制；远端是测试起的真控制面 `service::server(node)`，表里预置 dog1/cam-front）：
+
+```text
+# (1) 一份文档：本地 status 的关键字段（判决是对象、对端是数组、计数器嵌套）
+$ amos-link-cli status --peer dog1 --kind robot
+{"health":{"state":"unknown"},"peers":[],"metrics":{"published":0,"delivered":0,"dropped":0,
+ "blocked":0,"decode_errors":0,"encode_errors":0}}
+
+# (2) 远端人类形态：多了「谁在链路上」这一栏（修前只有 peers=2 这个数字）
+$ amos-link-cli status --socket <UDS>
+remote=<UDS> link peer=amos-daemon kind=tool version=0.1.0 uptime=614ms clock_synced=false
+  peers=2 published=0 delivered=0 dropped=0 blocked=0 decode_errors=0 health=degraded
+health reasons: clock_unsynced
+peers (2):
+peer                 kind         seen(ms)  beacons  endpoint
+cam-front            sensor            614        0  -
+dog1                 robot             614        0  udp/10.0.0.9:7446
+topics (0): inventory complete
+robots reported (0): nobody has reported its actuation since the daemon started watching …
+
+# (3) 远端 JSON = 本地键 + remote + actuations（peers 是数组，health 是对象）
+$ amos-link-cli status --socket <UDS> --json
+{"actuations":[],"clock_synced":false,"health":{"reasons":["clock_unsynced"],"state":"degraded"},
+ "kind":"tool","metrics":{"blocked":0,"decode_errors":0,"delivered":0,"dropped":0,"encode_errors":0,
+ "published":0},"peer":"amos-daemon","peers":[{"beacons":0,"endpoint":null,"id":"cam-front",
+ "kind":"sensor","last_seen_ms":622},{"beacons":0,"endpoint":"udp/10.0.0.9:7446","id":"dog1",
+ "kind":"robot","last_seen_ms":622}],"remote":"<UDS>","topics":[],"topics_complete":true,"uptime_ms":622}
+
+# (4) 同一套对端字段，扫描侧也一样
+$ amos-link-cli discover --static dog1 --json
+{"discovery":"mock","peers":[{"beacons":0,"endpoint":null,"id":"dog1","kind":"robot",
+ "last_seen_ms":0}],"self_refused":0,"ttl_ms":3000}
+```
+
+**负控实测**（5 次注入；每次改回并核验）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 判决的 JSON 改回"Rust 字段名对象"（NC1） | `health::tests::the_verdict_json_is_the_control_planes_vocabulary` ⇒ **FAILED**（`left: …"reasons":[{"count":15},…]`）；`telemetry::…the_status_document_speaks…` ⇒ **FAILED** |
+| `PeerView` 改回嵌套 `info`（NC2） | `discovery::…a_peer_view_serializes_as_the_flat_peer…` ⇒ **FAILED**（`left: {"info":{"endpoints":[…],"id":…}}`）；`telemetry::…the_status_document_speaks…` ⇒ **FAILED**；CLI 的**跨端一致性**单测 `the_remote_status_document_is_the_local_document_plus_who_answered` ⇒ **FAILED**（`peers must be the same fact in the same shape`） |
+| 远端 `peers` 改回**数字**（NC3） | 上面那条单测 + 进程级 `status_json_is_one_document_locally_and_over_a_socket` + `the_running_nodes_peer_table_crosses_the_socket` ⇒ 三条 **FAILED** |
+| 远端 `health` 改回**裸字符串**（NC4） | 单测 + `remote_mode_reads_a_running_control_plane_over_a_unix_socket` + 文档等同性 ⇒ 三条 **FAILED** |
+| 远端文档**丢掉** `topics`/`topics_complete`（NC5） | 单测（键集断言）+ 文档等同性 ⇒ 两条 **FAILED** |
+
+**负控过程中的一次自伤（照实记下）**：NC2 的还原脚本自己有 bug —— 它在**每次**运行时把当前文件复制成"备份"，
+于是第二次注入失败后，备份里已经是**注入后的**内容；`cmp` 因此**通过**，而缺陷还在树上（随后整包跑测试抓红：
+`amos-link` lib 2 条 FAILED）。处置：把扁平序列化实现按原样写回并用测试重新核验（`cargo test -p amos-link` **133**、
+`cargo test -p amos-link-cli` **18 + 27** 全绿），并把脚本改成**只在显式 backup 时取一次备份**。
+教训与 §3.10 那条自指测试同形：**"我验证过了"这句话本身也要有可执行的判据** —— 对"还原"而言，
+判据不是 `cmp`（它可能只是在比两份脏文件），而是**命名测试重新变绿**。
+
+**诚实边界（本轮新增）**：
+
+1. **端点列表被折叠**：`PeerRow`/`PeerView` 的 JSON 只带**首选端点**（`PeerInfo::endpoint()`），完整列表仍在
+   Rust API（`PeerInfo.endpoints`）里。这与 proto `Peer`（单字段）和 UI 的映射一致，但**确实少了一维信息** ——
+   将来要多端点，得先在 proto 上加字段，再让三处一起改。
+2. **`--json` 仍不是版本化的 schema**（继承 §3.10 的边界）：这一轮让"两种模式同形"，没有给字段加版本号。
+3. **渲染类型现在只 `Serialize`**：`NodeStatus`/`PeerView`/`LinkHealth`/`HealthReason` 去掉了 `Deserialize`。
+   工作区里没有任何地方反序列化它们（已 grep 核实），但**外部**读者若曾依赖那个（事实上与其 `Serialize` 不对称的）
+   派生实现，需要显式加一个自己的形状 —— 这是有意的：**一个渲染不该假装能往返**。
+4. **proto 与判决词表都没改**：控制面一直是这套词汇（枚举 + token），本轮改的是**生产者**向它对齐；
+   `state` 的三个词（`unknown|healthy|degraded`）是 CLI/UI 的显示词，proto 的枚举仍是 `HEALTH_*`（线上契约不变）。
+5. **UI 未改一行**：`LinkPeerOut` 本来就是扁平五字段，前端零改动；本轮只补了一条**钉住它**的序列化测试
+   （`a_peer_serializes_to_the_same_five_fields_the_cli_prints`）。
+6. **真机复核未做**：全部证据来自真二进制 + 真 UDS（本机），没有真狗/真板卡上的第二次复核。
+
+### 3.12 报告也要有日期：`age=` 与 `age_ms`（第十一轮，REQ-A266）
+
+> 起点是上一轮（§3.11）把「一份对端表、一种判决词汇」收口之后剩下的一个问题：
+> **回程（`amos/<robot>/state/actuation`）说的每个字都是"现在"，而"现在"从哪来？**
+> 面板早就为自己的**读数**打了日期（`link.probe` + 每 10 秒重读，REQ-A246），终端早就在心跳上打
+> `age=`（`watch` 的 `beat … age=…ms`），而对端表有 `last_seen_ms` —— **只有机器人自报的状态没有年龄**：
+> `armed=true` / `estopped=false` 是"此刻是否通电/是否已切扭矩"的**安全断言**，而一份两小时前的报告
+> 与一份两秒前的报告，在屏幕上长得一模一样。
+>
+> 一句话：**读有日期，报告没有**。
+
+| # | 缺陷（修前，均有真二进制实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **人类形态完全没有日期**：`render_actuation` 打印 `robot=… armed=… estopped=… gait=… frames=… seq=… watchdog=…`，不带时间戳、不带年龄 —— `state`（数据面订阅）与 `status --socket`（控制面折叠）**两条路径共用这一个渲染器**，于是两边都缺 | `armed` 是"此刻通电"的断言：一个上报过 `armed=true` 之后死掉的机器人，在终端里会**永远**显示 `armed=true`，而旁边没有任何东西说明这是多久以前的事。命令存在的理由就是回答"机器人现在在做什么"，缺了年龄这一列，它回答的是"机器人**曾经**在做什么" | `render_actuation` 增加 `now_ms` 参数并在人类行尾追加 ` age=<…>`（`state` 与 `status --socket` 一起变，因为是同一个渲染器）；`actuation_json` 增加 `age_ms` |
+| 2 | **机器可读形态给了时间戳、没给年龄**：JSON 里只有 `stamp_ms`（56 位纪元毫秒），读者要自己知道"本机现在几点"才能算 | `stamp_ms` 是**报告者**的表（跨机时钟不同步时它是唯一可比的量），而"多久以前"是**读者**的问题。让每个消费者各算一次，就是把"用哪个时钟、算错了怎么办"留给每个脚本 | JSON 同时给 `stamp_ms`（原样）与 `age_ms`（用本机时钟算出的年龄），一个都不少 |
+| 3 | **无法计算的情形会被折成一个数字**（修前的形状：`stamp_ms` 为 `0`、或时间戳**在未来**） | `0` 是 proto 的"缺省"哨兵，不是 1970：按 `now - 0` 算会得到"56 年前上报"；时间戳在未来（两台机器时钟不一致的**可见症状**）按 `now - stamp` 算会得到负数，而 `0`/负数会读成"刚刚" —— 两者都是**把未知说成了一个数字**。本 crate 的纪律是"未知要说出来"（`HealthReason::Unknown`、`unknown ≠ healthy`、`endpoint: null ≠ ""`） | 两个 `AgeUnknown` 情形各有名字：`age=unknown(no stamp)`、`age=unknown(stamp is Nms in the future — **that** clock is not this clock)`（措辞于第十四轮改为中性的「that clock」，因为同一条规则也被**帧**渲染器使用了；见 §3.15）；JSON 里是 `age_ms: null`，**绝不 `0`** |
+| 4 | **面板：读数有日期，报告没有**：`LinkActuation.stamp_ms` 在类型里带着注释（"When the robot published it"），`LinkPage.svelte` 的机器人行**从不渲染它**，页面只有 `link.probe`（整个读数的时间） | 与缺陷 1 同形，且更危险：面板每 10 秒重读一次，所以 `link.probe` 永远是"新鲜的" —— 一个死了两小时的机器人旁边挂着一个刚刚的时间戳，读起来像"两小时前到现在一直是 armed" | `lib/link.ts` 新增 `actuationAgeMs(a, now)` / `reportAgeKey(age)` / `reportAgeText(age)`（纯函数），面板每行渲染 `link.reportedNow` / `link.reportedAgo{age}` / `link.reportedUnknown` |
+
+**实测证据**（真二进制；机器人由**第二个节点**在真链路上发布报告，守护进程的 watch 折叠，CLI 读回来）：
+
+```text
+$ amos-link-cli status --socket <UDS>          # 人类形态：多了一列年龄
+remote=<UDS> link peer=amos-daemon kind=tool version=0.1.0 uptime=1111ms clock_synced=false
+  peers=0 published=24 delivered=22 dropped=0 blocked=0 decode_errors=0 health=degraded
+health reasons: no_peers, clock_unsynced
+peers (0): (nobody else is fresh on this link)
+(no peers)
+topics (2): inventory complete
+robots reported (1):
+  robot=dog1 armed=true estopped=false gait=trot frames=13 seq=7 watchdog=1000ms age=23ms
+
+$ amos-link-cli status --socket <UDS> --json   # 机器形态：stamp_ms 与 age_ms 并列
+{"actuations":[{"age_ms":26,"armed":true,"estop_reason":null,"estopped":false,"frames":13,
+ "gait":"trot","last_refusal":null,"robot":"dog1","seq":7,"stamp_ms":1789486030723,
+ "watchdog_ms":1000}, …]}
+
+# 单元级（受控时钟）：三小时前的报告、无时间戳、未来时间戳
+state_lines(frame(now - 3h))   ⇒ … age=3h 00m
+state_lines(frame(now - 250))  ⇒ … age=2xxms
+state_lines(frame(0))          ⇒ … age=unknown(no stamp)            ; JSON age_ms = null
+state_lines(frame(now + 5s))   ⇒ … age=unknown(stamp is 5000ms in the future …) ; JSON age_ms = null
+
+# 面板（zh）：一行一个年龄
+dog1 · trot · #12   …   2s 前上报
+dog2 · estop · #13  …   3h 00m 前上报
+（无时间戳 / 未来时间戳）⇒ 上报时间未知（时间戳不可用——机器人时钟可能不同步）
+```
+
+**负控实测**（5 次注入；UI 侧另有一条**方法学**教训）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 人类行去掉 `age=`（NC-cli_human） | `a_report_is_dated_and_an_unusable_stamp_says_so` ⇒ **FAILED**；进程级 `the_return_path_is_dated_when_it_crosses_the_socket` ⇒ **FAILED** |
+| JSON 的 `age_ms` 写死 `0`（NC-cli_json） | `the_machine_form_carries_the_age_as_a_number_or_null` ⇒ **FAILED**（**进程级那条仍绿**：它断言的是"年龄存在且合理"，精确值由受控时钟的单测负责） |
+| `report_age_ms` 改成 `Ok(now - stamp)`（任何时间戳都给数字，NC-cli_unusable） | `a_report_is_dated_and_an_unusable_stamp_says_so` ⇒ **FAILED**（`frame(0)` 变成"56 年"而不是 unknown） |
+| `actuationAgeMs` 改成永远返回数字（NC-ui_helper） | `bun test src/__tests__/link.test.ts` ⇒ **1 failed**（`null` 的两种情形）；面板 `…a report whose stamp is unusable…` ⇒ **FAILED** |
+| 面板里删掉年龄那一行（NC-ui_row） | 面板 `…robot rows show what each robot reports…` 与 `…a report whose stamp is unusable…` ⇒ 两条 **FAILED** |
+
+**方法学教训（照实记下）**：NC-ui_row 第一次跑**"通过"了** —— 注入确实落到了文件里（`grep` 为 0），但 Vite 的 transform 缓存按 mtime 粒度复用，同一个粒度内改动的 `.svelte` 被当作上一次的编译结果用了。处置：负控跑 UI 侧时**先 `sleep 1 && touch` 目标文件**再跑；加了这个步骤之后两条测试如期变红。这与上一轮那次"还原脚本把注入后的文件当备份"（§3.11）是同一条：**一次"通过"必须能解释为什么它应该通过**，否则它什么都没证明。
+
+**诚实边界（本轮新增）**：
+
+1. **年龄是"报告者时钟"与"读者时钟"之差**：两台机器的时钟不同步时它是**界，不是测量** —— 与延迟数字同一条规矩
+   （`clock_synced: false ⇒ latencies are bounds`）。能看见的症状是"时间戳在未来"，那时本轮**拒绝给年龄**；
+   但"报告者慢两分钟、看起来像 10 秒前"这种**温和**的不同步无法从数据上区分，因此 CLI 的 `status --socket` 仍把
+   `clock_synced=` 打在同一屏上。
+2. **`stamp_ms` 与 `age_ms` 都保留**：前者是跨机可比的原始量，后者是读者要的答案；只给年龄会让"两台机器差多少"
+   变得不可算，只给时间戳则把算年龄这件事推给每个消费者。
+3. **面板的年龄在每次重读时定格**（页面每 10 秒重读一次）：屏幕上的"2s 前上报"最多滞后 10 秒。既有文案
+   （`link.probe` 的"每 10 秒重读"）已说明这个周期，本轮没有为年龄单独加计时器 —— 那是另一件事。
+4. **`state`（数据面订阅）的年龄几乎总是 0ms**：它订阅的是**正在发布**的帧，年龄是"这帧从发布到我看完"的时延；
+   真正会"老"的是 `status --socket` 读到的折叠表。同一条规则、两种尺度，因此没有为它们各写一套渲染。
+5. **阈值是工程选择**：`0` 与"未来"是**结构性**的不可用；"56 年前"（例如从纪元起算的时钟）本轮**当作真实年龄**如实打印
+   —— 不设"太久就是假的"这种魔法阈值（设了就是在替读者猜）。真机上如果出现这种报告，应当去修那台机器人的时钟。
+6. **真机复核未做**：证据全部来自本机真二进制 + 真 UDS + 真前端测试；没有在真狗上验证"拔网线后 `armed` 变老"的观感。
+
+### 3.13 序号属于「流」而不是「对端」：`missing` 既不虚报也不漏报（第十二轮，REQ-A267）
+
+> 起点是把上一轮（§3.12）的仪器问到底：**损失数字的键，和序号被盖出去的方式，是不是同一件事？**
+> 不是。生产者每建一个 `Publisher` 就有**一个自己的计数器**（`LinkNode::publisher::<T>(topic)` 是**按话题**发的），
+> 而 `SeqTracker` 只按**发布者**建表。于是：**一个机器人发布两路（相机 + IMU），或者既打心跳又发数据，
+> 在消费者眼里就成了「同一个流在反复重启」。**
+>
+> 一句话：**序号标识的是「谁·在哪个话题上」的那一刻** —— 键少了一维，仪器就会替链路编故事。
+
+| # | 缺陷（修前，均有测试实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **一个对端的两条流被当成一条**：帧头带 `(topic, publisher, seq)`，`Publisher` 每个对象一个计数器（**按话题**），而 `SeqTracker` 的 `BTreeMap<PeerId, u64>` 只按 publisher 建键 | `sub --pattern 'amos/**'`（CLI 默认）覆盖多条流：相机与 IMU 各自的 1、2、3… 交错到达，仪器把它们读成「同一个发布者的高水位反复回退」⇒ **虚报 `stale`**（模块文档把 stale 定义为「重复、乱序、或发布者重启计数器」—— 三条全不成立），而且 `streams=` 数的是**对端数**，与字段名说的不是一回事 | 新增 `StreamKey { publisher, topic }`（`SeqTracker` 的键），`observe_received` 从**帧自己**读出键（`StreamKey::of`）；`observe`/`highest` 改为收 `&StreamKey`；`streams=` 从此就是流数 |
+| 2 | **真正的丢帧会被更快的流吃掉（这一半没人看得见）**：键共享时，活跃流把高水位拖到很远，安静流的帧**全部落在高水位之下** ⇒ 一律 `Stale` | 一条 200 Hz 的 IMU 把水位推到 200 之后，10 Hz 的雷达（其帧号 2、3、4…）全部是「Stale」；它**真的丢了第 3 帧**时，仪器看到的只是又一条「Stale」——**丢帧被记成重复**，`missing` 不增、`has_loss()` 为 false、判决照旧 `healthy`。这是仪器**比线缆更乐观**，与 REQ-A248 那条「判决不得比仪器更干净」正好互为反面 | 同上（键 = 流）之后，`Gap` 按**每条流自己的**高水位判定；`a_fast_stream_does_not_hide_a_slow_streams_real_gap` 钉住它 |
+| 3 | **总量无法归因**：`missing=3` 只说链路丢了帧，不说**丢在哪条流**；通配模式下有几十条流时，操作员只能猜 | 本 crate 的一贯纪律是「数字要能行动」（`health reasons`、`topics_complete`、`untracked=`、`age_ms` 都是这条）。归因的代价是每条流多两个 `u64`（`gaps`/`missing`），而表本身**已经有界**（`MAX_TRACKED_STREAMS`） | `StreamState { highest, gaps, missing }` + `pub fn streams_with_loss() -> Vec<(StreamKey, u64, u64)>`（按 (publisher, topic) 排序，两次运行输出一致）；CLI `sub` 在总量行之下打印 `lost peer=… topic=… missing=N in M gap(s)` |
+
+**实测证据**（都先用测试证明缺陷存在，再修）：
+
+```text
+# (1) 一个对端、两条话题（修前）：第二条流的 seq 1 被读成「重复」
+observe_received(cam, 1) ⇒ First { seq: 1 }
+observe_received(imu, 1) ⇒ **Stale { seq: 1, last: 1 }**   ← 修前：同一个对端的另一条流
+observe_received(cam, 2) ⇒ InOrder { seq: 2 }
+summary ⇒ streams=1（真值 2）、stale=2（真值 0）、gaps=0
+
+# (2) 快流吃掉慢流的真丢帧（修前）：IMU 推到 5 之后，雷达的 2、4 全是 Stale
+lidar: 1 → First；imu: 1..5；lidar: 2 → **Stale**；lidar: 4 → **Stale**
+summary ⇒ missing=0、has_loss()=false    ← 雷达真的丢了第 3 帧，仪器没有说
+
+# (3) 修后（同一个用例）
+streams=2、stale=0、gaps=0；lidar 2 → InOrder、lidar 4 → **Gap { expected: 3, missing: 1 }**
+streams_with_loss() ⇒ [(dog1@amos/dog1/sensor/lidar, missing=1, gaps=1)]
+CLI `sub` 末行之下：lost peer=dog1 topic=amos/dog1/sensor/lidar missing=1 in 1 gap(s)
+```
+
+**负控实测**（3 次注入；每次改回并核验）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| `observe_received` 忽略话题、只按发布者建键（NC-peer_key） | `one_peers_two_topics_are_two_streams_not_one_restarting` 与 `a_fast_stream_does_not_hide_a_slow_streams_real_gap` ⇒ **FAILED**；内核 e2e `a_best_effort_lag_is_visible_as_a_sequence_gap`（真 broker）⇒ **FAILED** |
+| 去掉每条流的 `gaps`/`missing` 累加（NC-no_attribution） | 归因断言 ⇒ **FAILED**（`left: []`，而真值是一条 `lidar` 流）；总数仍然正确 —— 正是「有总量、没出处」的旧局面 |
+| CLI 的归因行构造改为返回空（NC-no_lines） | `the_loss_figures_name_the_stream_that_lost_frames` ⇒ **FAILED**（`left: []` vs 两行） |
+
+**诚实边界（本轮新增）**：
+
+1. **归因行的端到端（进程级）没有被覆盖**：`sub` 的统计行与归因行是在 `run` 里直接打印的，
+   能进程级复现「丢掉某一帧」需要一个会真的丢帧的链路；本轮覆盖的是**纯行构造器**（单测）+ 打印调用本身。
+   内核侧的 `streams_with_loss()` 有单测，e2e 覆盖面是「真 broker 上一条流的 gap」。
+2. **`streams=` 的语义变了**（对端数 → 流数）：这是一个**行为变化**，对日志比对脚本的人有意义；
+   `untracked=` / `tracking=complete|full` 的语义不变，而 `MAX_TRACKED_STREAMS` 现在数的是流
+   —— 一个对端可以占多条（更容易撞上限，「说它停了」的那套机制照旧生效）。
+3. **生产者没有改**：`Publisher` 仍然每个对象一个计数器（按话题）——本轮把**仪器**对齐到生产者的实际语义，
+   而不是反过来把生产者改成「一个节点一个计数器」（后者会让**只订阅一条流的消费者**看到莫名其妙的空洞，
+   反而更糟：见 §3.13 缺陷 2 的推理）。
+4. **心跳不受影响**：每个对端的心跳在自己的话题上（`amos/<peer>/telemetry/beat`），所以 `watch` 的
+   `beats_missing` 一直就是「按对端」的；本轮之后它仍然是「每个 (对端, 话题) 一条流」的特例。
+5. **重复/乱序的判定仍然按流**：`Stale` 的定义没变，变的只是它的键；一个**在同一话题上**重启计数器的
+   发布者仍会呈现一串 `Stale`，需要调用方 `reset()`（这条边界与 REQ-A245 相同）。
+6. **真机复核未做**：证据来自受控单测 + 真 broker 的 e2e（本机），没有在真机器狗上跑双流丢帧的实验。
+
+### 3.14 信标的端点：一条只能被测试表达的承诺 + 流式命令的 `--json` 最终兑现（第十三轮，REQ-A268）
+
+> 起点是把 §3.13 的仪器问到底之后换一个问法：**这条链路上，哪一栏是「文档在说、代码做不到」的？**
+> 于是逐字段核对 `PeerInfo` —— `id`/`kind`/`endpoints` 三个字段，前两个**每个生产路径都填**，
+> 第三个**只有测试填**。
+>
+> 一句话：**`PeerInfo::with_endpoint` 有边界、有校验、有渲染、有文档，却没有生产者** ——
+> 于是一张「谁在链路上、怎么连它」的表，在每一次真实部署里都印着 `-`。
+
+| # | 缺陷（修前，均有实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **端点字段没有生产者**：`PeerInfo::with_endpoint`/`endpoints` 的 `grep` 命中全部落在 `#[cfg(test)]` 里；两个真正的产出者都在用 `PeerInfo::new(id, kind)` —— `discovery::spawn_federation`（总线联邦）与 CLI 的 `discover --lan`。也就是**每一个真实信标的 `endpoints` 都是空数组** | 这个字段不是内部细节，它是**四个消费者的一栏**：内核 `PeerRegistry`→`PeerView`（`endpoint`）、控制面 `proto.Peer.endpoint`、系统设置的「机器人链路」页（有专门的渲染与用例）、CLI `discover`/`status --socket` 的 `endpoint` 列（`-`/`null`）。同时 §6 第 3 条把信标定义为「**它只是『去连我』的提示**」—— 而**没有任何办法把一个地址放进这条提示里**：没有旗标、没有环境变量、没有部署开关。信标存在的理由（告诉别人连哪里）在代码里不存在 | 新增 `discovery::parse_endpoints(raw)`（逗号分隔的**操作员输入**的唯一解析处：去空白、丢空项、按 `MAX_ENDPOINTS`/`MAX_ENDPOINT_LEN` 逐字段设界，错误点名**数量/第几项/字节数**而不是回显 4 KiB 的输入）+ `PeerInfo::advertising(id, kind, endpoints)`（唯一填 `endpoints` 的生产路径）+ `spawn_federation_advertising(node, period, endpoints)`（`spawn_federation` 以空表委托它，一条实现两条入口）+ `LinkNode::spawn_federation_advertising`；CLI 新增 `--endpoint <EP>`（可重复、值内也可逗号）与 `AMOS_LINK_ENDPOINT`，`watch`/`discover --bus` 走同一个 `start_federation`，`discover --lan` 用 `PeerInfo::advertising` 建自己的公告 |
+| 2 | **逐字段的界不是整帧的界**：`MAX_ENDPOINTS = 8` × `MAX_ENDPOINT_LEN = 128` = 1024 字节的公告，而信标帧上限 `MAX_BEACON_BYTES = 512`。**修 #1 的第一版就有这个洞**：只做 `PeerInfo::validate()` 的话，一个「每项都合法」的列表会让**每一个**信标在 emit 路径上被拒 —— `spawn_federation` 只记一行 `debug!`，于是**节点在 LAN 上彻底不可见，而没有任何东西说出口** | 「启动时拒绝」与「发不出去的节点」是两种完全不同的失败：前者点名原因、退出非零；后者安静地表现为「这个 LAN 上没有别人」。本 crate 的纪律是「一个被隐藏的过滤器与一条什么都没运的链路无法区分」（`self_entries_refused`、`self_echoes` 都是为这条存在的） | `PeerInfo::advertising` 在 `validate()` 之后**再编码一个探针信标**：只有把整帧编出来才知道 id/kind/时间戳加起来是否塞得下，错误带回**实测**字节数（8 × 128B 的端点 ⇒ `beacon of 1138 bytes exceeds the 512-byte frame ceiling`）。CLI 侧两条 announcing 路径都经过它，因此 `watch --endpoint <8×127B>` ⇒ **exit 1 且点名整帧**（`beacon of 1136 bytes …`），而不是跑满整个窗口一个信标都发不出去 |
+| 3 | **§3.10 自己登记的边界 #2 兑现**：那里写着「`--json` 只保证『能解析』，不保证『整个输出流都是 JSON』：`sub`/`state` 的**横幅行**（`subscribed …`、`stats …`）仍是散文」。实测三条流式命令**首行就是散文**：`sub`→`subscribed peer=…`、`state`→`watching …`、`watch`→`watching transport=…`（本地与 `--socket` 两种形态都是），末尾还有散文的 `timeout …`/`stats …`/`watched …`；而 USAGE 与 README 承诺的是「流式命令**一行一个对象**」 | 这是「接受了一个请求、却没有全程回应它」的同一形状（REQ-A264 修的就是它的一半）：`watch --json \| jq` 在**第一行**就语法错，而上一轮把这条写成了**边界**而不是缺陷 —— 边界可以是「做不到的事」，不能是「已经承诺却没有做到的事」 | 三条流式命令的散文行全部变成**事件对象**（事实一条不丢）：`sub` 出 `subscribed`/`frame`/`timeout`/`stats`（`lost` 归因从字符串行变成数组）、`state` 出 `watching`/`report`/`timeout`/`stats`、`watch`（含 `--socket`）出 `watching`/`heartbeat`/`status`/`summary`；**人形态逐字节不变**（只在 `!opts.json` 时打印）。`print_frame` 此前是唯一没有 `event` 键的流式行，一并补上 `"event":"frame"` |
+**实测证据**（真二进制 + 真 broker）：
+
+```text
+# (1) 修前：两个产出者都不带端点（`PeerInfo::new` 的两个生产调用点）
+spawn_federation      ⇒ Beacon::new(PeerInfo::new(peer, kind), now)      endpoints=[]
+discover --lan        ⇒ PeerInfo::new(peer, kind)                        endpoints=[]
+peer table（任意部署） ⇒ {"id":"dog1","kind":"robot","endpoint":null,…}   ← 永远
+CLI 人类表            ⇒ dog1  robot  300ms  7×   -                        ← endpoint 列永远印占位符
+
+# (1b) 修后：同一条链路上，对端表里终于有地址（crates/amos-link 的联邦 e2e）
+dog1 spawn_federation_advertising(period, ["tcp/10.0.0.7:7447","udp/239.0.0.1:7446"])
+mini-brain 的 peers()      ⇒ info.endpoints == ["tcp/10.0.0.7:7447","udp/239.0.0.1:7446"]
+mini-brain 的 status JSON  ⇒ "endpoint":"tcp/10.0.0.7:7447"
+
+# (2) 逐字段合法 ≠ 发得出去（修 #1 的第一版会漏掉的一半）
+parse_endpoints("8 × 128B")     ⇒ Ok（每一项都在 MAX_ENDPOINT_LEN 内）
+PeerInfo::advertising(…)        ⇒ Err(Frame: beacon of 1138 bytes exceeds the 512-byte frame ceiling)
+CLI: watch --endpoint <8×127B>  ⇒ exit 1，stderr 点名整帧（beacon of 1136 bytes …，不是「跑完窗口、什么都没发」）
+
+# (3) 流式命令的机器形态（修前首行就是散文，jq 在第一行报语法错）
+sub   --json  ⇒ {"event":"subscribed","peer":"amos-node","pattern":"amos/**","qos":{…},"from":…,"waiting_for":1}
+                {"event":"frame","topic":…,"publisher":…,"seq":1,"age_ms":0,"frame_len":…}   ← 新增 event
+                {"event":"timeout","timeout_ms":50,"received":0,"waiting_for":1}
+                {"event":"stats","received":0,…,"tracking":"complete","loss_percent":0.0,"lost":[]}
+state --json  ⇒ {"event":"watching","pattern":"amos/*/state/actuation","qos":{…}} … {"event":"report",…} …
+                {"event":"stats","received":0,"dropped":0,"decode_errors":0,"note":"state is latest-wins per robot"}
+watch --json  ⇒ {"event":"watching","transport":"broker","peer":"link-watch","kind":"tool",
+                 "beat":"amos/link-watch/telemetry/beat","advertised":["tcp/10.0.0.7:7447"],"seconds":1}
+                {"event":"status",…,"advertised":[…]} / {"event":"heartbeat",…}
+                {"event":"summary","watched_s":1,"beats_published":2,"beats_seen":1,…,"advertised":[…]}
+watch --socket … --json ⇒ {"event":"watching","remote":"/tmp/…sock","seconds":1} … {"event":"summary",…,"per_peer":{}}
+```
+
+**负控实测**（4 次注入；每次从注入前的副本 `cp` 回来并核验）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| `spawn_federation_advertising` 忽略传入列表、改回 `PeerInfo::new`（NC1） | 内核 e2e `a_federating_node_announces_the_endpoints_it_was_given` ⇒ **FAILED**（对端表的 `endpoints` 为空） |
+| `PeerInfo::advertising` 去掉探针编码、只留逐字段界（NC2） | `an_advertisement_is_parsed_and_bounded_before_a_beacon_is_built`（第 3 段）与 `an_unemittable_advertisement_is_refused_before_the_task_starts` ⇒ **FAILED**；进程级 `an_advertised_endpoint_is_what_the_node_announces_or_a_usage_error` 的第 5 段（期望 exit 1，实得 0）⇒ **FAILED** |
+| `watch` 的本地横幅改回散文（NC3a） | **第一次注入时 `the_streaming_commands…` 仍然通过** —— 它当时只覆盖 `watch --socket`，而名字说的是「流式命令」。补上本地 `watch` 一节后重注入 ⇒ **FAILED**（`printed a non-JSON line "watching transport=broker …"`）。**一次通过必须能解释为什么它应该通过**（§3.10 的 `honors` 自指测试是同一教训的第二次出现） |
+| CLI 的 `start_federation` 改传空列表（NC4） | 进程级的「CLI 说自己在广播 `tcp/…`」断言**全部仍然通过** —— 因为那些行印的是 `opts.endpoints`（**操作员输入的东西**），不是节点**发出去的东西**。于是新增 `the_cli_announces_the_endpoint_the_operator_gave`（两个节点挂同一个 broker，问**对端**的 `peers()`）：重注入 ⇒ **FAILED**（`left: []` vs 两个端点），进程级用例因整帧检查失败而 **FAILED**（期望 exit 1） |
+
+**诚实边界（本轮新增）**：
+
+1. **端点是一句声明，不是身份**：信标仍是明文、未认证（§6 第 3 条），所以「对端表里有 `tcp/…`」只说明**它这么说过**。
+   冒充者可以贴别人的地址；真正的信任路径仍是守护进程的 UDS（peer-credential）。本轮的保证只是：这句声明**有地方填、填错在启动期被拒、并且真的上了线**。
+2. **默认仍然是「不广播地址」**：所有既有部署的行为**逐字节不变**（空列表 = 今天就有的形状）。这是有意的 —— Zenoh 之类的传输自己会发现的地址，硬填一个反而更糟。`--endpoint`/`AMOS_LINK_ENDPOINT` 是**显式**的。
+3. **`endpoint` 只是「首选端点」**：列表的其余项仍在 Rust API（`PeerInfo.endpoints`）里，JSON/proto/UI 都只取第一项（REQ-A265 定下的折叠）。`watch --json` 的 `advertised` 是**本节点自己广播的整份列表**，不是对端表的形状。
+4. **进程级观测不到自己的信标**：一个进程只有一个节点，而「节点不是自己的对端」是被保证的性质，所以「CLI 真的把地址放进了信标」只能由**另一个节点**来观察（`the_cli_announces_the_endpoint_the_operator_gave`）。真机（两块板子对着同一个交换机）仍未复核。
+5. **流式 `--json` 的字段名仍不是 schema**（§3.10 边界 #1 不变）：本轮只保证每一行都是**带 `event` 的对象**，不保证字段永不改名。
+6. **`--lan` 的进程级用例需要 `lan` 特性**（`cargo test -p amos-link-cli --features lan`）：默认构建下它被 `#[cfg(feature = "lan")]` 跳过。
+
+
+### 3.15 一个事实，两种回答：帧的年龄被折成 `0`（第十四轮，REQ-A269）
+
+> 起点是把第十三轮那句「哪一栏是文档在说、代码做不到」换个方向问：**同一个事实，CLI 里的两处渲染器会不会给出两个答案？**
+>
+> 会。第十一轮已经立下规矩：**时间戳在未来 ⇒ 年龄无法陈述**（`age=unknown(…)`、`age_ms: null`），
+> 因为那是两台时钟不一致的可见症状。而同一份 CLI 的**帧**渲染器（`sub`、`watch`、`bench`）走的是
+> `Received::age()` —— 它的底座 `Timestamp::since` 对「更早」的一端**饱和到 ZERO**（对 duration 是对的设计：
+> 回退的时钟不该产出天文数字），于是帧的年龄被印成 **`0`**。
+>
+> 一句话：**`0` 读起来是「刚刚到达」——那是关于链路的一个断言，而仪器并不能支持它。**
+
+| # | 缺陷（修前，均有实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **`sub`/`watch` 把未来的戳印成 `age=0ms`**：`received.age().as_millis()`（`Timestamp::since` 的饱和值） | 对端时钟快 5 秒（两块没校准的板子），或者本机时钟在中途被校准/回退（`Clock::apply`、NTP step），每一帧都变成「刚刚到达」。**同一个 CLI 对同一类事实已经拒绝这么做**（`state`/`status --socket` 说 unknown）—— 一个事实两个答案，而错的那个在操作员用来判断链路健康的那条线上 | 新增 `age_between(stamp_ms, now_ms)` 作为**唯一规则**（未来 ⇒ `InTheFuture`），`report_age_ms`（回程，`0` = proto 的「缺省」哨兵）与 `frame_age_ms`（帧，`0` = 纪元，是一个**真实但巨大**的年龄）是同一规则的两条哨兵策略；`received_line`/`received_json` 成为纯渲染器（此前只能靠打印来观察），`watch` 的心跳行同样走它 |
+| 2 | **`bench` 把「不可测」记成 `0 µs`**：`latencies.push(received.age().as_micros())` | 于是一条时钟不一致的链路在直方图里**变得更快**：那个 0 会拉低 `min`/`p50`/`p99`，而 `bench` 存在的理由就是回答「这条链路够快吗」。这是**测量往好听的方向撒谎** —— 本轮唯一不能接受的错误方向 | `sample()` 成为纯分类器：可测 ⇒ 采样，不可测 ⇒ `skewed += 1`；`latency_line`/`latency_json` 成为纯渲染器，`latency_us` 增加 `samples`（百分位数的基数）、顶层增加 `skewed`，`received = samples + skewed`（两个数字不可能悄悄互相矛盾）；全部样本都不可测 ⇒ 直方图为 `null` + 一行 `latency: none measurable (N frame(s) skewed)` |
+| 3 | **`Received::age()` 的文档承诺没有兑现**：它写着「an unsynced host clock ⇒ it is a bound — **which is why the node reports `clock_synced` beside it**」，而 `sub` 从不打印 `clock_synced` | 文档替代码许了一个不存在的旁注；操作员在 `sub` 的输出里看不到「这些年龄只是上界」。与第十三轮同一形状：**承诺要么兑现，要么别说** | `sub` 的 `subscribed` 事件与人类行、`watch` 的头部行都带上 `clock_synced` 与同一个子句 `clock_synced=false: ages are bounds, not measurements`；内核该方法的文档同时补上**渲染器的两条义务**（饱和度要还原；未校准要说明），因为那是事实与旁注唯一相遇的地方 |
+
+**修 #2 的第一版自己的洞（写下来，因为它是这一轮第二个「先跑一遍真二进制」抓到的缺陷）**：
+把 `sample()` 改成 `frame_age_ms(&stamp) * 1000` 之后，本地一次 `bench --count 20` 打出
+`min=0 p50=0 p99=0` —— **亚毫秒的样本被截断成 0**，也就是用**另一种**方式说了「瞬时」（正是本轮要修的那句话）。
+处置：把**唯一的比较**提到**纳秒**（线上自己的单位，`Timestamp::as_nanos`），各种单位只是由它**除**出来的
+（`frame_age_ms` = ns/1e6、`frame_age_us` = ns/1e3、回程用 ms 形状）；`InTheFuture` 里的毫秒数字**向上取整**
+（亚毫秒的偏斜读作「1ms in the future」，不再是「0ms in the future」）。钉住它的用例是
+`the_benchmark_histogram_keeps_its_microsecond_resolution`（250 µs 的年龄：µs 形状是 250、ms 形状是 0 —— 两者都对，
+但只有前者能当延迟样本）。
+
+**实测证据**（真 broker、两个真实时钟）：
+
+```text
+# (1) 同一个事实，修前两个答案（CLI 内）：
+state --json（回程）   时间戳在未来 ⇒ age_ms: null        ← 第十一轮立的规矩
+sub   --json（帧）     同一时刻        ⇒ age_ms: 0         ← 修前：饱和值被当成测量
+sub（人类形态）        ⇒ "… age=0ms …"                     ← 读作「刚刚到达」
+
+# (2) 两个真实时钟的 e2e（发布者时钟快 5 秒，读者用本机时钟）
+received.age()                    ⇒ Duration::ZERO       （`Timestamp::since` 的饱和，设计如此）
+frame_age_ms(&stamp)              ⇒ Err(InTheFuture(≈5000))
+received_line()                   ⇒ "… age=unknown(stamp is 5000ms in the future — that clock is not this clock) …"
+received_json()                   ⇒ {"age_ms": null, …}   ← 绝不 0
+（同一个渲染器，正常时钟）        ⇒ age=250ms / {"age_ms": 250}
+（帧头 stamp=0，即纪元）          ⇒ 一个巨大但真实的年龄，**不是** unknown（`0` 只是回程的哨兵）
+
+# (3) bench 的分类（单元级，两个时钟）
+sample(now-2s) ⇔ 采样 ⇒ latencies=[2_000_000µs]；sample(now+1year) ⇒ skewed=1（不进直方图）
+latency_line ⇒ "latency (publish -> decoded, us): min=… p50=… p99=… max=… (n=1) · 1 frame(s) excluded: …"
+全不可测 ⇒ latency_us: null + "latency: none measurable (N frame(s) skewed)"
+进程级：bench --count 20 --json ⇒ latency_us.samples=20、skewed=0、received=20
+```
+
+**负控实测**（4 次注入；每次从注入前的副本 `cp` 回来 `diff` 核验）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 两个帧渲染器改回 `received.age()`（NC1） | `a_frame_stamped_in_the_future_has_no_age_to_print` ⇒ **FAILED**（`age=0ms` 又回来了） |
+| `bench` 的 `sample()` 改回 `push(received.age().as_micros())`（NC2） | `a_benchmark_never_counts_an_unmeasurable_frame_as_zero_latency` ⇒ **FAILED**（`left: 0, right: 1` —— 未来那一帧又进了分布） |
+| `sub` 去掉 `clock_synced`（人类行与 JSON 两处，NC3） | 进程级 `the_age_caveat_and_the_bench_sample_count_are_wired` ⇒ **FAILED**。**第一次注入没能编译**（少一个 `{}` 参数）—— 那是编译器在兜底，不是测试；重做成「完全合法的旧行为」后才是真的红 |
+| `frame_age_ms` 借用回程的哨兵（`report_age_ms`，NC4） | `a_measurable_age_is_still_a_number_and_the_epoch_is_not_absent` ⇒ **FAILED**（纪元被说成 unknown） |
+| 比较退化为毫秒（`stamp_ns/1e6 > now_ns/1e6`，NC5） | **第一次注入时 `the_benchmark_histogram…` 仍然通过，而且第二次也通过** —— 两个原因，都值得写下来：**(a)** 用例当时直接调 `frame_age_us`，**没有经过 `sample()`**（回归真正发生的那一行），名字比断言覆盖得多；**(b)** 改走 `sample()` 之后它**仍然是随机的** ——「未来 500 µs」是否跨过一个毫秒边界取决于 `Timestamp::now()` 恰好落在哪里（所以注入是「红或绿看运气」）。处置：把读者的时钟**钉在毫秒内部**（`nanos = 400_000`），于是该用例由**比较本身**决定；重注入 ⇒ **FAILED**，而且是**确定的**失败（`attempt to subtract with overflow` —— 毫秒比较把这一帧当成「现在」再相减）。 |
+| `sample()` 用 `frame_age_ms × 1000`（NC6，也就是本轮自查到的那个回归） | 同一条用例 ⇒ **FAILED**（`a 250 µs age must survive into the histogram, got 0µs`） |
+
+**诚实边界（本轮新增）**：
+
+1. **饱和本身没有改，也不该改**：`Timestamp::since` 对回退时钟给 `0` 是**故意的**（对 duration 而言），
+   本轮把「把它当测量」这件事从渲染器里拿掉，而不是改底座。唯一的比较是 `age_nanos_between`（纳秒，
+   线上自己的单位），各种单位由它除出来；任何**新的**年龄渲染器都要走它
+   —— 这条纪律写在 `Received::age()` 的文档里（事实与旁白唯一相遇的地方）。
+2. **进程级造不出时钟偏斜**：一个 CLI 进程只有一个节点、一个时钟，而「节点不是自己的对端」是被保证的性质
+   （与第十二轮归因行同一处边界）。所以偏斜本身由**单元级的两个真实时钟**证明（跨 broker 的发布/接收），
+   进程级只证明**接线**（`clock_synced` 旁注、`bench` 的两个字段）。
+3. **`bench` 的 `received` 变了含义**（现在含被排除的帧）：它是「收到的帧数」，而百分位数的基数是
+   `latency_us.samples`；两个数字现在都印出来，`received = samples + skewed`。
+4. **帧行的人类形态变了拼写**：`age=5000ms` → `age=5s`（同一个 `format_age_ms`，与回程行、面板一致）；
+   数值不变，`grep 'age='` 的人会看到更短的一串。
+5. **`age=unknown(…)` 的措辞变了**：原来是「the **robot's** clock is not this clock」，现在是
+   「**that** clock is not this clock」—— 同一条规则现在也回答帧，而帧的发布者可能是大脑或工具，不一定是机器人。
+6. **真机复核未做**：两块真板子（或一台时钟被 NTP step 的机器）上「拔掉/校准时钟后年龄变 unknown」的观感仍未验证。
+
+
+
+### 3.16 同一份数字，两个传输：真网络上的节点把自己的计数器留在 0（第十五轮，REQ-A270）
+
+> 起点是把 §3.15 的问法再推一步：**同一个事实在同一个 CLI 里只有一种回答 —— 那么同一份数字在两个传输上呢？**
+>
+> 不会一样。`published`/`delivered`/`dropped`/`blocked` 这四个计数器由 **传输**在事实发生的地方记录，
+> 而 `record_published`/`record_delivered` 的全部调用点都在 **`broker.rs`** —— 也就是说
+> 进程内 broker 会数，**Zenoh 一个都不数**。而现场跑的就是 Zenoh：`--transport zenoh` 的 CLI、
+> 板卡上的 `LinkNode::with_parts(.., ZenohTransport, ..)`。
+>
+> 一句话：**仪器在进程内很诚实，一到真网络上就整体读到 0 —— 而 0 是没有说谎的形式在说谎。**
+
+| # | 缺陷（修前，均有实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **网络传输不计数**：`ZenohTransport::publish` 只 `put` 然后返回报告，`subscribe` 的转发任务也不记；`ZenohTransport` 甚至**不持有**任何计数器。于是 `LinkNode::metrics()` 在 Zenoh 上永远是 0 | 这四个数字是操作员读到的**全部**：`status --json`、`watch` 的周期行、`LinkHealth::evaluate` 的判决、系统设置「机器人链路」页的计数行。一个正在跨会话发帧的节点报 `published=0 delivered=0`，而 **0 不会被读成「不知道」，只会被读成「没发过」**——正是本 crate 反复钉住的那条纪律的反面 | `ZenohTransport` 持有节点的那一组计数器（`open_with_metrics`/`with_metrics`/`metrics()`）：`put` 返回 `Ok` ⇒ `published+1`、`delivered+1`（与它自己的报告里 `delivered: 1` = "put on the wire" 同义）；转发任务把帧交给订阅队列 ⇒ `delivered+1`，订阅者已走 ⇒ `dropped+1`（与 broker 的分工一字不差）。CLI 的 `build_zenoh_node` 改为**一组计数器**贯穿传输与节点 |
+| 2 | **这个不变式此前不可检查**：`LinkNode::with_parts` 同时收 `transport` 与 `metrics`，两者是**不同的 Arc 也不会有人发现** —— 节点照常工作、计数落进没人读的那一组 | 这是缺陷 1 的**成因**（CLI 就是这么写的），也是它**能藏这么久**的原因：一条只在文档里的不变式，等于没有不变式。本轮写自己的测试时**又踩了同一脚**（订阅侧传了节点的一组、传输持有另一组 ⇒ `delivered` 依旧是 0），说明这个形状随手就能复现 | 把不变式做**可比较**：`Transport::metrics()` 成为 seam 的一部分（broker / Zenoh / 测试替身都实现它），`LinkNode::with_parts` 在两组不是同一个 `Arc` 时 **`warn!`**（可见而不静默），并把「必须传传输那一组」写进 `with_parts` 的文档 |
+| 3 | **同文档自相矛盾（文档缺陷）**：§4 的「测试现状」写着「真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布）以 `#[ignore]` 标注」，而 §3.6 与 §7 **都写着同一个用例「不再是 `#[ignore]`」**（REQ-A243 已把它变成确定性的 TCP 环回往返） | 同一份文档的两节对同一件事给出两个答案；而且**看测试现状的人会以为这条证据不存在**（`-- --ignored` 才跑），于是要么重做一遍、要么不信任这个套件。`grep '#\[ignore'` 的真实答案是：`src/zenoh.rs` 里只剩**跨主机 scouting** 一个 | §4 的该段改写为事实：三个会话用例（往返、最长键、计数器）都在 `make test` 里跑；仍然 `#[ignore]` 的只有跨主机 scouting，并点名它 |
+
+**实测证据**（真 TCP 会话、两个 peer、显式端点、关 scouting）：
+
+```text
+# (1) 修前：帧真的过去了，计数器仍是 0
+cargo test -p amos-link --features zenoh --lib a_node_over_a_real_session_counts_what_it_publishes
+  ⇒ 对端收到了 seq=1（sub.recv() 成功）
+  ⇒ 但 metrics.snapshot().published == 0            ← assertion failed: left: 0, right: 1
+
+# (2) 修后（同一条用例）
+metrics.snapshot().published == 1（发布侧：一次成功的 put = 一帧）
+subscriber_metrics.snapshot().delivered >= 1（接收侧：转发任务把帧交给订阅队列）
+node.status().await.metrics.published == 1（操作员读到的那条路径）
+
+# (3) 仍然不可见的部分（照实说）
+Zenoh 自己的 RingChannel 在满时丢帧（best-effort）—— 那发生在 Zenoh 内部，
+这一侧**看不到**，因此网络节点的 `dropped` 仍可能是 0；可见的真相是**订阅自己的** stats。
+```
+
+**负控实测**（2 次注入；每次从注入前的副本 `cp` 回来并核验）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| `ZenohTransport::publish` 去掉 `record_published`/`record_delivered`（NC1） | `a_node_over_a_real_session_counts_what_it_publishes` ⇒ **FAILED**（`left: 0, right: 1`）；这正是修前那条用例报出的同一句话 |
+| 转发任务去掉 `record_delivered`（NC2） | 同一条用例的**接收侧**断言 ⇒ **FAILED**（`delivered: 0`，而帧确实到了订阅者手里） |
+
+**诚实边界（本轮新增）**：
+
+1. **`dropped` 在网络传输上仍不完整**：Zenoh 内部的丢弃（`RingChannel` 满、UDP 线缆丢包）发生在**我们的进程之外**，
+   这一侧只能数「我把帧交给了订阅队列吗」。所以网络节点的 `dropped` 是**下界**，而**订阅自己的** `stats().received`
+   才是消费者可见的真相。这条不写成「已解决」——它写在这里，也写在 §4 的表里。
+2. **`delivered` 在两个传输上含义略有不同**（broker：本地扇出的队列数；Zenoh：`put` 上线 1 次 + 转发任务各 1 次），
+   这正是 `PublishReport` 自带的写法（"accepted into a subscriber queue **or put on the wire**"）。数字不再撒谎，但跨传输比较时要知道口径。
+3. **`blocked` 在 Zenoh 上天然是 0**：`put` 不阻塞我们的发布者（背压发生在 Zenoh 内部），这一条是**正确**的 0，不是缺失。
+4. **`Transport::metrics` 是 seam 的新成员**：任何新的传输实现都必须回答它（否则编译不过），测试替身也一样；
+   这条 seam 只能保证「传输持有的那一组」被节点读到，**不保证**调用方传对了——那由 `with_parts` 的 `warn!` 提示，而不是由类型系统。
+5. **真机复核未做**：证据是 TCP 环回上的两个真实会话（真握手、真路由），没有在两块真板子/真 5G 回程上跑。
+
+
+
+### 3.17 一条只写在文档里的降级路径：老 daemon 会把整页拖下水（第十六轮，REQ-A271）
+
+> 起点是把 §3.16 的问法再推一步：**同一条契约，两个消费者会不会给出两个答案？** —— 这次是**有版本差**的时候。
+>
+> §6.5 写着「老版本的 daemon 没有这个 RPC 时，界面只是少显示一栏、不报错」；
+> 而 `link_status` 里那一行是 `client.list_actuations(...).await.map_err(...)?` ——
+> 一个 `?` 把「少显示一栏」变成了「**整页显示守护进程未连接**」，连 daemon **已经答过**的状态、对端表与判定一起丢掉。
+>
+> 一句话：**「我们没被告知」被当成了「没有人上报」** —— 而这正是同一个页面上写着「a robot that has not reported is absent, not idle」的那页。
+
+| # | 缺陷（修前，均有实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **System UI 的桥把整次读取交给 `?`**：`crates/amos-tauri/src/link.rs` 的 `link_status` 先 `get_status`（已成功），再 `list_actuations(...)?` —— 老 daemon（没有这个 RPC）回 `Unimplemented`，于是命令返回 `Err`，前端把 `Err` 渲染成「守护进程未连接」并**清空所有数字** | 文档承诺的降级不存在；更糟的是**丢掉的是已经拿到的答案**（状态/对端表/判定都在同一次会话里答过了）。而这条 RPC 恰恰是「回程」——**老 daemon 与正在升级的现场**是最常见的组合 | 只对 `Unimplemented` 降级：回程成为 **`actuations: None`**（JSON `null`）+ 一条 `warn!`；**其它失败照旧 `Err`**（有实现却服务不了是真故障，不能折进「老版本」）。`status_out(&status, Option<Vec<..>>)` 随之把这个区分带进类型 |
+| 2 | **CLI 的 `status --socket` 是同一个形状**：`ListActuations` 的失败同样靠 `?` 冒到顶层 ⇒ 老 daemon 上一条状态都读不到（`exit 1`） | 终端是**同一份契约的另一个消费者**：如果只有面板降级，那么「老 daemon 上能读到什么」就取决于你用哪个工具 —— 这正是本仓反复拒绝的形状（§3.10/§3.11）。而且 CLI 的 JSON 是脚本的输入：`actuations` 从数组变成 `null`，脚本必须能区分 | 同一个规则：`Unimplemented` ⇒ `Some/None` 三态 + `tracing::warn!`；人类形态打印 `robots reported: not answered by this daemon (no ListActuations — an older build); the status above was answered`，JSON 里 `actuations: null`（**绝不 `[]`**） |
+| 3 | **前端把「没有回答」与「没人上报」渲染成同一句话**：`LinkStatus.actuations` 的类型注释写着「a daemon older than the RPC simply omits it: the panel must show less」，而页面只有两个分支（有列表 / `link.noReports`）；`link-page.svelte.test.ts` 里那条用例**把这个合并钉住了**（老 daemon ⇒ 断言 `link-robots-none`） | 一个「缺席」被渲染成「机群一句话都没说」——与本页自己那句「absent, not idle」直接矛盾；而**测试把它固定下来**，所以它不是疏忽而是**被接受的行为** | 三态成为类型与纯函数：`returnPathLevel(status) -> "unavailable" \| "none" \| "reported"`（`null` 与 `undefined` 都算 `unavailable`：反方向的版本差——**新面板 × 老桥**——是同一件事），`unavailable` 有自己的 testid 与文案（en/zh），那条钉住旧行为的用例改写成断言**相反**的事实 |
+
+**实测证据**（真 UDS + 真 gRPC；两个「老 daemon」替身只实现一部分 RPC）：
+
+```text
+# (1) 修前（tauri 侧，`tests/link_status_e2e.rs`）：一个只有 GetStatus 的 daemon
+link_status() ⇒ Err("robot-link ListActuations failed: code: 'Operation is not implemented …'")
+                 ← 整次读取失败；而 GetStatus 已经答了 peer/uptime/peers
+
+# (2) 修后（同一条用例）
+link_status() ⇒ Ok(peer="amos-daemon", clock_synced=true, peers=[], actuations=null)
+JSON: {"actuations": null, "peers": []}   ← 没有被回答的那一栏是 null，答过的照旧
+
+# (3) 修前（CLI 侧，`cli_smoke.rs`）：`status --socket <老 daemon>` ⇒ exit 1，什么都读不到
+#     修后：exit 0，且
+remote=… link peer=amos-daemon … health=unknown        （已答的照常打印）
+peers (1): … dog1 …                                    （已答的对端表照常打印）
+topics (1): inventory complete                          （已答的清单照常打印）
+robots reported: not answered by this daemon (no ListActuations — an older build); the status
+above was answered                                      （没答的那一栏如实说明）
+--json ⇒ "actuations": null（不是 []）
+
+# (4) 面板（vitest）：老 daemon ⇒ [data-testid="link-robots-unavailable"] + 「这个守护进程不上报回程」，
+#     且 link-robots-none **不存在**；老桥（字段整个缺席）走同一条分支；counterSummary 照常显示
+```
+
+**负控实测**（3 次注入；每次从注入前的副本 `cp` 回来并核验）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 桥改回 `list_actuations(...)?`（NC1） | `a_daemon_without_the_return_path_still_answers_the_panel` ⇒ **FAILED**（`a daemon without ListActuations must still answer the status`，逐字复现修前的错误串） |
+| CLI 改回 `with_context(...)?`（NC2） | 进程级 `an_older_daemon_still_answers_the_status_over_a_socket` ⇒ **FAILED**（exit 1） |
+| 面板去掉 `unavailable` 分支（NC3） | `link-page.svelte.test.ts` 的那条用例 ⇒ **FAILED**（`link-robots-none` 又出现了） |
+
+**诚实边界（本轮新增）**：
+
+1. **只对 `Unimplemented` 降级**：`tonic::Code::Unimplemented` 是「这个 RPC 不存在」的**唯一**可靠信号。别的失败
+   （`Internal`/`Unavailable`/超时）一律照实报错——把「服务不了」也说成「老版本」会让真故障**永远沉默**。
+   这条规则写在两个消费者的代码里，也写进 §5 的契约表。
+2. **「老 daemon」的两个方向都覆盖了**：老 **daemon** × 新面板（`actuations: null`）与老 **桥** × 新面板
+   （字段整个缺席）都读作 `unavailable`；但**老面板 × 新桥**（字段可能是 `null` 而老代码只认数组）**没有**覆盖 ——
+   那个方向的兜底是 `?? []`（读成「没人上报」），属于升级顺序问题，本轮不动（面板与桥同包发布）。
+3. **`status --socket` 的 JSON 多了一个可能的 `null`**：`actuations` 现在是 `[] | null`，脚本若要区分必须显式判断；
+   人类形态的一行说明是新增的（老 daemon 上以前什么都看不到）。
+4. **面板的行为在「老 daemon」上是新增文案，不是新增数据**：`unavailable` 只说「它没有回答」，绝不推断机群状态。
+5. **真机复核未做**：证据落在真 UDS + 真 gRPC（两个只实现部分 RPC 的替身服务）+ 真前端测试；
+   没有一台**真的旧版本 daemon 二进制**可用（版本化部署属现场的升级顺序问题）。
+
+### 3.18 同一份 QoS，两个传输上是两种东西：ROS 对照复核（第十七轮，REQ-A272）
+
+> 起点是这一轮的题面本身：**对照 ROS 2 的功能再核一遍**。于是先做对照表（§8），再从表里挑出「我们声称对齐」
+> 的那一行去查代码 —— **QoS：`Reliability{BestEffort,Reliable} × depth × DropPolicy`，`qos.rs` 的模块文档说
+> 「DDS 叫 QoS，ROS 2 叫 reliability + history depth，我们用同一个东西表达」**。
+>
+> 一查就露：**这份 QoS 只在进程内有效**。`Broker::subscribe` 为 `DropOldest` + depth 1（`Qos::sensor()`，
+> 「latest sample wins」）建的是**单槽覆盖队列**；而 `ZenohTransport::subscribe` 走的是 `Subscription::remote`
+> ——**没有槽**（`slot: None`），只有一个 `mpsc` + 一个「阻塞式 `send`」转发任务。于是**同一份 QoS 在两个传输上
+> 语义不同**，且**丢帧数在两个传输上都读不到**。
+>
+> 一句话：**QoS 是「订阅的属性」，不是「broker 的属性」** —— 而这正是 ROS 2 / DDS 的立场（QoS 由中间件在
+> 每个传输上兑现）。本仓自己的 `qos.rs` 却把 `LatestSlot` 留在了 `Broker::subscribe` 里，等于把契约绑在了
+> 一个传输上。
+
+| # | 缺陷（修前，均有实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **`Qos::sensor()` 在网络传输上不是「最新的一帧赢」**：`ZenohTransport::subscribe` 对 `is_latest_only()` 也只建 `mpsc(depth)` + 转发任务 `tx.send(..).await`。一个「忙了 10 帧」的消费者醒来拿到的是**它卡住时被抽走的第 1 帧**（最老的那一帧），而不是第 10 帧 | `qos.rs` 的原话是「a consumer that was busy for 10 frames **wakes up holding frame 10** — never a backlog of 10 stale ones」。而在真网络上（相机板 → 大脑，**这条 profile 就是为它写的**）拿到的是**陈旧帧**——正是「stale depth is worse than no depth」要避免的东西。ROS 2 的 KEEP_LAST(1) 在任何 transport 上都意味着「最近的一帧」 | 远端订阅也按 **sink** 分形状：`is_latest_only()` ⇒ `Subscription::remote_latest`（单槽，`LatestSlot::offer`/`offer_blocking`），其余 ⇒ 队列。`Broker::subscribe` 建哪种、远端就建哪种 |
+| 2 | **`DropPolicy::DropNewest` 在网络传输上从不生效**：转发任务对**任何**可靠性都做阻塞 `send`，于是「队列满 ⇒ 丢新帧」被实现成了「队列满 ⇒ 背压整条链路」 | 一个 depth 2 的 best-effort 订阅**承诺**满了就丢，实际却把生产者/网络拖住；更糟的是**没有任何计数器动**：`sub.stats().dropped` 与节点的 `dropped` 都读 0，而帧真的没了 —— 破的正是本仓反复强调的「**`0` 不是「不知道」的说法**」（§3.15 同一条纪律） | 转发任务按 `$reliable` 分支：best-effort ⇒ `try_send` 失败即丢并**计数**；reliable ⇒ `try_send` 后再 `send().await`（与 broker 一字不差） |
+| 3 | **订阅自己的计数器在网络传输上是死的**：`SubCounters` 只被 broker 触碰（`LatestSlot::offer`、队列满、槽被毒化）；转发任务只写**节点**那一组（`metrics`），而且只写「消费者不见了」这一种 | `SubscriptionStats` 的文档写着「`dropped` covers **every** way a frame this subscription was routed can fail to arrive… 与节点的 `metrics.dropped` **count the same frames, so the two never disagree**」。进程内为真，网络上是假的（一个恒为 0）——`sub --transport zenoh` 的收尾统计、`bench` 的 `dropped`、面板都读它 | 新增 `RelayCounters`：**三种结局**（`stored` / `replaced` / `lost`）与 broker 的发布路径一一对应，每处只动它该动的那一组（`replaced` 只动节点那一组，因为槽已经记过订阅侧；见 §3.18 后的边界 2） |
+
+**实测证据**（真 TCP 环回会话，两个 session、真 `put`/订阅路由；帧间隔 50 ms，消费者**故意**全程不 poll）：
+
+```text
+# (1) Qos::sensor()（DropOldest + depth 1）：连发 5 帧，然后才 recv
+修前： recv ⇒ seq=1      sub.stats().dropped = 0     ← 最老的那一帧，4 帧「凭空消失」
+修后： recv ⇒ seq=5      sub.stats().dropped = 4     节点 metrics.dropped = 4
+       （与进程内 broker 的同名用例逐字一致：frame 5 + dropped 4）
+
+# (2) BestEffort depth 2 + DropNewest：连发 5 帧
+修前： recv ⇒ 1, 2, 3 …（第 3 帧在 400 ms 内到达 = 转发任务在背压，而不是丢）
+      sub.stats().dropped = 0    节点 metrics.dropped = 0
+修后： recv ⇒ 1, 2，之后 400 ms 无帧（满即丢，不背压）
+      sub.stats().dropped = 3    节点 metrics.dropped = 3
+```
+
+**负控实测**（2 次注入，均为**单条命令内**注入 → 跑测 → 从注入前副本 `cp` 回来 → `diff` 核验）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 转发任务改回「任何可靠性都阻塞 `send`」（NC1） | `a_best_effort_queue_over_a_real_session_drops_the_newest_and_counts_it` ⇒ **FAILED**（`a full best-effort queue drops; it does not back-pressure the link` —— 第 3 帧真的又出现了） |
+| 远端订阅去掉单槽、全部走队列（NC2） | `a_latest_only_subscription_over_a_real_session_keeps_the_newest_frame` ⇒ **FAILED**（`left: 1, right: 5`，逐字复现修前的观察） |
+
+**诚实边界（本轮新增）**：
+
+1. **传输边界内仍然丢得看不见**：`RingChannel`（best-effort 的 Zenoh 侧）自己满时会丢**最老**的样本，`FifoChannel`
+   会阻塞 Zenoh 的投递线程；这两件事发生在本 crate 之外，**不计入**任何计数器（§3.16 边界 ① 不变，仍是下界）。
+   本轮修的是「**我们自己的消费队列**」那一层的语义与计数 —— 那正是 `network_reliability_note` 一直说我们保证的东西。
+2. **`replaced` 只动节点那一组计数器**：单槽覆盖时，**槽**已经记了订阅侧的 `dropped`（它拥有那个计数器，
+   `LatestSlot::offer` 的既有行为）；转发任务若再调 `lost()` 会把**一次丢失算两次**。这条分工与 broker 一字不差。
+3. **`blocked` 在网络节点上仍然是 0，这是有意的**：它定义为「**本节点的发布路径**等待过慢订阅者」。网络路径上等待的是
+   *转发任务*（我们的消费者），不是我们的发布者 —— 把两者合并会让「远端生产者被本机慢消费者拖住」伪装成
+   「本机发布被拖住」。§4 的边界因此不变（只是多了一句：reliable 的远端订阅**会**把背压传给 Zenoh 的 FIFO 通道）。
+4. **`FORWARD_CHANNEL = 64` 仍是上限**：`depth > 64` 的订阅在 Zenoh 侧的处理器容量被夹到 64（本地队列仍是 `depth`）。
+   这是既有的、写在 `FORWARD_CHANNEL` 上的边界，本轮不动，只是它现在**同时**决定了两种 sink 的形状。
+5. **两帧之间的「中间那几帧」仍然只能靠序号推断**：latest-only 现在会**数**被覆盖的帧，但被覆盖的是*哪几帧*只有
+   `SeqTracker` 能说（它按 `(publisher, topic)` 记序号，§3.13）—— 计数器与追踪器回答的是两个问题。
+6. **真机复核未做**：证据是同一个进程里两个真 session 的 TCP 环回（真握手、真路由、真 `put`），
+   没有两块板子/真 Wi-Fi-5G 的现场数据；`#[ignore]` 的跨主机 scouting 用例仍然忽略。
+
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
-
-
-
 
 
 依赖声明（`crates/amos-link/Cargo.toml`，可选依赖、默认构建不拉）：
@@ -448,20 +1061,24 @@ zenoh = { version = "1.10", default-features = false,
 | **Key expression 语法（`*` / `**`）** | ✅ 用（同构复用） | `keyexpr.rs` 自己实现并校验同一套语法，**原样交给 Zenoh**：进程内 broker 与跨网 Zenoh 对同一模式给出同一行为。**长度也实测钉住**（REQ-A247）：本 crate 允许的最长键（32 段 / ~2 KiB，`MAX_SEGMENT = 64` × `MAX_SEGMENTS = 32`）与同形模式都能跨真会话往返（`the_longest_key_expression_we_accept_crosses_a_real_session`）——此前只核对了**语法**，长度是没验证的（Zenoh 0.x 把键表达式限制在 255 字节，而那会让一个本地合法的键**在线上**失败）；实测 Zenoh 1.10.1 无此上限，且该用例会在未来引入上限时变红 |
 | **`Session::put`（发布）** | ✅ 用 | `Transport::publish`：一次 `put`，无长生命周期 publisher（控制话题 1 Hz，不值得为它维持句柄） |
 | **`declare_subscriber` + Handler** | ✅ 用（**QoS 映射的真实落点**） | `Reliability::BestEffort → RingChannel`（满则丢，与「最新帧胜」一致）、`Reliability::Reliable → FifoChannel`（满则阻塞 Zenoh 线程 = 背压） |
+| **计数器（`published`/`delivered`/`dropped`/`blocked`）** | ✅ 用（**第十五轮补上**） | 传输持有**节点的那一组**（`Transport::metrics`）：`put` 成功 ⇒ `published+1`/`delivered+1`；转发任务把帧交给订阅队列 ⇒ `delivered+1`，订阅者已走 ⇒ `dropped+1`。**此前一个都不数**（`record_*` 只在 `broker.rs`），于是真网络上的节点终生报 0（§3.16）。**边界**：Zenoh 内部的丢弃（`RingChannel` 满、UDP 线缆丢包）在这一侧不可见 ⇒ `dropped` 是下界；`blocked` 天然为 0（`put` 不阻塞我们的发布者） |
 | **组播 scouting（无 IP 列表发现）** | ✅ 用（默认开启） | 跨节点发现的本体；`AMOS_LINK_ZENOH_ENDPOINT` 可显式指定 `tcp/host:port` 列表用于锁定网络 |
 | **总线联邦（信标走链路自身）** | ✅ 用（本仓新增） | `BusDiscovery`/`spawn_federation`：在 `amos/*/telemetry/beacon` 上收发 `Beacon`，与数据同路 ⇒ **Zenoh 场景下对端表终于被填满**（此前只有会话、没有 peer 表）；自身回声被过滤并计数 |
 | **`ZBytes` 零拷贝载荷 / shared-memory** | ❌ 未用 | 我们走 `to_vec()`：`Envelope` 已经是一段自校验字节，SHM 需要两侧同机同版本约定，收益不抵复杂度（列入 §6 的后续项） |
 | **query/reply、liveliness、admin space** | ❌ 未用 | 数据面只需要 pub/sub；节点存活由**我们自己的心跳 + TTL 注册表**表达（与 `amos-timesync` 的时钟配合可测真实延迟） |
 | **router（`zenohd`）、plugin、TLS/QUIC/WS、multilink、compression** | ❌ 未用 | 去中心化的 peer 模式不需要 router；跨公网/加密属于部署决定，不是内核默认（`--features zenoh` 不带这些依赖） |
 | **zenoh-pico（MCU 版）** | ❌ 未用（**边界**） | 本仓是 Rust 主机/板卡端中间件，**不编译到 MCU**；RK3576 上跑的是本 crate 的 Linux 二进制。MCU 直连属于另一条产品线，需要 pico 的 C 端与 AmOS-Link 的 key/帧格式对齐（§6） |
-| **`unstable` 特性 / 逐调用 `Reliability`** | ❌ 未用 | Zenoh 的 per-call 可靠性藏在 `unstable` 后；本 crate 的诚实做法：**链路可靠性**取传输默认（TCP/UDS 可靠、UDP 尽力而为），**我们保证的是本地消费队列的 QoS**（`depth` 直接映射到 Handler 容量）。这条边界写在 `zenoh.rs::network_reliability_note` 的文档里，而不是含糊过去 |
+| **`unstable` 特性 / 逐调用 `Reliability`** | ❌ 未用 | Zenoh 的 per-call 可靠性藏在 `unstable` 后；本 crate 的诚实做法：**链路可靠性**取传输默认（TCP/UDS 可靠、UDP 尽力而为），**我们保证的是本地消费队列的 QoS**（`depth` 直接映射到 Handler 容量）。这条边界写在 `zenoh.rs::network_reliability_note` 的文档里，而不是含糊过去。**第十七轮补完（§3.18）**：「消费队列」这一半现在**与进程内 broker 逐条同形** —— `DropOldest`+depth 1 ⇒ 单槽（最新帧赢、被覆盖的帧计入 `dropped`），其余 ⇒ 有界队列（best-effort 满即丢并计数、reliable 满即等）；此前 `DropPolicy` 在网络侧从不生效、订阅自己的 `dropped` 恒为 0 |
 
-**测试现状（诚实）**：`lan` 与 `zenoh` 的**离线**用例进入 `make test`
-（`cargo test -p amos-link --features amos-link/lan --lib`、
-`cargo test -p amos-link --features amos-link/zenoh --lib`），`lan` 的用例在**回环地址**上收发真实
-UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布）以 `#[ignore]` 标注——
-它需要可用的组播/网络环境，`cargo test -p amos-link --features zenoh -- --ignored` 可在联网机器上手动跑。
-**默认 CI 不会伪造这条证据**。
+**测试现状（诚实 —— 本段于第十五轮更正，此前它把**已经不再 ignore** 的用例说成 `#[ignore]`，与本文件的 §3.6/§7 自相矛盾）**：
+`lan` 与 `zenoh` 的用例都进入 `make test`（`cargo test -p amos-link --features lan --lib`、
+`cargo test -p amos-link --features zenoh --lib`）。
+- `lan`：在**回环地址**上收发真实 UDP 信标（`lan_multicast/…`）。
+- `zenoh`：**真会话往返已经在跑** —— `a_typed_frame_crosses_a_real_session_over_tcp_loopback`、
+  `the_longest_key_expression_we_accept_crosses_a_real_session`、`a_node_over_a_real_session_counts_what_it_publishes`
+  三个用例都是**两个 peer + 显式端点 + 关 scouting，走 TCP 环回**，因此不依赖任何网络环境、**不再是 `#[ignore]`**（REQ-A243 收口；§3.6）。
+- **仍然 `#[ignore]` 的只剩跨主机 scouting**（`scouting_finds_a_peer_on_a_real_network`：需要真实组播与第二台主机），
+  `cargo test -p amos-link --features zenoh -- --ignored` 可在真机器上手动跑。**默认 CI 不会伪造这条证据。**
 
 ## 5. 控制面（`proto/robot_link.proto`，5 个 RPC）
 
@@ -477,6 +1094,23 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
 与 AiAgent/Sensor/Telephony 同一条 UDS；证据是 `crates/amos-ai/tests/link_rpc_e2e.rs`（真 UDS 往返）。
 `mock_server()` 挂的是**带心跳**的服务（`LinkService::with_heartbeat`）；`server(node)` 把「谁负责让节点打拍」留给调用方（跨板卡部署通常在 `spawn_heartbeat` 之外还要 `spawn_federation`）。
 
+**每种事实的消费者与拼法**（第十轮定稿，§3.11）：`GetStatus` 的**对端表**由 CLI（`status --socket`，人类表 +
+`peers[]` 数组）与 System UI（`LinkPeerOut`）共同消费，两边都是同一套扁平五字段（`id`/`kind`/`endpoint`/`last_seen_ms`/`beacons`）；
+**判决**是 `health`（枚举）`+ health_reasons`（token），CLI 把它渲染成 `{"state":…,"reasons":[token,…]}` —— 与内核
+`status --json` 逐字一致。也就是说：**控制面一直是这套词汇，生产者曾经不一致**（§3.11 的四个缺陷）。
+
+**一个 RPC「不存在」时的消费者契约**（第十六轮，REQ-A271，§3.17）：控制面五个 RPC 是**同一条 UDS 上的一次会话**，
+一次调用失败**不等于**整条链路不可用。约定如下（CLI 与 System UI 一字不差）：
+
+| 情形 | 消费者怎么说 | 依据 |
+|---|---|---|
+| `GetStatus` 不可达（守护进程没起） | 「守护进程未连接」/ `exit 1` —— 什么都不显示 | 没有这条就什么都没有 |
+| 某个 RPC 回 `Unimplemented`（**老构建**没有它，例如没有 `ListActuations` 的 daemon） | **降级**：那一栏读作「本 daemon 没有回答这个问题」（`null` / 一行说明），其余已答的照常显示，并 `warn!` 一条日志 | 「界面只是少显示一栏」（§6.5）——**这只对「没有这个 RPC」成立** |
+| 某个 RPC **有这个实现却失败**（真故障） | **照实报错**，绝不折进「老版本」 | 「有 RPC 却服务不了」是故障，不是版本差异 |
+
+回程因此有**三种状态**（`Option` 的三种含义）：`null` = 没有回答、`[]` = 回答了且没人上报过、`[…]` = 这些机器人上报过；
+`null` 绝不能被渲染成 `[]`（「我们没被告知」不是关于机群的任何事实）。
+
 ## 6. 环境变量与边界（老实说）
 
 | 变量 | 作用 | 读取处 |
@@ -486,6 +1120,7 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
 | `AMOS_LINK_BEACON_IFACE` | LAN 信标**固定到哪个接口**（本机 IPv4 地址，如 `192.168.1.5`；出向 `IP_MULTICAST_IF` + 入向组加入都绑到它）。多网卡板子必须设，否则「内核挑一个」可能让信标从 5G 出去而相机板在 Wi-Fi 上；**错值在启动期拒绝** | `crates/amos-link/src/lan.rs` |
 | `AMOS_LINK_BEACON_LOOP` | 组播回环开关（`1`/`0`，默认 = 平台默认即开）。关掉会让**本机所有进程**都收不到自己的信标（不只自己），因此**不是**正确性机制（对端表才是）| `crates/amos-link/src/lan.rs` |
 | `AMOS_LINK_ZENOH_ENDPOINT` | Zenoh 连接点（逗号分隔，如 `tcp/10.0.0.7:7447`） | `crates/amos-link/src/zenoh.rs` |
+| `AMOS_LINK_ENDPOINT` | **本节点广播的地址**（逗号分隔，如 `tcp/10.0.0.7:7447,udp/239.255.42.99:7446`；`--endpoint` 优先）。只有**会公告自己**的命令读它（`watch`、`discover --lan`/`--bus`）：`status` 之类读了也没有意义，否则一个部署变量就能让一条没有公告的命令失败。留空 = 不广播地址（**默认**，也是自发现传输唯一合理的取值）。界与信标同源（≤8 项、每项 ≤128 字节、整帧 ≤512 字节），**在启动期拒绝**（见 §3.14） | `crates/amos-link-cli/src/lib.rs` |
 
 **明确不做的事**（避免把边界留给想象）：
 
@@ -495,6 +1130,10 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
    （真实产品里是 50–100 Hz 的控制任务）决定。
 3. **发现不认证**：`lan` 的信标是明文广播，任何人都能伪造（它只是「去连我」的提示）。**认证路径是
    daemon 的 UDS**（`amos-ai` 的 peer-credential 检查），不是这条信标。
+   **（第十三轮更正）** 这句话此前**没有兑现的机制**：信标里的 `endpoints` 字段有边界、有校验、有渲染，
+   却**没有任何生产者**，因此「去连我」这条提示**从不带地址**（`endpoint` 永远是 `null`）。现在它是**显式**的
+   （`--endpoint` / `AMOS_LINK_ENDPOINT`，见 §3.14），并且填错在**启动期**被拒 —— 但「对端表里有地址」
+   仍然只是一句**声明**：本条的不认证性质不变。
 4. **shm / pico / `unstable` QoS / 加密传输**：见 §4 表格的 ❌ 行，都是有意的未做项。
 5. **System UI 的"链路面板"——已建成（本条原来的"未做"已兑现）**。历史上本条记录过：本 crate 的模块文档曾把
    "System UI 的链路面板"写成一个消费者，而 `crates/amos-tauri` 与 `src/` 里**零** `amos_link`/`robot_link`
@@ -509,7 +1148,14 @@ UDP 信标；真实 Zenoh 会话的往返用例（两个订阅者 + 一次发布
    **（本轮补全）它现在也读"回程"**：`link_status` 同时调 `ListActuations`（§5），所以「机器人链路」页在
    实时的对端表之下还列出**每台机器人自报的状态**——armed / 已切扭矩(+原因) / 当前步态 / 最近一次被拒绝的指令
    （连"怎么恢复"都带出来）。这一栏的诚实点写进了界面文案：**没上报过的机器人不在列表里（那不是"空闲"）**，
-   而且列表是**快照不是历史**；老版本的 daemon 没有这个 RPC 时，界面只是少显示一栏、不报错。
+   而且列表是**快照不是历史**。
+   **（第十六轮更正）** 上一句原先写着「老版本的 daemon 没有这个 RPC 时，界面只是少显示一栏、不报错」——
+   **当时那是假的**：`link_status` 用 `?` 把 `ListActuations` 的失败抛了出去，于是同一个老 daemon 会让**整个页面**
+   变成「守护进程未连接」，连它**已经答过**的状态、对端表与判定一起消失。现在这句话是**代码**（且只对
+   一种失败成立）：只有 `Unimplemented`（老构建 / 没有这个 RPC）才降级为「这一栏没有被回答」并 `warn!`，
+   **其它任何失败仍然照实报错**（有这个 RPC 却服务不了，那是真故障，不能被折进「老 daemon」）。
+   三种状态各有名字：`actuations: null` = 守护进程**没有回答这个问题**、`[]` = 回答了且没人上报过、
+   `[…]` = 这些机器人上报过；界面文案与 CLI（`status --socket`，人类行 + JSON）说同一种话（REQ-A271）。
    **诚实边界**：面板读的是守护进程**控制面**的状态；数据面（传感器帧、关节设定点）不经过它，
    也不经过任何 gRPC —— 回程能被看到，是因为**守护进程订阅了数据面并把它折叠进控制面**，而不是因为 UI 自己上了链路。
    **同步改口的地方**：`amos-link/src/service.rs` 的模块文档、`amos-link-cli` 的 `run_watch` 文档、
@@ -566,6 +1212,63 @@ cargo test -p amos-link --test service_uds     # StreamHeartbeats 不转发一�
 cargo test -p amos-link --lib health::tests::a_partial_loss_figure_is_never_called_healthy
 cargo test -p amos-link --test service_uds                 # ListTopics ⇒ topics **且** complete
 cargo test -p amos-link-cli --test cli_smoke               # 远端 topics 打印 (inventory complete|incomplete)
+# 参数面（第九轮，§3.10）：`--json` 处处兑现 + 不能用的旗标 exit 2
+cargo test -p amos-link-cli --lib no_flag_is_silently_ignored_on_any_command
+cargo test -p amos-link-cli --lib a_count_of_zero_is_refused_instead_of_doing_nothing
+cargo test -p amos-link-cli --test cli_smoke json_is_honored_by_every_command_that_prints
+cargo test -p amos-link-cli --test cli_smoke a_flag_the_command_cannot_use_is_a_usage_error_not_a_silent_no_op
+# 一份文档 / 一种词汇（第十轮，§3.11）：远端 status 与本地同形，对端表只有一种拼法，判决只有一种词
+cargo test -p amos-link --lib health::tests::the_verdict_json_is_the_control_planes_vocabulary
+cargo test -p amos-link --lib discovery::tests::a_peer_view_serializes_as_the_flat_peer_the_control_plane_carries
+cargo test -p amos-link --lib telemetry::tests::the_status_document_speaks_the_control_planes_peer_and_verdict_shapes
+cargo test -p amos-link-cli --lib the_remote_status_document_is_the_local_document_plus_who_answered
+cargo test -p amos-link-cli --test cli_smoke status_json_is_one_document_locally_and_over_a_socket
+cargo test -p amos-link-cli --test cli_smoke the_running_nodes_peer_table_crosses_the_socket
+cargo test -p amos-tauri --lib link::tests::a_peer_serializes_to_the_same_five_fields_the_cli_prints
+cargo run -p amos-link-cli -- status --peer dog1 | jq '.health.state, .peers, .metrics'   # 判决是对象、对端是数组
+cargo run -p amos-link-cli -- status --socket /tmp/amos-ai.sock | sed -n '1,12p'          # 人类形态含对端表与清单行
+cargo run -p amos-link-cli -- discover --static dog1 --json | jq '.peers[0]'              # id/kind/endpoint/last_seen_ms/beacons
+# 报告也要有日期（第十一轮，§3.12）：回程的年龄，人类形态 `age=` 与机器形态 `age_ms`
+cargo test -p amos-link-cli --lib a_report_is_dated_and_an_unusable_stamp_says_so
+cargo test -p amos-link-cli --lib the_machine_form_carries_the_age_as_a_number_or_null
+cargo test -p amos-link-cli --lib the_age_format_is_shared_with_the_panel
+cargo test -p amos-link-cli --test cli_smoke the_return_path_is_dated_when_it_crosses_the_socket
+cd crates/amos-tauri/frontend-ts && bun test src/__tests__/link.test.ts      # actuationAgeMs / reportAgeKey / reportAgeText
+cd crates/amos-tauri/frontend-ts && bunx vitest run svelte-tests/link-page.svelte.test.ts  # 每行的「… 前上报」
+cargo run -p amos-link-cli -- status --socket /tmp/amos-ai.sock | grep 'robot='   # 行尾 age=…（报告自己的日期）
+# 序号属于「流」（第十二轮，§3.13）：一个对端多条流不再虚报 stale，快流不再吃掉慢流的真丢帧
+cargo test -p amos-link --lib sequence::tests::one_peers_two_topics_are_two_streams_not_one_restarting
+cargo test -p amos-link --lib sequence::tests::a_fast_stream_does_not_hide_a_slow_streams_real_gap
+cargo test -p amos-link --test link_e2e a_best_effort_lag_is_visible_as_a_sequence_gap   # 真 broker：一条流的 gap
+cargo test -p amos-link-cli --lib the_loss_figures_name_the_stream_that_lost_frames
+# 信标的端点 + 流式 --json（第十三轮，§3.14）：地址能填、填错在启动期被拒、真的上线；每行都是事件
+cargo test -p amos-link --lib discovery::tests::an_advertisement_is_parsed_and_bounded_before_a_beacon_is_built
+cargo test -p amos-link --lib discovery::tests::a_federating_node_announces_the_endpoints_it_was_given   # 真 broker：对端表里有地址
+cargo test -p amos-link --lib discovery::tests::an_unemittable_advertisement_is_refused_before_the_task_starts
+cargo test -p amos-link-cli --lib the_cli_announces_the_endpoint_the_operator_gave   # 节点真的广播了操作员输入的地址
+cargo test -p amos-link-cli --lib the_advertisement_is_bounded_where_the_operator_can_fix_it
+cargo test -p amos-link-cli --test cli_smoke an_advertised_endpoint_is_what_the_node_announces_or_a_usage_error
+cargo test -p amos-link-cli --test cli_smoke the_streaming_commands_are_json_line_by_line_when_asked
+cargo test -p amos-link-cli --features lan --test cli_smoke a_lan_sweep_announces_the_endpoints_it_was_given
+# 一个事实一种回答（第十四轮，§3.15）：帧的年龄不再被折成 0，bench 不把「不可测」记成 0 µs
+cargo test -p amos-link-cli --lib a_frame_stamped_in_the_future_has_no_age_to_print   # 两个真实时钟的 e2e
+cargo test -p amos-link-cli --lib a_measurable_age_is_still_a_number_and_the_epoch_is_not_absent
+cargo test -p amos-link-cli --lib a_benchmark_never_counts_an_unmeasurable_frame_as_zero_latency
+cargo test -p amos-link-cli --lib the_benchmark_histogram_keeps_its_microsecond_resolution
+cargo test -p amos-link-cli --test cli_smoke the_age_caveat_and_the_bench_sample_count_are_wired
+cargo test -p amos-link --lib codec::tests::timestamps_validate_and_measure_age   # `since` 的饱和是**设计**（对 duration）
+cargo run -p amos-link-cli -- bench --count 20             # 末行 latency 带 (n=20)，异常时带 "N frame(s) excluded"
+cargo run -p amos-link-cli -- sub --count 1 --timeout-ms 50  # 头部带 clock_synced=false: ages are bounds, not measurements
+cargo run -p amos-link-cli -- bench --count 20 --json | jq '.latency_us.samples, .skewed, .received'
+cargo run -p amos-link-cli -- watch --kind robot --endpoint tcp/10.0.0.7:7447 --seconds 2   # advertising=tcp/…
+cargo run -p amos-link-cli -- watch --endpoint tcp/10.0.0.7:7447 --seconds 2 --json | jq -c '.event'  # 每行一个事件
+cargo run -p amos-link-cli -- discover --endpoint tcp/x:1                    # exit 2：离线 sweep 不公告
+cargo run -p amos-link-cli -- status --endpoint tcp/x:1                      # exit 2：belongs to `discover` and `watch`
+cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 5 --timeout-ms 2000   # 有丢帧时逐流打印 lost peer=… topic=…
+cargo run -p amos-link-cli -- topics --json                 # 一份文档：{"complete":…,"topics":[…]}（可 jq）
+cargo run -p amos-link-cli -- motor --action '{"action":"arm"}' --json   # frames[] + applied + device:null
+cargo run -p amos-link-cli -- bench --count 3 --pattern 'amos/**'        # exit 2：belongs to `sub` and `state`
+cargo run -p amos-link-cli -- pub --topic amos/x --text hi --count 0     # exit 2：--count 0 空跑被拒
 cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 5 --timeout-ms 2000   # 末行报告 gaps/missing/stale/loss
 cargo run -p amos-link-cli -- sub --pattern 'amos/*/control/*' --count 1 --timeout-ms 1000  # 档位由 channel 决定（reliable）
 # 注意 `--timeout-ms`：默认 0 = 永远等，没有发布者时这条命令**不会返回**（本文件的示例一律给上界）。
@@ -588,6 +1291,20 @@ cargo run -p amos-link-cli -- watch --socket /tmp/amos-ai.sock --seconds 3  # �
 cargo test -p amos-link --features zenoh --lib a_typed_frame_crosses_a_real_session_over_tcp_loopback
 # ↑ 真会话往返（两个 peer + 显式端点 + 关 scouting，走 TCP 环回）——**不再是 #[ignore]**（§3.6）
 cargo test -p amos-link --features zenoh -- --ignored   # 只剩跨主机 scouting（需真网络）
+# 一个 RPC「不存在」时的消费者契约（第十六轮，§3.17）：老 daemon 只让那一栏缺席，不拖垮整次读取
+cargo test -p amos-tauri --test link_status_e2e a_daemon_without_the_return_path_still_answers_the_panel
+cargo test -p amos-link-cli --test cli_smoke an_older_daemon_still_answers_the_status_over_a_socket
+cd crates/amos-tauri/frontend-ts && bunx vitest run svelte-tests/link-page.svelte.test.ts   # 三态（unavailable/none/reported）
+cargo run -p amos-link-cli -- status --socket /tmp/old-daemon.sock | tail -3    # 「not answered by this daemon」
+# 同一份 QoS 必须在两个传输上意味着同一件事（第十七轮，§3.18）：
+# 真 TCP 环回会话上，Qos::sensor() 连发 5 帧后只 recv 一次 ⇒ 拿到**第 5 帧**且 dropped=4
+cargo test -p amos-link --features zenoh --lib a_latest_only_subscription_over_a_real_session_keeps_the_newest_frame
+# best-effort depth 2：满即丢、不背压、dropped 如实计数
+cargo test -p amos-link --features zenoh --lib a_best_effort_queue_over_a_real_session_drops_the_newest_and_counts_it
+cargo test -p amos-link --features zenoh --lib a_node_over_a_real_session_counts_what_it_publishes
+# 计数器在真网络上也是真的（第十五轮，§3.16）：两个真实会话，帧过去、数字跟着动
+cargo test -p amos-link --features zenoh --lib a_node_over_a_real_session_counts_what_it_publishes
+cargo test -p amos-link --features zenoh --lib a_typed_frame_crosses_a_real_session_over_tcp_loopback
 # 联邦信标节奏 = TTL/3（`federation_period()`，一处规则；默认 TTL 3s ⇒ 每秒 1 个信标）。
 # 此前 `discover --bus` 与 `watch` 硬编码 200ms（5 个/秒），既多打 4 倍信标，又让
 # `published` 看起来像有真实流量 —— 现在三条路径（lan/bus/watch）同一条规则。
@@ -605,4 +1322,49 @@ cargo run -p amos-link-cli -- bench --size 16777216
 # 合法的大计数仍然照跑（"一直发"是操作员自己的请求），但不会再在预留 latency 向量时 abort
 cargo run -p amos-link-cli -- bench --count 18446744073709551615
 ```
+## 8. 与 ROS 2 的功能对照（逐项，2026-09-15 复核，REQ-A272）
+
+**为什么要有这一节**：README 把 AmOS-Link 叫作「ROS-class pub/sub」，`qos.rs` 说「DDS 叫 QoS，ROS 2 叫
+reliability + history depth」，而本节的用途是**把这些类比逐条落到代码和证据上** —— 哪一条是真的（有消费者、
+有用例）、哪一条只是名字像、哪一条我们**故意**不做。**类比不是兼容**：本 crate 没有 `.msg`/IDL、没有 DDS 线路、
+没有 `rostopic` 兼容（§6.1）；下表每一行都写明「对应物」与「差异」，最后三行是**类比的断裂处**。
+
+| ROS 2 能力 | AmOS-Link 的对应物 | 状态 | 证据 / 差异（诚实说） |
+|---|---|---|---|
+| **Topic + pub/sub** | `Topic`（`amos/<peer>/<channel>/<name>`，`*`/`**`）+ `Publisher<T>`/`Subscriber<T>` | ✅ 等价 | `keyexpr.rs`（迭代匹配、长度上限）、`broker.rs`、`node.rs`；**差异**：一层命名空间（peer 段）是**强制的**，没有「无名根话题」 |
+| **QoS：reliability** | `Reliability{BestEffort, Reliable}` | ⚠️ **名字同、语义不同** | ROS 2 的 RELIABLE = 传输层重传；本 crate 的 `Reliable` = **本地消费队列背压**（网络链路可靠性取传输默认）。§4 的 Zenoh 行与 `network_reliability_note` 都写着这条 |
+| **QoS：history depth（KEEP_LAST n）** | `depth` + `DropPolicy{Newest, Oldest}`，`Qos::sensor()/state()/control()` | ✅ 语义对齐（第十七轮收紧） | `KEEP_LAST(1)` ≡ `DropOldest` + depth 1 ≡ `Qos::sensor()`：**两个传输上都**「醒来拿到最新的那一帧」（§3.18 修的就是网络侧曾拿到最老那帧） |
+| **QoS：KEEP_ALL** | ❌ 无 | ❌ 故意不做 | 唯一的「全留」形状是 `Reliable` 的无损背压；无限历史的替代品不存在，`MAX_DEPTH=4096` 直接拒绝（一个更大的队列是泄漏，不是缓冲） |
+| **QoS：durability（VOLATILE / TRANSIENT_LOCAL）** | ❌ 只有 VOLATILE 语义 | ❌ 故意不做 | 没有「晚加入者收到最后一帧」的机制；**对端表 + 心跳 TTL** 是「谁在」的回答，不是历史。要 late-joiner 语义，只能让发布者周期重发（心跳/状态类话题本来就是周期性的） |
+| **QoS：deadline / lifespan / liveliness** | 心跳 + `PeerRegistry` TTL + `LinkHealth` | ⚠️ 用别的机制实现 | §4 的 Zenoh 行已写「节点存活由我们自己的心跳 + TTL 表表达」；**差异**：判据是**代际年龄与序号缺口**（`SeqTracker`），不是 per-topic 的 deadline 契约 |
+| **Service（request/reply）** | gRPC 控制面 `GetStatus`/`ListTopics`/`Publish`/`StreamHeartbeats`/`ListActuations` | ⚠️ 控制面有，数据面没有 | §5；**差异**：那些 RPC 是**运维工具**（读状态、注入帧、读回程），没有「服务名 + 客户端关联 id」这套数据面语义 |
+| **Action（长任务 + 反馈 + 取消）** | ❌ 无 | ❌ 故意不做 | 运动/长任务的编排在 `amos-robot`/`amos-ai` 层（gRPC 命令 + 状态回程），不在链路上 |
+| **Parameter（node 参数）** | ❌ 无 | ❌ 故意不做 | 配置来自环境变量（§6）与各 crate 自身；链路不承载参数分发 |
+| **`.msg` / IDL / 接口自描述** | `serde` 类型 + `bincode` 帧（`magic │ ver │ hdr │ crc32 │ payload`） | ⚠️ 类型契约只在进程内、线缆不自描述 | 帧头**不带类型名**：订阅方必须先知道类型（`Subscriber::<T>`）。这是设计选择（体积/零拷贝），代价是「通用 echo 任意类型」做不到 —— CLI 的 `sub` 只能解它认识的消息（§6.1） |
+| **Discovery（DDS simple discovery）** | 两种信标：链路自身传输上的 beacon + `lan` feature 的 UDP 组播；`PeerRegistry` 带 TTL | ✅ 等价（范围更小） | `discovery.rs`/`lan.rs`；**差异**：不是 DDS 的分布式发现协议，**且明确不是认证**（§6.2） |
+| **Time / sim time（`/clock`）** | `amos-timesync` 的 `Clock`（`host()` / 已校准），`clock_synced` 一路带到判决与界面 | ✅ 有对应物 | §3.15：未校准时所有延迟是**上界**；**差异**：没有 `use_sim_time` 那种「仿真时钟注入」开关 |
+| **TF / 坐标变换树** | ❌ 无 | ❌ 故意不做 | 坐标与里程计在 `amos-robot` 的 HAL/状态里；链路只搬字节 |
+| **rosbag（录制/回放）** | ❌ 无 | ❌ 故意不做 | `bench`/`watch`/`sub --json` 是可**管道**的观测（`> file.jsonl` 就是录制），但没有 bag 格式、没有按时间回放 |
+| **SROS2（认证/加密）** | ❌ 无 | ❌ 故意不做 | §6.2：发现不是认证；UDS 侧靠文件权限，网络侧靠传输配置。**不要**把链路当作安全边界 |
+| **Lifecycle node（configure/activate/…）** | ❌ 无 | ❌ 故意不做 | 组件的启动/停止是 systemd / `amos-kernel` 的事 |
+| **Executor / callback group** | ❌ 无（**由调用方拥有线程**） | ❌ 故意不做 | README：「not a scheduler (you own the control thread and its rate)」；`try_recv` 是给控制回路用的非阻塞读取 |
+| **`ros2 topic echo` / `hz` / `bw`** | `sub` / `watch` / `bench` | ⚠️ 一一对应，形状不同 | `watch` 打**心跳**（含 `missed`）、`bench` 打**延迟直方图 + 吞吐**、`sub` 打**每一帧 + 序号缺口与丢帧计数**。**差异**：`hz`/`bw` 是**按话题**的速率/带宽，本 CLI 的吞吐属于 `bench`，速率的代理是 `published` 与序号缺口（§3.15 的纪律：数字要能行动） |
+| **`ros2 topic info`（类型 + 订阅者数）** | `status`（对端表、计数器、判决）+ `topics`（清单及其**完整性**） | ⚠️ 部分 | **差异**：没有「谁订阅了它」的远端视图（broker 知道本地 fan-out 数，网络传输**诚实地说不知道**），也没有类型名 |
+| **`ros2 node list` / `info`** | `status` / `discover`（对端表：id/kind/version/uptime/地址/beacon 数） | ✅ 形状相近 | §5 与 §3.11：对端表是**本节点**看到的，不是全网权威视图 |
+| **`ros2 param` / `service` / `action` CLI** | ❌ 无（没有这些数据面概念） | ❌ 由上表三行决定 | — |
+| **`ros2 doctor`** | `status --json` 的 `health` + `health_reasons`（每个 token 可行动） | ⚠️ 更窄但更具体 | §3.9/§3.12：判决**不是**「OK」，而是枚举 + 原因 token；未校准时钟、序号缺口、清单不完整都会进 reasons |
+| **多语言客户端（rclcpp/rclpy/…）** | ❌ 只有 Rust + 5 个 gRPC RPC | ❌ 故意不做 | 非 Rust 节点通过**控制面**参与（§5 的 `Publish` 就是给它们的）；完整 API 需要各自实现帧格式，不在本仓目标内 |
+| **DDS 线路 / RTPS 互操作** | ❌ 无（Zenoh 作为网络底座，**不是** DDS） | ❌ 故意不做 | §6.1 与 §4：进 ROS 生态需要另写桥接（Zenoh 有 ros2dds 插件，属部署组件） |
+| **安全（认证的对端身份）** | ❌ 无 | ❌ 故意不做 | §6.2：`PeerId` 是**一致性**标记，不是身份。§3.9 的「一帧一个身份」也只是**拒绝自相矛盾**，不是认证 |
+
+**三条断裂处（类比的边界，必须记住）**：
+
+1. **可靠性是两层的**：ROS 2 的 QoS 由中间件在**每个传输**上兑现；本 crate 的 `Reliability` 只管**本地消费队列**，
+   线缆可靠性交给传输（TCP/UDS 可靠、UDP 尽力而为）。所以「`Reliable` ⇒ 一定不丢」在网络上是**两段承诺的合取**，
+   而我们只能证明本地那一段（§4 的界限）。第十七轮把**深度与丢弃策略**这一半在两个传输上对齐了（§3.18）。
+2. **类型契约不在线缆上**：帧头不带类型名/类型哈希。跨语言、跨版本消费者必须先约定类型 —— 这正是「不是 ROS 兼容层」
+   的具体含义之一。
+3. **「谁在」不等于「谁健康」**：对端表回答前者（TTL + 信标），`health` + 心跳序号缺口回答后者；
+   ROS 2 里 liveliness/deadline 是 per-topic 契约，这里是**节点级**的判断。
+
 

@@ -33,6 +33,24 @@ use tauri::State;
 /// but the caller is released with an honest timeout error instead of hanging.
 const SMS_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Maximum bytes in an SMS `thread_id` / `message_id` / `address` string the
+/// WebView hands in via `sms_*` commands.
+///
+/// Real platform ids are short hashes / addresses (`thread_<digits>`, an E.164
+/// phone number). The 256-byte cap mirrors `MAX_MAIL_NAME_BYTES` — well above
+/// any legitimate value, and tight enough that a paste-sized caller cannot
+/// inflate the provider's lookup keys.
+pub const MAX_SMS_ID_BYTES: usize = 256;
+
+/// Maximum bytes in an `sms_send` `text` payload.
+///
+/// The SMS engine already enforces [`amos_sms::validate::MAX_TEXT_CHARS`] (1600
+/// chars ≈ 10 GSM-7 segments); the bridge-level guard is a defence-in-depth
+/// ceiling so a JSON failure (e.g. an over-cap text deserialised as empty
+/// after a JS bug) cannot bypass the engine's check by a path where the
+/// underlying library is rebuilt without the validation crate.
+pub const MAX_SMS_TEXT_BYTES: usize = 4 << 10;
+
 /// Bridge state managed by Tauri.
 pub struct SmsBridge {
     provider: Arc<dyn SmsProvider>,
@@ -193,6 +211,23 @@ fn checked_send(address: &str, text: &str) -> Result<(String, usize), String> {
     let addr = normalize_address(address).map_err(|e| e.to_string())?;
     validate_text(text).map_err(|e| e.to_string())?;
     Ok((addr, segment_count(text)))
+}
+
+/// Bound a thread_id / message_id / address string at the command seam so a
+/// paste-sized caller cannot inflate the SMS provider's lookup keys (the keys
+/// are reused on every list / read command — a 1 MiB id would slow every
+/// subsequent operation).
+fn check_sms_id(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("sms id is empty".to_string());
+    }
+    if s.len() > MAX_SMS_ID_BYTES {
+        return Err(format!(
+            "sms id too long: {} bytes (max {MAX_SMS_ID_BYTES})",
+            s.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Which backend backs SMS right now (no I/O — safe to call at any time).
@@ -682,6 +717,8 @@ pub async fn sms_trash_add(
     if thread_id.trim().is_empty() || message_id.trim().is_empty() {
         return Err("invalid SMS payload: blank thread/message id".to_string());
     }
+    check_sms_id(&thread_id)?;
+    check_sms_id(&message_id)?;
     let folder = match folder.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(name) => Some(amos_sms::SmsFolder::from_wire(name).map_err(|e| e.to_string())?),
@@ -714,6 +751,8 @@ pub fn sms_trash_list() -> Vec<TrashOut> {
 /// Undo a trash: the message shows in AmOS again. `true` when it was trashed.
 #[tauri::command]
 pub fn sms_trash_restore(thread_id: String, message_id: String) -> bool {
+    let _ = check_sms_id(&thread_id);
+    let _ = check_sms_id(&message_id);
     let ok = trash_shared().restore(&thread_id, &message_id);
     if ok {
         tracing::info!(
@@ -852,7 +891,9 @@ pub async fn sms_messages(
     if thread_id.trim().is_empty() {
         return Err("invalid SMS payload: blank thread id".to_string());
     }
+    check_sms_id(&thread_id)?;
     if let Some(addr) = address.as_deref().filter(|a| !a.trim().is_empty()) {
+        check_sms_id(addr)?;
         if let Some(reason) = crate::blocklist::shared().check(addr, amos_blocklist::Channel::Sms) {
             return Err(format!("blocked by rule: {reason:?}"));
         }
@@ -902,6 +943,16 @@ pub async fn sms_send(
     address: String,
     text: String,
 ) -> Result<String, String> {
+    check_sms_id(&address)?;
+    // Defence-in-depth upper bound — `validate_text` will reject with a
+    // user-facing reason, but a megabyte-sized body still costs a JSON round
+    // trip per call before the engine sees it.
+    if text.len() > MAX_SMS_TEXT_BYTES {
+        return Err(format!(
+            "sms_send text too long: {} bytes (max {MAX_SMS_TEXT_BYTES})",
+            text.len()
+        ));
+    }
     let (addr, segments) = checked_send(&address, &text)?;
     let masked = mask_address(&addr);
     let provider = active_arc(&state);
@@ -1655,5 +1706,18 @@ mod tests {
         let t = kept.iter().find(|t| t.id == "1").unwrap();
         assert_eq!(t.last_text, "下班顺路买点菜。");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_sms_id_rejects_empty_and_oversized() {
+        assert!(check_sms_id("").is_err(), "empty id is refused");
+        let huge = "x".repeat(MAX_SMS_ID_BYTES + 1);
+        assert!(
+            check_sms_id(&huge).is_err(),
+            "id past MAX_SMS_ID_BYTES is refused"
+        );
+        // A real-looking thread id fits comfortably.
+        assert!(check_sms_id("thread_42").is_ok());
+        assert!(check_sms_id("+8613800138000").is_ok());
     }
 }

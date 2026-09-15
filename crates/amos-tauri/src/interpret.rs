@@ -21,6 +21,22 @@ use tokio::sync::mpsc;
 /// Tauri event emitted for every session output.
 pub const INTERPRET_EVENT: &str = "interpret-output";
 
+/// Maximum number of f32 samples in one `interpret_audio` chunk.
+///
+/// Mono 16 kHz PCM: 16 000 samples/sec. A reasonable chunk is 100 ms (~1 600
+/// samples), but a streaming UI may legitimately send up to a 5-second buffer
+/// when the WebView coalesces frames. 64 000 samples ≈ 4 s is comfortably
+/// larger than any single producer chunk; beyond it the call is almost certainly
+/// a runaway producer / a paste attack and must be refused at the seam.
+pub const MAX_INTERPRET_AUDIO_SAMPLES: usize = 64_000;
+
+/// Maximum bytes in one `interpret_text` segment.
+///
+/// The translation daemon is rate-limited; a multi-megabyte text line would
+/// either stall the gRPC pipeline or consume its token budget. 32 KiB is a
+/// paragraph; a UI that really wants longer content should chunk it client-side.
+pub const MAX_INTERPRET_TEXT_BYTES: usize = 32 << 10;
+
 /// Serializable mirror of [`InterpretationOutput`] (prost/domain enums are not
 /// directly `Serialize`-able as one tagged enum).
 #[derive(Clone, Debug, Serialize)]
@@ -331,6 +347,13 @@ pub async fn interpret_text(
     text: String,
     session_id: Option<u64>,
 ) -> Result<(), String> {
+    // Bound at the command seam — same rationale as `ask_ai_agent` prompts.
+    if text.len() > MAX_INTERPRET_TEXT_BYTES {
+        return Err(format!(
+            "interpret text too long: {} bytes (max {MAX_INTERPRET_TEXT_BYTES})",
+            text.len()
+        ));
+    }
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
@@ -350,6 +373,15 @@ pub async fn interpret_audio(
     chunk: Vec<f32>,
     session_id: Option<u64>,
 ) -> Result<(), String> {
+    // Bound the chunk at the command seam: a misbehaving producer that hands a
+    // megabyte-long Vec to every push would saturate the channel. The downstream
+    // ASR expects frames in the ms-to-low-second range, not multi-second dumps.
+    if chunk.len() > MAX_INTERPRET_AUDIO_SAMPLES {
+        return Err(format!(
+            "interpret audio chunk too large: {} samples (max {MAX_INTERPRET_AUDIO_SAMPLES})",
+            chunk.len()
+        ));
+    }
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
@@ -656,5 +688,16 @@ mod tests {
             p.is_some(),
             "configured model dir {dir} should yield a local sherpa pipeline"
         );
+    }
+
+    /// The constant shapes are documented and unit-checked so a future bump of
+    /// either ceiling is a conscious choice rather than a silent drift.
+    #[test]
+    fn the_interpret_command_bounds_cover_realistic_payloads() {
+        // A 5-second mono 16 kHz buffer is 80 000 samples — already past the cap,
+        // so the cap truly only covers streaming-sized chunks.
+        assert!(MAX_INTERPRET_AUDIO_SAMPLES < 80_000);
+        // 32 KiB of text is a long paragraph; nothing legitimate is longer.
+        assert_eq!(MAX_INTERPRET_TEXT_BYTES, 32 << 10);
     }
 }

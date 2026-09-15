@@ -2,9 +2,10 @@
   /**
    * SpotlightTrigger.svelte — the 🔍 widget in the top bar.
    *
-   * Same contract as `LaunchpadTrigger`: own rendering, ask the container (via the
-   * chrome handle) for the overlay. `⌘Space` reaches the same intent from the
-   * keyboard, which the container binds — one action, two ways in.
+   * Same contract as `LaunchpadTrigger`: own rendering, ask the shell (via the chrome
+   * handle) for the overlay. `⌘Space` reaches the same intent from the keyboard, which
+   * the shell binds **out of the registry** — and the widget reads the very same row to
+   * label its tooltip, so the hint a user sees is the key that is actually matched.
    */
   import { getContext } from "svelte";
   import { SHELL_CHROME_API, type ShellChromeApi } from "../../lib/shellModule";
@@ -18,5 +19,6 @@
   label={t("desktop.spotlight")}
   testId="chrome-spotlight"
   glyph="🔍"
+  shortcut={api?.overlayShortcut("spotlight") ?? null}
   onclick={() => api?.openSpotlight()}
 />

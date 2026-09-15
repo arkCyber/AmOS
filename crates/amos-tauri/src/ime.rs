@@ -65,6 +65,36 @@ pub const PREDICT_KIND: &str = "predict";
 /// logged, never silent.
 pub const MAX_IME_SESSIONS: usize = 64;
 
+/// Maximum bytes the WebView may hand to one [`crate::ime::ime_key`] call.
+///
+/// Only ASCII letters compose, but the call accepts an arbitrary string and
+/// scans it char-by-char; bounding the **input** prevents a paste / malicious
+/// caller from forcing the engine to iterate a 4 MiB string and to grow the
+/// buffer beyond [`MAX_INPUT_CHARS`]. `64` covers a 64-character latin-alphabet
+/// paste (rare but legal for romanisation workflows), well above any one-finger
+/// tap. The command seam is the right place to refuse — same rule as
+/// `real_dial::MAX_DIAL_CHARS`.
+pub const MAX_KEY_CHARS: usize = 64;
+
+/// Maximum bytes in one `ime_fuzzy_toggle` pair name / `ime_fuzzy_preset` preset
+/// name coming from the WebView.
+///
+/// Real pair keys are ≤7 ASCII chars (`"z_zh"`, `"n_l"`, …); real preset names
+/// are 11 chars (`"permissive"`). The cap is well above any legitimate value
+/// but tight enough that a paste / runaway JS loop cannot turn every fuzzy
+/// change into an O(n) string compare over a multi-kilobyte buffer.
+pub const MAX_IME_NAME_BYTES: usize = 64;
+
+/// Maximum length of one window's pinyin buffer in characters.
+///
+/// Pinyin words are at most 6 letters (`zhuang`), the longest valid sentence
+/// search is bounded by the engine's `MAX_INPUT`. A 64-letter buffer is far
+/// past what any human would type; anything longer is almost certainly a loop
+/// or a hostile caller, and silently accepting it would (a) make candidate
+/// generation slow on every keystroke and (b) defeat the log line that says
+/// "you hit the cap" if such a thing ever needed reporting.
+pub const MAX_INPUT_CHARS: usize = 64;
+
 /// The IME bridge: **one** shared engine + learner, **one** buffer per window.
 pub struct ImeBridge {
     inner: Mutex<ImeInner>,
@@ -358,11 +388,40 @@ impl ImeBridge {
     /// A tap that starts a new word also closes **that window's** previous commit's
     /// undo window (the engine drops its hint, and the code it would have forgotten
     /// is no longer the "last pick").
+    ///
+    /// The buffer is bounded at [`MAX_INPUT_CHARS`]: when a paste / runaway loop
+    /// would push it past the cap the call is **dropped silently** (a single
+    /// pinyin sentence never legitimately reaches 64 chars) and the existing
+    /// buffer is left intact. The dropped count is logged once per window so a
+    /// stuck key handler is visible.
     pub fn key(&self, window: &str, ch: &str) -> ImeStateOut {
         let mut inner = self.lock();
         let core = Arc::clone(&inner.core);
         let session = inner.session(window);
-        if session.input.type_str(ch) > 0 {
+        let before = session.input.input().len();
+        if before >= MAX_INPUT_CHARS {
+            // A buffer already at the cap will not absorb any new letters.
+            // Silent drop, but log so a stuck keyboard is visible: the WebView
+            // may have entered a loop that hammers ime_key.
+            tracing::warn!(
+                target: "amos::ime",
+                window = %window,
+                input_len = before,
+                cap = MAX_INPUT_CHARS,
+                "IME buffer at cap — refusing further letters for this window"
+            );
+            return state_of(session, &core);
+        }
+        // Take only the letters that fit (the JS side already enforces
+        // MAX_KEY_CHARS, but a leftover in-flight caller could still exceed).
+        let remaining = MAX_INPUT_CHARS.saturating_sub(before);
+        let mut accepted = 0usize;
+        for c in ch.chars().take(remaining) {
+            if session.input.type_char(c) {
+                accepted += 1;
+            }
+        }
+        if accepted > 0 {
             session.last_pick_code = None;
         }
         state_of(session, &core)
@@ -612,6 +671,16 @@ pub fn ime_key(
     ch: String,
     bridge: tauri::State<'_, ImeBridge>,
 ) -> Result<ImeStateOut, String> {
+    // `ch` is a string from the JS side — paste / a buggy keyboard could hand us
+    // arbitrarily long input, so cap it before it reaches the buffer (the
+    // engine itself only accepts ASCII letters, but iterating a 4 MiB string
+    // would still be wasted work and a denial-of-service vector).
+    if ch.len() > MAX_KEY_CHARS {
+        return Err(format!(
+            "ime_key payload too long: {} chars (max {MAX_KEY_CHARS})",
+            ch.len()
+        ));
+    }
     Ok(bridge.key(window.label(), &ch))
 }
 
@@ -652,6 +721,12 @@ pub fn ime_fuzzy_toggle(
     pair: String,
     bridge: tauri::State<'_, ImeBridge>,
 ) -> Result<ImeStateOut, String> {
+    if pair.len() > MAX_IME_NAME_BYTES {
+        return Err(format!(
+            "ime_fuzzy_toggle pair too long: {} bytes (max {MAX_IME_NAME_BYTES})",
+            pair.len()
+        ));
+    }
     bridge.fuzzy_toggle(window.label(), &pair)
 }
 
@@ -663,6 +738,12 @@ pub fn ime_fuzzy_preset(
     preset: String,
     bridge: tauri::State<'_, ImeBridge>,
 ) -> Result<ImeStateOut, String> {
+    if preset.len() > MAX_IME_NAME_BYTES {
+        return Err(format!(
+            "ime_fuzzy_preset name too long: {} bytes (max {MAX_IME_NAME_BYTES})",
+            preset.len()
+        ));
+    }
     bridge.fuzzy_preset(window.label(), &preset)
 }
 
@@ -793,6 +874,57 @@ mod tests {
             "a composing window was evicted while idle ones were droppable"
         );
         assert!(b.open_window_count() <= MAX_IME_SESSIONS);
+    }
+
+    /// One window's pinyin buffer is **bounded** — a paste / a runaway keyboard
+    /// loop cannot push it past the cap, and letters beyond it are silently
+    /// dropped (so the buffer's state is preserved, the new chars are not).
+    #[test]
+    fn the_input_buffer_is_bounded_and_extra_letters_are_dropped() {
+        let b = ImeBridge::boot();
+        // Fill the buffer to the cap with one big call.
+        let big = "z".repeat(MAX_INPUT_CHARS + 50);
+        let s = b.key(MAIN, &big);
+        assert_eq!(
+            s.input.len(),
+            MAX_INPUT_CHARS,
+            "the buffer was not capped at MAX_INPUT_CHARS"
+        );
+
+        // Further letters stay dropped.
+        let s = b.key(MAIN, "abc");
+        assert_eq!(s.input.len(), MAX_INPUT_CHARS);
+        // …and an ASCII tap **beyond** the cap on a new call also stays a no-op:
+        // a stuck keyboard that hammers ime_key would otherwise grow this map
+        // to an unbounded size.
+        let s = b.key(MAIN, "xyz");
+        assert_eq!(s.input.len(), MAX_INPUT_CHARS);
+
+        // `backspace` releases room and accepts letters again.
+        let s = b.backspace(MAIN);
+        assert_eq!(s.input.len(), MAX_INPUT_CHARS - 1);
+        let s = b.key(MAIN, "q");
+        assert_eq!(s.input.len(), MAX_INPUT_CHARS);
+    }
+
+    /// The constants defend the documented shapes — E.164 + pinyin lengths +
+    /// the cap is comfortably above any single human keystroke, and the
+    /// per-tap limit fits in the buffer's per-window limit (so a single key
+    /// cannot exceed it in one go).
+    #[test]
+    fn the_key_and_input_constants_make_sense() {
+        assert!(
+            MAX_KEY_CHARS >= 1,
+            "MAX_KEY_CHARS must allow at least one char"
+        );
+        assert!(
+            MAX_INPUT_CHARS >= MAX_KEY_CHARS,
+            "MAX_INPUT_CHARS must accept a full MAX_KEY_CHARS tap"
+        );
+        assert!(
+            MAX_INPUT_CHARS >= 32,
+            "MAX_INPUT_CHARS must cover a real pinyin sentence"
+        );
     }
 
     /// Two windows answer from **one** profile: what one window learns is on disk

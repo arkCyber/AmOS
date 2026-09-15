@@ -20,5 +20,6 @@
   label={t("desktop.launchpad")}
   testId="chrome-launchpad"
   glyph="🚀"
+  shortcut={api?.overlayShortcut("launchpad") ?? null}
   onclick={() => api?.openLaunchpad()}
 />
