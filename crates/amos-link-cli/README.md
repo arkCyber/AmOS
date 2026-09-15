@@ -44,6 +44,11 @@ Four honest notes about scope, all enforced in code rather than promised:
   nothing is publishing — a scripted probe must bound it. Expiry is reported
   (`timeout after …ms with no frame (received N)`) and the run still exits 0: a bounded
   observation that saw nothing is a fact, not a failure.
+- **The loss figures say what they cover.** The per-publisher sequence tracker is bounded
+  (`MAX_TRACKED_STREAMS`, because its keys are publisher ids off the wire), so `sub`/`watch`
+  print `untracked=` and `tracking=complete|full` beside `missing=`/`lost=`: when the table
+  filled up, `tracking=full` is the honest answer, never a clean loss figure that quietly
+  stopped accounting.
 - Every command that joins the peer federation (`discover --bus`, `watch`, `discover --lan`)
   announces at the same cadence — a beacon every `TTL/3` (1 s for the default 3 s TTL), from
   one helper. Announcing faster is legal but it is wire noise, and it makes this node's own

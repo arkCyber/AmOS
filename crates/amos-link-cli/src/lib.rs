@@ -547,7 +547,7 @@ pub async fn run(opts: Opts) -> Result<()> {
             let gaps = seq.summary();
             println!(
                 "stats received={} dropped={} decode_errors={} blocked={} streams={} gaps={} \
-                 missing={} stale={} loss={:.2}%",
+                 missing={} stale={} untracked={} tracking={} loss={:.2}%",
                 stats.received,
                 stats.dropped,
                 stats.decode_errors,
@@ -556,6 +556,15 @@ pub async fn run(opts: Opts) -> Result<()> {
                 gaps.gaps,
                 gaps.missing,
                 gaps.stale,
+                gaps.untracked,
+                // The loss figure describes only the streams that were tracked
+                // (`MAX_TRACKED_STREAMS`); when the table filled up, this says so instead of
+                // presenting a clean number that stopped accounting.
+                if seq.is_complete() {
+                    "complete"
+                } else {
+                    "full"
+                },
                 f64::from(gaps.loss_ratio()) * 100.0
             );
         }
@@ -1584,6 +1593,8 @@ async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
                             "peers": status.peers.len(),
                             "beats_seen": seen,
                             "beats_missing": beats_missing,
+                            "beats_untracked": beats_seq.untracked(),
+                            "beat_tracking": if beats_seq.is_complete() { "complete" } else { "full" },
                             "health": health.label(),
                             "health_reasons": health
                                 .reasons()
@@ -1596,7 +1607,7 @@ async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
                     println!(
                         "link  peer={} uptime={}ms clock_synced={} peers={} published={} \
                          delivered={} dropped={} blocked={} decode_errors={} beats_seen={} \
-                         beats_missing={} health={}",
+                         beats_missing={} beats_untracked={} tracking={} health={}",
                         status.peer,
                         status.uptime_ms,
                         status.clock_synced,
@@ -1608,6 +1619,12 @@ async fn run_watch(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
                         metrics.decode_errors,
                         seen,
                         beats_missing,
+                        beats_seq.untracked(),
+                        if beats_seq.is_complete() {
+                            "complete"
+                        } else {
+                            "full"
+                        },
                         health.summary()
                     );
                 }

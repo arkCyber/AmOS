@@ -459,7 +459,10 @@ fn proto_actuation(robot: &str, state: &ActuationState, stamp: Timestamp) -> Pro
         robot: robot.to_string(),
         seq: state.seq.unwrap_or(0),
         gait: state.gait.map(|g| g.key().to_string()).unwrap_or_default(),
-        frames: state.frames as u32,
+        // Saturating, like every other `usize -> u32` on this wire (see `count_to_u32`). Since
+        // the report is validated at decode, an over-ceiling count cannot arrive from a peer —
+        // which is exactly why the mapping states the rule instead of assuming it.
+        frames: count_to_u32(state.frames),
         armed: state.armed,
         estopped: state.estopped,
         estop_reason: state
@@ -524,6 +527,38 @@ mod tests {
             assert_eq!(count_to_u32(beyond), u32::MAX);
             assert_eq!(beyond as u32, 3, "…not the low 32 bits");
         }
+    }
+
+    #[test]
+    fn an_actuation_report_maps_to_the_wire_without_wrapping() {
+        // The same rule, in the *other* mapping on this wire. `proto_actuation` used
+        // `state.frames as u32`, so a report claiming `2³² + 3` frames was rendered to the
+        // System UI as `3` — "the robot wrote three frames" — even though the number came off
+        // the link. Decode-time validation now makes such a report impossible (`ActuationState`
+        // is refused before it can be folded), and this test pins the mapping itself so the
+        // arithmetic cannot silently regress to a truncation either way.
+        let stamp = Timestamp { secs: 1, nanos: 2 };
+        let mut huge = report(Gait::Trot, true);
+        huge.frames = usize::MAX;
+        assert_eq!(
+            proto_actuation("dog1", &huge, stamp).frames,
+            u32::MAX,
+            "saturated, not the low 32 bits"
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            huge.frames = (1usize << 32) + 3;
+            let wire = proto_actuation("dog1", &huge, stamp);
+            assert_eq!(wire.frames, u32::MAX);
+            assert_ne!(wire.frames, 3, "the truncation this replaced");
+        }
+
+        // A normal report is untouched.
+        assert_eq!(
+            proto_actuation("dog1", &report(Gait::Trot, true), stamp).frames,
+            13
+        );
     }
 
     fn report(gait: Gait, armed: bool) -> ActuationState {

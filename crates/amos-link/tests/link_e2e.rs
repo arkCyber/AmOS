@@ -292,6 +292,76 @@ async fn a_best_effort_lag_is_visible_as_a_sequence_gap() {
     assert_eq!(tracker.streams(), 1);
 }
 
+/// A report off the wire is **validated**, and a refused one is visible as a decode error.
+///
+/// The control plane folds whatever decodes on `amos/*/state/actuation` into the table the
+/// System UI reads, so this payload is a trust boundary: an over-ceiling frame count (which a
+/// `u32` proto field must later carry), an absurd deadman period, or a refusal reason longer
+/// than a sentence must not become a stored, rendered "fact". The honest answer is the one this
+/// crate gives everywhere else — refuse it, **count it**, and let the link go on.
+#[tokio::test]
+async fn a_hostile_actuation_report_is_refused_and_counted() {
+    let metrics = Arc::new(LinkMetrics::new());
+    let clock = Arc::new(Clock::host());
+    let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+    let daemon = LinkNode::with_parts(
+        PeerId::new("amos-daemon").expect("peer"),
+        NodeKind::Tool,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+    let robot = LinkNode::with_parts(
+        PeerId::new("dog1").expect("peer"),
+        NodeKind::Robot,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+
+    // The watcher's own shape: the daemon subscribes to every robot's report on the state
+    // channel (this is what `LinkService::with_heartbeat` starts).
+    let mut watcher = daemon
+        .subscriber::<ActuationState>(
+            amos_link::robot_hal::actuation_pattern().expect("pattern"),
+            Qos::for_channel(Channel::State),
+        )
+        .await
+        .expect("subscribe");
+    let reports = robot.publisher::<ActuationState>(
+        actuation_topic(&PeerId::new("dog1").expect("peer")).expect("topic"),
+    );
+
+    let honest = ActuationState {
+        seq: Some(1),
+        gait: Some(Gait::Trot),
+        frames: JOINTS + 1,
+        armed: true,
+        estopped: false,
+        estop_reason: None,
+        watchdog_ms: Some(1_000),
+        last_refusal: None,
+    };
+    assert!(honest.validate().is_ok(), "the fixture is a legal report");
+
+    // A hostile report: it *encodes* fine (the wire form is unchanged, so a peer can produce
+    // it) — the refusal happens where the bytes are turned back into a value.
+    let mut hostile = honest.clone();
+    hostile.frames = usize::MAX;
+    reports.publish(&hostile).await.expect("publish hostile");
+    reports.publish(&honest).await.expect("publish honest");
+
+    // The watcher skips the hostile one and delivers the honest one…
+    let received = watcher.recv().await.expect("the honest report arrives");
+    assert_eq!(received.message, honest);
+    // …having counted the refusal (the subscription's counter and the node's), which is how an
+    // operator learns that the link carried something that did not become a fact.
+    assert_eq!(watcher.stats().decode_errors, 1);
+    assert!(metrics.snapshot().decode_errors >= 1);
+    // The hostile frame really did travel (it is not a decode error of *our* making).
+    assert_eq!(reports.seq(), 2);
+}
+
 /// A back-pressured control subscriber must not slow an unrelated sensor topic.
 #[tokio::test]
 async fn a_subscriber_that_is_gone_does_not_stall_an_unrelated_topic() {

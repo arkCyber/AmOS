@@ -1088,6 +1088,29 @@ pub fn actuation_pattern() -> Result<Topic> {
     Topic::pattern(format!("amos/*/{}/{ACTUATION_NAME}", Channel::State.key()))
 }
 
+/// Longest refusal reason accepted from the wire, in bytes.
+///
+/// A reason is a sentence for a human (the System UI renders it in a list row, the CLI prints
+/// it): our own are ~60 bytes. 512 is that with room, and it is a **bound on what a peer can
+/// make this node hold and render** — the frame ceiling (16 MiB) is far too generous for a
+/// field that exists to be read.
+pub const MAX_REFUSAL_REASON_BYTES: usize = 512;
+
+/// Largest frame count one actuation report may claim.
+///
+/// A report says how many frames the HAL wrote for one action: 13 on the reference quadruped,
+/// and a multi-step gait on a bigger machine is still far below this. 4096 is two orders of
+/// magnitude of headroom *and* a number a `u32` proto field carries exactly — an absurd claim
+/// (`usize::MAX`) is refused at the decode boundary instead of being folded in and then
+/// silently truncated on its way to the UI.
+pub const MAX_ACTUATION_FRAMES: usize = 4096;
+
+/// Largest deadman period a report may claim, in milliseconds (one hour).
+///
+/// A watchdog longer than this is not a watchdog; accepting `u64::MAX` would put a made-up
+/// number in front of an operator as if the robot had measured it.
+pub const MAX_WATCHDOG_MS: u64 = 3_600_000;
+
 /// A command that was refused **before it reached the bus**, as reported to the commander.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Refusal {
@@ -1107,7 +1130,14 @@ pub struct Refusal {
 /// Who published it is the envelope's `publisher` (the robot), exactly as the topic
 /// doctrine in `docs/amos-link.md` §2 describes, so the payload does not duplicate it. The
 /// report time is the envelope's stamp for the same reason.
+///
+/// **The wire form is validated** ([`ActuationStateWire`]): a report arrives from *another*
+/// peer, so this is a trust boundary like a motor frame's, not a local call. A count, a deadman
+/// period or a reason outside its bound is **refused at decode** — counted as a decode error by
+/// the subscriber and never folded into the control plane's table — instead of being stored,
+/// rendered, and (for `frames`) silently truncated into a `u32` on the way out.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ActuationStateWire", into = "ActuationStateWire")]
 pub struct ActuationState {
     /// The most recent action the bridge acted on (`None` before any arrived).
     pub seq: Option<u64>,
@@ -1142,6 +1172,101 @@ impl ActuationState {
             self.gait,
             self.last_refusal.as_ref().map(|r| r.reason.as_str()),
         )
+    }
+}
+
+/// The wire form of an [`ActuationState`]: identical fields, order and encoding, so the bytes
+/// on the link are unchanged — the difference is that **decoding validates** (the same pattern
+/// [`MotorFrameWire`] uses for a motor frame, and for the same reason: this payload comes from
+/// a peer).
+///
+/// The bounds exist because every one of these fields ends up in front of a human (the System
+/// UI's 「机器人链路」 page, the CLI's `state`) or in a `u32` proto field:
+///
+/// * `frames` — a frame count a `u32` must carry ([`MAX_ACTUATION_FRAMES`]);
+/// * `watchdog_ms` — a deadman period ([`MAX_WATCHDOG_MS`]);
+/// * `last_refusal.reason` — a sentence that is stored and rendered
+///   ([`MAX_REFUSAL_REASON_BYTES`]).
+///
+/// A report that exceeds any of them is refused as a *decode error* (counted by the
+/// subscription, logged with a bounded budget, and skipped) rather than folded in.
+#[derive(Serialize, Deserialize)]
+struct ActuationStateWire {
+    seq: Option<u64>,
+    gait: Option<Gait>,
+    frames: usize,
+    armed: bool,
+    estopped: bool,
+    estop_reason: Option<EstopReason>,
+    watchdog_ms: Option<u64>,
+    last_refusal: Option<Refusal>,
+}
+
+impl TryFrom<ActuationStateWire> for ActuationState {
+    type Error = LinkError;
+
+    fn try_from(wire: ActuationStateWire) -> Result<Self> {
+        let state = ActuationState {
+            seq: wire.seq,
+            gait: wire.gait,
+            frames: wire.frames,
+            armed: wire.armed,
+            estopped: wire.estopped,
+            estop_reason: wire.estop_reason,
+            watchdog_ms: wire.watchdog_ms,
+            last_refusal: wire.last_refusal,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+}
+
+impl From<ActuationState> for ActuationStateWire {
+    /// Encoding never *creates* a report, so it does not re-validate (the value came from a
+    /// locally measured HAL state or from a decode that already passed).
+    fn from(state: ActuationState) -> Self {
+        Self {
+            seq: state.seq,
+            gait: state.gait,
+            frames: state.frames,
+            armed: state.armed,
+            estopped: state.estopped,
+            estop_reason: state.estop_reason,
+            watchdog_ms: state.watchdog_ms,
+            last_refusal: state.last_refusal,
+        }
+    }
+}
+
+impl ActuationState {
+    /// Check a report's **untrusted** fields against their bounds (see
+    /// [`ActuationStateWire`]): a count, a deadman period and a refusal reason.
+    ///
+    /// Called by the wire path ([`ActuationStateWire`]); a local producer does not need it
+    /// (its numbers are measured), but calling it is always safe and cheap.
+    pub fn validate(&self) -> Result<()> {
+        if self.frames > MAX_ACTUATION_FRAMES {
+            return Err(LinkError::Robot(format!(
+                "a report claims {} frames for one action, over the {MAX_ACTUATION_FRAMES} ceiling",
+                self.frames
+            )));
+        }
+        if let Some(ms) = self.watchdog_ms {
+            if ms > MAX_WATCHDOG_MS {
+                return Err(LinkError::Robot(format!(
+                    "a report claims a {ms} ms watchdog, over the {MAX_WATCHDOG_MS} ms ceiling"
+                )));
+            }
+        }
+        if let Some(refusal) = &self.last_refusal {
+            if refusal.reason.len() > MAX_REFUSAL_REASON_BYTES {
+                return Err(LinkError::Robot(format!(
+                    "a refusal reason is {} bytes, over the {MAX_REFUSAL_REASON_BYTES}-byte ceiling",
+                    refusal.reason.len()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1548,6 +1673,85 @@ mod tests {
         .is_ok());
         // A no-argument op ignores its argument (there is nothing to bound).
         assert!(MotorFrame::decode(&raw_frame(MAX_JOINT, MotorOp::Estop.code(), i32::MIN)).is_ok());
+    }
+
+    #[test]
+    fn an_actuation_report_off_the_wire_is_validated_not_trusted() {
+        use crate::codec::Message;
+
+        // The report comes from *another peer*, so it is a trust boundary like a motor frame's
+        // — and every field here ends up in front of a human (the System UI's panel, the CLI's
+        // `state`) or inside a `u32` proto field. The fixture is a legal report; the three
+        // mutations below are what a hostile or broken publisher can put on the link.
+        let good = ActuationState {
+            seq: Some(7),
+            gait: Some(Gait::Trot),
+            frames: JOINTS + 1,
+            armed: true,
+            estopped: false,
+            estop_reason: None,
+            watchdog_ms: Some(1_000),
+            last_refusal: Some(Refusal {
+                seq: 6,
+                reason: "e-stop latched: send {\"action\":\"arm\"} to re-arm".to_string(),
+            }),
+        };
+        // A legitimate report round-trips unchanged: the wire form is byte-compatible.
+        let bytes = <ActuationState as Message>::encode(&good).expect("encode");
+        assert_eq!(
+            <ActuationState as Message>::decode(&bytes).expect("decode"),
+            good
+        );
+
+        // 1. A frame count beyond the ceiling: a `u32` proto field must carry it later, and the
+        //    player is refusing to hold a number it could not report faithfully.
+        let mut huge = good.clone();
+        huge.frames = MAX_ACTUATION_FRAMES + 1;
+        let wire = <ActuationState as Message>::encode(&huge).expect("a peer can write it");
+        let err = <ActuationState as Message>::decode(&wire).expect_err("…and we must refuse it");
+        // The refusal travels through bincode, so it arrives wrapped as a codec error whose text
+        // is the domain refusal — which is what a log line and the decode-error counter carry.
+        assert!(
+            err.to_string().contains("robot command error"),
+            "the domain refusal is preserved: {err}"
+        );
+        assert!(
+            err.to_string().contains(&MAX_ACTUATION_FRAMES.to_string()),
+            "the refusal names the bound: {err}"
+        );
+
+        // 2. A deadman period that is not a deadman period.
+        let mut absurd = good.clone();
+        absurd.watchdog_ms = Some(u64::MAX);
+        assert!(<ActuationState as Message>::decode(
+            &<ActuationState as Message>::encode(&absurd).expect("encode")
+        )
+        .is_err());
+
+        // 3. A refusal reason longer than a sentence: bounded because it is stored and rendered.
+        let mut verbose = good.clone();
+        verbose.last_refusal = Some(Refusal {
+            seq: 1,
+            reason: "x".repeat(MAX_REFUSAL_REASON_BYTES + 1),
+        });
+        assert!(<ActuationState as Message>::decode(
+            &<ActuationState as Message>::encode(&verbose).expect("encode")
+        )
+        .is_err());
+
+        // …and the ceiling itself is legal: an off-by-one here would refuse a real report from a
+        // machine with more joints than the reference quadruped.
+        let mut at_ceiling = good.clone();
+        at_ceiling.frames = MAX_ACTUATION_FRAMES;
+        at_ceiling.watchdog_ms = Some(MAX_WATCHDOG_MS);
+        at_ceiling.last_refusal = Some(Refusal {
+            seq: 1,
+            reason: "x".repeat(MAX_REFUSAL_REASON_BYTES),
+        });
+        assert!(<ActuationState as Message>::decode(
+            &<ActuationState as Message>::encode(&at_ceiling).expect("encode")
+        )
+        .is_ok());
     }
 
     #[test]

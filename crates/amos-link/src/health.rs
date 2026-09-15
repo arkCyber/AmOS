@@ -245,6 +245,7 @@ mod tests {
             gaps,
             missing,
             stale: 0,
+            untracked: 0,
         }
     }
 
@@ -278,6 +279,7 @@ mod tests {
             gaps: 0,
             missing: 0,
             stale: 1,
+            untracked: 0,
         };
         assert!(LinkHealth::evaluate(&busy(), &[peer("dog1")], true, Some(&clean)).is_healthy());
     }

@@ -20,6 +20,11 @@
 //! Honest boundary: counters are per publisher (their sequences are independent), so two
 //! publishers on one topic are tracked separately, and a publisher that reboots to
 //! sequence 1 looks like a run of `stale` frames until [`SeqTracker::reset`] is called.
+//! And the table is **bounded** ([`MAX_TRACKED_STREAMS`]) because its keys come off the
+//! wire: past the ceiling a new publisher is refused and *counted*
+//! (`SeqEvent::Untracked`, [`SeqSummary::is_complete`]) — the alternative shapes are an
+//! unbounded map (a peer could mint a publisher per frame) or a silent stop (a loss figure
+//! that looks clean because nothing was accounted for).
 
 use std::collections::BTreeMap;
 
@@ -57,6 +62,14 @@ pub enum SeqEvent {
         /// The highest sequence seen from this publisher so far.
         last: u64,
     },
+    /// A frame from a publisher this tracker **refuses to add**: the table is full
+    /// ([`MAX_TRACKED_STREAMS`]). The frame is counted (`SeqSummary::untracked`) and the
+    /// summary reports itself as incomplete (`SeqSummary::is_complete`) — never silently
+    /// flattened into a stream that looks clean.
+    Untracked {
+        /// The frame's sequence number.
+        seq: u64,
+    },
 }
 
 impl SeqEvent {
@@ -64,7 +77,27 @@ impl SeqEvent {
     pub fn is_loss(&self) -> bool {
         matches!(self, SeqEvent::Gap { .. })
     }
+
+    /// True when this frame could not be accounted for at all (the tracker is full).
+    pub fn is_untracked(&self) -> bool {
+        matches!(self, SeqEvent::Untracked { .. })
+    }
 }
+
+/// The largest number of publishers one tracker keeps a high-water mark for.
+///
+/// A **static bound** (NASA Power of 10 #2), for the same reason
+/// [`MAX_TRACKED_TOPICS`](crate::broker::MAX_TRACKED_TOPICS) is one: the key is a
+/// **publisher id taken off the wire** (`envelope.header.publisher`), so a hostile or broken
+/// peer can invent a fresh one every frame (`amos/p1/…`, `amos/p2/…`, … — ids are arbitrary
+/// 1..=63-byte tokens). Without a ceiling that map is a permanent, unbounded allocation in a
+/// consumer that runs for hours. Past the ceiling a new publisher is simply not tracked, and
+/// that fact is *reported* rather than hidden: "we stopped accounting" must never read as
+/// "the stream is clean".
+///
+/// The number matches the broker's topic ceiling: one link, one order of magnitude for
+/// diagnostic bookkeeping.
+pub const MAX_TRACKED_STREAMS: usize = 4096;
 
 /// The running totals of a [`SeqTracker`] (a snapshot an operator or a UI reads).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,12 +112,23 @@ pub struct SeqSummary {
     pub missing: u64,
     /// Frames at or below the high-water mark.
     pub stale: u64,
+    /// Frames from publishers the tracker refused to add (its table was full). These are
+    /// **outside** the accounting above — `is_complete()` is how a reader learns that.
+    pub untracked: u64,
 }
 
 impl SeqSummary {
     /// Frames classified so far (`in_order + missing + stale` as frame counts).
+    ///
+    /// Untracked frames are deliberately **not** included: they were not classified. A reader
+    /// that presents this number must present [`SeqSummary::is_complete`] with it.
     pub fn observed(&self) -> u64 {
         self.in_order + self.missing + self.stale
+    }
+
+    /// True when every frame this trackter saw was accounted for (no publisher was refused).
+    pub fn is_complete(&self) -> bool {
+        self.untracked == 0
     }
 
     /// The share of the observed stream that never arrived, in `[0, 1]`.
@@ -99,9 +143,9 @@ impl SeqSummary {
         (self.missing as f64 / total as f64) as f32
     }
 
-    /// True when no frame has been observed at all.
+    /// True when no frame has been observed at all (classified or refused).
     pub fn is_empty(&self) -> bool {
-        self.observed() == 0
+        self.observed() == 0 && self.untracked == 0
     }
 
     /// True when a frame was lost (a non-zero `missing` count).
@@ -127,8 +171,18 @@ impl SeqTracker {
     ///
     /// Total and panic-free for **any** input, including `seq == u64::MAX` (after which
     /// no “next” exists, so every later frame is `Stale` rather than an overflow).
+    ///
+    /// A publisher the tracker has never seen is added **unless** the table is full
+    /// ([`MAX_TRACKED_STREAMS`]): the ceiling exists because the key comes off the wire, so it
+    /// is the one place a peer can make this map grow without bound. Past it the frame is
+    /// returned as [`SeqEvent::Untracked`] and counted — a bounded tracker that *says it
+    /// stopped*, rather than one that either grows forever or silently drops the evidence.
     pub fn observe(&mut self, publisher: &PeerId, seq: u64) -> SeqEvent {
         let Some(highest) = self.highest.get_mut(publisher) else {
+            if self.highest.len() >= MAX_TRACKED_STREAMS {
+                self.summary.untracked += 1;
+                return SeqEvent::Untracked { seq };
+            }
             self.highest.insert(publisher.clone(), seq);
             self.summary.streams = self.highest.len();
             self.summary.in_order += 1;
@@ -154,8 +208,9 @@ impl SeqTracker {
             }
             SeqEvent::Stale { .. } => self.summary.stale += 1,
             SeqEvent::InOrder { .. } => self.summary.in_order += 1,
-            // The stream exists (it was found in the map), so `First` cannot occur here.
-            SeqEvent::First { .. } => {}
+            // The stream exists (it was found in the map), so neither `First` nor
+            // `Untracked` can occur here.
+            SeqEvent::First { .. } | SeqEvent::Untracked { .. } => {}
         }
         if seq > last {
             *highest = seq;
@@ -181,6 +236,18 @@ impl SeqTracker {
     /// How many publishers are tracked.
     pub fn streams(&self) -> usize {
         self.highest.len()
+    }
+
+    /// True when no frame has been refused for want of table space
+    /// ([`MAX_TRACKED_STREAMS`]) — the honesty flag every *summary* reader needs, because
+    /// `missing`/`loss_ratio` describe only the streams that were tracked.
+    pub fn is_complete(&self) -> bool {
+        self.summary.is_complete()
+    }
+
+    /// Frames from publishers that were refused (see [`MAX_TRACKED_STREAMS`]).
+    pub fn untracked(&self) -> u64 {
+        self.summary.untracked
     }
 
     /// Forget every stream and counter (what a consumer does after a deliberate
@@ -369,6 +436,63 @@ mod tests {
         assert!(gap.is_loss());
         assert!(!SeqEvent::InOrder { seq: 2 }.is_loss());
         assert!(tracker.summary().has_loss());
+    }
+
+    #[test]
+    fn a_full_tracker_refuses_a_new_publisher_and_says_so() {
+        // The defect this pins: the table is keyed by `envelope.header.publisher`, i.e. by a
+        // string **off the wire**, and it had no ceiling — a peer that mints a fresh id per
+        // frame (`p1`, `p2`, …) grew a long-running consumer's memory without bound. The
+        // broker's topic inventory has had a ceiling (and a `topics_complete()` flag) since
+        // the first hardening round; this map is the same shape of resource.
+        let mut tracker = SeqTracker::new();
+        for index in 0..MAX_TRACKED_STREAMS {
+            let event = tracker.observe(&peer(&format!("p{index}")), 1);
+            assert_eq!(event, SeqEvent::First { seq: 1 }, "filling frame {index}");
+        }
+        assert_eq!(tracker.streams(), MAX_TRACKED_STREAMS);
+        assert!(
+            tracker.is_complete(),
+            "nothing has been refused yet, so the summary is still the whole truth"
+        );
+
+        // One publisher too many: refused, counted, and the map does not grow.
+        let refused = tracker.observe(&peer("one-too-many"), 1);
+        assert!(
+            refused.is_untracked(),
+            "the event says what happened, not just that nothing was delivered"
+        );
+        assert_eq!(refused, SeqEvent::Untracked { seq: 1 });
+        assert_eq!(
+            tracker.streams(),
+            MAX_TRACKED_STREAMS,
+            "the ceiling holds: the new publisher was not inserted"
+        );
+        assert_eq!(tracker.summary().untracked, 1);
+        assert!(
+            !tracker.is_complete(),
+            "the loss figure no longer describes every frame that arrived"
+        );
+        assert_eq!(tracker.highest(&peer("one-too-many")), None);
+
+        // …and a *known* publisher is still tracked normally at the ceiling: the bound must
+        // not break healthy accounting for the streams that are already there.
+        assert_eq!(
+            tracker.observe(&peer("p0"), 2),
+            SeqEvent::InOrder { seq: 2 }
+        );
+        assert_eq!(tracker.summary().in_order, MAX_TRACKED_STREAMS as u64 + 1);
+        assert_eq!(
+            tracker.summary().untracked,
+            1,
+            "a tracked stream is never counted as untracked"
+        );
+
+        // `reset` is the way back (a deliberate reconnect), and it clears the flag too.
+        tracker.reset();
+        assert!(tracker.is_complete());
+        assert_eq!(tracker.untracked(), 0);
+        assert!(tracker.summary().is_empty());
     }
 
     #[test]

@@ -268,6 +268,47 @@ filtered 3 entries naming this node itself (a node is not its own peer)
 **建了不跑**）。三处一起修，负控是"改回 `--lib`/删掉步骤 ⇒ 门 EXIT=1 且点名那个文件"。
 
 
+### 3.7 信任边界：回程载荷与"按对端建表"（第四轮，REQ-A244）
+
+> 前三轮查的是"分配 · 等待 · 上报的数字"。本轮查的是另一条：**谁的数据被当成事实存下来**。
+> 两个缺陷都同一形状——**键或值来自线缆**，而代码把它们当本地量处理。
+
+| # | 缺陷（修前） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **回程报告不受校验**：`ActuationState`（`amos/<robot>/state/actuation` 的载荷）直接 `Deserialize`，控制面把 `frames`/`watchdog_ms`/`last_refusal.reason` 原样存进表、原样交给 UI/CLI | 这份数据**来自另一个对端**（信任边界），而它有三个"下游已经假定有界"的字段：`frames` 要进 proto 的 **u32**（`proto_actuation` 用的是 `state.frames as u32`——**静默截断**，`2³²+3` 会显示成 `3`，正是 REQ-A241 在 `PublishReply` 上修掉的同一类）、`watchdog_ms` 会被当作"看门狗周期"展示、`reason` 会被**存下来并渲染**（帧上限 16 MiB 对一个"给人看的句子"太宽松） | 照本 crate 既有先例（`JointId`/`MotorFrame` 的 `try_from` wire 形态）给 `ActuationState` 加**线缆形态校验**：`MAX_ACTUATION_FRAMES = 4096`、`MAX_WATCHDOG_MS = 3_600_000`、`MAX_REFUSAL_REASON_BYTES = 512`；越界即**解码失败**——订阅侧计数（`decode_errors`）并跳过，**绝不进表**。`proto_actuation` 的映射同时改为饱和（`count_to_u32`），把"下游字段装不下"这件事写出来而不是假定 |
+| 2 | **`SeqTracker` 按对端无界建表**：`BTreeMap<PeerId, u64>` 的键是 `envelope.header.publisher`，即**线缆上的任意 1..63 字节 token**，而它没有上限 | 一个（恶意或坏掉的）对端每帧换一个 id（`p1`、`p2`…）就能让长跑的消费者内存无界增长。本 crate 的同类资源早有先例：broker 的话题清单有 `MAX_TRACKED_TOPICS` + `topics_complete()`（Power of 10 #2"静态有界资源"） | `MAX_TRACKED_STREAMS = 4096`（与话题上限同一量级）：满表时**拒绝新增**并返回 `SeqEvent::Untracked`、计入 `SeqSummary::untracked`，summary 用 `is_complete()` **如实声明自己不再完整**——"我们停止记账"绝不能被读成"这条流很干净"。已在表里的对端照常记账（上限不能破坏健康路径）。CLI 的 `sub`/`watch` 现在打印 `untracked=` 与 `tracking=complete|full` |
+
+**实测证据**：
+
+```text
+# 一条真实链路上的恶意回程（tests/link_e2e.rs）：谎报 frames=usize::MAX 的帧先发，再发一条正常报告
+watcher.recv() ⇒ 正常报告（恶意那条被跳过）
+watcher.stats().decode_errors == 1     # 被拒绝且**计数**，不是静默丢弃
+reports.seq() == 2                     # 两帧真的都上了线（拒绝发生在解码处，不是发布处）
+
+# 线缆形态（tests/… robot_hal::tests）
+MAX_ACTUATION_FRAMES + 1  ⇒ 解码 Err（错误里带边界数字）
+MAX_ACTUATION_FRAMES      ⇒ 解码 Ok（边界本身合法，防 off-by-one）
+u64::MAX 的 watchdog_ms   ⇒ 解码 Err
+MAX_REFUSAL_REASON_BYTES+1 的 reason ⇒ 解码 Err
+
+# 追踪表（sequence::tests）：填满 4096 个对端后再来一个新 id
+observe("one-too-many") ⇒ SeqEvent::Untracked { seq: 1 }；streams() 仍 = 4096
+is_complete() == false；untracked == 1
+observe("p0", 2) ⇒ SeqEvent::InOrder（已知对端照常）
+```
+
+**负控实测**（3/3，每次注入后 `cmp` 还原**逐字节一致**）：
+
+| 注入的旧行为 | 新验证的反应 |
+|---|---|
+| 去掉 `ActuationState` 的线缆校验 | `an_actuation_report_off_the_wire_is_validated_not_trusted` ⇒ **FAILED**；`a_hostile_actuation_report_is_refused_and_counted` 同样变红 |
+| `proto_actuation` 改回 `frames as u32` | `an_actuation_report_maps_to_the_wire_without_wrapping` ⇒ **FAILED**（`2³²+3` 读成 3） |
+| 去掉 `SeqTracker` 的表上限 | `a_full_tracker_refuses_a_new_publisher_and_says_so` ⇒ **FAILED**（表越过 4096 继续长） |
+
+**诚实边界（本轮新增）**：`MAX_ACTUATION_FRAMES`/`MAX_WATCHDOG_MS`/`MAX_REFUSAL_REASON_BYTES` 是**工程上界**而非物理定律——一台关节特别多、或做多步规划的机器若真超过 4096 帧/动作，需要在同一处上调（并同步 proto 的 u32 约定）；`SeqTracker` 的 4096 对端同理，满表后的"拒绝"是**有界策略**，不是"丢掉了坏数据"（`untracked` 计数与 `is_complete()` 就是它的如实出口）；线缆校验只覆盖这三个字段，`seq` 是任意的 `u64`（它本来就没有上界语义）。
+
+
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
 
 

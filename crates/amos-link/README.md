@@ -59,6 +59,18 @@ Four pieces, in the order data flows:
   `amos/<robot>/state/actuation` (armed / e-stopped + why / which gait / the last refusal),
   published **only when the mode changes** — so a commander can tell an applied command from
   a refused one, and a watchdog torque cut is visible to the very peer whose link died.
+- **The wire is not trusted, on either side of the loop**: a motor frame and an actuation
+  report are both *decoded from a peer*, so both validate on decode (`try_from` on the wire
+  form). A report whose frame count, deadman period or refusal reason is outside its bound is
+  refused as a **decode error** — counted by the subscription, logged with a bounded budget,
+  and never folded into the control plane's table — instead of being stored, rendered and
+  silently truncated into a `u32` on the way to the UI.
+- **Bounded bookkeeping, and it says when it stops**: the broker's topic inventory caps at
+  `MAX_TRACKED_TOPICS` (and reports `topics_complete()`); the per-publisher sequence tracker
+  caps at `MAX_TRACKED_STREAMS` (and reports `SeqEvent::Untracked` /
+  `SeqSummary::is_complete()`). Both keys come off the wire, so a peer could otherwise mint a
+  new one per frame — and a bounded table that *admits* it stopped is worth more than an
+  unbounded one or a silent gap.
 
 It is **not**: a scheduler (you own the control thread and its rate), a ROS compatibility
 layer (no `.msg`/IDL, no DDS wire), or a replacement for the daemon's authenticated UDS
@@ -160,6 +172,11 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
 - **Zenoh session round trips are tested; Zenoh *scouting* across hosts is not.** Two peers with
   explicit endpoints over TCP loopback are a real session and run in CI; `scouting_finds_a_peer_on_a_real_network`
   stays `#[ignore]`d because it needs a network someone else controls.
+- **The bounds on a report are engineering limits, not laws.** `MAX_ACTUATION_FRAMES` (4096),
+  `MAX_WATCHDOG_MS` (1 h) and `MAX_REFUSAL_REASON_BYTES` (512) are generous for the reference
+  quadruped; a machine that legitimately exceeds one must raise it *here* (and keep the proto's
+  `u32` in mind). The tracker's `MAX_TRACKED_STREAMS` is the same kind of number: past it the
+  tracker refuses new publishers and says so, rather than growing without bound.
 
 ## Related
 

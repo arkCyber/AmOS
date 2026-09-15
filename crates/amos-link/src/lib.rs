@@ -96,9 +96,10 @@ pub use qos::{DropPolicy, Qos, Reliability};
 pub use robot_hal::{
     actuation_pattern, actuation_topic, ActuationState, AgentAction, Gait, JointId, JointTarget,
     MockRobotHal, MotorFrame, MotorOp, Refusal, RobotBridge, RobotCommand, RobotHal,
-    StreamRobotHal, ACTUATION_NAME, DEFAULT_REPORT_REFRESH,
+    StreamRobotHal, ACTUATION_NAME, DEFAULT_REPORT_REFRESH, MAX_ACTUATION_FRAMES,
+    MAX_REFUSAL_REASON_BYTES, MAX_WATCHDOG_MS,
 };
-pub use sequence::{SeqEvent, SeqSummary, SeqTracker};
+pub use sequence::{SeqEvent, SeqSummary, SeqTracker, MAX_TRACKED_STREAMS};
 pub use telemetry::{
     heartbeat_pattern, Heartbeat, HeartbeatTask, NodeStatus, DEFAULT_HEARTBEAT_PERIOD,
 };
