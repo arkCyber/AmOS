@@ -68,6 +68,10 @@ const KNOWN_FAILURES = [
   { id: 'F-IME-004', module: 'amos-ime', files: ['crates/amos-ime/src/engine.rs', 'crates/amos-tauri/src/ime.rs'], markers: ['commit_prediction', 'record_commit'], severity: 3 },
   { id: 'F-IME-005', module: 'amos-ime', files: ['crates/amos-ime/Cargo.toml'], markers: ['predict', 'trigrams'], severity: 2 },
 
+  // 桌面壳 chrome (前端): 模块契约与"可用性=真行为"
+  { id: 'F-SH-001', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/ControlCenterButton.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/modules/ChromeIconButton.svelte'], markers: ['disabled', 'aria-disabled'], severity: 2 },
+  { id: 'F-SH-002', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/shellModules.ts', 'crates/amos-tauri/frontend-ts/src/lib/shellModule.ts'], markers: ['modulesFor', 'slot'], severity: 2 },
+
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
   { id: 'F-TAU-002', module: 'amos-tauri', files: ['crates/amos-tauri/src/ai_bridge.rs'], markers: ['ask_daemon', 'deadline'], severity: 4 },

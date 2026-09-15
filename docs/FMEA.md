@@ -85,8 +85,14 @@
 | F-WM-017 | 屏幕变小后 app 窗口挂在屏幕外 | 用户在屏幕上**看不到也点不到**自己的窗口 | 3 | 1 | 2 | 6 | 每次真实屏幕变化后 `WmState::reclamp_windows()` 读平台真实几何(无宿主账本可漂移)、按 `LayoutPolicy::fit_window` 回夹,**只动需要动的窗口**;跳过 Launcher / 外部表面 / 隐藏窗口,读不出的几何计数 + `warn!` 不猜位置 | `reclamp_target_moves_only_windows_that_need_it`、`only_a_believable_reading_becomes_a_window_position` |
 | F-WM-018 | 被拒的 app 窗口在状态机里**留痕**(模型有窗口、屏幕上没有) | 布局/焦点/z 序被幽灵窗口污染(REQ-A227 形状) | 3 | 1 | 3 | 9 | 判定**在注册之前**问:`WmState::check_new_app_window()`(生产 `open()` 与测试缝 `register_app()` 共用),拒绝是数据(`AppWindowRefusal`)而非字符串 | `a_refused_app_window_leaves_no_trace_in_the_model`、`a_class_without_multi_window_refuses_the_second_app_window` |
 
-### 2.2b 输入法 (amos-ime / amos-tauri)
+### 2.2c 桌面壳 chrome (前端)
 
+| ID | 失效模式 | 影响 | S | P | D | RPN | 当前缓解 | 测试保护 |
+|----|----------|------|---|---|---|-----|-----------|----------|
+| F-SH-001 | **不可用的 chrome 控件假装可用**(有可读名字、能 Tab 聚焦、点下去什么都不做) | 用户点了没反应、无从判断是坏了还是没做(REQ-A261 实测:顶栏「控制中心」) | 2 | 3 | 4 | 24 | 可用性=**真行为**:未接入的控件 `disabled` + `aria-disabled` + 说明性名字(i18n),而不是留一个按钮;模块契约让"接入"变成单文件改动(`modules/ControlCenterButton.svelte`) | `chrome-widgets.svelte.test.ts`「the control centre is disabled and says why (no inert control)」+ `topbar-container.svelte.test.ts` 同一条断言(两个层级都钉) |
+| F-SH-002 | 挂件写回容器模板里 ⇒ **无边界、无法独立交付**(顺序/存在性住在模板而非数据) | 每加一个指示器都要改顶栏;挂件的测试被迫挂载整条栏;两个人无法同时改两个挂件 | 2 | 4 | 3 | 24 | 容器 ↔ 挂件:注册表 `svelte/shellModules.ts` 是数据,容器只按 `modulesFor(slot)` 渲染、只暴露一个小的 `ShellChromeApi` 把手;外观收进 `lib/shellChrome.ts` 一处 | `shellModule.test.ts`(槽位/顺序/不变量/i18n 键)+ `chrome-widgets.svelte.test.ts`(**每个挂件单独挂载**)+ `topbar-container.svelte.test.ts`(容器自身 markup 不含挂件)+ `unwired-scan`(每个模块必须被注册表引用) |
+
+### 2.2b 输入法 (amos-ime / amos-tauri)
 | ID | 失效模式 | 影响 | S | P | D | RPN | 当前缓解 | 测试保护 |
 |----|----------|------|---|---|---|-----|-----------|----------|
 | F-IME-001 | 两个窗口**共用一条拼音缓冲**(A 的候选栏显示 B 打的码、B 的提交吃掉 A 的码) | 用户看到/提交**不是自己打**的字(REQ-A258 的 G1) | 3 | 1 | 2 | 6 | 作用域拆开:`PinyinCore`(词典 + L0 学习层 + 模糊音,`Arc`,进程级)与 `PinyinInput`(每窗口一条缓冲 + 提示 + 撤销码);九条 `ime_*` 带 `window: tauri::WebviewWindow` 按 `window.label()` 归档缓冲;设备级动作(模糊音/清空学习)显式作用于每个窗口 | `two_windows_do_not_share_a_composition_buffer`、`the_undo_hint_is_per_window`、`two_sessions_over_one_core_keep_their_own_buffers`(**负控**:改成单会话 ⇒ 前两条 FAIL) |

@@ -1,24 +1,52 @@
 <script lang="ts">
-  // TopBar.svelte — macOS 风格顶部菜单栏。
+  // TopBar.svelte — the macOS-style top bar, as a **container**.
   //
-  // 渲染在 DesktopShell 内（DesktopShell → TopBar + Dock + 舞台）。
-  // 高度 28px（含刘海区占位 12px），毛玻璃背景。
-  // 左侧：Apple Logo + 当前 App 名 + 主菜单占位（File/Edit/View/Window/Help）。
-  // 右侧：Spotlight + 控制中心 + 时钟 + WiFi + 电池。
+  // What changed and why: the bar used to hard-code its right-hand widgets (and
+  // own their state: a second-ticker for the clock, a settings subscription and
+  // `online` listeners for the radios, the battery placeholder). "Which widgets
+  // exist, in what order" lived in this template, so every new indicator was an
+  // edit here and every widget's test had to mount the whole bar.
   //
-  // 焦点 app 状态来自 SharedStore（`amos.app_focused`），由 wm.rs 在
-  // FocusChanged 事件时写入（跨窗口同步）。
-  import { createEventDispatcher } from "svelte";
+  // Now the bar owns only what a container should: the glass surface, the left-hand
+  // group (Apple menu + focused app name + the main menu — macOS semantics rather
+  // than independent widgets), the **slot layout**, and the chrome handle widgets
+  // ask through (`SHELL_CHROME_API`). The widget list — ids, order, test ids — is
+  // data in `./shellModules.ts`, and the widgets live in `./modules/` with their own
+  // tests.
+  //
+  // Order on screen is unchanged (Launchpad, Spotlight, control centre, radios,
+  // clock, battery); this is a restructuring, not a redesign.
+  import { setContext } from "svelte";
   import { t } from "./locale.svelte";
-  import { fmtClock } from "../lib/time";
-  import { batterySvg, iconSvg, radioIcon } from "../lib/sysIcons";
-  import { firstBattery, batteryTone } from "../lib/batteryStatus";
-  import { statusIcons } from "../lib/netStatus";
-  import { SETTINGS_KEY, normalizeQuick } from "../lib/settings";
+  import { SHELL_CHROME_API, modulesFor, type ShellChromeApi } from "../lib/shellModule";
+  import { CHROME_MENU_BUTTON, CHROME_TEXT, CHROME_TEXT_SHADOW } from "../lib/shellChrome";
+  import { SHELL_MODULES } from "./shellModules";
   import { APP_FOCUSED_KEY } from "../lib/wm";
   import { createStoreValue } from "./store";
 
-  const dispatch = createEventDispatcher<{ spotlight: void; launchpad: void }>();
+  // ─── The chrome handle the widgets ask through ───────────────────────────────
+  // A small, explicit capability set — **not** the shell: a widget cannot reach
+  // `shellState`, the layout snapshot or another widget through it. The two
+  // overlays remain the shell's (DesktopShell) business, so the bar translates an
+  // intent into the callback the shell handed it.
+  //
+  // The callbacks are **props** (`onlaunchpad` / `onspotlight`), not
+  // `createEventDispatcher` events: this file is Svelte 5 with runes, and the
+  // legacy `$on(...)` API is gone — a test (or another component) can no longer
+  // subscribe to a dispatch, only pass a handler. Moving the two events to props
+  // is what makes the container testable without `DesktopShell` around it.
+  let {
+    onlaunchpad,
+    onspotlight,
+  }: { onlaunchpad?: () => void; onspotlight?: () => void } = $props();
+
+  setContext<ShellChromeApi>(SHELL_CHROME_API, {
+    openLaunchpad: () => onlaunchpad?.(),
+    openSpotlight: () => onspotlight?.(),
+  });
+
+  /** The right-hand slot, in registry order (`lib/shellModule.ts` sorts it). */
+  const rightModules = modulesFor("topbar-right", SHELL_MODULES);
 
   // ─── 焦点 App 状态（来自 SharedStore）─────────────────────────────────────────
   // 键名从 `lib/wm.ts` 导入（与 Rust `store.rs::APP_FOCUSED_KEY` 同名）：不在这里
@@ -41,49 +69,10 @@
     return un;
   });
 
-  // ─── 时钟 ──────────────────────────────────────────────────────────────────
-  let now = $state(new Date());
-  $effect(() => {
-    const id = setInterval(() => (now = new Date()), 1000);
-    return () => clearInterval(id);
-  });
-
-  // ─── 电池 / 网络 ────────────────────────────────────────────────────────────
-  const settingsStore = createStoreValue<unknown>(SETTINGS_KEY, {});
-  let quickRaw = $state<unknown>({});
-  let online = $state(typeof navigator !== "undefined" ? navigator.onLine : true);
-
-  $effect(() => {
-    const un = settingsStore.subscribe((v) => (quickRaw = v));
-    return un;
-  });
-  $effect(() => {
-    const on = () => (online = true);
-    const off = () => (online = false);
-    window.addEventListener("online", on);
-    window.addEventListener("offline", off);
-    return () => {
-      window.removeEventListener("online", on);
-      window.removeEventListener("offline", off);
-    };
-  });
-
-  const quick = $derived(normalizeQuick(quickRaw));
-  const icons = $derived(statusIcons(quick, online, typeof quick.wifi === 'string' ? quick.wifi : null));
-  // batt 占位：桌面形态下从顶层 daemon 读取 system_health（Phase 2 实测接入）。
-  const batt = $derived(firstBattery([{ levelPct: null, charging: null }]));
-  const battTone = $derived(batteryTone(batt));
-  const battText = $derived(batt.levelPct === null ? "—" : `${Math.round(batt.levelPct)}%`);
-
   // 显示名称
   const appDisplayName = $derived(
     focusedApp ? focusedApp.charAt(0).toUpperCase() + focusedApp.slice(1) : "Amos",
   );
-
-  // 辅助函数：规范化 title 为字符串（i18n key 可能返回 undefined）
-  function titleOrUndef(s: unknown): string | undefined {
-    return typeof s === "string" ? s : undefined;
-  }
 </script>
 
 <!--
@@ -102,82 +91,35 @@
     border-bottom: 1px solid rgba(255,255,255,0.08);
   "
 >
-  <!-- 左侧：Apple Logo + 当前 App 名 + 主菜单占位 -->
+  <!-- 左侧：Apple Logo + 当前 App 名 + 主菜单（macOS 语义，暂留容器内） -->
   <div class="flex items-center gap-4">
-    <!-- Apple Logo -->
     <button
       aria-label={t("desktop.appleMenu")}
       title={t("desktop.appleMenu")}
-      class="flex h-6 w-6 items-center justify-center text-[15px] text-white/90 transition-colors hover:text-white"
-      style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
+      class="{CHROME_MENU_BUTTON} h-6 w-6 px-0"
+      style="text-shadow: {CHROME_TEXT_SHADOW};"
     >🍎</button>
 
-    <!-- 当前 App 名（焦点 app） -->
-    <span class="text-[13px] font-semibold text-white" style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);">{appDisplayName}</span>
+    <span class="{CHROME_TEXT} font-semibold" style="text-shadow: {CHROME_TEXT_SHADOW};"
+      >{appDisplayName}</span
+    >
 
-    <!-- 主菜单占位（File / Edit / View / Window / Help）—— 名字必须走 i18n：
+    <!-- 主菜单（File / Edit / View / Window / Help）—— 名字必须走 i18n：
          这是产品界面文案，不是内部标识。 -->
     <nav class="ml-1 flex gap-1" aria-label={t("desktop.mainMenu")}>
       {#each MENU_KEYS as menuKey (menuKey)}
-        <button
-          class="rounded px-2 py-0.5 text-[12px] text-white/80 transition-colors hover:bg-white/10 hover:text-white"
-          style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
-        >{t(menuKey)}</button>
+        <button class={CHROME_MENU_BUTTON} style="text-shadow: {CHROME_TEXT_SHADOW};"
+          >{t(menuKey)}</button
+        >
       {/each}
     </nav>
   </div>
 
-  <!-- 右侧：Spotlight + Launchpad + 控制中心 + 时间 + WiFi + 电池 -->
-  <div class="flex items-center gap-3">
-    <!-- Launchpad 图标 -->
-    <button
-      aria-label={t("desktop.launchpad")}
-      title={t("desktop.launchpad")}
-      onclick={() => dispatch("launchpad")}
-      class="flex h-5 w-5 items-center justify-center text-[12px] text-white/60 transition-colors hover:text-white/90"
-      style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
-    >🚀</button>
-
-    <!-- Spotlight 图标 -->
-    <button
-      aria-label={t("desktop.spotlight")}
-      title={t("desktop.spotlight")}
-      onclick={() => dispatch("spotlight")}
-      class="flex h-5 w-5 items-center justify-center text-[12px] text-white/60 transition-colors hover:text-white/90"
-      style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
-    >🔍</button>
-
-    <!-- 控制中心图标 -->
-    <button
-      aria-label={t("desktop.controlCenter")}
-      class="flex h-5 w-5 items-center justify-center text-[12px] text-white/60 transition-colors hover:text-white/90"
-      style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
-    >⚙️</button>
-
-    <!-- WiFi / 网络图标 -->
-    {#each icons as ic (ic.kind)}
-      <span
-        title={titleOrUndef(ic.titleKey ? t(ic.titleKey, ic.titleSsid ? { ssid: ic.titleSsid } : undefined) : undefined)}
-        class="text-[11px] transition-opacity {ic.on ? 'text-white/90' : 'text-white/30'}"
-        style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
-      >{@html iconSvg(radioIcon(ic.kind), "")}</span>
+  <!-- 右侧：注册表里的挂件（顺序见 shellModules.ts；此处只是槽位） -->
+  <div class="flex items-center gap-3" data-testid="topbar-right-slot">
+    {#each rightModules as mod (mod.id)}
+      {@const Widget = mod.component}
+      <Widget />
     {/each}
-
-    <!-- 时钟 -->
-    <span
-      class="text-[12px] tabular-nums font-medium text-white"
-      style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
-    >{fmtClock(now)}</span>
-
-    <!-- 电池 -->
-    <span
-      aria-label={t("a11y.batteryLevel")}
-      title={titleOrUndef(batt.levelPct === null ? undefined : t(batt.charging === true ? "a11y.batteryCharging" : "a11y.battery", { pct: battText }))}
-      class="flex items-center gap-0.5 text-[11px] tabular-nums text-white"
-      style="text-shadow: 0 1px 2px rgba(0,0,0,0.3);"
-    >
-      {@html batterySvg(batt.levelPct === null ? 0 : batt.levelPct, "h-3 w-3", battTone)}
-      <span>{battText}</span>
-    </span>
   </div>
 </div>

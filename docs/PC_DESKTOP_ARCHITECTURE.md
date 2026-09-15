@@ -874,6 +874,52 @@ if let Some(id) = focused_id {
 </div>
 ```
 
+### 4.11 桌面壳 chrome 的模块契约（REQ-A261）
+
+**问题**：桌面形态的 **app 屏**早就模块化了（`svelte/appRegistry.ts`：id → 动态 import，
+`lib/appMeta.ts` 是声明式元数据的唯一真源），但**壳本身**没有：`DesktopShell.svelte`
+静态 import 整条壳，`TopBar.svelte` 把右侧五个挂件（Launchpad / Spotlight / 控制中心 / 时钟 /
+WiFi·电池）连同它们的状态（每秒 tick 的定时器、`amos.settings` 订阅、`online` 监听、电池占位）
+**全部写在一份模板里**。"有哪些挂件、按什么顺序"住在 Svelte 模板里，于是每加一个指示器都要改顶栏、
+每个挂件的测试都得挂载整条栏。
+
+**借鉴与不借鉴**（参考 `pop-os/cosmic-panel` + `cosmic-applets`、`libcosmic`）：
+
+| 借鉴 | 不借鉴 |
+|---|---|
+| **容器 ↔ 挂件**分工：容器只管布局、顺序与配置；挂件自带数据、渲染与测试 | applet 是**独立进程** + Wayland layer-shell 表面（买的是崩溃隔离与第三方 ABI；我们的挂件都在同一个已沙箱化的 WebView 里，拆进程只有内存/IPC 成本） |
+| **清单即数据**：id / 槽位 / 顺序 / i18n 键 / testId 放进表里，容器读表渲染 | Rust/iced 控件与工具链（等于重写 40+ 屏与 800+ i18n 键） |
+| **能力是把手，不是内部**：挂件只拿到一个小的 `ShellChromeApi`（`openLaunchpad` / `openSpotlight`），拿不到 `shellState`、布局快照或别的挂件 | 把组件拆成 npm 包 / 微前端（只增加构建与类型链路） |
+| **注入的上下文**：容器 `setContext(SHELL_CHROME_API, api)`，挂件按需 `getContext` —— 于是**没有 props 传递**，容器对挂件是通用的 | 第三方挂件生态（P3：需要清单校验 + 能力白名单 + 安全评审，先不做） |
+
+**文件与职责**
+
+| 文件 | 职责 |
+|---|---|
+| `src/lib/shellModule.ts` | 契约：`ShellSlot` / `ShellModule` / `ShellChromeApi` / `SHELL_CHROME_API` + 纯函数 `modulesFor(slot, modules)`（按 `order` 排序，**并列取注册表顺序**） |
+| `src/lib/shellChrome.ts` | chrome 的**外观**唯一处：命中区 24px（`h-6 min-w-6`）、hover 洗色、`focus-visible` 环（键盘可达）、读数 `tabular-nums` + 固定最小宽（时钟跳动时右侧不位移）、统一的文字投影 |
+| `src/svelte/shellModules.ts` | 注册表（数据）：`launchpad-trigger`(10) / `spotlight-trigger`(20) / `control-center`(30) / `radios`(40) / `clock`(50) / `battery`(60) —— **与改造前的屏幕顺序逐一对应** |
+| `src/svelte/modules/*.svelte` | 挂件本体。`ChromeIconButton.svelte` 是被三个触发器共用的按钮实现；`RadiosWidget` / `BatteryWidget` 各自订阅自己需要的东西（顶栏不再为它们持有状态） |
+| `src/svelte/TopBar.svelte` | **容器**：玻璃面、左侧组（Apple 菜单 / 当前 app 名 / 主菜单 —— macOS 语义，暂留容器内）、槽位布局、以及 `ShellChromeApi` 的注入 |
+
+**怎么加一个挂件**（这是这套拆分的验收标准）：在 `modules/` 写组件（需要动作时 `getContext`
+拿把手）→ 在 `shellModules.ts` 加一行（id / slot / order / titleKey / testId）→ 两个 locale 加
+`titleKey`。**不需要**改 `TopBar`、不需要改 `DesktopShell`。
+
+**门禁怎么钉住它**：`unwired-scan`（每个模块必须被注册表引用、每个 lib 导出必须有生产调用点）、
+`i18n-scan`（`titleKey` 必须解析且中英齐备；**死键会被报出**——本轮就因此删掉了随控制中心一起
+失用的 `desktop.controlCenter`）、`store-scan`（挂件只能碰已分类的 store 键；它顺带纠正了一处
+命名——`SHELL_CHROME_API` 不能占用 `amos.*` 命名空间）、`write-scan`（写入必须分类），
+外加 `src/__tests__/shellModule.test.ts`（注册表不变量 + 顺序表）与
+`svelte-tests/{chrome-widgets,topbar-container}.svelte.test.ts`（挂件各自可独立挂载；
+容器只从表里取、只把意图交给壳）。
+
+**诚实边界**：①本轮的拆分**不改变屏幕上的样子**（顺序、字号、颜色、玻璃面都保持）；
+②左侧组（Apple 菜单 / 主菜单）仍是容器内联——它们是 macOS 语义的一体三件，不是独立挂件，
+真要拆是 P1；③"控制中心"过去是一个**有名字、能聚焦、点下去什么都不做**的按钮，本轮改成
+**disabled + 说明性名字**（`desktop.controlCenterUnavailable`），等面板落地再恢复；
+④模糊/观感项（玻璃感、Dock 磁吸曲线、per-app 菜单模型）仍属 G6 的设备/肉眼复核，不因拆分而消失。
+
 ## 5. Shell 路由：桌面 vs. 手机
 
 `Shell.svelte` 根据 `LayoutSnapshot.form` 选择渲染哪个 Shell：
@@ -950,7 +996,6 @@ Phase 4: 单测补（desktopLayout.test.ts）
 Phase 5: i18n 补全
 Phase 6: 文档更新
 ```
-
 ## 9. 不回归保证
 
 | 文件 | 改动类型 | 验证 |

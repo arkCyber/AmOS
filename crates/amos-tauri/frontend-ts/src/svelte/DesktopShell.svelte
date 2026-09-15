@@ -144,7 +144,7 @@
 
   <!-- 顶部 TopBar -->
   <div class="absolute left-0 right-0 top-0 z-30">
-    <TopBar on:spotlight={() => (showSpotlight = true)} on:launchpad={openLaunchpad} />
+    <TopBar onspotlight={() => (showSpotlight = true)} onlaunchpad={openLaunchpad} />
   </div>
 
   <!-- 底部 Dock -->
