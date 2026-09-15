@@ -25,7 +25,14 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
         │  ▲  gRPC over Unix Domain Socket (tonic client)
         ▼  │
 [ AI CLI daemon  →  amos-ai ]   ◄── GPU/NPU inference core
+        │
+        └── mounts the AmOS-Link control plane (RobotLink, `amos-link`)
 ```
+
+The same daemon also hosts **[AmOS-Link](#robot-link-amos-link)** —
+the ROS-class robot middleware (`amos-link` + `amos-link-cli`): a pub/sub bus that carries a
+robot's sensor frames and motor commands across boards, plus the gRPC **control plane** the
+System UI and the CLI read it through.
 
 ## Workspace topology
 
@@ -33,11 +40,14 @@ long-lived native AI CLI daemon (`amos-ai`) with a Tauri 2 System UI
 .
 ├── Cargo.toml                    # workspace root (shared deps + profiles)
 ├── proto/
-│   └── ai_agent.proto            # single source of truth (gRPC contract)
+│   ├── ai_agent.proto            # the AI shell's contract (StreamChat / Chat / GetStatus)
+│   ├── robot_link.proto          # AmOS-Link control plane (RobotLink: 5 RPCs)
+│   └── …                         # android_compat · sensor · telephony · translate · governor · privacy
 ├── docs/
 │   ├── ARCHITECTURE.md             # system overview (layers, crates, contracts)
 │   ├── multi-window.md           # multi-window (真·OS 阶段) architecture
-│   └── android-compat.md         # Waydroid APK-compat layer
+│   ├── android-compat.md         # Waydroid APK-compat layer
+│   └── amos-link.md                # AmOS-Link robot middleware: layers, Zenoh audit, control plane, non-goals
 └── crates/
     ├── amos-proto/               # tonic-generated types + socket-path helper
     ├── amos-audio/               # hardware audio-HAL abstraction: capture/playback traits + resample + mocks + gated TinyALSA/AAudio FFI seams (docs/audio-hal-bridge.md)
@@ -242,6 +252,70 @@ as the offline/dev fallback.
 produces a token stream. Swapping it for the real GPU/NPU core only touches that
 module — the transport and UI layers stay unchanged.
 
+## Robot link (AmOS-Link)
+
+`crates/amos-link` is the middleware that connects a robot's parts — a stereo pair and an IMU on
+one board, a model server on a Mac mini, a control laptop joining over Wi-Fi/5G — **without ROS**.
+`crates/amos-link-cli` drives the same kernel from a terminal, and the daemon mounts its
+**control plane** (`amos-ai/src/server.rs` → `proto/robot_link.proto`), so the CLI and the System UI
+can ask a *running* node what it sees on the link.
+
+| piece | what it does |
+|---|---|
+| keys | `amos/<peer>/<channel>/<name>` + `*` / `**` (`keyexpr`) — an **iterative DP** matcher, no recursion and (since the last hardening round) **no allocation on the publish hot path**, bounded at 32 segments; a naive backtracking matcher used to hang the broker's registry lock, and a repo-wide `rust-recursion-scan` gate now guards that class |
+| framing | `magic │ version │ bincode header │ CRC32 │ payload` with a 16 MiB ceiling checked on **both** sides *before* any allocation; the CRC streams over header ‖ payload, so a frame is never copied twice (a `concat()` used to double a frame's peak memory, on the receive path *before* the checksum was verified) |
+| transport | in-process `Broker` (`Arc` fan-out, never awaits while holding the lock) + optional **Zenoh** across boards (`--features zenoh`) |
+| QoS | `Reliability{BestEffort,Reliable} × depth × DropPolicy` from **one strategy table per channel**: sensor streams are latest-wins, control streams back-press and are counted as `blocked` — never silently dropped |
+| discovery | beacons over the link's own transport (works on **any** transport, incl. Zenoh) + real UDP multicast behind `--features lan`, announcing repeatedly so a peer that joins later still learns one that booted earlier; a node is **never its own peer** (self-echoes are refused and **counted**, not filtered away silently) |
+| health | `published`/`delivered`/`dropped`/`blocked`/`decode_errors` are measured, never estimates; `LinkHealth` folds them into `Unknown \| Healthy \| Degraded{reasons}` — `Unknown` means *no evidence yet* and is deliberately not the same as "healthy" |
+| robot HAL | an agent's JSON intent → a validated gait pose → CRC16-checked motor frames, with a latched e-stop and a deadman watchdog whose torque cut is reported as a **measured** frame count (it used to be assumed as "one frame per joint") |
+| return path | a policy can report its own mode on `amos/<robot>/state/actuation` (armed / e-stopped + why / gait / last refusal) — published on change **and** replayed periodically, so the very peer whose link died sees the watchdog stop, and a late-joining brain still learns a steady gait |
+
+```bash
+# One process, no network: the robot↔brain loop (stereo out, control back, motor frames applied).
+cargo run -p amos-link --example robot_brain_loop
+
+# The CLI: one in-process node, one command per operator question.
+cargo run -p amos-link-cli -- status                              # identity · counters · peers · verdict
+cargo run -p amos-link-cli -- bench --count 2000 --size 4096      # real publish→decode latency
+cargo run -p amos-link-cli -- motor --action '{"action":"trot","speed":0.5}'   # 13 CRC16 motor frames
+cargo run -p amos-link-cli -- sub --pattern 'amos/**' --count 3 --timeout-ms 2000
+cargo run -p amos-link-cli -- discover --lan --peer dog1 --seconds 9   # real UDP beacons (`--features lan`)
+cargo run -p amos-link-cli -- state --timeout-ms 2000             # what the robots say about themselves
+
+# Remote mode: read a *running* daemon's control plane instead of a temporary local node.
+cargo run -p amos-link-cli -- status --socket /tmp/amos-ai.sock
+```
+
+`status` / `topics` / `pub` / `watch` accept `--socket` and name the socket on every line, so a local
+answer can never be mistaken for the robot's. Data-plane commands (`sub` / `bench` / `discover`) need a
+local node and are **refused by name** when `--socket` is present rather than silently downgraded.
+Exit codes are part of the contract: `0` ok, `1` failure, `2` usage error — a window the platform clock
+cannot represent, or a payload above the wire ceiling, is now refused at parse time (both used to
+panic/abort the process).
+
+| RPC (`proto/robot_link.proto`) | purpose |
+|---|---|
+| `GetStatus` | identity, uptime, clock-calibrated?, cumulative counters, the live peer table, and the daemon's **own** `health` verdict + reasons |
+| `ListTopics` | the topic inventory the transport really saw (a network transport answers "unknown" instead of fabricating an empty list) |
+| `Publish` | let a non-Rust node inject a payload — the daemon stamps its own peer id, independent sequence and calibrated clock, so typed subscribers still decode it |
+| `StreamHeartbeats` | server-streaming heartbeat, forwarding the beats actually received on `amos/*/telemetry/beat` (the node's own included) |
+| `ListActuations` | the return path folded into the control plane: each robot's armed / torque-cut(+reason) / gait / last refusal, attributed by frame publisher — a robot that never reported is **absent, not idle** |
+
+The System UI mirrors this read-only: **Settings →「机器人链路 / Robot Link」**
+(`frontend-ts/src/svelte/settings/LinkPage.svelte` over `crates/amos-tauri/src/link.rs`) shows the
+daemon's verdict, its reasons, cumulative counters, the live peer table and the robots' self-reported
+modes. It has **no toggle** — the CLI owns publishing; the page observes.
+
+Honest boundaries, all of them enforced in code: **not ROS** (no `.msg`/DDS wire — a bridge into that
+ecosystem is a separate deployment component), **not a scheduler** (`RobotBridge::step()` is one
+explicit step; the control thread and its frequency are the caller's), **discovery is not
+authentication** (plaintext beacons are a hint telling a peer where to connect — the authenticated path
+is the daemon's UDS), `zenoh-pico`/MCU firmware is out of scope, and cross-board multicast on a real
+switch (IGMP, Wi-Fi power save) is still a field-verification item. See
+[`docs/amos-link.md`](./docs/amos-link.md) · [`crates/amos-link/README.md`](./crates/amos-link/README.md) ·
+[`crates/amos-link-cli/README.md`](./crates/amos-link-cli/README.md).
+
 ## OS integration notes (mobile)
 
 * **Transport:** UDS, not TCP loopback → lower latency + process isolation.
@@ -293,6 +367,12 @@ see `docs/appstore.md`).
 A few first-party apps (Reminders ✅-style, Voice Memos, Notes) render **bespoke
 Apple-inspired tile icons** (`AppIcon.tsx` `isBespokeTile`) instead of the generic
 emoji-on-gradient tile; every other app keeps the uniform tonal face.
+
+**Settings** also carries a read-only **「机器人链路 / Robot Link」** page (🦿): the daemon's own
+AmOS-Link verdict and reasons, cumulative counters, the live peer table, and each robot's
+self-reported actuation mode (`RobotLink.ListActuations`). A robot that has not reported since the
+daemon started watching is named **absent, never idle**. There is no toggle — the page observes; the
+CLI owns publishing (see [Robot link](#robot-link-amos-link)).
 
 The **status bar** (and lock screen / System Monitor / About) shows a **real
 battery** reading, layered daemon `system_health` → desktop-host OS battery
@@ -386,6 +466,13 @@ git-ignored `.cargo/config.toml`, so a stale machine path can't leak into CI.
 Native-gated CI jobs can opt into running inside that pinned container by setting
 the repository Variable `CI_ANDROID_IMAGE`. See `docs/ci-engineering.md`.
 
+## Recent additions (2026-09-14 → 2026-09-15)
+
+- **AmOS-Link — the robot middleware, and everything around it (`amos-link` + `amos-link-cli` + the daemon's control plane + the System UI panel)**: the workspace now has the layer that was missing between a board's sensor stream and another machine's brain. Fifteen rounds — the landing plus fourteen hardening/completion rounds (REQ-A207…A214, A235…A242) — shipped it and then audited it against its own documentation: key-expression topics with an **iterative, allocation-free** matcher (§3 of `docs/amos-link.md`), a framed wire contract whose CRC is streamed so a frame is never copied twice, ROS-like QoS with one strategy table per channel (sensor latest-wins vs control back-pressure), bus federation over any transport + real UDP beacon discovery, a robot HAL from JSON intent to CRC16 motor frames with a latched e-stop and deadman watchdog, a **return path** (`amos/<robot>/state/actuation`) so the peer whose link died can see the watchdog stop, and a 5-RPC control plane folded into the daemon's UDS. Operator surface: `amos-link-cli` (`status`/`topics`/`pub`/`sub`/`bench`/`discover`/`watch`/`state`/`motor`, plus `--socket` to read a **running** daemon) and the read-only **Settings →「机器人链路」** page. See `docs/amos-link.md` · `crates/amos-link/README.md` · `crates/amos-link-cli/README.md`.
+- **Two aerospace-grade hardening rounds over that middleware — 7 real defects, 2 of them reproducible process-level crashes (REQ-A241 · REQ-A242)**: the rounds re-audited the *shipped* public surface as a black box against the repo's own discipline ("allocation · waiting · the numbers you report"), each finding reproduced first, fixed second, and pinned with a **negative control** (inject the defect back ⇒ the named test FAILS ⇒ restore byte-for-byte). (a) `crc32fast::hash(&[header, payload].concat())` allocated a **whole second copy of every frame** on both encode *and* decode — and on decode it happened **before** the checksum was verified, so a 16 MiB frame made the receiver allocate 32 MiB first ⇒ streamed `Hasher` (zero extra allocation, identical CRC, pinned to `0xFC0E56E6`). (b) A poisoned broker lock was read as "slot full", so `offer_blocking` waited for a notification **no sender would ever send** (an unbounded wait in a control loop) ⇒ typed `LinkError::Closed`. (c) The watchdog **reported a guessed frame count** (`frames: JOINTS`) ⇒ `estop() -> Result<usize>` measured, with a 1-frame `BroadcastCutHal` case. (d) `discover --seconds u64::MAX` panicked (`overflow when adding duration to instant`) and `bench --count u64::MAX` aborted (`capacity overflow`) ⇒ both refused at parse time with exit 2, plus a bounded latency reservation and a `--size` above the wire ceiling rejected. (e) Silent truncation (`usize as u32`, `u128 as u64`) saturating instead of wrapping. (f) **A node listed itself as its own peer** — a multicast beacon reaches its own socket (`IP_MULTICAST_LOOP` is the platform default), the LAN path did not filter, and two CLI paths even seeded themselves into the table; the invariant moved into the table itself (`PeerRegistry::with_local`, `self_entries_refused()`), the old test that asserted "the node appears in its own peer table" was **protecting the defect** and was replaced. (g) `Topic::matches` allocated **two `Vec`s per subscriber per frame under the registry lock** (measured: 1000 matches ⇒ 128 000 bytes) while the module documented "no allocation" ⇒ stack-fixed arrays. Also one *suspicion* was **disproved** against the dependency's source and recorded as a failing precondition instead of a change. Evidence: `cargo test -p amos-link` **117 lib + 1 allocation budget (encode/decode/matcher) + 4 e2e + 2 UDS**, `--features lan` **120**, `--features zenoh` **117 + 1 ignored**, `cargo test -p amos-link-cli` **9 + 17**, `clippy -D warnings` and `fmt` green. See `docs/amos-link.md` §3.3/§3.4.
+- **Every workspace member now documents itself at its own door — and it is a gate, not a convention (REQ-A237)**: `scripts/crate-readme-scan.mjs` (wired into `make lint`, with `scripts/crate-readme-allowlist.json`) demands a `README.md` per `Cargo.toml` member, with an H1 naming the crate and a link back to the root; the scan has a `--selftest`, because a gate that never fails is not a gate. The same round turned README-promised examples into code that actually compiles (4 broken examples fixed).
+- **Local gates hardened on the Rust side**: a repo-wide **"no recursion"** scan (`scripts/rust-recursion-scan.mjs`, now including mutual recursion via a resolved call graph) after a recursive matcher was found holding the broker's lock, plus the `unsafe-scan` / Tauri-reply JSON contract checks — all in `make lint`.
+
 ## Recent additions (2026-09-13)
 
 - **F-Droid repository compatibility — `amos-appstore` + `amos-appstore-cli`**: the host store now consumes the **official F-Droid `index-v1.json`** (both `packages` shapes, numeric/string values, localized metadata) through `FdroidRepoProvider`, mapped onto the same `AppManifest` contract, and can publish our own catalog **back in F-Droid format** (`catalog_to_fdroid_index_v1`; categories map symmetrically, `suggestedVersionCode` is synthesised). Verified against **real f-droid.org** (61 MB index → zh backfill → real APK download + sha256). The CLI gains `--repo` (browse/search/find), `info`, `export` and an **atomic, sha256-verified `download`** that never pretends to install; network bodies are **capped fail-closed** (never silently truncated). Honest gaps: index PGP/JAR verification is not implemented (a pinned-index sha256 is the interim), and silent install still needs the device channel below. See `docs/appstore.md` · `docs/fdroid-audit.md`.
@@ -454,6 +541,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [docs/fdroid-audit.md](./docs/fdroid-audit.md) — F-Droid distribution audit: `FdroidRepoProvider` (official `index-v1.json` read + F-Droid-format publish), the container APK-install channel (gap 1), and nine probe-verified audit rounds
 - [docs/release-artifacts.md](./docs/release-artifacts.md) — Release artifacts: the headless bundle (`scripts/release-artifacts.sh` = the single definition, `make release-artifacts`, `.github/workflows/release.yml`), the `--version` contract, tag↔version consistency and honest boundaries
 - [docs/api-grpc.md](./docs/api-grpc.md) — Generated gRPC API reference for `proto/*.proto` (services / RPCs / messages / enums, doc comments included); regenerate with `make api-docs`, drift-checked by `make lint`
+- [docs/amos-link.md](./docs/amos-link.md) — AmOS-Link robot middleware: layers & the real data flow, the kernel modules, safety semantics (§3.1), an honest `LinkHealth` verdict (§3.2), the two hardening rounds (§3.3 allocation/arithmetic, §3.4 peer table & matcher), the Zenoh usage audit (§4 — what is used and what is not), the 5-RPC control plane (§5), env vars + non-goals (§6) and the verification entry points (§7)
 - [docs/telephony.md](./docs/telephony.md) — Telephony: design + contract (dialer, EmergencyMap/110-112 hard path, TelephonyProvider seams, call-recording consent, call-history page)
 - [docs/sms.md](./docs/sms.md) — SMS: real device send/receive, inbox/sent/drafts folders, validation bounds, and the shared spam blocklist (rules + SMS filter + CallScreeningService)
 - [docs/radio.md](./docs/radio.md) — Radio/connectivity: wifi/bluetooth/airplane state, RadioManager airplane policy + cascade, provider seams (Mock / Android JNI) & System UI bridge
@@ -507,6 +595,7 @@ You may use this project under either license at your discretion. See [LICENSE](
 - [ ] Mobile platform optimization (iOS/Android)
 - [ ] Extended device API access — domain core + gRPC `SensorService` wired into the daemon UDS + System UI desktop bridge (`sensor_snapshot`/`set_mode`/`acquire` + `lib/sensors.ts`); feature-gated Android skeleton landed (GNSS real via `LocationManager`); device bring-up: camera-frame/IMU stream bridges + System UI real-`Context` wiring (`docs/sensors.md`)
 - [ ] Performance profiling and optimization — metric kernel wired into the daemon's `stream_chat` + bidi `Chat` decode paths, exposed on `get_status.profile`, on the periodic heartbeat log, and rendered in the Settings diagnostics area; **real power model landed** (`BatterySample`/`mean_power_mw`, Android source reads live `CURRENT_NOW` × `EXTRA_VOLTAGE` → `est_energy_j`); **Energy-Governor → CPU/NPU frequency closed loop landed** (`freq` domain + `FrequencyGovernor` + Linux `scaling_max_freq` cap/restore seam, and `ResourceGovernor::freq_plan` composition bridge). Remaining device/UI follow-ons: System-UI ticker sampling real battery + injecting chip topology + cpufreq write privileges (`docs/profiling.md`, `docs/power-policy.md`)
+- [x] Robot middleware — **AmOS-Link** (`amos-link` + `amos-link-cli`, the daemon's 5-RPC control plane and the read-only Settings「机器人链路」page) landed and then audit-hardened over fifteen rounds (`docs/amos-link.md`). Remaining: cross-board multicast on a real switch is a field-verification item, the MCU/`zenoh-pico` firmware path is out of scope by design, and a ROS/DDS bridge would be a separate deployment component
 
 ## Support
 
