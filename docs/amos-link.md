@@ -1040,6 +1040,75 @@ above was answered                                      （没答的那一栏如
 6. **真机复核未做**：证据是同一个进程里两个真 session 的 TCP 环回（真握手、真路由、真 `put`），
    没有两块板子/真 Wi-Fi-5G 的现场数据；`#[ignore]` 的跨主机 scouting 用例仍然忽略。
 
+### 3.19 「这条流还在按它的频率跑吗？」——`hz`，以及为它做的三处修正（第十八轮，REQ-A273）
+
+> 起点是上一轮自己留下的那张表：§8 的 ROS 2 对照里，`ros2 topic echo / hz / bw` 那一行是唯一还写着
+> 「速率的代理是 `published` 与序号缺口」的 ⚠️。**本 CLI 一个速率数字都没有** —— `bench` 测的是它自己造的
+> 合成发布者，`watch` 数的是心跳。于是「相机掉到 10 fps」「大脑不再发控制指令但心跳照打」「IMU 驱动在高负载
+> 下限速」这三类故障，**在操作员能读到的任何数字里都不存在**：丢帧计数干净（没有丢帧），判决健康（心跳还在），
+> 而流已经不跑它的频率了。`ros2 topic hz` 存在的全部理由就是这个问题。
+>
+> 本轮把它补上，并顺手修掉实现过程中撞出来的三处缺陷。
+
+**交付**：内核 `crates/amos-link/src/rate.rs`（`RateTracker` / `StreamRate` / `RateEvidence`，**纯状态机**：
+无 I/O、无时钟、到达时刻由调用方注入 ⇒ 单测用注入的时刻把速率钉成算术，而不是测量本机调度器）+
+CLI 新命令 **`hz`**（`--pattern` / `--qos` / `--seconds` / `--json`，每 1 秒打印每条流一条读数）。
+
+**三条诚实点**（都是本仓反复付过学费的那几条）：
+
+1. **用我们自己的单调时钟的到达时刻，绝不用帧里的 `stamp`**。用远端时间戳算速率，会在两块板卡时钟不一致时
+   悄悄变成另一种量 —— §3.15 对「年龄」的教训，用在第二个测量上。副产品：**速率不需要时钟校准**，
+   `clock_synced=false` 不削弱它。
+2. **速率 = 间隔数 / 跨度**（`(frames − 1) / span`），不是 `frames / span`（后者在 60 Hz 上快 ~1.7%，
+   在两帧时快 100%）。`frames` 与 `span` 就印在与数字**同一行**，读者随时可以自己复核算术。
+3. **说不出速率时说原因，绝不说 `0`**：一帧 = `unknown(one frame so far (no interval to divide by))`；
+   跨度短于 `MIN_RATE_SPAN`（500 ms）= `unknown(only 40ms of span …)`。`0 Hz` 会被读成「机器人停止发布了」，
+   那是关于**别人**的断言，而我们只知道自己这个窗口。`--json` 里是 `"rate_hz": null` + `"why": "single-frame"`。
+
+| # | 本轮撞出的缺陷（都是为 `hz` 找路时发现的，均已实测） | 为什么是缺陷 | 处置 |
+|---|---|---|---|
+| 1 | **只要信封的消费者要复制整份帧**：`Envelope::decode` 以 `payload.to_vec()` 结束，而速率/计数/转发这类消费者只需要 `(topic, publisher, seq, stamp)` —— 上限 16 MiB 的帧，每帧一次 memcpy | 与 §3.3「接收路径永不构造第二份帧」同一条纪律（那条只修了 CRC）。一个 60 Hz 的深度流会为「读一个头部」付出 60 MB/s 的拷贝 | 新增 **`Envelope::decode_header(frame) -> (Header, &[u8])`**（借出负载切片），并让 `decode` 写在它之上：**一份解析器、两副形状**，magic/版本/长度/CRC/头部校验不可能在两条路径之间漂移（校验就是拒绝敌对帧的那几道，第二份实现等于第二种意见） |
+| 2 | **订阅 profile 规则写了两遍**：`sub` 与 `state` 各自实现「`--qos` ＞ pattern 的 channel ＞ 默认」，而 `hz` 会是第三份 —— 同一个 pattern 在两个命令里可能选出**不同的 profile**（正是 §3.18 修过的形状：同一份契约两个消费者给出两个答案） | 复制粘贴的规则会在下一次修改时漂移，而漂移的后果是「控制流被 best-effort 丢掉」这条最危险的默认 | 抽成 `subscription_qos(pattern, requested, default_channel)`：`--qos` 胜；否则 **pattern 自己的 channel**（`amos/*/control/**` 永远拿 reliable）；否则调用方文档化的默认（`sub`/`hz` = sensor，`state` = state）。**打印出来的来源文案不变**（`from channel control` / `from --qos` / `from default (no channel in the pattern)`） |
+| 3 | **一个用例钉住了一次 `select!` 竞态**：`watch` 的判定断言写在「状态 tick」那一行上，而 `tokio::time::interval` 的**第一次 tick 是立即的** ⇒ 负载高时它先于本节点自己的第一拍触发，此刻 `published=0`、无证据 ⇒ `health=unknown`（那一瞬间诚实，但不是整轮的结论）。实测：全量跑时该用例偶发失败（`got … health=unknown`），单跑三次全过 | 一个「通过或失败取决于哪个分支先跑」的用例，既不能证明它声称的事实，还会在有人真正改坏判定时给出错误信号 | 判定**同时写进收尾 summary**（`watched 1s: … health=degraded: no_peers, clock_unsynced`，`--json` 的 summary 事件加 `health` 对象）；用例改为断言 summary，tick 行只断言**形状**（` tracking=complete health=`）。summary 折的是整窗的累计事实，因此与机器负载无关 |
+
+**实测证据**（真二进制、进程级）：
+
+```text
+$ amos-link-cli hz --seconds 1                     # 空闲链路：没有任何数字可编
+measuring transport=broker peer=amos-node pattern=amos/** qos=best-effort/drop-oldest \
+  from default (no channel in the pattern) every=1000ms for 1s · clock_synced=false: …
+no frames observed in 1s (an idle link is not a 0 Hz stream; check --pattern and --transport)
+summary streams=0 frames=0 untracked=0 undecodable=0 complete=yes ran=1s
+
+$ amos-link-cli hz --seconds 1 --json              # 机器形态：rates 为空数组，绝不虚构 rate_hz
+{"event":"measuring","every_ms":1000,"from":"default (no channel in the pattern)",…}
+{"complete":true,"event":"hz_summary","frames":0,"rates":[],"seconds":1,"streams":0,…}
+
+# 内核：注入时刻，把速率钉成算术（`cargo test -p amos-link --lib rate::`）
+5 帧 × 250 ms ⇒ span=1s、rate=4.0Hz（`frames/span` 会给出 5.0Hz）；1 帧 ⇒ None + `single-frame`；
+2 帧 × 250 ms（span=250ms < 500ms）⇒ None + `span-too-short{span:250ms}`；2 帧 × 500 ms ⇒ 恰在界内 ⇒ Some(2.0)
+一台 peer 的两个话题 ⇒ 两条流两个速率（§3.13 的键在速率仪器上的同一个道理）
+乱序注入的时刻 ⇒ span 饱和到 0、速率**不说**（不会因减法回绕而给出看似合理的错数）
+超过 MAX_TRACKED_STREAMS ⇒ `Untracked` 计数、`complete=no`，且 `reset()` **不擦掉**这个证据
+
+# 信封只读（`cargo test -p amos-link --lib the_header_only_reader`）
+decode_header 返回的负载切片指向**帧内**（不是新缓冲）；decode 与 decode_header 对坏 magic/版本/
+截断/CRC/长度上限给出**逐字相同**的拒绝理由
+```
+
+**诚实边界（本轮新增）**：
+
+1. **印出来的是「自 `hz` 启动以来的平均速率」**（与 `watch` 的 `beats_seen` 同一形状），不是滑动窗口。
+   一个「先 60 Hz 跑了 60 s、然后死了 30 s」的流会读成 ~40 Hz —— 停住这件事体现在**同一行的 `frames` 不再增长**，
+   而「速率跌到 0」这种说法需要窗口，窗口在 1 秒的采样上只是在描述本机调度器（因此**故意不做**窗口速率）。
+2. **`MIN_RATE_SPAN = 500 ms` 是策略，不是定理**：它把「3 帧挤在 40 ms 内的 ~50 Hz」这类**关于调度器的**数字挡在门外，
+   代价是慢流（1 Hz 心跳）在前两拍内只能得到 `span-too-short`，要等满 500 ms 才有数。
+3. **`hz` 是数据面命令**：`--socket` 会被按名拒绝（控制面不携带 per-topic 速率），因此它测的是**本进程所在的这条链路**
+   —— 在板卡上就是 `--transport zenoh` 那条真链路。
+4. **`undecodable` 是单独计数的**：一个连本 crate 的 `Envelope::decode_header` 都拒绝的帧不是任何流的到达，
+   它进 `undecodable`（summary 里可见），不会被折进任何速率。
+5. **真机复核未做**：证据是内核注入时刻的单测、进程级的空闲链路输出与真二进制行为；没有两块板卡/真 Wi-Fi-5G 的现场采样。
+
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
 
 
@@ -1295,7 +1364,12 @@ cargo test -p amos-link --features zenoh -- --ignored   # 只剩跨主机 scouti
 cargo test -p amos-tauri --test link_status_e2e a_daemon_without_the_return_path_still_answers_the_panel
 cargo test -p amos-link-cli --test cli_smoke an_older_daemon_still_answers_the_status_over_a_socket
 cd crates/amos-tauri/frontend-ts && bunx vitest run svelte-tests/link-page.svelte.test.ts   # 三态（unavailable/none/reported）
-cargo run -p amos-link-cli -- status --socket /tmp/old-daemon.sock | tail -3    # 「not answered by this daemon」
+cargo run -p amos-link-cli -- status --socket /tmp/old-daemon.sock | tail -3
+# 速率仪器（第十八轮，§3.19）：每条流一行 `frames`/`span`/`rate`，说不出的速率给原因而不给 0
+cargo run -p amos-link-cli -- hz --pattern 'amos/**' --seconds 10
+cargo run -p amos-link-cli -- hz --pattern 'amos/*/sensor/**' --seconds 10 --json
+cargo test -p amos-link --lib rate::          # 9 例：注入时刻 ⇒ 速率是算术（含 single-frame / span-too-short）
+cargo test -p amos-link --lib the_header_only_reader   # 只读信封：负载是借用，拒绝理由与 decode 逐字相同    # 「not answered by this daemon」
 # 同一份 QoS 必须在两个传输上意味着同一件事（第十七轮，§3.18）：
 # 真 TCP 环回会话上，Qos::sensor() 连发 5 帧后只 recv 一次 ⇒ 拿到**第 5 帧**且 dropped=4
 cargo test -p amos-link --features zenoh --lib a_latest_only_subscription_over_a_real_session_keeps_the_newest_frame
@@ -1348,7 +1422,7 @@ reliability + history depth」，而本节的用途是**把这些类比逐条落
 | **SROS2（认证/加密）** | ❌ 无 | ❌ 故意不做 | §6.2：发现不是认证；UDS 侧靠文件权限，网络侧靠传输配置。**不要**把链路当作安全边界 |
 | **Lifecycle node（configure/activate/…）** | ❌ 无 | ❌ 故意不做 | 组件的启动/停止是 systemd / `amos-kernel` 的事 |
 | **Executor / callback group** | ❌ 无（**由调用方拥有线程**） | ❌ 故意不做 | README：「not a scheduler (you own the control thread and its rate)」；`try_recv` 是给控制回路用的非阻塞读取 |
-| **`ros2 topic echo` / `hz` / `bw`** | `sub` / `watch` / `bench` | ⚠️ 一一对应，形状不同 | `watch` 打**心跳**（含 `missed`）、`bench` 打**延迟直方图 + 吞吐**、`sub` 打**每一帧 + 序号缺口与丢帧计数**。**差异**：`hz`/`bw` 是**按话题**的速率/带宽，本 CLI 的吞吐属于 `bench`，速率的代理是 `published` 与序号缺口（§3.15 的纪律：数字要能行动） |
+| **`ros2 topic echo` / `hz` / `bw`** | `sub` / `hz` / `watch` / `bench` | ⚠️ 一一对应，形状不同 | `watch` 打**心跳**（含 `missed`）、`bench` 打**延迟直方图 + 吞吐**、`sub` 打**每一帧 + 序号缺口与丢帧计数**、`hz` 打**每条流的到达速率**（第十八轮补上，§3.19：此前速率的代理只是 `published` 与序号缺口，一个速率数字都没有）。**差异**：`bw`（按话题带宽）没有对应物 —— `bench` 的吞吐是它自己造的那条流，而「这条流占了多少字节/秒」仍需 `watch --json` 的计数器自己算 |
 | **`ros2 topic info`（类型 + 订阅者数）** | `status`（对端表、计数器、判决）+ `topics`（清单及其**完整性**） | ⚠️ 部分 | **差异**：没有「谁订阅了它」的远端视图（broker 知道本地 fan-out 数，网络传输**诚实地说不知道**），也没有类型名 |
 | **`ros2 node list` / `info`** | `status` / `discover`（对端表：id/kind/version/uptime/地址/beacon 数） | ✅ 形状相近 | §5 与 §3.11：对端表是**本节点**看到的，不是全网权威视图 |
 | **`ros2 param` / `service` / `action` CLI** | ❌ 无（没有这些数据面概念） | ❌ 由上表三行决定 | — |

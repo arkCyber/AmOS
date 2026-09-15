@@ -569,7 +569,10 @@ mod tests {
         );
         assert_eq!(payload, &frame[offset..]);
         assert!(
-            core::ptr::eq(payload.as_ptr(), frame[frame.len() - payload.len()..].as_ptr()),
+            core::ptr::eq(
+                payload.as_ptr(),
+                frame[frame.len() - payload.len()..].as_ptr()
+            ),
             "the returned slice must point *into* the frame"
         );
         // Same bytes through the owning path: same header, same payload.

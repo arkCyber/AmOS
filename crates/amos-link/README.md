@@ -136,7 +136,7 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 | file | what |
 |---|---|
 | `src/keyexpr.rs` | `Topic` / `Channel`: validation, `*`/`**` matching, channel→QoS |
-| `src/codec.rs` | `Message`, `Envelope`, `Header`, `Timestamp`, `Clock` (stamps from `amos-timesync`) |
+| `src/codec.rs` | `Message`, `Envelope`, `Header`, `Timestamp`, `Clock` (stamps from `amos-timesync`); `Envelope::decode_header` reads the envelope **without copying the payload** (a rate/counter/forwarder needs only the header) |
 | `src/qos.rs` | `Qos::sensor()/state()/control()` + `Qos::for_channel` |
 | `src/broker.rs` | `Transport` seam + the in-process `Broker` (`Arc<[u8]>` fan-out, bounded topic inventory) |
 | `src/pubsub.rs` | `Publisher<T>` / `Subscriber<T>` / `Received<T>` |
@@ -145,6 +145,7 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 | `src/zenoh.rs` | *(feature `zenoh`)* the inter-board transport |
 | `src/telemetry.rs` | `Heartbeat` + `NodeStatus` + `spawn_heartbeat` |
 | `src/sequence.rs` | `SeqTracker`: per-**stream** `(publisher, topic)` gaps/duplicates, so "a frame was lost" is a number — and it names the stream it happened on |
+| `src/rate.rs` | `RateTracker`: per-**stream** arrival rate (from *our* monotonic clock, never the frame's `stamp`), with `RateEvidence` saying *why* when a rate cannot be stated — `0 Hz` would read as "the robot stopped" |
 | `src/robot_hal.rs` | `AgentAction` → `plan()` → `MotorFrame` (CRC16) → `RobotHal`; `RobotBridge` with e-stop + watchdog, and `reporting()` for the mode return path |
 | `src/health.rs` | `LinkHealth::evaluate` — the fold from counters to a verdict |
 | `src/node.rs` | `LinkNode`: identity + transport + clock + counters + peer table |

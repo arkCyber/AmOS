@@ -2846,7 +2846,6 @@ fn rate_json(rate: &StreamRate) -> serde_json::Value {
     })
 }
 
-
 /// With `--socket` this is also the terminal twin of the System UI's Settings
 /// 「机器人链路 / Robot Link」 page (`amos-tauri`'s `link_status` reads the same
 /// `GetStatus`): both answer "is the robot on the link" from the *daemon's* node,
@@ -3851,7 +3850,8 @@ mod tests {
         let pattern = |s: &str| Topic::pattern(s.to_string()).expect("pattern");
 
         // An explicit `--qos` wins, and says so.
-        let (qos, source) = subscription_qos(&pattern("amos/*/sensor/**"), Some(Qos::control()), None);
+        let (qos, source) =
+            subscription_qos(&pattern("amos/*/sensor/**"), Some(Qos::control()), None);
         assert_eq!(qos, Qos::control());
         assert_eq!(source, "--qos");
 
@@ -3875,7 +3875,8 @@ mod tests {
         assert_eq!(source, "channel state");
         // A pattern that *does* name a channel still wins over that default (`state` included):
         // one rule, not one rule per command.
-        let (qos, source) = subscription_qos(&pattern("amos/*/control/**"), None, Some(Channel::State));
+        let (qos, source) =
+            subscription_qos(&pattern("amos/*/control/**"), None, Some(Channel::State));
         assert_eq!(qos, Qos::control());
         assert_eq!(source, "channel control");
     }

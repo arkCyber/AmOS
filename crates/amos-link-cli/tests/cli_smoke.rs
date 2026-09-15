@@ -968,7 +968,10 @@ fn hz_is_a_local_data_plane_command_and_belongs_to_its_own_flags() {
     let (code, _, stderr) = run(&["hz", "--count", "5"]);
     assert_eq!(code, 2, "a mis-scoped flag is a usage error");
     assert!(stderr.contains("--count"), "got: {stderr}");
-    assert!(stderr.contains("hz"), "the refusal names the command: {stderr}");
+    assert!(
+        stderr.contains("hz"),
+        "the refusal names the command: {stderr}"
+    );
 }
 
 #[test]
