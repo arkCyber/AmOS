@@ -530,11 +530,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_flashlight_size_cap_is_well_under_the_general_store_cap() {
         // Real values are ~32 B; the cap is small but generous, AND it is
         // deliberately much smaller than `store::MAX_STORE_VALUE_BYTES` (256
         // KiB) so an oversized payload is refused BEFORE it can pollute the
-        // boot-time JSON parse.
+        // boot-time JSON parse. The tripwire is the test itself; the lint is
+        // suppressed so the tripwire keeps its "if this is wrong the build
+        // fails" shape.
         assert!(
             MAX_FLASHLIGHT_VALUE_BYTES <= 4096,
             "the torch key has no legitimate use for a 256 KiB value: got {MAX_FLASHLIGHT_VALUE_BYTES}"

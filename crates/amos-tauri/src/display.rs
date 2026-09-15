@@ -317,14 +317,24 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_screen_state_cap_is_a_small_known_value() {
-        // The contract file is two ASCII bytes (`on`/`off`); the cap is a small
-        // known value that pins the contract — not the 64 KiB of arbitrary
-        // store values — so a runaway writer that tries to push megabytes
-        // through the contract is refused at the byte level.
+        // The contract file is two ASCII bytes (`on`/`off`); the cap is a
+        // small known value that pins the contract — not the 64 KiB of
+        // arbitrary store values — so a runaway writer that tries to push
+        // megabytes through the contract is refused at the byte level. The
+        // clippy lint that would move these into `const {…}` is suppressed:
+        // the tripwire's value is *being* a runtime test on top of a test
+        // build (the constant cannot change between runs, but a CI-runner /
+        // investigator reading the diff still gets a self-documenting test
+        // to compare against).
         assert!(
-            (16..=4096).contains(&MAX_SCREEN_STATE_BYTES),
-            "cap is small enough to refuse runaway writes but large enough to never bind a 2-byte payload: got {MAX_SCREEN_STATE_BYTES}"
+            MAX_SCREEN_STATE_BYTES >= 16,
+            "cap is large enough to never bind a 2-byte payload: got {MAX_SCREEN_STATE_BYTES}"
+        );
+        assert!(
+            MAX_SCREEN_STATE_BYTES <= 4096,
+            "cap is small enough to refuse runaway writes: got {MAX_SCREEN_STATE_BYTES}"
         );
         // The actual payload (`on`/`off`) is far under the cap.
         assert!(("on".len() as u64) < MAX_SCREEN_STATE_BYTES);

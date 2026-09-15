@@ -383,9 +383,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn sensor_rate_bounds_are_sane_for_real_streams() {
         // Real streams run 30–200 Hz; the cap is well above that but refuses
         // the u32::MAX probe (a div-by-zero or "what if I pass max" canary).
+        // The tripwire is the test itself; the lint is suppressed so the
+        // tripwire keeps its "if any of these is wrong the build fails"
+        // shape — the assertions are the contract, not the constant values.
         assert!(MIN_SENSOR_RATE_HZ >= 1);
         assert!(MAX_SENSOR_RATE_HZ >= 1000, "real high-rate streams fit");
         assert!(MAX_SENSOR_RATE_HZ < u32::MAX, "pathological max refused");
