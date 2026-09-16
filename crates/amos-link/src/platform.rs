@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use crate::error::{LinkError, Result};
 use crate::robot_hal::{
-    parse_command, plan as plan_reference, JointId, MotorFrame, MotorOp, RobotCommand,
+    parse_command, plan as plan_reference, JointId, MotorFrame, MotorOp, RobotCommand, MAX_JOINT,
     MAX_JOINT_MILLI_DEG, MAX_TORQUE_MILLI_PERCENT, MAX_WATCHDOG_MS,
 };
 
@@ -313,9 +313,22 @@ pub struct ActionSpec {
     /// Scale the pose by the intent's speed factor (the reference machine's rule: a positive
     /// base becomes `-((base as f32) * (0.5 + 0.5 * speed)) as i32`). A profile that has no such
     /// rule leaves this `false` and its pose is used literally.
+    ///
+    /// `false` also means an **explicit** `speed` cannot be honoured, and
+    /// [`Platform::parse_intent`] refuses one instead of dropping it: an operator asking for a
+    /// gentle `takeoff` must not get full thrust with no indication that the number was ignored.
     pub speed_scaled: bool,
     /// The parameters this action accepts (validated against [`ParamSpec::range`]).
     pub params: &'static [ParamSpec],
+    /// How many of `params` a command must actually carry to **be** this action (`0` = the pose
+    /// alone is a complete command).
+    ///
+    /// It exists for the actions whose meaning *is* their parameter: `goto` is a target and
+    /// `waypoint` is a point, so a command naming neither is not that action — it is the
+    /// profile's default pose wearing the action's name, which is how a machine ends up moving
+    /// because a tool forgot to fill a field. An action with a meaningful default (a lane offset
+    /// of zero is *centred*, a stopped cell's default cadence is a cadence) declares `0`.
+    pub min_params: usize,
 }
 
 /// What a machine should do when the link is lost — the manoeuvre, declared instead of assumed.
@@ -479,11 +492,214 @@ impl Platform {
     }
 
     /// The single action of a class, when the profile declares exactly one (every profile
-    /// declares exactly one `Arm` and one `Halt`; the tests pin that).
+    /// declares exactly one `Arm` and one `Halt`; [`Platform::validate`] enforces it).
     pub fn action_of_class(&self, class: IntentClass) -> Option<&'static ActionSpec> {
         let mut found = self.actions.iter().filter(|a| a.class == class);
         let first = found.next()?;
         found.next().is_none().then_some(first)
+    }
+
+    /// A profile a **deployment** writes: its own actuators, vocabulary and envelope, checked by
+    /// the same rules the six built-ins are held to.
+    ///
+    /// Until this existed, "a machine is data, not code" was true of the six `const`s in this file
+    /// and of nothing else: the fields are private and every built-in is a `const`, so a product
+    /// with a 6-axis arm that travels ±120°, an eight-rotor airframe or a different braking
+    /// actuator could only edit this crate. It now writes the data and hands it over:
+    ///
+    /// ```text
+    /// static MY_ACTUATORS: &[Actuator] = &[ /* … */ ];
+    /// static MY_ACTIONS: &[ActionSpec] = &[ /* … */ ];
+    /// static MY_PROFILE: OnceLock<Platform> = OnceLock::new();
+    /// let profile: &'static Platform = MY_PROFILE.get_or_init(|| {
+    ///     Platform::from_parts(PlatformKind::Manipulator, MY_ACTUATORS, MY_ACTIONS,
+    ///                          SafetyEnvelope { watchdog: Duration::from_millis(20),
+    ///                                           failsafe: Failsafe::Hold }, false)
+    ///         .expect("reviewed against the machine")
+    /// });
+    /// ```
+    ///
+    /// A profile that is not self-consistent — a pose that does not fit its actuator table, two
+    /// `Arm` actions, a travel the frame cannot carry, a deadman a report cannot hold — is refused
+    /// **here**, naming the rule, instead of becoming a machine that accepts a command and writes
+    /// a frame nobody can explain. `arm_on_motion` is the reference machine's quirk (a motion
+    /// batch that energizes on its way out); a profile that arms explicitly passes `false`, which
+    /// is also what makes the disarmed-refusal in `RobotBridge` reachable for it.
+    ///
+    /// [`PlatformKind`] is still closed (the six domains this build documents): a profile is data,
+    /// a *new domain* is a code change — see docs/robot-domains.md §5.
+    pub fn from_parts(
+        kind: PlatformKind,
+        actuators: &'static [Actuator],
+        actions: &'static [ActionSpec],
+        envelope: SafetyEnvelope,
+        arm_on_motion: bool,
+    ) -> Result<Self> {
+        let platform = Self {
+            kind,
+            actuators,
+            actions,
+            envelope,
+            arm_on_motion,
+        };
+        platform.validate()?;
+        Ok(platform)
+    }
+
+    /// Is this profile one the layer can honour?
+    ///
+    /// Every rule is data a machine's reviewer can argue with, and each refusal names the profile,
+    /// the actuator or the action that broke it. The built-ins are `const`s (a `const fn` cannot
+    /// return an error), so the integration suite calls this on all six as well — one rule, two
+    /// callers, which is what keeps a hand-written profile from shipping a vocabulary its own pose
+    /// table contradicts.
+    pub fn validate(&self) -> Result<()> {
+        let label = self.kind.key();
+        if self.actions.is_empty() {
+            return Err(LinkError::Robot(format!(
+                "platform {label} declares no actions: there is nothing it can be asked to do"
+            )));
+        }
+        // Actuators: at least one (a motion batch energizes actuator 0, and every plan iterates
+        // them), at most `MAX_JOINT + 1` (the frame's `id` byte is a `JointId`), contiguous from 0
+        // (the index *is* the bus address), uniquely named, with a travel that is ordered, inside
+        // the frame's own argument space, and legal at both of its ends.
+        if self.actuators.is_empty() {
+            return Err(LinkError::Robot(format!(
+                "platform {label} declares no actuators"
+            )));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for (position, actuator) in self.actuators.iter().enumerate() {
+            if usize::from(actuator.index) != position {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: actuator {} is at position {position} — indices must be \
+                     contiguous from 0, because the index is the bus address",
+                    actuator.index
+                )));
+            }
+            if actuator.index > MAX_JOINT {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: actuator {} ({}) is past the {}-actuator boundary this \
+                     layer registers",
+                    actuator.index,
+                    actuator.name,
+                    usize::from(MAX_JOINT) + 1
+                )));
+            }
+            if !names.insert(actuator.name) {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: two actuators are called `{}`",
+                    actuator.name
+                )));
+            }
+            let (min, max) = actuator.travel;
+            if min > max {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: actuator {} ({}) has an inverted travel {min}..={max}",
+                    actuator.index, actuator.name
+                )));
+            }
+            for edge in [min, max] {
+                actuator.check(edge).map_err(|e| {
+                    LinkError::Robot(format!(
+                        "platform {label}: actuator {} ({}) cannot be driven to its own travel \
+                         edge — {e}",
+                        actuator.index, actuator.name
+                    ))
+                })?;
+            }
+        }
+        for class in [IntentClass::Arm, IntentClass::Halt] {
+            if self.action_of_class(class).is_none() {
+                return Err(LinkError::Robot(format!(
+                    "platform {label} needs exactly one `{}` action (it has {}): a machine with no \
+                     way to {} cannot be left unattended",
+                    class.key(),
+                    self.actions.iter().filter(|a| a.class == class).count(),
+                    match class {
+                        IntentClass::Arm => "energize its drives",
+                        _ => "be stopped",
+                    }
+                )));
+            }
+        }
+        self.validate_actions(label)
+    }
+
+    /// The vocabulary half of [`Platform::validate`]: unique keys, poses that fit the actuator
+    /// table, one `Arm` and one `Halt`, bounded and uniquely named parameters, and a `min_params`
+    /// a command can actually satisfy.
+    fn validate_actions(&self, label: &'static str) -> Result<()> {
+        let mut keys = std::collections::BTreeSet::new();
+        for action in self.actions {
+            if !keys.insert(action.key) {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: two actions are called `{}`",
+                    action.key
+                )));
+            }
+            if action.pose.is_empty() {
+                if action.speed_scaled {
+                    return Err(LinkError::Robot(format!(
+                        "platform {label}: `{}` asks a speed to scale a pose it does not have (an \
+                         empty pose means the intent must name every actuator)",
+                        action.key
+                    )));
+                }
+            } else if action.pose.len() != self.actuators.len() {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: `{}` has {} pose entries for {} actuators",
+                    action.key,
+                    action.pose.len(),
+                    self.actuators.len()
+                )));
+            }
+            if action.class != IntentClass::Motion && !action.pose.iter().all(|arg| *arg == 0) {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: `{}` is a `{}` action, so its pose must be inert (every \
+                     entry 0) — its frames come from the actuator table",
+                    action.key,
+                    action.class.key()
+                )));
+            }
+            for (position, arg) in action.pose.iter().enumerate() {
+                let actuator = &self.actuators[position];
+                if let Err(e) = actuator.check(*arg) {
+                    return Err(LinkError::Robot(format!(
+                        "platform {label}: `{}` sets actuator {} ({}) to {arg} — {e}",
+                        action.key, actuator.index, actuator.name
+                    )));
+                }
+            }
+            let mut params = std::collections::BTreeSet::new();
+            for param in action.params {
+                if !params.insert(param.name) {
+                    return Err(LinkError::Robot(format!(
+                        "platform {label}: `{}` declares the parameter `{}` twice",
+                        action.key, param.name
+                    )));
+                }
+                if param.range.0 > param.range.1 {
+                    return Err(LinkError::Robot(format!(
+                        "platform {label}: `{}`'s `{}` has an inverted range {}..={}",
+                        action.key, param.name, param.range.0, param.range.1
+                    )));
+                }
+            }
+            if action.min_params > action.params.len() {
+                return Err(LinkError::Robot(format!(
+                    "platform {label}: `{}` requires {} of its {} parameters — no command could \
+                     ever satisfy it",
+                    action.key,
+                    action.min_params,
+                    action.params.len()
+                )));
+            }
+        }
+        self.envelope
+            .validate()
+            .map_err(|e| LinkError::Robot(format!("platform {label}: {e}")))
     }
 }
 
@@ -528,6 +744,16 @@ impl Platform {
     ///   space) and its parameters. An **unknown** parameter is refused: an unrecognised limit is
     ///   not a hint, and silently dropping a geofence parameter is the failure this layer exists
     ///   to catch.
+    ///
+    /// Three more inputs are refused rather than accepted-and-dropped, because each of them is a
+    /// command the operator believes is in effect:
+    ///
+    /// * a **`speed`** on a `Motion` whose pose is fixed (`speed_scaled == false`) — the number
+    ///   cannot be honoured, so it is named instead of ignored;
+    /// * a **duplicate set point** for one actuator — two values for one index leave the layer
+    ///   picking one silently;
+    /// * an action with **fewer than `min_params` parameters** — a `goto` with no coordinate is
+    ///   not a target, it is the profile's default pose wearing the action's name.
     pub fn parse_intent(&self, json: &str) -> Result<Intent> {
         let raw: RawIntent = serde_json::from_str(json)
             .map_err(|e| LinkError::Robot(format!("action is not valid JSON: {e}")))?;
@@ -558,6 +784,19 @@ impl Platform {
         if !(0.0..=1.0).contains(&speed) {
             return Err(LinkError::Robot(format!("speed {speed} is outside [0, 1]")));
         }
+        // A speed this action cannot honour is refused rather than dropped. `takeoff`'s thrust is
+        // the profile's pose, not a multiple of it: accepting `speed: 0.1` and flying at full
+        // thrust is the machine telling the operator something it did not do. (An `Arm`/`Halt`
+        // keeps the shipping shape, where a cosmetic field never blocks an energize or a stop.)
+        if raw.speed.is_some() && !spec.speed_scaled {
+            return Err(LinkError::Robot(format!(
+                "action `{}` on platform {} has a fixed pose, so `speed` {} cannot be honoured: \
+                 remove it, or send the set points you want in `targets`",
+                spec.key,
+                self.kind.key(),
+                speed
+            )));
+        }
         let mut set_points = Vec::with_capacity(raw.targets.len());
         for t in &raw.targets {
             let actuator = self.actuator(t.actuator).ok_or_else(|| {
@@ -568,6 +807,18 @@ impl Platform {
                 ))
             })?;
             actuator.check(t.arg)?;
+            // One actuator, one set point. Two entries for the same index are a command nobody
+            // can reconstruct, and picking the first (JSON order) would silently drop the other.
+            if set_points
+                .iter()
+                .any(|s: &SetPoint| s.actuator == t.actuator)
+            {
+                return Err(LinkError::Robot(format!(
+                    "actuator {} ({}) is named twice in one intent: two set points for one \
+                     actuator leave the layer choosing which of them to drop",
+                    t.actuator, actuator.name
+                )));
+            }
             set_points.push(SetPoint {
                 actuator: t.actuator,
                 arg: t.arg,
@@ -592,6 +843,23 @@ impl Platform {
                 )));
             }
             params.push((param.name, *value));
+        }
+        // An action whose meaning *is* its parameter is incomplete without one: `goto` with no
+        // coordinate is the profile's default pose wearing the action's name. Checked after the
+        // limits (a target that is present **and** wrong is refused for being wrong).
+        if params.len() < spec.min_params {
+            return Err(LinkError::Robot(format!(
+                "action `{}` on platform {} needs at least {} of its parameters ({}), and this \
+                 intent names none of them — a target is not a default",
+                spec.key,
+                self.kind.key(),
+                spec.min_params,
+                spec.params
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
         Ok(Intent {
             action: spec.key,
@@ -845,6 +1113,7 @@ const QUADRUPED_ACTIONS: &[ActionSpec] = &[
         key: "stand",
         class: IntentClass::Motion,
         speed_scaled: true,
+        min_params: 0,
         params: &[],
         pose: &[
             0, 35_000, 60_000, 0, 35_000, 60_000, 0, 35_000, 60_000, 0, 35_000, 60_000,
@@ -854,6 +1123,7 @@ const QUADRUPED_ACTIONS: &[ActionSpec] = &[
         key: "trot",
         class: IntentClass::Motion,
         speed_scaled: true,
+        min_params: 0,
         params: &[],
         pose: &[
             0, 20_000, 45_000, 0, 45_000, 80_000, 0, 45_000, 80_000, 0, 20_000, 45_000,
@@ -863,6 +1133,7 @@ const QUADRUPED_ACTIONS: &[ActionSpec] = &[
         key: "walk",
         class: IntentClass::Motion,
         speed_scaled: true,
+        min_params: 0,
         params: &[],
         pose: &[
             0, 30_000, 55_000, 0, 30_000, 55_000, 0, 30_000, 55_000, 0, 30_000, 55_000,
@@ -872,6 +1143,7 @@ const QUADRUPED_ACTIONS: &[ActionSpec] = &[
         key: "sit",
         class: IntentClass::Motion,
         speed_scaled: true,
+        min_params: 0,
         params: &[],
         pose: &[
             0, 70_000, 30_000, 0, 70_000, 30_000, 0, 20_000, 10_000, 0, 20_000, 10_000,
@@ -881,6 +1153,7 @@ const QUADRUPED_ACTIONS: &[ActionSpec] = &[
         key: "arm",
         class: IntentClass::Arm,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 12],
     },
@@ -888,6 +1161,7 @@ const QUADRUPED_ACTIONS: &[ActionSpec] = &[
         key: "estop",
         class: IntentClass::Halt,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 12],
     },
@@ -969,6 +1243,7 @@ const DRONE_ACTIONS: &[ActionSpec] = &[
         key: "takeoff",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[55_000, 55_000, 55_000, 55_000, 0, 0],
     },
@@ -976,6 +1251,7 @@ const DRONE_ACTIONS: &[ActionSpec] = &[
         key: "hover",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[55_000, 55_000, 55_000, 55_000, 0, 0],
     },
@@ -983,6 +1259,7 @@ const DRONE_ACTIONS: &[ActionSpec] = &[
         key: "goto",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 1, // A target with no target is not a `goto`: one coordinate must be named.
         params: DRONE_FENCE,
         pose: &[58_000, 58_000, 58_000, 58_000, 0, 0],
     },
@@ -990,6 +1267,7 @@ const DRONE_ACTIONS: &[ActionSpec] = &[
         key: "rtl",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[60_000, 60_000, 60_000, 60_000, 0, 0],
     },
@@ -997,6 +1275,7 @@ const DRONE_ACTIONS: &[ActionSpec] = &[
         key: "land",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[35_000, 35_000, 35_000, 35_000, 0, 0],
     },
@@ -1004,6 +1283,7 @@ const DRONE_ACTIONS: &[ActionSpec] = &[
         key: "arm",
         class: IntentClass::Arm,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 6],
     },
@@ -1011,6 +1291,7 @@ const DRONE_ACTIONS: &[ActionSpec] = &[
         key: "estop",
         class: IntentClass::Halt,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 6],
     },
@@ -1078,6 +1359,7 @@ const MANIPULATOR_ACTIONS: &[ActionSpec] = &[
         key: "home",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 7],
     },
@@ -1085,6 +1367,7 @@ const MANIPULATOR_ACTIONS: &[ActionSpec] = &[
         key: "ready",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[10_000, -20_000, 15_000, 0, -10_000, 5_000, 0],
     },
@@ -1092,6 +1375,7 @@ const MANIPULATOR_ACTIONS: &[ActionSpec] = &[
         key: "move",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "speed_milli_percent",
             unit: "milli-percent",
@@ -1103,6 +1387,7 @@ const MANIPULATOR_ACTIONS: &[ActionSpec] = &[
         key: "grip",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "force_milli_percent",
             unit: "milli-percent",
@@ -1114,6 +1399,7 @@ const MANIPULATOR_ACTIONS: &[ActionSpec] = &[
         key: "arm",
         class: IntentClass::Arm,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 7],
     },
@@ -1121,6 +1407,7 @@ const MANIPULATOR_ACTIONS: &[ActionSpec] = &[
         key: "estop",
         class: IntentClass::Halt,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 7],
     },
@@ -1161,6 +1448,7 @@ const VEHICLE_ACTIONS: &[ActionSpec] = &[
         key: "hold",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0, 0, 0],
     },
@@ -1168,6 +1456,7 @@ const VEHICLE_ACTIONS: &[ActionSpec] = &[
         key: "lane_keep",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "lane_offset_mm",
             unit: "mm",
@@ -1179,6 +1468,7 @@ const VEHICLE_ACTIONS: &[ActionSpec] = &[
         key: "cruise",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "speed_mm_s",
             unit: "mm/s",
@@ -1190,6 +1480,7 @@ const VEHICLE_ACTIONS: &[ActionSpec] = &[
         key: "slow",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "decel_mm_s2",
             unit: "mm/s2",
@@ -1201,6 +1492,7 @@ const VEHICLE_ACTIONS: &[ActionSpec] = &[
         key: "arm",
         class: IntentClass::Arm,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 3],
     },
@@ -1208,6 +1500,7 @@ const VEHICLE_ACTIONS: &[ActionSpec] = &[
         key: "estop",
         class: IntentClass::Halt,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 3],
     },
@@ -1247,6 +1540,7 @@ const VESSEL_ACTIONS: &[ActionSpec] = &[
         key: "station_keep",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "radius_mm",
             unit: "mm",
@@ -1258,6 +1552,7 @@ const VESSEL_ACTIONS: &[ActionSpec] = &[
         key: "waypoint",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 1, // A point with no coordinates is not a `waypoint`.
         params: &[
             ParamSpec {
                 name: "x_mm",
@@ -1281,6 +1576,7 @@ const VESSEL_ACTIONS: &[ActionSpec] = &[
         key: "loiter",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "radius_mm",
             unit: "mm",
@@ -1292,6 +1588,7 @@ const VESSEL_ACTIONS: &[ActionSpec] = &[
         key: "arm",
         class: IntentClass::Arm,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 3],
     },
@@ -1299,6 +1596,7 @@ const VESSEL_ACTIONS: &[ActionSpec] = &[
         key: "estop",
         class: IntentClass::Halt,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 3],
     },
@@ -1346,6 +1644,7 @@ const CELL_ACTIONS: &[ActionSpec] = &[
         key: "home",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0, 0, 0, 0],
     },
@@ -1353,6 +1652,7 @@ const CELL_ACTIONS: &[ActionSpec] = &[
         key: "cycle",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[ParamSpec {
             name: "cycle_ms",
             unit: "ms",
@@ -1364,6 +1664,7 @@ const CELL_ACTIONS: &[ActionSpec] = &[
         key: "pick",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[40_000, 40_000, 20_000, 70_000],
     },
@@ -1371,6 +1672,7 @@ const CELL_ACTIONS: &[ActionSpec] = &[
         key: "release",
         class: IntentClass::Motion,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[40_000, 40_000, 20_000, 0],
     },
@@ -1378,6 +1680,7 @@ const CELL_ACTIONS: &[ActionSpec] = &[
         key: "enable",
         class: IntentClass::Arm,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 4],
     },
@@ -1385,6 +1688,7 @@ const CELL_ACTIONS: &[ActionSpec] = &[
         key: "stop",
         class: IntentClass::Halt,
         speed_scaled: false,
+        min_params: 0,
         params: &[],
         pose: &[0; 4],
     },

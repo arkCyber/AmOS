@@ -126,6 +126,16 @@ const KNOWN_FAILURES = [
   { id: 'F-LK-016', module: 'amos-link', files: ['crates/amos-link/src/robot_hal.rs', 'crates/amos-link/src/platform.rs'], markers: ['for_platform', 'Vocabulary::Profile', 'must_be_armed'], severity: 3 },
   // REQ-A277: 剖面参考机兼容性 — Platform::quadruped() 必须对每步态×速度产出与手写 plan 字节完全相同的帧(含前导 Enable(0))
   { id: 'F-LK-017', module: 'amos-link', files: ['crates/amos-link/src/platform.rs', 'crates/amos-link/src/robot_hal.rs'], markers: ['Platform::quadruped', 'plan as plan_reference', 'Vocabulary::Reference'], severity: 3 },
+  // REQ-A281: 固定位姿动作上的 speed 曾被收下、校验、然后丢掉(takeoff 的 0.0 与 1.0 产出同一批帧) ——
+  // 操作员以为生效了。实测出来的,不是读出来的:解析失败比静默忽略安全。
+  { id: 'F-LK-018', module: 'amos-link', files: ['crates/amos-link/src/platform.rs'], markers: ['has a fixed pose, so `speed`', 'speed_scaled: false'], severity: 3 },
+  // REQ-A281: 同一执行器两个设定点曾被 find() 静默取第一个 —— JSON 字段顺序决定了无人机飞哪个推力
+  { id: 'F-LK-019', module: 'amos-link', files: ['crates/amos-link/src/platform.rs'], markers: ['is named twice in one intent', 'SetPoint'], severity: 3 },
+  // REQ-A281: 只有目标参数的动作(goto/waypoint)曾被允许不带参数 ⇒ 飞出默认位姿,动作名在撒谎
+  { id: 'F-LK-020', module: 'amos-link', files: ['crates/amos-link/src/platform.rs', 'crates/amos-link/tests/platform_cases.rs'], markers: ['min_params', 'a target is not a default'], severity: 3 },
+  // REQ-A281: 「机器是数据」曾是空话 —— 字段私有 + 六份 const ⇒ 部署只能改这个 crate。from_parts 把
+  // 内置剖面同一条校验规则交给部署自己写的机器(否则手写剖面可以带着自相矛盾的词表上线)
+  { id: 'F-LK-021', module: 'amos-link', files: ['crates/amos-link/src/platform.rs', 'crates/amos-link/tests/platform_cases.rs'], markers: ['pub fn from_parts', 'pub fn validate(&self) -> Result<()>', 'validate_actions'], severity: 4 },
 
   // 数据完整性
   { id: 'F-DA-001', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/amosStore.ts'], markers: ['readJson', 'corrupt'], severity: 3 },

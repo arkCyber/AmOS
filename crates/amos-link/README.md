@@ -146,7 +146,7 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 | `src/telemetry.rs` | `Heartbeat` + `NodeStatus` + `spawn_heartbeat` |
 | `src/sequence.rs` | `SeqTracker`: per-**stream** `(publisher, topic)` gaps/duplicates, so "a frame was lost" is a number — and it names the stream it happened on |
 | `src/rate.rs` | `RateTracker`: per-**stream** arrival rate **and bandwidth** (from *our* monotonic clock, never the frame's `stamp`; bytes are the framed size the link moved), with `RateEvidence` saying *why* when the figures cannot be stated — `0 Hz` would read as "the robot stopped" |
-| `src/platform.rs` | the **platform profile**: what a machine has (actuator table + units + travel), what it accepts (vocabulary + classes + bounded parameters) and what it owes itself when the link dies (deadman + failsafe manoeuvre) — six built-in profiles (quadruped · manipulator · drone · ground-vehicle · surface-vessel · industrial-cell) that plan into the *shipping* `MotorFrame`, plus `Vocabulary`, the seam that gives `RobotBridge` a profile's words without a second safety core (`docs/robot-domains.md`) |
+| `src/platform.rs` | the **platform profile**: what a machine has (actuator table + units + travel), what it accepts (vocabulary + classes + bounded parameters) and what it owes itself when the link dies (deadman + failsafe manoeuvre) — six built-in profiles (quadruped · manipulator · drone · ground-vehicle · surface-vessel · industrial-cell) that plan into the *shipping* `MotorFrame`, plus `Vocabulary`, the seam that gives `RobotBridge` a profile's words without a second safety core. A deployment writes its **own** machine with `Platform::from_parts(...)`, checked by `Platform::validate` — the same rule that the integration suite runs on all six built-ins. What a profile *refuses* matters as much as what it accepts, and it was measured rather than read: a `speed` on a fixed-pose action, a second set point for one actuator and a parameter-less `goto` were each accepted and then silently dropped, and are now refused by name (`docs/robot-domains.md`) |
 | `src/robot_hal.rs` | `AgentAction` → `plan()` → `MotorFrame` (CRC16) → `RobotHal`; `RobotBridge` with e-stop + watchdog, and `reporting()` for the mode return path |
 | `src/health.rs` | `LinkHealth::evaluate` — the fold from counters to a verdict |
 | `src/node.rs` | `LinkNode`: identity + transport + clock + counters + peer table |
@@ -193,6 +193,15 @@ cargo run -p amos-link --example road_autonomy
 
 The **platform profiles** behind cases ④/⑤ (and the other four machines: quadruped, manipulator,
 surface vessel, industrial cell) are the subject of [`docs/robot-domains.md`](../../docs/robot-domains.md).
+
+A profile is **data, and it is checked**: the six built-ins are `const`s, and a deployment writes its own
+machine with `Platform::from_parts(kind, actuators, actions, envelope, arm_on_motion)` — the same
+`Platform::validate` runs on it (contiguous in-range actuators, exactly one `Arm` and one `Halt`, poses that
+fit the actuator table, bounded parameters) and on all six built-ins in the integration suite. What the layer
+does with a command it *cannot* honour is the other half of that contract: an unknown action, an unknown
+parameter, an out-of-limit number, a `speed` on a fixed-pose action, a second set point for one actuator, and
+a `goto` with no target are each **refused by name** — never accepted and then quietly dropped. A `Halt` is
+never refused for a cosmetic reason.
 
 | example | shows |
 |---|---|

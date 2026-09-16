@@ -1212,6 +1212,7 @@ summary streams=1 frames=19 bytes=1957 untracked=0 undecodable=0 complete=yes ra
 六份内置剖面 + `RobotBridge::for_platform`（同一安全核心换了词表）+ 新文档
 [`docs/robot-domains.md`](robot-domains.md)（每域契约、协议/认证/实时性的域侧责任、诚实边界）+
 两个域案例（`examples/uav_mission.rs`、`examples/road_autonomy.rs`）+ `tests/platform_cases.rs`（**13 例**）。
+第二十二轮（§3.23）把**接受边界**与**部署自定义剖面**补上 ⇒ 该套件现在是 **18 例**。
 
 **四条设计决定，每条都有代价写在边界里**：
 
@@ -1260,6 +1261,46 @@ mission layer: decel wrote 3 frame(s), the halt batch wrote 3 (brake=100000, thr
    proto 与界面），剖面机器把 `gait` 留空、安全事实照常上报，域自己的模式走自己的话题。
 4. **没有认证、没有实时承诺、没有真机**：剖面是策略与契约，不是安全论证；两个域案例跑在同一台机器的一个进程里。
 5. **剖面不是规划器**：`goto` 不生成轨迹、`lane_keep` 不做横向控制、`cycle` 不编排节拍 —— 那些在域侧。
+
+### 3.23 剖面的接受边界：把"收下、校验、然后丢掉"逐条堵死（第二十二轮，REQ-A281）
+
+> 上一轮（§3.22，REQ-A277）的**双 agent 只读审计**（REQ-A278）判定 `platform` 面 0 缺陷 ——
+> 它读的是代码。本轮改成**实测**：把每一类 JSON 喂进 `Platform::parse_intent`、把产出的帧打出来，
+> 三条真缺陷当场现形，另外四条"说得出但做不到"的措辞也一并纠正。
+
+**三条真缺陷（都是"收下、校验、然后悄悄不用"）**：
+
+| # | 实测到的形状 | 为什么危险 | 现在的回答 |
+|---|---|---|---|
+| 1 | `{"action":"takeoff","speed":0.0}` 与 `speed:1.0` 产出**同一批** 4×55% 推力帧 —— `speed_scaled: false` 的动作把 speed 解析、做了范围检查、然后丢掉 | 地面站要求"温柔起飞"得到满推力，**且没有任何提示** | `action takeoff on platform drone has a fixed pose, so speed 0.1 cannot be honoured: remove it, or send the set points you want in targets` |
+| 2 | 同一执行器两个设定点：`[{"actuator":0,"arg":10000},{"actuator":0,"arg":90000}]` ⇒ `arg:90000` 消失（`find()` 取第一个），**JSON 字段顺序**决定了无人机飞哪个推力 | 一条自相矛盾的指令被静默地二选一 | `actuator 0 (thruster_1) is named twice in one intent: two set points for one actuator leave the layer choosing which of them to drop` |
+| 3 | `{"action":"goto"}` 被接受，飞出默认 58% 推力位姿 —— 一个顶着"去某处"名字的**默认动作** | 工具少填一个字段 ⇒ 机器动起来 | `action goto … needs at least 1 of its parameters (north_mm, east_mm, altitude_mm), and this intent names none of them — a target is not a default` |
+
+**一条"说得出做不到"的措辞（补全代码，不只是补文档）**：文档写着"剖面的看门狗周期是策略，产品按自己的
+安全论证定值"，但 `Platform` 的字段是私有的、六个剖面是 `const` —— 产品**只能改这个 crate 的文件**。
+⇒ 新增 `Platform::from_parts(kind, actuators, actions, envelope, arm_on_motion)` + `Platform::validate()`：
+部署自己写的机器（6 轴 ±120° 机械臂、八旋翼、不同制动执行器）现在**是一份数据**，且被**内置剖面同一条规则**
+逐条校验（18 条规则：序号连续且在帧参数空间内、名字唯一、恰好一个 `Arm` 与一个 `Halt`、位姿长度与行程、
+非运动动作的位姿必须惰性、参数名唯一且区间有序、`min_params` 可满足、包线可排程）。
+这条规则同时被集成测试跑在六个内置剖面上 —— **一条规则，两个调用方**，手写剖面不可能带着自相矛盾的词表上线。
+
+**实测（本轮的负数控制 5/5，每次都逐字节还原，`cmp` 证明）**：
+
+| # | 在生产代码里改坏什么 | 失败的用例（实测） |
+|---|---|---|
+| 1 | `if raw.speed.is_some() && !spec.speed_scaled` → `if false && …`（= 恢复"悄悄丢掉"） | `a_speed_that_cannot_be_honoured_is_refused_not_dropped`：`platform_cases.rs:921` 拒绝没有发生 |
+| 2 | 重复设定点检查 → `if false && …` | `two_set_points_for_one_actuator_are_refused_rather_than_first_wins`：`platform_cases.rs:983` |
+| 3 | `if params.len() < spec.min_params` → `if false && …` | `an_action_that_is_its_target_is_refused_without_one`：`platform_cases.rs:1018` |
+| 4 | `Platform::from_parts` 里的 `platform.validate()?` 注释掉 | `a_misdeclared_profile_is_refused_naming_the_rule_it_broke`：`platform_cases.rs:1106`（坏剖面被**收下**了） |
+| 5 | `validate()` 里"恰好一个 `Arm`"的检查 → `if false && …` | 同上（`needs exactly one arm action` 不再出现） |
+
+**同时更新的两个域案例**（它们曾在**自己的** JSON 里演示这个缺陷）：`uav_mission` 的 `takeoff` 与 `rtl`
+不再带 `speed`（那台机器的推力是它的位姿，不是位姿的倍数）。
+
+**诚实边界（本轮新增）**：**剖面的解析比参考机更严**（重复设定点/未知参数在剖面路径被拒，而
+`Vocabulary::Reference` 逐字节冻结，仍按第一个设定点走）；`duration_ms` 携带但不参与规划（与参考机一致）；
+一个 `Motion` 的 `targets` 仍可只覆盖部分执行器（参考机语义，`trot` 的单关节覆盖必须逐字节不变）；
+`PlatformKind` 仍是闭集（机器是数据，**新域**是代码）。全部登记在 `docs/robot-domains.md` §5–§6。
 
 
 
@@ -1546,9 +1587,9 @@ cargo run -p amos-link --example fleet_console      # 一张表印两次：哪�
 cargo run -p amos-link --example remote_brain       # 真 UDS + 真 tonic：注入是真帧、回程能读回
 cargo test -p amos-link --test robot_cases          # 10 例：断言性质（不是打印）；含契约表对码
 cargo test -p amos-link --test robot_cases -- --nocapture   # 需要看时序时用；断言与上面同一条
-# 平台剖面与领域案例（第二十一轮，§3.22 + docs/robot-domains.md）：
+# 平台剖面与领域案例（第二十一/二十二轮，§3.22/§3.23 + docs/robot-domains.md）：
 # 六份剖面（四足/机械臂/无人机/车辆/无人艇/工业单元）、共用的帧与安全核心、每个限都有牙齿
-cargo test -p amos-link --test platform_cases      # 13 例：参考机逐字节不变 + 六剖面自检 + 包线拒绝 + 解锁语义
+cargo test -p amos-link --test platform_cases      # 18 例：参考机逐字节不变 + 六剖面自检 + 包线拒绝 + 解锁语义 + 接受边界 + 自定义剖面校验
 cargo run -p amos-link --example uav_mission       # 未解锁拒绝 → 起飞 → 围栏内/外 → 看门狗 → 任务层飞 RTL
 cargo run -p amos-link --example road_autonomy     # 设定点流 → 越界拒绝 → 收油 → 看门狗 → MRM（全力制动）
 ```

@@ -77,6 +77,16 @@ pub struct JointId(u8);
 
 impl JointId {
     /// Validate a joint index (0..=[`MAX_JOINT`]).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{JointId, MAX_JOINT};
+    ///
+    /// assert_eq!(JointId::new(0).unwrap().index(), 0);
+    /// // The highest legal index (4 legs × 3 joints - 1):
+    /// assert_eq!(JointId::new(MAX_JOINT).unwrap().index(), MAX_JOINT);
+    /// // One past it is refused, with a message that names the bad index:
+    /// assert!(JointId::new(MAX_JOINT + 1).is_err());
+    /// ```
     pub fn new(index: u8) -> Result<Self> {
         if index > MAX_JOINT {
             return Err(LinkError::Robot(format!(
@@ -92,11 +102,32 @@ impl JointId {
     }
 
     /// The leg this joint belongs to.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::JointId;
+    ///
+    /// // Joint 0 is the front-left hip (leg 0, part 0); joint 11 is the rear-right knee.
+    /// assert_eq!(JointId::new(0).unwrap().leg(), 0);
+    /// assert_eq!(JointId::new(2).unwrap().leg(), 0); // knee of the same leg
+    /// assert_eq!(JointId::new(3).unwrap().leg(), 1); // first joint of the next leg
+    /// assert_eq!(JointId::new(11).unwrap().leg(), 3);
+    /// ```
     pub fn leg(self) -> u8 {
         self.0 / 3
     }
 
     /// The joint within its leg: 0 = hip, 1 = thigh, 2 = knee.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::JointId;
+    ///
+    /// let hip = JointId::new(0).unwrap();
+    /// let thigh = JointId::new(1).unwrap();
+    /// let knee = JointId::new(2).unwrap();
+    /// assert_eq!((hip.part(), thigh.part(), knee.part()), (0, 1, 2));
+    /// // Repeats every leg:
+    /// assert_eq!(JointId::new(9).unwrap().part(), 0); // rear-left hip
+    /// ```
     pub fn part(self) -> u8 {
         self.0 % 3
     }
@@ -141,6 +172,16 @@ pub enum Gait {
 
 impl Gait {
     /// Every gait, in documentation order.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::Gait;
+    ///
+    /// // The order is the order the docs walk through the cases:
+    /// assert_eq!(
+    ///     Gait::ALL,
+    ///     [Gait::Stand, Gait::Trot, Gait::Walk, Gait::Sit, Gait::Arm, Gait::Estop]
+    /// );
+    /// ```
     pub const ALL: [Gait; 6] = [
         Gait::Stand,
         Gait::Trot,
@@ -151,6 +192,16 @@ impl Gait {
     ];
 
     /// Stable JSON/CLI key.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::Gait;
+    ///
+    /// for gait in Gait::ALL {
+    ///     // Every key round-trips through `from_key` (case-insensitive, trimmed):
+    ///     assert_eq!(Gait::from_key(&gait.key().to_uppercase()), Some(gait));
+    ///     assert_eq!(Gait::from_key(&format!("  {}  ", gait.key())), Some(gait));
+    /// }
+    /// ```
     pub fn key(self) -> &'static str {
         match self {
             Gait::Stand => "stand",
@@ -163,6 +214,20 @@ impl Gait {
     }
 
     /// Parse a gait key (case-insensitive; `e-stop`/`stop` mean `estop`).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::Gait;
+    ///
+    /// // The aliases a CLI accepts so a hurried operator is not refused:
+    /// assert_eq!(Gait::from_key("enable"), Some(Gait::Arm));
+    /// assert_eq!(Gait::from_key("re-arm"), Some(Gait::Arm));
+    /// assert_eq!(Gait::from_key("e-stop"), Some(Gait::Estop));
+    /// assert_eq!(Gait::from_key("STOP"), Some(Gait::Estop));
+    ///
+    /// // Anything unknown is None — not a guessed default:
+    /// assert_eq!(Gait::from_key("backflip"), None);
+    /// assert_eq!(Gait::from_key(""), None);
+    /// ```
     pub fn from_key(s: &str) -> Option<Gait> {
         match s.trim().to_ascii_lowercase().as_str() {
             "stand" => Some(Gait::Stand),
@@ -176,16 +241,46 @@ impl Gait {
     }
 
     /// True for the halt command (which skips speed/duration validation).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::Gait;
+    ///
+    /// assert!(Gait::Estop.is_emergency());
+    /// for gait in Gait::ALL {
+    ///     if gait != Gait::Estop {
+    ///         assert!(!gait.is_emergency(), "{:?} is not an emergency", gait);
+    ///     }
+    /// }
+    /// ```
     pub fn is_emergency(self) -> bool {
         matches!(self, Gait::Estop)
     }
 
     /// True for the arm command (energize only; clears a latched e-stop).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::Gait;
+    ///
+    /// assert!(Gait::Arm.is_arm());
+    /// // Arm and Estop are *separate* predicates — an e-stop is not an arm:
+    /// assert!(!Gait::Estop.is_arm());
+    /// ```
     pub fn is_arm(self) -> bool {
         matches!(self, Gait::Arm)
     }
 
     /// True when the gait moves the robot (so a latched e-stop must refuse it).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::Gait;
+    ///
+    /// // The four motion gaits; Arm and Estop do not move:
+    /// for motion in [Gait::Stand, Gait::Trot, Gait::Walk, Gait::Sit] {
+    ///     assert!(motion.is_motion());
+    /// }
+    /// assert!(!Gait::Arm.is_motion());
+    /// assert!(!Gait::Estop.is_motion());
+    /// ```
     pub fn is_motion(self) -> bool {
         matches!(self, Gait::Stand | Gait::Trot | Gait::Walk | Gait::Sit)
     }
@@ -195,6 +290,27 @@ impl Gait {
     /// A single table, not a gait *generator*: the frames a robot needs at 100 Hz are
     /// the ones a real gait controller emits, and pretending this module plans
     /// trajectories would be a lie. What it does is translate and validate intent.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{Gait, JOINTS};
+    ///
+    /// // The hip column stays at 0 md in every pose — stability first.
+    /// for gait in [Gait::Stand, Gait::Trot, Gait::Walk, Gait::Sit] {
+    ///     let pose = gait.pose(0.5);
+    ///     assert_eq!(pose.len(), JOINTS);
+    ///     assert!(pose.iter().step_by(3).all(|m| *m == 0), "hip column for {gait:?}");
+    /// }
+    ///
+    /// // Arm and Estop are deliberately a zero pose — `plan` carries the meaning,
+    //  // the pose does not.
+    /// assert_eq!(Gait::Arm.pose(0.7), [0_i32; JOINTS]);
+    /// assert_eq!(Gait::Estop.pose(0.0), [0_i32; JOINTS]);
+    ///
+    /// // A non-finite speed is treated as 0, not propagated through `clamp`:
+    /// // `clamp(NaN, 0, 1)` returns NaN, and `NaN as i32` is 0 — so an unvalidated
+    /// // agent must not be able to pick a straighter pose than any legal speed.
+    /// assert_eq!(Gait::Trot.pose(f32::NAN), Gait::Trot.pose(0.0));
+    /// ```
     pub fn pose(self, speed: f32) -> [i32; JOINTS] {
         // Speed scales the thigh/knee extension, never the hip (stability first): the
         // hip column stays at 0 md in every pose. A **non-finite** speed is treated as 0
@@ -288,6 +404,22 @@ impl JointTarget {
     /// release build a negative wrap that *passes* an `abs() > limit` test and lets an
     /// insane set point through. `-2147483648` must be refused like any other
     /// out-of-travel angle.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{JointId, JointTarget, MAX_JOINT_MILLI_DEG};
+    ///
+    /// let j = JointId::new(0).unwrap();
+    /// assert!(JointTarget::new(j, 0).is_ok());
+    /// assert!(JointTarget::new(j, MAX_JOINT_MILLI_DEG).is_ok());
+    /// assert!(JointTarget::new(j, -MAX_JOINT_MILLI_DEG).is_ok());
+    ///
+    /// // Just past the limit is refused…
+    /// assert!(JointTarget::new(j, MAX_JOINT_MILLI_DEG + 1).is_err());
+    /// assert!(JointTarget::new(j, -MAX_JOINT_MILLI_DEG - 1).is_err());
+    ///
+    /// // …and `i32::MIN` is refused too (the value that would overflow `abs()`):
+    /// assert!(JointTarget::new(j, i32::MIN).is_err());
+    /// ```
     pub fn new(joint: JointId, milli_deg: i32) -> Result<Self> {
         if !(-MAX_JOINT_MILLI_DEG..=MAX_JOINT_MILLI_DEG).contains(&milli_deg) {
             return Err(LinkError::Robot(format!(
@@ -395,6 +527,26 @@ pub enum MotorOp {
 
 impl MotorOp {
     /// The wire opcode.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{MotorFrame, MotorOp, JointId, FRAME_LEN};
+    /// use amos_link::robot_hal::MotorOp::*;
+    ///
+    /// // Each opcode has a unique wire byte:
+    /// assert_eq!(SetPosition.code(), 0x01);
+    /// assert_eq!(SetTorque.code(),    0x02);
+    /// assert_eq!(Enable.code(),       0x03);
+    /// assert_eq!(Disable.code(),      0x04);
+    /// assert_eq!(Estop.code(),        0x05);
+    ///
+    /// // And round-trips through `from_code` — an unknown byte is `None`:
+    /// for op in [SetPosition, SetTorque, Enable, Disable, Estop] {
+    ///     assert_eq!(MotorOp::from_code(op.code()), Some(op));
+    ///     let frame = MotorFrame::new(JointId::new(0).unwrap(), op, 0);
+    ///     assert_eq!(frame.encode().len(), FRAME_LEN);
+    /// }
+    /// assert_eq!(MotorOp::from_code(0x06), None);
+    /// ```
     pub fn code(self) -> u8 {
         match self {
             MotorOp::SetPosition => 0x01,
@@ -521,6 +673,26 @@ impl MotorFrame {
     }
 
     /// Encode to the 10-byte bus frame (CRC16-CCITT over the first 8 bytes).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{JointId, MotorFrame, MotorOp, FRAME_LEN, FRAME_SOF};
+    ///
+    /// let frame = MotorFrame::new(
+    ///     JointId::new(1).unwrap(),
+    ///     MotorOp::SetPosition,
+    ///     -45_000, // -45° in milli-degrees
+    /// );
+    /// let bytes = frame.encode();
+    /// assert_eq!(bytes.len(), FRAME_LEN);
+    /// assert_eq!(&bytes[..2], &FRAME_SOF);
+    /// assert_eq!(bytes[2], 1);                 // joint
+    /// assert_eq!(bytes[3], MotorOp::SetPosition.code());
+    /// assert_eq!(&bytes[4..8], &(-45_000_i32).to_le_bytes()); // little-endian arg
+    ///
+    /// // CRC16-CCITT over the first 8 bytes — what every servo bus expects:
+    /// let crc = u16::from_le_bytes([bytes[8], bytes[9]]);
+    /// assert_eq!(crc, amos_link::robot_hal::crc16_ccitt(&bytes[..8]));
+    /// ```
     pub fn encode(&self) -> [u8; FRAME_LEN] {
         let mut out = [0u8; FRAME_LEN];
         out[0] = FRAME_SOF[0];
@@ -534,6 +706,20 @@ impl MotorFrame {
     }
 
     /// The frame as lowercase hex (`aa550301e8030000b9e1`).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{JointId, MotorFrame, MotorOp, FRAME_LEN};
+    ///
+    /// // One Enable frame for joint 0 — a frame's hex is `bytes[..] as hex`,
+    /// // including the trailing two CRC bytes in the order the wire carries them:
+    /// let frame = MotorFrame::new(JointId::new(0).unwrap(), MotorOp::Enable, 0);
+    /// let bytes = frame.encode();
+    /// let mut expected = String::with_capacity(FRAME_LEN * 2);
+    /// for byte in bytes {
+    ///     expected.push_str(&format!("{byte:02x}"));
+    /// }
+    /// assert_eq!(frame.encode_hex(), expected);
+    /// ```
     pub fn encode_hex(&self) -> String {
         to_hex(&self.encode())
     }
@@ -545,6 +731,50 @@ impl MotorFrame {
     /// (only random corruption is caught by a checksum, not a wrong or malicious
     /// producer), and a joint index or set point that never could have been commanded
     /// must not reach a HAL that trusts its input.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{JointId, MotorFrame, MotorOp, FRAME_SOF};
+    ///
+    /// // Round-trip: a frame is its own decoder.
+    /// let original = MotorFrame::new(JointId::new(2).unwrap(), MotorOp::SetPosition, 30_000);
+    /// let decoded = MotorFrame::decode(&original.encode()).expect("round-trip");
+    /// assert_eq!(decoded, original);
+    ///
+    /// // A CRC flip is refused — the checksum is the *only* corruption check:
+    /// let mut bytes = original.encode();
+    /// bytes[4] ^= 1; // flip one bit of the argument
+    /// assert!(MotorFrame::decode(&bytes).is_err());
+    ///
+    /// // Wrong SOF is refused without a CRC computation — no decoder should
+    /// // spend its budget on a frame that was never on this bus.
+    /// let mut bytes = original.encode();
+    /// bytes[0] = 0; bytes[1] = 0;
+    /// assert!(MotorFrame::decode(&bytes).is_err());
+    ///
+    /// // A CRC-valid frame with an out-of-range joint is *still* refused:
+    /// // a checksum catches random corruption, not a wrong or malicious producer.
+    /// let mut bytes = original.encode();
+    /// bytes[2] = 200; // bad joint
+    /// let crc = amos_link::robot_hal::crc16_ccitt(&bytes[..8]);
+    /// bytes[8..10].copy_from_slice(&crc.to_le_bytes());
+    /// assert!(MotorFrame::decode(&bytes).is_err());
+    ///
+    /// // …and an in-range joint with an out-of-range argument is refused too —
+    /// // this is the safety-relevant path the docstring calls out.
+    /// let mut bytes = original.encode();
+    /// bytes[2] = 0;
+    /// // arg = i32::MIN (the value that would slip past an `abs()` check):
+    /// let bytes_arg = (i32::MIN).to_le_bytes();
+    /// bytes[4..8].copy_from_slice(&bytes_arg);
+    /// let crc = amos_link::robot_hal::crc16_ccitt(&bytes[..8]);
+    /// bytes[8..10].copy_from_slice(&crc.to_le_bytes());
+    /// assert!(MotorFrame::decode(&bytes).is_err());
+    ///
+    /// // SOF is the public constant — a frame can be checked for the bus it claims
+    /// // to be on without decoding the rest:
+    /// let bytes = original.encode();
+    /// assert_eq!(&bytes[..2], &FRAME_SOF);
+    /// ```
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != FRAME_LEN {
             return Err(LinkError::Frame(format!(
@@ -639,6 +869,49 @@ struct RawTarget {
 /// Refusals are explicit and named (so the agent gets a message it can act on): an
 /// unknown action, a speed outside `[0, 1]`, a joint out of range, an angle beyond the
 /// travel limit, or a target without an angle.
+///
+/// ```
+/// use amos_link::robot_hal::{Gait, parse_command};
+///
+/// // A happy path — the JSON the agent emits on every gait:
+/// let cmd = parse_command(r#"{"action":"trot","speed":0.6,"duration_ms":800}"#).unwrap();
+/// assert_eq!(cmd.gait, Gait::Trot);
+/// assert!((cmd.speed - 0.6).abs() < f32::EPSILON);
+/// assert_eq!(cmd.duration_ms, 800);
+///
+/// // `speed` defaults to 0.5 when the agent omits it (the doc claim):
+/// let cmd = parse_command(r#"{"action":"walk"}"#).unwrap();
+/// assert_eq!(cmd.gait, Gait::Walk);
+/// assert!((cmd.speed - 0.5).abs() < f32::EPSILON);
+///
+/// // Unknown actions are named in the refusal — the agent gets a message it can branch on:
+/// let err = parse_command(r#"{"action":"backflip"}"#).unwrap_err();
+/// assert!(format!("{err}").contains("backflip"), "the refusal names the bad action");
+///
+/// // Speed outside `[0, 1]` is refused, not silently clamped:
+/// assert!(parse_command(r#"{"action":"trot","speed":1.5}"#).is_err());
+/// assert!(parse_command(r#"{"action":"trot","speed":-0.1}"#).is_err());
+///
+/// // An out-of-range joint, an over-travel angle, or a target with no angle are refused:
+/// assert!(parse_command(r#"{"action":"trot","targets":[{"joint":200,"milli_deg":0}]}"#).is_err());
+/// assert!(parse_command(r#"{"action":"trot","targets":[{"joint":0,"milli_deg":999999}]}"#).is_err());
+/// assert!(parse_command(r#"{"action":"trot","targets":[{"joint":0}]}"#).is_err());
+///
+/// // `e-stop` accepts a wildly out-of-range speed — the halt path must never be refused
+/// // for a cosmetic reason (a speed typo must not block an e-stop):
+/// let cmd = parse_command(r#"{"action":"e-stop","speed":99.0}"#).unwrap();
+/// assert_eq!(cmd.gait, Gait::Estop);
+/// assert!(cmd.targets.is_empty());
+///
+/// // Arming ignores speed and targets — a hidden motion command after an e-stop
+/// // must not be smuggled in via the arm path:
+/// let cmd = parse_command(
+///     r#"{"action":"arm","speed":0.9,"targets":[{"joint":0,"milli_deg":-45000}]}"#,
+/// ).unwrap();
+/// assert_eq!(cmd.gait, Gait::Arm);
+/// assert_eq!(cmd.speed, 0.0);
+/// assert!(cmd.targets.is_empty());
+/// ```
 pub fn parse_command(json: &str) -> Result<RobotCommand> {
     let raw: RawCommand = serde_json::from_str(json)
         .map_err(|e| LinkError::Robot(format!("action is not valid JSON: {e}")))?;
@@ -725,6 +998,41 @@ pub trait RobotHal: Send + Sync + 'static {
 /// zero pose), which is what makes "re-arm after an e-stop" a deliberate act rather than
 /// a side effect. Every other gait emits `Enable` (idempotent on real drivers) followed
 /// by one position frame per joint, with explicit targets overriding the gait pose.
+///
+/// ```
+/// use amos_link::robot_hal::{plan, Gait, JOINTS, JointId, JointTarget, MAX_JOINT, MotorOp, parse_command};
+///
+/// // `Estop`: one torque-cut frame per joint — no pose, no enable, nothing else.
+/// let frames = plan(
+///     &parse_command(r#"{"action":"estop"}"#).unwrap(),
+/// );
+/// assert_eq!(frames.len(), (MAX_JOINT as usize) + 1);
+/// assert!(frames.iter().all(|f| f.op == MotorOp::Estop));
+///
+/// // `Arm`: one Enable per joint, no position frame — the drivers come up holding pose.
+/// let frames = plan(
+///     &parse_command(r#"{"action":"arm"}"#).unwrap(),
+/// );
+/// assert_eq!(frames.len(), (MAX_JOINT as usize) + 1);
+/// assert!(frames.iter().all(|f| f.op == MotorOp::Enable));
+///
+/// // A motion gait: one Enable (broadcast — joint 0 is the leading marker), then
+/// // one position frame per joint. 13 frames for the reference quadruped:
+/// let frames = plan(
+///     &parse_command(r#"{"action":"trot","speed":0.5,"duration_ms":800}"#).unwrap(),
+/// );
+/// assert_eq!(frames.len(), JOINTS + 1);
+/// assert_eq!(frames[0].op, MotorOp::Enable);
+/// assert!(frames[1..].iter().all(|f| f.op == MotorOp::SetPosition));
+///
+/// // Explicit joint targets override the gait's pose for the joints they name.
+/// let cmd = parse_command(
+///     r#"{"action":"stand","targets":[{"joint":3,"milli_deg":-1000}]}"#,
+/// ).unwrap();
+/// let frames = plan(&cmd);
+/// let j3 = frames.iter().find(|f| f.joint == JointId::new(3).unwrap()).unwrap();
+/// assert_eq!(j3.arg, -1000);
+/// ```
 pub fn plan(command: &RobotCommand) -> Vec<MotorFrame> {
     if command.gait.is_emergency() {
         return (0..=MAX_JOINT)
@@ -792,6 +1100,16 @@ pub struct MockRobotHal {
 
 impl MockRobotHal {
     /// A mock with de-energized drivers.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{MockRobotHal, RobotHal};
+    ///
+    /// let hal = MockRobotHal::new();
+    /// assert_eq!(hal.applied(), 0, "nothing has been sent yet");
+    /// assert!(!hal.armed(), "a fresh mock has de-energized drivers");
+    /// assert_eq!(hal.name(), "mock");
+    /// assert!(hal.frames().is_empty());
+    /// ```
     pub fn new() -> Self {
         Self {
             frames: Mutex::new(Vec::new()),
@@ -801,16 +1119,52 @@ impl MockRobotHal {
     }
 
     /// Every frame this HAL has been asked to send, in order.
+    ///
+    /// ```
+    /// # async fn demo() {
+    /// use amos_link::robot_hal::{AgentAction, MockRobotHal, RobotHal, execute};
+    ///
+    /// let hal = MockRobotHal::new();
+    /// execute(&hal, &AgentAction::new(r#"{"action":"arm"}"#)).await.unwrap();
+    /// execute(&hal, &AgentAction::new(r#"{"action":"stand","speed":0.5}"#)).await.unwrap();
+    ///
+    /// // The frames arrive in the order the HAL received them — what a bus log shows:
+    /// assert_eq!(hal.frames().len(), hal.applied() as usize);
+    /// # }
+    /// ```
     pub fn frames(&self) -> Vec<MotorFrame> {
         self.frames.lock().map(|f| f.clone()).unwrap_or_default()
     }
 
     /// How many frames were accepted.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{AgentAction, MockRobotHal, RobotHal, execute};
+    ///
+    /// # async fn demo() {
+    /// let hal = MockRobotHal::new();
+    /// // Two commands, one is the 13-frame arm/stand on the reference quadruped:
+    /// execute(&hal, &AgentAction::new(r#"{"action":"arm"}"#)).await.unwrap();
+    /// execute(&hal, &AgentAction::new(r#"{"action":"trot"}"#)).await.unwrap();
+    /// // The arm + trot counts are pinned by `plan` — `applied()` is just the sum:
+    /// assert!(hal.applied() > 13);
+    /// # }
+    /// ```
     pub fn applied(&self) -> u64 {
         self.applied.load(Ordering::Relaxed)
     }
 
     /// Forget the recorded frames (keeping the counters).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{MockRobotHal, RobotHal};
+    ///
+    /// let hal = MockRobotHal::new();
+    /// // …a test injects frames…
+    /// hal.clear();
+    /// assert!(hal.frames().is_empty(), "the recorded log is gone");
+    /// assert_eq!(hal.applied(), 0, "the counter is independent of the log");
+    /// ```
     pub fn clear(&self) {
         if let Ok(mut f) = self.frames.lock() {
             f.clear();
@@ -818,6 +1172,23 @@ impl MockRobotHal {
     }
 
     /// The recorded frames as hex, one line per frame (what a bus log looks like).
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{AgentAction, MockRobotHal, RobotHal, FRAME_LEN, execute};
+    ///
+    /// # async fn demo() {
+    /// let hal = MockRobotHal::new();
+    /// execute(&hal, &AgentAction::new(r#"{"action":"estop"}"#)).await.unwrap();
+    ///
+    /// let log = hal.hex_log();
+    /// // One line per frame, two lowercase hex chars per byte of the 10-byte frame:
+    /// for line in &log {
+    ///     assert_eq!(line.len(), FRAME_LEN * 2);
+    ///     assert!(line.chars().all(|c| c.is_ascii_hexdigit()));
+    /// }
+    /// assert_eq!(log.len(), hal.applied() as usize);
+    /// # }
+    /// ```
     pub fn hex_log(&self) -> Vec<String> {
         self.frames().iter().map(MotorFrame::encode_hex).collect()
     }
@@ -1055,7 +1426,6 @@ pub async fn execute<H: RobotHal>(hal: &H, action: &AgentAction) -> Result<Vec<M
     let applied = hal.apply(&frames).await?;
     Ok(frames[..applied.min(frames.len())].to_vec())
 }
-
 /// The `state`-channel name a bridge reports actuation on.
 pub const ACTUATION_NAME: &str = "actuation";
 
@@ -1073,6 +1443,18 @@ pub const DEFAULT_REPORT_REFRESH: Duration = Duration::from_secs(5);
 /// (armed / e-stopped / which gait), so `Qos::for_channel(Channel::State)` gives it
 /// latest-wins semantics — a brain that joins late learns the robot's real mode instead of
 /// replaying a command history.
+///
+/// ```
+/// use amos_link::discovery::PeerId;
+/// use amos_link::keyexpr::Channel;
+/// use amos_link::robot_hal::{ACTUATION_NAME, actuation_topic};
+///
+/// let topic = actuation_topic(&PeerId::new("patrol-01").unwrap()).unwrap();
+/// assert_eq!(topic.as_str(), "amos/patrol-01/state/actuation");
+/// assert_eq!(topic.channel(), Some(Channel::State));
+/// // The trailing `actuation` is the `ACTUATION_NAME` constant — a single source of truth:
+/// assert!(topic.as_str().ends_with(ACTUATION_NAME));
+/// ```
 pub fn actuation_topic(peer: &crate::discovery::PeerId) -> Result<Topic> {
     Topic::new(format!(
         "amos/{}/{}/{ACTUATION_NAME}",
@@ -1085,6 +1467,16 @@ pub fn actuation_topic(peer: &crate::discovery::PeerId) -> Result<Topic> {
 ///
 /// This is what a consumer that is not a single robot's brain subscribes to: the daemon's
 /// control plane (so the System UI can read the return path) and `amos-link-cli state`.
+///
+/// ```
+/// use amos_link::keyexpr::Channel;
+/// use amos_link::robot_hal::{ACTUATION_NAME, actuation_pattern};
+///
+/// let pattern = actuation_pattern().unwrap();
+/// assert_eq!(pattern.as_str(), "amos/*/state/actuation");
+/// assert_eq!(pattern.channel(), Some(Channel::State));
+/// assert!(pattern.as_str().ends_with(ACTUATION_NAME));
+/// ```
 pub fn actuation_pattern() -> Result<Topic> {
     Topic::pattern(format!("amos/*/{}/{ACTUATION_NAME}", Channel::State.key()))
 }

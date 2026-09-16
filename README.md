@@ -288,7 +288,7 @@ cargo test -p amos-link --test robot_cases        # the cases' asserted properti
 # vehicle fly/drive on the same link, the same frame type and the same safety core.
 cargo run -p amos-link --example uav_mission
 cargo run -p amos-link --example road_autonomy
-cargo test -p amos-link --test platform_cases     # 13 profile contracts (docs/robot-domains.md)
+cargo test -p amos-link --test platform_cases     # 18 profile contracts (docs/robot-domains.md)
 
 # The CLI: one in-process node, one command per operator question.
 cargo run -p amos-link-cli -- status                              # identity · counters · peers · verdict
@@ -356,7 +356,11 @@ of machine: the **platform profiles** ([`docs/robot-domains.md`](./docs/robot-do
 quadruped, a manipulator, a drone, a road vehicle, a surface vessel and an industrial cell as **data**
 (actuators, vocabulary, safety envelope) and run them through one safety core — with the layer's own
 boundaries registered (12 actuators, the reference argument space, no certification, no real-time
-claim). The **application cases**
+claim). A profile is data a **deployment** writes too: `Platform::from_parts` builds its own machine and
+`Platform::validate` checks it (and all six built-ins) before anything reaches a bus, and a command the
+layer cannot honour — an unknown action, an unknown parameter, a number past its limit, a `speed` on a
+fixed-pose action, a second set point for one actuator, a `goto` with no target — is **refused by name**
+rather than accepted and quietly dropped. The **application cases**
 ([`docs/robot-apps.md`](./docs/robot-apps.md)) test the *middleware*, not a machine: they run the
 reference quadruped's HAL through `MockRobotHal`, so another form factor (a wheeled base, an arm, a
 drone) implements `RobotHal` — the bus layer is form-factor-agnostic, this layer is not. See

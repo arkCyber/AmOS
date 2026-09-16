@@ -132,7 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 2. arm, and take off ───────────────────────────────────────────────────────
     command(&commands, r#"{"action":"arm"}"#).await?;
     read_step(&mut bridge, &mut modes).await?;
-    command(&commands, r#"{"action":"takeoff","speed":0.8}"#).await?;
+    // The profile's thrust is its own pose, not a multiple of it: an explicit `speed` here would
+    // be refused (`takeoff` has a fixed pose), so the case does not send one.
+    command(&commands, r#"{"action":"takeoff"}"#).await?;
     read_step(&mut bridge, &mut modes).await?;
 
     // ── 3. a waypoint inside the fence is accepted … ───────────────────────────────
@@ -201,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DRONE.kind().key(),
         failsafe.key()
     );
-    let rtl = DRONE.plan(&DRONE.parse_intent(r#"{"action":"rtl","speed":0.6}"#)?)?;
+    let rtl = DRONE.plan(&DRONE.parse_intent(r#"{"action":"rtl"}"#)?)?;
     let applied = bridge.hal().apply(&rtl).await?;
     println!("mission layer: rtl wrote {applied} frame(s) through the same HAL");
     if let Some(frame) = rtl.first() {

@@ -13,6 +13,7 @@
 //!    *limit* that was asked to be exceeded (never a silent clamp).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use amos_link::broker::{Broker, Transport};
 use amos_link::codec::Clock;
@@ -20,7 +21,10 @@ use amos_link::discovery::{NodeKind, PeerId};
 use amos_link::keyexpr::{Channel, Topic};
 use amos_link::metrics::LinkMetrics;
 use amos_link::node::LinkNode;
-use amos_link::platform::{Failsafe, IntentClass, Platform, PlatformKind, Vocabulary};
+use amos_link::platform::{
+    ActionSpec, Actuator, ActuatorRole, Failsafe, IntentClass, ParamSpec, Platform, PlatformKind,
+    SafetyEnvelope, Unit, Vocabulary,
+};
 use amos_link::pubsub::{Publisher, Subscriber};
 use amos_link::qos::Qos;
 use amos_link::robot_hal::{
@@ -199,6 +203,12 @@ fn every_profile_is_self_consistent() {
     for (kind, platform) in profiles() {
         let label = kind.key();
         assert_eq!(platform.kind(), kind, "{label}: the kind must round-trip");
+        // The library's own rule — the same one `Platform::from_parts` runs on a deployment's
+        // profile — agrees with the assertions below (two expressions of one invariant: these
+        // have the human messages, `validate` is what a hand-written machine meets).
+        platform
+            .validate()
+            .unwrap_or_else(|e| panic!("{label}: the built-in must pass its own rule: {e}"));
 
         // Actuators: contiguous from 0 (the frame's `id` byte is the index), inside the frame's
         // own argument space, named, and inside the 12-actuator boundary this layer registers.
@@ -668,7 +678,7 @@ async fn a_profile_bridge_latches_refuses_and_reports() {
 
     // A set point on disarmed drives is refused — with the profile's own arm key. A drone
     // accepts no motion before it is armed, and the *measured* bus state is what decides.
-    send(&commands, r#"{"action":"takeoff","speed":1.0}"#).await;
+    send(&commands, r#"{"action":"takeoff"}"#).await;
     match bridge.step().await.expect("one step") {
         BridgeEvent::Refused { reason, .. } => {
             assert!(reason.contains("not armed"), "{reason}");
@@ -699,7 +709,7 @@ async fn a_profile_bridge_latches_refuses_and_reports() {
     );
 
     // … and the same action is applied through the *shipping* HAL and frame type.
-    send(&commands, r#"{"action":"takeoff","speed":1.0}"#).await;
+    send(&commands, r#"{"action":"takeoff"}"#).await;
     assert_eq!(
         bridge.step().await.expect("the takeoff"),
         BridgeEvent::Applied {
@@ -890,4 +900,578 @@ async fn a_lost_link_stops_the_machine_and_the_mission_layer_finishes_the_manoeu
             .all(|f| f.op == MotorOp::SetPosition && f.arg == 0),
         "…with the elevons levelled, and this is the *same* frame type the bus already takes"
     );
+}
+
+// ── 6. the acceptance boundary: nothing is accepted and then dropped ───────────────
+//
+// The three cases below were found by *measuring* the layer instead of reading it: each used to be
+// accepted, validated — and then quietly not used, which is the shape of defect this middleware
+// refuses everywhere else (a missing set point is refused, never zeroed; an unknown parameter is
+// refused, never dropped). Each pins the refusal **and** the input that must still go through.
+
+#[test]
+fn a_speed_that_cannot_be_honoured_is_refused_not_dropped() {
+    // Measured before this existed: `{"action":"takeoff","speed":0.0}` and `speed:1.0` planned the
+    // **same** four 55 % thrust frames — the number was parsed, range-checked and then dropped, so
+    // a ground station asking for a gentle takeoff got full thrust and no indication.
+    let drone = Platform::drone();
+    let message = drone
+        .parse_intent(r#"{"action":"takeoff","speed":0.1}"#)
+        .expect_err("`takeoff`'s pose is its thrust, not a multiple of it")
+        .to_string();
+    assert!(message.contains("takeoff"), "{message}");
+    assert!(message.contains("fixed pose"), "{message}");
+    assert!(
+        message.contains("drone") && message.contains("0.1"),
+        "…naming the machine and the number it cannot honour: {message}"
+    );
+
+    // A motion that *does* scale still takes a speed: the reference machine's gaits, unchanged.
+    let quadruped = Platform::quadruped();
+    for speed in [0.0f32, 0.25, 0.6, 1.0] {
+        assert!(
+            quadruped
+                .parse_intent(&format!(r#"{{"action":"trot","speed":{speed}}}"#))
+                .is_ok(),
+            "the shipping planner's speed must still parse"
+        );
+    }
+    // An out-of-range speed keeps its own sentence (the shared rule fires first)…
+    assert!(drone
+        .parse_intent(r#"{"action":"takeoff","speed":2.0}"#)
+        .expect_err("speed 2")
+        .to_string()
+        .contains("outside [0, 1]"));
+    // …and a cosmetic field still never blocks an energize or a stop (the shipping shape).
+    assert!(drone
+        .parse_intent(r#"{"action":"arm","speed":0.2}"#)
+        .is_ok());
+    assert!(drone
+        .parse_intent(r#"{"action":"estop","speed":9}"#)
+        .is_ok());
+
+    // The general rule, over every action of every profile: an explicit speed is either honoured
+    // (`speed_scaled`) or refused — never silently ignored.
+    let mut checked = 0usize;
+    for kind in PlatformKind::all() {
+        let platform = Platform::of_kind(kind);
+        for action in platform.actions() {
+            if action.class != IntentClass::Motion {
+                continue;
+            }
+            let json = format!(r#"{{"action":"{}","speed":0.25}}"#, action.key);
+            assert_eq!(
+                platform.parse_intent(&json).is_ok(),
+                action.speed_scaled,
+                "{}: `{}` must honour a speed or refuse it, not drop it",
+                kind.key(),
+                action.key
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 20,
+        "every profile's motions were covered ({checked})"
+    );
+}
+
+#[test]
+fn two_set_points_for_one_actuator_are_refused_rather_than_first_wins() {
+    // `iter().find(|s| s.actuator == …)` returns the **first** match, so the second entry used to
+    // vanish: the caller's own field order decided which of two contradicting thrusts a drone flew
+    // (measured: `arg:90000` disappeared behind `arg:10000`).
+    let drone = Platform::drone();
+    let message = drone
+        .parse_intent(
+            r#"{"action":"hover","targets":[{"actuator":0,"arg":10000},{"actuator":0,"arg":90000}]}"#,
+        )
+        .expect_err("one actuator, two values")
+        .to_string();
+    assert!(message.contains("twice"), "{message}");
+    assert!(
+        message.contains("thruster_1"),
+        "…naming the actuator: {message}"
+    );
+
+    // One set point per actuator is the shipping shape and stays: the override, two *different*
+    // actuators, and the teleop vector that must name all seven.
+    assert!(drone
+        .parse_intent(r#"{"action":"hover","targets":[{"actuator":0,"arg":10000}]}"#)
+        .is_ok());
+    assert!(drone
+        .parse_intent(
+            r#"{"action":"hover","targets":[{"actuator":0,"arg":10000},{"actuator":1,"arg":90000}]}"#
+        )
+        .is_ok());
+    assert!(Platform::manipulator()
+        .parse_intent(
+            r#"{"action":"move","targets":[{"actuator":0,"arg":1},{"actuator":1,"arg":2},
+                {"actuator":2,"arg":3},{"actuator":3,"arg":4},{"actuator":4,"arg":5},
+                {"actuator":5,"arg":6},{"actuator":6,"arg":7}]}"#
+        )
+        .is_ok());
+}
+
+#[test]
+fn an_action_that_is_its_target_is_refused_without_one() {
+    // `{"action":"goto"}` used to be accepted and planned the profile's default 58 % thrust pose: a
+    // "go to" that goes nowhere, wearing the action's name — which is how a machine moves because a
+    // tool forgot to fill a field.
+    let drone = Platform::drone();
+    let message = drone
+        .parse_intent(r#"{"action":"goto"}"#)
+        .expect_err("a target with no target is not a `goto`")
+        .to_string();
+    assert!(
+        message.contains("goto") && message.contains("drone"),
+        "{message}"
+    );
+    assert!(
+        message.contains("north_mm")
+            && message.contains("east_mm")
+            && message.contains("altitude_mm"),
+        "…and lists what a target could be: {message}"
+    );
+    // One coordinate is enough — `0` is a coordinate, not an absent one.
+    assert!(drone
+        .parse_intent(r#"{"action":"goto","params":{"north_mm":0}}"#)
+        .is_ok());
+    // A wrong target is refused for being wrong, not for being incomplete (the limit comes first).
+    assert!(drone
+        .parse_intent(r#"{"action":"goto","params":{"north_mm":400000}}"#)
+        .expect_err("past the fence")
+        .to_string()
+        .contains("outside the limit"));
+    // The vessel's `waypoint` is a point too.
+    assert!(Platform::surface_vessel()
+        .parse_intent(r#"{"action":"waypoint"}"#)
+        .expect_err("a point with no coordinates")
+        .to_string()
+        .contains("x_mm"));
+    assert!(Platform::surface_vessel()
+        .parse_intent(r#"{"action":"waypoint","params":{"y_mm":-1200}}"#)
+        .is_ok());
+
+    // …while an action whose parameter has a documented default still needs none. This is the list
+    // that keeps `min_params` from becoming "every action must be given everything".
+    for (platform, action) in [
+        (Platform::ground_vehicle(), "lane_keep"),
+        (Platform::ground_vehicle(), "cruise"),
+        (Platform::ground_vehicle(), "slow"),
+        (Platform::industrial_cell(), "cycle"),
+        (Platform::surface_vessel(), "station_keep"),
+        (Platform::surface_vessel(), "loiter"),
+        (Platform::manipulator(), "grip"),
+    ] {
+        let json = format!(r#"{{"action":"{action}"}}"#);
+        assert!(
+            platform.parse_intent(&json).is_ok(),
+            "{}: `{action}` has a documented default and must not need a parameter",
+            platform.kind().key()
+        );
+    }
+    // …and the same actions still take one.
+    assert!(Platform::industrial_cell()
+        .parse_intent(r#"{"action":"cycle","params":{"cycle_ms":1500}}"#)
+        .is_ok());
+}
+
+// ── 7. a deployment writes its own machine (data, checked) ─────────────────────────
+
+/// One actuator, reusable through struct-update syntax so a longer table stays readable.
+const THRUST: Actuator = Actuator {
+    index: 0,
+    name: "thrust",
+    role: ActuatorRole::Thrust,
+    unit: Unit::MilliPercent,
+    travel: (0, MAX_TORQUE_MILLI_PERCENT),
+};
+
+/// The envelope a test profile declares, unless the envelope is the thing being tested.
+fn envelope() -> SafetyEnvelope {
+    SafetyEnvelope {
+        watchdog: Duration::from_millis(250),
+        failsafe: Failsafe::Stop,
+    }
+}
+
+/// Build a profile the way a deployment does: hand over the data, get a checked machine back.
+fn built(
+    actuators: &'static [Actuator],
+    actions: &'static [ActionSpec],
+) -> amos_link::Result<Platform> {
+    Platform::from_parts(PlatformKind::Drone, actuators, actions, envelope(), false)
+}
+
+/// The sentence a misdeclared profile is refused with.
+fn refused(actuators: &'static [Actuator], actions: &'static [ActionSpec]) -> String {
+    built(actuators, actions)
+        .expect_err("a profile that contradicts itself must be refused at construction")
+        .to_string()
+}
+
+/// One actuator of the valid profile below.
+static VALID_ACTUATORS: &[Actuator] = &[Actuator { ..THRUST }];
+
+/// Its vocabulary — note the arm key: a deployment names its own (`enable` here, not `arm`).
+static VALID_ACTIONS: &[ActionSpec] = &[
+    ActionSpec {
+        key: "enable",
+        class: IntentClass::Arm,
+        pose: &[0],
+        speed_scaled: false,
+        params: &[],
+        min_params: 0,
+    },
+    ActionSpec {
+        key: "hover",
+        class: IntentClass::Motion,
+        pose: &[50_000],
+        speed_scaled: false,
+        params: &[],
+        min_params: 0,
+    },
+    ActionSpec {
+        key: "stop",
+        class: IntentClass::Halt,
+        pose: &[0],
+        speed_scaled: false,
+        params: &[],
+        min_params: 0,
+    },
+];
+
+/// The valid profile, built once and borrowed `'static` — the shape a deployment gets from a
+/// `OnceLock`, which is what makes `Vocabulary::Profile(&Platform)` usable at all.
+static DEPLOYMENT_PROFILE: std::sync::OnceLock<Platform> = std::sync::OnceLock::new();
+
+/// The valid profile as a `'static` reference.
+fn deployment() -> &'static Platform {
+    DEPLOYMENT_PROFILE.get_or_init(|| {
+        built(VALID_ACTUATORS, VALID_ACTIONS).expect("the valid profile must be accepted")
+    })
+}
+
+#[test]
+fn a_deployment_profile_is_a_usable_machine_not_just_an_accepted_value() {
+    let platform = deployment();
+    assert_eq!(platform.kind(), PlatformKind::Drone);
+    // Its own vocabulary, its own arm key, its own label — and *not* the reference machine's words.
+    assert_eq!(Vocabulary::Profile(platform).arm_key(), "enable");
+    assert_eq!(Vocabulary::Profile(platform).label(), "drone");
+    assert!(!Vocabulary::Profile(platform).self_arms_on_motion());
+    assert!(platform.parse_intent(r#"{"action":"hover"}"#).is_ok());
+    assert!(platform
+        .parse_intent(r#"{"action":"trot"}"#)
+        .expect_err("the quadruped's word is not this machine's")
+        .to_string()
+        .contains("unknown action"));
+    // It plans into the **shipping** frames: the same type, the same CRC, the same HAL.
+    let intent = platform
+        .parse_intent(r#"{"action":"hover"}"#)
+        .expect("hover");
+    let frames = platform.plan(&intent).expect("a plan");
+    assert_eq!(frames.len(), 1);
+    assert_eq!((frames[0].op, frames[0].arg), (MotorOp::SetTorque, 50_000));
+    assert_eq!(
+        frames[0].joint,
+        amos_link::robot_hal::JointId::new(0).expect("joint 0")
+    );
+    // …and its stop is the shared `Halt` rule applied to its own table.
+    let halt = platform.halt_frames().expect("a halt");
+    assert_eq!((halt[0].op, halt[0].arg), (MotorOp::Estop, 0));
+}
+
+/// One action of a broken profile, spelled out. A `const fn` (the valid tables above are raw
+/// literals on purpose — that is what a deployment copies) keeps the variants below readable.
+const fn action(
+    key: &'static str,
+    class: IntentClass,
+    pose: &'static [i32],
+    speed_scaled: bool,
+    params: &'static [ParamSpec],
+    min_params: usize,
+) -> ActionSpec {
+    ActionSpec {
+        key,
+        class,
+        pose,
+        speed_scaled,
+        params,
+        min_params,
+    }
+}
+
+/// One actuator of a broken profile.
+const fn actuator(index: u8, name: &'static str, travel: (i32, i32)) -> Actuator {
+    Actuator {
+        index,
+        name,
+        role: ActuatorRole::Thrust,
+        unit: Unit::MilliPercent,
+        travel,
+    }
+}
+
+/// Actuator tables that break exactly one rule each.
+static NO_ACTUATORS: &[Actuator] = &[];
+static THIRTEEN: &[Actuator] = &[
+    Actuator { ..THRUST },
+    actuator(1, "t1", THRUST.travel),
+    actuator(2, "t2", THRUST.travel),
+    actuator(3, "t3", THRUST.travel),
+    actuator(4, "t4", THRUST.travel),
+    actuator(5, "t5", THRUST.travel),
+    actuator(6, "t6", THRUST.travel),
+    actuator(7, "t7", THRUST.travel),
+    actuator(8, "t8", THRUST.travel),
+    actuator(9, "t9", THRUST.travel),
+    actuator(10, "t10", THRUST.travel),
+    actuator(11, "t11", THRUST.travel),
+    actuator(12, "t12", THRUST.travel),
+];
+static GAP: &[Actuator] = &[Actuator { ..THRUST }, actuator(2, "pump", THRUST.travel)];
+static SAME_NAME: &[Actuator] = &[Actuator { ..THRUST }, actuator(1, "thrust", THRUST.travel)];
+static INVERTED_TRAVEL: &[Actuator] = &[actuator(0, "thrust", (4_000, 1_000))];
+static PAST_THE_FRAME: &[Actuator] = &[Actuator {
+    // ±180° is a legal axis; it is not inside this frame's argument space (a registered boundary).
+    travel: (-180_000, 180_000),
+    unit: Unit::MilliDegrees,
+    role: ActuatorRole::RotaryJoint,
+    ..THRUST
+}];
+
+/// Vocabulary tables that break exactly one rule each (each is a one-actuator machine).
+/// `const` (not `static`): a static may not read another static's value, and these are copied into
+/// the tables below.
+const HOVER: ActionSpec = action("hover", IntentClass::Motion, &[50_000], false, &[], 0);
+const ARM: ActionSpec = action("enable", IntentClass::Arm, &[0], false, &[], 0);
+const STOP: ActionSpec = action("stop", IntentClass::Halt, &[0], false, &[], 0);
+static NO_ACTIONS: &[ActionSpec] = &[];
+static NO_ARM: &[ActionSpec] = &[HOVER, STOP];
+static TWO_HALTS: &[ActionSpec] = &[
+    ARM,
+    HOVER,
+    STOP,
+    action("emergency", IntentClass::Halt, &[0], false, &[], 0),
+];
+static TWO_ARMS: &[ActionSpec] = &[
+    ARM,
+    action("enable_again", IntentClass::Arm, &[0], false, &[], 0),
+    HOVER,
+    STOP,
+];
+static DUPLICATE_KEY: &[ActionSpec] = &[
+    ARM,
+    HOVER,
+    action("hover", IntentClass::Motion, &[60_000], false, &[], 0),
+    STOP,
+];
+static SHORT_POSE: &[ActionSpec] = &[
+    ARM,
+    action(
+        "hover",
+        IntentClass::Motion,
+        &[50_000, 60_000],
+        false,
+        &[],
+        0,
+    ),
+    STOP,
+];
+static POSE_OUTSIDE_TRAVEL: &[ActionSpec] = &[
+    ARM,
+    action("hover", IntentClass::Motion, &[100_001], false, &[], 0),
+    STOP,
+];
+static SPEED_WITHOUT_POSE: &[ActionSpec] = &[
+    ARM,
+    action("move", IntentClass::Motion, &[], true, &[], 0),
+    STOP,
+];
+static HALT_WITH_A_POSE: &[ActionSpec] = &[
+    ARM,
+    HOVER,
+    action("stop", IntentClass::Halt, &[10_000], false, &[], 0),
+];
+static UNSATISFIABLE: &[ActionSpec] = &[
+    ARM,
+    action("goto", IntentClass::Motion, &[50_000], false, &[], 1),
+    STOP,
+];
+static DUPLICATE_PARAM: &[ActionSpec] = &[
+    ARM,
+    action(
+        "goto",
+        IntentClass::Motion,
+        &[50_000],
+        false,
+        &[
+            ParamSpec {
+                name: "north_mm",
+                unit: "mm",
+                range: (-10, 10),
+            },
+            ParamSpec {
+                name: "north_mm",
+                unit: "mm",
+                range: (-20, 20),
+            },
+        ],
+        1,
+    ),
+    STOP,
+];
+static INVERTED_RANGE: &[ActionSpec] = &[
+    ARM,
+    action(
+        "goto",
+        IntentClass::Motion,
+        &[50_000],
+        false,
+        &[ParamSpec {
+            name: "north_mm",
+            unit: "mm",
+            range: (10, -10),
+        }],
+        1,
+    ),
+    STOP,
+];
+
+#[test]
+fn a_misdeclared_profile_is_refused_naming_the_rule_it_broke() {
+    // Eighteen profiles, one broken rule each. Without this, the only profiles a reviewer can run
+    // are the six built-ins — all valid — so every refusal inside `plan` (a pose that does not fit
+    // its table, a travel the frame cannot carry) was a sentence no test could reach.
+    let cases = [
+        (
+            "no actuators",
+            refused(NO_ACTUATORS, VALID_ACTIONS),
+            "declares no actuators",
+        ),
+        (
+            "no actions",
+            refused(VALID_ACTUATORS, NO_ACTIONS),
+            "declares no actions",
+        ),
+        (
+            "thirteen actuators",
+            refused(THIRTEEN, VALID_ACTIONS),
+            "12-actuator boundary",
+        ),
+        (
+            "a gap in the indices",
+            refused(GAP, VALID_ACTIONS),
+            "contiguous from 0",
+        ),
+        (
+            "two actuators, one name",
+            refused(SAME_NAME, VALID_ACTIONS),
+            "two actuators are called `thrust`",
+        ),
+        (
+            "an inverted travel",
+            refused(INVERTED_TRAVEL, VALID_ACTIONS),
+            "inverted travel 4000..=1000",
+        ),
+        (
+            "a travel past the frame",
+            refused(PAST_THE_FRAME, VALID_ACTIONS),
+            "argument space",
+        ),
+        (
+            "no Arm action",
+            refused(VALID_ACTUATORS, NO_ARM),
+            "needs exactly one `arm` action (it has 0)",
+        ),
+        (
+            "two Arm actions",
+            refused(VALID_ACTUATORS, TWO_ARMS),
+            "needs exactly one `arm` action (it has 2)",
+        ),
+        (
+            "two Halt actions",
+            refused(VALID_ACTUATORS, TWO_HALTS),
+            "needs exactly one `halt` action (it has 2)",
+        ),
+        (
+            "a duplicated action key",
+            refused(VALID_ACTUATORS, DUPLICATE_KEY),
+            "two actions are called `hover`",
+        ),
+        (
+            "a pose too short",
+            refused(VALID_ACTUATORS, SHORT_POSE),
+            "2 pose entries for 1 actuators",
+        ),
+        (
+            "a pose outside the travel",
+            refused(VALID_ACTUATORS, POSE_OUTSIDE_TRAVEL),
+            "100001",
+        ),
+        (
+            "a speed to scale an absent pose",
+            refused(VALID_ACTUATORS, SPEED_WITHOUT_POSE),
+            "scale a pose it does not have",
+        ),
+        (
+            "a Halt that moves",
+            refused(VALID_ACTUATORS, HALT_WITH_A_POSE),
+            "must be inert",
+        ),
+        (
+            "min_params nothing can satisfy",
+            refused(VALID_ACTUATORS, UNSATISFIABLE),
+            "requires 1 of its 0 parameters",
+        ),
+        (
+            "a duplicated parameter",
+            refused(VALID_ACTUATORS, DUPLICATE_PARAM),
+            "declares the parameter `north_mm` twice",
+        ),
+        (
+            "an inverted parameter range",
+            refused(VALID_ACTUATORS, INVERTED_RANGE),
+            "inverted range 10..=-10",
+        ),
+    ];
+    for (case, message, expected) in cases {
+        assert!(
+            message.contains(expected),
+            "{case}: expected {expected:?} in {message:?}"
+        );
+        assert!(
+            message.contains("platform drone"),
+            "{case}: the refusal must name the profile: {message}"
+        );
+    }
+
+    // The envelope is part of the profile, so it is checked with it — including the bound a
+    // *report* imposes (`SafetyEnvelope::validate`, docs/robot-domains.md §5).
+    let zero = Platform::from_parts(
+        PlatformKind::Drone,
+        VALID_ACTUATORS,
+        VALID_ACTIONS,
+        SafetyEnvelope {
+            watchdog: Duration::ZERO,
+            failsafe: Failsafe::Stop,
+        },
+        false,
+    )
+    .expect_err("a zero deadman is not a watchdog");
+    assert!(zero.to_string().contains("zero deadman"), "{zero}");
+    let too_long = Platform::from_parts(
+        PlatformKind::Drone,
+        VALID_ACTUATORS,
+        VALID_ACTIONS,
+        SafetyEnvelope {
+            watchdog: Duration::from_millis(MAX_WATCHDOG_MS + 1),
+            failsafe: Failsafe::Stop,
+        },
+        false,
+    )
+    .expect_err("past what a report may carry");
+    assert!(too_long.to_string().contains("exceeds"), "{too_long}");
 }
