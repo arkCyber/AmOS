@@ -7,6 +7,7 @@ import {
   homeGrid,
   homeTile,
   pageCapacity,
+  photosCols,
   PHONE_GRID,
   type HomeGrid,
 } from "../lib/formLayout";
@@ -229,6 +230,36 @@ describe("appLibraryColumns — the library surface scales with the class (REQ-A
   test("the column count is a positive integer for every class", () => {
     for (const form of FORMS) {
       const n = appLibraryColumns(form);
+      expect(Number.isInteger(n) && n >= 1).toBe(true);
+    }
+  });
+});
+
+describe("photosCols — the Photos grid scales with the class (REQ-A292)", () => {
+  test("phone keeps today's 3 columns (iOS Photos phone density)", () => {
+    expect(photosCols("phone")).toBe(3);
+  });
+
+  test("tablet widens to 5 columns (iPadOS My-Photos density)", () => {
+    // iPadOS Photos is 5 columns wide in My Photos — the same density that ships on
+    // a 12.9" iPad Pro and the same the user expects. A 3-column grid on a 900px-wide
+    // tablet window wastes half the width.
+    expect(photosCols("tablet")).toBe(5);
+  });
+
+  test("desktop widens further (matches the launcher cap)", () => {
+    // Pinned to DESKTOP_MAX_COLS (not a hand-picked number): the launcher already
+    // honors this cap, so the gallery stays in step with it.
+    expect(photosCols("desktop")).toBe(DESKTOP_MAX_COLS);
+  });
+
+  test("robot has no UI, so its gallery column count is the phone's (never zero)", () => {
+    expect(photosCols("robot")).toBe(3);
+  });
+
+  test("the column count is a positive integer for every class", () => {
+    for (const form of FORMS) {
+      const n = photosCols(form);
       expect(Number.isInteger(n) && n >= 1).toBe(true);
     }
   });

@@ -15,6 +15,7 @@ import { writeStoreValue } from "../src/lib/amosStore";
 import { PHOTOS_KEY } from "../src/lib/photos";
 import { CAPTURES_KEY } from "../src/lib/cameraCapture";
 import { zh } from "../src/i18n/locales/zh";
+import { setFormFactor } from "../src/lib/desktopApps";
 
 afterEach(() => {
   cleanup();
@@ -309,5 +310,57 @@ describe("PhotosApp.svelte", () => {
       if (stub === undefined) delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
       else (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = stub;
     }
+  });
+});
+
+describe("PhotosApp.svelte - form-aware gallery columns (REQ-A292)", () => {
+  // The gallery used to render `grid-cols-3` unconditionally. On a 900x1200 iPad-class
+  // window that was the phone's 3 columns stretched out — half the width empty.
+  // The PhotosApp now reads `form` from the host via `currentFormFactor()` and
+  // asks `lib/formLayout::photosCols` how many columns. This group pins the column
+  // count per class via the same inline `grid-template-columns` style that
+  // HomeDock / AppLibrary use (Tailwind purges constructed class names).
+
+  /** Read the `repeat(N, …)` count from the gallery grid's style attribute. */
+  function galleryCols(container: HTMLElement): number {
+    const grid = container.querySelector(".grid[style*=\"grid-template-columns\"]") as HTMLElement | null;
+    if (!grid) throw new Error("no gallery grid");
+    const m = grid.getAttribute("style")?.match(/repeat\(\s*(\d+)\s*,/);
+    return m && m[1] ? Number(m[1]) : 0;
+  }
+
+  test("no host form → the phone's 3 columns (the conservative default)", () => {
+    // `currentFormFactor()` returns `null` when the shell has not pushed a form;
+    // `photosCols(null ? "phone" : …)` keeps today's iOS-Phone layout so the
+    // preview build is unaffected. (REQ-A292, mirroring `formLayout`'s "no
+    // measurement → phone grid" rule.)
+    const host = render(PhotosApp);
+    expect(galleryCols(host.container)).toBe(3);
+  });
+
+  test("phone form → 3 columns", () => {
+    setFormFactor("phone");
+    const host = render(PhotosApp);
+    expect(galleryCols(host.container)).toBe(3);
+  });
+
+  test("tablet form → 5 columns (iPadOS My-Photos density)", () => {
+    setFormFactor("tablet");
+    const host = render(PhotosApp);
+    expect(galleryCols(host.container)).toBe(5);
+  });
+
+  test("desktop form → DESKTOP_MAX_COLS (8), pinned to the launcher cap", () => {
+    setFormFactor("desktop");
+    const host = render(PhotosApp);
+    // 8 = DESKTOP_MAX_COLS — pinned by formLayout.test.ts so the launcher and the
+    // gallery cannot drift apart to a hand-picked number.
+    expect(galleryCols(host.container)).toBe(8);
+  });
+
+  test("robot form → the phone's 3 columns (no UI, conservative default)", () => {
+    setFormFactor("robot");
+    const host = render(PhotosApp);
+    expect(galleryCols(host.container)).toBe(3);
   });
 });

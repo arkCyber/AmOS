@@ -17,7 +17,7 @@ import { writable } from "svelte/store";
 export type FormFactor = "phone" | "tablet" | "desktop" | "robot";
 
 // Internal on purpose: `setFormFactor` is the only writer (Shell.svelte) and
-// `desktopFormActive()` the only reader (the app registry). Exporting the store
+// `desktopFormActive()` / `currentFormFactor()` the only readers. Exporting the store
 // itself would be a third way to answer the same question (unwired-scan).
 const _formStore = writable<FormFactor | null>(null);
 
@@ -31,4 +31,20 @@ export function desktopFormActive(): boolean {
   let current: FormFactor | null = null;
   _formStore.subscribe((v) => (current = v))();
   return current === "desktop";
+}
+
+/**
+ * The current form factor as reported by the host, or `null` while the host has
+ * not yet answered.
+ *
+ * Used by Svelte app components (`PhotosApp`, `CalendarApp`, …) that want to lay
+ * themselves out per class without prop-drilling `form` through the dynamic
+ * `<AppComp />` mount point in `Shell.svelte`. Same answer the shell renders
+ * against (single source of truth: `_formStore`); `desktopFormActive()` is the
+ * narrower `desktop` predicate on top of this same reader.
+ */
+export function currentFormFactor(): FormFactor | null {
+  let current: FormFactor | null = null;
+  _formStore.subscribe((v) => (current = v))();
+  return current;
 }

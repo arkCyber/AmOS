@@ -31,6 +31,8 @@
   import { nativePhotoFromItem } from "../lib/photoLibrary";
   import type { NativePhoto } from "../lib/photoLibrary";
   import { t } from "./locale.svelte";
+  import { currentFormFactor } from "../lib/desktopApps";
+  import { photosCols } from "../lib/formLayout";
 
   // Demo seed — **only when the key is absent**: an emptied library stays empty.
   const seed = ((): Photo[] => {
@@ -58,6 +60,16 @@
   // read-only strip above the local grid (only when a bridge is present).
   let native = $state<NativePhoto[]>([]);
   const nativeShown = $derived(!favOnly && !vidsOnly && !selecting && native.length > 0);
+
+  // The gallery grid scales with the device class (REQ-A292): iOS keeps 3 columns
+  // on the phone; iPadOS Photos uses 5 columns in My Photos; the desktop class
+  // widens further to `DESKTOP_MAX_COLS` so a Mac window does not look like an
+  // iPad stretched out. We do NOT poll: the shell owns `form` and updates this
+  // store on every `layout-changed` push (the host emits only on a real change).
+  // `null` from `currentFormFactor()` is the "no host yet" state — we keep the
+  // most conservative answer (the phone's 3) so a preview build stays usable.
+  const form = $derived(currentFormFactor());
+  const cols = $derived(photosCols(form ?? "phone"));
 
   // The two standard collections the gallery reads stills from.
   const NATIVE_COLLECTIONS = ["camera", "screenshots"] as const;
@@ -440,7 +452,7 @@
             <span class="text-xs font-normal text-white/50">{sec.items.length}</span>
           {/if}
         </p>
-        <div class="grid grid-cols-3 gap-1">
+        <div class="grid gap-1" style={`grid-template-columns: repeat(${cols}, minmax(0, 1fr));`}>
           {#each sec.items as it (it.kind === "photo" ? it.p.id : it.v.id)}
           {#if it.kind === "video"}
             {@const v = it.v}
@@ -501,7 +513,7 @@
               <p role="status" class="text-xs text-white/80">{wallMsg}</p>
             {/if}
             <div class="flex items-center justify-between gap-3 self-stretch">
-              <button onclick={closeVideo} aria-label={t("a11y.closeVideo")} data-icon="x" class="grid h-8 w-8 place-items-center rounded-full bg-white/15 text-white ring-1 ring-white/25">{@html iconSvg("x", "h-4 w-4")}</button>
+              <button onclick={closeVideo} aria-label={t("a11y.closeVideo")} data-icon="x" class="grid h-11 w-11 place-items-center rounded-full bg-white/15 text-white ring-1 ring-white/25">{@html iconSvg("x", "h-4 w-4")}</button>
               <button onclick={() => playId && shareVideo(playId)} class="rounded-full bg-white/15 px-4 py-1.5 text-sm text-white ring-1 ring-white/25">{t("photo.share")}</button>
               <button onclick={() => playId && void deleteVideo(playId)} class="rounded-full bg-danger/90 px-4 py-1.5 text-sm text-white">{t("photo.delete")}</button>
             </div>

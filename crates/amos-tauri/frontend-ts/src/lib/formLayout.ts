@@ -135,6 +135,26 @@ export function appLibraryColumns(form: FormFactor): number {
 }
 
 /**
+ * The **Photos** grid column count for this class.
+ *
+ * iOS Photos uses 3 columns regardless of device size — a deliberate choice on a
+ * phone-shaped canvas; iPadOS Photos widens to 5 columns (its My Photos tab). The
+ * desktop class gets `DESKTOP_MAX_COLS` (matching the launcher) so a Mac window
+ * shows a desktop-class gallery rather than the iPad's 5. Robot has no UI ⇒ the
+ * most conservative answer (the phone default).
+ *
+ * Why `App.svelte` components consume a *number* from this module instead of
+ * branching on `form === "tablet"` themselves: one source of truth, one
+ * decision family, one set of tests. Each consumer only picks the function
+ * (`appLibraryColumns` / `photosCols` / …) — they never ask "what *is* a tablet?".
+ */
+export function photosCols(form: FormFactor): number {
+  if (form === "tablet") return 5;
+  if (form === "desktop") return DESKTOP_MAX_COLS;
+  return 3;
+}
+
+/**
  * The home-screen grid for this class at this measured screen size.
  *
  * `width`/`height` are the host's measured screen (logical px; see
