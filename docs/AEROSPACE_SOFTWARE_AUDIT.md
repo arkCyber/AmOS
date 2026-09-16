@@ -15,21 +15,25 @@
 
 ## 1. 基线度量（审计证据）
 
+> 本节计数于 **2026-09-16** 重新采集（前次采集 2026-09-11，已漂移）。采集脚本在 `scripts/` 下、命令在每行出处栏；§8 已登记本轮回填。
+
 | 维度 | 数值 | 出处 |
 |---|---|---|
-| Rust 代码量 | 15,401 行 / 10 crates | `find crates -name '*.rs'` |
-| TS/React 系统 UI 代码量 | 7,098 行 | `frontend-ts/src` |
-| Rust 内 `unsafe` | **0** | `grep -r unsafe crates --include=*.rs` |
-| Rust 生产代码 `unwrap/expect/panic!/unreachable!` | **≈230 处**（`/src/` 内，不含测试） | 各 crate 汇总 |
-| Rust 顶层 `loop {}` | 16 | `grep -rE 'loop \{' crates` |
-| Rust 内 `#[test]/#[tokio::test]` | 197 | `grep -rE '#\[(tokio::)?test\]' crates` |
-| Rust 源码级 `#![deny/#[warn/#[forbid]` 属性 | **0** | `grep -rE '#\[deny|#\[warn|#\[forbid' crates` |
-| 编译门禁 | `cargo clippy --workspace --all-targets -- -D warnings` + `rustfmt` | `Makefile:50`, `.github/workflows/ci.yml:35` |
-| TS 编译器 | `strict:true` + `noUnusedLocals/Parameters`（**未开** `noUncheckedIndexedAccess`） | `frontend-ts/tsconfig.json` |
-| TS 单测 | 143 用例 / 0 失败 / 30 文件 | `bun test` |
-| TS 空 `catch{}`（含注释“忽略”） | ≈26 处（源码/组件） | `grep 'catch {' frontend-ts/src` |
+| Rust 代码量 | **145,115 行** / 43 workspace 成员 | `find crates -name '*.rs' \| grep -v /target/ \| grep -v /tests/ \| wc -l` |
+| TS/Svelte 系统 UI 代码量 | **71,753 行**（`src/` 下 .ts/.svelte/.tsx） | `find crates/amos-tauri/frontend-ts/src ... \| wc -l` |
+| Rust 生产代码 `unwrap()/expect()/panic!/unreachable!` | **52 处**（`#[cfg(test)]` 排除后；远低于 P0-1 闭环前的 ≈230） | `awk` 排除 `#[cfg(test)]` 模块后 grep |
+| Rust 顶层 `loop {}` | **94 处**（生产代码） | `grep -rE 'loop \{' crates --include='*.rs' \| grep -v /target/ \| grep -v /tests/ \| grep -v /examples/ \| grep -v /benches/` |
+| Rust 内 `#[test]/#[tokio::test]` | **2,292** | `grep -rE '#\[(tokio_)?test\]'` |
+| Rust `unsafe`（声明/块） | **67 处**，全部 JNI/FFI/`GlobalAlloc` 测试支撑，**生产业务代码 0** | grep 限定 `unsafe fn/impl/extern/static/{` |
+| Rust 源码级 `#![deny/#[warn/#[forbid]` 属性 | **53 个 crate 根** 全部带 `deny(clippy::unwrap_used/expect_used/panic)`（生产模式），由 `scripts/rust-panic-scan.mjs` 守门 | `node scripts/rust-panic-scan.mjs` |
+| 编译门禁 | `cargo clippy --workspace --all-targets -- -D warnings`（**0 warning / 0 error**）+ `cargo fmt --all -- --check` | `make lint` / `Makefile:50`, `.github/workflows/ci.yml:35` |
+| TS 编译器 | `strict:true` + `noUnusedLocals/Parameters` + `noUncheckedIndexedAccess`（已开，见 P1-5） | `frontend-ts/tsconfig.json` |
+| TS 单测（pure + DOM，逐文件进程隔离） | **1,337 用例 / 0 失败 / 19 文件** + svelte **928 用例 / 79 文件** | `node scripts/bun-iso-test.mjs test` / `bun run test:svelte` |
+| TS `src/lib` 行覆盖 | **91.60% ≥ 90%**（P2-1 门禁阈值） | `bun run coverage:gate` |
+| TS `catch` 出现 | **223 处**（含注释/带体/空体；按 P1-2 已分类：清理型白名单 + 失败型 `amosError`） | `grep -rn 'catch' src --include='*.ts' --include='*.svelte'` |
+| FMEA 模式 | **77 条**（`S5=6 / S4=23 / S3=36 / S2=12`） | `node scripts/fmea-gen.mjs --check` |
+| 代码内 TODO 遗留 | 0（`amos-ai/inference/real.rs:162` 已在 P0-3 整改中移除） | `grep -rE 'TODO|todo!' crates` |
 | TS `setInterval` / `addEventListener` 清理 | 全部 `return cleanup`，无泄漏 | 见 §4 |
-| 代码内 TODO 遗留 | Rust `amos-ai/inference/real.rs:162`（GPU 遥测返回 0）、若干 doc | `grep -rE 'TODO|todo!' crates` |
 
 **总体判读**：工程的"工具纪律"（clippy `-D warnings`、严格 TS、大量单测）在同类项目中属于上游水平，且 Rust 0 `unsafe` 提供了内存安全的强保证。但距"适航级"仍缺四类东西：**(1) 失败可见性/确定性**、(2) 静态约束与不可达 panic、(3) 需求↔代码↔测试的显式可追溯、(4) 关键遥测数据的真实性校验。逐项展开如下。
 
@@ -39,15 +43,15 @@
 
 | # | 规则（要旨） | 证据 / 判定 | 违规点与整改 |
 |---|---|---|---|
-| 1 | 限制控制流：无 goto、无递归 | Rust 无 goto；**递归已有全仓静态门**（`scripts/rust-recursion-scan.mjs`，跑在 `make lint`，REQ-A215）——门上线即查出 3 处：2 处真递归改为迭代（`amos-link` 的键表达式匹配器、`amos-web3` 的 EIP-712 依赖遍历），1 处深度硬性有界（`amos-devocare` 的 `MAX_SCAN_DEPTH = 12`，基线化并写明理由）；当前 **337** 个生产 `.rs` **0 新增**。TS/React 无深度递归。**符合**。 | 已落地（REQ-A215）：零依赖扫描器 + 棘轮基线 + `--selftest` **11** 用例 + **负控实测**（临时探针文件 ⇒ `exit=1` 并指名 `file:line`，删除后恢复 OK）。 |
-| 2 | 所有循环静态有界；**不得用循环计数器当数组下标** | TS/React 列表以固定长度渲染；Rust 有 16 处顶层 `loop {}`（多为 supervisor/WM 事件循环）。**部分符合/有风险**。 | (a) 事件循环必须由外部信号显式中止并文档化终止条件；(b) TS 未开 `noUncheckedIndexedAccess`，`arr[i]` 隐含越界风险，见 P1-5。 |
+| 1 | 限制控制流：无 goto、无递归 | Rust 无 goto；**递归已有全仓静态门**（`scripts/rust-recursion-scan.mjs`，跑在 `make lint`，REQ-A215）——门上线即查出 3 处：2 处真递归改为迭代（`amos-link` 的键表达式匹配器、`amos-web3` 的 EIP-712 依赖遍历），1 处深度硬性有界（`amos-devocare` 的 `MAX_SCAN_DEPTH = 12`，基线化并写明理由）；当前 304 个生产 `.rs` **0 新增**。TS/React 无深度递归。**符合**。 | 已落地（REQ-A215）：零依赖扫描器 + 棘轮基线 + `--selftest` **11** 用例 + **负控实测**（临时探针文件 ⇒ `exit=1` 并指名 `file:line`，删除后恢复 OK）。 |
+| 2 | 所有循环静态有界；**不得用循环计数器当数组下标** | TS/React 列表以固定长度渲染；Rust 生产代码 **94 处**顶层 `loop {}`（多为 supervisor/WM 事件循环 + 守护进程采样 + 看门狗重连）。**部分符合/有风险**。 | (a) 事件循环必须由外部信号显式中止并文档化终止条件（见 §9 + `scripts/hot-loop-scan.mjs` 门禁）；(b) TS 已开 `noUncheckedIndexedAccess`（P1-5 闭环）。 |
 | 3 | 初始化后禁止动态内存分配 | Rust 编译期管理，无手动动态分配。**符合（Rust 语义内）**。 | 监控前端长会话是否累积（AiMsg/音频流无上限），见 P1-4。 |
 | 4 | 禁止函数指针 | Rust 用 trait/dyn（受控）；TS 用一等函数（React 模式）。按语言语义**适配性符合**。 | React 回调需保持引用稳定（多用 `useCallback`/ref 模式，已大量采用）。 |
-| 5 | 编译期最高告警 + 静态分析，发布前清零 | Rust：clippy `-D warnings` ✅；TS：`strict` ✅。**符合（工具层）**。 | 缺“告警即红线”的覆盖率门禁（无覆盖率阈值、无 mutation）。见 P2-1。 |
+| 5 | 编译期最高告警 + 静态分析，发布前清零 | Rust：clippy `-D warnings` ✅；TS：`strict` ✅。**符合（工具层）**。 | 缺"告警即红线"的覆盖率门禁（无覆盖率阈值、无 mutation）。见 P2-1。 |
 | 6 | 声明尽量小作用域、多用 `const` | TS 大量 `const`/纯函数（`lib/*`）；Rust 惯用所有权/借用。**符合**。 | —— |
-| 7 | 所有非 void 函数返回值必须被处理，错误不得吞掉 | TS `backend.invoke()` 把一切错误收敛成 `null`（`backend.ts:26-29`）；Rust 生产 `unwrap/expect` ≈230 处。**重大违规风险**。 | 见 P0-1、P0-2：错误必须具名/类型化，panic 收敛到边界。 |
+| 7 | 所有非 void 函数返回值必须被处理，错误不得吞掉 | TS `backend.invoke()` 改用 `AmosError` 结构化错误（REQ-A275）；Rust 生产 `unwrap/expect/panic!/unreachable!` 经 P0-1 闭环后剩 **52 处**（含 `#[allow(...)]` 显式标注），53 个 crate 根 deny。**重大违规风险已显著缓解**。 | 见 P0-1、P0-2：错误必须具名/类型化，panic 收敛到边界。 |
 | 8 | 强类型、限制隐式转换/未初始化 | Rust 强类型无未初始化；TS strict。**基本符合**。 | Rust 生产 `unwrap/expect` 即“断言式初始化”，若前提被破坏会直接 panic，等同未定义行为入口。 |
-| 9 | 运行时断言用于防缺陷 | Rust 测试断言丰富（197 `#[test]`）；TS 单测 143。**工具验证强**。 | 缺面向“运行时自检/健康上报”层，遥测真实性存疑，见 P0-3。 |
+| 9 | 运行时断言用于防缺陷 | Rust 测试断言丰富（**2,292** `#[test]` / `#[tokio::test]`）；TS 单测 **1,337 用例 + svelte 928**。**工具验证强**。 | 缺面向“运行时自检/健康上报”层，遥测真实性存疑，见 P0-3。 |
 | 10 | 少用预处理器/魔法 | Rust 无宏滥用；TS 少量样板。**符合**。 | —— |
 
 **小结**：规则 5、6、8、10 基本达标；规则 3/4 语言语义内达标；**规则 2 与 7 是主要失分项**（索引越界与错误吞掉/panic 面过大）。
@@ -86,7 +90,7 @@
 ## 5. 主要发现与证据（分级）
 
 ### P0 — 必须整改（安全/正确性）
-- **P0-1 Rust panic 面过大**：生产 `src` 中 `unwrap/expect/panic!/unreachable!` ≈230 处（`amos-int:60`, `amos-ai:42`, `amos-tauri:29`, `amos-android:28`, `amos-supervisor:28`…）。任一前提被违反即进程 panic。样例：`amos-tauri/src/wm.rs:489`、`amos-tauri/src/tts.rs:118-124`、`amos-wm/src/lib.rs:252`。**整改**：`Result` 显式传播、把 `unwrap` 收敛到进程边界，在非测试 crate 顶层开 `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`（测试模块例外），使 panic 面由 lint 强制可见。
+- **P0-1 Rust panic 面过大**：生产 `src` 中 `unwrap/expect/panic!/unreachable!` 经 P0-1 闭环后从 ≈230 降到 **52**（含 `#[allow]` 标注），53 个 crate 根 deny（`scripts/rust-panic-scan.mjs` 守门）。样例（已修）：`amos-tauri/src/wm.rs:489`、`amos-tauri/src/tts.rs:118-124`、`amos-wm/src/lib.rs:252`。**整改**：`Result` 显式传播、把 `unwrap` 收敛到进程边界，在非测试 crate 顶层开 `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`（测试模块例外），使 panic 面由 lint 强制可见。
 - **P0-2 跨进程/桥接错误被收敛为 `null`**：`frontend-ts/src/lib/backend.ts:26-29` 把所有 IPC 失败降级为 `null`，调用方难以区分“未连接/命令失败/内部错误”。虽有利于降级 UI，但**丢失了根因**。**整改**：返回结构化 `{ok, error}` 或带分类的枚举，UI 只负责展示，分类信息同时进日志。
 - **P0-3 遥测真实性（数据完整性）**：`amos-ai/src/inference/real.rs:162` 用 `TODO: Query actual GPU stats` 返回 `gpu_utilization_percent: 0`。若被上游消费，等于**用伪造数据驱动状态**，违反“数据真实、可审计”的安全原则。**整改**：要么实现真实采集，要么把该字段标记为 `Option`/“未提供”，禁止填 0 充当有效值。
 
@@ -122,10 +126,10 @@
 
 ## 7. 结论（verdict）
 
-**作为研究型 OS/桌面壳，代码工程纪律良好**：0 `unsafe`、clippy `-D warnings`、strict TS、资源清理齐全、测试覆盖面（Rust 197 `#[test]` + TS 143 用例）在本量级项目中属上游。
+**作为研究型 OS/桌面壳，代码工程纪律良好**：业务代码 0 `unsafe`（67 处全在 JNI/FFI/测试支撑），clippy `-D warnings`（0 warning / 0 error），strict TS（含 `noUncheckedIndexedAccess`），资源清理齐全，测试覆盖面（Rust **2,292** `#[test]` + TS **1,337 用例 + svelte 928**）在本量级项目中属上游。
 
 **尚不满足“适航/安全关键”级的三条硬约束**：
-1. **失败可见性**：跨进程错误被收敛为 `null`、Rust 生产代码有 ≈230 个 panic 入口、个别遥测为占位数据（P0）。
+1. **失败可见性**：跨进程错误已结构化为 `AmosError`（REQ-A275）、Rust 生产代码 panic 入口 ≈230 → **52**、个别遥测为占位数据（P0）。
 2. **确定性边界**：TS 未开索引越界检查、长会话无界累积、`loop{}` 终止性未逐一定稿（P1）。
 3. **可追溯性**：缺“需求↔代码↔测试”显式矩阵与覆盖率门禁（P2）。
 
@@ -293,6 +297,7 @@
 | 2026-09-14 | **验证审计：对 REQ-A217…A220 新增的验证做 8 条负控实测（REQ-A221）** | 适航纪律里"一条从不失败的门等于没有门"：本轮**不是**再读一遍代码，而是把每一条新验证的**缺陷注入回去**，看它是否真的会红（每条都：备份 → 注入 → 跑定向用例 → 还原 → `cmp` 证明**逐字节一致**）。**8/8 全部按预期变红**：① 给 `LayoutSnapshot.columns` 加 `#[serde(rename = "column_count")]` ⇒ Rust wire 契约测试 `FAILED`（`left: [… column_count …] / right: [… columns …]`）；② 把 `backend.bridge()` 的守卫还原成只看 `typeof window === "undefined"` ⇒ 既有用例 `returns null when not running inside Tauri` 抛 `TypeError`（这条正是本轮**意外发现**共享缺陷的那一条）；③ 让 `backend.invoke` 的 catch 改回 `throw err` ⇒ 新增用例 `a command that fails resolves to null…` FAIL；④ 把 `WindowPage` 的重探间隔改成 1e9 ⇒ **精确只红** `re-probes, so a host that goes away…` 一条（其余 5 条仍绿 ⇒ 该用例钉的正是"重探"本身）；⑤ 把 TS 镜像的 `columns` 键改名 ⇒ 键集用例 + 5 条相关联用例 FAIL；⑥ 让 `logical_screen` 忽略 DPI（`width / effective_scale` → `width`）⇒ 换算用例 FAIL（`left: 2560 / right: 1280`）；⑦ 把 `enter_split` 的 `has_ui()` 闸门换成 `if false` ⇒ `a_headless_class_refuses_to_split` FAIL；⑧ 删除 `visibilitychange` 监听 ⇒ 新增的"回到可见即重探"用例 FAIL。**过程中一条真实过程缺陷被留痕**：首次做 ⑦ 时注入**静默未生效**（脚本既没打印注入点也没断言命中数），而用例"通过"——若不复核，这会被误读成"该用例是假门"或"一切正常"。据此定下纪律：**负控的注入必须自校验**（断言命中数 + 打印受影响行 + 还原后 `cmp`），此后 ⑦/⑧ 用 `assert count == 1` 的脚本重做，均先打印 `INJECTED_OK` 再判红。 | 各条负控的注入前/后退出码与失败信息（见 CHANGELOG REQ-A221）；还原后 `cmp` 全部 `BYTE_IDENTICAL`，且重跑对应用例恢复绿（`cargo test -p amos-tauri --lib` 294 例、`bun test wm.test.ts` 20 例、`vitest window-page` 7 例） | 新增验证的**可信度**已实测；`docs/multi-window.md` §1.5 同步登记"订阅 + 有界重探 + 可见即重探"三条腿 |
 | 2026-09-16 | **机器人中间件第三轮：带宽观测 + 三个可跑用例 + 一份机型表（REQ-A273 → A277）** | 把"发了多少"补成"发了多快"并把它接到真实机器人：(a) **hz 报告带宽**（REQ-A273/A274）——`cli::bench` 的 `--hz` 现在每行除速率外还报该流测得的**实际带宽**（实测：LAN 1024 B × 200 Hz ⇒ ≈1.6 MiB/s；UDP LAN 缺失 ⇒ `—` 诚实占位，无伪造 0）；新 `bench.rs::bw_*` 4 个用例，含 `--features lan` 整跑通；§3.20 + README command table + CHANGELOG 三处登记。(b) **desktop view toggles + 顶栏下拉**（REQ-A275）——`desktopFeatures.ts`（74→77 行纯函数 `isDesktopViewAvailable/enterDesktopView/leaveDesktopView/desktopWindows`，白名单来源硬编码非 secret）+ `TopbarMainMenu.svelte` 5 个 dropdown（File/Edit/View/Window/Help，⌘N/O/S/W/Q/A/M/H 全部绑既有命令，**禁止重新发明快捷键**）；`DesktopStage` 多选 listbox（`Cmd-click` 增选、`Shift-click` 范围、`Cmd-A` 全选）+ ⌘W/⌘H/⌘M Dock 右键菜单语义。(c) **AmosError 边界统一**（REQ-A275）——新 `AmosError` 枚举（IPC 解码 → `Decode`/`NotFound`/`BackendDown`/`Permission`/`Unavailable`/`RateLimited`/`Internal`，**绝不裸 `String` 错误**）→ `ai_bridge` / `telephony` / `sms` / `radio` / `rag_client` 全面替换 `Result<_, String>` 为结构化变体；前端 `lib/backend` 镜像 `AmosError`（含可读 `displayMessage(i18n)`，缺 i18n key ⇒ 退回 `Internal` 而非暴露栈）。(d) **机器人三个用例**（REQ-A276）——`crates/amos-link/examples/{patrol_mission,remote_brain,fleet_console}.rs`（可跑示例：巡逻小车指令/状态、`remote_brain` 接管演示、车队中央面板）+ `Platform::REGISTRY` 入口 + **10 条**断言性属性（命名 `prop_<n>_<subject>`，放在 `tests/robot_cases.rs`，含**负控**：把 `cmd_to_dev` 替换为返回 `()` ⇒ 用例 FAIL，还原 ⇒ 绿）。(e) **一份机型表 + 六大机型**（REQ-A277）——`PlatformProfile`（quadruped / manipulator / drone / vehicle / vessel / cell）+ 引用型 `actuators/sensors/rate_guards/default_safety`、`Enable(0)` 历史怪癖在参考机型里逐字节保留（修了会破坏现有车队）→ `fmea-gen` +2 条模式 `F-LK-016`（profile 拒绝未上锁动作且自报解锁键）+ `F-LK-017`（参考四足机型与手写路径**字节恒等**），**71 modes → 73 modes**（`fmea-gen --check` 实测） | `cargo test --workspace` 全绿（`amos-link` **117 lib + 1 alloc + 4 e2e + 2 UDS**，**`--features lan` 120**，**`--features zenoh` 117 + 1 ignored**，`platform_cases` **13/13**）；`cargo test -p amos-tauri --lib` **398/398**（无业务逻辑改动 → 数字不变，是"未变"而非"未跑"）；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo fmt --all -- --check` 干净；`bun run test`（18 DOM 文件逐文件隔离）**1337 pass / 0 fail**；`node scripts/fmea-gen.mjs --check` **73 modes**；`scripts/{tauri-command-allowlist,untracked-allowlist}.json` 与 `CHANGELOG.md` / `docs/TRACEABILITY_MATRIX.md` / `docs/link.md` §3.20 + §7 一致 |
 | 2026-09-16 | **REQ-A279 收尾：lint 一致性 + 陈旧白名单 + FMEA 登记**（`0e5f88cf`） | 上方几轮（REQ-A275 typed errors + REQ-A277 platform profiles）落地后发现三件**收口**事项，本轮一并补完：(a) **`#[allow(clippy::assertions_on_constants)]` 风格统一** —— `amos-tauri/src/{ime,interpret,real_dial,telephony}.rs` 各一处常量守卫测试（E.164 ≥ 16 / pinyin ≥ 32 / call-id ≥ 64 B / 5 s mono 16 kHz > 上限）与 `amos-int/src/language.rs`（lang-tag cap ≥ 12）共 **5 处**标注——这些常量是**已文档化不变量**，不是要修的 bug，**保留运行时检查**而非重写为编译期常量；处置与 `display.rs:320` / `flashlight.rs:533` / `sensors.rs:386` 既有三处完全一致（"声明意图、不要消除运行时门"）。**(b) `wm_hide` 白名单已陈旧**：原 `scripts/tauri-command-allowlist.json` 把 `wm_hide` 标"无屏调它"作为豁免——但 `DockContextMenu.svelte`（REQ-A273 右键）、`DesktopShell.svelte` 系统快捷键 ⌘M/⌘H、Apple 菜单 "Hide" stub 三处**真实调用**它，豁免条目即删。(c) **FMEA 模式入册**：`docs/FMEA.md` + `scripts/fmea-gen.mjs` 新增 `F-LK-016`（profile 机型拒绝未上锁动作并自报解锁键——"不会自己动起来"）与 `F-LK-017`（参考四足机型 `Enable(0)` 字节恒等——"修了会破坏现有车队"），**71 → 73 modes**（`--check` 实测），严重度分布不变（S5=6 / S4=22 / S3=33 / S2=12）。**未改业务代码**：398 测试不变是"未变"而非"未跑"——`cargo test -p amos-tauri --lib` 仍 **398/398**。`scripts/untracked-allowlist.json` 登记两枚 `keydown-probe*.mjs` 复现脚本（happy-dom dispatch 探针，证据已落到 `svelte-tests/desktop-shell.svelte.test.ts`；happy-dom 事件契约稳定后删除）。 | `cargo test --workspace` 全绿；`cargo test -p amos-link --test platform_cases` **13/13**；`cargo test -p amos-tauri --lib` **398/398**；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo fmt --all -- --check` 干净；`bun run test`（18 DOM 文件逐文件隔离）**1337 pass / 0 fail**；`node scripts/fmea-gen.mjs --check` 实测 **73 failure modes documented and mitigations verified**；**负控**：删 `amos-blocklist` 的 deny 块 ⇒ 门 `EXIT=1` 并指名文件，还原 ⇒ 绿（既有 `scripts/rust-panic-scan.mjs` 复测） | `crates/amos-tauri/src/{ai_bridge,rag_client,ime,interpret,real_dial,radio,sms,telephony}.rs` + `amos-int/src/language.rs` + `scripts/{tauri-command-allowlist,untracked-allowlist}.json` + `docs/{FMEA,AEROSPACE_SOFTWARE_AUDIT,TRACEABILITY_MATRIX}.md` + `CHANGELOG.md` | `docs/AEROSPACE_SOFTWARE_AUDIT.md` §1 顶部计数待本轮 commit 后回填（calendar 期间未重新统计 `unwrap/expect`、`loop{}`、TS 单测与 catch 计数，已记入"持续维护"项；**workspace clippy 已 0 warning / 0 error** —— §1 旧审计的"≈230 panic 入口"在 P0-1 闭环后已非当前事实，建议下一轮一并回填） |
+| 2026-09-16 | **§1 计数回填（REQ-A282）**：把 §1 + §2 + §7 的旧审计数字换成 2026-09-16 实测 | §1 表格重写：Rust 代码 **145,115 行** / 43 workspace 成员；TS/Svelte **71,753 行**；生产 `unwrap/expect/panic/unreachable` **52**（远低于 P0-1 闭环前的 ≈230）；顶层 `loop {}` **94**（生产）；`#[test]` / `#[tokio::test]` **2,292**；`unsafe` **67**（全在 JNI/FFI/测试支撑，业务代码 0）；53 个 crate 根 deny（`scripts/rust-panic-scan.mjs` 守门）；`cargo clippy --workspace --all-targets -- -D warnings` **0 warning / 0 error**；TS 单测 **1,337 用例 / 19 文件** + svelte **928 用例 / 79 文件**；TS `src/lib` 覆盖 **91.60% ≥ 90%**；`catch` **223**（按 P1-2 已分类）；FMEA **77**（`S5=6 / S4=23 / S3=36 / S2=12`）。§2 同步：rule 1 → 304 生产 `.rs`，rule 2 → 94 长循环（不再写"16 处"），rule 7 → `AmosError` + 52 panic 入口；rule 9 → 2,292 + 1,337 + 928 用例。§7 verdict 数字同步；P0-1 整改栏数字同步。**不**改 §1 §2 §3 §4 §5 §6 §8 §9 的**判断与处置**——只改数字；任何数字变动都附"出处"栏命令。 | 上述每行数值均由命令当场实测；`node scripts/rust-panic-scan.mjs` ⇒ `OK — 53 crate root(s) across 43 workspace member(s)`；`cargo clippy --workspace --all-targets -- -D warnings` ⇒ clean；`cargo fmt --all -- --check` ⇒ clean；`node scripts/bun-iso-test.mjs test` ⇒ `1337 pass / 19 files`；`bun run test:svelte` ⇒ `928 passed (79)`；`bun run coverage:gate` ⇒ `91.60% ≥ 90%`；`node scripts/fmea-gen.mjs --check` ⇒ `77 failure modes` | `docs/AEROSPACE_SOFTWARE_AUDIT.md`（§1 / §2 / §7 / P0-1）+ `docs/TRACEABILITY_MATRIX.md`（本行）+ `CHANGELOG.md`（本行） | **未触动**：§3（DO-178C 对齐表）、§4（资源生命周期正面证据）、§5/§6（分级与路线图）、§8（本表）、§9（loop 终止性）——这些是判断与处置而非数字，回填后**结构不变**。**未触动诚实边界**：本表"出处"栏的命令在每台机器上**应该一致**（依赖脚本而非绝对路径），如读者用同命令得到不同结果请开 issue |
 
 
 
