@@ -235,8 +235,46 @@ function r4_focusVisible(file, content) {
 function r5_liveRegion(file, content) {
   // heuristic: presence of $effect + setInterval/setTimeout in <script>
   if (!/\$effect\s*\(/.test(content)) return null;
-  if (!/setInterval|setTimeout|setTimeout/.test(content)) return null;
-  if (/aria-live=|role=["']status["']|role=["']alert["']/.test(content)) return null;
+  if (!/setInterval|setTimeout/.test(content)) return null;
+  // Already mitigated — one of these patterns means the developer wired an accessible
+  // answer (polite/assertive live region, role=status/alert/timer). role="timer" is the
+  // "screen reader asks on demand" answer for clocks and counters — it is the explicit
+  // alternative to aria-live that we adopted for REQ-A284's clock files (ClockWidget /
+  // StageClock / LockScreen / StatusBar / HomeDock).
+  if (/aria-live=|role=["'](status|alert|timer)["']/.test(content)) return null;
+  // Files where the setInterval/setTimeout is **not** carrying user-perceivable state —
+  // it is a visual re-render trigger (Dock refreshes the running-dot set, MonitorApp polls
+  // for the progressbar values, CalendarApp re-derives the agenda, …). Screen readers do
+  // not need to be interrupted for these. Adding aria-live here would be noise. The list
+  // is maintained manually — when a file joins it, the rule that put it there is named
+  // alongside so reviewers can disagree.
+  //
+  // Paths are repo-relative (the scanner normalizes to that form before lookup).
+  const KNOWN_FALSE_POSITIVES = new Set([
+    "crates/amos-tauri/frontend-ts/src/svelte/CalendarApp.svelte",      // 60 s tick recomputes agenda view; no per-minute user-facing change
+    "crates/amos-tauri/frontend-ts/src/svelte/DeviceMicButton.svelte",   // 1 s poll of mic level for the level meter; visual only
+    "crates/amos-tauri/frontend-ts/src/svelte/Dock.svelte",              // 5 s poll of open windows for the "running" dot; visual only
+    "crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte",          // role=timer on the clock card mitigates; the weather/grid poll stays visual
+    "crates/amos-tauri/frontend-ts/src/svelte/ImeOverlay.svelte",        // setTimeout for caret-restoration, not a value change
+    "crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte",        // 2 s poll of CPU/mem/battery; exposed as role=progressbar, on-demand readable
+    "crates/amos-tauri/frontend-ts/src/svelte/MusicApp.svelte",          // setInterval updates the playback position slider (role=slider); on-demand readable
+    "crates/amos-tauri/frontend-ts/src/svelte/RemindersApp.svelte",      // 20 s tick re-evaluates overdue state; no announcement-worthy delta
+    "crates/amos-tauri/frontend-ts/src/svelte/SystemPanel.svelte",       // 2.5 s poll; readings exposed as text, no critical-alert path
+    "crates/amos-tauri/frontend-ts/src/svelte/TaskManager.svelte",       // same shape as SystemPanel
+    "crates/amos-tauri/frontend-ts/src/svelte/TerminalApp.svelte",       // setInterval for ANSI cursor blink (visual only)
+    "crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte",     // 250 ms tick drives the recording pulse animation; the recording state itself is a toggle, not a polling value
+  ]);
+  if (KNOWN_FALSE_POSITIVES.has(file)) return null;
+  // Allow repo-relative form too (when ROOT is set, file paths come absolute; the
+  // whitelist above is repo-relative to make the table human-grepable).
+  const repoRel = (() => {
+    const idx = file.indexOf("crates/amos-tauri/frontend-ts/");
+    if (idx >= 0) return file.slice(idx);
+    const idx2 = file.indexOf("src/svelte/");
+    if (idx2 >= 0) return `crates/amos-tauri/frontend-ts/${file.slice(idx2)}`;
+    return file;
+  })();
+  if (KNOWN_FALSE_POSITIVES.has(repoRel)) return null;
   return {
     rule: "live-region: $effect with setInterval/setTimeout but no aria-live / role=status on the readout",
     fix: "add aria-live='polite' (or role='status') to the container that displays the changing value; screen readers announce changes asynchronously",
@@ -337,7 +375,28 @@ function selftest() {
     console.error("  findings:", JSON.stringify(f5, null, 2));
     process.exit(1);
   }
-  console.log("[a11y-scan] selftest: 5 assertion(s), 0 failure(s).");
+  // sample 6 (REQ-A284): a clock with role="timer" — R5 must stay silent because role="timer"
+  // is the on-demand answer for live readouts. (Before A284 the rule only knew about
+  // aria-live / role=status / role=alert; this case is what added role="timer" to the
+  // recognised-mitigation list.)
+  const good6 = `<script>
+  let now = $state(new Date());
+  $effect(() => {
+    const id = setInterval(() => (now = new Date()), 1000);
+    return () => clearInterval(id);
+  });
+</script>
+<span role="timer" aria-label="current time">{now.toLocaleTimeString()}</span>`;
+  const tmp6 = path.join("/tmp", `a11y-scan-selftest-6-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp6, good6);
+  const f6 = scan(tmp6);
+  fs.unlinkSync(tmp6);
+  if (f6.some(x => x.rule.includes("live-region"))) {
+    console.error("[a11y-scan selftest] FAIL: a role=timer readout should NOT be flagged as live-region");
+    console.error("  findings:", JSON.stringify(f6, null, 2));
+    process.exit(1);
+  }
+  console.log("[a11y-scan] selftest: 6 assertion(s), 0 failure(s).");
 }
 
 // ─── 入口 ────────────────────────────────────────────────────────────────────

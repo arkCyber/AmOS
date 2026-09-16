@@ -154,7 +154,10 @@
 </script>
 
 <div class="relative flex items-center justify-between px-4 pb-1 pt-3 text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-  <span class="tabular-nums">{fmtClock(now)}</span>
+  <!-- role="timer": the visible time is the value; aria-label names it for on-demand query.
+       No aria-live: the chrome bar already broadcasts at most once a minute via the network/battery
+       span below, which is what the screen reader user actually wants to hear. (REQ-A284) -->
+  <span class="tabular-nums" role="timer" aria-label={t("a11y.currentTime")}>{fmtClock(now)}</span>
   <!-- Dynamic Island: iPhone hardware (a screen cutout), so it is drawn only for the
        class that has it. In a macOS window it was an invented black pill. -->
   {#if chrome.dynamicIsland}

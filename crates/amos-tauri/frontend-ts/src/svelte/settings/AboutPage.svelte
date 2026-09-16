@@ -80,7 +80,11 @@
 </script>
 
 <div class="space-y-5">
-  <section class={GROUP}>
+  <!-- systemStatus aria-label: the live-status section's accessible name — a screen
+       reader that lands on any row in this <section> hears "System status" before the
+       row label, so the live readings are situated in their containing region rather
+       than reading as bare "Battery 67%". (REQ-A284) -->
+  <section class={GROUP} aria-label={t("a11y.systemStatus")}>
     <div class={ROW}>
       <span class={LABEL}>{t("settings.aboutDevice")}</span>
       <span class={VALUE}>{AMOS_DEVICE_LABEL}</span>
@@ -95,16 +99,31 @@
     </div>
     <div class={ROW} data-testid="about-battery">
       <span class={LABEL}>{t("settings.aboutBattery")}</span>
-      <span class={VALUE}>{batteryLabel}</span>
+      <!-- aria-live="polite" + aria-atomic="true": the visible label and the changing
+           percentage both go to assistive tech as one utterance ("Battery 67%"). The
+           label is duplicated in the aria text on purpose — when the user lands on this
+           row they hear WHAT is changing and TO WHAT, not just the new number. (REQ-A284) -->
+      <span class={VALUE} aria-live="polite" aria-atomic="true">
+        <span class="sr-only">{t("settings.aboutBattery")}: </span>{batteryLabel}
+      </span>
     </div>
     {#if probeStamp}
       <div class="px-4 pb-3" data-testid="about-probe">
-        <p class={HINT}>{t("settings.aboutProbe", { time: probeStamp })}</p>
+        <!-- sr-only probeLabel: a screen-reader user who tabs onto the live timestamp hears
+             "Last updated: 14:32:07" — without the prefix the bare time reads as a number
+             out of context. (REQ-A284) -->
+        <p class={HINT} aria-live="polite">
+          <span class="sr-only">{t("a11y.probeLabel")}: </span>{t("settings.aboutProbe", { time: probeStamp })}
+        </p>
       </div>
     {/if}
     <div class={ROW} data-testid="about-cellular">
       <span class={LABEL}>{t("settings.aboutCellular")}</span>
-      <span class={VALUE}>{cellularValue}</span>
+      <!-- Same polite live-region pattern: cellular signal can shift edge/4G/5G; the
+           visible label + the new state announce together. (REQ-A284) -->
+      <span class={VALUE} aria-live="polite" aria-atomic="true">
+        <span class="sr-only">{t("settings.aboutCellular")}: </span>{cellularValue}
+      </span>
     </div>
   </section>
   {#if !connected}

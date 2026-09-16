@@ -12,6 +12,8 @@
    * the OS/browser locale, which is the macOS behaviour (the menu bar's clock is
    * localised by the system, not by the app).
    */
+  import { t } from "../locale.svelte";
+
   let now = $state(new Date());
   $effect(() => {
     const id = setInterval(() => (now = new Date()), 1000);
@@ -30,10 +32,17 @@
   );
 </script>
 
+<!--
+  role="timer" — the value (clockLabel / dayLabel) is queried on demand by screen
+  readers; aria-label="Current time" is the descriptive name. No aria-live: a clock
+  that interrupts every second is hostile. (REQ-A284)
+-->
 <div
   class="pointer-events-none absolute right-6 top-6 text-right"
   style="text-shadow: 0 2px 12px rgba(0,0,0,0.5);"
   data-testid="stage-clock"
+  role="timer"
+  aria-label={t("a11y.currentTime")}
 >
   <div class="text-[64px] font-thin leading-none text-white" style="font-variant-numeric: tabular-nums;">
     {clockLabel}

@@ -125,6 +125,10 @@
 </script>
 
 {#if banner}
+  <!-- role="alert" makes the wrapper a live region (aria-live=assertive + aria-atomic=true):
+       a notification arriving is the canonical "interrupt me" event — a polite nudge would
+       be lost while the user is focused on a typing task. (REQ-A284) -->
+  <div role="alert" class="contents">
   <button
     onclick={ack}
     aria-label="notification: acknowledge"
@@ -148,4 +152,5 @@
     </span>
     <span aria-hidden="true" class="opacity-50">✓</span>
   </button>
+  </div>
 {/if}

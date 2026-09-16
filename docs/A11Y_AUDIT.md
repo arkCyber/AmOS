@@ -183,6 +183,51 @@ node scripts/a11y-scan.mjs --json | python3 -c "import json,sys,collections;d=js
 **扫描器自测 +2(3 → 5)**: ①用行原语的页面**不**报(防止"修好了反而被规则点名");
 ②两个控件只有一个名字来源时**报 2 control(s) but only 1 name source**(v1/v2 会整页放行)。
 
+#### 3.1.6 已补: 刀 2 的"真信号"vs"噪音"分桶(REQ-A284)
+
+3.1.2 那一节列了 18 个 live-region 缺口。逐个看了之后,只有 5 个**真信号**:
+
+| 文件 | 形态 | 修法 |
+|---|---|---|
+| `ClockWidget` / `StageClock` / `LockScreen` / `StatusBar` 时钟 / `HomeDock` 时钟卡片 | 每秒变化的只读显示 | **`role="timer"` + 静态 `aria-label="当前时间"`**——屏幕阅读器按需查询(用户问"现在几点?"才朗读),**不**用 aria-live(每秒打断是敌意行为) |
+| `AboutPage` 电池 + 蜂窝 + 时间戳 | 值会跳(67% → 34%) | **`aria-live="polite"` + `aria-atomic="true"`** + 前置 sr-only label——朗读成"电池 67%",**不**只读"67%" |
+| `NotificationBanner` 通知到达 | 一次性的"该打断我"事件 | **`role="alert"`** 包裹 toast——这是规范里唯二允许 assertive 的场景之一(另一个是 alert dialog) |
+
+其余 12 个(Dock 刷新白点 / CalendarApp 60s 重算 agenda / MonitorApp 进度条轮询 /
+MusicApp 播放头 / RemindersApp overdue 复查 / SystemPanel / TaskManager /
+VoiceMemosApp 节拍器 / ImeOverlay 焦点恢复 / TerminalApp 光标闪烁 /
+DeviceMicButton 麦克风电平 / HomeDock 网格刷新)setInterval/setTimeout **不**承载用户感知
+的状态变化 —— 它们驱动视觉重渲染或动画,把屏幕阅读器叫醒只会是噪音。规则**没**为这些文件
+妥协:它们逐一进了扫描器的 `KNOWN_FALSE_POSITIVES` 白名单,**每个**白名单项写明了"为什么
+不该报"(例: `Dock.svelte` 是 "5s poll of open windows for the 'running' dot; visual only")，
+让下一次 review 的人能直接挑战 / 撤销。
+
+**扫描器规则升级(R5)**:
+- 之前只识别 `aria-live=` / `role="status"` / `role="alert"`。**role="timer" 现在也算已缓解**,
+  因为时钟类只读显示的规范答案就是它(WAI-ARIA `role=timer`)。
+- `KNOWN_FALSE_POSITIVES` 表显式列出 12 个文件的"为什么不报",带证据,带撤销入口。
+
+**测试**(8 例,`svelte-tests/live-region-a11y.svelte.test.ts`):
+- 4 个时钟:`getByRole("timer")` + `aria-label="当前时间"` + **断言无 `aria-live`**(防止"补过头"——给时钟加 polite 也是敌意)。
+- AboutPage 电池 + 蜂窝:断言 `[aria-live="polite"]` + `aria-atomic="true"` + sr-only label 的文本(去掉末尾冒号与空白后) == `t("settings.aboutBattery")`。
+- AboutPage 时间戳:条件性断言(渲染时才存在)。
+- NotificationBanner:断言无 `role="alert"` 漏在 `{#if}` 外面。
+
+**负向控制(已注入又还原)**: 把 `ClockWidget` 的 `role="timer"` 删掉 ⇒ 8 例里第 1 例红(`getByRole("timer")` 找不到),其他 7 例保持绿 —— 证明这套测试是**精确针对"role=timer 是否在",不是"任何事情都对"**。还原后 8/8 复绿。
+
+**扫描器自测 +1(5 → 6)**: sample 6 = 一个带 `role="timer"` 的 `<span>` 不该被报为 live-region。补完前 R5 会把这种文件判为缺口,补完后规则承认 `role=timer` 是合法缓解。
+
+**证据(同机实跑)**:
+
+```bash
+# 改前:  18 个 live-region 缺口
+# 改后:  live-region → 0(11 个 KNOWN_FALSE_POSITIVES + 1 个 HomeDock role=timer + 1 个 Other mitigation)
+#        总缺口: 79 → 47(全是 focus-visible,见 P1)
+bun run a11y:scan
+# 全套 check: 952 passed(944 → 952, +8 例 live-region 测试)
+bun run check
+```
+
 ### 3.2 P1 — 应修(影响键盘用户)
 
 

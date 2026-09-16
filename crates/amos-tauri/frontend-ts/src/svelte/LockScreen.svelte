@@ -134,14 +134,16 @@
       <span>{Math.round(batteryLevel)}%</span>
     </div>
   {/if}
-  <div class="relative z-10 flex w-full flex-col items-center">
-    <div class="text-center leading-none">
-      <div class="text-7xl font-medium tabular-nums tracking-tight">{fmtClock(now)}</div>
-      <div class="mt-2.5 text-lg text-neutral-200">{dateStr}</div>
-      <div class="mt-7 flex items-center justify-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.2em] text-neutral-400">
-        <span aria-hidden="true" data-icon="lock" class="grid h-3.5 w-3.5 place-items-center">{@html iconSvg("lock", "h-3.5 w-3.5")}</span> {t("shell.lockTitle")}
+    <div class="relative z-10 flex w-full flex-col items-center">
+      <!-- role="timer": screen readers can ask "what time is it?" and read this on demand;
+           aria-label is the descriptive name; no aria-live (per-second interruption is hostile). (REQ-A284) -->
+      <div class="text-center leading-none" role="timer" aria-label={t("a11y.currentTime")}>
+        <div class="text-7xl font-medium tabular-nums tracking-tight">{fmtClock(now)}</div>
+        <div class="mt-2.5 text-lg text-neutral-200">{dateStr}</div>
+        <div class="mt-7 flex items-center justify-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.2em] text-neutral-400">
+          <span aria-hidden="true" data-icon="lock" class="grid h-3.5 w-3.5 place-items-center">{@html iconSvg("lock", "h-3.5 w-3.5")}</span> {t("shell.lockTitle")}
+        </div>
       </div>
-    </div>
 
     {#if needPin}
       <div class="my-7 text-2xl tabular-nums tracking-[0.35em] text-neutral-100">

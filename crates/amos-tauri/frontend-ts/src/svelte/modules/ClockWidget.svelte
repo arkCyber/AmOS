@@ -10,6 +10,7 @@
    */
   import { fmtClock } from "../../lib/time";
   import { CHROME_READOUT, CHROME_READOUT_MIN_WIDTH, CHROME_TEXT_SHADOW } from "../../lib/shellChrome";
+  import { t } from "../locale.svelte";
 
   let now = $state(new Date());
   $effect(() => {
@@ -18,8 +19,17 @@
   });
 </script>
 
+<!--
+  role="timer" tells assistive tech this is a live readout it can query on demand;
+  the *visible* text is the value (current time), and the static aria-label is the
+  descriptive name ("Current time") a screen reader uses when the user asks
+  "what time is it?". We deliberately do NOT use aria-live — a clock that interrupts
+  the screen reader every second is hostile. (REQ-A284)
+-->
 <span
   data-testid="chrome-clock"
+  role="timer"
+  aria-label={t("a11y.currentTime")}
   class={CHROME_READOUT}
   style="text-shadow: {CHROME_TEXT_SHADOW}; min-width: {CHROME_READOUT_MIN_WIDTH}; text-align: center;"
 >{fmtClock(now)}</span>

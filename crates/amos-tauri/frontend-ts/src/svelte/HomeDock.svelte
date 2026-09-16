@@ -344,9 +344,10 @@
         <button
           class="flex flex-col justify-center rounded-3xl bg-white/40 p-4 text-left shadow-sm ring-1 ring-black/5 backdrop-blur-md transition active:scale-95 dark:bg-white/10 dark:ring-white/10"
           onclick={() => home.emit("open", "clock")}
+          aria-label={`${t("a11y.currentTime")} · ${fmtClock(now)}`}
         >
-          <div class="text-4xl font-medium leading-none tabular-nums text-neutral-900 dark:text-white">{fmtClock(now)}</div>
-          <div class="mt-2 text-xs text-neutral-600/90 dark:text-neutral-300/90">{dateStr}</div>
+          <div class="text-4xl font-medium leading-none tabular-nums text-neutral-900 dark:text-white" aria-hidden="true">{fmtClock(now)}</div>
+          <div class="mt-2 text-xs text-neutral-600/90 dark:text-neutral-300/90" aria-hidden="true">{dateStr}</div>
         </button>
 {#if today}
           <button
