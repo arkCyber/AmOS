@@ -1480,7 +1480,6 @@ export const zh = {
   "desktop.apple.lockScreen": "锁定屏幕",
   "desktop.apple.restart": "重新启动…（尚未接入：需要宿主的电源/会话命令）",
   "desktop.apple.shutDown": "关机…（尚未接入：需要宿主的电源/会话命令）",
-  "desktop.menuUnavailable": "应用菜单尚未接入：需要 per-app 菜单模型",
   "desktop.mainMenu": "应用菜单",
   "desktop.menu.file": "文件",
   "desktop.menu.edit": "编辑",

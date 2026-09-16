@@ -30,11 +30,12 @@
  *     by an empty handler in this file (a wire to nowhere) and is a greyed menu row now.
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { fireEvent, render } from "@testing-library/svelte";
+import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import DesktopShell from "../src/svelte/DesktopShell.svelte";
 import Dock from "../src/svelte/Dock.svelte";
-import { LAYOUT_KEY, writeStoreValue } from "../src/lib/amosStore";
+import { LAYOUT_KEY, readStoreValue, writeStoreValue } from "../src/lib/amosStore";
+import { DEFAULT_DESKTOP_VIEW, type DesktopView } from "../src/lib/desktopView";
 import { DOCK_MIN_WIDTH, SPOTLIGHT_HEIGHT, SPOTLIGHT_WIDTH,
   DESKTOP_GRID_COLS,
   DESKTOP_GRID_INSET,
@@ -85,6 +86,28 @@ function installHost({ windows = [] as unknown[], commands = [] as string[] } = 
   return commands;
 }
 
+/** Variant for the REQ-A275 menu tests: every `wm_open(label)` call is recorded
+ * on `window.__wmOpens` so a test can assert "File → New Window invoked the host
+ * with `label: 'files'`" without parsing `__lastCall` (which is also written). */
+function installHostWithRecorder() {
+  (window as unknown as Record<string, unknown>).__wmOpens = [] as string[];
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+    invoke: async (cmd: string, args?: unknown) => {
+      if (cmd === "wm_open") {
+        const label = (args as { label?: string } | undefined)?.label;
+        if (typeof label === "string") {
+          ((window as unknown as { __wmOpens: string[] }).__wmOpens).push(label);
+        }
+        (window as unknown as Record<string, unknown>).__lastCall = { cmd, args };
+      }
+      if (cmd === "wm_layout_snapshot") return DESKTOP_SNAPSHOT;
+      if (cmd === "wm_windows") return { windows: [] };
+      return null;
+    },
+    listen: async () => () => {},
+  };
+}
+
 function press(key: string, mods: { metaKey?: boolean } = {}) {
   window.dispatchEvent(new KeyboardEvent("keydown", { key, ...mods }));
 }
@@ -92,10 +115,12 @@ function press(key: string, mods: { metaKey?: boolean } = {}) {
 beforeEach(() => window.localStorage.clear());
 
 afterEach(() => {
+  cleanup();
   window.localStorage.clear();
   vi.restoreAllMocks();
   delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   delete (window as unknown as { __lastCall?: unknown }).__lastCall;
+  delete (window as unknown as { __wmOpens?: unknown }).__wmOpens;
 });
 
 
@@ -798,6 +823,84 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     } finally {
       delete (window as { __amosDisabledFeatures?: string[] }).__amosDisabledFeatures;
     }
+  });
+
+  // ─── REQ-A275 — topbar File / Edit / View / Window / Help dropdowns ────────
+  test("topbar View → Toggle Wallpaper hides the Backdrop without touching the icons grid (REQ-A275)", async () => {
+    installHost();
+    writeStoreValue("amos.settings.view", {
+      showWallpaper: true,
+      showIcons: true,
+      showStageWidgets: true,
+    });
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="stage-backdrop"]')).toBeTruthy();
+    const viewTrigger = container.querySelector<HTMLButtonElement>(
+      '[data-testid="menu-view-trigger"]',
+    )!;
+    await fireEvent.click(viewTrigger);
+    await tick();
+    const panel = container.querySelector('[data-testid="menu-view-panel"]');
+    expect(panel).toBeTruthy();
+    const toggleRow = panel!.querySelector<HTMLButtonElement>(
+      '[data-testid="menu-view-view.toggle-wallpaper"]',
+    )!;
+    await fireEvent.click(toggleRow);
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="stage-backdrop"]')).toBeNull();
+    expect(container.querySelector('[data-testid="desktop-icon-grid"]')).toBeTruthy();
+    const v = readStoreValue<DesktopView>("amos.settings.view", DEFAULT_DESKTOP_VIEW);
+    expect(v.showWallpaper).toBe(false);
+  });
+
+  test("topbar View → Toggle Icons removes the desktop icon grid (REQ-A275)", async () => {
+    installHost();
+    writeStoreValue("amos.settings.view", {
+      showWallpaper: true,
+      showIcons: true,
+      showStageWidgets: true,
+    });
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="desktop-icon-grid"]')).toBeTruthy();
+    const viewTrigger = container.querySelector<HTMLButtonElement>(
+      '[data-testid="menu-view-trigger"]',
+    )!;
+    await fireEvent.click(viewTrigger);
+    await tick();
+    const toggleRow = container.querySelector<HTMLButtonElement>(
+      '[data-testid="menu-view-view.toggle-icons"]',
+    )!;
+    await fireEvent.click(toggleRow);
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="desktop-icon-grid"]')).toBeNull();
+    const v = readStoreValue<DesktopView>("amos.settings.view", DEFAULT_DESKTOP_VIEW);
+    expect(v.showIcons).toBe(false);
+  });
+
+  test("topbar File → New Window fires wm_open('files') (REQ-A275)", async () => {
+    installHostWithRecorder();
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+    const fileTrigger = container.querySelector<HTMLButtonElement>(
+      '[data-testid="menu-file-trigger"]',
+    )!;
+    await fireEvent.click(fileTrigger);
+    await tick();
+    const row = container.querySelector<HTMLButtonElement>(
+      '[data-testid="menu-file-file.new-window"]',
+    )!;
+    await fireEvent.click(row);
+    await tick();
+    await settle();
+    const opens = (window as unknown as { __wmOpens: string[] }).__wmOpens;
+    expect(opens).toContain("files");
   });
 });
 

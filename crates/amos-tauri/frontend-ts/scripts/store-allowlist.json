@@ -10,6 +10,7 @@
     { "key": "amos-ui.theme", "kind": "configuration" },
     { "key": "amos-ui.ime", "kind": "configuration" },
     { "key": "amos.settings", "kind": "configuration" },
+    { "key": "amos.settings.view", "kind": "configuration" },
     { "key": "amos.home.layout", "kind": "configuration" },
     { "key": "amos.appLibrary.groups", "kind": "configuration" },
     { "key": "amos.displayAutoOffSec", "kind": "configuration" },

@@ -170,14 +170,31 @@ describe("chrome widgets (mounted alone)", () => {
     expect(name.textContent?.trim()).toBeTruthy();
   });
 
-  test("the five app menus are disabled, and their names carry the reason", async () => {
+  test("the bar has 5 enabled menu triggers (REQ-A275)", async () => {
     const { container } = render(TopbarMainMenu);
     await tick();
     const buttons = [...container.querySelectorAll("button")];
     expect(buttons.length).toBe(5);
     for (const b of buttons) {
-      expect((b as HTMLButtonElement).disabled).toBe(true);
-      expect(b.getAttribute("aria-label")).toContain(zh["desktop.menuUnavailable"]);
+      expect((b as HTMLButtonElement).disabled).toBe(false);
+      expect(b.getAttribute("aria-haspopup")).toBe("menu");
+    }
+  });
+
+  test("Help menu is wholly F-SH-001 honest UI (every row disabled and named)", async () => {
+    const { container } = render(TopbarMainMenu);
+    await tick();
+    const help = container.querySelector<HTMLElement>('[data-testid="menu-help-trigger"]')!;
+    await fireEvent.click(help);
+    await tick();
+    const panel = container.querySelector('[data-testid="menu-help-panel"]');
+    expect(panel).toBeTruthy();
+    const rows = [...panel!.querySelectorAll<HTMLButtonElement>("[role=menuitem]")];
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) {
+      expect(r.disabled).toBe(true);
+      expect(r.getAttribute("aria-disabled")).toBe("true");
+      expect((r.textContent ?? "").trim().length).toBeGreaterThan(0);
     }
   });
 

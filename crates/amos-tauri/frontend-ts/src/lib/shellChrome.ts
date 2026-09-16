@@ -150,6 +150,16 @@ export const DESKTOP_ICON_SELECTED =
   "outline outline-2 outline-offset-2 outline-blue-400/90 rounded-[24px]";
 
 /**
+ * Keyboard-focus ring on a desktop icon (REQ-A273 — WAI-ARIA Active Descendant).
+ * Distinct from `DESKTOP_ICON_SELECTED` (blue outline) so a user navigating with
+ * the keyboard can see *which* icon the listbox's focus is on, even when it
+ * matches the selection. White-with-translucency matches the topbar focus ring
+ * so a sighted user sees one consistent focus vocabulary across the chrome.
+ */
+export const DESKTOP_ICON_FOCUSED =
+  "outline outline-2 outline-offset-2 outline-white/80 rounded-[24px]";
+
+/**
  * The drag-rectangle that appears while the user is rubber-band-selecting icons on the
  * desktop (mouse-down on the stage backdrop → drag → mouse-up). macOS draws this as a
  * translucent blue rectangle with a hairline border, and only while the drag is live;

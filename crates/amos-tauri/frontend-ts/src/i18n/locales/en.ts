@@ -1483,7 +1483,6 @@ export const en: Record<MessageKey, string> = {
   "desktop.apple.lockScreen": "Lock Screen",
   "desktop.apple.restart": "Restart… (not wired up: needs a host power/session command)",
   "desktop.apple.shutDown": "Shut Down… (not wired up: needs a host power/session command)",
-  "desktop.menuUnavailable": "App menus are not wired up yet: they need a per-app menu model",
   "desktop.mainMenu": "App menu",
   "desktop.menu.file": "File",
   "desktop.menu.edit": "Edit",

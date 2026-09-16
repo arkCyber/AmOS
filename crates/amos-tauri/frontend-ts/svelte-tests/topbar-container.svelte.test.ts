@@ -87,25 +87,46 @@ describe("TopBar as a chrome container", () => {
     expect(name()).toBe("Files");
   });
 
-  test("the five app menus are disabled and named with the reason (no inert buttons)", async () => {
+  test("the five app menus are enabled triggers that open a real dropdown (REQ-A275)", async () => {
+    // REQ-A275 turned the bar from "5 inert buttons" into "5 enabled triggers that
+    // open dropdowns". Each dropdown contains a mix of live rows (wired to the host)
+    // and F-SH-001 honest rows (visible, disabled, named with the reason). The
+    // invariant we pin here: **all 5 triggers open a panel** and **at least one row
+    // per panel is disabled + named** (so the F-SH-001 discipline is still in force).
     const host = render(TopBar);
     await tick();
     const nav = host.container.querySelector('[data-testid="menu-main"]')!;
-    const buttons = [...nav.querySelectorAll("button")];
-    expect(buttons.map((b) => b.textContent?.trim())).toEqual([
+    const triggers = [...nav.querySelectorAll("button")];
+    expect(triggers.map((b) => b.textContent?.trim())).toEqual([
       zh["desktop.menu.file"],
       zh["desktop.menu.edit"],
       zh["desktop.menu.view"],
       zh["desktop.menu.window"],
       zh["desktop.menu.help"],
     ]);
-    for (const b of buttons) {
-      expect((b as HTMLButtonElement).disabled).toBe(true);
-      expect(b.getAttribute("aria-disabled")).toBe("true");
-      // A disabled control whose name is just "文件" explains nothing: the name carries
-      // the reason, which is the only useful information here.
-      expect(b.getAttribute("aria-label")).toContain(zh["desktop.menuUnavailable"]);
-      expect(b.getAttribute("title")).toBe(zh["desktop.menuUnavailable"]);
+    for (const t of triggers) {
+      expect((t as HTMLButtonElement).disabled).toBe(false);
+      expect(t.getAttribute("aria-haspopup")).toBe("menu");
+    }
+    const groups = ["file", "edit", "view", "window", "help"] as const;
+    for (const id of groups) {
+      const trigger = host.container.querySelector<HTMLElement>(
+        `[data-testid="menu-${id}-trigger"]`,
+      )!;
+      await fireEvent.click(trigger);
+      await tick();
+      const panel = host.container.querySelector(`[data-testid="menu-${id}-panel"]`);
+      expect(panel, `the ${id} menu must open`).toBeTruthy();
+      const rows = [...panel!.querySelectorAll<HTMLButtonElement>("[role=menuitem]")];
+      expect(rows.length).toBeGreaterThan(0);
+      const disabledRows = rows.filter((r) => r.disabled);
+      expect(disabledRows.length, `${id} must have at least one F-SH-001 honest row`)
+        .toBeGreaterThan(0);
+      const first = disabledRows[0]!;
+      expect(first.getAttribute("aria-disabled")).toBe("true");
+      expect(first.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+      await fireEvent.click(trigger);
+      await tick();
     }
   });
 });

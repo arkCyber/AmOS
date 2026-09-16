@@ -58,8 +58,10 @@
     CHROME_MENU_PANEL_STYLE,
     CHROME_MENU_SEPARATOR,
     DESKTOP_ICON_SELECTED,
+    DESKTOP_ICON_FOCUSED,
     DESKTOP_SELECTION_RECT,
   } from "../lib/shellChrome";
+  import { DESKTOP_VIEW_KEY, DEFAULT_DESKTOP_VIEW, type DesktopView } from "../lib/desktopView";
   import Backdrop from "./Backdrop.svelte";
   import AppIcon from "./AppIcon.svelte";
 
@@ -82,6 +84,26 @@
   const DESKTOP_ICON_LIMIT = desktopIconCapacity();
   const desktopIcons = $derived(withoutPhone(layout.page).slice(0, DESKTOP_ICON_LIMIT));
 
+  // ─── View toggles (REQ-A275) ──────────────────────────────────────────────────
+  // The View menu writes `amos.settings.view`; this component reads the same key
+  // and hides the icon grid when the user has toggled icons off. Backdrop is
+  // a separate component that subscribes to the same key (Backdrop owns its own
+  // subscription; we deliberately don't pass a prop so the two surfaces stay
+  // decoupled — neither one needs the other to render). Stage widgets are
+  // filtered here because the iteration lives in this template.
+  const viewStore = createStoreValue<DesktopView>(
+    DESKTOP_VIEW_KEY,
+    DEFAULT_DESKTOP_VIEW,
+  );
+  let view = $state<DesktopView>(DEFAULT_DESKTOP_VIEW);
+  $effect(() => {
+    const un = viewStore.subscribe((v) => (view = v ?? DEFAULT_DESKTOP_VIEW));
+    return un;
+  });
+  const visibleStageModules = $derived(
+    view.showStageWidgets ? stageModules : [],
+  );
+
   // ─── 多选（rubber-band + 单击切换 + 双击打开 + 拖动移动）──────────────────
   //
   // 选区只追踪 id 集合（**id 是唯一稳定键**：图标 DOM 节点会随父级重渲染而被换掉，
@@ -91,6 +113,12 @@
   //   - 「打开启动台」是真实的——经壳的把手
   // 做不到的（比如「移到废纸篓」）这一版就不列。
   let selectedIds = $state<Set<string>>(new Set());
+  /** The icon that was last clicked without a modifier — the **anchor** for ⇧-click
+   * range selection (REQ-A273, macOS semantic). A range click does not move the
+   * anchor; only plain and ⌘-click do. */
+  let anchorId = $state<string | null>(null);
+  /** The icon that is currently the listbox's keyboard focus (REQ-A273). */
+  let focusedId = $state<string | null>(null);
   /** Whether the click that just landed should toggle (vs replace) — macOS: ⌘-click adds
    * to selection; we don't bind ⌘ here, so every click REPLACES selection. Documented
    * honestly: no "extend" / "toggle" shortcut is wired up, and Shift-click is also
@@ -128,11 +156,22 @@
    * and are not advertised). */
   function onIconClick(id: string, e: MouseEvent) {
     e.stopPropagation();
-    // A `click` that follows a successful drag should NOT also re-write selection —
-    // without this guard the user would drag an icon to a new spot, release the
-    // mouse, and find the selection has snapped back to the icon under the cursor.
     if (dragJustEnded) return;
-    selectedIds = new Set([id]);
+    if (e.shiftKey && anchorId !== null) {
+      selectedIds = new Set(unionRange(anchorId, id));
+      focusedId = id;
+    } else if (e.metaKey || e.ctrlKey) {
+      const next = new Set(selectedIds);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      selectedIds = next;
+      anchorId = id;
+      focusedId = id;
+    } else {
+      selectedIds = new Set([id]);
+      anchorId = id;
+      focusedId = id;
+    }
   }
 
   function onIconDoubleClick(id: string, e: MouseEvent) {
@@ -320,10 +359,131 @@
   /** Keyboard: Esc clears selection; everything else stays where it is (no Shift/Cmd
    * toggles wired up — declared honestly above). */
   function onWindowKeyDown(e: KeyboardEvent) {
-    if (e.key === "Escape" && selectedIds.size > 0) {
+    if (isEditableTarget(e.target)) return;
+    const meta = e.metaKey || e.ctrlKey;
+    if (e.key === "Escape" && (selectedIds.size > 0 || focusedId !== null)) {
       selectedIds = new Set();
+      anchorId = null;
+      focusedId = null;
       e.stopPropagation();
+      return;
     }
+    if (meta && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "a") {
+      selectedIds = new Set(desktopIcons);
+      anchorId = desktopIcons[desktopIcons.length - 1] ?? null;
+      focusedId = anchorId;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (!meta && !e.altKey) {
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+        if (e.shiftKey) {
+          if (focusedId !== null && anchorId !== null) {
+            const next = nextFocus(focusedId, 1);
+            if (next !== null) {
+              focusedId = next;
+              selectedIds = new Set(unionRange(anchorId, next));
+            }
+          }
+        } else {
+          stepFocus(1);
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+        if (e.shiftKey) {
+          if (focusedId !== null && anchorId !== null) {
+            const next = nextFocus(focusedId, -1);
+            if (next !== null) {
+              focusedId = next;
+              selectedIds = new Set(unionRange(anchorId, next));
+            }
+          }
+        } else {
+          stepFocus(-1);
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (e.key === "Home") {
+        stepFocus("home");
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (e.key === "End") {
+        stepFocus("end");
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (e.key === "Enter" || e.key === " ") {
+        const t = e.target as Element | null;
+        if (e.key === " " && t && (t.tagName === "BUTTON" || t.tagName === "INPUT")) {
+          return;
+        }
+        if (selectedIds.size > 0) {
+          for (const id of selectedIds) {
+            void invoke("wm_open", { label: id });
+          }
+          selectedIds = new Set();
+          anchorId = null;
+          focusedId = null;
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }
+    }
+  }
+
+  /** True if the event target is an editable element — input / textarea /
+   * contenteditable. The keyboard handler must skip when the user is typing. */
+  function isEditableTarget(t: EventTarget | null): boolean {
+    if (!t || !(t instanceof HTMLElement)) return false;
+    const tag = t.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (t.isContentEditable) return true;
+    return false;
+  }
+
+  /** Union of every id strictly between `a` and `b` (both inclusive), in the
+   * current `desktopIcons` order. */
+  function unionRange(a: string, b: string): string[] {
+    const i = desktopIcons.indexOf(a);
+    const j = desktopIcons.indexOf(b);
+    if (i < 0 || j < 0) {
+      const probe = [...selectedIds, a, b];
+      return probe.filter((x, k, arr) => arr.indexOf(x) === k);
+    }
+    const [lo, hi] = i < j ? [i, j] : [j, i];
+    return desktopIcons.slice(lo, hi + 1);
+  }
+
+  /** Move `focusedId` along `desktopIcons` by `delta`. */
+  function stepFocus(delta: 1 | -1 | "home" | "end"): void {
+    if (desktopIcons.length === 0) return;
+    const idx = focusedId ? desktopIcons.indexOf(focusedId) : -1;
+    let next: number;
+    if (delta === "home") next = 0;
+    else if (delta === "end") next = desktopIcons.length - 1;
+    else if (idx < 0) next = delta === 1 ? 0 : desktopIcons.length - 1;
+    else next = Math.max(0, Math.min(desktopIcons.length - 1, idx + delta));
+    const newId = desktopIcons[next]!;
+    focusedId = newId;
+    anchorId = newId;
+  }
+
+  /** Compute the next focusable id after `from` by `delta` slots. */
+  function nextFocus(from: string, delta: 1 | -1): string | null {
+    const i = desktopIcons.indexOf(from);
+    if (i < 0) return null;
+    const j = i + delta;
+    if (j < 0 || j >= desktopIcons.length) return null;
+    return desktopIcons[j]!;
   }
 
   onMount(() => {
@@ -453,14 +613,17 @@
   <Backdrop />
 
   <!-- stage 槽位：注册表里的挂件（顺序见 shellModules.ts；此处只是槽位） -->
-  {#each stageModules as mod (mod.id)}
+  {#each visibleStageModules as mod (mod.id)}
     {@const Widget = mod.component}
     <Widget />
   {/each}
 
   <!-- 桌面图标网格：列/行/间距/内缩全部来自 lib/desktopLayout.ts（数值与改造前一致）。
        `role="listbox"` + 每张图标 `role="option"` + `aria-selected` 与原生 listbox 一致：
-       读屏用户拿到的是"桌面有 N 个图标、其中 K 个已选"的真实模型。 -->
+       读屏用户拿到的是"桌面有 N 个图标、其中 K 个已选"的真实模型。
+       REQ-A275: `view.showIcons = false` ⇒ listbox 不渲染(右键菜单里的 "Open the N selected" 也自动空,
+       因为没有 icon 可作用于；与"诚实 UI" 一致 —— 不假装有一个看不见的桌面)。 -->
+  {#if view.showIcons}
   <div
     class="absolute grid"
     style="
@@ -473,14 +636,18 @@
     "
     data-testid="desktop-icon-grid"
     role="listbox"
+    tabindex="0"
     aria-multiselectable="true"
+    aria-activedescendant={focusedId ? `desktop-icon-${focusedId}` : undefined}
     aria-label={t("desktop.stage")}
   >
     {#each desktopIcons as id (id)}
       {@const selected = isSelected(id)}
       {@const dropTarget = dropTargetId === id}
+      {@const focused = focusedId === id}
       <button
-        class="group flex flex-col items-center gap-1.5 outline-none {selected ? DESKTOP_ICON_SELECTED : ''} {dropTarget ? 'opacity-90' : ''}"
+        id={`desktop-icon-${id}`}
+        class="group flex flex-col items-center gap-1.5 outline-none {selected ? DESKTOP_ICON_SELECTED : ''} {dropTarget ? 'opacity-90' : ''} {!selected && focused ? DESKTOP_ICON_FOCUSED : ''}"
         aria-label={(appTitleKey(id) ? t(appTitleKey(id)!) : id) +
           (selected ? ', ' + t("desktop.iconAriaSelected") : '')}
         title={appTitleKey(id) ? t(appTitleKey(id)!) : id}
@@ -488,10 +655,12 @@
         role="option"
         data-testid="desktop-icon"
         data-desktop-icon-id={id}
+        data-focused={focused ? "true" : undefined}
         onclick={(e) => onIconClick(id, e)}
         ondblclick={(e) => onIconDoubleClick(id, e)}
         onmousedown={(e) => onIconMouseDown(id, e)}
         oncontextmenu={(e) => onIconContextMenu(id, e)}
+        onfocus={() => (focusedId = id)}
       >
         <AppIcon
           {id}
@@ -518,6 +687,7 @@
       </div>
     {/if}
   </div>
+  {/if}
 
   <!-- 选区计数提示（macOS：在选区顶部居中显示"4 个已选"）。位于舞台容器内、不拦截
        事件，纯粹是状态展示。 -->
