@@ -1109,6 +1109,53 @@ decode_header 返回的负载切片指向**帧内**（不是新缓冲）；decod
    它进 `undecodable`（summary 里可见），不会被折进任何速率。
 5. **真机复核未做**：证据是内核注入时刻的单测、进程级的空闲链路输出与真二进制行为；没有两块板卡/真 Wi-Fi-5G 的现场采样。
 
+### 3.20 「这条流占了多少链路？」——`bw` 并入同一台仪器（第十九轮，REQ-A274）
+
+> 上一轮补掉 §8 里 `hz` 那半格之后，同一行的 `bw` 还空着：**按话题的带宽没有对应物**。
+> 而「跑得多快」和「占了多少」是同一个问题的两半 —— 60 Hz 的立体相机和 10 Hz 的不是一条链路，
+> 60 Hz 的 160×120 和 60 Hz 的 1920×1080 也不是。
+>
+> **不新开一条命令**：第二条命令会有自己的订阅、自己的窗口、自己的一份「说不出就别说」的实现 ——
+> 那正是上一轮刚修掉的形状（`sub`/`state` 各写一份 profile 规则、`hz` 会是第三份）。所以
+> `hz` 的同一条读数上多了两个数：`bytes=` 与 `bw=`，与 `rate=`/`span=` 出自**同一个窗口**。
+
+| 想做 | 做法 | 为什么这么选 |
+|---|---|---|
+| 数字节 | 每次到达**必须**带上它的 framed 大小（`RateTracker::observe(.., bytes)`，`observe_received` 直接取 `Received::frame_len`） | 一个窗口两半数字，不可能出现「速率来自这一窗、带宽来自那一窗」；framed 大小 = 中间件**真的搬过**的字节（`magic│ver│hdr│crc32│payload`），不是猜的负载大小 |
+| 算带宽 | `bytes / span`（**不是** `(bytes − first) / span`） | 印出来的总数就是分子 —— 读者可以用同一行的 `bytes` 除以 `span` 自己复核；代价写在下面的边界 ② |
+| 说不出时 | 与速率**共用**一条规则（`MIN_RATE_SPAN`）：两者同时为 `Some` 或同时为 `None`，`evidence()` 只解释一次 | 一个窗口不可能「够算速率但不够算带宽」；两个理由字段迟早会互相矛盾 |
+
+**实测证据**（两个真进程、真 Zenoh 会话、环回 scouting；发布方 `pub --count 20 --hz 10`）：
+
+```text
+$ amos-link-cli hz --transport zenoh --pattern 'amos/**' --seconds 9
+measuring transport=zenoh peer=amos-node pattern=amos/** qos=best-effort/drop-oldest \
+  from default (no channel in the pattern) every=1000ms for 9s · clock_synced=false: …
+rate publisher=amos-node topic=amos/dog1/sensor/imu frames=9  span=0.82s rate=9.8Hz bytes=927  bw=1.1KiB/s
+rate publisher=amos-node topic=amos/dog1/sensor/imu frames=19 span=1.84s rate=9.8Hz bytes=1957 bw=1.0KiB/s
+…（同一读数每秒重印，直到窗口结束）
+summary streams=1 frames=19 bytes=1957 untracked=0 undecodable=0 complete=yes ran=9s
+
+# 发布方（同一会话的另一端）：published seq=20 … delivered=1 dropped=0 blocked=0
+# 读数的自洽性：18 个间隔 / 1.84 s = 9.78 Hz ⇒ `rate=9.8Hz`；1957 B / 1.84 s = 1063 B/s ⇒ `bw=1.0KiB/s`
+# 1957 / 19 = 103 B/帧 —— 与「`hi` + 头 + CRC」的量级一致（§3.20 的边界①说这是整帧的账）
+```
+
+**诚实边界（本轮新增）**：
+
+1. **`bytes` 是整帧的账，不是负载大小**：它回答「这条流花了链路多少」，所以包含头与 CRC（每帧几十字节，
+   小帧上占比可观 —— 上面 103 B/帧里大部分是框开销）。想知道负载大小要减去框开销，本命令不给这个数。
+2. **`bytes / span` 把第一帧的字节算进分子，却不算进分母**（它的到达时刻就是 `span` 的起点）：帧数一多就低于
+   千分之一，且换来「印出来的数字能自证」；若要精确的「窗口内搬运量」，需要 `(bytes − first)/span`，
+   但那个分子不在行上，读者无法复核 —— 这是**有意的取舍**，写在 `rate.rs` 的模块文档里。
+3. **总数饱和、不回绕**：`bytes` 用 `saturating_add` 累计（与 `next_seq`、`LinkMetrics` 同一条规则）。
+   一个跑了数周的消费者绝不能因为回绕而报出**比真实负载更低**的带宽 —— 那是唯一不可接受的方向。
+4. **仍然是「自 `hz` 启动以来的平均」**（§3.19 边界①不变）：停住体现为 `frames`/`bytes` 不再增长。
+5. **发布方发的帧数与 `frames=` 可能不等**：链路**没有留存**（§6.4），`hz` 订阅建立之前发出的帧本来就不存在 ——
+   上面 20 发 19 收正是这件事，不是丢帧（丢帧由 `sub` 的序号缺口回答）。
+6. **真机复核未做**：证据是同一台机器上两个真进程的真 Zenoh 会话（真 scouting、真 `put`/路由），
+   没有两块板卡/真 Wi-Fi-5G 的现场采样。
+
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
 
 
