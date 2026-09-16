@@ -58,9 +58,29 @@ export type GuardLevel =
   | "disarmed"
   | "offline"; // daemon not reachable / no status yet
 
+/**
+ * Can a backend *named* `backend` enforce anything?
+ *
+ * `enforced` is the daemon's own claim, and the UI's "armed-enforced" sentence asserts a
+ * firewall is blocking traffic — so the claim has to come from a backend that can do it.
+ * The default host backend is the in-process mock and **says so itself** (`enforced:
+ * false`, pinned by `crates/amos-ai/src/netguard_service.rs`'s own test), but a
+ * self-contradictory reply (`backend: "mock"`, `enforced: true`) would otherwise make the
+ * Settings page claim a firewall that cannot exist. Same rule as `isRealEngine` in
+ * `lib/aiEngine.ts`: a mock is never real, **including a decorated one** (`mock+…`).
+ *
+ * A *named* backend that is not the mock is believed (that is the daemon's authority, and
+ * under-claiming a future real backend would be its own dishonesty); an **empty** name is
+ * not, because then nothing identifies what enforces.
+ */
+function canEnforce(backend: string): boolean {
+  const kind = backend.split("+")[0]?.trim().toLowerCase() ?? "";
+  return kind !== "" && kind !== "mock";
+}
+
 /** Classify a status (or its absence) into a display level (pure, unit-tested). */
 export function guardLevel(s: NetGuardStatus | null): GuardLevel {
   if (!s) return "offline";
   if (!s.enabled) return "disarmed";
-  return s.enforced ? "armed-enforced" : "armed-intent";
+  return s.enforced && canEnforce(s.backend) ? "armed-enforced" : "armed-intent";
 }

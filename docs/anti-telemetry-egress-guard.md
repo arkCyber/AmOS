@@ -25,6 +25,20 @@
 > **尚未**并入既有 `PrivacyService.RecentAudit`（`crates/amos-ai/src/privacy_service.rs`）；
 > 以及 §3.3 的 AOSP 平台层补丁（按 §2 属真机/平台范围，不在本仓库）。
 > 因此下面 checklist 里遗留的 `[ ]` 是**落地前的计划文本**，**不代表当前待办**。
+>
+> **2026-09-16（REQ-A295）"enforced" 的**证据链**补上一环**：`enforced` 是**守护进程的声明**，
+> 而页面那句「已开启 · 正在执行（真实后端）」是在断言"流量真的被拦住了"。原先前端 `guardLevel`
+> 只信这一个布尔值 —— 出厂 mock 自己会报 `enforced: false`（`netguard_service.rs` 有测试钉住
+> "mock backend must never report enforced"），可一旦出现**自相矛盾**的答复（`backend: "mock"`
+> 却 `enforced: true`），页面就会宣称一个该后端**不可能**提供的防火墙。现在前端按本仓既有惯例
+> 做交叉核对（同 `lib/aiEngine.ts` 的 `isRealEngine`："被装饰的 mock 也不是真的"，`mock+…` 同样
+> 不算）：`guardLevel` 只有在 `enforced === true` **且** 后端名不是空、且（去掉 `+…` 装饰后）
+> 不是 `mock` 时才给 `armed-enforced`，否则一律 `armed-intent`（「已开启 · 仅记录意图（无执行
+> 后端）」）。*具名*的真实后端（`vpn`/`nftables`/未来的 `ebpf`）仍然被采信 —— 守护进程是执行事实
+> 的权威，压低一个真后端的声明也是另一种不诚实。守护测试：`__tests__/netguard.test.ts`（矛盾
+> 答复 ×4 形态 + 具名后端被采信 + `mock+vpn` 仍是 mock）与 `svelte-tests/settings-untested-screens`
+> （矛盾答复在页面上读作"仅记录意图"，**不**出现"正在执行（真实后端）"）；负控：把交叉核对改回
+> 恒真 ⇒ 恰好这 2 条单测 + 1 条 DOM 用例红，还原 `cmp` byte-identical。
 
 ---
 

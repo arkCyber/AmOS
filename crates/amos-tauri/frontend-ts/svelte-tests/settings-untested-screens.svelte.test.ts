@@ -149,6 +149,33 @@ describe("NetGuardPage (never claims enforcement it does not have)", () => {
     expect(calls.filter((c) => c === "netguard_status").length).toBeGreaterThan(1);
   });
 
+  test("a contradictory reply (mock claiming enforced) still reads as intent (REQ-A295)", async () => {
+    // `enforced: true` is the daemon's *claim*; the page's "正在执行（真实后端）" sentence
+    // asserts traffic is really blocked, so the claim must come from a backend that can do
+    // it. The shipped mock says `enforced: false` itself (pinned by its own Rust test), so
+    // this shape is a contradiction — the honest reading is *intent*, never a firewall the
+    // named backend cannot provide (`guardLevel` cross-checks the backend, like
+    // `isRealEngine` treats a decorated mock as a mock).
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) =>
+        cmd === "netguard_status"
+          ? {
+              enabled: true,
+              backend: "mock",
+              enforced: true, // ← the contradiction
+              policy_rules: 0,
+              top_egress: [],
+            }
+          : null,
+      listen: async () => () => {},
+    };
+    const host = render(NetGuardPage);
+    await vi.waitFor(() => expect(host.container.textContent ?? "").toContain("后端: mock"));
+    const text = host.container.textContent ?? "";
+    expect(text).toContain("仅记录意图");
+    expect(text).not.toContain("正在执行（真实后端）");
+  });
+
   test("a rejected toggle is not shown as a new state", async () => {
     // The daemon refuses (returns null): no re-read happens, so the page keeps showing
     // the state it actually has instead of pretending the switch moved.
