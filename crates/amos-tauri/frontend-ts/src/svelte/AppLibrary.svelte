@@ -28,6 +28,8 @@
     type CustomGroup,
   } from "../lib/customGroups";
   import { propsChannel } from "./propsBus";
+  import { appLibraryColumns } from "../lib/formLayout";
+  import type { FormFactor } from "../lib/wm";
   import AppIcon from "./AppIcon.svelte";
 
   interface FolderView {
@@ -42,6 +44,13 @@
     layout: HomeLayout;
     /** Store-installed (third-party) tiles the shell owns (merged into layout). */
     ext?: StoreTile[];
+    /**
+     * Host-reported device class (`lib/wm`). Optional on purpose: a channel payload
+     * that predates this field (or a preview build with no host) keeps the phone
+     * library (4 columns) — the same "never gain a capability from a missing
+     * payload" rule `lib/formLayout` follows for the home grid.
+     */
+    form?: FormFactor;
   }
   const bus = propsChannel<LibraryProps>("appLibrary");
   let incoming = $state<LibraryProps | null>(null);
@@ -54,6 +63,8 @@
   const EMPTY_LAYOUT: HomeLayout = { page: [], dock: [], hidden: [] };
   const homeLayout = $derived(incoming?.layout ?? EMPTY_LAYOUT);
   const ext = $derived(incoming?.ext ?? []);
+  /** Class-derived library column count; falls back to the phone's 4 when no host. */
+  const libraryCols = $derived(appLibraryColumns(incoming?.form ?? "phone"));
   const extById = $derived(new Map(ext.map((e) => [e.id, e])));
   // Apps that currently exist (built-in or installed third-party). Members pointing
   // at removed/uninstalled apps are reconciled out so we never render ghosts.
@@ -478,7 +489,7 @@
           {#if memberApps.length === 0}
             <p class="px-1 pt-14 text-center text-sm opacity-60">{t("appLibrary.emptyMembers")}</p>
           {:else}
-            <div class="grid grid-cols-4 gap-y-5">
+            <div class="grid gap-y-5" style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}>
               {#each memberApps as id, index (id)}
                 {#if sorting}
                   <div class="flex w-full flex-col items-center gap-0.5">
@@ -588,7 +599,8 @@
             <p class="px-1 text-xs font-medium opacity-70">{t("appLibrary.frequent")}</p>
             <div
               data-testid="app-library-frequent"
-              class="mt-1 grid grid-cols-4 gap-x-1 gap-y-3 rounded-3xl bg-white/30 p-3 shadow-sm ring-1 ring-black/5 backdrop-blur-md dark:bg-white/5 dark:ring-white/10"
+              class="mt-1 grid gap-x-1 gap-y-3 rounded-3xl bg-white/30 p-3 shadow-sm ring-1 ring-black/5 backdrop-blur-md dark:bg-white/5 dark:ring-white/10"
+              style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}
             >
               {#each frequentShown as id (id)}
                 <button
@@ -610,7 +622,7 @@
           {/if}
 
           {#if foldersShown.length > 0}
-            <div data-testid="app-library-folders" class="mt-4 grid grid-cols-4 gap-x-2 gap-y-4">
+            <div data-testid="app-library-folders" class="mt-4 grid gap-x-2 gap-y-4" style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}>
               {#each foldersShown as f (f.id)}
                 <button
                   type="button"
@@ -631,7 +643,7 @@
                       {/each}
                     </span>
                     {#if f.apps.length > 4}
-                      <span class="absolute -right-1 -top-1 rounded-full bg-neutral-500/90 px-1 text-[9px] font-semibold leading-4 text-white ring-2 ring-white dark:bg-neutral-700 dark:ring-neutral-900">{t("appLibrary.more", { n: f.apps.length - 4 })}</span>
+                      <span class="absolute -right-1 -top-1 rounded-full bg-neutral-700 px-1 text-[9px] font-semibold leading-4 text-white ring-2 ring-white dark:bg-neutral-700 dark:ring-neutral-900">{t("appLibrary.more", { n: f.apps.length - 4 })}</span>
                     {/if}
                   </span>
                   <span class="max-w-full truncate text-[10px] font-medium text-neutral-800 dark:text-neutral-200">{t(f.nameKey)}</span>
@@ -643,7 +655,7 @@
           {#if customGroups.length > 0}
             <p class="mt-4 px-1 text-xs font-medium opacity-70">{t("appLibrary.customSection")}</p>
           {/if}
-          <div data-testid="app-library-custom" class="mt-2 grid grid-cols-4 gap-x-2 gap-y-4">
+          <div data-testid="app-library-custom" class="mt-2 grid gap-x-2 gap-y-4" style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}>
             {#each customGroups as g (g.id)}
               {@const gKnown = g.apps.filter((a) => knownIds.has(a))}
               <button
@@ -667,7 +679,7 @@
                       {/each}
                     </span>
                     {#if gKnown.length > 4}
-                      <span class="absolute -right-1 -top-1 rounded-full bg-neutral-500/90 px-1 text-[9px] font-semibold leading-4 text-white ring-2 ring-white dark:bg-neutral-700 dark:ring-neutral-900">{t("appLibrary.more", { n: gKnown.length - 4 })}</span>
+                      <span class="absolute -right-1 -top-1 rounded-full bg-neutral-700 px-1 text-[9px] font-semibold leading-4 text-white ring-2 ring-white dark:bg-neutral-700 dark:ring-neutral-900">{t("appLibrary.more", { n: gKnown.length - 4 })}</span>
                     {/if}
                   {:else}
                     <span aria-hidden="true" class="grid place-items-center text-[24px] leading-none drop-shadow-sm">{g.icon ?? "📁"}</span>
@@ -703,7 +715,7 @@
             >{t("appLibrary.matches", { n: matchCount })}</p>
             {#each foldersShown as f (f.id)}
               <p class="px-1 text-xs font-medium opacity-70">{t(f.nameKey)}</p>
-              <div class="grid grid-cols-4 gap-x-1 gap-y-3 px-1">
+              <div class="grid gap-x-1 gap-y-3 px-1" style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}>
                 {#each f.apps as id (id)}
                   <button
                     aria-label={labelOf(id)}
@@ -734,7 +746,7 @@
         <span class="flex-1 truncate text-center text-base font-semibold">{t(openView.folder.nameKey)}</span>
         <span class="w-6"></span>
       </div>
-      <div class="mt-3 grid min-h-0 flex-1 auto-rows-min grid-cols-4 place-content-start gap-y-5 overflow-y-auto">
+      <div class="mt-3 grid min-h-0 flex-1 auto-rows-min place-content-start gap-y-5 overflow-y-auto" style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}>
         {#each openView.folder.apps as id (id)}
           <button
             aria-label={labelOf(id)}
@@ -773,7 +785,7 @@
 {#snippet name(id: string)}
   {#each splitMatch(labelOf(id)) as seg, i (i)}
     {#if seg.hit}
-      <mark class="rounded bg-accent/25 px-0.5 text-accent dark:text-white">{seg.text}</mark>
+      <mark class="rounded bg-accent/10 px-0.5 text-accent dark:text-white">{seg.text}</mark>
     {:else}
       {seg.text}
     {/if}

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  appLibraryColumns,
   DESKTOP_MAX_COLS,
   DESKTOP_MAX_ROWS,
   deviceChrome,
@@ -198,6 +199,37 @@ describe("deviceChrome — do not draw another device's hardware", () => {
       expect(typeof chrome.dynamicIsland).toBe("boolean");
       expect(typeof chrome.homeIndicator).toBe("boolean");
       expect(typeof chrome.titleBar).toBe("boolean");
+    }
+  });
+});
+
+describe("appLibraryColumns — the library surface scales with the class (REQ-A289)", () => {
+  test("phone keeps today's 4 columns (no UI drift on existing devices)", () => {
+    expect(appLibraryColumns("phone")).toBe(4);
+  });
+
+  test("tablet widens to 6 columns (iPadOS App-Library density)", () => {
+    // The audit (REQ-A289) found the App Library surface rendering on a tablet was
+    // still 4 columns wide — REQ-A234 wired the *home* grid for tablet but not the
+    // library. iPadOS uses 6; the screen real estate on a 900x1200 tablet is otherwise
+    // wasted as a half-empty 4-col grid.
+    expect(appLibraryColumns("tablet")).toBe(6);
+  });
+
+  test("desktop widens further (matches Launchpad-class capacity, capped by the desktop cap)", () => {
+    // Pinned to DESKTOP_MAX_COLS rather than a magic number: this is the same cap
+    // `homeGrid` honors, so the library and the launcher stay in step.
+    expect(appLibraryColumns("desktop")).toBe(DESKTOP_MAX_COLS);
+  });
+
+  test("robot has no UI, so its library column count is the phone's (never zero)", () => {
+    expect(appLibraryColumns("robot")).toBe(4);
+  });
+
+  test("the column count is a positive integer for every class", () => {
+    for (const form of FORMS) {
+      const n = appLibraryColumns(form);
+      expect(Number.isInteger(n) && n >= 1).toBe(true);
     }
   });
 });

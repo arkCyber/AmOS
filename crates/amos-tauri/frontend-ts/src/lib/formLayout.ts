@@ -113,6 +113,28 @@ export const DESKTOP_MAX_COLS = 8;
 export const DESKTOP_MAX_ROWS = 6;
 
 /**
+ * The **App Library** column count for this class.
+ *
+ * The App Library is the search / browse surface that mirrors the home screen's icon
+ * grid; it lives on the `library` surface (full screen on phone/tablet, modal-launchpad
+ * on desktop). iOS keeps it at 4 columns; iPadOS widens to 6 so the screen real
+ * estate is actually used; macOS / desktop widens further (`DESKTOP_MAX_COLS`). A
+ * robot has no UI ⇒ the most conservative answer (the phone default).
+ *
+ * Why this lives next to `homeGrid`: it is the *same* decision family (class →
+ * layout), driven by the *same* authority (the host's `form`), and tested the *same*
+ * way (pure function of inputs, no DOM, no `window`). Keeping the rule here means
+ * `AppLibrary.svelte` does not have to repeat the `form === "tablet"` branch itself
+ * — that branch is what the audit found missing (REQ-A234 wired the *home* grid for
+ * tablet, not the App Library surface).
+ */
+export function appLibraryColumns(form: FormFactor): number {
+  if (form === "tablet") return 6;
+  if (form === "desktop") return DESKTOP_MAX_COLS;
+  return 4;
+}
+
+/**
  * The home-screen grid for this class at this measured screen size.
  *
  * `width`/`height` are the host's measured screen (logical px; see

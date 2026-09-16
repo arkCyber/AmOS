@@ -18,6 +18,7 @@ import { zh } from "../src/i18n/locales/zh";
 interface LibraryProps {
   layout: { page: string[]; dock: string[]; hidden: string[] };
   ext?: StoreTile[];
+  form?: "phone" | "tablet" | "desktop" | "robot";
 }
 
 let upEvents: Array<[string, unknown]> = [];
@@ -251,6 +252,69 @@ describe("AppLibrary.svelte - third-party (store) apps", () => {
     await fireEvent.click(tile as HTMLButtonElement);
     await tick();
     expect(upEvents.some(([e, d]) => e === "open" && d === POMODORO.id)).toBe(true);
+  });
+});
+
+describe("AppLibrary.svelte - form-aware column count (REQ-A289)", () => {
+  // The library surface used to render `grid-cols-4` unconditionally, even on a
+  // tablet: a 900x1200 iPad-class window then showed a half-empty 4-col grid instead
+  // of iPadOS's 6-col App Library. This group pins the column count per class via
+  // the inline grid-template-columns style — the same shape HomeDock uses (Tailwind
+  // purges constructed class names).
+
+  function renderWithForm(form: LibraryProps["form"]) {
+    bus.set({ layout: { page: [], dock: [], hidden: [] }, form });
+    return render(AppLibrary);
+  }
+
+  function gridTemplateCols(el: HTMLElement | null): string {
+    if (!el) throw new Error("missing grid element");
+    // Browsers may normalize `repeat(N, minmax(0, 1fr))`; match the leading number.
+    const s = el.getAttribute("style") ?? "";
+    const m = s.match(/repeat\(\s*(\d+)\s*,/);
+    return m && m[1] ? m[1] : "0";
+  }
+
+  test("phone (default, no form sent) keeps today's 4 columns", async () => {
+    const { container } = renderLibrary();
+    await tick();
+    const folders = inArea(container, "app-library-folders");
+    expect(folders).toBeTruthy();
+    // Without a `form` payload the screen degrades to the phone plan — the rule
+    // `lib/formLayout` follows for the home grid also applies here.
+    expect(gridTemplateCols(folders)).toBe("4");
+  });
+
+  test("phone explicitly still 4 columns", async () => {
+    const { container } = renderWithForm("phone");
+    await tick();
+    const folders = inArea(container, "app-library-folders");
+    expect(gridTemplateCols(folders)).toBe("4");
+  });
+
+  test("tablet widens to 6 columns (iPadOS App-Library density)", async () => {
+    const { container } = renderWithForm("tablet");
+    await tick();
+    const folders = inArea(container, "app-library-folders");
+    expect(folders).toBeTruthy();
+    expect(gridTemplateCols(folders)).toBe("6");
+  });
+
+  test("desktop widens to DESKTOP_MAX_COLS, not a hand-picked number", async () => {
+    const { container } = renderWithForm("desktop");
+    await tick();
+    const folders = inArea(container, "app-library-folders");
+    expect(folders).toBeTruthy();
+    // 8 (DESKTOP_MAX_COLS) — pinned via formLayout.test.ts so the two scanners
+    // cannot drift apart.
+    expect(gridTemplateCols(folders)).toBe("8");
+  });
+
+  test("robot (no UI) keeps the phone's 4 columns", async () => {
+    const { container } = renderWithForm("robot");
+    await tick();
+    const folders = inArea(container, "app-library-folders");
+    expect(gridTemplateCols(folders)).toBe("4");
   });
 });
 

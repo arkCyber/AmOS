@@ -13,7 +13,7 @@
   import { moveBefore, addAppsToDock, readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { amosWarn } from "../lib/debugLog";
   import { homeGrid, homeTile, deviceChrome, PHONE_GRID, type HomeGrid, type HomeTile } from "../lib/formLayout";
-  import { onLayoutChanged, wmLayoutSnapshot, wmSetShellTitle, type LayoutSnapshot } from "../lib/wm";
+  import { onLayoutChanged, wmLayoutSnapshot, wmSetShellTitle, type LayoutSnapshot, type FormFactor } from "../lib/wm";
   import { CONTACTS_KEY, seedContacts } from "../lib/contacts";
   import { setFormFactor } from "../lib/desktopApps";
   import {
@@ -155,9 +155,10 @@
   // home screen / dock.
   $effect(() => {
     if (surface().kind === "library") {
-      propsChannel<{ layout: HomeLayout; ext: StoreTile[] }>("appLibrary").set({
+      propsChannel<{ layout: HomeLayout; ext: StoreTile[]; form?: FormFactor }>("appLibrary").set({
         layout: layout(),
         ext,
+        form: shellForm,
       });
     }
   });

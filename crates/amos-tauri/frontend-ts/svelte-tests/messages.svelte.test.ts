@@ -18,6 +18,7 @@ import { tick } from "svelte";
 import { messagesChannel } from "../src/svelte/appLinks";
 import { resetPropsChannels } from "../src/svelte/propsBus";
 import { zh } from "../src/i18n/locales/zh";
+import { t } from "../src/svelte/locale.svelte";
 
 // Each test starts from a fresh, single seeded 小安 conversation (the Messages
 // screen persists to the shared store, which is not reset between tests) and an
@@ -685,12 +686,18 @@ describe("MessagesApp.svelte", () => {
       addReply?: unknown;
       restoreReply?: unknown;
       purgeReply?: unknown;
+      /** Commands whose call **rejects** (a Rust `Err`): `lib/backend` records it in the
+       *  diagnostics ledger and answers `null`, which is how a command failure reaches a
+       *  caller. Passing `null` as a reply cannot express this — `opts.x ?? default`
+       *  treats it as "unset". */
+      throwFor?: string[];
     } = {},
   ) {
     const seen: Record<string, unknown>[] = [];
     (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (cmd: string, args?: Record<string, unknown>) => {
         seen.push({ cmd, ...(args ?? {}) });
+        if (opts.throwFor?.includes(cmd)) throw new Error(`refused: ${cmd}`);
         if (cmd === "sms_status") return { provider: "android-sms", device: true };
         if (cmd === "sms_counts") return { inbox: 1, sent: 0, draft: 0 };
         if (cmd === "sms_snapshot")
@@ -781,6 +788,72 @@ describe("MessagesApp.svelte", () => {
     await clickTestId(host.container, "trash-purge");
     expect(seen.some((c) => c.cmd === "sms_trash_purge")).toBe(true);
     expect(host.container.querySelector('[data-testid="trash-msg"]')!.textContent).toContain("回收站已清空");
+  });
+
+  test("a restore the host no longer matches says so — it never names the trash-add action (REQ-A288)", async () => {
+    // `sms_trash_restore` answers a bool, and the host's `SmsTrashState::restore` answers
+    // `false` **exactly** when no entry matched (a stale row — already restored elsewhere —
+    // or a malformed id; persisting is best-effort and never flips the answer). So the
+    // false branch must say "it is no longer in the trash": the sentence it used to show,
+    // `message.trashFailed` = "移入回收站失败，请重试", names the *opposite* action ("could not
+    // move **to** the trash") for a case where nothing was being moved anywhere.
+    deviceBridge({
+      trashList: [
+        { thread_id: "1", message_id: "m1", ts_ms: 1_700_000_000_000, trashed_ms: 1_700_000_000_000 },
+      ],
+      restoreReply: false,
+    });
+    const host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-toggle");
+    await clickTestId(host.container, "trash-restore-m1");
+    const note = host.container.querySelector('[data-testid="trash-msg"]')!;
+    expect(note.textContent).toContain(t("message.trashNotInTrash"));
+    expect(note.textContent).not.toContain(t("message.trashFailed"));
+    // Still an alert (the outcome is surprising), and the thread is NOT re-read on a
+    // no-op — there is nothing new to show.
+    expect(note.getAttribute("data-ok")).toBe("false");
+    expect(note.getAttribute("role")).toBe("alert");
+  });
+
+  test("a purge the bridge never answered names the purge, not the trash-add (REQ-A288)", async () => {
+    // `sms_trash_purge` returning nothing means the *call* was not answered (a `0` count is
+    // a successful no-op and reads as success — pinned by the case below). The failure
+    // sentence must therefore be about emptying the trash.
+    deviceBridge({
+      trashList: [
+        { thread_id: "1", message_id: "m1", ts_ms: 1_700_000_000_000, trashed_ms: 1_700_000_000_000 },
+      ],
+      throwFor: ["sms_trash_purge"],
+    });
+    const host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-toggle");
+    await clickTestId(host.container, "trash-purge");
+    const note = host.container.querySelector('[data-testid="trash-msg"]')!;
+    expect(note.textContent).toContain(t("message.trashPurgeFailed"));
+    expect(note.textContent).not.toContain(t("message.trashFailed"));
+  });
+
+  test("a purge that finds nothing left is a success, not a failure (REQ-A288)", async () => {
+    // A stale panel: the tab still lists one entry (so the button is enabled), but the
+    // host's trash is already empty ⇒ the command answers `0`. That is a *successful*
+    // no-op — the wrapper's `typeof purged === "number"` is what keeps `0` out of the
+    // falsy trap, and the sentence must not call it a failure.
+    deviceBridge({
+      trashList: [
+        { thread_id: "1", message_id: "m1", ts_ms: 1_700_000_000_000, trashed_ms: 1_700_000_000_000 },
+      ],
+      purgeReply: 0,
+    });
+    const host = render(MessagesApp);
+    await settle();
+    await clickTestId(host.container, "trash-toggle");
+    await clickTestId(host.container, "trash-purge");
+    const note = host.container.querySelector('[data-testid="trash-msg"]')!;
+    expect(note.getAttribute("data-ok")).toBe("true");
+    expect(note.textContent).toContain(t("message.trashPurged"));
+    expect(note.textContent).not.toContain(t("message.trashPurgeFailed"));
   });
 
   test("trashing a message reports the bridge's three honest outcomes", async () => {

@@ -251,6 +251,12 @@ Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就�
 
 **前端（`backend.ts` + `MessagesApp.svelte` + i18n 中英）**：真机模式气泡悬停出现「移入回收站」按钮；工具栏「回收站 (n)」切换面板，列出隐藏条目（线程名 + 时间），支持单条**恢复**与**清空**；三态结果以状态条明示——成功文案写明「系统短信应用中仍保留」，陈旧 id 报「该短信已不在当前文件夹中」，被拒报「移入回收站失败」。参数走 Tauri v2 的 camelCase（`threadId`/`messageId`，与 `sms_messages` 同一约定），**回复**则按 serde 原样读（snake_case 字段、`bool`/`number` 原类型）。
 
+> **2026-09-16（REQ-A288）恢复/清空的**回答语义**与它决定的那句话**：上面那三个句子是**回收**（`sms_trash_add`）的；`sms_trash_restore` 与 `sms_trash_purge` 的回答此前被套用了同一句话，于是「恢复」和「清空」的失败都显示**移入回收站失败**——名字指向**相反的动作**。本轮把两条命令的回答语义写清并用测试钉住：
+>
+> * `sms_trash_restore` 回答 `bool`，而 `SmsTrashState::restore` 的 `false` **恰好**等于「没有任何条目匹配」（陈旧行——例如已在别处恢复过——或畸形 id；畸形 id 由桥按 REQ-A286 记一条 warn）。落盘是 best-effort，**不会**把 `true` 翻成 `false` ⇒ `false` **永远不表示**"写了但写失败"。因此前端 `false` 说「该短信已不在回收站里」（新键 `message.trashNotInTrash`），并 `amosWarn` 记一条「matched nothing」；`role="alert"`（结果令人意外，但不假装失败重试）。
+> * `sms_trash_purge` 回答**条目数**：`0` 是**成功的空操作**（面板陈旧到已无条目），`smsTrashPurge` 用 `typeof purged === "number"` 判「这次调用有没有被应答」；只有**没被应答**（无桥 / 命令 Err）才算失败，句子是新键 `message.trashPurgeFailed`「清空回收站失败，请重试」。
+> * 守护测试：`sms::tests` **+3**（`restore` 的 `false` 三态——从未回收 / 恢复成功 / 二次恢复；畸形与超长 id 是 no-op 且**不 panic**；`purge` 的空回收站返回 `0`、清空后归零）；`messages.svelte.test.ts` **+3**（陈旧行的恢复文案且**不含**移入回收站失败句；purge 未被应答时是清空失败句；purge 返回 `0` 仍是成功句）。桥 harness 为此新增 `throwFor`（用**真的拒绝**建模命令失败——`purgeReply: null` 会被 `??` 当成"未设置"，表达不了失败）。
+
 
 **本节验证（本机）**：`cargo test -p amos-tauri --lib` **237 例**（`sms::` +6：预览换到上一条可见消息、整线程隐藏、未知 id 诚实报错、恢复出自然预览 + 未读徽标、新消息到来后预览覆盖失效、落盘/重载 round-trip）；`cargo test -p amos-sms` **55 例**（`trash::` 纯域用例）；`clippy --all-targets -D warnings`（host 与 `--features android`）、`fmt --check`、`cargo check -p amos-sms --features android` 全干净；前端 `tsc --noEmit` 与 `svelte-check` 0 错 0 警、vitest **471 例**全绿。
 

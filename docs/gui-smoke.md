@@ -16,6 +16,15 @@ make gui-smoke-check            # 无头就绪探针：显示环境检查 + 构�
 > 任务或 make 目标调用它**（REQ-A189 量出：48 个脚本里有 4 个无调用者）。它现在是
 > `make gui-smoke-check`；CI 的 `make lint`/`make test` **不**跑它（它会 `cargo build`
 > 两个二进制并要求显示环境），所以无头就绪仍然靠上面那两条命令。
+>
+> **2026-09-16（REQ-A289）实测补记**：`make gui-smoke-check` 从 REQ-A189 起**每次都会失败** ——
+> 包装脚本 `scripts/gui-smoke-check.sh` 解析的是**仓库根**再去取 `gui-smoke.sh`（根目录里没有
+> 这个文件，它在 `scripts/` 下），于是 `No such file or directory` + `make: *** Error 1`。
+> 这正是 REQ-A189 自己登记的那条边界（"**被命名 ≠ 被执行**"）的代价：`watched by 引用层**
+> 的门（`unwired-script-scan` 看"有没有调用者"、`lint-inputs-scan` 看"被引用的文件在不在"）
+> 都只能看见**引用**，看不见**执行**；这个目标又刻意不进 CI，于是坏掉的路径一直没人跑到。
+> 本轮把路径改成同目录兄弟（`$(dirname "$0")/gui-smoke.sh`）并**实跑验证**：`display detected
+> (macOS/Wayland)` + `prerequisites OK.`（exit 0）。
 
 ## 前置
 

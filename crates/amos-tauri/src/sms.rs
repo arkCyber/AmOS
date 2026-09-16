@@ -1783,6 +1783,120 @@ mod tests {
     }
 
     #[test]
+    fn restore_answers_false_exactly_when_nothing_matched() {
+        // The UI's restore branch reads this boolean as "it was no longer in the trash"
+        // and words its message accordingly (`message.trashNotInTrash`, REQ-A288). Pin the
+        // three cases that produce it, so a later change cannot make `false` also mean
+        // "we tried and the write failed" without breaking this test (which is the only
+        // thing standing between the UI's sentence and a silent lie).
+        let p = MockSms::seeded();
+        let state = SmsTrashState::empty();
+
+        // (a) nothing was ever trashed → false, and nothing is invented.
+        assert!(!state.restore("1", "m2"));
+        assert!(state.read().is_empty());
+
+        // (b) trashed, then restored → true; the entry is gone …
+        trash_message(
+            &state,
+            &p,
+            "1",
+            "m2",
+            Some(amos_sms::SmsFolder::Inbox),
+            5_000,
+        )
+        .unwrap();
+        assert_eq!(state.read().len(), 1);
+        assert!(state.restore("1", "m2"));
+        assert!(state.read().is_empty(), "the entry is gone");
+        // … and the preview override went with it (it was computed against the trashed
+        // state), which is what makes the natural preview show again.
+        assert!(
+            state.read().previews().is_empty(),
+            "the override is dropped"
+        );
+
+        // (c) restoring it a second time is false again — a no-op, never an error.
+        assert!(!state.restore("1", "m2"));
+    }
+
+    #[test]
+    fn restore_with_a_malformed_or_foreign_id_is_a_no_op_never_a_panic() {
+        // `sms_trash_restore` is a `#[tauri::command]` behind a UI button, so a malformed
+        // id must not panic the host. The bridge logs the boundary violation (REQ-A286) and
+        // the answer stays the same `false` the not-in-trash sentence describes.
+        let p = MockSms::seeded();
+        let state = SmsTrashState::empty();
+        trash_message(
+            &state,
+            &p,
+            "1",
+            "m2",
+            Some(amos_sms::SmsFolder::Inbox),
+            5_000,
+        )
+        .unwrap();
+        let oversized = "x".repeat(MAX_SMS_ID_BYTES + 1);
+        for (thread, msg) in [
+            ("", ""),
+            ("1", ""),
+            ("", "m2"),
+            (oversized.as_str(), "m2"),
+            ("1", oversized.as_str()),
+        ] {
+            assert!(
+                !state.restore(thread, msg),
+                "a malformed id ({thread:?}, {msg:?}) matches nothing"
+            );
+        }
+        // …and it did not disturb the one real entry.
+        assert_eq!(state.read().len(), 1);
+        assert!(state.read().contains("1", "m2"));
+    }
+
+    #[test]
+    fn purge_answers_a_count_so_zero_is_an_honest_success() {
+        // The frontend reads the purge answer as "was the call answered?" and treats `0` as
+        // a successful no-op (`smsTrashPurge`), so `0` must really mean "the trash was
+        // already empty" — not "the purge failed".
+        let p = MockSms::seeded();
+        let state = SmsTrashState::empty();
+        assert_eq!(
+            state.purge(),
+            0,
+            "an empty trash purges nothing, successfully"
+        );
+        // Two entries from different threads (m2 is inbox thread "1", m4 inbox thread "2";
+        // m3 is a *sent* row, so trashing it against the inbox folder is refused).
+        trash_message(
+            &state,
+            &p,
+            "1",
+            "m2",
+            Some(amos_sms::SmsFolder::Inbox),
+            5_000,
+        )
+        .unwrap();
+        trash_message(
+            &state,
+            &p,
+            "2",
+            "m4",
+            Some(amos_sms::SmsFolder::Inbox),
+            5_001,
+        )
+        .unwrap();
+        assert_eq!(state.read().len(), 2);
+        assert_eq!(state.purge(), 2);
+        assert!(state.read().is_empty());
+        assert!(
+            state.read().previews().is_empty(),
+            "purge drops the overrides too"
+        );
+        assert_eq!(state.purge(), 0, "and it stays a no-op the second time");
+    }
+
+    #[test]
     fn check_sms_id_rejects_empty_and_oversized() {
         assert!(check_sms_id("").is_err(), "empty id is refused");
         let huge = "x".repeat(MAX_SMS_ID_BYTES + 1);

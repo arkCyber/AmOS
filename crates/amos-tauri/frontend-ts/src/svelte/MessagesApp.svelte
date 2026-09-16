@@ -379,8 +379,19 @@
     trashBusy = true;
     try {
       const ok = await smsTrashRestore(e.thread_id, e.message_id);
-      noteTrash(ok, ok ? t("message.trashRestored") : t("message.trashFailed"));
-      if (ok) refreshReal();
+      if (ok) {
+        noteTrash(true, t("message.trashRestored"));
+        refreshReal();
+      } else {
+        // `false` from the host is **not a failure**: `SmsTrashState::restore` answers
+        // `false` exactly when no trash entry matched (the row was stale — already
+        // restored from another surface — or the id was malformed; the host logs the
+        // malformed case). Persisting is best-effort and never flips the answer, so a
+        // false can never mean "we tried and the write failed". Saying
+        // "移入回收站失败" here would name the *opposite* action and the wrong cause.
+        amosWarn("messages", "sms_trash_restore matched nothing", bridgeDiag());
+        noteTrash(false, t("message.trashNotInTrash"));
+      }
     } finally {
       trashBusy = false;
     }
@@ -392,7 +403,11 @@
     trashBusy = true;
     try {
       const ok = await smsTrashPurge();
-      noteTrash(ok, ok ? t("message.trashPurged") : t("message.trashFailed"));
+      // `smsTrashPurge` answers whether the *call* was answered (`0` purged is a
+      // successful no-op — see lib/backend), so `false` here means the bridge did not
+      // answer at all. That is a failure to empty the trash, not a failure to move one
+      // message into it — the sentence has to name the action the user pressed.
+      noteTrash(ok, ok ? t("message.trashPurged") : t("message.trashPurgeFailed"));
       if (ok) refreshReal();
     } finally {
       trashBusy = false;
