@@ -109,6 +109,24 @@ pub enum ErrorCode {
     /// Generic appstore RPC failure (status / catalog / find — surface as data so the
     /// UI can show a translated message instead of swallowing it into `null`).
     AppStoreRpcFailed,
+    // --- Spaces / virtual desktops (REQ-A297 phase 2 follow-up: typed errors) ---
+    /// `SpaceManager`'s inner `Mutex` was poisoned (a thread panicked while holding
+    /// the lock). The Spaces commands refuse to silently drop the request — the UI
+    /// is told to retry / surface the failure.
+    SpacesLockFailed,
+    /// `SpaceManager::save()` could not serialize the in-memory state to JSON
+    /// (a wire-contract change on `Space` / `SpaceManagerData` that would have been
+    /// silent). The error returns rather than corrupting `SharedStore`.
+    SpacesSerializationFailed,
+    /// `spaces_switch` / `spaces_delete` / `spaces_move_window` / `spaces_rename`
+    /// received an id / index that does not match any current Space.
+    SpacesNotFound,
+    /// `spaces_switch` index is `>=` the current space count. The UI is told
+    /// "out of bounds", not "blank id".
+    SpacesIndexOutOfBounds,
+    /// The caller asked to delete the last remaining Space — refused so the
+    /// manager always has at least one usable desktop.
+    SpacesDeleteLast,
 }
 
 impl ErrorCode {
@@ -161,6 +179,11 @@ impl ErrorCode {
             Self::AppStoreUpgradeFailed => "amos.appstore.upgrade_failed",
             Self::AppStoreUninstallFailed => "amos.appstore.uninstall_failed",
             Self::AppStoreRpcFailed => "amos.appstore.rpc_failed",
+            Self::SpacesLockFailed => "amos.spaces.lock_failed",
+            Self::SpacesSerializationFailed => "amos.spaces.serialization_failed",
+            Self::SpacesNotFound => "amos.spaces.not_found",
+            Self::SpacesIndexOutOfBounds => "amos.spaces.index_out_of_bounds",
+            Self::SpacesDeleteLast => "amos.spaces.delete_last",
         }
     }
 
@@ -306,6 +329,11 @@ mod tests {
             ErrorCode::AppStoreUpgradeFailed,
             ErrorCode::AppStoreUninstallFailed,
             ErrorCode::AppStoreRpcFailed,
+            ErrorCode::SpacesLockFailed,
+            ErrorCode::SpacesSerializationFailed,
+            ErrorCode::SpacesNotFound,
+            ErrorCode::SpacesIndexOutOfBounds,
+            ErrorCode::SpacesDeleteLast,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in codes {
@@ -335,6 +363,8 @@ mod tests {
         assert_eq!(ErrorCode::AiRpcFailed.group(), "ai");
         assert_eq!(ErrorCode::RagRpcFailed.group(), "rag");
         assert_eq!(ErrorCode::AppStoreInstallFailed.group(), "appstore");
+        assert_eq!(ErrorCode::SpacesLockFailed.group(), "spaces");
+        assert_eq!(ErrorCode::SpacesNotFound.group(), "spaces");
     }
 
     #[test]
