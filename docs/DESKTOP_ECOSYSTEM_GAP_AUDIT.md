@@ -214,6 +214,9 @@ AmOS 的拼音只能输入**它自己的 WebView**，容器里的 Android app、
 > **G1**（输入法跨窗口会话）是同一种形状在另一个子系统的翻版——多窗口已落地，而输入法还当自己
 > 是单窗口——也已在本轮收口（REQ-A258，`docs/input-method.md`）。
 > 本轮（REQ-A273）还收口了：系统快捷键作用于焦点窗口（Dock 右键菜单），新失效模式 F-SH-008/F-SH-009 已进 `docs/FMEA.md` §2.2a 与 `scripts/fmea-gen.mjs` 列表（机读 69 条）。
+> **REQ-A275 这一轮**把 G6 的顶栏 **File / Edit / View / Window / Help** 从「五个 disabled 按钮」翻成 **macOS 真菜单**：
+> 五个 trigger 都 enabled + `aria-haspopup="menu"`，每个面板里有真按钮（File → New Window 接 `wm_open`，Edit → Copy/Paste 接 clipboard bridge，View → Toggle Wallpaper / Icons / Stage Widgets 接新的 `lib/desktopView.ts`，Window → Minimize 接 `wm_hide`），其余仍然按 **FMEA F-SH-001** 列出 + 灰 + 命名（Print / Zoom / Bring All to Front / Search / App Help / Undo / Full Screen）。Help 整段是 F-SH-001——per-app 菜单模型仍是缺口，不是装饰。
+> **桌面视图切换**走 `amos.settings.view = { showWallpaper, showIcons, showStageWidgets }`：Backdrop 与 DesktopStage 都订阅同一个 key，互不传 prop；View 菜单翻一项，桌面立刻重渲染（壁纸没了 / 图标没了 / 时钟没了）。store 已加入 `store-allowlist.json`（configuration 类——属于设备本地 UI 状态，不进云备份）。
 > 下一步优先级最高的是 **G2**（远程站点/PWA 启动能力，需要一次明确的产品/安全决策）、
 > **G8**（macOS 上的 Android 运行时，产品决策三选一），以及 **G6/G7** 的逐项真机复核。
 
