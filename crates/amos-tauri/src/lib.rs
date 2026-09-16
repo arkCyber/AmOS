@@ -87,7 +87,19 @@ pub mod linux_apps;
 #[cfg(desktop)]
 pub mod wine;
 // The freedesktop `.desktop` entry format, shared by both surfaces above (pure).
+#[cfg(desktop)]
 pub mod desktop_entry;
+// Call recording storage and metadata (used by telephony).
+pub mod recording;
+// macOS menu bar (Aqua Global Menu) — REQ-A275.
+#[cfg(target_os = "macos")]
+pub mod menu;
+// macOS window title-bar colour (REQ-A326).
+#[cfg(target_os = "macos")]
+pub mod window_background;
+// Persist window position/size across launches (REQ-A249).
+#[cfg(target_os = "macos")]
+pub mod window_state;
 
 use ai_bridge::AiBridge;
 use std::sync::Arc;
