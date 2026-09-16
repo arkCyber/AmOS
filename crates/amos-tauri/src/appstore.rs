@@ -32,6 +32,8 @@ use amos_appstore::{
 use serde::Serialize;
 use tauri::State;
 
+use crate::error::{AmosError, ErrorCode};
+
 /// Maximum bytes in an appstore app id handed in by the WebView.
 ///
 /// The id is appended to `<install-root>/` to form the on-disk install directory,
@@ -48,6 +50,13 @@ pub const MAX_APPSTORE_ID_BYTES: usize = 128;
 /// comfortably above any plausible value and tight enough that a paste-sized
 /// caller cannot inflate the catalog RPC.
 pub const MAX_APPSTORE_QUERY_BYTES: usize = 256;
+
+/// Result type used by every appstore Tauri command.
+///
+/// Replaces the previous `Result<_, String>` — the UI now receives an
+/// [`AmosError`] envelope instead of a raw string, so it can show a translated
+/// error message rather than silently swallowing a Tauri internal error.
+pub type AppStoreResult<T> = Result<T, AmosError>;
 
 #[cfg(feature = "appstore-live")]
 use amos_appstore::HttpStoreProvider;
@@ -366,9 +375,15 @@ pub async fn appstore_updatable(state: State<'_, StoreBridge>) -> Result<Vec<Str
 pub async fn appstore_status(
     state: State<'_, StoreBridge>,
     id: String,
-) -> Result<AppStatus, String> {
-    check_appstore_id(&id)?;
-    state.store.status(&id).await.map_err(|e| e.to_string())
+) -> AppStoreResult<AppStatus> {
+    validate_appstore_id(&id)?;
+    state.store.status(&id).await.map_err(|e| {
+        AmosError::with_cause(
+            ErrorCode::AppStoreRpcFailed,
+            format!("status failed for {id}: {e}"),
+            e,
+        )
+    })
 }
 
 /// Download → verify → install the catalog's release of `id`.
@@ -376,9 +391,12 @@ pub async fn appstore_status(
 pub async fn appstore_install(
     state: State<'_, StoreBridge>,
     id: String,
-) -> Result<InstalledApp, String> {
-    check_appstore_id(&id)?;
-    let app = state.store.install(&id).await.map_err(|e| e.to_string())?;
+) -> AppStoreResult<InstalledApp> {
+    validate_appstore_id(&id)?;
+    let app = state.store.install(&id).await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::AppStoreInstallFailed,
+            format!("install failed for {id}: {e}"), e)
+    })?;
     state.persist_best_effort();
     Ok(app)
 }
@@ -388,40 +406,46 @@ pub async fn appstore_install(
 pub async fn appstore_upgrade(
     state: State<'_, StoreBridge>,
     id: String,
-) -> Result<InstalledApp, String> {
-    check_appstore_id(&id)?;
-    let app = state.store.upgrade(&id).await.map_err(|e| e.to_string())?;
+) -> AppStoreResult<InstalledApp> {
+    validate_appstore_id(&id)?;
+    let app = state.store.upgrade(&id).await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::AppStoreUpgradeFailed,
+            format!("upgrade failed for {id}: {e}"), e)
+    })?;
     state.persist_best_effort();
     Ok(app)
 }
 
 /// Uninstall `id`.
 #[tauri::command]
-pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> Result<(), String> {
-    check_appstore_id(&id)?;
-    state.store.uninstall(&id).map_err(|e| e.to_string())?;
+pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> AppStoreResult<()> {
+    validate_appstore_id(&id)?;
+    state.store.uninstall(&id).map_err(|e| {
+        AmosError::with_cause(ErrorCode::AppStoreUninstallFailed,
+            format!("uninstall failed for {id}: {e}"), e)
+    })?;
     state.persist_best_effort();
     Ok(())
 }
 
-/// Bound the caller-supplied app id at the command seam and refuse path-segment
+/// Validate the caller-supplied app id at the command seam and refuse path-segment
 /// metacharacters (`..` / `/` / `\`) so an id cannot escape `<install-root>/`.
 /// Mirrors the same `valid_id` rule the install/upgrade paths use internally —
 /// exposes it here so a UI bug cannot slip an unvalidated id to the on-disk
 /// `dir_for(id)` join in `webinstall`.
-fn check_appstore_id(id: &str) -> Result<(), String> {
+///
+/// Returns `Ok(())` on success; [`AppStoreResult`] on failure so callers can
+/// use `?` without wrapping.
+fn validate_appstore_id(id: &str) -> AppStoreResult<()> {
     if id.is_empty() {
-        return Err("appstore id is empty".to_string());
+        return Err(AmosError::new(ErrorCode::AppStoreIdEmpty,
+            "appstore id is empty"));
     }
     if id.len() > MAX_APPSTORE_ID_BYTES {
-        return Err(format!(
-            "appstore id too long: {} bytes (max {MAX_APPSTORE_ID_BYTES})",
-            id.len()
-        ));
+        return Err(AmosError::new(ErrorCode::AppStoreIdTooLong,
+            format!("appstore id too long: {} bytes (max {})",
+                id.len(), MAX_APPSTORE_ID_BYTES)));
     }
-    // A reverse-DNS id is `[a-z0-9._-]`; reject any path separator or
-    // `..` segment up front so a paste attack cannot turn an app id into
-    // a directory traversal payload.
     if id.contains('/')
         || id.contains('\\')
         || id.contains('\0')
@@ -431,7 +455,8 @@ fn check_appstore_id(id: &str) -> Result<(), String> {
         || id.contains("/../")
         || id.ends_with("/..")
     {
-        return Err(format!("appstore id is not a valid id: {id:?}"));
+        return Err(AmosError::new(ErrorCode::AppStoreIdInvalid,
+            format!("appstore id is not a valid id: {id:?}")));
     }
     Ok(())
 }
@@ -1053,12 +1078,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The `check_appstore_id` seam is the single place that decides whether an
+    /// The `validate_appstore_id` seam is the single place that decides whether an
     /// id may proceed to the on-disk `dir_for(id)` join. The unit tests below
     /// pin down what is (and is not) acceptable, so a future relaxation is a
     /// conscious change rather than a silent drift toward "anything goes".
-    #[test]
-    fn check_appstore_id_accepts_well_formed_ids() {
+    /// conscious change rather than a silent drift toward "anything goes".
+    fn validate_appstore_id_accepts_well_formed_ids() {
         for ok in [
             "org.amos.pomodoro",
             "a",
@@ -1067,14 +1092,14 @@ mod tests {
             "x".repeat(MAX_APPSTORE_ID_BYTES).as_str(),
         ] {
             assert!(
-                check_appstore_id(ok).is_ok(),
+                validate_appstore_id(ok).is_ok(),
                 "legitimate id {ok:?} should be accepted"
             );
         }
     }
 
     #[test]
-    fn check_appstore_id_rejects_path_traversal() {
+    fn validate_appstore_id_rejects_path_traversal() {
         // Without this refusal, `dir_for(id)` would escape the install root.
         for evil in [
             "..",
@@ -1090,20 +1115,39 @@ mod tests {
             "good/../bad/x",
         ] {
             assert!(
-                check_appstore_id(evil).is_err(),
+                validate_appstore_id(evil).is_err(),
                 "path-traversal-shaped id {evil:?} must be refused"
             );
         }
     }
 
     #[test]
-    fn check_appstore_id_rejects_empty_and_oversized() {
-        assert!(check_appstore_id("").is_err(), "empty id must be refused");
+    fn validate_appstore_id_rejects_empty_and_oversized() {
+        assert!(validate_appstore_id("").is_err(), "empty id must be refused");
         let huge = "x".repeat(MAX_APPSTORE_ID_BYTES + 1);
         assert!(
-            check_appstore_id(&huge).is_err(),
+            validate_appstore_id(&huge).is_err(),
             "id past MAX_APPSTORE_ID_BYTES must be refused"
         );
-        assert!(check_appstore_id("x\0y").is_err(), "NUL must be refused");
+        assert!(validate_appstore_id("x\0y").is_err(), "NUL must be refused");
+    }
+
+    /// REQ-A268 follow-up: the mutation commands (`appstore_install` /
+    /// `appstore_upgrade` / `appstore_uninstall`) must reject at the seam with
+    /// a **typed** `AmosError`, not a plain `String` — that way the JS layer's
+    /// `bridgeDiag()` sees a `code` and the UI can render a translated
+    /// explanation instead of silently swallowing a Tauri internal error into
+    /// `null`. Three pinned samples cover the three failure surfaces.
+    #[test]
+    fn validate_appstore_id_returns_typed_amose_errors() {
+        let e = validate_appstore_id("").unwrap_err();
+        assert_eq!(e.code(), "amos.appstore.id_empty");
+
+        let huge = "x".repeat(MAX_APPSTORE_ID_BYTES + 1);
+        let e = validate_appstore_id(&huge).unwrap_err();
+        assert_eq!(e.code(), "amos.appstore.id_too_long");
+
+        let e = validate_appstore_id("../etc/passwd").unwrap_err();
+        assert_eq!(e.code(), "amos.appstore.id_invalid");
     }
 }

@@ -88,6 +88,27 @@ pub enum ErrorCode {
     RagPayloadTooLong,
     /// Any RAG RPC failed (notes-index unreachable / rejected).
     RagRpcFailed,
+    // --- App Store (REQ-A268 follow-up: install / upgrade / uninstall surface) ---
+    /// `appstore_install` / `appstore_upgrade` / `appstore_uninstall` — caller-supplied
+    /// id is empty. The same check gates `appstore_status` and `appstore_bundle_entry`.
+    AppStoreIdEmpty,
+    /// Caller-supplied id exceeds [`MAX_APPSTORE_ID_BYTES`] (128 B). Long ids are
+    /// path segments; the cap prevents unbounded filesystem work from a paste attack.
+    AppStoreIdTooLong,
+    /// Caller-supplied id contains path metacharacters (`/` `\` `..`) that would
+    /// escape `<install-root>/` — refused before any filesystem call.
+    AppStoreIdInvalid,
+    /// The download → verify → install pipeline failed (provider unreachable, bundle
+    /// corrupted, verification rejected). The user-visible reason lives in `message`.
+    AppStoreInstallFailed,
+    /// The catalog has no newer release for this app, or the upgrade pipeline failed.
+    AppStoreUpgradeFailed,
+    /// Uninstall failed (installed registry write error, bundle cleanup error). The
+    /// uninstall is idempotent — retrying after a failure will still attempt removal.
+    AppStoreUninstallFailed,
+    /// Generic appstore RPC failure (status / catalog / find — surface as data so the
+    /// UI can show a translated message instead of swallowing it into `null`).
+    AppStoreRpcFailed,
 }
 
 impl ErrorCode {
@@ -133,6 +154,13 @@ impl ErrorCode {
             Self::AiBackendSwitchFailed => "amos.ai.backend_switch_failed",
             Self::RagPayloadTooLong => "amos.rag.payload_too_long",
             Self::RagRpcFailed => "amos.rag.rpc_failed",
+            Self::AppStoreIdEmpty => "amos.appstore.id_empty",
+            Self::AppStoreIdTooLong => "amos.appstore.id_too_long",
+            Self::AppStoreIdInvalid => "amos.appstore.id_invalid",
+            Self::AppStoreInstallFailed => "amos.appstore.install_failed",
+            Self::AppStoreUpgradeFailed => "amos.appstore.upgrade_failed",
+            Self::AppStoreUninstallFailed => "amos.appstore.uninstall_failed",
+            Self::AppStoreRpcFailed => "amos.appstore.rpc_failed",
         }
     }
 
@@ -271,6 +299,13 @@ mod tests {
             ErrorCode::AiBackendSwitchFailed,
             ErrorCode::RagPayloadTooLong,
             ErrorCode::RagRpcFailed,
+            ErrorCode::AppStoreIdEmpty,
+            ErrorCode::AppStoreIdTooLong,
+            ErrorCode::AppStoreIdInvalid,
+            ErrorCode::AppStoreInstallFailed,
+            ErrorCode::AppStoreUpgradeFailed,
+            ErrorCode::AppStoreUninstallFailed,
+            ErrorCode::AppStoreRpcFailed,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in codes {
@@ -299,6 +334,7 @@ mod tests {
         assert_eq!(ErrorCode::SmsProviderRejected.group(), "sms");
         assert_eq!(ErrorCode::AiRpcFailed.group(), "ai");
         assert_eq!(ErrorCode::RagRpcFailed.group(), "rag");
+        assert_eq!(ErrorCode::AppStoreInstallFailed.group(), "appstore");
     }
 
     #[test]
