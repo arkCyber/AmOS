@@ -784,8 +784,28 @@ pub fn sms_trash_list() -> Vec<TrashOut> {
 /// Undo a trash: the message shows in AmOS again. `true` when it was trashed.
 #[tauri::command]
 pub fn sms_trash_restore(thread_id: String, message_id: String) -> bool {
-    let _ = check_sms_id(&thread_id);
-    let _ = check_sms_id(&message_id);
+    // The bridge ID check is a **boundary** guard (empty / over-cap) — its
+    // `Err` is not propagated because the underlying `restore` keys by raw
+    // string, so an out-of-range id is a **no-op match** there and a quiet
+    // "false" would silently mask a UI/JSON bug. Log the validation failure so
+    // it is visible (the operator-level audit pattern, like the mkdir/cleanup
+    // sites already acknowledged in the discard baseline).
+    if let Err(e) = check_sms_id(&thread_id) {
+        tracing::warn!(
+            target: "amos::sms",
+            thread = %thread_id,
+            error = %e,
+            "sms_trash_restore called with an invalid thread_id"
+        );
+    }
+    if let Err(e) = check_sms_id(&message_id) {
+        tracing::warn!(
+            target: "amos::sms",
+            msg_id = %message_id,
+            error = %e,
+            "sms_trash_restore called with an invalid message_id"
+        );
+    }
     let ok = trash_shared().restore(&thread_id, &message_id);
     if ok {
         tracing::info!(
