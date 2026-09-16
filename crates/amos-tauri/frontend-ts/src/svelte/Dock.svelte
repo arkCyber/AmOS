@@ -11,7 +11,7 @@
   // 挂件（modules/Dock*Item.svelte）自带名字与动作；它们通过 getContext 拿到壳注入的
   // `SHELL_CHROME_API` 把手（`openLaunchpad`），拿不到 shellState、布局快照或别的挂件。
   import { appIcon, appTitleKey, APP_META } from "../lib/appMeta";
-  import { invoke } from "../lib/backend";
+  import { bridgeDiag, invoke } from "../lib/backend";
   import { getLayout } from "../lib/amosStore";
   import { withoutPhone } from "../lib/phoneApps";
   import { isDesktopFeatureEnabled } from "../lib/desktopFeatures";
@@ -97,17 +97,38 @@
   });
 
   async function refreshOpenWindows() {
-    try {
-      const raw = await invoke<{ windows: Array<{ label: string; state: string }> }>(
-        "wm_windows",
+    // REQ-A297 phase-2 §4: `invoke` swallows rejections into `null`
+    // (REQ-A296). The previous `try/catch` was dead code — the host
+    // could only ever resolve, either to a payload or to `null`. We
+    // now branch on the null result: when `wm_windows` is genuinely
+    // unavailable (not in a desktop form) the dock just keeps the
+    // last-known set; a typed refusion is logged instead of swallowed.
+    const raw = await invoke<{ windows: Array<{ label: string; state: string }> } | null>(
+      "wm_windows",
+    );
+    if (raw?.windows) {
+      openLabels = new Set(
+        raw.windows.filter((w) => w.state !== "Hidden").map((w) => w.label),
       );
-      if (raw?.windows) {
-        openLabels = new Set(
-          raw.windows.filter((w) => w.state !== "Hidden").map((w) => w.label),
+      return;
+    }
+    if (raw === null) {
+      const diag = bridgeDiag("wm_windows");
+      if (!diag.ok && diag.kind !== "not-bridged") {
+        // not-bridged is the normal "phone/tablet form factor" path;
+        // anything else (command-failed) is worth a breadcrumb because
+        // it means we ARE on desktop but the host still refused.
+        const code =
+          diag.kind === "command-failed" &&
+          diag.detail &&
+          typeof diag.detail === "object"
+            ? (diag.detail as { code?: string }).code
+            : undefined;
+        console.warn(
+          "🛟 [Dock] wm_windows refused",
+          code ?? diag.kind,
         );
       }
-    } catch {
-      /* wm_windows 在非桌面形态下不可用 */
     }
   }
 

@@ -7,7 +7,7 @@
    * row the shell can actually do, and lists the rest as macOS does — visible, greyed,
    * and named with the reason.
    */
-  import { invoke } from "../../lib/backend";
+  import { bridgeDiag, invoke } from "../../lib/backend";
   import { clipboardRead, clipboardWrite } from "../../lib/clipboard";
   import { t } from "../locale.svelte";
   import { toggleDesktopView } from "../../lib/desktopView";
@@ -35,6 +35,50 @@
     rows: MenuRow[];
   }
 
+  // REQ-A297 phase-2 §4 cont.2 (typed-error discipline). The bar's three
+  // wm_* rows used to be `invoke("wm_*", ...).catch(() => undefined)` —
+  // `catch` is dead code because `invoke` swallows rejections into `null`
+  // (REQ-A296). A refused wm_open / wm_close / wm_hide therefore
+  // silently dropped the user's File→New Window / Close / Minimize tap.
+  // We now branch on the null result via a tiny `noteFailure` helper
+  // and write a `🛟` breadcrumb to the launcher log so the failure is
+  // visible. Sharing one helper keeps the three rows symmetric — if a
+  // future View→Toggle Stage Module (or similar) needs the same
+  // shape, it can reuse this code rather than invent a new variant.
+  function noteFailure(
+    command: string,
+    label: string,
+    context: string,
+  ): void {
+    const diag = bridgeDiag(command);
+    if (diag.ok) return;
+    const code =
+      diag.kind === "command-failed" &&
+      diag.detail &&
+      typeof diag.detail === "object"
+        ? (diag.detail as { code?: string }).code
+        : undefined;
+    console.warn(
+      `🛟 [Topbar menu] ${context} — ${command}(${label}) refused`,
+      code ?? diag.kind,
+    );
+  }
+
+  /**
+   * Run a bar-row action. The shell has many rows that fire a `wm_*`
+   * command; reading the result and routing through `noteFailure` keeps
+   * the failure surface honest. The user still expects the menu to
+   * close on click — that's the topbar's job, not this helper's.
+   */
+  async function wmRun(
+    command: "wm_open" | "wm_close" | "wm_hide",
+    label: string,
+    context: string,
+  ): Promise<void> {
+    const result = await invoke<unknown>(command, { label });
+    if (result === null) noteFailure(command, label, context);
+  }
+
   // ─── File ────────────────────────────────────────────────────────────────────
   const fileRows: MenuRow[] = [
     {
@@ -42,7 +86,12 @@
       labelKey: "desktop.menu.file.newWindow",
       shortcutKey: "desktop.menu.file.newWindowShortcut",
       run: () => {
-        invoke("wm_open", { label: "files" }).catch(() => undefined);
+        // REQ-A297 phase-2 §4 cont.2: pre-fix this row used
+        // `.catch(() => undefined)` — dead code, since `invoke`
+        // resolves to `null` on a refused open instead of rejecting.
+        // The new helper logs the typed error so the user (and ops)
+        // can tell that "Open New Window" did nothing visible.
+        void wmRun("wm_open", "files", "file.new-window");
       },
     },
     {
@@ -50,7 +99,9 @@
       labelKey: "desktop.menu.file.closeWindow",
       shortcutKey: "desktop.menu.file.closeWindowShortcut",
       run: () => {
-        invoke("wm_close", { label: "" }).catch(() => undefined);
+        // Empty `label` is the macOS "close the focused window" idiom;
+        // a refused close surfaces honestly through `noteFailure`.
+        void wmRun("wm_close", "", "file.close");
       },
     },
     { id: "file.print", labelKey: "desktop.menu.file.printUnavailable" },
@@ -143,7 +194,10 @@
       labelKey: "desktop.menu.window.minimize",
       shortcutKey: "desktop.menu.window.minimizeShortcut",
       run: () => {
-        invoke("wm_hide", { label: "" }).catch(() => undefined);
+        // Empty `label` is the macOS "minimize the focused window"
+        // idiom — same as File→Close above. A refused minimize is
+        // surfaced via `noteFailure` rather than silently ignored.
+        void wmRun("wm_hide", "", "window.minimize");
       },
     },
     { id: "window.zoom", labelKey: "desktop.menu.window.zoomUnavailable" },

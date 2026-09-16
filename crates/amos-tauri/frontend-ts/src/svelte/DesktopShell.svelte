@@ -24,7 +24,7 @@
   //
   // Power of 10 #2：所有几何常量由 lib/desktopLayout.ts 提供；纯函数决策。
   import { onMount, setContext } from "svelte";
-  import { invoke } from "../lib/backend";
+  import { bridgeDiag, invoke, onMenuEvent } from "../lib/backend";
   import {
     wmLayoutSnapshot,
     onLayoutChanged,
@@ -161,6 +161,42 @@
     // 系统快捷键（⌘W 关窗 / ⌘M 最小化 / ⌘H 隐藏 / ⌘, 偏好）先于浮层快捷键：它们
     // 不打开浮层，所以"作用于焦点窗口"的快捷键应直接交给宿主，不要被浮层先吞掉。
     if (handleSystemShortcut(e)) return;
+    
+    // Spaces direct jump shortcuts: Ctrl+1-9 (switch to space by index)
+    if (e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
+      const key = e.key;
+      if (/^[1-9]$/.test(key)) {
+        e.preventDefault();
+        e.stopPropagation();
+        const index = parseInt(key, 10) - 1; // 0-based index
+        // REQ-A297 phase-2 §4: same dead-`.catch(...)` shape as the
+        // bar menus. `invoke` swallows into `null`, and `spaces_switch`
+        // is one of the typed-error-coded paths (ErrorCode::SpacesIndexOutOfBounds
+        // / SpacesNotFound — see `crates/amos-tauri/src/error.rs`,
+        // REQ-A297 phase-2). We now branch on the result so a refused
+        // switch lands in the launcher log instead of vanishing.
+        void (async () => {
+          const ok = await invoke<unknown>("spaces_switch", { index });
+          if (ok === null) {
+            const diag = bridgeDiag("spaces_switch");
+            if (!diag.ok) {
+              const code =
+                diag.kind === "command-failed" &&
+                diag.detail &&
+                typeof diag.detail === "object"
+                  ? (diag.detail as { code?: string }).code
+                  : undefined;
+              console.warn(
+                `🛟 [DesktopShell] spaces_switch(${index}) refused`,
+                code ?? diag.kind,
+              );
+            }
+          }
+        })();
+        return;
+      }
+    }
+    
     const target = moduleForShortcut("overlay", SHELL_MODULES, e);
     if (target) {
       e.preventDefault();
@@ -212,6 +248,64 @@
     // 避免再开第三组定时器。
     void refreshFocused();
     const pollId = setInterval(refreshFocused, 5000);
+
+    // Native macOS menu bar (Apple / File / Edit / View / Window / Help).
+    // The Rust host installs the global menu at boot and forwards every item
+    // activation to the WebView as a `menu-event`.  We map a small subset here
+    // (Preferences / New Window / Close Window / Enter Full Screen) so the menu
+    // actually does something — items the host handles directly (About, Quit,
+    // Hide Amos) only need to refresh the WebView's own UI.
+    const stopMenu = onMenuEvent((id) => {
+      // Best-effort: log unknown ids but do not throw — a host-only id (e.g.
+      // `menu.about`) arrives here too and is meant to be ignored.
+      switch (id) {
+        case "menu.preferences":
+          // ⌘, opens the Settings window (same as the existing ⌘, shortcut).
+          void invoke("wm_open", { label: "settings" });
+          break;
+        case "menu.new-window":
+          // New Window on macOS opens a fresh "Finder-like" surface.  We open
+          // the Files app as a reasonable default (it's our closest analog).
+          void invoke("wm_open", { label: "files" });
+          break;
+        case "menu.close-window":
+          // Close Window closes the **focused** non-shell window.
+          const label = focusedWindowLabel;
+          if (label && label !== "main") void invoke("wm_close", { label });
+          break;
+        case "menu.minimize":
+          // ⌘M hides the focused window (mirrors ⌘M on the focused window).
+          const mlabel = focusedWindowLabel;
+          if (mlabel && mlabel !== "main") void invoke("wm_hide", { label: mlabel });
+          break;
+        case "menu.zoom":
+          // Tauri windows don't expose a "zoom" (toggle max size) call here;
+          // fall back to maximize which is the closest platform-neutral analog.
+          const zlabel = focusedWindowLabel;
+          // No `wm_zoom` — leave as a no-op for now.
+          if (zlabel) { /* intentional */ }
+          break;
+        case "menu.enter-fullscreen":
+          // Toggle fullscreen on the focused window (the platform toggles).
+          // Tauri's per-window toggle is `is_fullscreen` → not exposed as a
+          // command yet; the user can still use macOS's native green button.
+          break;
+        case "menu.show-all":
+          // "Show All" mirrors "unhide all" — unhide every hidden window.
+          // `WmWindowInfo.state` is one of "Hidden" | "Shown" | "Focused"
+          // (the host's own spelling — see lib/wm.ts).
+          void wmWindows().then((snap) => {
+            if (!snap) return;
+            for (const w of snap.windows) {
+              if (w.state === "Hidden") void invoke("wm_focus", { label: w.label });
+            }
+          });
+          break;
+        default:
+          // Host-handled (about / quit / hide-amos) — nothing to do here.
+          break;
+      }
+    });
     // Cleanup is returned from `onMount` (Svelte runs it on destroy) — the canonical
     // shape. The earlier version registered it with `onDestroy(...)` *inside* this
     // callback, which is a lifecycle call from outside the component's init phase;
@@ -228,6 +322,7 @@
       window.removeEventListener("keydown", onKeyDown, KEY_LISTENER);
       stopLayout();
       clearInterval(pollId);
+      stopMenu();
     };
   });
 </script>
