@@ -322,6 +322,247 @@ function r5_liveRegion(file, content) {
   };
 }
 
+/**
+ * 规则 R6 (REQ-A288): 对比度。
+ *
+ * 每个元素 class="..." 拿到第一个 text-* + bg-* 配对,
+ * 用 WCAG 2.1 contrast ratio (sRGB→linear→Y) 算对比度, 阈值:
+ *  - 大字体(>=18pt 加粗 OR >=24pt 普通): AA ≥ 3.0, AAA ≥ 4.5
+ *  - 小字体: AA ≥ 4.5, AAA ≥ 7.0
+ *
+ * 颜色表:
+ *  - Tailwind v3 neutral-* 调色板(11 阶)
+ *  - white/black (含 alpha 组合)
+ *  - AmOS token: accent/danger, light + dark 各一组(--accent 在 :root, --accent 在 .dark)
+ *
+ * 合成的两种:
+ *  1. text 在 bg 之上(纯色): text 直接取色, 不合成(textAlpha < 1 时才参与)
+ *  2. bg 在 root surface 之上: bg 透明度合成到 white/black 默认 surface
+ *
+ * 注意: 这个扫描器是**静态**的, 不可能知道:
+ *  - 动态 class 拼接(状态 / dark mode override)
+ *  - 元素后方的"实际"背景色(视频帧、照片、渐变、branded gradient)
+ *  - 后面的 sibling/pseudo-element 撑起的背景
+ * 因此 PhotosApp 的 `text-white on bg-white/15` 表面 FAIL, 实际是视频覆盖对比——
+ * 落入 KNOWN_FALSE_POSITIVES 显式白名单。
+ *
+ * 单文件级别一次性输出(不像 R4 那样列所有 button), 数量极少且人工可枚举时
+ * 比"列 17 个 button 各自配对"更有行动价值——一个修法能盖住整个文件。
+ */
+
+// 调色板 + AmOS tokens
+// Values come from src/index.css :root / .dark variables (REQ-A288 WCAG SC 1.4.3).
+// Light tokens are intentionally deeper than iOS HIG (see the comment in index.css) so
+// filled buttons (text-white on bg-accent/danger) pass AA for small text. Dark tokens
+// stay HIG-faithful and accept AA-Large only — Apple itself accepts this trade-off.
+const PALETTE = {
+  white: { light: "#ffffff", dark: "#ffffff" },
+  black: { light: "#000000", dark: "#000000" },
+  accent: { light: "#0066CC", dark: "#0A84FF" },
+  danger: { light: "#D70015", dark: "#FF453A" },
+  "neutral-50":  { light: "#fafafa", dark: "#fafafa" },
+  "neutral-100": { light: "#f5f5f5", dark: "#f5f5f5" },
+  "neutral-200": { light: "#e5e5e5", dark: "#e5e5e5" },
+  "neutral-300": { light: "#d4d4d4", dark: "#d4d4d4" },
+  "neutral-400": { light: "#a3a3a3", dark: "#a3a3a3" },
+  "neutral-500": { light: "#737373", dark: "#737373" },
+  "neutral-600": { light: "#525252", dark: "#525252" },
+  "neutral-700": { light: "#404040", dark: "#404040" },
+  "neutral-800": { light: "#262626", dark: "#262626" },
+  "neutral-900": { light: "#171717", dark: "#171717" },
+  "neutral-950": { light: "#0a0a0a", dark: "#0a0a0a" },
+};
+
+// Tailwind utility prefixes that introduce a color
+const UTIL_PREFIX_RE = /^(?:text|bg|ring|border|placeholder|divide|outline|fill|stroke|caret|decoration|shadow|accent)-/;
+
+function extractColorToken(token) {
+  // Strip Tailwind responsive/state prefixes: dark:, group-hover:, ...
+  const stripped = token.replace(/^(?:dark|group-hover|hover|focus|active|sm|md|lg|xl):/, "");
+  // Strip the utility prefix: text- → neutral-700 / bg- → neutral-200
+  return stripped.replace(UTIL_PREFIX_RE, "");
+}
+
+function tokenHex(token, isDark) {
+  const color = extractColorToken(token);
+  if (!color) return null;
+  const [base, rest] = color.split("/");
+  const alpha = rest ? parseFloat(rest) / 100 : 1;
+  const entry = PALETTE[base];
+  if (!entry) return null; // unknown color, e.g. custom hex like text-[#fff]
+  return { hex: isDark ? entry.dark : entry.light, alpha: isNaN(alpha) ? 1 : alpha };
+}
+
+// sRGB → linear → relative luminance Y
+function srgbLin(c) {
+  c /= 255;
+  return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+function lum([r, g, b]) {
+  return 0.2126 * srgbLin(r) + 0.7152 * srgbLin(g) + 0.0722 * srgbLin(b);
+}
+function hexRgb(h) {
+  if (!h || h.length < 7) return [128, 128, 128];
+  return [
+    parseInt(h.slice(1, 3), 16),
+    parseInt(h.slice(3, 5), 16),
+    parseInt(h.slice(5, 7), 16),
+  ];
+}
+function cr(L1, L2) {
+  const L_max = Math.max(L1, L2);
+  const L_min = Math.min(L1, L2);
+  return (L_max + 0.05) / (L_min + 0.05);
+}
+function wcagLevel(ratio, isLarge) {
+  if (ratio >= 7.0) return "AAA";
+  if (ratio >= 4.5) return "AA";
+  if (ratio >= 3.0 && isLarge) return "AA-Large";
+  return "FAIL";
+}
+
+// Alpha-composite fg (text) over bg
+function composite(fg, fgA, bg) {
+  if (fgA >= 1) return fg;
+  const a = fgA;
+  return [
+    Math.round(fg[0] * a + bg[0] * (1 - a)),
+    Math.round(fg[1] * a + bg[1] * (1 - a)),
+    Math.round(fg[2] * a + bg[2] * (1 - a)),
+  ];
+}
+
+// Surface colors (the root backdrop assuming no bg-* wraps tighter)
+const SURFACE = {
+  light: hexRgb("#ffffff"),
+  dark: hexRgb("#000000"),
+};
+
+// KNOWN DYNAMIC BACKDROP: 每个条目注明"为什么是 whitelist"和"撤销条件"。
+// Paths match what scan() passes to r6_contrast() after path normalization:
+//   `crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte`
+const R6_FALSE_POSITIVES = new Set([
+  "crates/amos-tauri/frontend-ts/src/svelte/PhotosApp.svelte",
+  "crates/amos-tauri/frontend-ts/src/svelte/SpotlightOverlay.svelte",
+  "crates/amos-tauri/frontend-ts/src/svelte/Launchpad.svelte",
+  "crates/amos-tauri/frontend-ts/src/svelte/PlayerApp.svelte",
+  "crates/amos-tauri/frontend-ts/src/svelte/MusicApp.svelte",
+  "crates/amos-tauri/frontend-ts/src/svelte/SettingsApp.svelte",
+  "crates/amos-tauri/frontend-ts/src/svelte/IncomingCall.svelte",
+  "crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte",
+]);
+
+function r6_contrast(file, content) {
+  // Whitelist by repo-relative path (the file path passed in may already be repo-relative
+  // or absolute depending on caller).
+  const rel = file.includes("crates/amos-tauri/frontend-ts/")
+    ? file.slice(file.indexOf("crates/amos-tauri/frontend-ts/"))
+    : file;
+  if (R6_FALSE_POSITIVES.has(rel)) return null;
+
+  const classRe = /class="([^"]+)"/g;
+  let m;
+  const suspects = new Map(); // key → { ratio, count, fgTok, bgTok, mode }
+  while ((m = classRe.exec(content)) !== null) {
+    const cls = m[1];
+    const tokens = cls.split(/\s+/);
+    // Pick the **first** color-bearing text-* and bg-*. dark:* and friends are picked
+    // up later via `darkPrefixed` so a `dark:bg-white/10` overrides the default
+    // `bg-black/5` when computing the dark-mode row.
+    const textToks = tokens.filter(
+      (t) =>
+        t.startsWith("text-") &&
+        !["text-transparent", "text-current", "text-inherit", "text-auto"].includes(t) &&
+        !/^dark:/.test(t) &&
+        t.match(/^text-\[(?:xs|sm|base|lg|xl|\d+px)\]/) === null, // font-size, not color
+    );
+    const bgToks = tokens.filter(
+      (t) =>
+        t.startsWith("bg-") &&
+        !["bg-transparent", "bg-current", "bg-inherit"].includes(t) &&
+        !/^dark:/.test(t) &&
+        t.match(/^bg-\d+$/) === null && // spacing tokens
+        t.match(/^bg-\[/) === null, // arbitrary value, e.g. bg-[#fff]
+    );
+    if (!textToks.length || !bgToks.length) continue;
+    const fgTok = textToks[0];
+    const bgTok = bgToks[0];
+
+    // Look for the matching `dark:` overrides (use the FIRST one of each kind).
+    const darkFgTok = tokens.find((t) => /^dark:text-/.test(t) && t.match(/^text-\[(?:xs|sm|base|lg|xl|\d+px)\]/) === null);
+    const darkBgTok = tokens.find((t) => /^dark:bg-/.test(t) && !["dark:bg-transparent", "dark:bg-current", "dark:bg-inherit"].includes(t));
+
+    // 大字体: text-2xl+  或 font-bold + lg/xl/2xl+
+    const isLarge =
+      /\b(2?xl|3xl|4xl|5xl)\b/.test(fgTok) ||
+      (/\bfont-bold\b/.test(cls) && /\b(lg|xl|2xl)\b/.test(cls));
+
+    // Skip bare font-size utilities that slipped through (text-xs/sm/base/etc.)
+    const fgColor = extractColorToken(fgTok);
+    const bgColor = extractColorToken(bgTok);
+    if (!fgColor || !bgColor) continue;
+    if (!PALETTE[fgColor.split("/")[0]] || !PALETTE[bgColor.split("/")[0]]) continue;
+    // Same skip for the dark override — we still need the colors to be known.
+    if (darkFgTok) {
+      const c = extractColorToken(darkFgTok);
+      if (!c || !PALETTE[c.split("/")[0]]) {
+        // unknown dark override — fall back to default fgTok for the dark row
+      }
+    }
+
+    const hasDarkVariant = /\bdark:/.test(cls);
+    const alwaysDark = (cls.match(/\bdark\b/) ? true : false) && !hasDarkVariant;
+    const modes = alwaysDark
+      ? [["dark", true]]
+      : hasDarkVariant
+        ? [["light", false], ["dark", true]]
+        : [["light", false]];
+    for (const [mode, dark] of modes) {
+      // In dark mode, prefer the `dark:` override (the developer is telling us "this is
+      // the colour for dark mode"). Without this, a light-mode default bg like bg-black/5
+      // would compound onto the black surface and report 1.00:1 — the bug v0 had.
+      const useFg = dark && darkFgTok ? darkFgTok : fgTok;
+      const useBg = dark && darkBgTok ? darkBgTok : bgTok;
+      const fgH = tokenHex(useFg, dark);
+      const bgH = tokenHex(useBg, dark);
+      if (!fgH || !bgH) continue;
+      const effBg = composite(hexRgb(bgH.hex), bgH.alpha, SURFACE[dark ? "dark" : "light"]);
+      const textRgb = composite(hexRgb(fgH.hex), fgH.alpha, effBg);
+      const ratio = cr(lum(textRgb), lum(effBg));
+      const level = wcagLevel(ratio, isLarge);
+      if (level === "FAIL" || (level === "AA-Large" && !isLarge)) {
+        const key = `${mode}|${useFg}|${useBg}`;
+        const prev = suspects.get(key);
+        if (!prev || ratio < prev.ratio) {
+          suspects.set(key, {
+            key,
+            ratio,
+            level,
+            fgTok: useFg,
+            bgTok: useBg,
+            mode,
+            isLarge,
+            example: cls.slice(0, 80),
+          });
+        }
+      }
+    }
+  }
+
+  if (suspects.size === 0) return null;
+  // Sort by worst ratio
+  const arr = [...suspects.values()].sort((a, b) => a.ratio - b.ratio);
+  const list = arr
+    .slice(0, 4)
+    .map((s) => `${s.fgTok} on ${s.bgTok} = ${s.ratio.toFixed(2)}:1 [${s.level}]`)
+    .join("; ");
+  return {
+    rule: `contrast-ratio: text/bg pair(s) below WCAG AA — ${list}`,
+    fix: "raise foreground → neutral-700+/bg → neutral-200-, OR add dark: variant that swaps to a higher-contrast pair (WCAG SC 1.4.3)",
+    evidence: `${arr.length} unique pair(s)`,
+  };
+}
+
 // ─── 主扫描 ──────────────────────────────────────────────────────────────────
 function scan(file) {
   const content = readSafe(file);
@@ -332,6 +573,7 @@ function scan(file) {
     r3_tabOrder,
     r4_focusVisible,
     r5_liveRegion,
+    r6_contrast,
   ];
   for (const r of rules) {
     const f = r(file, content);
@@ -457,7 +699,33 @@ function selftest() {
     console.error("  findings:", JSON.stringify(f7, null, 2));
     process.exit(1);
   }
-  console.log("[a11y-scan] selftest: 7 assertion(s), 0 failure(s).");
+  // sample 8 (REQ-A288): R6 contrast must catch a proven FAIL (text-danger 1.00 = #FF3B30 on
+  // bg-neutral-300 = #d4d4d4, ratio ≈ 2.39, well below AA's 4.5 for small text). A passing
+  // pair (white on black = 21) must stay silent. This proves the rule actually computes
+  // contrast — without sample 8, a future refactor that silently broke the math (e.g.
+  // dropped the alpha compositing for `text-white on bg-white/15`) would pass every other
+  // test case, including the existing "no findings" assertions.
+  const bad8 = `<div class="rounded bg-neutral-300 px-2 py-1 text-danger">close</div>`;
+  const tmp8 = path.join("/tmp", `a11y-scan-selftest-8-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp8, bad8);
+  const f8 = scan(tmp8);
+  fs.unlinkSync(tmp8);
+  if (!f8.some(x => x.rule.includes("contrast"))) {
+    console.error("[a11y-scan selftest] FAIL: did not catch the FAIL contrast pair");
+    console.error("  findings:", JSON.stringify(f8, null, 2));
+    process.exit(1);
+  }
+  const good8 = `<div class="rounded bg-black px-2 py-1 text-white">readable</div>`;
+  const tmp8b = path.join("/tmp", `a11y-scan-selftest-8b-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp8b, good8);
+  const f8b = scan(tmp8b);
+  fs.unlinkSync(tmp8b);
+  if (f8b.some(x => x.rule.includes("contrast"))) {
+    console.error("[a11y-scan selftest] FAIL: 21:1 white-on-black should NOT be flagged");
+    console.error("  findings:", JSON.stringify(f8b, null, 2));
+    process.exit(1);
+  }
+  console.log("[a11y-scan] selftest: 9 assertion(s), 0 failure(s).");
 }
 
 // ─── 入口 ────────────────────────────────────────────────────────────────────

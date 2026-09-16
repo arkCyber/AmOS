@@ -434,7 +434,7 @@
         aria-label={t("shell.search")}
         title={t("shell.search")}
         onclick={() => home.emit("search")}
-        class="flex h-6 cursor-pointer items-center gap-1 rounded-full bg-white/45 px-2 text-[11px] font-medium text-neutral-700 shadow-sm ring-1 ring-black/5 transition hover:scale-105 active:scale-90 dark:bg-white/10 dark:text-neutral-200 dark:ring-white/10"
+        class="flex h-6 cursor-pointer items-center gap-1 rounded-full bg-white/70 px-2 text-[11px] font-medium text-neutral-800 shadow-sm ring-1 ring-black/10 transition hover:scale-105 active:scale-90 dark:bg-white/15 dark:text-neutral-100 dark:ring-white/15"
       >
         <span aria-hidden="true" class="text-[10px] leading-none">🔍</span>
         <span>{t("shell.search")}</span>

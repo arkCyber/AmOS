@@ -704,7 +704,7 @@
                 <button onclick={() => smsBack(it.num)} aria-label={`sms-back-${it.num}`} title={t("phone.smsBack")} data-icon="messageCircle"
                   class="grid h-10 w-10 place-items-center rounded-full bg-accent/15 text-accent active:scale-90">{@html iconSvg("messageCircle", "h-[18px] w-[18px]")}</button>
                 <button onclick={() => blockFromRecents(it.num)} aria-label={`block-caller-${it.num}`} title={t("phone.blockThisNumber")} data-icon="x"
-                  class="grid h-10 w-10 place-items-center rounded-full bg-danger/10 text-danger active:scale-90 dark:bg-danger/20">{@html iconSvg("x", "h-[18px] w-[18px]")}</button>
+                  class="grid h-10 w-10 place-items-center rounded-full bg-danger/15 text-danger active:scale-90 dark:bg-danger/30">{@html iconSvg("x", "h-[18px] w-[18px]")}</button>
               </div>
             </li>
           {/each}

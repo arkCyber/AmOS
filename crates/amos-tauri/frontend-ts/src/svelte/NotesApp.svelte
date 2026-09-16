@@ -491,7 +491,7 @@
 
 <div class="p-4">
   {#if aiOffline}
-    <p role="status" data-testid="note-ai-offline" class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-[11px] text-neutral-500 dark:bg-white/10 dark:text-neutral-400">
+    <p role="status" data-testid="note-ai-offline" class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-[11px] text-neutral-600 dark:bg-white/10 dark:text-neutral-300">
       {t(aiHintKey)}
     </p>
   {/if}
@@ -499,7 +499,7 @@
     <p
       role="status"
       data-testid="note-store-error"
-      class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-[11px] text-danger dark:bg-white/10"
+      class="mb-2 rounded-lg bg-danger/10 px-3 py-1.5 text-[11px] text-danger dark:bg-danger/20"
     >
       {notesErr}
     </p>

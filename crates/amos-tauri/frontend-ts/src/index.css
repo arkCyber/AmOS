@@ -4,14 +4,23 @@
 
 /* iOS adaptive system colors. Utilities reference these as RGB channels so that
    opacity suffixes (bg-accent/15, ring-danger/…) keep working in both themes.
-   Light ≈ systemBlue/systemRed; dark lightens both (HIG dark palette). */
+   Light/dark pair chosen for WCAG SC 1.4.3 (Contrast, Minimum):
+   - white on --accent light: 5.57:1 (AA, was 4.02:1 with HIG #007AFF)
+   - white on --accent dark:  3.65:1 (HIG iOS dark blue; AA-Large only — buttons
+     must use ≥18pt OR bold+≥14pt; small-text iOS dark buttons intentionally stay
+     HIG-faithful and surface this trade-off in docs/A11Y_AUDIT.md §3.1.8)
+   - white on --danger light: 5.38:1 (AA, was 3.55:1 with HIG #FF3B30)
+   - white on --danger dark:  3.41:1 (HIG iOS dark red; AA-Large only, same caveat)
+   Light tokens are intentionally **slightly deeper** than iOS HIG so small text
+   inside filled buttons passes AA; dark tokens stay HIG-faithful and accept the
+   AA-Large-only label inside dark buttons. */
 :root {
-  --accent: 0 122 255; /* iOS system blue (light)   #007AFF */
-  --danger: 255 59 48; /* iOS system red  (light)   #FF3B30 */
+  --accent: 0 102 204; /* AA-blue (light)              #0066CC */
+  --danger: 215 0 21;  /* AA-red  (light)              #D70015 */
 }
 .dark {
-  --accent: 10 132 255; /* iOS system blue (dark)   #0A84FF */
-  --danger: 255 69 58; /* iOS system red  (dark)   #FF453A */
+  --accent: 10 132 255; /* iOS system blue (dark)        #0A84FF */
+  --danger: 255 69 58;  /* iOS system red  (dark)        #FF453A */
 }
 
 /* base scrollbar + tap feel, iOS-ish */
