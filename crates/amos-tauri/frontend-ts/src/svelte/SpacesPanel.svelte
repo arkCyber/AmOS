@@ -19,6 +19,7 @@
     type Space,
   } from "../lib/spaces";
   import { bridgeDiag } from "../lib/backend";
+  import { t } from "./locale.svelte";
 
   let spaces = $state<Space[]>([]);
   let currentIndex = $state(0);
@@ -35,24 +36,24 @@
    */
   function spacesErrorLabel(command: string): string {
     const diag = bridgeDiag(command);
-    if (diag.ok) return "操作失败 (无详情)";
+    if (diag.ok) return t("spaces.errorUnknown");
     const detail =
       diag.kind === "command-failed" && typeof diag.detail === "object" && diag.detail
         ? (diag.detail as { code?: string; message?: string })
         : null;
     switch (detail?.code) {
       case "amos.spaces.lock_failed":
-        return "内部锁失败,请稍后再试";
+        return t("spaces.errorLockFailed");
       case "amos.spaces.serialization_failed":
-        return "保存失败 (本地存储不可写)";
+        return t("spaces.errorSerialization");
       case "amos.spaces.not_found":
-        return "找不到该桌面 (可能已经被删除)";
+        return t("spaces.errorNotFound");
       case "amos.spaces.index_out_of_bounds":
-        return "桌面索引超出范围";
+        return t("spaces.errorOutOfBounds");
       case "amos.spaces.delete_last":
-        return "无法删除最后一个桌面";
+        return t("spaces.errorDeleteLast");
       default:
-        return detail?.message ?? "操作失败";
+        return detail?.message ?? t("spaces.errorUnknown");
     }
   }
 
@@ -120,8 +121,7 @@
   }
 
   async function handleCreate() {
-    const name = `桌面 ${spaces.length + 1}`;
-    const newId = await createSpace(name);
+    const newId = await createSpace(`Desktop ${spaces.length + 1}`);
     if (newId === null) {
       error = spacesErrorLabel("spaces_create");
       return;
@@ -131,7 +131,7 @@
 
   async function handleDelete(id: string) {
     if (spaces.length <= 1) {
-      error = "无法删除最后一个桌面";
+      error = t("spaces.cannotDeleteLast");
       return;
     }
 
@@ -184,14 +184,14 @@
   <!-- 头部 -->
   <div class="flex items-center justify-between mb-6">
     <h2 class="text-2xl font-semibold text-neutral-800 dark:text-neutral-200">
-      虚拟桌面管理
+      {t("spaces.title")}
     </h2>
     <button
       onclick={handleCreate}
       class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors disabled:opacity-50"
       disabled={loading}
     >
-      ＋ 新建桌面
+      {t("spaces.newDesktop")}
     </button>
   </div>
 
@@ -199,7 +199,7 @@
   {#if error}
     <div class="mb-4 p-3 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 rounded-lg">
       ⚠️ {error}
-      <button onclick={() => (error = null)} class="ml-2 underline">关闭</button>
+      <button onclick={() => (error = null)} class="ml-2 underline">{t("spaces.dismiss")}</button>
     </div>
   {/if}
 
@@ -207,7 +207,7 @@
   {#if loading}
     <div class="flex items-center justify-center py-12">
       <div class="animate-spin text-4xl">⏳</div>
-      <span class="ml-3 text-neutral-600 dark:text-neutral-400">加载中...</span>
+      <span class="ml-3 text-neutral-600 dark:text-neutral-400">{t("spaces.loading")}</span>
     </div>
   {:else}
     <!-- Spaces 列表 -->
@@ -241,13 +241,13 @@
                 onclick={() => saveEdit(space.id)}
                 class="flex-1 px-2 py-1 bg-green-600 text-white rounded text-sm"
               >
-                保存
+                {t("spaces.save")}
               </button>
               <button
                 onclick={cancelEdit}
                 class="flex-1 px-2 py-1 bg-neutral-600 text-white rounded text-sm"
               >
-                取消
+                {t("spaces.cancel")}
               </button>
             </div>
           {:else}
@@ -261,7 +261,7 @@
                   startEdit(space);
                 }}
                 class="text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300"
-                title="重命名"
+                title={t("spaces.rename")}
               >
                 ✏️
               </button>
@@ -269,28 +269,28 @@
 
             <!-- 窗口数量 -->
             <div class="text-sm text-neutral-600 dark:text-neutral-400 mb-3">
-              {space.windows.length} 个窗口
+              {t("spaces.windowCount", { n: space.windows.length })}
             </div>
 
             <!-- 操作按钮 -->
             <div class="flex gap-2" onclick={(e) => e.stopPropagation()}>
               {#if currentIndex === index}
                 <div class="flex-1 px-2 py-1 bg-blue-600 text-white text-center rounded text-sm">
-                  当前桌面
+                  {t("spaces.currentDesktop")}
                 </div>
               {:else}
                 <button
                   onclick={() => handleSwitch(index)}
                   class="flex-1 px-2 py-1 bg-neutral-600 hover:bg-neutral-700 text-white rounded text-sm"
                 >
-                  切换
+                  {t("spaces.switch")}
                 </button>
               {/if}
               <button
                 onclick={() => handleDelete(space.id)}
                 class="px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm disabled:opacity-50"
                 disabled={spaces.length <= 1}
-                title={spaces.length <= 1 ? "无法删除最后一个桌面" : "删除"}
+                title={spaces.length <= 1 ? t("spaces.cannotDeleteLast") : t("spaces.delete")}
               >
                 🗑️
               </button>
@@ -302,22 +302,22 @@
 
     <!-- 快捷键提示 -->
     <div class="mt-8 p-4 bg-neutral-100 dark:bg-neutral-800 rounded-lg">
-      <h3 class="font-medium mb-3 text-neutral-800 dark:text-neutral-200">⌨️ 快捷键</h3>
+      <h3 class="font-medium mb-3 text-neutral-800 dark:text-neutral-200">{t("spaces.shortcuts")}</h3>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
         <div class="flex justify-between">
-          <span class="text-neutral-600 dark:text-neutral-400">切换到上一个桌面：</span>
+          <span class="text-neutral-600 dark:text-neutral-400">{t("spaces.shortcutPrev")}</span>
           <kbd class="px-2 py-1 bg-neutral-200 dark:bg-neutral-700 rounded">Ctrl+←</kbd>
         </div>
         <div class="flex justify-between">
-          <span class="text-neutral-600 dark:text-neutral-400">切换到下一个桌面：</span>
+          <span class="text-neutral-600 dark:text-neutral-400">{t("spaces.shortcutNext")}</span>
           <kbd class="px-2 py-1 bg-neutral-200 dark:bg-neutral-700 rounded">Ctrl+→</kbd>
         </div>
         <div class="flex justify-between">
-          <span class="text-neutral-600 dark:text-neutral-400">Mission Control：</span>
+          <span class="text-neutral-600 dark:text-neutral-400">{t("spaces.shortcutMission")}</span>
           <kbd class="px-2 py-1 bg-neutral-200 dark:bg-neutral-700 rounded">F3</kbd>
         </div>
         <div class="flex justify-between">
-          <span class="text-neutral-600 dark:text-neutral-400">新建桌面：</span>
+          <span class="text-neutral-600 dark:text-neutral-400">{t("spaces.shortcutNew")}</span>
           <kbd class="px-2 py-1 bg-neutral-200 dark:bg-neutral-700 rounded">Ctrl+↑</kbd>
         </div>
       </div>
@@ -345,9 +345,14 @@
     transition: all 0.2s;
   }
 
-  .space-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  /* REQ-A331: a component <style> block is **outside** Tailwind's
+     `hoverOnlyWhenSupported`, so a bare `:hover` here is a sticky-hover regression on touch
+     (the tile stays lifted after a tap). Scoped like the dock magnifier in `index.css`. */
+  @media (hover: hover) {
+    .space-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    }
   }
 
   kbd {

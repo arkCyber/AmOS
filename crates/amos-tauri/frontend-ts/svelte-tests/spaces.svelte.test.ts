@@ -38,23 +38,29 @@ describe("SpacesPanel.svelte - 模块完整性", () => {
   test("组件文件包含正确的内容", async () => {
     const fs = await import("fs");
     const path = await import("path");
-    
+
     const componentPath = path.resolve(
       __dirname,
       "../src/svelte/SpacesPanel.svelte"
     );
-    
+
     const content = fs.readFileSync(componentPath, "utf-8");
-    
-    // 验证关键元素存在
-    expect(content).toContain("虚拟桌面管理");
-    expect(content).toContain("新建桌面");
+
+    // 验证关键元素存在 — REQ-A297 phase-2 i18n 扫除后,文案都走 t() 了。
+    expect(content).toContain("spaces.title");
+    expect(content).toContain("spaces.newDesktop");
     expect(content).toContain("listSpaces");
     expect(content).toContain("switchSpace");
     expect(content).toContain("createSpace");
     expect(content).toContain("deleteSpace");
     expect(content).toContain("renameSpace");
     expect(content).toContain("space-card");
+    // i18n-scan 的硬要求 — 文件的 user-visible markup 再不许有 zh 字面量。
+    // (JSDoc 注释里的中文不算 — i18n-scan 只看 markup,跟它口径一致。)
+    expect(content).toContain("spaces.title");
+    expect(content).not.toContain("新建桌面");
+    expect(content).not.toContain("加载失败");
+    expect(content).not.toContain("加载中");
   });
 
   test("组件文件包含样式定义", async () => {
