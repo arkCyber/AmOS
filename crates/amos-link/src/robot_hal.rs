@@ -43,6 +43,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::{LinkError, Result};
 use crate::keyexpr::{Channel, Topic};
+use crate::platform::{IntentClass, Vocabulary};
 use crate::pubsub::Publisher;
 
 /// Frame start bytes (`0xAA55`).
@@ -1287,6 +1288,9 @@ impl ActuationState {
 ///    [`EstopReason::Watchdog`]: the honest answer to "the Wi-Fi died mid-stride".
 pub struct RobotBridge<H: RobotHal> {
     subscriber: crate::pubsub::Subscriber<AgentAction>,
+    /// How the control channel is read: the reference machine's gaits, or a platform profile's
+    /// vocabulary. The safety core below is identical for both.
+    vocabulary: Vocabulary,
     hal: H,
     watchdog: Option<Duration>,
     estop_latched: bool,
@@ -1315,6 +1319,7 @@ impl<H: RobotHal> RobotBridge<H> {
     pub fn new(subscriber: crate::pubsub::Subscriber<AgentAction>, hal: H) -> Self {
         Self {
             subscriber,
+            vocabulary: Vocabulary::Reference,
             hal,
             watchdog: None,
             estop_latched: false,
@@ -1342,6 +1347,7 @@ impl<H: RobotHal> RobotBridge<H> {
     ) -> Self {
         Self {
             subscriber,
+            vocabulary: Vocabulary::Reference,
             hal,
             watchdog: Some(period),
             estop_latched: false,
@@ -1355,6 +1361,55 @@ impl<H: RobotHal> RobotBridge<H> {
             last_frames: 0,
             last_refusal: None,
         }
+    }
+
+    /// The same safety core, driven by a **platform profile**'s vocabulary.
+    ///
+    /// The e-stop latch, the deadman, the refusal-with-a-reason and the return path are the code
+    /// below — unchanged. What changes is what an action *means*: `{"action":"takeoff"}` is a
+    /// `Motion` on the drone profile (refused while latched) and `{"action":"enable"}` is its
+    /// `Arm`; the sentence a refusal carries names *that* key, never an `arm` the machine does
+    /// not have.
+    ///
+    /// The deadman period comes from the profile's own [`SafetyEnvelope`], and an envelope a
+    /// bridge cannot honour (zero, or longer than a report may carry) is refused **here** rather
+    /// than at the first missed beat.
+    ///
+    /// The shared return document's `gait` field is left `None` for a profile: it is the
+    /// reference machine's vocabulary, and putting a profile's action key there would be a
+    /// payload-schema change (with its proto and UI consequences) rather than a report. A profile
+    /// publishes its own mode on its own topic — see docs/robot-domains.md.
+    ///
+    /// [`SafetyEnvelope`]: crate::platform::SafetyEnvelope
+    pub fn for_platform(
+        subscriber: crate::pubsub::Subscriber<AgentAction>,
+        hal: H,
+        platform: &'static crate::platform::Platform,
+    ) -> Result<Self> {
+        let envelope = platform.envelope();
+        envelope.validate()?;
+        Ok(Self {
+            subscriber,
+            vocabulary: Vocabulary::Profile(platform),
+            hal,
+            watchdog: Some(envelope.watchdog),
+            estop_latched: false,
+            estop_reason: None,
+            reporter: None,
+            last_reported: None,
+            last_report_at: None,
+            report_refresh: DEFAULT_REPORT_REFRESH,
+            last_seq: None,
+            last_gait: None,
+            last_frames: 0,
+            last_refusal: None,
+        })
+    }
+
+    /// Which machine this bridge speaks for (`quadruped`, `drone`, …): the profile's kind, or the
+    /// reference machine's for a bridge built by [`RobotBridge::new`].
+    pub fn platform_label(&self) -> &'static str {
+        self.vocabulary.label()
     }
 
     /// Report this bridge's actuation state on the link (see [`ActuationState`]).
@@ -1471,11 +1526,23 @@ impl<H: RobotHal> RobotBridge<H> {
             Some(period) => match tokio::time::timeout(period, self.subscriber.recv()).await {
                 Ok(result) => result?,
                 Err(_) => {
-                    // Deadman: no action within the period → cut torque and latch.
-                    // The frame count comes back from the HAL, not from a guess: how many
-                    // frames a cut takes is the driver's business (one per joint, one
-                    // broadcast, a hardware line), and a report must carry a measured number.
-                    let frames = self.hal.estop().await?;
+                    // Deadman: no action within the period → cut torque / stop, and latch.
+                    //
+                    // What the stop *is* depends on how this loop reads the control channel:
+                    // a platform profile knows its own actuator table, so its halt batch is the
+                    // profile's (a car's deadman is full braking, a drone's is its six motors);
+                    // the reference machine keeps the HAL's own cut, because a bus may cut torque
+                    // with a single hardware line and that shape is the driver's business.
+                    //
+                    // Either way the count comes back from what the bus **accepted** — never from
+                    // a guess — and the report carries a measured number.
+                    let frames = match self.vocabulary.platform() {
+                        Some(platform) => {
+                            let halt = platform.halt_frames()?;
+                            self.hal.apply(&halt).await?
+                        }
+                        None => self.hal.estop().await?,
+                    };
                     self.estop_latched = true;
                     self.estop_reason = Some(EstopReason::Watchdog);
                     tracing::warn!(
@@ -1493,8 +1560,8 @@ impl<H: RobotHal> RobotBridge<H> {
         };
         let seq = received.seq;
 
-        let command = match received.message.parse() {
-            Ok(command) => command,
+        let intent = match self.vocabulary.parse(&received.message.json) {
+            Ok(intent) => intent,
             Err(e) => {
                 // Malformed intent never reaches the bus (and never silently becomes a
                 // default pose).
@@ -1510,14 +1577,14 @@ impl<H: RobotHal> RobotBridge<H> {
             }
         };
 
-        if command.gait.is_arm() {
-            let frames = plan(&command);
+        if intent.class == IntentClass::Arm {
+            let frames = self.vocabulary.plan(&intent)?;
             let applied = self.hal.apply(&frames).await?;
             let was_latched = self.estop_latched;
             self.estop_latched = false;
             self.estop_reason = None;
             self.last_seq = Some(seq);
-            self.last_gait = Some(command.gait);
+            self.last_gait = Gait::from_key(intent.action);
             self.last_frames = applied;
             self.last_refusal = None;
             tracing::info!(seq, was_latched, "armed: motion allowed again");
@@ -1528,8 +1595,8 @@ impl<H: RobotHal> RobotBridge<H> {
             });
         }
 
-        if self.estop_latched && command.gait.is_motion() {
-            let reason = "e-stop latched: send {\"action\":\"arm\"} to re-arm".to_string();
+        if self.estop_latched && intent.class == IntentClass::Motion {
+            let reason = self.vocabulary.arm_hint();
             tracing::warn!(seq, reason = %reason, "refusing motion while e-stopped");
             self.last_refusal = Some(Refusal {
                 seq,
@@ -1538,13 +1605,30 @@ impl<H: RobotHal> RobotBridge<H> {
             return Ok(BridgeEvent::Refused { seq, reason });
         }
 
-        let frames = plan(&command);
+        // A set point on de-energized drives is a command nobody is listening to: it is refused
+        // (with the profile's own arm key) instead of written and forgotten. The reference
+        // machine self-arms on motion, so this branch cannot fire for it — and a `Halt` is never
+        // refused here, because a stop must work on a disarmed machine too.
+        if intent.class == IntentClass::Motion
+            && !self.vocabulary.self_arms_on_motion()
+            && !self.hal.armed()
+        {
+            let reason = self.vocabulary.disarmed_hint();
+            tracing::warn!(seq, reason = %reason, "refusing motion on disarmed drives");
+            self.last_refusal = Some(Refusal {
+                seq,
+                reason: reason.clone(),
+            });
+            return Ok(BridgeEvent::Refused { seq, reason });
+        }
+
+        let frames = self.vocabulary.plan(&intent)?;
         let applied = self.hal.apply(&frames).await?;
         self.last_seq = Some(seq);
-        self.last_gait = Some(command.gait);
+        self.last_gait = Gait::from_key(intent.action);
         self.last_frames = applied;
         self.last_refusal = None;
-        if command.gait.is_emergency() {
+        if intent.class == IntentClass::Halt {
             self.estop_latched = true;
             self.estop_reason = Some(EstopReason::Commanded);
             tracing::warn!(seq, "commanded e-stop");

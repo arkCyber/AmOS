@@ -48,7 +48,8 @@ System UI and the CLI read it through.
 │   ├── multi-window.md           # multi-window (真·OS 阶段) architecture
 │   ├── android-compat.md         # Waydroid APK-compat layer
 │   ├── amos-link.md                # AmOS-Link robot middleware: layers, Zenoh audit, control plane, non-goals
-│   └── robot-apps.md              # the robot application cases: topology, topic/QoS contract, asserted properties
+│   ├── robot-apps.md              # the robot application cases: topology, topic/QoS contract, asserted properties
+│   └── robot-domains.md          # platform profiles: the six machines, their actuators, vocabulary, safety envelopes
 └── crates/
     ├── amos-proto/               # tonic-generated types + socket-path helper
     ├── amos-audio/               # hardware audio-HAL abstraction: capture/playback traits + resample + mocks + gated TinyALSA/AAudio FFI seams (docs/audio-hal-bridge.md)
@@ -283,6 +284,11 @@ cargo run -p amos-link --example patrol_mission
 cargo run -p amos-link --example fleet_console
 cargo run -p amos-link --example remote_brain
 cargo test -p amos-link --test robot_cases        # the cases' asserted properties (10)
+# …and the platform profiles behind a fleet that is not all quadrupeds: a multirotor and a
+# vehicle fly/drive on the same link, the same frame type and the same safety core.
+cargo run -p amos-link --example uav_mission
+cargo run -p amos-link --example road_autonomy
+cargo test -p amos-link --test platform_cases     # 13 profile contracts (docs/robot-domains.md)
 
 # The CLI: one in-process node, one command per operator question.
 cargo run -p amos-link-cli -- status                              # identity · counters · peers · verdict
@@ -345,7 +351,12 @@ explicit step; the control thread and its frequency are the caller's), **discove
 authentication** (plaintext beacons are a hint telling a peer where to connect — the authenticated path
 is the daemon's UDS; the beat rule above is a *consistency* check in the same spirit: it makes "one
 frame, one identity" true, not the link trustworthy), `zenoh-pico`/MCU firmware is out of scope, and cross-board multicast on a real
-switch (IGMP, Wi-Fi power save) is still a field-verification item. The **application cases**
+switch (IGMP, Wi-Fi power save) is still a field-verification item. One OS serves more than one kind
+of machine: the **platform profiles** ([`docs/robot-domains.md`](./docs/robot-domains.md)) describe a
+quadruped, a manipulator, a drone, a road vehicle, a surface vessel and an industrial cell as **data**
+(actuators, vocabulary, safety envelope) and run them through one safety core — with the layer's own
+boundaries registered (12 actuators, the reference argument space, no certification, no real-time
+claim). The **application cases**
 ([`docs/robot-apps.md`](./docs/robot-apps.md)) test the *middleware*, not a machine: they run the
 reference quadruped's HAL through `MockRobotHal`, so another form factor (a wheeled base, an arm, a
 drone) implements `RobotHal` — the bus layer is form-factor-agnostic, this layer is not. See

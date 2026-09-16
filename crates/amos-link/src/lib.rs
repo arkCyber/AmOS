@@ -66,6 +66,7 @@ pub mod health;
 pub mod keyexpr;
 pub mod metrics;
 pub mod node;
+pub mod platform;
 pub mod pubsub;
 pub mod qos;
 pub mod rate;
@@ -92,6 +93,10 @@ pub use health::{HealthReason, LinkHealth};
 pub use keyexpr::{Channel, Topic};
 pub use metrics::{LinkMetrics, MetricsSnapshot};
 pub use node::{LinkNode, VERSION};
+pub use platform::{
+    ActionSpec, Actuator, ActuatorRole, Failsafe, Intent, IntentClass, ParamSpec, Platform,
+    PlatformKind, SafetyEnvelope, SetPoint, Unit, Vocabulary,
+};
 pub use pubsub::{Publisher, Received, Subscriber};
 pub use qos::{DropPolicy, Qos, Reliability};
 pub use robot_hal::{

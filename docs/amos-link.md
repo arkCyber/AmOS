@@ -1198,6 +1198,71 @@ summary streams=1 frames=19 bytes=1957 untracked=0 undecodable=0 complete=yes ra
    真交换机的现场验证仍是 bring-up 项。
 5. **案例的时钟是宿主时钟**：所有延迟都是上界，直到 `amos-timesync` 校准（案例输出自己写着这一句）。
 
+### 3.22 平台剖面：一个 OS，六类机器（第二十一轮，REQ-A277）
+
+> 上一轮把"应用"补上了（§3.21），但那一轮的三个案例全是**同一台机器**：参考四足。
+> 而我们真正要服务的是**无人机、具身机器人、工业自主设备、汽车自动驾驶、无人艇**这几类 —
+> 它们与四足的共同点只有"需要一条链路 + 一套安全语义"，执行器、单位、词表、**停机方式**全都不同。
+>
+> 本轮把"四足专用"的那一层（`robot_hal` 的意图词表与 12 关节姿态表）抽象成**平台剖面**：
+> 描述是**数据**（执行器表 + 动作表 + 安全包线），机器实现是**共用**的（帧、类别、看门狗、回程、控制面）。
+
+**交付**：`crates/amos-link/src/platform.rs`（`PlatformKind` / `Unit` / `Actuator` / `ActionSpec` /
+`ParamSpec` / `IntentClass` / `Failsafe` / `SafetyEnvelope` / `Platform` / `Vocabulary`）+
+六份内置剖面 + `RobotBridge::for_platform`（同一安全核心换了词表）+ 新文档
+[`docs/robot-domains.md`](robot-domains.md)（每域契约、协议/认证/实时性的域侧责任、诚实边界）+
+两个域案例（`examples/uav_mission.rs`、`examples/road_autonomy.rs`）+ `tests/platform_cases.rs`（**13 例**）。
+
+**四条设计决定，每条都有代价写在边界里**：
+
+| 决定 | 为什么 | 代价 |
+|---|---|---|
+| **规划进出货帧**（`MotorFrame`，没有第二套线格式） | 总线的 CRC16/10 字节布局已经与形态无关；多一套格式 = 多一份校验与拒绝理由 | 剖面行程必须落在参考机的参数空间内（±90°，0..=100% 非负）⇒ **倒车推力、毫米直线轴今天不可表达**（登记在 §5） |
+| **类别共用**（`Arm`/`Motion`/`Halt`），停机**动作**归剖面 | 安全核心只该知道三件事；车的 `Halt` 是全力制动、机械臂是切扭矩、单元是断电 | 三类机器的"停"不再长得一样，回程必须靠剖面解释 |
+| **看门狗的最小动作是本层的**（剖面的 halt 批次），**机动**归任务层 | 本层知道"停"，不知道"家在哪"；无人机切桨不是降落 | 无人机/无人艇必须自带任务层执行 RTL/值守（案例演示了这一点） |
+| **参考机逐字节不变** | 19 轮的行为不能被一次抽象改坏 | 剖面必须复刻四足的历史怪癖（运动批次前导一个 `Enable(0)`），并由等价测试钉住 |
+
+**为域补的一条安全语义（本轮新增，来自写无人机案例时的实测）**：剖面机器在**未解锁**时收到
+`Motion` 会被**拒绝**并点名它自己的解锁动作（`arm` / `enable`），拒绝写在回程里 ——
+"油门动了但什么都没发生"正是这类系统最危险的形状；参考机自身在运动批次里带 `Enable`，
+因此这条分支对它**永不触发**（等价测试仍然逐字节为证）。
+
+**实测（真跑，删节）**：
+
+```text
+$ cargo run -p amos-link --example uav_mission
+platform drone · failsafe=return-to-base · deadman=300ms
+  actuator  0 thruster_1   thrust  mpercent  travel 0..=100000
+  action   goto      motion  params=["north_mm -300000..=300000", …, "altitude_mm 0..=120000"]
+gcs -> {"action":"takeoff"}  [matched=1 delivered=1]
+uav-01: refused #1: not armed: send {"action":"arm"} first
+uav-01: applied #2, 6 frame(s) on the bus
+uav-01: applied #4, 6 frame(s) on the bus                      # goto 在围栏内
+uav-01: refused #5: north_mm 420000 mm is outside the limit -300000..=300000 of action `goto` (drone)
+uav-01: stopped (watchdog) — 6 frame(s) the bus accepted
+profile drone: failsafe=return-to-base — a torque cut is not a landing, so the *mission layer* flies it
+mission layer: rtl wrote 6 frame(s) through the same HAL
+
+$ cargo run -p amos-link --example road_autonomy
+platform ground-vehicle · failsafe=minimal-risk-manoeuvre · deadman=100ms · stop="brake 100000" + throttle cut
+planner cadence: frames=12 span=0.57s rate=19.2Hz (its own clock; the wire's rate is the broker's business)
+car-01: refused #12: lane_offset_mm 4200 mm is outside the limit -1750..=1750 of action `lane_keep` (ground-vehicle)
+car-01: refused #13: speed_mm_s 40000 mm/s is outside the limit 0..=36000 of action `cruise` (ground-vehicle)
+car-01: stopped (watchdog) — 3 frame(s) the bus accepted
+mission layer: decel wrote 3 frame(s), the halt batch wrote 3 (brake=100000, throttle=Estop)
+```
+
+**诚实边界（本轮新增）**：
+
+1. **12 个执行器的上界**（`JointId`）：24 轴机械臂需要"剖面自己的" id 上界 —— 布局已通用，界还是参考机的策略。
+2. **参数空间非负**：`SetTorque` 0..=100 000 ⇒ 倒车推力不可表达（艇剖面登记为现场项）；直线轴用行程百分比。
+3. **回程共享文档的 `gait` 字段仍属四足词表**：剖面的动作键**不**写进它（那是一次载荷 schema 变更，连带
+   proto 与界面），剖面机器把 `gait` 留空、安全事实照常上报，域自己的模式走自己的话题。
+4. **没有认证、没有实时承诺、没有真机**：剖面是策略与契约，不是安全论证；两个域案例跑在同一台机器的一个进程里。
+5. **剖面不是规划器**：`goto` 不生成轨迹、`lane_keep` 不做横向控制、`cycle` 不编排节拍 —— 那些在域侧。
+
+
+
 ## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
 
 依赖声明（`crates/amos-link/Cargo.toml`，可选依赖、默认构建不拉）：
@@ -1481,6 +1546,11 @@ cargo run -p amos-link --example fleet_console      # 一张表印两次：哪�
 cargo run -p amos-link --example remote_brain       # 真 UDS + 真 tonic：注入是真帧、回程能读回
 cargo test -p amos-link --test robot_cases          # 10 例：断言性质（不是打印）；含契约表对码
 cargo test -p amos-link --test robot_cases -- --nocapture   # 需要看时序时用；断言与上面同一条
+# 平台剖面与领域案例（第二十一轮，§3.22 + docs/robot-domains.md）：
+# 六份剖面（四足/机械臂/无人机/车辆/无人艇/工业单元）、共用的帧与安全核心、每个限都有牙齿
+cargo test -p amos-link --test platform_cases      # 13 例：参考机逐字节不变 + 六剖面自检 + 包线拒绝 + 解锁语义
+cargo run -p amos-link --example uav_mission       # 未解锁拒绝 → 起飞 → 围栏内/外 → 看门狗 → 任务层飞 RTL
+cargo run -p amos-link --example road_autonomy     # 设定点流 → 越界拒绝 → 收油 → 看门狗 → MRM（全力制动）
 ```
 
 **操作员输入的两个上界**（都在**解析期**拒绝，exit 2，绝不 panic / abort —— 见 §3.3）：

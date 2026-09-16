@@ -146,6 +146,7 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 | `src/telemetry.rs` | `Heartbeat` + `NodeStatus` + `spawn_heartbeat` |
 | `src/sequence.rs` | `SeqTracker`: per-**stream** `(publisher, topic)` gaps/duplicates, so "a frame was lost" is a number — and it names the stream it happened on |
 | `src/rate.rs` | `RateTracker`: per-**stream** arrival rate **and bandwidth** (from *our* monotonic clock, never the frame's `stamp`; bytes are the framed size the link moved), with `RateEvidence` saying *why* when the figures cannot be stated — `0 Hz` would read as "the robot stopped" |
+| `src/platform.rs` | the **platform profile**: what a machine has (actuator table + units + travel), what it accepts (vocabulary + classes + bounded parameters) and what it owes itself when the link dies (deadman + failsafe manoeuvre) — six built-in profiles (quadruped · manipulator · drone · ground-vehicle · surface-vessel · industrial-cell) that plan into the *shipping* `MotorFrame`, plus `Vocabulary`, the seam that gives `RobotBridge` a profile's words without a second safety core (`docs/robot-domains.md`) |
 | `src/robot_hal.rs` | `AgentAction` → `plan()` → `MotorFrame` (CRC16) → `RobotHal`; `RobotBridge` with e-stop + watchdog, and `reporting()` for the mode return path |
 | `src/health.rs` | `LinkHealth::evaluate` — the fold from counters to a verdict |
 | `src/node.rs` | `LinkNode`: identity + transport + clock + counters + peer table |
@@ -184,7 +185,14 @@ cargo run -p amos-link --example patrol_mission
 cargo run -p amos-link --example fleet_console
 # Case ③ a brain that is *not* on the link: the gRPC control plane over a Unix socket.
 cargo run -p amos-link --example remote_brain
+# Domain case ④ a multirotor: profile vocabulary, geofence, deadman, return-to-base.
+cargo run -p amos-link --example uav_mission
+# Domain case ⑤ a road vehicle: set-point stream, road limits, full braking, minimal-risk manoeuvre.
+cargo run -p amos-link --example road_autonomy
 ```
+
+The **platform profiles** behind cases ④/⑤ (and the other four machines: quadruped, manipulator,
+surface vessel, industrial cell) are the subject of [`docs/robot-domains.md`](../../docs/robot-domains.md).
 
 | example | shows |
 |---|---|
@@ -192,6 +200,8 @@ cargo run -p amos-link --example remote_brain
 | `patrol_mission` | case ①: a patrol command applied (13 frames), the camera's `frames`/`span`/`rate`/`bytes`/`bw` on **one** line, a burst that latest-wins drops and counts, the deadman cutting torque when the link goes quiet (with the cut **measured** and reported), motion refused by the latch with a reason the commander can act on, and the re-arm that clears it |
 | `fleet_console` | case ②: three robots under one wildcard console, the same table printed twice (which stream is *moving* and which one stopped — `patrol-03`'s camera reads `frames=1 rate=unknown(one frame so far …)`, never `0 Hz`), each robot's own deadman visible in the console's mode column, peer table + self-echo count + health verdict |
 | `remote_brain` | case ③: a caller that is not on the link — `GetStatus`, a `Publish` whose payload the robot's **typed** subscriber decodes, `ListActuations` folding the robot's self-reported mode (attributed by the frame's publisher), the torque cut a silent brain caused seen from outside, and the topic inventory with its `complete` flag |
+| `uav_mission` | domain case ④ (drone): the profile's own vocabulary (`takeoff`/`goto`/`rtl`/…), a set point refused while the drives are **disarmed**, a waypoint inside the fence accepted and one outside it refused *naming the limit*, the 300 ms deadman stopping the aircraft, and the mission layer flying the declared `return-to-base` manoeuvre through the same HAL |
+| `road_autonomy` | domain case ⑤ (vehicle): a set-point stream at the profile's cadence, `lane_offset_mm`/`speed_mm_s`/`decel_mm_s2` refused outside the road's limits, `estop` planning **full braking plus a throttle cut** (a car has no torque to cut), and the deadman driving the vehicle's minimal-risk manoeuvre |
 
 What the runs print (real output, abbreviated):
 
@@ -269,6 +279,20 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
   figures are the arrivals **of the process that printed them** (a slow console under-reports and
   counts the frames it missed in `dropped`), and they are averages since the reader started, so a
   stream that stopped is visible as a `frames` column that no longer grows — never as `0 Hz`.
+- **One OS, six machines — and the profile layer's boundaries are registered.** `src/platform.rs`
+  describes a machine as data (actuators, vocabulary, safety envelope) and the quad*, manipulator,
+  drone, vehicle, vessel and cell profiles all plan into the **same** `MotorFrame`, run `RobotBridge`'s
+  **same** safety core and report on the **same** return path. What the abstraction does *not* do
+  today, with its reason: a profile is capped at **12 actuators** (the frame's `id` bound is the
+  reference machine's policy, `JointId::new`), the argument space is the reference policy
+  (`SetPosition` ±90 000 mdeg, `SetTorque` 0..=100 000 mpercent and **non-negative** — so a vessel's
+  astern thrust is not expressible yet, and a linear axis is a percentage of stroke rather than a
+  distance), the shared return document's `gait` field stays the reference vocabulary (putting a
+  drone's action key there is a payload-schema change with proto and UI consequences — a profile
+  publishes its own mode on its own topic instead), and there is **no certification or real-time
+  claim** anywhere in this layer. `docs/robot-domains.md` §5 lists all of them together with what the
+  domain side still owes (MAVLink/CANopen/EtherCAT/OPC-UA, ISO 26262 / IEC 61508, deterministic
+  timing, trajectory planning).
 - **`shm`, `unstable` per-call QoS, encrypted transports**: deliberately not used — see
   `docs/amos-link.md` §4/§6 for each ❌ together with its reason.
 - **Multicast on a real switch is still a field item**: the `lan` tests now prove the *protocol and
