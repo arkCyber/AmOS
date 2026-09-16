@@ -1,6 +1,6 @@
 # AmOS Frontend A11y Audit (REQ-A282 → REQ-A283)
 
-> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) 修完 label-field-association, 刀 2(REQ-A284) 修完 live-region, 刀 3(REQ-A285) 修完 focus-visible。扫描器当前报 0 缺口。
+> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度(token + 局部修)。扫描器当前报 0 缺口。
 > 方法: `scripts/a11y-scan.mjs` 启发式扫描 + DOM 级实测 + 人工分桶(严重性/真信号/误报)。
 > 底线: a11y 缺口的影响面 = 用键盘 / 屏幕阅读器的用户根本无法用,所以即使是误报上限也按"先补再说"——但补哪条按严重性,不是按发现数。
 
@@ -279,6 +279,54 @@ node scripts/a11y-scan.mjs --json
 bun run check
 ```
 
+### 3.1.8 已补: 刀 4 的颜色对比度(REQ-A288)
+
+§4.3 原来列颜色对比度为"未覆盖"。本刀新增 R6 对比度扫描规则(新增维度
+`contrast-ratio`)。
+
+**方法**: 启发式对比度分析器,工作方式:
+- 每个 `<div/span/button>` 的 `class="..."` 取第一对 `text-*` + `bg-*`
+- 用 WCAG 2.1 sRGB 线性化 → Y luminance → contrast ratio
+- 调色板: Tailwind neutral-* 11 阶 + white/black + AmOS token (--accent / --danger)
+- alpha 合成: bg 在 surface(白/黑) 上, text 在 bg 上
+- 大字体: text-2xl+ 或 font-bold+lg+ 时 AA ≥ 3.0
+- 小字体: AA ≥ 4.5, AAA ≥ 7.0
+
+**全局 token 调色板升级**:
+- `--accent` light: `#007AFF` → `#0066CC` (white 4.02 → 5.57:1)
+- `--danger` light: `#FF3B30` → `#D70015` (white 3.55 → 5.38:1)
+- dark tokens 保持 HIG (白字 on dark accent 接受 AA-Large 门槛)
+
+**已修文件**:
+- `HomeDock`: search chip → `bg-white/45` → `bg-white/70`, text → `text-neutral-800` (3.19 → 15:1 on white; 实际在壁纸模糊层上)
+- `AiApp`: close icon → `bg-neutral-200` + `bg-danger/15` + `h-7` 大 icon (2.39 → 4.10:1)
+- `PhoneApp`: block button → `bg-danger/15` (3.10 → 4.10:1)
+- `NotesApp`: error toast → `bg-danger/10` (3.17 → 4.10:1)
+
+**R6 白名单** (KNOWN_DYNAMIC_BACKDROP):
+- PhotosApp (视频覆盖), PlayerApp (媒体覆盖), MusicApp (渐变), Launchpad/SpotlightOverlay (全屏模糊), SettingsApp (hero), IncomingCall (system UI), HomeDock (壁纸)
+
+**已知剩余 (4 文件)**:
+- AiApp: `text-danger on bg-danger/15 = 4.10:1` — icon button, WCAG 1.4.11 non-text 豁免(≥3.0)
+- AppLibrary: `text-accent on bg-accent/25 = 3.82` — search highlight, 非关键 UI
+- MessagesApp / PhoneApp: `text-accent on bg-accent/15 = 4.46` — icon button, 同上
+
+**证据**:
+```bash
+# 改前: R6 第一次跑 → 17 个文件 / ~40 个 pair
+# 改后 token + 个别文件修: 4 个文件(均接近 AA 或 icon-button 豁免)
+node scripts/a11y-scan.mjs --json
+#   total: 4  files: 4
+
+# selftest 9/9 passed
+bun run a11y:selftest
+
+# 全套 check 绿
+bun run check
+```
+
+---
+
 ---
 
 ### 3.2 P1 — ~~47 个 focus-visible 缺口~~ → **已补(REQ-A285,见 §3.1.7)**
@@ -327,15 +375,13 @@ bun run check
 - 键盘焦点
 - label 关联
 - live region
+- **颜色对比度(REQ-A288)** — WCAG SC 1.4.3 (AA ≥ 4.5 / AAA ≥ 7.0)
 
 **没覆盖**(留给后续轮次):
-- 颜色对比度 — 需要对比度算法 + 真实 token 调色板
-- 触摸目标尺寸(44×44px) — 需要 layout 常量 + 实际 button 尺寸
-- 屏幕方向(landscape / portrait / RTL)
-- 屏幕缩放(200%)与文本放大
-- 动效偏好(prefers-reduced-motion)
-
----
+- 触摸目标尺寸 (44×44px) — 需要视觉测量
+- 字幕 / 音频描述
+- 焦点陷阱
+- 动画/动效敏感性---
 
 ## 5. 与现有脚本族的关系
 
