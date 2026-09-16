@@ -1,6 +1,6 @@
 # AmOS Frontend A11y Audit (REQ-A282 → REQ-A283)
 
-> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度, 刀 5(REQ-A290) 触摸目标尺寸, 刀 6(REQ-A291) 动画敏感性(prefers-reduced-motion, R8 0 findings)。扫描器当前报 0 AA 缺口,6 处触摸 AAA 警告。
+> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度, 刀 5(REQ-A290) 触摸目标尺寸, 刀 6(REQ-A291) 动画敏感性, 刀 7(REQ-A292) 焦点陷阱。扫描器当前报 0 AA 缺口,6 处触摸 AAA 警告。
 > 方法: `scripts/a11y-scan.mjs` 启发式扫描 + DOM 级实测 + 人工分桶(严重性/真信号/误报)。
 > 底线: a11y 缺口的影响面 = 用键盘 / 屏幕阅读器的用户根本无法用,所以即使是误报上限也按"先补再说"——但补哪条按严重性,不是按发现数。
 
@@ -378,6 +378,38 @@ bun run check
 cargo test -p amos-tauri --lib
 ```
 
+### 3.1.11 已补: 刀 7 的焦点陷阱(REQ-A292)
+
+§4.3 列了"焦点陷阱"未覆盖。`src/lib/focusTrap.ts` 是早就写好的焦点陷阱库
+(SpotlightPanel / RecentsPanel / NotificationCenter 已在用),
+但三个全屏 dialog **没有调用它**:
+  - `LockScreen.svelte` — 全屏锁屏
+  - `MissionControl.svelte` — ⌘Tab 浮层
+  - `IncomingCall.svelte` — 来电/通话全屏覆盖
+
+**本刀工作**:
+- 三块全部接上 `attachFocusTrap(rootEl, [onEscape])`,
+  用 Svelte 5 `$effect` 在 mount 时挂载、unmount 时 cleanup 自动运行。
+- `LockScreen` / `IncomingCall` 故意不接 Escape —
+  锁屏必须 PIN 才能走、来电时误触 Esc 不能挂电话。语义化交还给调用方。
+- 新增 `src/lib/__tests__/focusTrap.test.ts` (9 用例):
+  - 初始聚焦 / Tab 末→首 / Shift+Tab 首→末 / Esc 回调 / 无 Esc 回调不抛
+  - disabled focusable 跳过 / 非 Tab/Esc 不干扰 / cleanup 生效 / 多 trap 共存
+- 修了 `bun-iso-test.mjs` 的扫描根 — 之前只扫 `src/__tests__/`,
+  `src/lib/__tests__/` 里的 focusTrap / desktopFeatures / desktopView
+  三个文件**从未被套件跑过**。现在两个根都扫。
+
+**证据**:
+```bash
+bun test src/lib/__tests__/focusTrap.test.ts
+# 9 pass, 0 fail, 11 expect()
+
+bun run check
+# 987 tests pass, 15 a11y assertions, all scans OK
+```
+
+---
+
 ### 3.1.10 已补: 刀 6 的动画敏感性(REQ-A291)
 
 §4.3 列了"动画/动效敏感性"未覆盖。
@@ -456,10 +488,10 @@ node scripts/a11y-scan.mjs --json
 - **颜色对比度(REQ-A288)** — WCAG SC 1.4.3 (AA ≥ 4.5 / AAA ≥ 7.0)
 - **触摸目标尺寸(REQ-A290)** — WCAG SC 2.5.5 (AAA 44px) / SC 2.5.8 (AA 24px); desktop mouse-primary, 6 处 32-40px icon button AAA-warn 已记录
 - **动画敏感性(REQ-A291)** — WCAG SC 2.3.1/2.3.2 (AAA); scoped @keyframes infinite + @media override 已补; global reset covers animate-pulse
+- **焦点陷阱(REQ-A292)** — WCAG SC 2.1.2 (AAA); LockScreen / MissionControl / IncomingCall 已接 attachFocusTrap, SpotlightPanel/RecentsPanel/NotificationCenter 之前已接; 9 个 attachFocusTrap DOM 测试覆盖
 
 **没覆盖**(留给后续轮次):
-- 字幕 / 音频描述
-- 焦点陷阱---
+- 字幕 / 音频描述---
 
 ## 5. 与现有脚本族的关系
 
