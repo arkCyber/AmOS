@@ -25,7 +25,7 @@
    * 把 `label` 立刻读到局部 `targetLabel` 再调用 `onclose()`——这是闭包捕获，不是
    * "复制一个字符串"。这一处缺陷本轮才出现：先前的 stage 右键菜单没有跨过 await。
    */
-  import { invoke } from "../../lib/backend";
+  import { bridgeDiag, invoke } from "../../lib/backend";
   import { t } from "../locale.svelte";
   import {
     CHROME_MENU_ITEM,
@@ -48,15 +48,36 @@
     onclose?: () => void;
   } = $props();
 
+  // REQ-A297 phase-2 §4 (typed-error discipline): `invoke` swallows
+  // rejections into `null`. The pre-fix code wrapped every `wm_close` /
+  // `wm_hide` / `wm_focus` in `try { ... } catch {}` — all of them were
+  // dead code (the catch could never fire). The user would close the
+  // context menu and see the dock app do nothing, with no breadcrumb
+  // and no way to retry. We now branch on the null result and write a
+  // diagnostic via `bridgeDiag(command)` plus a `console.warn` so the
+  // failure is visible in the launcher log.
+  const WARN_ICON = "🛟";
+  function noteFailure(command: string, targetLabel: string, context: string) {
+    const diag = bridgeDiag(command);
+    if (diag.ok) return; // invariant: null result implies diag is not ok
+    const code =
+      diag.kind === "command-failed" &&
+      diag.detail &&
+      typeof diag.detail === "object"
+        ? (diag.detail as { code?: string }).code
+        : undefined;
+    console.warn(
+      `${WARN_ICON} [Dock menu] ${context} — ${command}(${targetLabel}) refused`,
+      code ?? diag.kind,
+    );
+  }
+
   /** 「退出」需要真的把窗口关掉。`wm_close` 在 `main`（Launcher）上是 no-op。 */
   async function quit() {
     const targetLabel = label;
     onclose?.();
-    try {
-      await invoke("wm_close", { label: targetLabel });
-    } catch {
-      /* wm_* 失败已由 lib/backend 记账 */
-    }
+    const result = await invoke<unknown>("wm_close", { label: targetLabel });
+    if (result === null) noteFailure("wm_close", targetLabel, "quit");
   }
 
   /** 「隐藏」对应 macOS 的 "Hide"（⌘H）。非运行中项上没有意义，灰掉。 */
@@ -64,11 +85,8 @@
     const targetLabel = label;
     onclose?.();
     if (!running) return;
-    try {
-      await invoke("wm_hide", { label: targetLabel });
-    } catch {
-      /* see lib/backend diagnostics ledger */
-    }
+    const result = await invoke<unknown>("wm_hide", { label: targetLabel });
+    if (result === null) noteFailure("wm_hide", targetLabel, "hide");
   }
 
   /** 「显示」对应 macOS 的"再次点按运行中的图标 → 切回焦点"。 */
@@ -76,11 +94,8 @@
     const targetLabel = label;
     onclose?.();
     if (!running) return;
-    try {
-      await invoke("wm_focus", { label: targetLabel });
-    } catch {
-      /* see lib/backend diagnostics ledger */
-    }
+    const result = await invoke<unknown>("wm_focus", { label: targetLabel });
+    if (result === null) noteFailure("wm_focus", targetLabel, "show");
   }
 </script>
 
