@@ -266,9 +266,20 @@
     let served = 0;
     let failed = 0;
     for (const r of settled) {
-      if (r.status === "fulfilled") {
+      // `mediaList` returns a `MediaListing` (`{ items, total }`), NOT a flat
+      // array. The pre-fix `Array.isArray(r.value)` was true at the wrong level:
+      // it always rejected the host's well-formed answer, so the bridge
+      // serving items still surfaced as "the bridge returned nothing" and the
+      // dev-mode no-photos message covered a real device library. Pull the
+      // items out of the listing; the `null` reply is the bridge-offline path.
+      if (r.status === "fulfilled" && r.value && Array.isArray(r.value.items)) {
         served += 1;
-        if (Array.isArray(r.value)) items.push(...r.value);
+        items.push(...r.value.items);
+      } else if (r.status === "fulfilled") {
+        // A listing-shaped object with no `items` array is a protocol error
+        // (the host answered something we cannot parse) — count it as a failure
+        // so the "could not read" notice can fire, never as "empty library".
+        failed += 1;
       } else {
         failed += 1;
       }
