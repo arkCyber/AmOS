@@ -59,19 +59,24 @@ Honest notes about scope, all enforced in code rather than promised:
   in `sub`'s closing line, and the node's own counter) accounts for the frames a full best-effort
   queue discards. Before this, the network relay did a blocking `send` for every reliability: the
   consumer got the **oldest** frame of its stall and `dropped` read `0` while frames vanished.
-- **`hz` measures arrivals, and says when it cannot** (§3.19, round 18): one line per stream per
-  second — `rate publisher=dog1 topic=amos/dog1/sensor/imu frames=120 span=2.00s rate=59.5Hz` — with
-  `frames` and `span` on the same line so the arithmetic can be checked. The rate is
-  `(frames − 1) / span` over **arrival** instants from *this* machine's monotonic clock (never the
-  frame's own `stamp`, so an uncalibrated clock does not weaken it), and it needs no payload type:
-  a stream whose messages this build cannot decode is still measured (the envelope is read with
+- **`hz` measures arrivals, and says when it cannot** (§3.19/§3.20, rounds 18–19): one line per
+  stream per second — `rate publisher=dog1 topic=amos/dog1/sensor/imu frames=120 span=2.00s
+  rate=59.5Hz bytes=61800 bw=30.2KiB/s` — with `frames`, `span` and `bytes` on the line so the
+  arithmetic can be checked (`rate = (frames−1)/span`, `bw = bytes/span`). The rate comes from
+  **arrival** instants on *this* machine's monotonic clock (never the frame's own `stamp`, so an
+  uncalibrated clock does not weaken it), and `bytes` is the **framed size** — what the middleware
+  actually moved, header and CRC included — so `bw` answers "how much of the link does this stream
+  cost?", not "how big is the payload". The instrument needs no payload type: a stream whose
+  messages this build cannot decode is still measured (the envelope is read with
   `Envelope::decode_header`, which borrows the payload instead of copying it). A stream with one
-  frame, or with less than `MIN_RATE_SPAN` (500 ms) of arrivals, prints **why there is no rate**
-  instead of `0 Hz` — `0` would read as "the robot stopped publishing", a claim about the robot
-  rather than about our window. `--json` carries `rate_hz: null` plus the stable `why` token
-  (`single-frame` / `span-too-short`). It is a **data-plane** command (refused with `--socket`), and
-  the figure is the average since the run started — a stall shows as `frames` that stop growing, not
-  as an invented windowed rate.
+  frame, or with less than `MIN_RATE_SPAN` (500 ms) of arrivals, prints **why there are no figures**
+  instead of `0 Hz`/`0B/s` — `0` would read as "the robot stopped publishing", a claim about the
+  robot rather than about our window. `--json` carries `rate_hz: null`, `bytes_per_sec: null` and
+  the stable `why` token (`single-frame` / `span-too-short`); `bytes` is a number either way. It is
+  a **data-plane** command (refused with `--socket`), and the figures are averages since the run
+  started — a stall shows as `frames`/`bytes` that stop growing, not as an invented windowed rate.
+  The byte total **saturates** rather than wrapping: a wrapped total would under-report the link's
+  load, the one direction that must never happen.
 - **Arguments are bounded where the platform is**: `--seconds` beyond what the clock can
   represent and `--size` above the wire ceiling (16 MiB − 64, since a larger bench payload
   could never be published) are refused at parse time with exit 2 — they used to panic

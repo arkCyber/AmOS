@@ -1411,12 +1411,15 @@ cargo test -p amos-link --features zenoh -- --ignored   # 只剩跨主机 scouti
 cargo test -p amos-tauri --test link_status_e2e a_daemon_without_the_return_path_still_answers_the_panel
 cargo test -p amos-link-cli --test cli_smoke an_older_daemon_still_answers_the_status_over_a_socket
 cd crates/amos-tauri/frontend-ts && bunx vitest run svelte-tests/link-page.svelte.test.ts   # 三态（unavailable/none/reported）
-cargo run -p amos-link-cli -- status --socket /tmp/old-daemon.sock | tail -3
-# 速率仪器（第十八轮，§3.19）：每条流一行 `frames`/`span`/`rate`，说不出的速率给原因而不给 0
+cargo run -p amos-link-cli -- status --socket /tmp/old-daemon.sock | tail -3    # 「not answered by this daemon」
+# 速率与带宽（第十八/十九轮，§3.19/§3.20）：每条流一行 `frames`/`span`/`rate`/`bytes`/`bw`，
+# 说不出的数字给原因而不给 0
 cargo run -p amos-link-cli -- hz --pattern 'amos/**' --seconds 10
-cargo run -p amos-link-cli -- hz --pattern 'amos/*/sensor/**' --seconds 10 --json
-cargo test -p amos-link --lib rate::          # 9 例：注入时刻 ⇒ 速率是算术（含 single-frame / span-too-short）
-cargo test -p amos-link --lib the_header_only_reader   # 只读信封：负载是借用，拒绝理由与 decode 逐字相同    # 「not answered by this daemon」
+cargo run -p amos-link-cli -- hz --pattern 'amos/*/sensor/**' --seconds 10 --json   # 每条流：rate + bytes/bw
+cargo test -p amos-link --lib rate::          # 11 例：注入时刻 ⇒ 速率与带宽都是算术（single-frame / span-too-short / 饱和）
+cargo test -p amos-link --lib the_header_only_reader   # 只读信封：负载是借用，拒绝理由与 decode 逐字相同
+# 真会话上的速率与带宽（第十九轮 §3.20 的证据）：发布方 `pub --count 20 --hz 10`，另一进程
+cargo run -p amos-link-cli --features zenoh -- hz --transport zenoh --pattern 'amos/**' --seconds 9
 # 同一份 QoS 必须在两个传输上意味着同一件事（第十七轮，§3.18）：
 # 真 TCP 环回会话上，Qos::sensor() 连发 5 帧后只 recv 一次 ⇒ 拿到**第 5 帧**且 dropped=4
 cargo test -p amos-link --features zenoh --lib a_latest_only_subscription_over_a_real_session_keeps_the_newest_frame
@@ -1469,7 +1472,7 @@ reliability + history depth」，而本节的用途是**把这些类比逐条落
 | **SROS2（认证/加密）** | ❌ 无 | ❌ 故意不做 | §6.2：发现不是认证；UDS 侧靠文件权限，网络侧靠传输配置。**不要**把链路当作安全边界 |
 | **Lifecycle node（configure/activate/…）** | ❌ 无 | ❌ 故意不做 | 组件的启动/停止是 systemd / `amos-kernel` 的事 |
 | **Executor / callback group** | ❌ 无（**由调用方拥有线程**） | ❌ 故意不做 | README：「not a scheduler (you own the control thread and its rate)」；`try_recv` 是给控制回路用的非阻塞读取 |
-| **`ros2 topic echo` / `hz` / `bw`** | `sub` / `hz` / `watch` / `bench` | ⚠️ 一一对应，形状不同 | `watch` 打**心跳**（含 `missed`）、`bench` 打**延迟直方图 + 吞吐**、`sub` 打**每一帧 + 序号缺口与丢帧计数**、`hz` 打**每条流的到达速率**（第十八轮补上，§3.19：此前速率的代理只是 `published` 与序号缺口，一个速率数字都没有）。**差异**：`bw`（按话题带宽）没有对应物 —— `bench` 的吞吐是它自己造的那条流，而「这条流占了多少字节/秒」仍需 `watch --json` 的计数器自己算 |
+| **`ros2 topic echo` / `hz` / `bw`** | `sub` / `hz`（速率**与**带宽） / `watch` / `bench` | ✅ 覆盖（形状不同） | `watch` 打**心跳**（含 `missed`）、`bench` 打**延迟直方图 + 吞吐**、`sub` 打**每一帧 + 序号缺口与丢帧计数**、`hz` 打**每条流的到达速率与带宽**（§3.19 补速率、§3.20 把 `bw` 并入同一读数：`frames/span/rate/bytes/bw` 出自一个窗口）。**差异**：`hz` 的带宽是**该进程这条链路上收到的**（不是发布方的发送量），且计的是整帧的账（含头与 CRC）；`bench` 的吞吐仍是它自己造的那条流 |
 | **`ros2 topic info`（类型 + 订阅者数）** | `status`（对端表、计数器、判决）+ `topics`（清单及其**完整性**） | ⚠️ 部分 | **差异**：没有「谁订阅了它」的远端视图（broker 知道本地 fan-out 数，网络传输**诚实地说不知道**），也没有类型名 |
 | **`ros2 node list` / `info`** | `status` / `discover`（对端表：id/kind/version/uptime/地址/beacon 数） | ✅ 形状相近 | §5 与 §3.11：对端表是**本节点**看到的，不是全网权威视图 |
 | **`ros2 param` / `service` / `action` CLI** | ❌ 无（没有这些数据面概念） | ❌ 由上表三行决定 | — |
