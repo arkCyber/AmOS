@@ -21,6 +21,8 @@
     type PwaIndexFailure,
   } from "../lib/pwaIndex";
   import { t } from "./locale.svelte";
+  import { currentFormFactor } from "../lib/desktopApps";
+  import { pwaHubCols } from "../lib/formLayout";
 
   type Load =
     | { kind: "loading" }
@@ -31,6 +33,14 @@
   /** The protocol base the host told us to use (shown in the footer, for diagnosis). */
   let base = $state<string | null>(null);
   let selectedId = $state<string | null>(null);
+
+  // The PWA picker scales with the device class (REQ-A293): iOS keeps 4 columns on
+  // the phone; iPadOS widens to 6 so the screen real estate is actually used;
+  // the desktop class widens further to `DESKTOP_MAX_COLS` (matching the launcher
+  // and the photo gallery) so a Mac window does not look like an iPad stretched out.
+  // `null` from `currentFormFactor()` is the "no host yet" state — we keep the most
+  // conservative answer (the phone's 4) so a preview build stays usable.
+  const cols = $derived(pwaHubCols(currentFormFactor() ?? "phone"));
 
   const run = async () => {
     load = { kind: "loading" };
@@ -103,7 +113,7 @@
     </p>
 
 
-    <div class="grid grid-cols-4 gap-4" data-testid="pwa-grid">
+    <div class="grid gap-4" style={`grid-template-columns: repeat(${cols}, minmax(0, 1fr));`} data-testid="pwa-grid">
       {#each doc.apps as entry (entry.id)}
         <button
           type="button"

@@ -9,6 +9,7 @@ import {
   pageCapacity,
   photosCols,
   PHONE_GRID,
+  pwaHubCols,
   type HomeGrid,
 } from "../lib/formLayout";
 import type { FormFactor } from "../lib/wm";
@@ -260,6 +261,37 @@ describe("photosCols — the Photos grid scales with the class (REQ-A292)", () =
   test("the column count is a positive integer for every class", () => {
     for (const form of FORMS) {
       const n = photosCols(form);
+      expect(Number.isInteger(n) && n >= 1).toBe(true);
+    }
+  });
+});
+
+describe("pwaHubCols — system PWA index grid column count", () => {
+  // The PWA picker is a *3rd* member of the form-aware grid family, joining the
+  // App Library (REQ-A290) and Photos (REQ-A292). The numbers do NOT equal any of
+  // the siblings — 4/6/DESKTOP_MAX_COLS is iOS-style picker density, not Photos
+  // density — so each surface owns its own function name.
+  const FORMS: FormFactor[] = ["phone", "tablet", "desktop", "robot"];
+
+  test("phone uses the iOS-picker 4-column density", () => {
+    expect(pwaHubCols("phone")).toBe(4);
+  });
+
+  test("tablet widens to 6 columns (iPadOS picker density)", () => {
+    expect(pwaHubCols("tablet")).toBe(6);
+  });
+
+  test("desktop uses the launcher cap (DESKTOP_MAX_COLS), not a hand-picked number", () => {
+    expect(pwaHubCols("desktop")).toBe(DESKTOP_MAX_COLS);
+  });
+
+  test("robot has no UI, so its picker column count is the phone's (never zero)", () => {
+    expect(pwaHubCols("robot")).toBe(4);
+  });
+
+  test("the column count is a positive integer for every class", () => {
+    for (const form of FORMS) {
+      const n = pwaHubCols(form);
       expect(Number.isInteger(n) && n >= 1).toBe(true);
     }
   });

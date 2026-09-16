@@ -155,6 +155,21 @@ export function photosCols(form: FormFactor): number {
 }
 
 /**
+ * The **PWA picker** (system PWA index) column count for this class.
+ *
+ * iOS uses 4 columns for the system-installed web-app picker; iPadOS widens to 6
+ * columns (its picker density); the desktop class widens further to
+ * `DESKTOP_MAX_COLS` so a Mac window shows a desktop-class picker. Robot has no UI
+ * ⇒ the phone default. Same family as `appLibraryColumns` / `photosCols` — the
+ * function name is per-surface because the column counts differ.
+ */
+export function pwaHubCols(form: FormFactor): number {
+  if (form === "tablet") return 6;
+  if (form === "desktop") return DESKTOP_MAX_COLS;
+  return 4;
+}
+
+/**
  * The home-screen grid for this class at this measured screen size.
  *
  * `width`/`height` are the host's measured screen (logical px; see
