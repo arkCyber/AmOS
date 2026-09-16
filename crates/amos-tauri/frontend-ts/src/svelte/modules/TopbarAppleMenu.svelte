@@ -22,7 +22,7 @@
    * action. It is one file to extend.
    */
   import { getContext } from "svelte";
-  import { invoke } from "../../lib/backend";
+  import { bridgeDiag, invoke } from "../../lib/backend";
   import { SHELL_CHROME_API, type ShellChromeApi } from "../../lib/shellModule";
   import { t } from "../locale.svelte";
   import {
@@ -45,8 +45,31 @@
     run?: () => void | Promise<void>;
   }
 
+  /** Open System Settings via the chrome's `wm_open` bridge.
+   *
+   *  REQ-A297 phase-2 §4: a bare `await invoke("wm_open", ...)` returns
+   *  `null` on failure without rejecting, so a refused open would have
+   *  been silently swallowed. The post-fix branches on the null result
+   *  and writes a `🛟` breadcrumb to the launcher log so the failure
+   *  is at least visible.
+   */
   async function openSettings() {
-    await invoke("wm_open", { label: "settings" });
+    const result = await invoke<unknown>("wm_open", { label: "settings" });
+    if (result === null) {
+      const diag = bridgeDiag("wm_open");
+      if (!diag.ok) {
+        const code =
+          diag.kind === "command-failed" &&
+          diag.detail &&
+          typeof diag.detail === "object"
+            ? (diag.detail as { code?: string }).code
+            : undefined;
+        console.warn(
+          "🛟 [Apple menu] wm_open(settings) refused",
+          code ?? diag.kind,
+        );
+      }
+    }
   }
 
   /**

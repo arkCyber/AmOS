@@ -11,7 +11,7 @@
  */
 import { saveLayout, pushRecent, getLayout, defaultLayout, type HomeLayout } from "../lib/amosStore";
 import { appTitleKey, appIds } from "../lib/appMeta";
-import { invoke } from "../lib/backend";
+import { bridgeDiag, invoke } from "../lib/backend";
 import type { LayoutSnapshot } from "../lib/wm";
 
 export type Surface =
@@ -94,14 +94,53 @@ export async function open(id: string): Promise<void> {
   clearOverlays();
   
   // Desktop form factor: multi-window (each app is a real WebviewWindow).
+  //
+  // REQ-A297 phase-2 §4: a refused `wm_open` is logged instead of
+  // silently dropped. Pre-fix, the function would `await invoke(...)`
+  // and unconditionally reset `_surface` to home — so a refused open
+  // could leave the user looking at home with no app to interact
+  // with and no diagnostic to explain why. We now branch on the null
+  // result and only commit to "the app opened" (the surface reset)
+  // when the host actually accepted the request.
   if (_layoutSnap?.form === "desktop") {
-    await invoke("wm_open", { label: id });
+    const result = await invoke<unknown>("wm_open", { label: id });
+    if (result === null) {
+      const diag = bridgeDiag("wm_open");
+      if (!diag.ok) {
+        const code =
+          diag.kind === "command-failed" &&
+          diag.detail &&
+          typeof diag.detail === "object"
+            ? (diag.detail as { code?: string }).code
+            : undefined;
+        console.warn(
+          `🛟 [shellState] wm_open(${id}) refused`,
+          code ?? diag.kind,
+        );
+        // Surface stays where it was — don't claim the app opened if
+        // the host refused. The user can re-tap from home; the
+        // breadcrumb tells ops what went wrong.
+        return;
+      }
+    }
     // Desktop stays on home after opening an app window (macOS behavior).
     _surface = { kind: "home" };
     return;
   }
   
   // Phone/tablet: single-window SPA routing (no change).
+  //
+  // REQ-A319: **this branch is the whole reason a tablet cannot split.** The host
+  // really does allow concurrent windows for a tablet (`LayoutPolicy::of(Tablet)
+  // .multi_window`, enforced at window creation in `crates/amos-tauri/src/wm.rs`),
+  // and the settings page reports that truthfully — but every `wm_open` consumer
+  // lives in the *desktop* shell (here, and `Launchpad`/`SpotlightOverlay`/
+  // `DesktopShell`), so a touch class can never end up with a second window for
+  // `WindowPage` to offer as a pane. The settings page now names the cause
+  // (`wm.whyNoCandidates`), `svelte-tests/shell-state.svelte.test.ts` pins this routing
+  // (touch ⇒ no `wm_open`; desktop ⇒ `wm_open`), and `docs/multi-window.md` §1.5
+  // records the chain. Giving a tablet real windows means changing **this** line —
+  // and moving the test and that doc section with it.
   _surface = { kind: "app", id };
 }
 

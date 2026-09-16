@@ -29,7 +29,7 @@
   //   - 桌面图标：`SharedStore.home.layout.page`（与手机主屏共用）
   //   - 选区：**只在本组件内**（DesktopStage 选区不该跨"主屏"——主屏是手机形态）
   import { getContext, onMount, tick } from "svelte";
-  import { invoke } from "../lib/backend";
+  import { bridgeDiag, invoke } from "../lib/backend";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import {
     LAYOUT_KEY,
@@ -572,19 +572,47 @@
     ctxMenu = null;
   }
 
+  // REQ-A297 phase-2 §4: a refused `wm_open("settings")` is now visible in
+  // the launcher log instead of a silent nothing. (Pre-fix: the bare
+  // `await invoke(...)` could only ever resolve to `null` on failure —
+  // the user clicked "Change Wallpaper…" and the menu closed without
+  // anything happening and without a diagnostic.)
+  async function noteOpenFailure(command: string, label: string, context: string) {
+    const diag = bridgeDiag(command);
+    if (diag.ok) return;
+    const code =
+      diag.kind === "command-failed" &&
+      diag.detail &&
+      typeof diag.detail === "object"
+        ? (diag.detail as { code?: string }).code
+        : undefined;
+    console.warn(
+      `🛟 [DesktopStage] ${context} — ${command}(${label}) refused`,
+      code ?? diag.kind,
+    );
+  }
+
   /** 壁纸与显示设置都住在设置应用里——打开它，不假装这里能改。 */
   async function openSettings() {
-    await invoke("wm_open", { label: "settings" });
+    const result = await invoke<unknown>("wm_open", { label: "settings" });
     closeContextMenu();
+    if (result === null) noteOpenFailure("wm_open", "settings", "openSettings");
   }
 
   /** Multi-open: walk the selection and invoke `wm_open` for each (the host opens a
-   * new window per call, which is exactly what macOS Finder's "Open N selected" does). */
+   * new window per call, which is exactly what macOS Finder's "Open N selected" does).
+   *
+   * REQ-A297 phase-2 §4: pre-fix, a single refused open inside the loop
+   * silently dropped the rest of the selection. We now keep iterating
+   * (so a partial success still opens the remaining apps) and log a
+   * breadcrumb per refusal — the user gets the apps that worked, the
+   * launcher log has the ones that did not. */
   async function openSelectedApps() {
     const ids = [...selectedIds];
     closeContextMenu();
     for (const id of ids) {
-      await invoke("wm_open", { label: id });
+      const result = await invoke<unknown>("wm_open", { label: id });
+      if (result === null) noteOpenFailure("wm_open", id, "openSelectedApps");
     }
   }
 

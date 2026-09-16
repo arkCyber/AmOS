@@ -9,7 +9,7 @@
   // 数据：wm_windows → 过滤 App 类、非 Hidden 的窗口；用 label 反查 i18n 显示名。
   //       spaces_list / spaces_active → Spaces 栏显示。
   import { onMount } from "svelte";
-  import { invoke } from "../lib/backend";
+  import { bridgeDiag, invoke } from "../lib/backend";
   import { appIcon, appTitleKey } from "../lib/appMeta";
   import { shouldShowMissionControl } from "../lib/desktopLayout";
   import { t } from "./locale.svelte";
@@ -28,18 +28,22 @@
     void refreshSpaces();
   });
 
+  // REQ-A297 phase-2 §4: `invoke` swallows failures into `null` (REQ-A296).
+  // The earlier `try/catch` was dead code — listSpaces / activeSpace /
+  // wm_windows can never reject, only return null. The new code checks
+  // the null result and treats it as "this surface is offline / not
+  // available" rather than crashing or pretending we got data.
   async function refreshSpaces() {
-    try {
-      const list = await listSpaces();
-      const active = await activeSpace();
-      if (list !== null) {
-        spaces = list;
-        currentSpaceIndex = active ?? 0;
-        spacesLoaded = true;
-      }
-    } catch {
-      /* Spaces 不可用 */
+    const list = await listSpaces();
+    const active = await activeSpace();
+    if (list !== null) {
+      spaces = list;
+      currentSpaceIndex = active ?? 0;
+      spacesLoaded = true;
     }
+    // list === null → Spaces not available: keep spacesLoaded false so
+    // the spaces bar is hidden (the {#if spacesLoaded && spaces.length}
+    // gate below).
   }
 
   async function onSwitchSpace(index: number) {
@@ -63,18 +67,19 @@
     void refreshWindows();
   });
 
+    // REQ-A297 phase-2 §4: see refreshSpaces() for the contract rationale.
+  // The pre-fix try/catch was dead code; wm_windows only ever returns
+  // `null` on failure, never rejects.
   async function refreshWindows() {
-    try {
-      const raw = await invoke<{ windows: WmWindow[] }>("wm_windows");
-      if (raw?.windows) {
-        // 只显示 App 类窗口，不显示 Launcher
-        windows = raw.windows.filter(
-          (w) => w.kind === "App" && w.state !== "Hidden",
-        );
-      }
-    } catch {
-      /* 非桌面形态 */
+    const raw = await invoke<{ windows: WmWindow[] } | null>("wm_windows");
+    if (raw?.windows) {
+      // 只显示 App 类窗口，不显示 Launcher
+      windows = raw.windows.filter(
+        (w) => w.kind === "App" && w.state !== "Hidden",
+      );
     }
+    // raw === null → not in a desktop form; leave windows empty and
+    // let shouldShowMissionControl(windows.length) hide the panel.
   }
 
   function titleOf(label: string): string {
@@ -85,11 +90,32 @@
   }
 
   // ─── 聚焦 ────────────────────────────────────────────────────────────────
+  //
+  // REQ-A297 phase-2 §4 (typed-error discipline): `invoke` swallows
+  // rejections into `null`. The earlier `try/catch` was dead code; a
+  // refused `wm_focus` (host offline / window already torn down by the
+  // time the user clicked) silently closed the panel and left the
+  // user wondering why the app didn't come to front.
+  //
+  // The post-fix branches on the null result: a breadcrumb goes to
+  // the launcher log, the panel still closes (the user has chosen —
+  // staying on a dead overlay is worse), and the failure is visible.
   async function focusWindow(label: string) {
-    try {
-      await invoke("wm_focus", { label });
-    } catch {
-      /* ignore */
+    const result = await invoke<unknown>("wm_focus", { label });
+    if (result === null) {
+      const diag = bridgeDiag("wm_focus");
+      if (!diag.ok) {
+        const code =
+          diag.kind === "command-failed" &&
+          diag.detail &&
+          typeof diag.detail === "object"
+            ? (diag.detail as { code?: string }).code
+            : undefined;
+        console.warn(
+          `🛟 [MissionControl] wm_focus(${label}) refused`,
+          code ?? diag.kind,
+        );
+      }
     }
     onclose?.();
   }
