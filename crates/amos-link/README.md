@@ -155,6 +155,7 @@ service bus. `docs/amos-link.md` §6 records every deliberate non-goal.
 
 ```bash
 cargo test -p amos-link                     # unit + e2e + control-plane-over-UDS (offline)
+cargo test -p amos-link --test robot_cases  # the application cases' asserted properties (10 cases)
 cargo test -p amos-link --features lan      # + real UDP multicast beacons on loopback
 cargo test -p amos-link --features zenoh    # + the transport config/env mapping
 cargo clippy -p amos-link --all-targets -- -D warnings
@@ -170,16 +171,30 @@ The Zenoh *session* round trip is `#[ignore]`d on purpose (it needs a real netwo
 
 ## Examples
 
+The **robot application cases** live here — each one runs offline (one process, the in-process
+broker) and uses the shipping code paths. [`docs/robot-apps.md`](../../docs/robot-apps.md) is the
+catalogue: topology, topic/QoS contract, the asserted properties and the honest boundaries per case.
+
 ```bash
-# The robot↔brain loop on one offline link: stereo out, control back, motor frames applied.
+# The robot↔brain loop in miniature: stereo out, control back, motor frames applied.
 cargo run -p amos-link --example robot_brain_loop
+# Case ① one patrol, end to end: apply → report → deadman cut → refusal → re-arm.
+cargo run -p amos-link --example patrol_mission
+# Case ② three robots, one console: wildcards, per-stream figures, one deadman each.
+cargo run -p amos-link --example fleet_console
+# Case ③ a brain that is *not* on the link: the gRPC control plane over a Unix socket.
+cargo run -p amos-link --example remote_brain
 ```
 
 | example | shows |
 |---|---|
 | `robot_brain_loop` | two nodes on one broker: a depth frame the brain decodes (latest-wins), its measured age, the control action that reaches the robot's bus, the 13 CRC-checked motor frames, the mode the brain reads back off `state`, the latched e-stop refusing motion (with the refusal reported), and the counters + health verdict |
+| `patrol_mission` | case ①: a patrol command applied (13 frames), the camera's `frames`/`span`/`rate`/`bytes`/`bw` on **one** line, a burst that latest-wins drops and counts, the deadman cutting torque when the link goes quiet (with the cut **measured** and reported), motion refused by the latch with a reason the commander can act on, and the re-arm that clears it |
+| `fleet_console` | case ②: three robots under one wildcard console, the same table printed twice (which stream is *moving* and which one stopped — `patrol-03`'s camera reads `frames=1 rate=unknown(one frame so far …)`, never `0 Hz`), each robot's own deadman visible in the console's mode column, peer table + self-echo count + health verdict |
+| `remote_brain` | case ③: a caller that is not on the link — `GetStatus`, a `Publish` whose payload the robot's **typed** subscriber decodes, `ListActuations` folding the robot's self-reported mode (attributed by the frame's publisher), the torque cut a silent brain caused seen from outside, and the topic inventory with its `complete` flag |
 
-What the run prints (real output, abbreviated):
+What the runs print (real output, abbreviated):
+
 
 ```text
 link up: dog1 + mini-brain over the in-process broker
@@ -244,6 +259,16 @@ health: degraded: no_peers, clock_unsynced (latencies are bounds until amos-time
   at this layer, which is why it is a bring-up item.
 - **No real servo has been driven by this code.** The evidence is "correct CRC16 frames on a real
   descriptor" (`tests/hardware_hal.rs`), not "the joints moved".
+- **The application cases test the middleware, not a robot.** ①–③ (`docs/robot-apps.md`) run the
+  reference quadruped's HAL through `MockRobotHal`: they prove latest-wins, the deadman's *measured*
+  frame count travelling back to the peer whose link died, a refusal that names how to recover,
+  per-stream figures that state why they cannot be stated, and the control plane's fold — and
+  nothing about a machine. The joint table is the quadruped's (`JOINTS=12`, `leg*3+(hip|thigh|knee)`,
+  milli-degrees), so another form factor (a wheeled base, an arm, a drone) implements `RobotHal`;
+  the *middleware* is form-factor-agnostic because it moves bytes, this layer is not. A case's
+  figures are the arrivals **of the process that printed them** (a slow console under-reports and
+  counts the frames it missed in `dropped`), and they are averages since the reader started, so a
+  stream that stopped is visible as a `frames` column that no longer grows — never as `0 Hz`.
 - **`shm`, `unstable` per-call QoS, encrypted transports**: deliberately not used — see
   `docs/amos-link.md` §4/§6 for each ❌ together with its reason.
 - **Multicast on a real switch is still a field item**: the `lan` tests now prove the *protocol and

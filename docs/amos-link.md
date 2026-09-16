@@ -1156,8 +1156,49 @@ summary streams=1 frames=19 bytes=1957 untracked=0 undecodable=0 complete=yes ra
 6. **真机复核未做**：证据是同一台机器上两个真进程的真 Zenoh 会话（真 scouting、真 `put`/路由），
    没有两块板卡/真 Wi-Fi-5G 的现场采样。
 
-## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
+### 3.21 三个应用案例：把「中间件成立」变成「应用成立」（第二十轮，REQ-A276）
 
+> 前十九轮把中间件自己磨得很利：信任边界、序号归属、速率、带宽、回程、判定的词汇表。
+> 但**没有一个应用案例**：仓库里的例子只有 `robot_brain_loop` 一个（§2 的数据流），
+> 而"巡检机器人怎么用这套东西""监督台看什么""不在链路上的大脑怎么参与"这些**用法**，
+> 以及应用层依赖的性质（最新一帧赢、拒绝读得懂、看门狗在监督台看得见、控制面注入是真帧）
+> —— 一个都没有被**断言**过。例子只打印；打印的东西不会在有人改坏它时报错。
+>
+> 本轮把这一面补上：三个可运行案例 + 一份案例目录（[`docs/robot-apps.md`](robot-apps.md)）
+> + 10 例案例级测试（断言性质，不是打印）+ 3 个负数控制（每条性质都在生产代码里改坏过一次，
+> 确认对应用例**失败**，再逐字节还原）。
+
+| # | 案例 | 例子 | 断言的性质（`tests/robot_cases.rs`） |
+|---|---|---|---|
+| ① | 巡检任务（一条闭环） | `examples/patrol_mission.rs` | 一条步态 = 1×`Enable` + 每关节位置帧（13）；回程带**实际**看门狗周期；切扭矩的帧数是 HAL **报出来的**且原因是 `watchdog`；e-stop 后运动被拒且原因点名 `arm`；`arm` 清锁并清拒绝记录；未知步态/非 JSON ⇒ `Refused` 且 `hal.applied()==0`（拒绝 ≠ 半应用）；连发 3 帧 ⇒ 拿到第 3 帧、`dropped==2`；注入时刻下 6 帧/500ms ⇒ `10.0Hz` 与 `1560 B/s`，单帧 ⇒ `single-frame` |
+| ② | 机群监督台（多机只读测量） | `examples/fleet_console.rs` | 通配订阅看到全部机器人、**不含自己**、全部来自信标（非 static）、自我信标**被过滤且被计数**；两台机器人各自的看门狗都切扭矩，监督台在一条订阅上收到**两条**报告并按帧头归属；注入时刻下 4 条流 4 个窗口互不串（10Hz / 4Hz / 单帧 / 状态流），`bytes` 总和自洽，`rates()` 顺序稳定 |
+| ③ | 不在链路上的大脑（控制面） | `examples/remote_brain.rs` | `Publish` 回复带控制面自己的序号且 `matched==1`；机器人侧**类型化**订阅者解出 `Gait::Trot`/`speed`/`duration_ms`，帧头署名是控制面节点；注入后 `ListActuations` 读回 `armed/frames/gait`；沉默一个看门狗周期后同一 RPC 读出 `estopped=true` + `estop_reason=watchdog`，归属按帧头而非载荷自称 |
+
+**案例目录为什么要单独一份文档**：案例把"应用能依赖什么"写成了可执行的东西，而这份依赖**必须有一张契约表**
+（话题 → channel → profile → 为什么）。那张表在代码里只有一处实现（`Qos::for_channel`），
+并由 `the_catalogue_topics_use_the_profile_their_channel_implies` 钉住 —— **文档与中间件不许各说一套**。
+
+**负数控制（3/3，每次都逐字节还原，`cmp` 证明）**：
+
+| # | 在生产代码里改坏什么 | 失败的用例（实测） |
+|---|---|---|
+| 1 | `Qos::sensor()` 的 `DropOldest` → `DropNewest`（= 队列留最老那帧） | `case_1_the_camera_stream_is_latest_wins_and_the_loss_is_counted`：`left: 1, right: 3`（"醒来拿到的是最新一帧"） |
+| 2 | `Gait::is_motion` 恒为 `false`（= 急停锁不住运动） | `case_1_the_patrol_loop_applies_refuses_and_reports`：`expected a refusal, got Applied { seq: 2, frames: 13, armed: true }` |
+| 3 | `service::start_actuation_watch` 直接 `return None`（= 控制面不再折叠回程） | `case_3_the_deadman_is_visible_from_outside_the_link`：3.02 s 后 `left: 0, right: 1`（"one robot has reported"） |
+
+**诚实边界（本轮新增）**：
+
+1. **案例测的是中间件，不是一台机器人**：①–③ 走 `MockRobotHal`（记录型总线）。没有真电机被驱动过，
+   案例④（`tests/hardware_hal.rs`，写**真描述符**）也只是"字节真的出去了"。
+2. **HAL 的关节表是参考四足的**（`JOINTS=12`、`leg*3+(hip|thigh|knee)`、毫度整数）：轮式底盘、机械臂、
+   无人机要各自实现 `RobotHal`。中间件与形态无关（它搬字节），**这一层**与形态有关。
+3. **案例的读数是"打印它的那个进程收到的到达"**（§3.19 边界①/§3.20 边界②）：监督台自己慢了会漏帧，
+   漏掉的计进 `dropped` 并印在同一张表的 note 行上；停住的流靠 `frames` 不再增长暴露，**绝不**印成 `0 Hz`。
+4. **案例在同一台机器的一个进程里**（案例③ 是同一台机器上的真 UDS + 真 tonic）：真板卡、真 Wi-Fi/5G、
+   真交换机的现场验证仍是 bring-up 项。
+5. **案例的时钟是宿主时钟**：所有延迟都是上界，直到 `amos-timesync` 校准（案例输出自己写着这一句）。
+
+## 4. Zenoh 集成审计（**实际用了什么、没用什麼**）
 
 依赖声明（`crates/amos-link/Cargo.toml`，可选依赖、默认构建不拉）：
 
@@ -1434,6 +1475,12 @@ cargo test -p amos-link --features zenoh --lib a_typed_frame_crosses_a_real_sess
 # `published` 看起来像有真实流量 —— 现在三条路径（lan/bus/watch）同一条规则。
 # System UI 的链路面板（只读）：设置 →「机器人链路」，读运行中的 daemon。
 cd crates/amos-tauri/frontend-ts && bunx vitest run svelte-tests/link-page.svelte.test.ts
+# 应用案例（第二十轮，§3.21 + docs/robot-apps.md）：① 巡检闭环 ② 机群监督台 ③ 不在链路上的大脑
+cargo run -p amos-link --example patrol_mission     # 施加 → 回程 → 看门狗切扭矩 → 拒绝 → 重新 arm
+cargo run -p amos-link --example fleet_console      # 一张表印两次：哪条流在动、哪条停了
+cargo run -p amos-link --example remote_brain       # 真 UDS + 真 tonic：注入是真帧、回程能读回
+cargo test -p amos-link --test robot_cases          # 10 例：断言性质（不是打印）；含契约表对码
+cargo test -p amos-link --test robot_cases -- --nocapture   # 需要看时序时用；断言与上面同一条
 ```
 
 **操作员输入的两个上界**（都在**解析期**拒绝，exit 2，绝不 panic / abort —— 见 §3.3）：
