@@ -10,6 +10,7 @@
     storeCatalog,
     storeInstall,
     storeInstalled,
+    storeSearch,
     storeUninstall,
     storeUpdatable,
     storeUpgrade,
@@ -18,12 +19,23 @@
     type InstalledApp,
   } from "../lib/backend";
   import { notifyStoreTilesChanged } from "../lib/storeApps";
+  import { searchQueryOf } from "../lib/storeSearch";
   import { t } from "./locale.svelte";
 
   const online = $derived(bridged());
   let catalog = $state<AppManifest[] | null>(null);
   let installed = $state<InstalledApp[] | null>(null);
   let acting = $state<string | null>(null);
+  // ---- catalog search (REQ-A315) --------------------------------------------
+  // The daemon owns catalog search (`appstore_search`); this screen had never called it,
+  // so a big catalog could only be scrolled — an app that *is* published was
+  // indistinguishable from one that is not. `results === null` means **browsing** (the
+  // full catalog); a real search always sets an array, even an empty one, so "no match"
+  // and "not searched" can never be confused.
+  let query = $state("");
+  let results = $state<AppManifest[] | null>(null);
+  let searchErr = $state<string | null>(null);
+  let searching = $state(false);
   // Last mutation error (translated message for display). Cleared on next
   // successful mutation, and shown next to the app row that failed (REQ-A268 —
   // AppStore install/upgrade/uninstall now surface typed errors instead of
@@ -47,6 +59,60 @@
   });
 
   const installedMap = $derived(new Map((installed ?? []).map((a) => [a.manifest.id, a])));
+
+  /**
+   * Run the catalog search the user asked for.
+   *
+   * Three outcomes are kept **distinct** on purpose:
+   *  * a real reply — even an empty one ⇒ results ("no matches" is a fact);
+   *  * a refusal ⇒ the search says it failed and shows **no** list (never "no matches");
+   *  * an empty/whitespace box ⇒ browsing again, with no round-trip at all.
+   *
+   * A refusal reaches us in one of two shapes, and both are checked (the same rule
+   * `run()` uses): a plain `String` error **rejects** the invoke, while a typed
+   * `AmosError` resolves `null` and is only visible in the diagnostic ledger (REQ-A296).
+   * Either way the previous results are dropped: a stale list under a new query would
+   * read as that query's answer.
+   */
+  const runSearch = async (): Promise<void> => {
+    const q = searchQueryOf(query);
+    if (q === null) {
+      results = null;
+      searchErr = null;
+      return;
+    }
+    searching = true;
+    searchErr = null;
+    // REQ-A297 phase-2 §4 cont.3: `storeSearch` returns `AppManifest[] | null`
+    // and never rejects (REQ-A296 — `invoke` swallows rejections into `null`).
+    // The previous `try { ... } catch { rejected = true; }` was dead code:
+    // the catch branch was unreachable, and the `rejected` flag would never
+    // flip. The post-fix code folds the dead branch into the `reply === null`
+    // check that already existed below — one path, one source of truth.
+    const reply = await storeSearch(q);
+    const diag = bridgeDiag("appstore_search");
+    // `BridgeDiag` is a union: narrow on `ok` first (the same shape `run()` uses).
+    let code = "";
+    if (!diag.ok && diag.kind === "command-failed" && typeof diag.detail === "object" && diag.detail) {
+      code = (diag.detail as { code?: string }).code ?? "";
+    }
+    if (reply === null) {
+      results = null;
+      // Known codes get a localized line; anything else says "the search did not run"
+      // rather than leaking the host's own (English, path-shaped) reason.
+      searchErr = labelForCode(code) ?? t("store.searchFailed");
+    } else {
+      results = reply;
+    }
+    searching = false;
+  };
+  const clearSearch = (): void => {
+    query = "";
+    results = null;
+    searchErr = null;
+  };
+  /** What the list shows: search results when searching, else the whole catalog. */
+  const rows = $derived(results ?? catalog ?? []);
 
   /**
    * Ids the **host** reports as updatable (`appstore_updatable`), or `null` when it
@@ -152,11 +218,54 @@
   <div class="p-6 text-center text-sm opacity-70">{t("store.empty")}</div>
 {:else}
   <div class="p-4">
+    <!-- Catalog search (REQ-A315). The daemon owns the matching; this row only asks. -->
+    <div class="mb-2 flex items-center gap-2">
+      <input
+        bind:value={query}
+        onkeydown={(e) => {
+          if (e.key === "Enter") void runSearch();
+        }}
+        placeholder={t("store.searchPlaceholder")}
+        aria-label={t("store.searchPlaceholder")}
+        data-testid="store-search"
+        class="min-w-0 flex-1 rounded-full bg-neutral-200 px-3 py-1.5 text-sm outline-none dark:bg-neutral-800"
+      />
+      {#if results !== null || query !== ""}
+        <button
+          onclick={clearSearch}
+          aria-label={t("store.searchClear")}
+          data-testid="store-search-clear"
+          class="shrink-0 rounded-full bg-neutral-300 px-3 py-1.5 text-xs dark:bg-neutral-700"
+        >{t("store.searchClear")}</button>
+      {/if}
+      <button
+        onclick={() => void runSearch()}
+        disabled={searching}
+        aria-label={t("store.searchAction")}
+        data-testid="store-search-run"
+        class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+      >{t("store.searchAction")}</button>
+    </div>
+    {#if searchErr}
+      <p data-testid="store-search-error" role="alert" class="mb-2 px-1 text-xs text-danger">{searchErr}</p>
+    {/if}
+    {#if results !== null}
+      <p data-testid="store-search-count" role="status" class="px-1 pb-2 text-[11px] uppercase tracking-wide opacity-50">
+        {t("store.searchResults", { n: results.length })}
+      </p>
+    {/if}
     <div class="px-1 pb-2 text-[11px] uppercase tracking-wide opacity-50">
       {t("store.tagline")}
     </div>
+    {#if results !== null && results.length === 0}
+      <!-- A real, empty result set: the catalog has no match for this query. Never the
+           same wording as "the catalog is empty" (that is a different fact). -->
+      <div data-testid="store-search-empty" class="p-6 text-center text-sm opacity-70">
+        {t("store.searchEmpty")}
+      </div>
+    {:else}
     <div class="space-y-2">
-      {#each catalog as app (app.id)}
+      {#each rows as app (app.id)}
         {@const own = installedMap.get(app.id)}
         {@const updatable =
           updatableIds !== null
@@ -212,6 +321,7 @@
         </div>
       {/each}
     </div>
+    {/if}
     <div class="mt-4 rounded-2xl bg-white/40 px-3 py-2 text-[11px] opacity-60 dark:bg-white/[0.04]">
       {t("store.myApps")}: {installed?.length ?? 0}
     </div>
