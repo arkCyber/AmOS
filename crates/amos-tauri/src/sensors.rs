@@ -76,6 +76,10 @@ pub struct SensorImu {
     pub accel_x: f64,
     pub accel_y: f64,
     pub accel_z: f64,
+    /// Angular rate, in rad/s — zero when the bus reported no gyro sample.
+    pub gyro_x: f64,
+    pub gyro_y: f64,
+    pub gyro_z: f64,
     pub temp_c: f32,
 }
 
@@ -163,11 +167,15 @@ fn gnss_payload(g: &GnssReply) -> SensorGnss {
 
 fn imu_payload(i: &ImuReply) -> SensorImu {
     let acc = i.accel_m_s2.as_ref();
+    let gyro = i.gyro_rad_s.as_ref();
     SensorImu {
         rate_hz: i.rate_hz,
         accel_x: acc.map(|v| v.x).unwrap_or(0.0),
         accel_y: acc.map(|v| v.y).unwrap_or(0.0),
         accel_z: acc.map(|v| v.z).unwrap_or(0.0),
+        gyro_x: gyro.map(|v| v.x).unwrap_or(0.0),
+        gyro_y: gyro.map(|v| v.y).unwrap_or(0.0),
+        gyro_z: gyro.map(|v| v.z).unwrap_or(0.0),
         temp_c: i.temperature_c,
     }
 }
@@ -345,33 +353,54 @@ mod tests {
     }
 
     #[test]
-    fn imu_payload_maps_sample_and_handles_absent_accel() {
+    fn imu_payload_maps_sample_and_handles_absent_accel_and_gyro() {
         use amos_proto::amos_sensor::Vec3;
-        let with_accel = ImuReply {
+        let with_both = ImuReply {
             timestamp_ms: 5,
             accel_m_s2: Some(Vec3 {
                 x: 0.1,
                 y: -9.8,
                 z: 0.2,
             }),
-            gyro_rad_s: None,
+            gyro_rad_s: Some(Vec3 {
+                x: 0.005,
+                y: 0.001,
+                z: -0.003,
+            }),
             temperature_c: 36.5,
             rate_hz: 200,
         };
-        let p = imu_payload(&with_accel);
+        let p = imu_payload(&with_both);
         assert_eq!(p.rate_hz, 200);
         assert_eq!(p.temp_c, 36.5);
         assert_eq!(p.accel_x, 0.1);
         assert_eq!(p.accel_y, -9.8);
+        assert_eq!(p.gyro_x, 0.005);
+        assert_eq!(p.gyro_y, 0.001);
+        assert_eq!(p.gyro_z, -0.003);
+
+        // Both sensor families are optional on the wire — missing fields default to zero.
+        let no_gyro = ImuReply {
+            gyro_rad_s: None,
+            ..with_both
+        };
+        let p = imu_payload(&no_gyro);
+        assert_eq!(p.gyro_x, 0.0);
+        assert_eq!(p.gyro_y, 0.0);
+        assert_eq!(p.gyro_z, 0.0);
+        // Accelerometer still present.
+        assert_eq!(p.accel_x, 0.1);
 
         let no_accel = ImuReply {
             accel_m_s2: None,
-            ..with_accel
+            ..with_both
         };
         let p = imu_payload(&no_accel);
         assert_eq!(p.accel_x, 0.0);
         assert_eq!(p.accel_y, 0.0);
         assert_eq!(p.accel_z, 0.0);
+        // Gyroscope still present.
+        assert_eq!(p.gyro_x, 0.005);
     }
 
     #[test]

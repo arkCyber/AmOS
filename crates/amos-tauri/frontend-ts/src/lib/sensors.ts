@@ -33,6 +33,10 @@ export interface SensorImu {
   accel_x: number;
   accel_y: number;
   accel_z: number;
+  /** Angular rate in rad/s — zero when the bus reported no gyro sample. */
+  gyro_x: number;
+  gyro_y: number;
+  gyro_z: number;
   temp_c: number;
 }
 

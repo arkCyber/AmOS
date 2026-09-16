@@ -21,7 +21,16 @@ const full: SensorSnapshot = {
     sats: 11,
     fix_mode: "3d",
   },
-  imu: { rate_hz: 200, accel_x: 0.1, accel_y: -9.8, accel_z: 0.2, temp_c: 36.5 },
+  imu: {
+    rate_hz: 200,
+    accel_x: 0.1,
+    accel_y: -9.8,
+    accel_z: 0.2,
+    gyro_x: 0.005,
+    gyro_y: 0.001,
+    gyro_z: -0.003,
+    temp_c: 36.5,
+  },
 };
 
 describe("normalizeSnapshot (daemon sensor_snapshot -> typed view)", () => {
@@ -31,6 +40,11 @@ describe("normalizeSnapshot (daemon sensor_snapshot -> typed view)", () => {
     expect(s.mode).toBe("balanced");
     expect(s.gnss?.has_fix).toBe(true);
     expect(s.imu?.rate_hz).toBe(200);
+    // Gyro fields are passed through (they appear on the snapshot from the daemon's
+    // SensorService — this mirrors the live-path SensorImuDatum which already had them).
+    expect(s.imu?.gyro_x).toBeCloseTo(0.005);
+    expect(s.imu?.gyro_y).toBeCloseTo(0.001);
+    expect(s.imu?.gyro_z).toBeCloseTo(-0.003);
   });
 
   test("null/absent payload yields an empty, safe view (never throws)", () => {
