@@ -16,8 +16,8 @@
     type CloudPrefs,
   } from "../../lib/cloud";
   import { t } from "../locale.svelte";
-  import { GROUP, ROW, LABEL, HINT } from "./kit";
-  import Switch from "./Switch.svelte";
+  import { GROUP, HINT } from "./kit";
+  import ToggleRow from "./ToggleRow.svelte";
 
   let cloud = $state<CloudPrefs>(readCloud(readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {})));
   // The last snapshot lives in the shared store, so the summary/restore also work
@@ -77,14 +77,11 @@
 </script>
 
 <section class={GROUP}>
-  <div class={ROW}>
-    <span class={LABEL}>{t("settings.icloud")}</span>
-    <Switch
-      on={cloud.enabled}
-      ontoggle={() => persistCloud({ enabled: !cloud.enabled })}
-      aria={t("settings.icloud")}
-    />
-  </div>
+  <ToggleRow
+    label={t("settings.icloud")}
+    on={cloud.enabled}
+    ontoggle={() => persistCloud({ enabled: !cloud.enabled })}
+  />
   {#if cloud.enabled}
     <div class="px-4 py-3 border-t border-black/5 dark:border-white/10">
       <p class={HINT}>{t("settings.icloudHint")}</p>

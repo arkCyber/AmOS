@@ -11,8 +11,8 @@
     type NetGuardStatus,
   } from "../../lib/netguard";
   import { t } from "../locale.svelte";
-  import { GROUP, H2, HINT, LABEL, ROW, VALUE } from "./kit";
-  import Switch from "./Switch.svelte";
+  import { GROUP, H2, HINT, VALUE } from "./kit";
+  import ToggleRow from "./ToggleRow.svelte";
 
   let status = $state<NetGuardStatus | null>(null);
   let busy = $state(false);
@@ -55,10 +55,13 @@
 
 <div class="space-y-5">
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>🛡️ {t("settings.guard")}</span>
-      <Switch on={on} ontoggle={toggle} disabled={!canToggle} aria={t("settings.guard")} />
-    </div>
+    <ToggleRow
+      label={t("settings.guard")}
+      icon="🛡️"
+      on={on}
+      ontoggle={toggle}
+      disabled={!canToggle}
+    />
     <div class="border-t border-black/5 px-4 py-3 dark:border-white/10">
       <p class={VALUE}>{t(valKey)}</p>
       {#if status}

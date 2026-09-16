@@ -7,13 +7,35 @@
     on,
     ontoggle,
     aria,
+    id,
+    labelledby,
     disabled = false,
-  }: { on: boolean; ontoggle: () => void; aria?: string; disabled?: boolean } = $props();
+  }: {
+    on: boolean;
+    ontoggle: () => void;
+    /** Accessible name as a *string* (`aria-label`). Prefer `labelledby` when the row has a
+     *  visible label — see the two notes below. */
+    aria?: string;
+    /** The switch's own id, so a row's `<label for={id}>` can point at the button
+     *  (`<button>` is a labelable element: this is what forwards a label click to the
+     *  toggle, on top of the `labelledby` name). Handed over by `Field.svelte`. */
+    id?: string;
+    /** Id of the element that carries the visible label text → `aria-labelledby`
+     *  (REQ-A283). This is the association a Settings row uses: the name the screen reader
+     *  reads is then literally the text on screen, so the two cannot drift.
+     *
+     *  When both `labelledby` and `aria` are given, `aria-labelledby` wins (ARIA name
+     *  computation order) — pass only one of them. */
+    labelledby?: string;
+    disabled?: boolean;
+  } = $props();
 </script>
 
 <button
   role="switch"
   aria-checked={on}
+  {id}
+  aria-labelledby={labelledby}
   aria-label={aria}
   onclick={ontoggle}
   disabled={disabled}

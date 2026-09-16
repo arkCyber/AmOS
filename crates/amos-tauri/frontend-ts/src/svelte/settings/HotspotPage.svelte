@@ -27,9 +27,10 @@
   import type { QuickSettings, RadioKey } from "../../lib/settings";
   import type { RadioRefusalView } from "../../lib/radioControl";
   import { t } from "../locale.svelte";
-  import { GROUP, ROW, LABEL, SUB, HINT, FIELD } from "./kit";
-  import Switch from "./Switch.svelte";
-  import Segmented from "./Segmented.svelte";
+  import { GROUP, SUB, HINT, FIELD } from "./kit";
+  import ChoiceRow from "./ChoiceRow.svelte";
+  import Field from "./Field.svelte";
+  import ToggleRow from "./ToggleRow.svelte";
 
   let {
     qs,
@@ -88,10 +89,12 @@
     </p>
   {/if}
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>{t("settings.hotspot")}</span>
-      <Switch on={on} disabled={blocked} aria={t("settings.hotspot")} ontoggle={toggleHotspot} />
-    </div>
+    <ToggleRow
+      label={t("settings.hotspot")}
+      on={on}
+      disabled={blocked}
+      ontoggle={toggleHotspot}
+    />
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.hotspotDesc")}</p>
     </div>
@@ -116,80 +119,73 @@
 
   {#if !blocked}
     <section class={GROUP}>
-      <div class={ROW}>
-        <span class={LABEL}>{t("settings.hotspotName")}</span>
-        <input
-          value={cfg.ssid}
-          aria-label={t("settings.hotspotName")}
-          placeholder={t("settings.hotspotName")}
-          onchange={(e) => saveCfg(setSsid(cfg, (e.currentTarget as HTMLInputElement).value))}
-          class="{FIELD} max-w-[60%] text-right"
-        />
-      </div>
-      <div class={SUB}></div>
-      <div class={ROW}>
-        <span class={LABEL}>{t("settings.hotspotPassword")}</span>
-        <span class="flex min-w-0 items-center gap-2">
+      <Field label={t("settings.hotspotName")}>
+        {#snippet control({ id })}
           <input
-            value={cfg.password}
-            aria-label={t("settings.hotspotPassword")}
-            placeholder={t("settings.hotspotPassword")}
-            disabled={open}
-            onchange={(e) =>
-              saveCfg(setPassword(cfg, (e.currentTarget as HTMLInputElement).value))}
-            class="{FIELD} max-w-[40%] text-right disabled:opacity-40"
+            {id}
+            value={cfg.ssid}
+            placeholder={t("settings.hotspotName")}
+            onchange={(e) => saveCfg(setSsid(cfg, (e.currentTarget as HTMLInputElement).value))}
+            class="{FIELD} max-w-[60%] text-right"
           />
-          <button
-            type="button"
-            disabled={open}
-            onclick={() => saveCfg(setPassword(cfg, suggestPassword()))}
-            aria-label={t("settings.hotspotGenerate")}
-            class="shrink-0 text-xs text-accent disabled:opacity-40"
-          >{t("settings.hotspotGenerate")}</button>
-        </span>
-      </div>
+        {/snippet}
+      </Field>
       <div class={SUB}></div>
-      <div class={ROW}>
-        <span class={LABEL}>{t("settings.hotspotBand")}</span>
-        <Segmented
-          options={[
-            { value: "2.4", label: t("settings.hotspotBand24") },
-            { value: "5", label: t("settings.hotspotBand5") },
-          ]}
-          value={cfg.band}
-          onpick={pickBand}
-          aria={t("settings.hotspotBand")}
-        />
-      </div>
+      <Field label={t("settings.hotspotPassword")}>
+        {#snippet control({ id })}
+          <span class="flex min-w-0 items-center gap-2">
+            <input
+              {id}
+              value={cfg.password}
+              placeholder={t("settings.hotspotPassword")}
+              disabled={open}
+              onchange={(e) =>
+                saveCfg(setPassword(cfg, (e.currentTarget as HTMLInputElement).value))}
+              class="{FIELD} max-w-[40%] text-right disabled:opacity-40"
+            />
+            <button
+              type="button"
+              disabled={open}
+              onclick={() => saveCfg(setPassword(cfg, suggestPassword()))}
+              aria-label={t("settings.hotspotGenerate")}
+              class="shrink-0 text-xs text-accent disabled:opacity-40"
+            >{t("settings.hotspotGenerate")}</button>
+          </span>
+        {/snippet}
+      </Field>
       <div class={SUB}></div>
-      <div class={ROW}>
-        <span class={LABEL}>{t("settings.hotspotSecurity")}</span>
-        <Segmented
-          options={[
-            { value: "wpa2", label: t("settings.hotspotSecWpa2") },
-            { value: "wpa3", label: t("settings.hotspotSecWpa3") },
-            { value: "open", label: t("settings.hotspotSecOpen") },
-          ]}
-          value={cfg.security}
-          onpick={pickSecurity}
-          aria={t("settings.hotspotSecurity")}
-        />
-      </div>
+      <ChoiceRow
+        label={t("settings.hotspotBand")}
+        options={[
+          { value: "2.4", label: t("settings.hotspotBand24") },
+          { value: "5", label: t("settings.hotspotBand5") },
+        ]}
+        value={cfg.band}
+        onpick={pickBand}
+      />
       <div class={SUB}></div>
-      <div class={ROW}>
-        <span class={LABEL}>{t("settings.hotspotMaxClients")}</span>
-        <Segmented
-          options={[
-            { value: "1", label: "1" },
-            { value: "3", label: "3" },
-            { value: "5", label: "5" },
-            { value: "10", label: "10" },
-          ]}
-          value={String(cfg.maxClients)}
-          onpick={(v) => saveCfg(setMaxClients(cfg, Number(v)))}
-          aria={t("settings.hotspotMaxClients")}
-        />
-      </div>
+      <ChoiceRow
+        label={t("settings.hotspotSecurity")}
+        options={[
+          { value: "wpa2", label: t("settings.hotspotSecWpa2") },
+          { value: "wpa3", label: t("settings.hotspotSecWpa3") },
+          { value: "open", label: t("settings.hotspotSecOpen") },
+        ]}
+        value={cfg.security}
+        onpick={pickSecurity}
+      />
+      <div class={SUB}></div>
+      <ChoiceRow
+        label={t("settings.hotspotMaxClients")}
+        options={[
+          { value: "1", label: "1" },
+          { value: "3", label: "3" },
+          { value: "5", label: "5" },
+          { value: "10", label: "10" },
+        ]}
+        value={String(cfg.maxClients)}
+        onpick={(v) => saveCfg(setMaxClients(cfg, Number(v)))}
+      />
       {#if problems.length > 0}
         <div class={SUB}></div>
         <div class="px-4 py-3">

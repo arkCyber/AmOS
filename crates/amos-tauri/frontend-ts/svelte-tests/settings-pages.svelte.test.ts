@@ -37,6 +37,7 @@ import { LOCK_KEY } from "../src/lib/lock";
 import { assertHold, clearAllHolds, releaseHold } from "../src/lib/keepAwakeCore";
 import { AUTOOFF_STORE_KEY } from "../src/lib/display";
 import { zh } from "../src/i18n/locales/zh";
+import { controlByName } from "./a11y-name";
 
 beforeEach(() => window.localStorage.clear());
 afterEach(() => {
@@ -48,10 +49,14 @@ const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const buttonContaining = (h: { container: HTMLElement }, s: string) =>
   [...h.container.querySelectorAll("button")].find((b) => (b.textContent ?? "").includes(s)) as
     HTMLButtonElement | undefined;
+/**
+ * The switch whose **accessible name** is `aria` (REQ-A283). The index rows and the sub pages
+ * are built from the shared `ToggleRow`, so a switch's name now comes from `aria-labelledby` →
+ * the visible label instead of an `aria-label` attribute — the search is by name, which is the
+ * property the a11y audit is about.
+ */
 const switchByLabel = (h: { container: HTMLElement }, aria: string) =>
-  [...h.container.querySelectorAll('[role="switch"]')].find(
-    (b) => b.getAttribute("aria-label") === aria,
-  ) as HTMLButtonElement | undefined;
+  controlByName<HTMLButtonElement>(h.container, '[role="switch"]', aria);
 
 /** Push the index row whose text contains `label`. */
 const navigate = async (h: { container: HTMLElement }, label: string) => {

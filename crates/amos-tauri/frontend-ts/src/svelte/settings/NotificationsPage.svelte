@@ -15,8 +15,8 @@
     type QuickSettings,
   } from "../../lib/settings";
   import { t } from "../locale.svelte";
-  import { GROUP, ROW, LABEL, HINT } from "./kit";
-  import Switch from "./Switch.svelte";
+  import { GROUP, LABEL, HINT } from "./kit";
+  import ToggleRow from "./ToggleRow.svelte";
 
   const readQuick = (): QuickSettings => normalizeQuick(readStoreValue<unknown>(SETTINGS_KEY, {}));
   let qs = $state<QuickSettings>(readQuick());
@@ -37,10 +37,7 @@
 
 <div class="space-y-5">
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>{t("settings.dnd")}</span>
-      <Switch on={dnd} aria={t("settings.dnd")} ontoggle={toggleDnd} />
-    </div>
+    <ToggleRow label={t("settings.dnd")} on={dnd} ontoggle={toggleDnd} />
     <div class="px-4 pb-3">
       <p class={HINT}>{dnd ? t("settings.dndOn") : t("settings.dndOff")}</p>
     </div>

@@ -11,7 +11,7 @@
   } from "../../lib/cellularService";
   import { t } from "../locale.svelte";
   import { GROUP, ROW, LABEL, HINT, VALUE } from "./kit";
-  import Switch from "./Switch.svelte";
+  import ToggleRow from "./ToggleRow.svelte";
 
   const initPrefs = normalizeCellular(readStoreValue<unknown>(CELLULAR_KEY, {}));
   let prefs = $state<CellularPrefs>(initPrefs);
@@ -40,25 +40,23 @@
   </section>
 
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>{t("settings.cellularData")}</span>
-      <Switch on={prefs.data} aria={t("settings.cellularData")} ontoggle={() => toggle("data")} />
-    </div>
+    <ToggleRow
+      label={t("settings.cellularData")}
+      on={prefs.data}
+      ontoggle={() => toggle("data")}
+    />
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.cellularDesc")}</p>
     </div>
   </section>
 
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>{t("settings.cellularRoaming")}</span>
-      <Switch
-        on={prefs.roaming}
-        disabled={!prefs.data}
-        aria={t("settings.cellularRoaming")}
-        ontoggle={() => toggle("roaming")}
-      />
-    </div>
+    <ToggleRow
+      label={t("settings.cellularRoaming")}
+      on={prefs.roaming}
+      disabled={!prefs.data}
+      ontoggle={() => toggle("roaming")}
+    />
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.cellularRoamingDesc")}</p>
     </div>

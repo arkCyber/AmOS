@@ -36,9 +36,9 @@
   import { type RadioRefusalView } from "../lib/radioControl";
   import { syncQuickRadios, tapRadio } from "../lib/quickRadio";
   import { t, locale } from "./locale.svelte";
-  import { GROUP, ROW, LABEL, VALUE, SUB, CHEVRON, H1, ROW_ACTIVE } from "./settings/kit";
+  import { GROUP, LABEL, VALUE, SUB, CHEVRON, H1, ROW_ACTIVE } from "./settings/kit";
   import { settingsChannel } from "./appLinks";
-  import Switch from "./settings/Switch.svelte";
+  import ToggleRow from "./settings/ToggleRow.svelte";
   import DisplayPage from "./settings/DisplayPage.svelte";
   import WallpaperPage from "./settings/WallpaperPage.svelte";
   import LanguagePage from "./settings/LanguagePage.svelte";
@@ -353,10 +353,7 @@
 
 {#snippet rowView(row: Row)}
   {#if row.kind === "switch"}
-    <div class={ROW}>
-      <span class={LABEL}>{t(row.key)}</span>
-      <Switch on={row.on()} aria={t(row.key)} ontoggle={row.toggle} />
-    </div>
+    <ToggleRow label={t(row.key)} on={row.on()} ontoggle={row.toggle} />
   {:else}
     <button onclick={() => nav(row.page)} class={ROW_ACTIVE} aria-label={t(row.key)}>
       <span class={LABEL}>{t(row.key)}</span>

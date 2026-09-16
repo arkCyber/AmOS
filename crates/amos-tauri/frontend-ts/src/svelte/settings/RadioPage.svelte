@@ -54,8 +54,8 @@
     type RadioControlReply,
   } from "../../lib/backend";
   import { radioManagedState, type RadioRefusalView } from "../../lib/radioControl";
-  import { GROUP, ROW, LABEL, SUB, HINT } from "./kit";
-  import Switch from "./Switch.svelte";
+  import { GROUP, LABEL, SUB, HINT } from "./kit";
+  import ToggleRow from "./ToggleRow.svelte";
 
   let {
     which,
@@ -379,18 +379,15 @@
     </p>
   {/if}
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>{title}</span>
-      <!-- A switch the platform owns: the control still shows the device's real state,
-           but tapping it hands the user to the system surface instead of pretending to
-           flip something no app may flip (REQ-A202). -->
-      <Switch
-        on={on}
-        disabled={qs.airplane || ctlState.managed}
-        aria={title}
-        ontoggle={() => (ctlState.managed ? void openRadioSettings() : onToggle(which))}
-      />
-    </div>
+    <!-- A switch the platform owns: the control still shows the device's real state,
+         but tapping it hands the user to the system surface instead of pretending to
+         flip something no app may flip (REQ-A202). -->
+    <ToggleRow
+      label={title}
+      on={on}
+      disabled={qs.airplane || ctlState.managed}
+      ontoggle={() => (ctlState.managed ? void openRadioSettings() : onToggle(which))}
+    />
     {#if ctlState.managed}
       <div class={SUB}></div>
       <div class="flex items-center justify-between gap-3 px-4 py-2">
@@ -557,14 +554,11 @@
         </div>
       {/if}
       <div class={SUB}></div>
-      <div class={ROW}>
-        <span class={LABEL}>{t("settings.btDiscoverable")}</span>
-        <Switch
-          on={btCfg.discoverable}
-          aria={t("settings.btDiscoverable")}
-          ontoggle={() => saveBt(setDiscoverable(btCfg, !btCfg.discoverable))}
-        />
-      </div>
+      <ToggleRow
+        label={t("settings.btDiscoverable")}
+        on={btCfg.discoverable}
+        ontoggle={() => saveBt(setDiscoverable(btCfg, !btCfg.discoverable))}
+      />
       <div class={SUB}></div>
       <div class="px-4 py-2">
         <p class={HINT}>

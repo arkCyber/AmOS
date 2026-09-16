@@ -26,8 +26,8 @@
     type QuickSettings,
   } from "../../lib/settings";
   import { t } from "../locale.svelte";
-  import { GROUP, ROW, LABEL, SUB, HINT } from "./kit";
-  import Switch from "./Switch.svelte";
+  import { GROUP, SUB, HINT } from "./kit";
+  import ToggleRow from "./ToggleRow.svelte";
 
   const readQuick = (): QuickSettings => normalizeQuick(readStoreValue<unknown>(SETTINGS_KEY, {}));
   let qs = $state<QuickSettings>(readQuick());
@@ -50,16 +50,10 @@
 </script>
 
 <section class={GROUP}>
-  <div class={ROW}>
-    <span class={LABEL}>{t("settings.focusDnd")}</span>
-    <Switch on={dnd} aria={t("settings.focusDnd")} ontoggle={toggleDnd} />
-  </div>
+  <ToggleRow label={t("settings.focusDnd")} on={dnd} ontoggle={toggleDnd} />
   {#if FOCUS_SCENARIOS.length > 0}<div class={SUB}></div>{/if}
   {#each FOCUS_SCENARIOS as id, i (id)}
-    <div class={ROW}>
-      <span class={LABEL}>{t(idKey(id))}</span>
-      <Switch on={prefs[id]} aria={t(idKey(id))} ontoggle={() => toggle(id)} />
-    </div>
+    <ToggleRow label={t(idKey(id))} on={prefs[id]} ontoggle={() => toggle(id)} />
     {#if i < FOCUS_SCENARIOS.length - 1}<div class={SUB}></div>{/if}
   {/each}
   <div class="px-4 pb-3">

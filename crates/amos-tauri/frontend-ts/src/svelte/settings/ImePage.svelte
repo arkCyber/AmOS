@@ -26,7 +26,7 @@
   import { onMount } from "svelte";
   import { t } from "../locale.svelte";
   import { GROUP, ROW, LABEL, HINT, SUB } from "./kit";
-  import Switch from "./Switch.svelte";
+  import ToggleRow from "./ToggleRow.svelte";
 
   let enabled = $state(readImeEnabled());
   let engine = $state<ImeState | null>(null);
@@ -81,10 +81,11 @@
 </script>
 
 <section class={GROUP}>
-  <div class={ROW}>
-    <span class={LABEL}>{t("settings.imeKeyboard")}</span>
-    <Switch on={enabled} aria={t("settings.imeKeyboard")} ontoggle={toggleEnabled} />
-  </div>
+  <ToggleRow
+    label={t("settings.imeKeyboard")}
+    on={enabled}
+    ontoggle={toggleEnabled}
+  />
 </section>
 <div class="px-1">
   <p class={HINT}>{t("settings.imeHint")}</p>

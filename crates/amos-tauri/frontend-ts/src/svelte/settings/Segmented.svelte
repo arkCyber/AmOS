@@ -13,11 +13,22 @@
     value,
     onpick,
     aria,
+    id,
+    labelledby,
   }: {
     options: { value: string; label: string }[];
     value: string;
     onpick: (v: string) => void;
+    /** Accessible name as a *string* (`aria-label`), for the cases with no visible label
+     *  element. Settings rows pass `labelledby` instead (REQ-A283). */
     aria?: string;
+    /** The group's own id. A `radiogroup` is a composite widget, not a labelable element,
+     *  so a row's `<label for={id}>` never names it — the id exists so the id handed out by
+     *  `Field.svelte` resolves to a real node (the `labelledby` association does the naming). */
+    id?: string;
+    /** Id of the element carrying the visible label text → `aria-labelledby` (REQ-A283).
+     *  Takes precedence over `aria` when both are given. */
+    labelledby?: string;
   } = $props();
 
   let group = $state<HTMLDivElement | null>(null);
@@ -53,6 +64,8 @@
 
 <div
   role="radiogroup"
+  {id}
+  aria-labelledby={labelledby}
   aria-label={aria}
   use:el
   class="inline-flex rounded-[9px] bg-neutral-200/70 p-[3px] ring-1 ring-black/5 dark:bg-white/10 dark:ring-white/10"

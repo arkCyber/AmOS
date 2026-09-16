@@ -13,8 +13,9 @@
   } from "../../lib/sound";
   import { playNotifyTone } from "../../lib/notifyTone";
   import { t } from "../locale.svelte";
-  import { GROUP, ROW, LABEL, HINT } from "./kit";
-  import Switch from "./Switch.svelte";
+  import { GROUP, ROW, HINT } from "./kit";
+  import Field from "./Field.svelte";
+  import ToggleRow from "./ToggleRow.svelte";
 
   let prefs = $state<SoundPolicy>(loadSound());
   const toggle = (key: "ring" | "vibrate") => {
@@ -37,33 +38,37 @@
 
 <div class="space-y-5">
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>{t("settings.notifySound")}</span>
-      <Switch on={prefs.ring} aria={t("settings.notifySound")} ontoggle={() => toggle("ring")} />
-    </div>
+    <ToggleRow
+      label={t("settings.notifySound")}
+      on={prefs.ring}
+      ontoggle={() => toggle("ring")}
+    />
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.notifySoundDesc")}</p>
     </div>
-    <div class={ROW}>
-      <span class={LABEL}>{t("settings.notifyVolume")}</span>
-      <div class="flex items-center gap-2">
-        <input
-          type="range"
-          min="0"
-          max="100"
-          step="5"
-          value={Math.round(prefs.volume * 100)}
-          aria-label={t("settings.notifyVolume")}
-          data-testid="sound-volume"
-          oninput={(e) =>
-            setVolume(Number((e.currentTarget as HTMLInputElement).value))}
-          class="w-28 cursor-pointer accent-accent"
-        />
-        <span class="w-9 text-right text-xs tabular-nums opacity-70"
-          >{Math.round(prefs.volume * 100)}%</span
-        >
-      </div>
-    </div>
+    <Field label={t("settings.notifyVolume")}>
+      {#snippet control({ id })}
+        <div class="flex items-center gap-2">
+          <!-- A native range input: named by the row's <label for={id}> above, never by a
+               duplicated aria-label (REQ-A283). -->
+          <input
+            {id}
+            type="range"
+            min="0"
+            max="100"
+            step="5"
+            value={Math.round(prefs.volume * 100)}
+            data-testid="sound-volume"
+            oninput={(e) =>
+              setVolume(Number((e.currentTarget as HTMLInputElement).value))}
+            class="w-28 cursor-pointer accent-accent"
+          />
+          <span class="w-9 text-right text-xs tabular-nums opacity-70"
+            >{Math.round(prefs.volume * 100)}%</span
+          >
+        </div>
+      {/snippet}
+    </Field>
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.notifyVolumeDesc")}</p>
     </div>
@@ -79,10 +84,7 @@
   </section>
 
   <section class={GROUP}>
-    <div class={ROW}>
-      <span class={LABEL}>{t("settings.haptics")}</span>
-      <Switch on={prefs.vibrate} aria={t("settings.haptics")} ontoggle={() => toggle("vibrate")} />
-    </div>
+    <ToggleRow label={t("settings.haptics")} on={prefs.vibrate} ontoggle={() => toggle("vibrate")} />
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.hapticsDesc")}</p>
     </div>

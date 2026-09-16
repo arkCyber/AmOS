@@ -18,6 +18,7 @@ import { setLocale } from "../src/svelte/locale.svelte";
 import { AMOS_LOCALE_CHANGED_EVENT } from "../src/svelte/ui-events";
 import { AUTOOFF_STORE_KEY } from "../src/lib/display";
 import { LOCK_KEY, type LockCfg } from "../src/lib/lock";
+import { controlByName } from "./a11y-name";
 import { SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
 import { settingsChannel } from "../src/svelte/appLinks";
 import { WIFI_KEY } from "../src/lib/wifi";
@@ -39,10 +40,9 @@ const buttonContaining = (h: { container: HTMLElement }, s: string) =>
 const inputByPlaceholder = (h: { container: HTMLElement }, ph: string) =>
   [...h.container.querySelectorAll("input")].find((i) => i.getAttribute("placeholder") === ph) as
     HTMLInputElement | undefined;
+/** The switch whose accessible name is `aria` (REQ-A283 — see svelte-tests/a11y-name.ts). */
 const switchByLabel = (h: { container: HTMLElement }, aria: string) =>
-  [...h.container.querySelectorAll('[role="switch"]')].find(
-    (b) => b.getAttribute("aria-label") === aria,
-  ) as HTMLButtonElement | undefined;
+  controlByName<HTMLButtonElement>(h.container, '[role="switch"]', aria);
 
 /** Tap the index row whose text contains `label` to push its sub page. */
 const navigate = async (h: { container: HTMLElement }, label: string) => {
@@ -142,7 +142,11 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     // the Wi‑Fi-only "current network" row is NOT shown on the Bluetooth page
     expect(txt(host)).not.toContain("当前网络");
     // default discoverable = on; toggle persists it off
-    const disc = host.container.querySelector('[role="switch"][aria-label="可被发现"]') as HTMLButtonElement | null;
+    const disc = controlByName<HTMLButtonElement>(
+      host.container,
+      '[role="switch"]',
+      "可被发现",
+    );
     expect(disc).toBeTruthy();
     expect(disc?.getAttribute("aria-checked")).toBe("true");
     await fireEvent.click(disc as HTMLButtonElement);

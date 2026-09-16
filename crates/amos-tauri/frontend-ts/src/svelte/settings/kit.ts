@@ -18,3 +18,23 @@ export const H1 =
 export const H2 =
   "text-[15px] font-semibold text-neutral-900 dark:text-neutral-50";
 export const HINT = "text-xs opacity-60";
+
+/**
+ * Unique id for one label↔control pair (REQ-A283).
+ *
+ * The a11y rule is that a control's name must come from its *visible* label, and the two
+ * halves are wired by an id (`<label for={id}>` / `aria-labelledby={labelId}`, see
+ * `Field.svelte`). Hand-writing those ids per page is exactly how they drift, so they are
+ * generated here, from one counter: ids only ever need to be unique inside one document,
+ * and a page (or a test) that mounts N rows gets N distinct ids.
+ *
+ * A monotonic counter (not `crypto.randomUUID`) because the value also lands in test
+ * assertions / snapshots: a per-mount stable sequence keeps a failure readable.
+ */
+let fieldSeq = 0;
+
+/** Next `amos-field-<n>` id. Use through `Field.svelte`, not directly in pages. */
+export function nextFieldId(): string {
+  fieldSeq += 1;
+  return `amos-field-${fieldSeq}`;
+}

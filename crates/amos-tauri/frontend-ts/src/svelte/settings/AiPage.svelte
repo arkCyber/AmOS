@@ -27,7 +27,15 @@
     type DiagLevel,
   } from "../../lib/debugLog";
   import { t } from "../locale.svelte";
-  import { GROUP, LABEL, FIELD } from "./kit";
+  import { GROUP, LABEL, FIELD, nextFieldId } from "./kit";
+
+  // The three cloud fields are a *stacked* form (caption above the input), not a label/control
+  // row, so they are bound with `<label for>` + `id` rather than through the row primitives.
+  // The ids still come from kit.ts' single counter, so they cannot collide with a row's
+  // (REQ-A283).
+  const modelId = nextFieldId();
+  const endpointId = nextFieldId();
+  const apiKeyId = nextFieldId();
 
   /**
    * Localized circuit-breaker state (REQ-A131). An unknown/empty state is reported
@@ -221,16 +229,23 @@
   </div>
   {#if isCloud}
     <div class="mt-3 space-y-2">
-      <span class="block text-[11px] opacity-60">{t("settings.aiModel")}</span>
-      <input bind:value={aiEdits.model} class={FIELD} placeholder={t("settings.aiModelPlaceholder")} />
-      <span class="block text-[11px] opacity-60">{t("settings.aiEndpoint")}</span>
+      <label for={modelId} class="block text-[11px] opacity-60">{t("settings.aiModel")}</label>
       <input
+        id={modelId}
+        bind:value={aiEdits.model}
+        class={FIELD}
+        placeholder={t("settings.aiModelPlaceholder")}
+      />
+      <label for={endpointId} class="block text-[11px] opacity-60">{t("settings.aiEndpoint")}</label>
+      <input
+        id={endpointId}
         bind:value={aiEdits.endpoint}
         class={FIELD}
         placeholder={aiEdits.provider === "custom" ? t("settings.aiEndpointPlaceholder") : undefined}
       />
-      <span class="block text-[11px] opacity-60">{t("settings.aiKey")}</span>
+      <label for={apiKeyId} class="block text-[11px] opacity-60">{t("settings.aiKey")}</label>
       <input
+        id={apiKeyId}
         bind:value={aiEdits.apiKey}
         type="password"
         placeholder={aiEdits.apiKey ? "••••••••" : ""}

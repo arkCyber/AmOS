@@ -7,9 +7,9 @@
   import { heldReasons, onHoldChange } from "../../lib/keepAwakeCore";
   import { t } from "../locale.svelte";
   import { themeMode, setThemeMode } from "../theme.svelte";
-  import { GROUP, ROW, LABEL, SUB, HINT } from "./kit";
-  import Switch from "./Switch.svelte";
-  import Segmented from "./Segmented.svelte";
+  import { GROUP, SUB, HINT } from "./kit";
+  import ChoiceRow from "./ChoiceRow.svelte";
+  import ToggleRow from "./ToggleRow.svelte";
   import { onMount } from "svelte";
 
   let autoOffStr = $state(String(clampAutoOffSec(readStoreValue<unknown>(AUTOOFF_STORE_KEY, 0))));
@@ -43,34 +43,28 @@
 </script>
 
 <section class={GROUP}>
-  <div class={ROW}>
-    <span class={LABEL}>{t("settings.appearance")}</span>
-    <Segmented
-      options={[
-        { value: "light", label: t("theme.light") },
-        { value: "dark", label: t("theme.dark") },
-        { value: "auto", label: t("theme.auto") },
-      ]}
-      value={themeMode()}
-      onpick={(v) => setThemeMode(v as "light" | "dark" | "auto")}
-      aria="appearance"
-    />
-  </div>
+  <ChoiceRow
+    label={t("settings.appearance")}
+    options={[
+      { value: "light", label: t("theme.light") },
+      { value: "dark", label: t("theme.dark") },
+      { value: "auto", label: t("theme.auto") },
+    ]}
+    value={themeMode()}
+    onpick={(v) => setThemeMode(v as "light" | "dark" | "auto")}
+  />
   <div class={SUB}></div>
-  <div class={ROW}>
-    <span class={LABEL}>{t("settings.autoOff")}</span>
-    <Segmented
-      options={[
-        { value: "0", label: t("settings.autoOffOff") },
-        { value: "15", label: t("settings.autoOff15") },
-        { value: "30", label: t("settings.autoOff30") },
-        { value: "60", label: t("settings.autoOff60") },
-      ]}
-      value={autoOffStr}
-      onpick={pickAutoOff}
-      aria="auto-screen-off"
-    />
-  </div>
+  <ChoiceRow
+    label={t("settings.autoOff")}
+    options={[
+      { value: "0", label: t("settings.autoOffOff") },
+      { value: "15", label: t("settings.autoOff15") },
+      { value: "30", label: t("settings.autoOff30") },
+      { value: "60", label: t("settings.autoOff60") },
+    ]}
+    value={autoOffStr}
+    onpick={pickAutoOff}
+  />
   {#if autoOffStr !== "0"}
     <!-- Only meaningful once a timeout is set: explains why the screen is NOT
          sleeping despite it. Empty bus = an authoritative "nothing is holding". -->
@@ -81,8 +75,5 @@
     </div>
   {/if}
   <div class={SUB}></div>
-  <div class={ROW}>
-    <span class={LABEL}>{t("settings.wakeHome")}</span>
-    <Switch on={wakeHome} ontoggle={toggleWakeHome} aria={t("settings.wakeHome")} />
-  </div>
+  <ToggleRow label={t("settings.wakeHome")} on={wakeHome} ontoggle={toggleWakeHome} />
 </section>

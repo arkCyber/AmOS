@@ -4,8 +4,8 @@
   import { readStoreValue, writeStoreValueChecked } from "../../lib/amosStore";
   import { LOCK_KEY, makeLock, sanitizePin, type LockCfg } from "../../lib/lock";
   import { t } from "../locale.svelte";
-  import { GROUP, ROW, LABEL, SUB, FIELD, HINT } from "./kit";
-  import Switch from "./Switch.svelte";
+  import { GROUP, SUB, FIELD, HINT } from "./kit";
+  import ToggleRow from "./ToggleRow.svelte";
 
   const lockInit = readStoreValue<LockCfg>(LOCK_KEY, { enabled: false });
   let lockCfg = $state<LockCfg>(lockInit);
@@ -44,10 +44,11 @@
 </script>
 
 <section class={GROUP}>
-  <div class={ROW}>
-    <span class={LABEL}>{t("lock.enable")}</span>
-    <Switch on={lockOn} aria={t("lock.enable")} ontoggle={() => (lockOn = !lockOn)} />
-  </div>
+  <ToggleRow
+    label={t("lock.enable")}
+    on={lockOn}
+    ontoggle={() => (lockOn = !lockOn)}
+  />
   <p class="px-4 pb-3 text-xs opacity-60">
     {lockCfg.enabled ? t("lock.stateOn") : t("lock.stateOff")}
     {lockCfg.pin ? ` ${t("lock.pinSet")}` : ""}
@@ -55,7 +56,16 @@
   {#if lockOn}
     <div class={SUB}></div>
     <div class="flex items-center gap-2 px-4 py-3">
-      <input bind:value={lockPin} placeholder={t("lock.pin")} inputmode="numeric" class={FIELD} />
+      <!-- The only visible affordance of this field is its placeholder, so the name is the
+           `aria-label` carrying that same string (REQ-A283) — not `<label for>`, which would
+           have added text the design does not show. -->
+      <input
+        bind:value={lockPin}
+        placeholder={t("lock.pin")}
+        aria-label={t("lock.pin")}
+        inputmode="numeric"
+        class={FIELD}
+      />
       <button
         onclick={saveLock}
         class="rounded-full bg-accent px-4 py-1.5 text-sm text-white active:scale-95"
@@ -66,7 +76,9 @@
   {/if}
   {#if lockMsg}
     <div class="px-4 pb-3">
-      <p class={HINT}>{lockMsg}</p>
+      <!-- The save result is announced: "Saved" / "refused" / "failed" is the answer to an
+           action, and a screen-reader user who pressed 保存 must hear it (REQ-A283). -->
+      <p class={HINT} role="status">{lockMsg}</p>
     </div>
   {/if}
 </section>

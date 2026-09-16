@@ -17,6 +17,7 @@ import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
 import { HOTSPOT_KEY, type HotspotCfg } from "../src/lib/hotspot";
 import { SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
 import { zh } from "../src/i18n/locales/zh";
+import { controlByName } from "./a11y-name";
 
 beforeEach(() => window.localStorage.clear());
 afterEach(() => cleanup());
@@ -38,18 +39,20 @@ const qs = (over: Partial<QuickSettings> = {}): QuickSettings => ({
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const byTest = (c: HTMLElement, id: string) => c.querySelector(`[data-testid="${id}"]`);
+/**
+ * The switch whose **accessible name** is `aria` (REQ-A283). Rows are built from the shared
+ * `ToggleRow`, so the name comes from `aria-labelledby` → the visible label, not from an
+ * `aria-label` attribute any more — locating by name is what the audit is about.
+ */
 const switchByLabel = (h: { container: HTMLElement }, aria: string) =>
-  [...h.container.querySelectorAll('[role="switch"]')].find(
-    (b) => b.getAttribute("aria-label") === aria,
-  ) as HTMLButtonElement | undefined;
+  controlByName<HTMLButtonElement>(h.container, '[role="switch"]', aria);
 const buttonByLabel = (h: { container: HTMLElement }, aria: string) =>
   [...h.container.querySelectorAll("button")].find(
     (b) => b.getAttribute("aria-label") === aria,
   ) as HTMLButtonElement | undefined;
+/** The input whose accessible name is `aria` (REQ-A283 — the row's `<label for>` names it). */
 const inputByLabel = (h: { container: HTMLElement }, aria: string) =>
-  [...h.container.querySelectorAll("input")].find(
-    (i) => i.getAttribute("aria-label") === aria,
-  ) as HTMLInputElement | undefined;
+  controlByName<HTMLInputElement>(h.container, "input", aria);
 const radioByText = (h: { container: HTMLElement }, label: string) =>
   [...h.container.querySelectorAll('[role="radio"]')].find(
     (b) => (b.textContent ?? "").trim() === label,
