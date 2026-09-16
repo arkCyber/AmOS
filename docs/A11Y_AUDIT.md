@@ -1,6 +1,6 @@
 # AmOS Frontend A11y Audit (REQ-A282 → REQ-A283)
 
-> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度, 刀 5(REQ-A290) 触摸目标尺寸(全部 ≥28px AA-pass)。扫描器当前报 0 AA 缺口,6 处 AAA 警告(记录于 §3.1.9)。
+> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度, 刀 5(REQ-A290) 触摸目标尺寸, 刀 6(REQ-A291) 动画敏感性(prefers-reduced-motion, R8 0 findings)。扫描器当前报 0 AA 缺口,6 处触摸 AAA 警告。
 > 方法: `scripts/a11y-scan.mjs` 启发式扫描 + DOM 级实测 + 人工分桶(严重性/真信号/误报)。
 > 底线: a11y 缺口的影响面 = 用键盘 / 屏幕阅读器的用户根本无法用,所以即使是误报上限也按"先补再说"——但补哪条按严重性,不是按发现数。
 
@@ -378,6 +378,33 @@ bun run check
 cargo test -p amos-tauri --lib
 ```
 
+### 3.1.10 已补: 刀 6 的动画敏感性(REQ-A291)
+
+§4.3 列了"动画/动效敏感性"未覆盖。
+`index.css` 已有一份全局 `@media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms } }`
+但 Svelte scoped `<style>` 中的 `@keyframes` 在 scoped class 下运行,会绕过全局 reset。
+
+**本刀工作**:
+- 新规则 R8 (`a11y-scan.mjs`): 扫描 Svelte scoped `@keyframes` + `animation: ... infinite` 且 duration > 0.5s,
+  当 block 内无 `@media (prefers-reduced-motion: reduce)` 时报告。
+- `ClockApp.svelte` 修复: 给 `.alarm-active / .alarm-ring-btn / .timer-done` 的 infinite animation
+  加 scoped `@media (prefers-reduced-motion: reduce) { animation: none }`。
+- `AppLibrary.svelte` 的 `fx-fade-up` 是 0.22s one-shot, WCAG 2.3.1 豁免范围,无需修改。
+
+**R8 豁免**:
+- 功能性 `requestAnimationFrame` / `setInterval` (传感器轮询等) — 非装饰性
+- one-shot / ≤500ms infinite 动画 — WCAG 2.3.1 安全
+- `animate-pulse` Tailwind 类 — 被 `index.css` 全局 reset 覆盖
+
+**证据**:
+```bash
+bun run a11y:selftest
+# selftest: 15 assertion(s), 0 failure(s).
+
+node scripts/a11y-scan.mjs --json
+# total: 0 — ClockApp has @media override, AppLibrary one-shot is exempt.
+```
+
 ---
 
 ### 3.2 P1 — ~~47 个 focus-visible 缺口~~ → **已补(REQ-A285,见 §3.1.7)**
@@ -428,11 +455,11 @@ cargo test -p amos-tauri --lib
 - live region
 - **颜色对比度(REQ-A288)** — WCAG SC 1.4.3 (AA ≥ 4.5 / AAA ≥ 7.0)
 - **触摸目标尺寸(REQ-A290)** — WCAG SC 2.5.5 (AAA 44px) / SC 2.5.8 (AA 24px); desktop mouse-primary, 6 处 32-40px icon button AAA-warn 已记录
+- **动画敏感性(REQ-A291)** — WCAG SC 2.3.1/2.3.2 (AAA); scoped @keyframes infinite + @media override 已补; global reset covers animate-pulse
 
 **没覆盖**(留给后续轮次):
 - 字幕 / 音频描述
-- 焦点陷阱
-- 动画/动效敏感性---
+- 焦点陷阱---
 
 ## 5. 与现有脚本族的关系
 
