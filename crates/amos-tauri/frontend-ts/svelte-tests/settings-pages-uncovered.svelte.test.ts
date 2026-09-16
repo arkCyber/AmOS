@@ -181,6 +181,41 @@ describe("DiagnosticsPage.svelte", () => {
     expect(host.container.querySelector('[data-testid="store-quarantine"]')).toBeNull();
   });
 
+  test("a partial sensor snapshot renders unknowns as `—` instead of throwing (REQ-A294)", async () => {
+    // `normalizeSnapshot` promises "tolerating absent / partial fields … Never throws", and
+    // this page's SensorPanel formats the blocks it returns (`temp_c.toFixed(1)`,
+    // `latitude_deg.toFixed(5)`, …). A daemon that sends an imu/gnss block *without* those
+    // numbers used to reach the component with `undefined` and throw during render — the
+    // promise was in the doc comment, not in the code.
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "sensor_snapshot") {
+          return {
+            mode: "balanced",
+            cameras: [],
+            gnss: { enabled: true, has_fix: true }, // fix claimed, coordinates absent
+            imu: { rate_hz: 200 }, // sample rate only: no axes, no temperature
+          };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    try {
+      const host = render(DiagnosticsPage);
+      await settle();
+      const text = txt(host);
+      // Rendered at all (the throw would have failed the mount) …
+      expect(text).toContain(t("settings.sensor"));
+      // … and every missing reading shows as unknown, never as a fabricated number.
+      expect(text).toMatch(/[—]/);
+      expect(text).not.toContain("0.0°C");
+      expect(text).not.toContain("0.00000");
+    } finally {
+      delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+  });
+
   test("a preserved corrupt value makes the quarantine panel appear in the stack", async () => {
     window.localStorage.setItem(`amos.notes${CORRUPT_SUFFIX}`, "{ not json");
     const host = render(DiagnosticsPage);

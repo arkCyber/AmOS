@@ -56,6 +56,10 @@
   });
 
   const hasLive = $derived(view.totalEvents > 0);
+  /** One sample axis: a formatted number, or `—` when the daemon did not report it.
+   *  An unknown reading must never be printed as `0.00` (REQ-A294 / AEROSPACE P0-3). */
+  const liveSample = (v: number | null, digits = 2): string =>
+    v === null ? "—" : v.toFixed(digits);
   const dotClass = $derived(
     hasLive
       ? "h-2 w-2 animate-pulse rounded-full bg-emerald-500"
@@ -79,10 +83,10 @@
   const imuLine = $derived(
     view.lastImu
       ? t("settings.sensorLiveLastImu", {
-          ax: view.lastImu.accel_x.toFixed(2),
-          ay: view.lastImu.accel_y.toFixed(2),
-          az: view.lastImu.accel_z.toFixed(2),
-          temp: view.lastImu.temperature_c.toFixed(1),
+          ax: liveSample(view.lastImu.accel_x),
+          ay: liveSample(view.lastImu.accel_y),
+          az: liveSample(view.lastImu.accel_z),
+          temp: liveSample(view.lastImu.temperature_c, 1),
         })
       : "",
   );

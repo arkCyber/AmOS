@@ -9,6 +9,7 @@
     sensorCameraCount,
     sensorSetMode,
     sensorSnapshot,
+    type SensorGnss,
     type SensorMode,
   } from "../lib/sensors";
   import { t } from "./locale.svelte";
@@ -57,6 +58,19 @@
   const visible = $derived(
     cameraCount > 0 || !!snap.gnss || !!snap.imu || snap.mode !== "unknown",
   );
+  /** One unknown field is enough to make a position claim unstatable — the reading is
+   *  shown as `—` rather than a string that mixes measured and missing numbers (REQ-A294). */
+  const gnssFixLabel = (g: SensorGnss): string => {
+    const { latitude_deg: lat, longitude_deg: lon, accuracy_m: acc, sats } = g;
+    if (lat === null || lon === null) return "—";
+    const parts = [`${lat.toFixed(5)}, ${lon.toFixed(5)}`];
+    if (acc !== null) parts.push(`±${acc.toFixed(0)}m`);
+    if (sats !== null) parts.push(`${sats}sats`);
+    return parts.join(" · ");
+  };
+  /** A sample value, or `—` when the daemon did not report it. */
+  const sample = (v: number | null, digits: number): string =>
+    v === null ? "—" : v.toFixed(digits);
   const firstCam = $derived(snap.cameras[0]);
   const camLabel = $derived(
     cameraCount === 0
@@ -69,7 +83,7 @@
       : !snap.gnss.enabled
         ? t("settings.sensorGnssDisabled")
         : snap.gnss.has_fix
-          ? `${snap.gnss.latitude_deg.toFixed(5)}, ${snap.gnss.longitude_deg.toFixed(5)} · ±${snap.gnss.accuracy_m.toFixed(0)}m · ${snap.gnss.sats}sats`
+          ? gnssFixLabel(snap.gnss)
           : t("settings.sensorGnssNone"),
   );
 </script>
@@ -105,7 +119,7 @@
       <p>{t("settings.sensorCameras", { n: camLabel })}</p>
       <p>{t("settings.sensorGnss", { n: gnssLabel })}</p>
       {#if snap.imu}
-        <p>{t("settings.sensorImu", { hz: String(snap.imu.rate_hz), t: snap.imu.temp_c.toFixed(1) })}</p>
+        <p>{t("settings.sensorImu", { hz: String(snap.imu.rate_hz), t: sample(snap.imu.temp_c, 1) })}</p>
       {/if}
     </div>
   </section>

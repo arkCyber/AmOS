@@ -24,16 +24,23 @@ export const SENSOR_DATA_EVENT = "sensor-data";
 
 export type SensorDataKind = "imu" | "camera_frame" | "mode" | "cleared";
 
-/** Serializable mirror of the Rust `HostImu` sample payload. */
+/**
+ * Serializable mirror of the Rust `HostImu` sample payload.
+ *
+ * Axes are `number | null`: `null` means the field was absent or not finite on the wire,
+ * and it is **not** the same fact as `0` (a fabricated zero reads as "the device is
+ * perfectly still", i.e. a measurement — AEROSPACE P0-3). The live panel prints `—` for
+ * `null` and a number for a real sample (REQ-A294).
+ */
 export interface SensorImuDatum {
   timestamp_ms: number;
-  accel_x: number;
-  accel_y: number;
-  accel_z: number;
-  gyro_x: number;
-  gyro_y: number;
-  gyro_z: number;
-  temperature_c: number;
+  accel_x: number | null;
+  accel_y: number | null;
+  accel_z: number | null;
+  gyro_x: number | null;
+  gyro_y: number | null;
+  gyro_z: number | null;
+  temperature_c: number | null;
 }
 
 /** Serializable mirror of the Rust `HostFrameMeta` (metadata only, no bytes). */
@@ -77,15 +84,18 @@ function toImu(v: unknown): SensorImuDatum | null {
   if (!isObj(v)) return null;
   const timestamp_ms = num(v.timestamp_ms);
   if (timestamp_ms === null) return null;
+  // An absent / non-finite field stays `null` (`num` already rejects those): mapping it to
+  // `0` would put a fabricated measurement on screen — the panel would show a perfectly
+  // still device where the daemon actually reported nothing (REQ-A294 / P0-3).
   return {
     timestamp_ms,
-    accel_x: num(v.accel_x) ?? 0,
-    accel_y: num(v.accel_y) ?? 0,
-    accel_z: num(v.accel_z) ?? 0,
-    gyro_x: num(v.gyro_x) ?? 0,
-    gyro_y: num(v.gyro_y) ?? 0,
-    gyro_z: num(v.gyro_z) ?? 0,
-    temperature_c: num(v.temperature_c) ?? 0,
+    accel_x: num(v.accel_x),
+    accel_y: num(v.accel_y),
+    accel_z: num(v.accel_z),
+    gyro_x: num(v.gyro_x),
+    gyro_y: num(v.gyro_y),
+    gyro_z: num(v.gyro_z),
+    temperature_c: num(v.temperature_c),
   };
 }
 

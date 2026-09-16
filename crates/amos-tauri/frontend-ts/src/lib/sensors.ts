@@ -21,23 +21,30 @@ export interface SensorCamera {
 export interface SensorGnss {
   enabled: boolean;
   has_fix: boolean;
-  latitude_deg: number;
-  longitude_deg: number;
-  accuracy_m: number;
-  sats: number;
+  /** WGS-84 degrees — `null` when the fix was not reported (never a fabricated 0). */
+  latitude_deg: number | null;
+  longitude_deg: number | null;
+  /** Horizontal accuracy in metres — `null` when not reported. */
+  accuracy_m: number | null;
+  /** Satellites in use — `null` when not reported. */
+  sats: number | null;
   fix_mode: string;
 }
 
 export interface SensorImu {
   rate_hz: number;
-  accel_x: number;
-  accel_y: number;
-  accel_z: number;
-  /** Angular rate in rad/s — zero when the bus reported no gyro sample. */
-  gyro_x: number;
-  gyro_y: number;
-  gyro_z: number;
-  temp_c: number;
+  /** Acceleration in m/s² — `null` when the bus reported no sample for that axis.
+   *  An absent reading is **unknown**, never a fabricated `0` (AEROSPACE P0-3: a
+   *  zero here would read as "the device is perfectly still", i.e. a measurement). */
+  accel_x: number | null;
+  accel_y: number | null;
+  accel_z: number | null;
+  /** Angular rate in rad/s — `null` when the bus reported no gyro sample. */
+  gyro_x: number | null;
+  gyro_y: number | null;
+  gyro_z: number | null;
+  /** Die temperature in °C — `null` when not reported. */
+  temp_c: number | null;
 }
 
 export interface SensorSnapshot {
@@ -65,14 +72,64 @@ export function sensorCameraCount(s: SensorSnapshot): number {
 /**
  * Coerce a raw `sensor_snapshot` payload into a typed view, tolerating absent /
  * partial fields (daemon offline, older shape). Never throws.
+ *
+ * The `imu` / `gnss` blocks are normalized **field by field**, not passed through:
+ * the doc promise above is a promise about behaviour, and both consumers format these
+ * blocks (`SensorPanel` calls `temp_c.toFixed(1)`, `latitude_deg.toFixed(5)`, …), so a
+ * daemon that sends a *partial* block used to reach a component with `undefined` and
+ * throw during render (REQ-A294). Numeric fields that are absent / non-finite become
+ * `null` — **unknown stays unknown** — and the panels print `—` for them.
  */
 export function normalizeSnapshot(raw: unknown): SensorSnapshot {
   const s = (raw ?? {}) as Partial<SensorSnapshot>;
   return {
     mode: normalizeMode(s.mode),
     cameras: Array.isArray(s.cameras) ? (s.cameras as SensorCamera[]) : [],
-    gnss: s.gnss ?? null,
-    imu: s.imu ?? null,
+    gnss: normalizeGnss(s.gnss),
+    imu: normalizeImu(s.imu),
+  };
+}
+
+/** A finite number, else `null` (NaN/Infinity/strings/booleans are not measurements). */
+function optNum(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** A boolean, else `false` — the conservative direction for "usable?" flags. */
+function optBool(v: unknown): boolean {
+  return v === true;
+}
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
+}
+
+function normalizeImu(raw: unknown): SensorImu | null {
+  const imu = asRecord(raw);
+  if (!imu) return null;
+  return {
+    rate_hz: optNum(imu.rate_hz) ?? 0,
+    accel_x: optNum(imu.accel_x),
+    accel_y: optNum(imu.accel_y),
+    accel_z: optNum(imu.accel_z),
+    gyro_x: optNum(imu.gyro_x),
+    gyro_y: optNum(imu.gyro_y),
+    gyro_z: optNum(imu.gyro_z),
+    temp_c: optNum(imu.temp_c),
+  };
+}
+
+function normalizeGnss(raw: unknown): SensorGnss | null {
+  const g = asRecord(raw);
+  if (!g) return null;
+  return {
+    enabled: optBool(g.enabled),
+    has_fix: optBool(g.has_fix),
+    latitude_deg: optNum(g.latitude_deg),
+    longitude_deg: optNum(g.longitude_deg),
+    accuracy_m: optNum(g.accuracy_m),
+    sats: optNum(g.sats),
+    fix_mode: typeof g.fix_mode === "string" ? g.fix_mode : "",
   };
 }
 

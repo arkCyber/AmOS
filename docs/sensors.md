@@ -138,6 +138,25 @@ Camera/IMU 是**流**不是 getter：Android 把每个新帧/运动样本投递�
 
 ## 8. System UI 实时数据流广播（2026-09-09，`sensor-data` 事件）
 
+> **2026-09-16（REQ-A294）"未采集" ≠ `0.00`**：本节的链路里，快照路径（`imu_payload`）与实时路径
+> （`toSensorData`）都曾把**没有上报**的轴/温度映射成 `0.0`（Rust `unwrap_or(0.0)`、TS `?? 0`），
+> 而两个面板会把这些字段格式化显示 ⇒ 屏幕上的 `0.00` 是一个**设备从未测过的测量值**（且是最误导的
+> 那个：读起来像"设备完全静止"），直接违反 `AEROSPACE_SOFTWARE_AUDIT` **P0-3**（"遥测不伪造：未采集
+> 必须上报 `None`"）。现在这条链上"未知"是**一等事实**：
+>
+> * **Rust 快照**（`sensors.rs`）：`SensorImu` 的六个轴 + `temp_c` 是 `Option<f64>/Option<f32>`；
+>   proto 的 `accel_m_s2`/`gyro_rad_s` 为 `None` ⇒ 对应轴为 `None`（**不再** `unwrap_or(0.0)`）。
+> * **TS 归一化**（`lib/sensors.ts`）：`normalizeSnapshot` 逐字段归一 `imu`/`gnss`（此前是**原样透传**）
+>   —— 非有限值/字符串/布尔一律 `null`，未知保持未知；顺带修掉"部分载荷打崩面板"：`SensorPanel`
+>   会调 `temp_c.toFixed(1)` / `latitude_deg.toFixed(5)`，而透传的 `undefined` 会在渲染期 **抛 TypeError**
+>   （负控实测：注入回透传 ⇒ `Cannot read properties of undefined (reading 'toFixed')`）。
+> * **TS 实时**（`lib/sensorEvents.ts`）：`toImu` 不再 `?? 0`，`SensorImuDatum` 的轴/温度为 `number | null`。
+> * **UI**：`LiveSensors` 与 `SensorPanel` 对未知显示 `—`（该字面量是这两个面板既有的"缺失"记号）；
+>   GNSS 只要坐标缺失就整体显示 `—`，不把"测到的"和"没测到的"拼成一句话。
+> * **守护**：`sensors.test.ts`（部分块 + 畸形值）、`sensorEvents.test.ts`（缺失/NaN/字符串轴）、
+>   `sensor-live.svelte.test.ts`（未知轴渲染 `—` 且**不出现** `0.00`）、`settings-pages-uncovered`
+>   （部分快照 ⇒ 面板照常渲染并显示 `—`）、`sensors::tests`（三组独立缺失 + 全家缺失）。
+
 补上此前「传感器数据向 System UI 的实时 Context 总线广播」的缺口：除了按需快照（拉取），现在 System
 UI 的 `SensorHost` 是一个**实时推送源**——凡向共享流桥推入一个被接受的 IMU 样本 / 相机帧、能量档真实
 切换或 glue detach 清空样本，都会把一条 `sensor-data` 事件 `emit` 给 WebView（镜像

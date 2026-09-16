@@ -1,6 +1,1 @@
-[
-  {
-    "path": "crates/amos-tauri/frontend-ts/svelte-tests/pwa-hub.svelte.test.ts",
-    "reason": "REQ-A293 svelte-tests: PWA picker form-aware layout DOM tests (2026-09-16)"
-  }
-]
+[]

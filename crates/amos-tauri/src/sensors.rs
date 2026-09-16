@@ -70,17 +70,24 @@ pub struct SensorGnss {
 }
 
 /// Serializable IMU sample.
+///
+/// The six axes and the die temperature are `Option`: the proto's `accel_m_s2` /
+/// `gyro_rad_s` are optional, and a sample that was **not** reported must stay
+/// distinguishable from a real measurement. Mapping an absent axis to `0.0` would put a
+/// value on the wire that the device never measured (AEROSPACE P0-3 — the same rule
+/// `SystemStatus` follows), and `0` is the most misleading substitute available: it reads
+/// as "perfectly still". `None` is rendered as `—` by the UI (REQ-A294).
 #[derive(Clone, Debug, Serialize)]
 pub struct SensorImu {
     pub rate_hz: u32,
-    pub accel_x: f64,
-    pub accel_y: f64,
-    pub accel_z: f64,
-    /// Angular rate, in rad/s — zero when the bus reported no gyro sample.
-    pub gyro_x: f64,
-    pub gyro_y: f64,
-    pub gyro_z: f64,
-    pub temp_c: f32,
+    pub accel_x: Option<f64>,
+    pub accel_y: Option<f64>,
+    pub accel_z: Option<f64>,
+    /// Angular rate, in rad/s — `None` when the bus reported no gyro sample.
+    pub gyro_x: Option<f64>,
+    pub gyro_y: Option<f64>,
+    pub gyro_z: Option<f64>,
+    pub temp_c: Option<f32>,
 }
 
 /// One read of every sensor family + the energy mode.
@@ -170,13 +177,15 @@ fn imu_payload(i: &ImuReply) -> SensorImu {
     let gyro = i.gyro_rad_s.as_ref();
     SensorImu {
         rate_hz: i.rate_hz,
-        accel_x: acc.map(|v| v.x).unwrap_or(0.0),
-        accel_y: acc.map(|v| v.y).unwrap_or(0.0),
-        accel_z: acc.map(|v| v.z).unwrap_or(0.0),
-        gyro_x: gyro.map(|v| v.x).unwrap_or(0.0),
-        gyro_y: gyro.map(|v| v.y).unwrap_or(0.0),
-        gyro_z: gyro.map(|v| v.z).unwrap_or(0.0),
-        temp_c: i.temperature_c,
+        // Absent stays absent (`None`): the UI prints `—` for it instead of a fabricated
+        // `0.0`, which would read as a measurement (REQ-A294 / P0-3).
+        accel_x: acc.map(|v| v.x),
+        accel_y: acc.map(|v| v.y),
+        accel_z: acc.map(|v| v.z),
+        gyro_x: gyro.map(|v| v.x),
+        gyro_y: gyro.map(|v| v.y),
+        gyro_z: gyro.map(|v| v.z),
+        temp_c: Some(i.temperature_c),
     }
 }
 
@@ -353,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn imu_payload_maps_sample_and_handles_absent_accel_and_gyro() {
+    fn imu_payload_maps_sample_and_keeps_absent_families_unknown() {
         use amos_proto::amos_sensor::Vec3;
         let with_both = ImuReply {
             timestamp_ms: 5,
@@ -372,35 +381,54 @@ mod tests {
         };
         let p = imu_payload(&with_both);
         assert_eq!(p.rate_hz, 200);
-        assert_eq!(p.temp_c, 36.5);
-        assert_eq!(p.accel_x, 0.1);
-        assert_eq!(p.accel_y, -9.8);
-        assert_eq!(p.gyro_x, 0.005);
-        assert_eq!(p.gyro_y, 0.001);
-        assert_eq!(p.gyro_z, -0.003);
+        assert_eq!(p.temp_c, Some(36.5));
+        assert_eq!(p.accel_x, Some(0.1));
+        assert_eq!(p.accel_y, Some(-9.8));
+        assert_eq!(p.accel_z, Some(0.2));
+        assert_eq!(p.gyro_x, Some(0.005));
+        assert_eq!(p.gyro_y, Some(0.001));
+        assert_eq!(p.gyro_z, Some(-0.003));
 
-        // Both sensor families are optional on the wire — missing fields default to zero.
+        // Both sensor families are optional on the wire, and an absent one stays **absent**
+        // (`None` → the UI prints `—`): substituting `0.0` would put a measurement on the
+        // wire that the device never made — and `0` is the most misleading substitute,
+        // because it reads as "perfectly still" (REQ-A294 / AEROSPACE P0-3).
         let no_gyro = ImuReply {
             gyro_rad_s: None,
             ..with_both
         };
         let p = imu_payload(&no_gyro);
-        assert_eq!(p.gyro_x, 0.0);
-        assert_eq!(p.gyro_y, 0.0);
-        assert_eq!(p.gyro_z, 0.0);
-        // Accelerometer still present.
-        assert_eq!(p.accel_x, 0.1);
+        assert_eq!(p.gyro_x, None);
+        assert_eq!(p.gyro_y, None);
+        assert_eq!(p.gyro_z, None);
+        // Accelerometer still present (the families are independent).
+        assert_eq!(p.accel_x, Some(0.1));
 
         let no_accel = ImuReply {
             accel_m_s2: None,
             ..with_both
         };
         let p = imu_payload(&no_accel);
-        assert_eq!(p.accel_x, 0.0);
-        assert_eq!(p.accel_y, 0.0);
-        assert_eq!(p.accel_z, 0.0);
+        assert_eq!(p.accel_x, None);
+        assert_eq!(p.accel_y, None);
+        assert_eq!(p.accel_z, None);
         // Gyroscope still present.
-        assert_eq!(p.gyro_x, 0.005);
+        assert_eq!(p.gyro_x, Some(0.005));
+
+        // Both absent: every axis is unknown, nothing is invented — and the *scalar* sample
+        // facts that the reply does carry (rate, temperature) are still reported.
+        let neither = ImuReply {
+            accel_m_s2: None,
+            gyro_rad_s: None,
+            ..with_both
+        };
+        let p = imu_payload(&neither);
+        assert_eq!(
+            [p.accel_x, p.accel_y, p.accel_z, p.gyro_x, p.gyro_y, p.gyro_z],
+            [None, None, None, None, None, None]
+        );
+        assert_eq!(p.rate_hz, 200);
+        assert_eq!(p.temp_c, Some(36.5));
     }
 
     #[test]

@@ -35,6 +35,29 @@ describe("real-time sensor-data events (System UI SensorHost broadcast)", () => 
     expect(ev!.frame).toBeNull();
   });
 
+  test("a missing or non-finite axis stays unknown, never a fabricated 0 (REQ-A294)", () => {
+    // The live panel formats these fields, so `?? 0` used to put a *plausible measurement*
+    // on screen (a perfectly still device) where the wire carried nothing at all.
+    const ev = toSensorData({
+      ts_ms: 9,
+      kind: "imu",
+      backend: "live",
+      mode: "balanced",
+      // Only one real axis; the rest are absent, NaN, or a string.
+      imu: { timestamp_ms: 9, accel_y: -9.8, accel_x: Number.NaN, gyro_z: "0.5" },
+      frame: null,
+      prev_mode: null,
+    });
+    expect(ev).not.toBeNull();
+    expect(ev!.imu!.accel_y).toBeCloseTo(-9.8);
+    expect(ev!.imu!.accel_x).toBeNull();
+    expect(ev!.imu!.accel_z).toBeNull();
+    expect(ev!.imu!.gyro_x).toBeNull();
+    expect(ev!.imu!.gyro_y).toBeNull();
+    expect(ev!.imu!.gyro_z).toBeNull();
+    expect(ev!.imu!.temperature_c).toBeNull();
+  });
+
   test("toSensorData accepts a camera_frame metadata event", () => {
     const ev = toSensorData({ ts_ms: 2, kind: "camera_frame", backend: "live", mode: "balanced", imu: null, frame: FRAME, prev_mode: null });
     expect(ev).not.toBeNull();
