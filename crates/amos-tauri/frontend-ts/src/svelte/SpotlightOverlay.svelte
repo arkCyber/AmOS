@@ -8,7 +8,7 @@
   // 搜索：按名称 / id 子串匹配（大小写不敏感）。
   // 选中：Enter 打开 / 单击打开 → wm_open(id) → 关闭浮层。
   import { onMount } from "svelte";
-  import { invoke } from "../lib/backend";
+  import { bridgeDiag, invoke } from "../lib/backend";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import { LAYOUT_KEY, type HomeLayout, getLayout } from "../lib/amosStore";
   import { withoutPhone } from "../lib/phoneApps";
@@ -73,10 +73,27 @@
   });
 
   async function openApp(id: string) {
-    try {
-      await invoke("wm_open", { label: id });
-    } catch {
-      /* ignore */
+    // REQ-A297 phase-2 §4: `invoke` swallows failures into `null` (REQ-A296).
+    // The earlier try/catch was dead code. A silently-failed `wm_open` from
+    // Spotlight would feel like "Enter doesn't do anything" — log the null
+    // for ops but still close the panel (better than leaving the user with
+    // a dead modal over their desktop).
+    const result = await invoke<unknown>("wm_open", { label: id });
+    if (result === null) {
+      const diag = bridgeDiag("wm_open");
+      if (!diag.ok) {
+        // Only the `{ ok: false, kind: ... }` shape carries `kind` / `detail`
+        // — narrowed here so svelte-check sees the union.
+        const code =
+          diag.kind === "command-failed" &&
+          diag.detail &&
+          typeof diag.detail === "object"
+            ? (diag.detail as { code?: string }).code
+            : undefined;
+        // Soft log; the panel closes regardless. Keeps the failure visible
+        // in the diagnostic ledger without overwhelming the user.
+        console.warn(`[Spotlight] wm_open(${id}) refused`, code ?? diag.kind);
+      }
     }
     onclose?.();
   }

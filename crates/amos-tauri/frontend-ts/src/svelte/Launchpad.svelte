@@ -14,7 +14,7 @@
   //
   // 数据：实时读 home layout（page + dock，去重） → APP_META 元信息。
   import { onMount } from "svelte";
-  import { invoke } from "../lib/backend";
+  import { bridgeDiag, invoke } from "../lib/backend";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import { LAYOUT_KEY, type HomeLayout, getLayout, saveLayout } from "../lib/amosStore";
   import { withoutPhone } from "../lib/phoneApps";
@@ -95,13 +95,45 @@
   }
 
   // ─── 打开应用 ──────────────────────────────────────────────────────────────
+  //
+  // REQ-A297 phase-2 §4 (typed error discipline): `invoke` swallows
+  // failures into `null` (REQ-A296 / `lib/backend.ts`), so a bare
+  // `await invoke(...)` always resolves. The earlier `try/catch` was
+  // dead code — it could never fire — and a silently-failed `wm_open`
+  // made the icon look unresponsive ("click an app, nothing happens").
+  // We now branch on the null result and write a diagnostic the UI can
+  // surface via `bridgeDiag("wm_open")`.
+
   async function openApp(id: string) {
-    try {
-      await invoke("wm_open", { label: id });
-    } catch {
-      /* ignore */
+    const result = await invoke<unknown>("wm_open", { label: id });
+    if (result !== null) {
+      onclose?.();
+      return;
     }
-    onclose?.();
+    // The command ran but the host refused (or the bridge was offline).
+    // The earlier `try/catch` was dead code — `invoke` swallows rejections
+    // into `null` per REQ-A296. The user used to see a dead launcher; now
+    // we keep a breadcrumb and decide closure from the typed outcome.
+    const diag = bridgeDiag("wm_open");
+    if (diag.ok) {
+      // Last command succeeded but result was null? Invariant violation —
+      // close out of caution.
+      onclose?.();
+      return;
+    }
+    // Extract a typed error code (only present on command-failed outcomes);
+    // the empty `not-bridged` shape also encodes "the daemon is gone".
+    const code =
+      diag.kind === "command-failed" &&
+      diag.detail &&
+      typeof diag.detail === "object"
+        ? (diag.detail as { code?: string }).code
+        : undefined;
+    console.warn(`[Launchpad] wm_open(${id}) refused`, code ?? diag.kind);
+    // Host refused: keep the panel open so the user can pick another app.
+    // Offline (or any other failure path): close — staying on a dead modal
+    // over a broken backend isn't useful.
+    if (diag.kind === "not-bridged") onclose?.();
   }
 
   // ─── 隐藏 app（编辑模式：从 home layout 中删除，落盘）───────────────────────
