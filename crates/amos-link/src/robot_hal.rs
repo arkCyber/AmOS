@@ -1563,12 +1563,92 @@ pub const MAX_ACTUATION_FRAMES: usize = 4096;
 pub const MAX_WATCHDOG_MS: u64 = 3_600_000;
 
 /// A command that was refused **before it reached the bus**, as reported to the commander.
+///
+/// **The wire form is validated** ([`RefusalWire`]): a refusal may travel as a stand-alone
+/// frame on a future control-plane surface (today it appears inside an [`ActuationState`]),
+/// so its `reason` is bounded at decode time, the same way [`MotorFrame`] bounds its argument
+/// and [`ActuationState`] bounds its counts. A refusal whose `reason` exceeds
+/// [`MAX_REFUSAL_REASON_BYTES`] is **refused at decode** — counted as a decode error by the
+/// subscriber and skipped — instead of being stored, rendered, and silently truncated on the
+/// way to the UI.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RefusalWire", into = "RefusalWire")]
 pub struct Refusal {
     /// The link sequence of the refused action.
     pub seq: u64,
     /// Why it was refused (malformed intent, or motion while e-stopped).
     pub reason: String,
+}
+
+/// The wire form of a [`Refusal`]: identical fields, order and encoding, so the bytes on the
+/// link are unchanged — the difference is that **decoding validates** the `reason` length
+/// (the same pattern [`MotorFrameWire`] and [`ActuationStateWire`] use, for the same reason:
+/// this payload comes from a peer).
+#[derive(Serialize, Deserialize)]
+struct RefusalWire {
+    seq: u64,
+    reason: String,
+}
+
+impl Refusal {
+    /// Validate a refusal's reason against the byte ceiling ([`MAX_REFUSAL_REASON_BYTES`]).
+    ///
+    /// Called by the wire path ([`RefusalWire`]); a local producer does not need it (its
+    /// reasons are measured strings), but calling it is always safe and cheap.
+    ///
+    /// ```
+    /// use amos_link::robot_hal::{Refusal, MAX_REFUSAL_REASON_BYTES};
+    ///
+    /// // A normal refusal (a real reason from the bridge is ~60 bytes):
+    /// Refusal { seq: 1, reason: "e-stop latched: send {\"action\":\"arm\"}".to_string() }
+    ///     .validate()
+    ///     .expect("a real reason is under the ceiling");
+    ///
+    /// // At the ceiling is accepted (the bound is inclusive):
+    /// Refusal { seq: 1, reason: "x".repeat(MAX_REFUSAL_REASON_BYTES) }
+    ///     .validate()
+    ///     .expect("the ceiling is inclusive");
+    ///
+    /// // One byte over is refused — what the wire path does at decode time, so a
+    //  // stand-alone `Refusal` decoded from a peer can't smuggle in an unbounded
+    //  // sentence that the UI would render as-is:
+    /// Refusal { seq: 1, reason: "x".repeat(MAX_REFUSAL_REASON_BYTES + 1) }
+    ///     .validate()
+    ///     .expect_err("an over-ceiling reason is refused at decode");
+    /// ```
+    pub fn validate(&self) -> Result<()> {
+        if self.reason.len() > MAX_REFUSAL_REASON_BYTES {
+            return Err(LinkError::Robot(format!(
+                "a refusal reason is {} bytes, over the {MAX_REFUSAL_REASON_BYTES}-byte ceiling",
+                self.reason.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<RefusalWire> for Refusal {
+    type Error = LinkError;
+
+    fn try_from(wire: RefusalWire) -> Result<Self> {
+        let refusal = Refusal {
+            seq: wire.seq,
+            reason: wire.reason,
+        };
+        refusal.validate()?;
+        Ok(refusal)
+    }
+}
+
+impl From<Refusal> for RefusalWire {
+    /// Encoding never *creates* a refusal, so it does not re-validate (the value came from
+    /// either a measured local producer or a decode that already passed).
+    fn from(refusal: Refusal) -> Self {
+        Self {
+            seq: refusal.seq,
+            reason: refusal.reason,
+        }
+    }
 }
 
 /// What the bridge last did, as it travels on [`actuation_topic`].
@@ -2129,7 +2209,15 @@ impl<H: RobotHal> RobotBridge<H> {
             self.estop_latched = false;
             self.estop_reason = None;
             self.last_seq = Some(seq);
-            self.last_gait = Gait::from_key(intent.action);
+            // The report's `gait` field is the *reference* machine's vocabulary; for a
+            // profile the field is intentionally left `None` (the profile's own action key
+            // would be a payload-schema change with proto and UI consequences — see
+            // `for_platform`). The reference path keeps the gait key it parses from, so an
+            // older board still reads the same field the same way.
+            self.last_gait = match &self.vocabulary {
+                Vocabulary::Reference => Gait::from_key(intent.action),
+                Vocabulary::Profile(_) => None,
+            };
             self.last_frames = applied;
             self.last_refusal = None;
             tracing::info!(seq, was_latched, "armed: motion allowed again");
@@ -2170,7 +2258,15 @@ impl<H: RobotHal> RobotBridge<H> {
         let frames = self.vocabulary.plan(&intent)?;
         let applied = self.hal.apply(&frames).await?;
         self.last_seq = Some(seq);
-        self.last_gait = Gait::from_key(intent.action);
+        // Same `gait` discipline as the Arm branch: the reference machine reports its gait
+        // (the field is what makes `actuation_topic` useful for a quadruped), a profile leaves
+        // it `None`. A `None` from `Gait::from_key` is what the motion path already produced
+        // for any non-quadruped profile; we make it explicit so a future vocabulary cannot
+        // reintroduce the asymmetry by aliasing a profile action into a reference gait.
+        self.last_gait = match &self.vocabulary {
+            Vocabulary::Reference => Gait::from_key(intent.action),
+            Vocabulary::Profile(_) => None,
+        };
         self.last_frames = applied;
         self.last_refusal = None;
         if intent.class == IntentClass::Halt {

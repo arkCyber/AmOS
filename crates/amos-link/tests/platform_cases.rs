@@ -719,11 +719,14 @@ async fn a_profile_bridge_latches_refuses_and_reports() {
         },
         "four thrusters and two elevons"
     );
-    let mode = modes
-        .recv()
-        .await
-        .expect("the flight mode is reported")
-        .message;
+    // The bridge's mode (`armed`/`estopped`/`reason`/`gait`/`refusal`) is **unchanged** by
+    // this step: a profile's arm step already latched `armed=true, estop_reason=None` and a
+    // motion action on an armed, non-estopped profile flips none of them. `gait` is the
+    // reference machine's vocabulary and is intentionally `None` for a profile (the report
+    // contract documented on `for_platform`). So the right thing to check here is the
+    // bridge's local state, not a wire report: the report only fires on mode change, and
+    // for a profile arm → motion no mode changes.
+    let mode = bridge.state();
     assert!(mode.armed && !mode.estopped);
     assert_eq!(mode.seq, Some(3));
     assert_eq!(mode.frames, 6);
@@ -828,6 +831,39 @@ async fn a_cell_bridge_tells_the_operator_its_own_arm_key() {
         BridgeEvent::Applied { frames: 4, .. }
     ));
     assert_eq!(Vocabulary::Profile(&CELL).arm_key(), "enable");
+}
+
+#[tokio::test]
+async fn a_profile_arm_step_does_not_claim_a_reference_gait() {
+    // The report contract: a profile's `gait` field is **always** `None`, because the field
+    // is the reference machine's vocabulary and putting a profile's action key there would
+    // be a payload-schema change. This holds even when the profile's arm_key happens to be
+    // one that *aliases* into a reference `Gait` — the drone uses `"arm"` and the cell uses
+    // `"enable"`, both of which `Gait::from_key` maps to `Gait::Arm`. The bridge must NOT
+    // let that aliasing leak into the report: a `gait=arm` value on a non-quadruped profile
+    // would be a UI lie (the machine never executed a quadruped gait).
+    for (profile, arm_key) in [(&DRONE, "arm"), (&CELL, "enable")] {
+        let link = TestLink::new();
+        let robot = link.node(ROBOT, NodeKind::Robot);
+        let mut bridge =
+            RobotBridge::for_platform(control(&link).await, MockRobotHal::new(), profile)
+                .expect("a usable envelope");
+        let commands = commander(&link, &robot);
+
+        send(&commands, &format!(r#"{{"action":"{arm_key}"}}"#)).await;
+        let event = bridge.step().await.expect("the arm step");
+        assert!(
+            matches!(event, BridgeEvent::Applied { armed: true, .. }),
+            "{profile:?} arm step returns Applied: {event:?}"
+        );
+        assert_eq!(
+            bridge.state().gait,
+            None,
+            "{profile:?} reports gait=None after arm, even though its arm_key \
+             (\"{arm_key}\") aliases into Gait::Arm — the report must not carry a \
+             reference-machine gait for a profile"
+        );
+    }
 }
 
 #[tokio::test]
