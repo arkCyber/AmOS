@@ -497,7 +497,7 @@
           onclick={fullscreen}
           aria-label={t("player.fullscreen")}
           data-icon="maximize"
-          class="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-full bg-black/50 text-white transition active:scale-90"
+          class="absolute right-2 top-2 grid h-10 w-10 place-items-center rounded-full bg-black/50 text-white transition active:scale-90"
         >{@html iconSvg("maximize", "h-4 w-4")}</button>
       {:else}
         <audio
@@ -586,25 +586,25 @@
         onclick={toggleShuffle}
         aria-label={t("player.shuffle")}
         data-icon="shuffle"
-        class={"grid h-9 w-9 place-items-center rounded-full transition active:scale-90 " + (shuffle ? "text-accent opacity-90" : "opacity-40")}
+        class={"grid h-11 w-11 place-items-center rounded-full transition active:scale-90 " + (shuffle ? "text-accent opacity-90" : "opacity-40")}
       >{@html iconSvg("shuffle", "h-5 w-5")}</button>
       <button
         onclick={cycleRepeat}
         aria-label={t("player.repeat")}
         data-icon="repeat"
-        class={"grid h-9 w-9 place-items-center rounded-full transition active:scale-90 " + (repeat === "off" ? "opacity-35" : repeat === "one" ? "text-accent opacity-90" : "opacity-80")}
+        class={"grid h-11 w-11 place-items-center rounded-full transition active:scale-90 " + (repeat === "off" ? "opacity-35" : repeat === "one" ? "text-accent opacity-90" : "opacity-80")}
       >{@html iconSvg("repeat", "h-5 w-5")}</button>
       <button
         onclick={toggleMute}
         aria-label={muted ? t("player.unmute") : t("player.mute")}
         data-icon={muted ? "volumeX" : "volume"}
-        class="grid h-9 w-9 place-items-center rounded-full opacity-80 transition active:scale-90"
+        class="grid h-11 w-11 place-items-center rounded-full opacity-80 transition active:scale-90"
       >{@html iconSvg(muted ? "volumeX" : "volume", "h-5 w-5")}</button>
       <button
         onclick={cycleRate}
         aria-label={t("player.rate")}
         data-icon="rate"
-        class="grid h-9 min-w-9 place-items-center rounded-full px-2 text-xs font-semibold opacity-80 transition active:scale-90"
+        class="grid h-11 min-w-11 place-items-center rounded-full px-2 text-xs font-semibold opacity-80 transition active:scale-90"
       >{formatRate(rate)}</button>
       <input type="range" min="0" max="1" step="0.01" bind:value={volume} aria-label={t("player.volume")} class="h-1 w-20 cursor-pointer accent-accent" />
     </div>
@@ -615,7 +615,7 @@
         onclick={refresh}
         aria-label={t("player.refresh")}
         data-icon="rotateCcw"
-        class="grid h-7 w-7 place-items-center rounded-full transition active:scale-90 hover:bg-neutral-200/60 dark:hover:bg-white/10"
+        class="grid h-9 w-9 place-items-center rounded-full transition active:scale-90 hover:bg-neutral-200/60 dark:hover:bg-white/10"
       >{@html iconSvg("rotateCcw", "h-4 w-4")}</button>
     </div>
 

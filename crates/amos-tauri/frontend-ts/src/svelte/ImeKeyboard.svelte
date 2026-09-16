@@ -224,7 +224,7 @@
             aria-label={t("ime.clear")}
             data-testid="ime-composition-clear"
             onclick={onclear}
-            class="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/70 text-xs dark:bg-white/10"
+            class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white/70 text-sm dark:bg-white/10"
           >
             ✕
           </button>
@@ -256,7 +256,7 @@
               data-testid="ime-page-prev"
               disabled={current === 0}
               onclick={() => onpage(current - 1)}
-              class={"grid h-7 w-7 place-items-center rounded-full bg-white/70 dark:bg-white/10" +
+              class={"grid h-8 w-8 place-items-center rounded-full bg-white/70 dark:bg-white/10" +
                 (current === 0 ? " opacity-30" : "")}
             >
               ‹
@@ -270,7 +270,7 @@
               data-testid="ime-page-next"
               disabled={current >= pages - 1}
               onclick={() => onpage(current + 1)}
-              class={"grid h-7 w-7 place-items-center rounded-full bg-white/70 dark:bg-white/10" +
+              class={"grid h-8 w-8 place-items-center rounded-full bg-white/70 dark:bg-white/10" +
                 (current >= pages - 1 ? " opacity-30" : "")}
             >
               ›

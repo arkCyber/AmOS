@@ -637,7 +637,7 @@
       <div class="mt-1 text-4xl font-medium tabular-nums">{fmtStopwatch(sw.elapsedMs)}</div>
       <div class="mt-3 flex items-center justify-center gap-4">
         <button onclick={swToggle} aria-label={t("clock.stopwatch")} data-icon={sw.running ? "pause" : "play"} class={round(sw.running ? "bg-danger" : "bg-green-500")}>{@html iconSvg(sw.running ? "pause" : "play", "h-7 w-7")}</button>
-        <button onclick={doLap} disabled={!sw.running} aria-label={t("clock.lap")} class="h-10 rounded-full bg-neutral-300 px-3 text-sm disabled:opacity-30 dark:bg-neutral-700">{t("clock.lap")}</button>
+        <button onclick={doLap} disabled={!sw.running} aria-label={t("clock.lap")} class="h-11 rounded-full bg-neutral-300 px-4 text-sm disabled:opacity-30 dark:bg-neutral-700">{t("clock.lap")}</button>
         <button onclick={resetSw} disabled={sw.elapsedMs === 0 && !sw.running} aria-label={t("a11y.reset")} data-icon="reset" class="grid h-12 w-12 place-items-center rounded-full bg-neutral-300 text-neutral-700 disabled:opacity-30 dark:bg-neutral-700 dark:text-neutral-100">{@html iconSvg("rotateCcw", "h-5 w-5")}</button>
       </div>
       {#if laps.length > 0}

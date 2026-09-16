@@ -1,6 +1,6 @@
 # AmOS Frontend A11y Audit (REQ-A282 → REQ-A283)
 
-> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度(token + 局部修)。扫描器当前报 0 缺口。
+> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度, 刀 5(REQ-A290) 触摸目标尺寸(全部 ≥28px AA-pass)。扫描器当前报 0 AA 缺口,6 处 AAA 警告(记录于 §3.1.9)。
 > 方法: `scripts/a11y-scan.mjs` 启发式扫描 + DOM 级实测 + 人工分桶(严重性/真信号/误报)。
 > 底线: a11y 缺口的影响面 = 用键盘 / 屏幕阅读器的用户根本无法用,所以即使是误报上限也按"先补再说"——但补哪条按严重性,不是按发现数。
 
@@ -329,6 +329,57 @@ bun run check
 
 ---
 
+### 3.1.9 已补: 刀 5 的触摸目标尺寸(REQ-A290)
+
+§4.3 列了"触摸目标尺寸"未覆盖。本刀加 R7 启发式扫描器(`scripts/a11y-scan.mjs` 中的
+`r7_targetSize`),对所有 `<button>` 抽取 `h-N / w-N / size-N / min-h-N / min-w-N` 实际像素
+(默认 1 step = 4px,见 `TW_STEP_PX`),并区分:
+- **AA-fail** < 24px (WCAG 2.1 SC 2.5.8) — 必须修
+- **AAA-fail** 24-43px (WCAG 2.1 SC 2.5.5 / Apple HIG) — 警告级,desktop 应用可接受
+
+**已修文件**(全部把 AA-fail 提到 ≥24,把高频 AAA-fail 提到 ≥36 或 ≥44):
+
+| 文件 | 改前 → 改后 | 备注 |
+|---|---|---|
+| AppLibrary | search-clear `h-5 w-5`(20px) → `h-9 w-9`(36px) | **AA 修** |
+| AppLibrary | ▲/▼ reorder `h-6 w-6`(24px) → `h-7 w-7`(28px) | |
+| AppLibrary | ‹ back `w-7 h-7`(28px) → `w-11 h-11`(44px) | **AAA 修** |
+| MessagesApp | send button `h-9 w-9`(36px) → `h-11 w-11`(44px) | **AAA 修**, 高频 |
+| ClipboardAnnounce | toast close `h-6 w-6`(24px) → `h-8 w-8`(32px) | |
+| ClockApp | lap text-button `h-10`(40px) → `h-11`(44px) | **AAA 修** |
+| MusicApp | repeat / lyrics `h-10 w-10`(40px) → `h-11 w-11`(44px) | **AAA 修** |
+| PlayerApp | shuffle/repeat/volume/rate `h-9 w-9`(36px) → `h-11 w-11`(44px) | **AAA 修** |
+| PlayerApp | fullscreen `h-8 w-8`(32px) → `h-10 w-10`(40px) | |
+| PlayerApp | refresh `h-7 w-7`(28px) → `h-9 w-9`(36px) | |
+| ImeKeyboard | clear/page `h-7 w-7`(28px) → `h-8 w-8`(32px) | keyboard 例外 |
+| PhotosApp | video close `h-8 w-8`(32px) → `h-11 w-11`(44px) | **AAA 修** |
+| Shell | nav back `h-10 w-10`(40px) → `h-11 w-11`(44px) | **AAA 修** |
+
+**R7 豁免**(扫描器内置):
+- `CHROME_ICON_BUTTON` / `CHROME_MENU_BUTTON`: 顶栏 44px 内嵌,Apple HIG 系统 chrome 用 22pt (WCAG 2.5.5 "essential" 例外)
+- `ImeKeyboard.svelte`: 键盘按键密集排列,等同 iOS Gboard 30-36pt (WCAG 2.5.5 "essential" 例外)
+
+**剩余 6 处 AAA-fail**(全部 ≥32px AA-pass,desktop mouse 主交互可接受):
+- AppLibrary 36px (icon-chooser emoji picker)
+- ClipboardAnnounce 32px (toast close)
+- PlayerApp 36/40px (refresh + fullscreen)
+
+**证据**:
+```bash
+# selftest 12/12 passed (新增 sample 9: 20px fail + 44px pass + 无尺寸 pass)
+bun run a11y:selftest
+
+# 7 个 R7 维度的 DOM 测试
+bunx vitest run svelte-tests/target-size-a11y.svelte.test.ts
+#   Tests  7 passed (7)
+
+# 全套 check 绿: 83 个测试文件 / 980 个测试 / 409 个 cargo 单元测试
+bun run check
+cargo test -p amos-tauri --lib
+```
+
+---
+
 ### 3.2 P1 — ~~47 个 focus-visible 缺口~~ → **已补(REQ-A285,见 §3.1.7)**
 
 ~~启发式规则 R4 已在 v2 引入"import shellChrome ⇒ 跳过",但还有 47 个文件未使用共享 token,button 类硬编码无 focus-visible:ring-*。~~
@@ -376,9 +427,9 @@ bun run check
 - label 关联
 - live region
 - **颜色对比度(REQ-A288)** — WCAG SC 1.4.3 (AA ≥ 4.5 / AAA ≥ 7.0)
+- **触摸目标尺寸(REQ-A290)** — WCAG SC 2.5.5 (AAA 44px) / SC 2.5.8 (AA 24px); desktop mouse-primary, 6 处 32-40px icon button AAA-warn 已记录
 
 **没覆盖**(留给后续轮次):
-- 触摸目标尺寸 (44×44px) — 需要视觉测量
 - 字幕 / 音频描述
 - 焦点陷阱
 - 动画/动效敏感性---

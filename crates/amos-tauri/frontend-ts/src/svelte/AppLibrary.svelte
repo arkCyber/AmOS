@@ -353,7 +353,7 @@
       <!-- Custom group: add/remove member apps -->
       <div class="flex h-full flex-col px-4 pb-3 pt-3" data-testid="app-library-custom-edit">
         <div class="flex items-center justify-between">
-          <button onclick={closeCustomGroup} aria-label={t("a11y.back")} class="w-6 text-accent text-sm font-semibold">‹</button>
+          <button onclick={closeCustomGroup} aria-label={t("a11y.back")} class="w-11 h-11 grid place-items-center text-accent text-base font-semibold active:scale-90 transition">‹</button>
           <span class="flex-1 truncate text-center text-base font-semibold">{openGroupIcon} {openGroupName}</span>
           <button
             type="button"
@@ -390,7 +390,7 @@
       <!-- Custom group: view members -->
       <div class="flex h-full flex-col px-4 pb-3 pt-3" data-testid="app-library-custom-open">
         <div class="flex items-center justify-between">
-          <button onclick={closeCustomGroup} aria-label={t("a11y.back")} class="w-6 text-accent text-sm font-semibold">‹</button>
+          <button onclick={closeCustomGroup} aria-label={t("a11y.back")} class="w-11 h-11 grid place-items-center text-accent text-base font-semibold active:scale-90 transition">‹</button>
           <span class="flex-1 truncate text-center text-base font-semibold">{openGroupIcon} {openGroupName}</span>
           <span class="w-6"></span>
         </div>
@@ -507,7 +507,7 @@
                         data-testid="app-library-member-up"
                         onclick={() => shiftMember(index, -1)}
                         disabled={index === 0}
-                        class="grid h-6 w-6 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-[10px] text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
+                        class="grid h-9 w-9 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
                       >▲</button>
                       <button
                         type="button"
@@ -515,7 +515,7 @@
                         data-testid="app-library-member-down"
                         onclick={() => shiftMember(index, 1)}
                         disabled={index === memberApps.length - 1}
-                        class="grid h-6 w-6 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-[10px] text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
+                        class="grid h-9 w-9 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
                       >▼</button>
                     </span>
                   </div>
@@ -560,7 +560,7 @@
   {:else if openView === null}
     <div class="flex h-full flex-col px-4 pb-3 pt-3">
       <div class="flex items-center justify-between">
-        <button onclick={backHome} class="w-6 text-accent text-sm font-semibold" aria-label={t("a11y.back")}>‹</button>
+        <button onclick={backHome} class="w-11 h-11 grid place-items-center text-accent text-base font-semibold active:scale-90 transition" aria-label={t("a11y.back")}>‹</button>
         <div class="flex-1 text-center">
           <h2 class="text-lg font-semibold tracking-tight">{t("appLibrary.title")}</h2>
           <p class="text-[10px] opacity-50">{t("appLibrary.hint")}</p>
@@ -587,7 +587,7 @@
               type="button"
               aria-label={t("a11y.clearSearch")}
               onclick={clearSearch}
-              class="grid h-5 w-5 shrink-0 cursor-pointer place-items-center rounded-full bg-neutral-300 text-[10px] text-neutral-700 transition active:scale-90 dark:bg-neutral-600 dark:text-neutral-200"
+              class="grid h-9 w-9 shrink-0 cursor-pointer place-items-center rounded-full bg-neutral-300 text-sm text-neutral-700 transition active:scale-90 dark:bg-neutral-600 dark:text-neutral-200"
             >✕</button>
           {/if}
         </div>
@@ -624,30 +624,30 @@
           {#if foldersShown.length > 0}
             <div data-testid="app-library-folders" class="mt-4 grid gap-x-2 gap-y-4" style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}>
               {#each foldersShown as f (f.id)}
+                <div class="flex flex-col items-center gap-1.5">
                 <button
                   type="button"
                   data-testid="app-library-folder"
                   aria-label={t(f.nameKey)}
                   onclick={() => (openView = { folder: f })}
-                  class="group flex flex-col items-center gap-1.5 outline-none"
+                  class="group relative grid h-16 w-16 place-items-center rounded-2xl bg-white/40 p-1.5 shadow-sm ring-1 ring-black/5 transition group-hover:scale-[1.03] group-active:scale-95 dark:bg-white/10 dark:ring-white/10"
                 >
-                  <span class="relative grid h-16 w-16 place-items-center rounded-2xl bg-white/40 p-1.5 shadow-sm ring-1 ring-black/5 transition group-hover:scale-[1.03] group-active:scale-95 dark:bg-white/10 dark:ring-white/10">
-                    <span class="grid w-full grid-cols-2 place-items-center gap-0.5">
-                      {#each f.apps.slice(0, 4) as id (id)}
-                        <AppIcon
-                          id={id}
-                          icon={iconOf(id)}
-                          tileClassName="h-6 w-6 rounded-[8px]"
-                          glyphClassName="text-[14px]"
-                        />
-                      {/each}
-                    </span>
-                    {#if f.apps.length > 4}
-                      <span class="absolute -right-1 -top-1 rounded-full bg-neutral-700 px-1 text-[9px] font-semibold leading-4 text-white ring-2 ring-white dark:bg-neutral-700 dark:ring-neutral-900">{t("appLibrary.more", { n: f.apps.length - 4 })}</span>
-                    {/if}
+                  <span class="grid w-full grid-cols-2 place-items-center gap-0.5">
+                    {#each f.apps.slice(0, 4) as id (id)}
+                      <AppIcon
+                        id={id}
+                        icon={iconOf(id)}
+                        tileClassName="h-6 w-6 rounded-[8px]"
+                        glyphClassName="text-[14px]"
+                      />
+                    {/each}
                   </span>
-                  <span class="max-w-full truncate text-[10px] font-medium text-neutral-800 dark:text-neutral-200">{t(f.nameKey)}</span>
+                  {#if f.apps.length > 4}
+                    <span class="absolute -right-1 -top-1 rounded-full bg-neutral-700 px-1 text-[9px] font-semibold leading-4 text-white ring-2 ring-white dark:bg-neutral-700 dark:ring-neutral-900">{t("appLibrary.more", { n: f.apps.length - 4 })}</span>
+                  {/if}
                 </button>
+                <span class="max-w-full truncate text-[10px] font-medium text-neutral-800 dark:text-neutral-200">{t(f.nameKey)}</span>
+                </div>
               {/each}
             </div>
           {/if}
@@ -742,7 +742,7 @@
     <!-- Expanded single-category grid -->
     <div class="flex h-full flex-col px-4 pb-3 pt-3">
       <div class="flex items-center justify-between">
-        <button onclick={() => (openView = null)} class="w-6 text-accent text-sm font-semibold" aria-label={t("a11y.back")}>‹</button>
+        <button onclick={() => (openView = null)} class="w-11 h-11 grid place-items-center text-accent text-base font-semibold active:scale-90 transition" aria-label={t("a11y.back")}>‹</button>
         <span class="flex-1 truncate text-center text-base font-semibold">{t(openView.folder.nameKey)}</span>
         <span class="w-6"></span>
       </div>

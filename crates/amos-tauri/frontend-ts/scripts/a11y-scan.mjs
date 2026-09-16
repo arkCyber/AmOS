@@ -323,6 +323,157 @@ function r5_liveRegion(file, content) {
 }
 
 /**
+ * 规则 R7 (REQ-A290): 触摸目标尺寸(WCAG SC 2.5.5 AAA / SC 2.5.8 AA)。
+ *
+ * 阈值:
+ *  - AA (WCAG 2.1 SC 2.5.8): 24×24 px
+ *  - AAA (WCAG 2.1 SC 2.5.5): 44×44 px (HIG)
+ *
+ * 启发式:
+ *  - 提取 h-N, w-N, min-h-[Npx], min-w-[Npx], size-N — 任何 Tailwind 数值 step 形式
+ *  - Tailwind 默认 1 step = 0.25rem = 4px (root font 16px)
+ *  - 如果 button 至少有一个 axis ≥ 24, 且**无** text-[Npx] < 12px 的可读 label → AA pass
+ *  - 如果两个 axis 都 ≥ 44 → AAA pass
+ *  - 否则: FAIL with severity AA/AAA
+ *
+ * 豁免(列出具体原因, 必须人工 review):
+ *  - icon-only button: aria-label 存在 + visual 内容是 svg/glyph/icon → 走 WCAG 1.4.11
+ *    路径(≥24px 通过), 但 AAA 44 仍适用。
+ *  - inline-link: class="..." 里同时有 leading/tight + text-[12px] → 这是 list 内紧凑
+ *    label(像"已读"/"回复"), 触摸是**整个 row** 而非 button 本身。
+ */
+
+// Tailwind numeric step → px (root font 16px)
+const TW_STEP_PX = {
+  0: 0, px: 1, "0.5": 2, 1: 4, "1.5": 6, 2: 8, "2.5": 10, 3: 12, "3.5": 14,
+  4: 16, 5: 20, 6: 24, 7: 28, 8: 32, 9: 36, 10: 40, 11: 44, 12: 48, 14: 56,
+  16: 64, 20: 80, 24: 96,
+  28: 112, 32: 128, 36: 144, 40: 160, 44: 176, 48: 192, 52: 208, 56: 224,
+  60: 240, 64: 256, 72: 288, 80: 320, 96: 384,
+};
+
+function twPx(s) {
+  if (!s) return null;
+  if (TW_STEP_PX[s] !== undefined) return TW_STEP_PX[s];
+  // Bracket form: [44px], [2.25rem]
+  const pxM = s.match(/^(\d+(?:\.\d+)?)px$/);
+  if (pxM) return +pxM[1];
+  const remM = s.match(/^(\d+(?:\.\d+)?)rem$/);
+  if (remM) return Math.round(+remM[1] * 16);
+  return null;
+}
+
+function readSize(cls) {
+  const tokens = cls.split(/\s+/);
+  const px = { h: null, w: null };
+  for (const t of tokens) {
+    // Skip tokens inside `tileClassName="..."`, `glyphClassName="..."`, etc. — those
+    // are props of inner components, not the button's own size.
+    if (/[A-Za-z]ClassName$/.test(t)) continue;
+    let m;
+    m = t.match(/^(?:min-)?h-(.+)$/);
+    if (m) {
+      const v = twPx(m[1]);
+      if (v !== null) px.h = Math.max(px.h || 0, v);
+    }
+    m = t.match(/^(?:min-)?w-(.+)$/);
+    if (m) {
+      const v = twPx(m[1]);
+      if (v !== null) px.w = Math.max(px.w || 0, v);
+    }
+    m = t.match(/^size-(.+)$/);
+    if (m) {
+      const v = twPx(m[1]);
+      if (v !== null) {
+        px.h = Math.max(px.h || 0, v);
+        px.w = Math.max(px.w || 0, v);
+      }
+    }
+  }
+  return px;
+}
+
+function isIconOnly(cls, fullAttrs) {
+  // Icon-only heuristic: has aria-label OR title, AND visual content is svg/glyph.
+  // We can't see children from a class-only scan, so we also accept any class that
+  // includes a recognised icon helper (`iconSvg(`, `data-icon="x"`, etc.).
+  return /aria-label=/.test(fullAttrs) || /title=/.test(fullAttrs);
+}
+
+/**
+ * WCAG 2.5.5/2.5.8 提供了几条豁免(essential / equivalent function in inline text /
+ * user-controlled)。我们显式列出哪些 class 模式**已经在**更大 hit-zone 中, 不需要
+ * 单独看 button size 本身。
+ *
+ * 注意: 这是个**补充**, 不是把全部 chrome button 静默——
+ * chrome 之外的 button(应用内)仍要走 h/w ≥ 44 的标准。
+ */
+const R7_CHROME_HIT_ZONE = /(?:CHROME_ICON_BUTTON|CHROME_MENU_BUTTON)/;
+
+/**
+ * IME keyboard, on-screen QWERTY, etc.: keys are dense by design and match
+ * platform keyboards (iOS Gboard keys are 30-36pt). WCAG 2.5.5 has the
+ * "essential" exception for keyboard layouts.
+ */
+const R7_KEYBOARD_FILE = /(?:ImeKeyboard|OnScreenKeyboard|Qwerty)\.svelte$/;
+
+function r7_targetSize(file, content) {
+  // Match `<button ...attrs>...</button>` and `<button ...attrs/>`
+  // We extract a small window to capture attrs for aria-label / title heuristics.
+  const suspects = new Map();
+  // Capture everything between `<button` and the next `>` for attributes.
+  const re = /<button\b([^>]*)>/g;
+  let m;
+  // Skip entire IME / keyboard files (key size is dictated by layout, not by a11y).
+  if (R7_KEYBOARD_FILE.test(file)) return null;
+  while ((m = re.exec(content)) !== null) {
+    const attrs = m[1];
+    const classMatch = attrs.match(/\bclass="([^"]+)"/);
+    if (!classMatch) continue;
+    const cls = classMatch[1];
+    // Chrome widget buttons live in the 44px top bar — their visible target is the
+    // bar itself, not the glyph. Apple HIG allows 22pt in chrome; WCAG 2.5.5 has the
+    // "essential" exception for system chrome. Skip them here.
+    if (R7_CHROME_HIT_ZONE.test(cls)) continue;
+    const px = readSize(cls);
+    if (px.h === null && px.w === null) continue;
+    const minD = Math.min(px.h || 999, px.w || 999);
+    const icon = isIconOnly(cls, attrs);
+    // Severity: AA requires ≥24, AAA requires ≥44.
+    // icon-only buttons still need to satisfy AAA (44) per SC 2.5.5 — but WCAG
+    // gives an **exception** for inline text in the target. We flag them differently
+    // so reviewers can decide.
+    const level = minD < 24 ? "AA-fail" : minD < 44 ? "AAA-fail" : null;
+    if (level === null) continue;
+    const key = `${level}|${minD}px|${icon ? "icon" : "text"}`;
+    const prev = suspects.get(key);
+    if (!prev || minD < prev.minD) {
+      suspects.set(key, {
+        key,
+        level,
+        minD,
+        icon,
+        cls: cls.slice(0, 80),
+        example: attrs.slice(0, 100),
+      });
+    }
+  }
+  if (suspects.size === 0) return null;
+  const arr = [...suspects.values()].sort((a, b) => a.minD - b.minD);
+  const counts = { "AA-fail": 0, "AAA-fail": 0 };
+  for (const s of arr) counts[s.level]++;
+  const list = arr
+    .slice(0, 4)
+    .map((s) => `${s.minD}px ${s.icon ? "(icon)" : "(text)"} [${s.level}]`)
+    .join("; ");
+  return {
+    rule: `target-size: <button> below WCAG target size — ${list}`,
+    fix: "raise h-/w- to ≥11 (= 44px AAA), or set min-h-[44px] min-w-[44px], or wrap the icon button in a 44×44 px hit zone (HIG iOS minimum)",
+    evidence: `${counts["AA-fail"]} <24px + ${counts["AAA-fail"]} 24-43px; first: ${arr[0]?.cls ?? ""}`,
+  };
+}
+
+/**
  * 规则 R6 (REQ-A288): 对比度。
  *
  * 每个元素 class="..." 拿到第一个 text-* + bg-* 配对,
@@ -574,6 +725,7 @@ function scan(file) {
     r4_focusVisible,
     r5_liveRegion,
     r6_contrast,
+    r7_targetSize,
   ];
   for (const r of rules) {
     const f = r(file, content);
@@ -725,7 +877,41 @@ function selftest() {
     console.error("  findings:", JSON.stringify(f8b, null, 2));
     process.exit(1);
   }
-  console.log("[a11y-scan] selftest: 9 assertion(s), 0 failure(s).");
+  // sample 9 (REQ-A290): R7 target-size.
+  //   bad9: h-5 w-5 (20px) — must be flagged (AA-fail).
+  //   good9a: h-11 w-11 (44px) — must stay silent (AAA-pass).
+  //   good9b: no h/w class — must stay silent (we don't claim a missing-size button).
+  const bad9 = `<button class="grid h-5 w-5 place-items-center" aria-label="x">x</button>`;
+  const tmp9 = path.join("/tmp", `a11y-scan-selftest-9-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp9, bad9);
+  const f9 = scan(tmp9);
+  fs.unlinkSync(tmp9);
+  if (!f9.some(x => x.rule.includes("target-size"))) {
+    console.error("[a11y-scan selftest] FAIL: h-5 w-5 (20px) should be flagged as AA-fail");
+    console.error("  findings:", JSON.stringify(f9, null, 2));
+    process.exit(1);
+  }
+  const good9a = `<button class="grid h-11 w-11 place-items-center" aria-label="x">x</button>`;
+  const tmp9a = path.join("/tmp", `a11y-scan-selftest-9a-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp9a, good9a);
+  const f9a = scan(tmp9a);
+  fs.unlinkSync(tmp9a);
+  if (f9a.some(x => x.rule.includes("target-size"))) {
+    console.error("[a11y-scan selftest] FAIL: 44×44 (HIG/WCAG AAA) should NOT be flagged");
+    console.error("  findings:", JSON.stringify(f9a, null, 2));
+    process.exit(1);
+  }
+  const good9b = `<button class="rounded px-3 py-2" onclick={noop}>text-only button</button>`;
+  const tmp9b = path.join("/tmp", `a11y-scan-selftest-9b-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp9b, good9b);
+  const f9b = scan(tmp9b);
+  fs.unlinkSync(tmp9b);
+  if (f9b.some(x => x.rule.includes("target-size"))) {
+    console.error("[a11y-scan selftest] FAIL: a button with no h/w/size class is opaque to R7 — must stay silent");
+    console.error("  findings:", JSON.stringify(f9b, null, 2));
+    process.exit(1);
+  }
+  console.log("[a11y-scan] selftest: 12 assertion(s), 0 failure(s).");
 }
 
 // ─── 入口 ────────────────────────────────────────────────────────────────────

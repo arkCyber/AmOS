@@ -491,7 +491,7 @@
             <button
               onclick={goHome}
               aria-label={t("a11y.back")}
-              class="-ml-1 grid h-10 w-10 cursor-pointer place-items-center rounded-full text-accent text-[17px] font-semibold transition active:bg-black/5 dark:active:bg-white/10"
+              class="-ml-1 grid h-11 w-11 cursor-pointer place-items-center rounded-full text-accent text-[17px] font-semibold transition active:bg-black/5 dark:active:bg-white/10"
             >‹</button>
             <span class="flex-1 truncate text-center text-[17px] font-semibold tracking-tight">{appTitle(s.id)}</span>
             <span class="w-10"></span>

@@ -175,11 +175,11 @@
 
     <div class="mt-4 flex items-center justify-center gap-12 text-sm">
       <button onclick={cycleRepeat} title={t("music.repeat")} aria-label={t("music.repeat")} data-icon="repeat"
-        class={"grid h-10 w-10 place-items-center rounded-full text-base transition active:scale-90 " + (repeat === "off" ? "opacity-35" : repeat === "one" ? "text-accent opacity-90" : "opacity-80")}>
+        class={"grid h-11 w-11 place-items-center rounded-full text-base transition active:scale-90 " + (repeat === "off" ? "opacity-35" : repeat === "one" ? "text-accent opacity-90" : "opacity-80")}>
         {@html iconSvg("repeat", "h-6 w-6")}
       </button>
       <button onclick={cycleLyrics} title={t("music.lyrics")} aria-label={t("music.lyrics")} data-icon="lyrics"
-        class="grid h-10 w-10 place-items-center rounded-full text-base transition active:scale-90 {showLyrics ? 'text-accent opacity-90' : 'opacity-35'}">{@html iconSvg("messageCircle", "h-6 w-6")}</button>
+        class="grid h-11 w-11 place-items-center rounded-full text-base transition active:scale-90 {showLyrics ? 'text-accent opacity-90' : 'opacity-35'}">{@html iconSvg("messageCircle", "h-6 w-6")}</button>
     </div>
 
     <div class="mt-4 space-y-1">

@@ -737,7 +737,7 @@
     {/if}
     <div class="mt-2 flex items-center gap-2 pb-1">
       <input bind:value={realText} onkeydown={(e) => e.key === "Enter" && sendReal()} placeholder={t("message.placeholder", { name: activeRealName })} data-testid="real-message-input" aria-label={t("message.placeholder", { name: activeRealName })} class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
-      <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label={t("message.send")} data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
+      <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label={t("message.send")} data-icon="send" class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
     </div>
     {/if}
   {:else}
@@ -799,7 +799,7 @@
     {/if}
     <div class="mt-2 flex items-center gap-2 pb-1">
       <input bind:value={text} onkeydown={(e) => e.key === "Enter" && send()} placeholder={t("message.placeholder", { name: active.name })} data-testid="message-input" aria-label={t("message.placeholder", { name: active.name })} class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
-      <button onclick={send} title={t("message.placeholder", { name: active.name })} aria-label={t("message.send")} data-icon="send" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
+      <button onclick={send} title={t("message.placeholder", { name: active.name })} aria-label={t("message.send")} data-icon="send" class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
     </div>
   {:else}
     <p class="py-16 text-center text-sm opacity-60">{t("message.noThreads")}</p>
