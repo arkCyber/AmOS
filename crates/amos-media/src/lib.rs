@@ -63,6 +63,21 @@ pub mod provider;
 pub mod range;
 pub mod spec;
 
+// `protocol.rs` exists in this tree as a **draft** for REQ-A302 (stream media
+// bytes over `amos-media://`). It is NOT yet wired into the lib nor a
+// `pub mod` declaration: the file uses a half-finished API surface
+// (`range::UnknownPlan`, `MediaRequest`, `MediaManager::read_range`) that
+// `range.rs` and `manager.rs` do not export today. Once those are settled
+// the module declaration lands here, the file's first 1–2 lines change to
+// `use crate::…` to match the actual current crate shape, and a *narrow*
+// re-export set re-applies the public types callers will need. Until then,
+// `protocol.rs` stays in the tree so the design notes next to it survive
+// and can be picked up by the next round — but it is not part of the build.
+//
+// pub mod protocol;
+//
+// pub use protocol::{base_url, parse_uri, MediaReply, MediaRequest, ProtocolError};
+
 pub use error::{MediaError, Result};
 pub use hostfs::HostFsProvider;
 pub use manager::{Grant, MediaManager};
