@@ -142,3 +142,80 @@ export async function getSpacesStatus(): Promise<string> {
 // import it directly from `./backend` rather than relying on a re-export
 // (keeps the API surface obvious: `spaces_*` is this file, `bridgeDiag` is
 // the shared diagnostic helper).
+
+// ─── Navigation math (pure) ───────────────────────────────────────────
+
+/**
+ * The next active-space index when the user hits `Ctrl+←` (wrap left).
+ *
+ * `current` is 0-based; `spaceCount` is the number of spaces returned by
+ * `listSpaces()` (an empty array counts as `0`). The math is **cyclic**
+ * because there is no "end" of the desktop rail a user could want to
+ * fall off — it is the same invariant the host applies to its own
+ * switching and is the one the shell's keyboard handler reuses verbatim
+ * (REQ-A340).
+ *
+ * Three guarantees a unit test can lean on without a bridge:
+ *   1. **Cyclic** — going left from `0` lands on the **last** index
+ *      (`spaceCount - 1`), so `Ctrl+←` from the first space always does
+ *      something visible;
+ *   2. **Stationary when empty / single** — with 0 or 1 spaces, the
+ *      result is `0` (the only valid position), so the shortcut is
+ *      harmless when there is nothing to navigate to;
+ *   3. **Step size 1** — every other case decrements by exactly 1, so
+ *      the shell's `switchSpace()` call never has to range-check.
+ *
+ * Returning `null` means "the caller's preconditions do not hold"
+ * (negative `current`, negative `spaceCount`); the production handler
+ * does not branch on that case because it always reads from the bridge,
+ * but a test / future caller may want to surface it.
+ */
+export function prevSpaceIndex(current: number, spaceCount: number): number | null {
+  if (current < 0 || spaceCount < 0) return null;
+  if (spaceCount === 0) return 0;
+  if (current === 0) return spaceCount - 1;
+  return current - 1;
+}
+
+/**
+ * The next active-space index when the user hits `Ctrl+→` (wrap right).
+ *
+ * Same three guarantees as [`prevSpaceIndex`], mirrored for the right
+ * direction. Single / empty arrays return `0` so the shortcut is
+ * stationary when there is nothing to step through — a `1 → 2 → 1 → …`
+ * loop on a single space would otherwise still call `switchSpace(0)`
+ * and round-trip the bridge for nothing.
+ */
+export function nextSpaceIndex(current: number, spaceCount: number): number | null {
+  if (current < 0 || spaceCount < 0) return null;
+  if (spaceCount === 0) return 0;
+  if (current === spaceCount - 1) return 0;
+  return current + 1;
+}
+
+/**
+ * The auto-name a new Space gets when the user hits `Ctrl+↑`:
+ * `"Space ${spaceCount + 1}"`.
+ *
+ * One place for the convention; if the UI ever switches to "Desk {n}"
+ * or some localised form, every test and the handler move together.
+ */
+export function newSpaceName(spaceCount: number): string {
+  return `Space ${spaceCount + 1}`;
+}
+
+/**
+ * The index of the newly-created space in a refreshed listing, or `-1`
+ * if the create did not show up in the list (a host that returns the
+ * old snapshot, a deleted-by-mistake race, etc.).
+ *
+ * The caller already guards the `-1` branch by short-circuiting before
+ * `switchSpace`; we expose the helper so a test can pin both the
+ * "found it" path and the "never landed" path without a bridge.
+ */
+export function indexOfCreatedSpace(
+  refreshed: readonly { id: string }[],
+  newId: string,
+): number {
+  return refreshed.findIndex((s) => s.id === newId);
+}

@@ -31,6 +31,16 @@
     wmWindows,
     type LayoutSnapshot,
   } from "../lib/wm";
+  import {
+    activeSpace,
+    listSpaces,
+    switchSpace,
+    createSpace,
+    prevSpaceIndex,
+    nextSpaceIndex,
+    newSpaceName,
+    indexOfCreatedSpace,
+  } from "../lib/spaces";
   import { stageRect, DEFAULT_SCREEN } from "../lib/desktopLayout";
   import {
     SHELL_CHROME_API,
@@ -190,6 +200,59 @@
                 `🛟 [DesktopShell] spaces_switch(${index}) refused`,
                 code ?? diag.kind,
               );
+            }
+          }
+        })();
+        return;
+      }
+      
+      // Ctrl+Left/Right: Switch to previous/next Space
+      if (key === "ArrowLeft" || key === "ArrowRight") {
+        e.preventDefault();
+        e.stopPropagation();
+        void (async () => {
+          const spaces = await listSpaces();
+          const current = await activeSpace();
+          if (!spaces || current === null) return;
+
+          // REQ-A340: the wrap math lives in `lib/spaces` as a pure
+          // function so a test (and a future inline panel) can pin the
+          // exact contract — the production handler is just glue around
+          // `prevSpaceIndex` / `nextSpaceIndex` plus the bridge round-trip.
+          const newIndex =
+            key === "ArrowLeft"
+              ? prevSpaceIndex(current, spaces.length)
+              : nextSpaceIndex(current, spaces.length);
+          if (newIndex === null || newIndex === current) return;
+
+          const ok = await switchSpace(newIndex);
+          if (!ok) {
+            console.warn(`[DesktopShell] Failed to switch to space ${newIndex}`);
+          }
+        })();
+        return;
+      }
+
+      // Ctrl+Up: Create new Space
+      if (key === "ArrowUp") {
+        e.preventDefault();
+        e.stopPropagation();
+        void (async () => {
+          const spaces = await listSpaces();
+          if (!spaces) return;
+
+          const newName = newSpaceName(spaces.length);
+          const newId = await createSpace(newName);
+          if (!newId) {
+            console.warn("[DesktopShell] Failed to create new space");
+          } else {
+            // Automatically switch to the newly created space
+            const updatedSpaces = await listSpaces();
+            if (updatedSpaces) {
+              const newIndex = indexOfCreatedSpace(updatedSpaces, newId);
+              if (newIndex !== -1) {
+                await switchSpace(newIndex);
+              }
             }
           }
         })();
