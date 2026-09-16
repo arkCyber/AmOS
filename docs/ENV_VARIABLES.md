@@ -175,8 +175,8 @@
 | `AMOS_MAIL_STORE` | path | (none) | `→ empty` | 邮件存储路径 |
 | `AMOS_FORM_FACTOR` | enum | `auto` | `→ auto` | 形态因子:`auto`/`desktop`/`mobile` |
 | `AMOS_ROOT` | path | (none) | `→ cwd` | 应用根目录 |
-| `AMOS_DESKTOP_SHORTCUTS` | enum | `enabled` | `→ enabled` | 系统快捷键(`⌘W` / `⌘M` / `⌘H` / `⌘,`)作用于焦点窗口的开关:`enabled`(默认)/`disabled`。`disabled` ⇒ `DesktopShell.handleSystemShortcut` 直接返回,焦点窗口仍可关,但**前端不抢键**(适合 WebView/宿主 OS 已经接管的场景,如 macOS 真机上的 `⌘H`) |
-| `AMOS_DOCK_CONTEXT_MENU` | enum | `enabled` | `→ enabled` | Dock 右键菜单开关:`enabled`(默认)/`disabled`。`disabled` ⇒ Dock 的 `oncontextmenu` 不弹 `DockContextMenu`(调试 / 自动化截图时用) |
+| `AMOS_DESKTOP_SHORTCUTS` | enum | `enabled` | `→ enabled` | 系统快捷键(`⌘W` / `⌘M` / `⌘H` / `⌘,`)作用于焦点窗口的开关:`enabled`(默认)/`disabled`(也接受 `shortcuts` 列表写法)。`disabled` ⇒ `DesktopShell.handleSystemShortcut` 直接返回,焦点窗口仍可关,但**前端不抢键**(适合 WebView/宿主 OS 已经接管的场景,如 macOS 真机上的 `⌘H`)。**读取方是宿主**(`crates/amos-tauri/src/desktop_features.rs`,启动时解析并在 boot 日志里如实上报),UI 在 `DesktopShell` 挂载时通过 `desktop_features_disabled` 取回并缓存 —— WebView 里没有环境变量可读(REQ-A287),每个变量只管自己那一个能力,把另一个能力键写进来不会生效但在 boot 日志里有 warning | 
+| `AMOS_DOCK_CONTEXT_MENU` | enum | `enabled` | `→ enabled` | Dock 右键菜单开关:`enabled`(默认)/`disabled`(也接受 `dock-context-menu` 列表写法)。`disabled` ⇒ Dock 的 `oncontextmenu` 不弹 `DockContextMenu`(调试 / 自动化截图时用)。读取方/上报方式同上(REQ-A287) |
 
 ---
 

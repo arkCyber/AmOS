@@ -10,6 +10,7 @@
     "src/lib/calculator.ts::calcDisplay",
     "src/lib/calculator.ts::calcRun",
     "src/lib/calllog.ts::resetPendingCallsForTest",
+    "src/lib/desktopFeatures.ts::resetDesktopFeaturesForTest",
     "src/lib/emergency.ts::quickEmergencyNumber",
     "src/lib/externalFiles.ts::mergeDeduped",
     "src/lib/keepAwakeCore.ts::resetHoldBusForTest",

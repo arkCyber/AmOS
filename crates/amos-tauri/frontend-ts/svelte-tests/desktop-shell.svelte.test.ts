@@ -35,6 +35,7 @@ import { tick } from "svelte";
 import DesktopShell from "../src/svelte/DesktopShell.svelte";
 import Dock from "../src/svelte/Dock.svelte";
 import { LAYOUT_KEY, readStoreValue, writeStoreValue } from "../src/lib/amosStore";
+import { resetDesktopFeaturesForTest } from "../src/lib/desktopFeatures";
 import { DEFAULT_DESKTOP_VIEW, type DesktopView } from "../src/lib/desktopView";
 import { DOCK_MIN_WIDTH, SPOTLIGHT_HEIGHT, SPOTLIGHT_WIDTH,
   DESKTOP_GRID_COLS,
@@ -70,15 +71,29 @@ const DESKTOP_SNAPSHOT = {
  * non-poll invocation. `wm_windows` is polled (Dock running dots + shell's focused
  * window reader), so it would always be the last call; `lastCall` skips it so
  * "what did the user's keypress do" is answerable from the test. */
-function installHost({ windows = [] as unknown[], commands = [] as string[] } = {}) {
+/** Installs a fake host. `desktopFeatures` is what the host answers for
+ *  `desktop_features_disabled` (REQ-A287) — the *production* path for the two shell
+ *  capability switches, as opposed to the `window.__amosDisabledFeatures` test hook. */
+function installHost({
+  windows = [] as unknown[],
+  commands = [] as string[],
+  desktopFeatures = [] as string[],
+} = {}) {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: async (cmd: string, args?: unknown) => {
       commands.push(cmd);
-      if (cmd !== "wm_windows" && cmd !== "wm_layout_snapshot") {
+      // Boot facts (polled/asked once at mount) are not "a command the shell sent in
+      // response to something": the cases that assert `__lastCall === undefined` mean
+      // "this gesture reached no host command", so the boot reads must stay out of the
+      // probe (REQ-A287 added `desktop_features_disabled`).
+      const isBootFact =
+        cmd === "wm_windows" || cmd === "wm_layout_snapshot" || cmd === "desktop_features_disabled";
+      if (!isBootFact) {
         (window as unknown as Record<string, unknown>).__lastCall = { cmd, args };
       }
       if (cmd === "wm_layout_snapshot") return DESKTOP_SNAPSHOT;
       if (cmd === "wm_windows") return { windows };
+      if (cmd === "desktop_features_disabled") return desktopFeatures;
       return null;
     },
     listen: async () => () => {},
@@ -121,6 +136,9 @@ afterEach(() => {
   delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   delete (window as unknown as { __lastCall?: unknown }).__lastCall;
   delete (window as unknown as { __wmOpens?: unknown }).__wmOpens;
+  // The capability switches are module state in `lib/desktopFeatures` (one boot answer
+  // per page load), so a case that answers "disabled" must not leak into the next one.
+  resetDesktopFeaturesForTest();
 });
 
 
@@ -892,6 +910,36 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     } finally {
       delete (window as { __amosDisabledFeatures?: string[] }).__amosDisabledFeatures;
     }
+  });
+
+  test("REQ-A287 — the shell asks the host once at boot which capabilities the operator switched off", async () => {
+    // 宿主是唯一读得到 `AMOS_DESKTOP_SHORTCUTS` / `AMOS_DOCK_CONTEXT_MENU` 的地方
+    // (WebView 没有 env),所以 shell boot 必须真的去问一次 —— 否则那两个文档化的开关
+    // 又会退回"永远不生效"。这条用例钉的是**那一次调用**,不是某个 flag 的值。
+    const commands = installHost();
+    render(DesktopShell);
+    await tick();
+    await settle();
+    await settle();
+    expect(commands).toContain("desktop_features_disabled");
+  });
+
+  test("REQ-A287 — a host answer of ['shortcuts'] disables ⌘W exactly like the test hook does", async () => {
+    installHost({
+      windows: [{ label: "files", kind: "App", state: "Focused", focused: true }],
+      desktopFeatures: ["shortcuts"],
+    });
+    render(DesktopShell);
+    await tick();
+    await settle();
+    await settle();
+    press("w", { metaKey: true });
+    await tick();
+    await settle();
+    // 宿主说关了 ⇒ 前端不抢键(宿主 OS / WebView 自己决定)。注意这条**没有**设置
+    // `window.__amosDisabledFeatures`:走的就是生产路径。
+    const last = (window as unknown as Record<string, unknown>).__lastCall;
+    expect(last).toBeUndefined();
   });
 
   // ─── REQ-A275 — topbar File / Edit / View / Window / Help dropdowns ────────

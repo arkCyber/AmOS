@@ -41,7 +41,7 @@
   } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
   import { lock } from "./shellState.svelte";
-  import { isDesktopFeatureEnabled } from "../lib/desktopFeatures";
+  import { isDesktopFeatureEnabled, loadDesktopFeatures } from "../lib/desktopFeatures";
   import TopBar from "./TopBar.svelte";
   import Dock from "./Dock.svelte";
   import DesktopStage from "./DesktopStage.svelte";
@@ -188,6 +188,14 @@
 
   onMount(() => {
     window.addEventListener("keydown", onKeyDown, KEY_LISTENER);
+
+    // The two documented shells capability switches (`AMOS_DESKTOP_SHORTCUTS` /
+    // `AMOS_DOCK_CONTEXT_MENU`) are read by the **host** at startup — a WebView has no
+    // environment of its own, which is why reading them here could never work before
+    // (REQ-A287). Ask once, then `lib/desktopFeatures` holds the answer for the
+    // shortcut handler below and for the Dock's right-click menu. Until it arrives each
+    // capability keeps its documented default ("on"), i.e. what an unset environment means.
+    void loadDesktopFeatures();
 
     // 读取初始 LayoutSnapshot
     void wmLayoutSnapshot().then((s) => {

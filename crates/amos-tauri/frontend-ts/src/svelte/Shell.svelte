@@ -293,6 +293,10 @@
         setLayoutSnapshot(s); // Initialize shellState with layout snapshot
       }
     });
+    // Desktop-shell capability switches (`AMOS_DESKTOP_SHORTCUTS` /
+    // `AMOS_DOCK_CONTEXT_MENU`) are NOT asked here: they gate the shell's shortcut
+    // handler and the Dock's right-click menu, so `DesktopShell` — which owns both —
+    // fetches them when it mounts (REQ-A287).
     void onLayoutChanged((s) => {
       layoutSnap = s;
       setFormFactor(s.form);

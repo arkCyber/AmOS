@@ -36,6 +36,10 @@ pub mod clipboard_guest;
 /// (`AMOS_GUEST_CLIPBOARD_SOCKET`); see `docs/clipboard-container-sync.md` §5/§7.
 pub mod clipboard_guest_link;
 pub mod daemon;
+/// Desktop-shell capability switches (`AMOS_DESKTOP_SHORTCUTS` /
+/// `AMOS_DOCK_CONTEXT_MENU`) — read **host-side** because a WebView has no
+/// environment to read (REQ-A287).
+pub mod desktop_features;
 pub mod devcare;
 #[cfg(feature = "android")]
 pub mod devcare_device;
@@ -204,6 +208,7 @@ pub fn run() {
             wm::wm_set_shell_title,
             wm::wm_windows,
             wm::wm_layout_snapshot,
+            desktop_features::desktop_features_disabled,
             wm::wm_layout_set_screen,
             wm::wm_split,
             wm::wm_split_resize,
@@ -462,6 +467,38 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Desktop-shell capability switches (`AMOS_DESKTOP_SHORTCUTS` /
+            // `AMOS_DOCK_CONTEXT_MENU`) are resolved **here**, where an environment
+            // exists — the WebView has none, which is why these two documented
+            // switches could never be applied before (REQ-A287). Reported as a boot
+            // fact so an operator can see what the host actually resolved instead of
+            // inferring it from whether a key chord "felt" ignored.
+            {
+                let disabled = desktop_features::disabled_from_env();
+                if disabled.is_empty() {
+                    tracing::info!(
+                        "desktop shell capabilities: all enabled \
+                         (neither AMOS_DESKTOP_SHORTCUTS nor AMOS_DOCK_CONTEXT_MENU set)"
+                    );
+                } else {
+                    tracing::info!(
+                        disabled = ?disabled,
+                        "desktop shell capabilities disabled by the environment"
+                    );
+                }
+                // Each variable owns one capability, so naming the *other* key in it has
+                // no effect. That is a one-word mistake an operator cannot see from the
+                // outside, so it is reported rather than left as a capability that
+                // simply never moved.
+                let stray = desktop_features::stray_vars(|k| std::env::var(k).ok());
+                if !stray.is_empty() {
+                    tracing::warn!(
+                        vars = ?stray,
+                        "a desktop-shell switch names the other capability's key; \
+                         it has no effect there (each variable owns one capability)"
+                    );
+                }
+            }
             // Arm the native clipboard ingest bus with the managed GlobalClipboard
             // so container-originated copies land in the shared buffer, and install
             // an announce hook so those ingests broadcast a metadata-only
