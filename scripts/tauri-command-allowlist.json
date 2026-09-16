@@ -8,10 +8,6 @@
     "reason": "Developer/test seam for the hardware-button path (`buttons.rs` doc: \"lets desktop dev / tests drive the same path\"). No screen simulates a physical key."
   },
   {
-    "name": "wm_hide",
-    "reason": "Multi-window host; same missing surface as `wm_open` (docs/multi-window.md)."
-  },
-  {
     "name": "wm_home",
     "reason": "Multi-window host; the Svelte shell owns its own surface state (`shellState`), so nothing asks the WM to go home (docs/multi-window.md)."
   },

@@ -693,6 +693,7 @@ mod tests {
     /// The constant shapes are documented and unit-checked so a future bump of
     /// either ceiling is a conscious choice rather than a silent drift.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_interpret_command_bounds_cover_realistic_payloads() {
         // A 5-second mono 16 kHz buffer is 80 000 samples — already past the cap,
         // so the cap truly only covers streaming-sized chunks.

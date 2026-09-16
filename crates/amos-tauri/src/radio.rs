@@ -280,9 +280,7 @@ impl From<amos_radio::BtPeer> for BluetoothPeerPayload {
 /// then keeps showing its remembered value **as a preference**; that difference is the
 /// whole point of this command existing instead of reusing the store.
 #[tauri::command]
-pub async fn bluetooth_adapter_name(
-    bridge: State<'_, RadioBridge>,
-) -> Result<String, AmosError> {
+pub async fn bluetooth_adapter_name(bridge: State<'_, RadioBridge>) -> Result<String, AmosError> {
     bridge
         .manager
         .bluetooth_local_name()
@@ -409,9 +407,7 @@ impl From<amos_radio::BtScan> for BluetoothScanPayload {
 /// `BLUETOOTH_SCAN` not granted) — the screen then says the search could not start
 /// rather than showing an empty list.
 #[tauri::command]
-pub async fn bluetooth_start_scan(
-    bridge: State<'_, RadioBridge>,
-) -> Result<bool, AmosError> {
+pub async fn bluetooth_start_scan(bridge: State<'_, RadioBridge>) -> Result<bool, AmosError> {
     bridge
         .manager
         .bluetooth_start_discovery()

@@ -166,6 +166,7 @@ mod tests {
     /// private-use `x-…` subtag), but no headroom for a multi-kilobyte junk
     /// string to slip through.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_lang_tag_constant_has_real_headroom() {
         // Real longest tag is `zh-Hant-HK` (11 ASCII chars) — comfortably inside
         // the cap; the cap itself is short enough to fit in any reasonable log line.

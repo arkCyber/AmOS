@@ -269,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn max_dial_chars_constant_covers_e164_plus_emergency_shorts() {
         // 16 chars fits E.164 (`+8613800138000`); the constant must be >= that
         // or genuine international calls get refused at the seam.

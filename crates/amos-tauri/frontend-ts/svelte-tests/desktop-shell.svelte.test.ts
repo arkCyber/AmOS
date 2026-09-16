@@ -585,6 +585,75 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     expect(container.querySelector('[data-testid="desktop-selection-count"]')).toBeNull();
   });
 
+  test("desktop multi-selection: Cmd-click toggles one icon in/out; Shift-click unions a range (F-SH-010)", async () => {
+    // The topbar's Edit → Select All test covers the keyboard ⌘A path. Here we pin
+    // the mouse half of the same model so the two paths cannot diverge:
+    //   • Cmd-click on an unselected icon → adds it.
+    //   • Cmd-click on a *selected* icon → removes it (anchor does NOT move; macOS
+    //     Finder keeps the anchor on the last real pick — see `onIconClick`).
+    //   • Shift-click → unions [anchor..target] (in icon order) with the existing
+    //     selection; it never silently drops a previously-picked icon. That rule is
+    //     the FMEA F-SH-010 mitigation: a non-contiguous prior set {A, C} +
+    //     Shift-click E → {A, B, C, D, E} — not just {B, C, D, E}.
+    // Negative control: replace the union line in `onIconClick` with a plain
+    // `selectedIds = new Set(unionRange(anchorId, id))` and this case fails
+    // (`clock` is gone from the post-Shift-click selection — `expected false to
+    // be true`).
+    installHost();
+    writeStoreValue(LAYOUT_KEY, {
+      page: ["clock", "notes", "calendar", "files", "mail"],
+      dock: [],
+      hidden: [],
+    });
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+
+    const idOf = (s: string) =>
+      container.querySelector<HTMLButtonElement>(
+        `[data-desktop-icon-id="${s}"]`,
+      )!;
+    const isSel = (id: string) =>
+      idOf(id).getAttribute("aria-selected") === "true";
+
+    // 1) Cmd-click `clock` — selected = {clock}.
+    await fireEvent.click(idOf("clock"), { metaKey: true });
+    await tick();
+    expect(isSel("clock")).toBe(true);
+
+    // 2) Cmd-click `calendar` — selected = {clock, calendar}.
+    await fireEvent.click(idOf("calendar"), { metaKey: true });
+    await tick();
+    expect(isSel("clock")).toBe(true);
+    expect(isSel("calendar")).toBe(true);
+    expect(isSel("notes")).toBe(false);
+
+    // 3) Cmd-click `calendar` AGAIN — toggle off; anchor stays put.
+    await fireEvent.click(idOf("calendar"), { metaKey: true });
+    await tick();
+    expect(isSel("calendar")).toBe(false);
+    expect(isSel("clock")).toBe(true);
+
+    // 4) Shift-click `mail` — unions the contiguous range [calendar..mail] with
+    //    the existing set {clock}. Result: {clock, calendar, files, mail}. Note
+    //    that `notes` (index 1) is NOT in the anchor..target window (calendar is
+    //    index 2, mail is index 4); it's not in the union either. macOS Finder
+    //    agrees: Shift-click does not bend the range to include non-anchor-side
+    //    picks, it only **adds** the range — the previous pick (clock) is
+    //    preserved by the union-with-existing rule.
+    await fireEvent.click(idOf("mail"), { shiftKey: true });
+    await tick();
+    for (const id of ["clock", "calendar", "files", "mail"]) {
+      expect(isSel(id), `${id} should be selected after Shift-click`).toBe(true);
+    }
+    expect(isSel("notes")).toBe(false);
+    // Chip count is the user-visible proof.
+    const chip = container.querySelector('[data-testid="desktop-selection-count"]');
+    expect(chip?.textContent?.trim()).toBe(
+      zh["desktop.selection"].replace("{n}", "4"),
+    );
+  });
+
   test("double-clicking an icon in a multi-selection opens ALL the selected", async () => {
     installHost();
     writeStoreValue(LAYOUT_KEY, {

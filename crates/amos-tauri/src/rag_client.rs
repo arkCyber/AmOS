@@ -141,9 +141,11 @@ pub async fn rag_index(id: String, text: String) -> Result<RagIndexOut, AmosErro
             ),
         ));
     }
-    let mut client = RagClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client = RagClient::new(
+        build_channel()
+            .await
+            .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?,
+    );
     let reply = client
         .index(RagIndexRequest { id, text })
         .await
@@ -167,9 +169,11 @@ pub async fn rag_remove(id: String) -> Result<RagRemoveOut, AmosError> {
             ),
         ));
     }
-    let mut client = RagClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client = RagClient::new(
+        build_channel()
+            .await
+            .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?,
+    );
     let reply = client
         .remove(RagRemoveRequest { id })
         .await
@@ -192,9 +196,11 @@ pub async fn rag_query(query: String, top_k: u32) -> Result<RagQueryOut, AmosErr
             ),
         ));
     }
-    let mut client = RagClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client = RagClient::new(
+        build_channel()
+            .await
+            .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?,
+    );
     let reply = client
         .query(RagQueryRequest { query, top_k })
         .await
@@ -206,9 +212,11 @@ pub async fn rag_query(query: String, top_k: u32) -> Result<RagQueryOut, AmosErr
 /// Read the daemon's current index size / dimension / honest embedder label.
 #[tauri::command]
 pub async fn rag_status() -> Result<RagStatusOut, AmosError> {
-    let mut client = RagClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client = RagClient::new(
+        build_channel()
+            .await
+            .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?,
+    );
     let reply = client
         .status(RagStatusRequest {})
         .await

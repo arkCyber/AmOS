@@ -85,6 +85,10 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-008', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopShell.svelte'], markers: ['handleSystemShortcut', 'focusedWindowLabel'], severity: 3 },
   // REQ-A273: Dock 右键菜单的 props 在 onclose 之后访问会抛 —— 必须在 await 之前把 label 读到局部
   { id: 'F-SH-009', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/DockContextMenu.svelte'], markers: ['targetLabel', 'Prop-read ordering'], severity: 3 },
+  // REQ-A278: 多选 Shift-click 必须 union 而不是替换 —— macOS Finder 契约
+  { id: 'F-SH-010', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopStage.svelte'], markers: ['unionRange(anchorId, id)', 'wasSelected'], severity: 3 },
+  // REQ-A278: 顶栏 Edit → Select All 与键盘 ⌘A 必须走同一条选区
+  { id: 'F-SH-011', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/DesktopStage.svelte'], markers: ['edit.select-all', 'onWindowKeyDown'], severity: 2 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
@@ -118,6 +122,10 @@ const KNOWN_FAILURES = [
   { id: 'F-LK-014', module: 'amos-tauri', files: ['crates/amos-tauri/src/link.rs', 'crates/amos-link-cli/src/lib.rs'], markers: ['Unimplemented', 'returnPathLevel', 'actuations: Option'], severity: 3 },
   // REQ-A272: QoS 只在进程内成立 —— 网络传输上「最新帧赢」变成「最老帧」、DropNewest 从不生效、订阅计数器恒为 0
   { id: 'F-LK-015', module: 'amos-link', files: ['crates/amos-link/src/zenoh.rs', 'crates/amos-link/src/broker.rs'], markers: ['remote_latest', 'RelayCounters', 'forward_latest'], severity: 4 },
+  // REQ-A277: 平台剖面机器未解锁 ⇒ motion 被拒并点名解锁动作;参考机的运动批次自带 Enable,该分支对它永不触发
+  { id: 'F-LK-016', module: 'amos-link', files: ['crates/amos-link/src/robot_hal.rs', 'crates/amos-link/src/platform.rs'], markers: ['for_platform', 'Vocabulary::Profile', 'must_be_armed'], severity: 3 },
+  // REQ-A277: 剖面参考机兼容性 — Platform::quadruped() 必须对每步态×速度产出与手写 plan 字节完全相同的帧(含前导 Enable(0))
+  { id: 'F-LK-017', module: 'amos-link', files: ['crates/amos-link/src/platform.rs', 'crates/amos-link/src/robot_hal.rs'], markers: ['Platform::quadruped', 'plan as plan_reference', 'Vocabulary::Reference'], severity: 3 },
 
   // 数据完整性
   { id: 'F-DA-001', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/amosStore.ts'], markers: ['readJson', 'corrupt'], severity: 3 },

@@ -244,10 +244,7 @@ fn checked_send(address: &str, text: &str) -> Result<(String, usize), AmosError>
 /// subsequent operation).
 fn check_sms_id(s: &str) -> Result<(), AmosError> {
     if s.is_empty() {
-        return Err(AmosError::new(
-            ErrorCode::SmsBlankId,
-            "sms id is empty",
-        ));
+        return Err(AmosError::new(ErrorCode::SmsBlankId, "sms id is empty"));
     }
     if s.len() > MAX_SMS_ID_BYTES {
         return Err(AmosError::new(
@@ -826,7 +823,9 @@ pub async fn sms_snapshot(
     let provider = active_arc(&state);
     let threads = blocking(move || provider.snapshot(folder))
         .await
-        .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))?;
+        .map_err(|e| {
+            AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e)
+        })?;
     let (kept, hidden) = crate::blocklist::filter_threads(threads, &crate::blocklist::shared());
     if hidden > 0 {
         tracing::info!(target: "amos::sms", hidden, "blocked senders filtered from the list");
@@ -951,7 +950,9 @@ pub async fn sms_messages(
     let provider = active_arc(&state);
     let msgs = blocking(move || provider.messages(&thread_id, folder))
         .await
-        .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))?;
+        .map_err(|e| {
+            AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e)
+        })?;
     // REQ-A42: trashed messages are hidden from the thread read (ids only —
     // the platform store keeps them; restoring brings them back).
     let (visible, trashed) = {

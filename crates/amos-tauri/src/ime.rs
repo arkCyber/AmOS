@@ -912,6 +912,7 @@ mod tests {
     /// per-tap limit fits in the buffer's per-window limit (so a single key
     /// cannot exceed it in one go).
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_key_and_input_constants_make_sense() {
         assert!(
             MAX_KEY_CHARS >= 1,

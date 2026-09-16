@@ -488,9 +488,9 @@ impl AiBridge {
 /// promoted to a typed [`AmosError`] under [`ErrorCode::AiRpcFailed`] so it
 /// rides the same envelope every AI / Android command now returns.
 async fn build_channel() -> Result<crate::daemon::DaemonChannel, AmosError> {
-    crate::daemon::channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::AiRpcFailed, codes::RPC_FAILED, e)
-    })
+    crate::daemon::channel()
+        .await
+        .map_err(|e| AmosError::with_cause(ErrorCode::AiRpcFailed, codes::RPC_FAILED, e))
 }
 
 /// Serializable snapshot of the daemon status (prost types don't impl serde).
@@ -626,10 +626,7 @@ pub struct SessionHistory {
 }
 
 /// Fetch one session's completed conversation history (headless).
-pub async fn get_session_history(
-    bridge: &AiBridge,
-    id: &str,
-) -> Result<SessionHistory, AmosError> {
+pub async fn get_session_history(bridge: &AiBridge, id: &str) -> Result<SessionHistory, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = bridge.connect().await?;

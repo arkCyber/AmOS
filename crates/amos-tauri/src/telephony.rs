@@ -138,9 +138,10 @@ pub async fn telephony_dial(
             ),
         ));
     }
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let resp = client
         .dial(DialRequest { number, emergency })
         .await
@@ -173,9 +174,10 @@ pub async fn telephony_end(call_id: String) -> Result<(), AmosError> {
     if crate::incall::real_hang_up().unwrap_or(false) {
         return Ok(());
     }
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     client
         .end(EndRequest {
             call: Some(CallIdMsg { id: call_id }),
@@ -194,9 +196,10 @@ pub async fn telephony_end(call_id: String) -> Result<(), AmosError> {
 /// List live calls (dialling / ringing / active).
 #[tauri::command]
 pub async fn telephony_status() -> Result<Vec<TelephonyCallPayload>, AmosError> {
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let resp = client
         .status(StatusRequest {})
         .await
@@ -213,9 +216,7 @@ pub async fn telephony_status() -> Result<Vec<TelephonyCallPayload>, AmosError> 
 
 /// Start recording a live call; returns its authoritative snapshot (recording=On).
 #[tauri::command]
-pub async fn telephony_start_recording(
-    call_id: String,
-) -> Result<TelephonyCallPayload, AmosError> {
+pub async fn telephony_start_recording(call_id: String) -> Result<TelephonyCallPayload, AmosError> {
     if call_id.len() > MAX_TELEPHONY_CALL_ID_BYTES {
         return Err(AmosError::new(
             ErrorCode::TelephonyCallIdTooLong,
@@ -225,9 +226,10 @@ pub async fn telephony_start_recording(
             ),
         ));
     }
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let resp = client
         .start_recording(CallIdMsg { id: call_id })
         .await
@@ -244,9 +246,7 @@ pub async fn telephony_start_recording(
 
 /// Stop recording a live call; returns its authoritative snapshot (recording=Off).
 #[tauri::command]
-pub async fn telephony_stop_recording(
-    call_id: String,
-) -> Result<TelephonyCallPayload, AmosError> {
+pub async fn telephony_stop_recording(call_id: String) -> Result<TelephonyCallPayload, AmosError> {
     if call_id.len() > MAX_TELEPHONY_CALL_ID_BYTES {
         return Err(AmosError::new(
             ErrorCode::TelephonyCallIdTooLong,
@@ -256,9 +256,10 @@ pub async fn telephony_stop_recording(
             ),
         ));
     }
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let resp = client
         .stop_recording(CallIdMsg { id: call_id })
         .await
@@ -291,9 +292,10 @@ pub async fn telephony_answer(call_id: String) -> Result<(), AmosError> {
     if crate::incall::real_answer().unwrap_or(false) {
         return Ok(());
     }
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     client
         .answer(AnswerRequest {
             call: Some(CallIdMsg { id: call_id }),
@@ -322,9 +324,10 @@ pub async fn telephony_simulate_incoming(number: String) -> Result<String, AmosE
             ),
         ));
     }
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let resp = client
         .simulate_incoming(SimulateIncomingRequest { number })
         .await
@@ -343,9 +346,10 @@ pub async fn telephony_simulate_incoming(number: String) -> Result<String, AmosE
 /// event to the WebView as `telephony-event`. Ends `Ok(())` when the daemon closes
 /// the stream (caller reconnects) or `Err` if the daemon is down/errors.
 async fn watch_round(app: AppHandle) -> Result<(), AmosError> {
-    let mut client = TelephonyClient::new(build_channel().await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
-    })?);
+    let mut client =
+        TelephonyClient::new(build_channel().await.map_err(|e| {
+            AmosError::with_cause(ErrorCode::TelephonyRpcFailed, codes::RPC_FAILED, e)
+        })?);
     let mut stream = client
         .watch(WatchRequest {})
         .await
@@ -506,11 +510,11 @@ mod tests {
 
         // The enum side keeps the same strings — a drift between the two would
         // be a wire break one of the callsites would not survive.
-        assert_eq!(ErrorCode::TelephonyNumberTooLong.as_str(), codes::NUMBER_TOO_LONG);
         assert_eq!(
-            ErrorCode::TelephonyRpcFailed.as_str(),
-            codes::RPC_FAILED
+            ErrorCode::TelephonyNumberTooLong.as_str(),
+            codes::NUMBER_TOO_LONG
         );
+        assert_eq!(ErrorCode::TelephonyRpcFailed.as_str(), codes::RPC_FAILED);
 
         // And every variant groups under "telephony" so a single tracing filter
         // scopes the whole surface.

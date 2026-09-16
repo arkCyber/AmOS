@@ -158,15 +158,38 @@
     e.stopPropagation();
     if (dragJustEnded) return;
     if (e.shiftKey && anchorId !== null) {
-      selectedIds = new Set(unionRange(anchorId, id));
+      // macOS Finder: Shift-click extends the selection from the **anchor** to the
+      // click target (inclusive). It is an **union** with whatever was already
+      // selected, not a replacement — a non-contiguous prior selection {A, C} +
+      // Shift-click E becomes {A, B, C, D, E}, not just {B, C, D, E}. Replacing the
+      // set with the contiguous window is the FMEA F-SH-010 defect: it silently
+      // drops icons the user already picked. Pinning the union is the regression
+      // guard (negative control: replace this line with `selectedIds = new
+      // Set(unionRange(anchorId, id))` and the "clock stays selected after Cmd-
+      // toggle-off + Shift-click mail" assertion in `desktop-shell.svelte.test.ts`
+      // fails with `expected false to be true`).
+      selectedIds = new Set([...selectedIds, ...unionRange(anchorId, id)]);
       focusedId = id;
     } else if (e.metaKey || e.ctrlKey) {
       const next = new Set(selectedIds);
-      if (next.has(id)) next.delete(id);
+      const wasSelected = next.has(id);
+      if (wasSelected) next.delete(id);
       else next.add(id);
       selectedIds = next;
-      anchorId = id;
-      focusedId = id;
+      // macOS Finder: Cmd-click on an unselected icon moves the anchor to it;
+      // Cmd-click on an *already selected* icon (toggle off) leaves the anchor
+      // where it was — the next Shift-click still extends from the last real
+      // pick, not from the icon the user just removed. Pinning this rule is the
+      // FMEA F-SH-010 mitigation; its regression guard is the multi-selection
+      // case in `desktop-shell.svelte.test.ts` (negative control: re-assign
+      // anchorId on toggle-off ⇒ the test for `clock` after the toggle-off
+      // FAILED with `expected false to be true`).
+      if (!wasSelected) {
+        anchorId = id;
+        focusedId = id;
+      } else {
+        focusedId = id;
+      }
     } else {
       selectedIds = new Set([id]);
       anchorId = id;
