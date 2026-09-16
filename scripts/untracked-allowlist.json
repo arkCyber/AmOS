@@ -1,10 +1,1 @@
-[
-  {
-    "path": "crates/amos-tauri/frontend-ts/keydown-probe.mjs",
-    "reason": "Ad-hoc happy-dom dispatch probe written while pinning DesktopShell key handling; the result was folded into the test suite (`svelte-tests/desktop-shell.svelte.test.ts`). Kept here as a one-shot reproducer; delete if it gets in the way."
-  },
-  {
-    "path": "crates/amos-tauri/frontend-ts/keydown-probe2.mjs",
-    "reason": "Companion probe to `keydown-probe.mjs` (the window-level listener count path). Same disposition: keep as a reproducer, remove once happy-dom's event-delivery contract stops being a moving target."
-  }
-]
+[]
