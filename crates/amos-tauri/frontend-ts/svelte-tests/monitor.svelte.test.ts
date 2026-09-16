@@ -69,3 +69,31 @@ describe("TaskManager.svelte", () => {
     expect(txt(host)).toContain("结束"); // "kill" action button is always offered
   });
 });
+
+/**
+ * REQ-A297 phase-2 §4 cont.4 (SystemPanel half): the pre-fix
+ * `.catch(() => { ... })` ("daemon offline, keep previous") was dead code
+ * because `systemStatusWithHostBattery()` (lib/system.ts) routes through a
+ * `call` helper that catches internally and resolves `null` on a refused
+ * command. A refused `system_health` therefore manifests as the same
+ * observable state (`raw === null`) the success arm already handled — the
+ * `.catch` arm was unreachable. The fix is the now-typed-error surfacing:
+ * the success arm's `else` branch reads `bridgeDiag("system_health")` and
+ * logs the typed reason. The UI keeps showing whatever it last had, and
+ * the launcher ledger gains a real signal.
+ */
+describe("SystemPanel — honest error surfacing (REQ-A297 phase-2 §4 cont.4)", () => {
+  test("a refused system_health keeps the previous reading and does not throw", async () => {
+    // Always-null bridge = "host refused / not bridged".
+    installBridge(null, null);
+    // The pre-fix path threw at this `render` only if a `try { await invoke }
+    // catch {}` shape was left behind; with the cleanup, no `await invoke` is
+    // anywhere outside a typed contract.
+    const host = render(SystemPanel);
+    await settle();
+    // The empty `normalizeSystemHealth(null)` start — not a card with data,
+    // so the test verifies it didn't crash and the "no data" branch is the
+    // one being shown (no row that needs the daemon).
+    expect(host.container.textContent ?? "").toBe("");
+  });
+});

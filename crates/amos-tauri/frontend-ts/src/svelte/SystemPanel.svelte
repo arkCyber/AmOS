@@ -13,6 +13,7 @@
     memUsedPct,
     type SystemStatus,
   } from "../lib/system";
+  import { bridgeDiag, isCommandFailed } from "../lib/backend";
   import { t } from "./locale.svelte";
 
   const REFRESH_MS = 2500;
@@ -29,12 +30,22 @@
     if (inflight) return;
     inflight = true;
     busy = true;
+    // REQ-A297 phase-2 §4 cont.4: `systemStatusWithHostBattery()` routes through
+    // `lib/system.ts::call`, which **catches** internally and resolves `null` on a
+    // refused command (the bridge offline / daemon down case). The pre-fix
+    // `.catch(() => /* daemon offline */)` was therefore dead code: a refused
+    // `system_health` reaches the `raw === null` branch below, **and** the typed
+    // error code now lands in the diagnostic ledger (P1-3) via `bridgeDiag`.
     systemStatusWithHostBattery()
       .then((raw) => {
         if (raw) sys = raw;
-      })
-      .catch(() => {
-        /* daemon offline → keep previous / nothing */
+        else {
+          const diag = bridgeDiag("system_health");
+          if (isCommandFailed(diag)) {
+            console.warn("🛟 [SystemPanel] system_health refused:", diag.detail);
+          }
+          // `raw === null` (host down) — keep whatever `sys` already shows.
+        }
       })
       .finally(() => {
         inflight = false;
