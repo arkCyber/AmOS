@@ -215,6 +215,79 @@ describe("backend bridge", () => {
     expect(calls.some((c) => c.cmd === "plugin:event|unlisten")).toBe(true);
   });
 
+  test("a diagnosis belongs to its command, not to whichever call finished last (REQ-A296)", async () => {
+    const store = new Map<string, string>();
+    let failChat = true;
+    setWindow({
+      __TAURI_INTERNALS__: {
+        invoke: async (cmd: string) => {
+          if (cmd === "chat_agent") {
+            if (failChat) throw new Error("daemon: model load failed");
+            return "ok";
+          }
+          throw new Error(`refused: ${cmd}`);
+        },
+        listen: async () => async () => {},
+      },
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => void store.set(k, v),
+      },
+    });
+
+    await invoke("chat_agent", { prompt: "hi" }); // fails
+    await invoke("some_other_command"); // also fails, and writes the *global* slot
+    // The global (no-arg) form still reports the last outcome…
+    expect(bridgeDiag().ok).toBe(false);
+    // …while the per-command form keeps this call's own root cause. Before REQ-A296 both
+    // answers were the same slot, so a surface explaining its failure could print another
+    // command's error — and PhoneApp *branches* on it (rollback / error sentence).
+    const chat = bridgeDiag("chat_agent");
+    expect(chat.ok).toBe(false);
+    if (!chat.ok && chat.kind === "command-failed") {
+      expect(chat.command).toBe("chat_agent");
+      expect(String(chat.detail)).toContain("model load failed");
+    } else {
+      throw new Error(`expected a command-failed diagnosis, got ${JSON.stringify(chat)}`);
+    }
+    const other = bridgeDiag("some_other_command");
+    expect(other.ok).toBe(false);
+    if (!other.ok && other.kind === "command-failed") {
+      expect(String(other.detail)).toContain("refused: some_other_command");
+    } else {
+      throw new Error(`expected a command-failed diagnosis, got ${JSON.stringify(other)}`);
+    }
+
+    // A success for one command is recorded for that command only.
+    failChat = false;
+    await invoke("chat_agent", { prompt: "again" });
+    expect(bridgeDiag("chat_agent").ok).toBe(true);
+    expect(bridgeDiag("some_other_command").ok).toBe(false);
+
+    // Never called ⇒ no recorded failure (the caller's own null-check is the authority).
+    expect(bridgeDiag("never_called")).toEqual({ ok: true });
+  });
+
+  test("the per-command table is bounded (a long session cannot grow it without limit)", async () => {
+    setWindow({
+      __TAURI_INTERNALS__: {
+        // Every call fails, so every command that still has a slot reports `ok: false`.
+        invoke: async (cmd: string) => {
+          throw new Error(`refused: ${cmd}`);
+        },
+        listen: async () => async () => {},
+      },
+      localStorage: { getItem: () => null, setItem: () => {} } as unknown as Storage,
+    });
+    await invoke("first_command");
+    expect(bridgeDiag("first_command").ok).toBe(false);
+    // Fill well past the cap with distinct command names; the oldest entry is evicted,
+    // so its diagnosis degrades to "no recorded failure" rather than the map growing.
+    for (let i = 0; i < 60; i++) await invoke(`cmd_${i}`);
+    expect(bridgeDiag("first_command")).toEqual({ ok: true });
+    expect(bridgeDiag("cmd_59").ok).toBe(false);
+  });
+
   test("records structured diagnostics instead of losing failure root cause", async () => {
     // Not bridged → classified as such.
     setWindow({ localStorage: new Map() as unknown as Storage });

@@ -101,6 +101,10 @@ function formatDetail(d: unknown): string {
   return d === undefined || d === null ? "command failed" : String(d);
 }
 
+/** The command `fetchBundleEntry` calls — also the key its failure reason is looked up
+ *  under, so the two cannot drift (REQ-A296). */
+export const BUNDLE_ENTRY_COMMAND = "appstore_bundle_entry";
+
 /**
  * Turn a `null` reply into an honest reason, using the bridge's own diagnostic.
  *
@@ -110,9 +114,11 @@ function formatDetail(d: unknown): string {
  * dir (set AMOS_APPSTORE_INSTALL_DIR)`, is exactly what the user needs). Pure, so
  * every branch is testable without a bridge.
  *
- * Note: `bridgeDiag()` is the bridge's *last* outcome, so a concurrent command
- * could overwrite it between our call and this read. That only affects the
- * wording of an already-failed load, never a success.
+ * Callers pass the diag of **their own** command (`bridgeDiag(BUNDLE_ENTRY_COMMAND)`):
+ * the bridge keeps a per-command slot, so a concurrent command finishing in between can
+ * no longer have its outcome reported as this load's reason (REQ-A296 — before that, the
+ * global last-outcome slot made the *wording* of a failed load attributable to the wrong
+ * call; a success was never affected).
  */
 export function bundleFailureFromDiag(diag: BridgeDiag): {
   reason: BundleHostFailure;
@@ -137,7 +143,7 @@ export async function fetchBundleEntry(mid: string): Promise<BundleEntryResult> 
   if (id === null) {
     return { kind: "failed", reason: "blocked", detail: "empty app id" };
   }
-  const raw = await invoke<unknown>("appstore_bundle_entry", { id });
+  const raw = await invoke<unknown>(BUNDLE_ENTRY_COMMAND, { id });
   if (raw === null) {
     return { kind: "failed", ...bundleFailureFromDiag(bridgeDiag()) };
   }

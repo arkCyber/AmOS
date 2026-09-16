@@ -327,7 +327,7 @@
       if (!rule) {
         blockOk = false;
         blockMsg = t("message.blockSenderFailed");
-        amosWarn("messages", "blocklist_add failed", bridgeDiag());
+        amosWarn("messages", "blocklist_add failed", bridgeDiag("blocklist_add"));
         return;
       }
       blockOk = true;
@@ -359,7 +359,7 @@
     try {
       const r = await smsTrashAdd(realActiveId, m.id, folder);
       if (!r) {
-        amosWarn("messages", "sms_trash_add failed", bridgeDiag());
+        amosWarn("messages", "sms_trash_add failed", bridgeDiag("sms_trash_add"));
         noteTrash(false, t("message.trashFailed"));
         return;
       }
@@ -389,7 +389,7 @@
         // malformed case). Persisting is best-effort and never flips the answer, so a
         // false can never mean "we tried and the write failed". Saying
         // "移入回收站失败" here would name the *opposite* action and the wrong cause.
-        amosWarn("messages", "sms_trash_restore matched nothing", bridgeDiag());
+        amosWarn("messages", "sms_trash_restore matched nothing", bridgeDiag("sms_trash_restore"));
         noteTrash(false, t("message.trashNotInTrash"));
       }
     } finally {

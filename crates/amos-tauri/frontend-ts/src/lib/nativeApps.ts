@@ -128,27 +128,39 @@ export async function nativeApps(): Promise<NativeApp[] | null> {
 }
 
 /**
- * Launch one enumerated app. Returns the display name on success, `null` on any
- * refusal (unknown id, no Wine, not a Linux host, spawn failure) — the caller shows
- * the reason via `bridgeDiag()`/the returned detail of the screen's own state.
+ * The Tauri command that launches one enumerated app kind.
+ *
+ * Exported so a caller can ask `bridgeDiag(...)` about **its own** launch instead of the
+ * bridge's global last-outcome slot (which any other command can overwrite — REQ-A296).
  */
-export async function nativeLaunch(kind: NativeAppKind, id: string): Promise<string | null> {
-  if (id === "") return null;
-  const command = kind === "wine" ? "wine_launch" : "linux_launch";
-  return invoke<string>(command, { id });
+export function launchCommand(kind: NativeAppKind): string {
+  return kind === "wine" ? "wine_launch" : "linux_launch";
 }
 
 /**
- * Why the last bridge call failed, as text the screen can show.
+ * Launch one enumerated app. Returns the display name on success, `null` on any
+ * refusal (unknown id, no Wine, not a Linux host, spawn failure) — the caller shows
+ * the reason via `lastFailureReason(launchCommand(kind))`.
+ */
+export async function nativeLaunch(kind: NativeAppKind, id: string): Promise<string | null> {
+  if (id === "") return null;
+  return invoke<string>(launchCommand(kind), { id });
+}
+
+/**
+ * Why *that command's* last call failed, as text the screen can show.
  *
  * `invoke` collapses every failure into `null` (by design — callers keep a simple
- * contract), while `bridgeDiag()` keeps the root cause. Returning it as a string
- * here is what lets the screen say "not running inside AmOS" or the host's own
+ * contract), while `bridgeDiag(command)` keeps that command's root cause. Returning it as
+ * a string here is what lets the screen say "not running inside AmOS" or the host's own
  * refusal sentence ("no Linux app with id 'x' is installed") instead of a shrug.
- * `""` when the last call was fine.
+ * `""` when that command's last call was fine (or was never made).
+ *
+ * The command is **required** on purpose: reading the bridge's global slot here meant an
+ * unrelated command finishing in between could be reported as this launch's reason.
  */
-export function lastFailureReason(): string {
-  const d = bridgeDiag();
+export function lastFailureReason(command: string): string {
+  const d = bridgeDiag(command);
   if (d.ok) return "";
   if (d.kind === "not-bridged") return "not-bridged";
   const detail: unknown = d.detail;

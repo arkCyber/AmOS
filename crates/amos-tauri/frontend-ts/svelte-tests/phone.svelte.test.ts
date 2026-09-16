@@ -295,6 +295,36 @@ describe("PhoneApp.svelte (offline UI)", () => {
     expect(rules.length).toBe(0);
   });
 
+  test("an unrelated failure cannot roll back the unknown-number switch (REQ-A296)", async () => {
+    // Property guard, not a proof of misattribution: the switch asks about **its own**
+    // command now, so an accepted save stands even while other commands fail. (Measured:
+    // every production read sits immediately after its own `await`, so the pre-REQ-A296
+    // global slot also answered correctly here — the discriminating cases live in
+    // `__tests__/backend.test.ts` and `__tests__/nativeApps.test.ts`.)
+    let snapshotsFail = false;
+    fakeBridge((cmd) => {
+      if (cmd === "blocklist_set_unknown") return null; // answered ⇒ saved
+      if (cmd === "blocklist_snapshot") {
+        if (snapshotsFail) throw new Error("snapshot failed");
+        return { block_unknown: false, rules: [] };
+      }
+      if (cmd === "blocklist_status") return NO_STATUS;
+      return null;
+    });
+    const host = render(PhoneApp);
+    await openBlockTab(host);
+    await flush();
+    const sw = () =>
+      host.container.querySelector('button[data-testid="block-unknown"]') as HTMLButtonElement;
+    expect(sw().getAttribute("aria-pressed")).toBe("false");
+
+    snapshotsFail = true; // every re-read from here on fails
+    await fireEvent.click(sw());
+    await flush();
+    expect(sw().getAttribute("aria-pressed")).toBe("true");
+    expect(txt(host)).not.toContain(zh["phone.blockSaveFailed"]);
+  });
+
   test("the block field previews a match the daemon already covers (blocklist_check)", async () => {
     const calls = fakeBridge((cmd, args) => {
       if (cmd === "blocklist_snapshot") return { block_unknown: false, rules: [] };

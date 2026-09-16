@@ -103,23 +103,59 @@ export type BridgeDiag =
 
 let lastDiag: BridgeDiag = { ok: true };
 
-export function bridgeDiag(): BridgeDiag {
-  return lastDiag;
+/**
+ * Last outcome **per command**, so a caller can ask about the call it actually made.
+ *
+ * `lastDiag` alone is a single global slot: every `invoke` writes it, so by the time a
+ * surface logs "why did *this* fail?" an unrelated command that finished later may have
+ * overwritten the answer. That is not only a wrong log line — `PhoneApp` branches on it
+ * (`if (!bridgeDiag().ok)`), so a stale slot could roll back a switch the host *did*
+ * save, or (worse) hide a real failure behind someone else's success (REQ-A296).
+ *
+ * Bounded (oldest command evicted first) because "one entry per command name" must not
+ * grow with the number of distinct commands a session ever calls.
+ */
+const perCommandDiag = new Map<string, BridgeDiag>();
+const PER_COMMAND_CAP = 48;
+
+function noteDiag(command: string, d: BridgeDiag): void {
+  lastDiag = d;
+  if (!perCommandDiag.has(command) && perCommandDiag.size >= PER_COMMAND_CAP) {
+    const oldest = perCommandDiag.keys().next().value;
+    if (oldest !== undefined) perCommandDiag.delete(oldest);
+  }
+  perCommandDiag.set(command, d);
+}
+
+/**
+ * Structured diagnosis of a bridge call.
+ *
+ * * `bridgeDiag()` — the **last** outcome of any command (kept for compatibility; prefer
+ *   the form below whenever the question is about one specific call).
+ * * `bridgeDiag(command)` — the last outcome of *that* command. A command that was never
+ *   called has no record: the answer is `{ ok: true }` — "no recorded failure", which is
+ *   the honest default for a caller whose own `null` check is the authority
+ *   (`invoke` returns `null` on failure, so the value is the primary signal and this is
+ *   the explanation).
+ */
+export function bridgeDiag(command?: string): BridgeDiag {
+  if (command === undefined) return lastDiag;
+  return perCommandDiag.get(command) ?? { ok: true };
 }
 
 /** Call a Tauri command; returns null when not running inside Tauri. */
 export async function invoke<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T | null> {
   const b = bridge();
   if (!b) {
-    lastDiag = { ok: false, kind: "not-bridged", command };
+    noteDiag(command, { ok: false, kind: "not-bridged", command });
     return null;
   }
   try {
     const result = (await b.invoke(command, args)) as T;
-    lastDiag = { ok: true };
+    noteDiag(command, { ok: true });
     return result;
   } catch (err) {
-    lastDiag = { ok: false, kind: "command-failed", command, detail: err };
+    noteDiag(command, { ok: false, kind: "command-failed", command, detail: err });
     // Routed through the diagnostic ledger (P1-3) so a failed bridge call is
     // retrievable from the UI, not just visible in logcat while it scrolls away.
     amosWarn("backend", `${command} failed`, err);

@@ -11,6 +11,7 @@
   // list is empty" are **four different sentences**.
   import {
     lastFailureReason,
+    launchCommand,
     nativeApps,
     nativeAvailability,
     nativeLaunch,
@@ -60,7 +61,7 @@
     // keeps it in the bridge ledger — show it rather than a generic error.
     launch =
       name === null
-        ? { kind: "refused", reason: lastFailureReason() }
+        ? { kind: "refused", reason: lastFailureReason(launchCommand(app.kind)) }
         : { kind: "started", name };
   };
 

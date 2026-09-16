@@ -128,7 +128,10 @@
         running = true;
         submitted = 0; // new listen session starts its own count
       } else {
-        const diag = bridgeDiag();
+        // Per-command diagnosis: the bridge's global last-outcome slot could belong to a
+        // *different* command by now, which here would decide between "offline" and
+        // "no native mic" (REQ-A296).
+        const diag = bridgeDiag("device_mic_start");
         note =
           !diag.ok && diag.kind === "not-bridged"
             ? t("ai.deviceMicOffline")

@@ -226,7 +226,7 @@
       // error surfaces as a `null` result (see `invoke`), not a thrown promise.
       const rule = await blocklistAdd(pattern, kind, channel);
       if (!rule) {
-        amosWarn("blocklist", "add rejected", bridgeDiag());
+        amosWarn("blocklist", "add rejected", bridgeDiag("blocklist_add"));
         blockErr = t("phone.blockInvalid");
         return false;
       }
@@ -240,9 +240,12 @@
   const removeBlockRule = async (id: string) => {
     blockErr = "";
     const removed = await blocklistRemove(id);
-    if (!bridgeDiag().ok) {
+    // Ask about **this** command's outcome: `bridgeDiag()` without a name is a global
+    // slot that any other command can overwrite, which here decides between "the removal
+    // failed" and "the rule was already gone" (REQ-A296).
+    if (!bridgeDiag("blocklist_remove").ok) {
       blockErr = t("phone.blockRemoveFailed");
-      amosWarn("blocklist", "remove failed", bridgeDiag());
+      amosWarn("blocklist", "remove failed", bridgeDiag("blocklist_remove"));
     } else if (!removed) {
       // Not an error: the rule was already gone (e.g. removed elsewhere).
       amosWarn("blocklist", "remove: rule not found", id);
@@ -254,10 +257,12 @@
     blockUnknown = next; // optimistic, rolled back on failure
     blockErr = "";
     await blocklistSetUnknown(next);
-    if (!bridgeDiag().ok) {
+    // Same attribution rule: an unrelated failure must not roll back a switch the host
+    // really saved, and an unrelated success must not hide this one's failure.
+    if (!bridgeDiag("blocklist_set_unknown").ok) {
       blockUnknown = !next;
       blockErr = t("phone.blockSaveFailed");
-      amosWarn("blocklist", "set_unknown failed", bridgeDiag());
+      amosWarn("blocklist", "set_unknown failed", bridgeDiag("blocklist_set_unknown"));
     }
   };
   const requestBlockRole = async () => {
@@ -267,7 +272,7 @@
       const ok = await blocklistRequestRole();
       if (!ok && bridged()) {
         blockErr = t("phone.blockRoleFailed");
-        amosWarn("blocklist", "role request failed", bridgeDiag());
+        amosWarn("blocklist", "role request failed", bridgeDiag("blocklist_request_role"));
       }
     } finally {
       blockBusy = false;

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
   lastFailureReason,
+  launchCommand,
   nativeApps,
   nativeAvailability,
   nativeLaunch,
@@ -130,15 +131,30 @@ describe("nativeApps bridge", () => {
   test("a refused launch keeps the host's own sentence", async () => {
     installBridge(() => new Error("no Linux app with id 'ghost' is installed"));
     expect(await nativeLaunch("linux", "ghost")).toBeNull();
-    expect(lastFailureReason()).toBe("no Linux app with id 'ghost' is installed");
+    expect(lastFailureReason(launchCommand("linux"))).toBe(
+      "no Linux app with id 'ghost' is installed",
+    );
   });
 
   test("a successful call clears the failure reason", async () => {
     installBridge(() => new Error("boom"));
     await nativeLaunch("wine", "x");
-    expect(lastFailureReason()).toBe("boom");
+    expect(lastFailureReason(launchCommand("wine"))).toBe("boom");
     installBridge(() => "ok");
     await nativeLaunch("wine", "x");
-    expect(lastFailureReason()).toBe("");
+    expect(lastFailureReason(launchCommand("wine"))).toBe("");
+  });
+
+  test("a failure reason belongs to its own command, not to whoever finished last (REQ-A296)", async () => {
+    // The bridge keeps one slot per command: a *different* command failing after our
+    // launch must not become this launch's reason (the old global slot did exactly that).
+    installBridge(() => new Error("boom"));
+    await nativeLaunch("wine", "x");
+    installBridge(() => new Error("unrelated command failed"));
+    await nativeApps(); // fails on wine_apps / linux_apps
+    expect(lastFailureReason(launchCommand("wine"))).toBe("boom");
+    expect(lastFailureReason("wine_apps")).toBe("unrelated command failed");
+    // A command that was never called has no recorded failure.
+    expect(lastFailureReason("never_called")).toBe("");
   });
 });
