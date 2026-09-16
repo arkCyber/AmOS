@@ -727,5 +727,15 @@
     0%, 100% { opacity: 0.55; transform: scale(1); }
     50% { opacity: 1; transform: scale(1.14); }
   }
+
+  /* WCAG 2.3.1 (AAA) / 2.3.2 (AAA) — respect prefers-reduced-motion:
+     users who need it should not see any decorative infinite animation. */
+  @media (prefers-reduced-motion: reduce) {
+    .alarm-active,
+    .alarm-ring-btn,
+    .timer-done {
+      animation: none !important;
+    }
+  }
 </style>
 

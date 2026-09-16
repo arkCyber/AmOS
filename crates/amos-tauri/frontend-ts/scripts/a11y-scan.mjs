@@ -323,6 +323,90 @@ function r5_liveRegion(file, content) {
 }
 
 /**
+ * 规则 R8 (REQ-A291): 动画敏感性(WCAG SC 2.3.1 AAA / SC 2.3.2 AAA)。
+ *
+ * WCAG 2.1:
+ *  - 2.3.1 (AAA): 动画可以安全地 turn off (≤ 3 flashes/sec 豁免)
+ *  - 2.3.2 (AAA): 避免 ≥ 3 flashes/sec (光敏性癫痫)
+ *
+ * 我们的扫描策略(启发式):
+ *  1. `index.css` 的全局 `@media (prefers-reduced-motion: reduce)` — 这是 source of truth，
+ *     在根级别 kill 所有 *{} animation/transition。已有，不重复报告。
+ *  2. Svelte scoped `<style>` 里的 `@keyframes` + `animation:` — 这些在 scoped class 下运行，
+ *     可能绕过全局 reset。
+ *  3. `animate-*` Tailwind 类(animate-pulse, animate-spin 等) — `index.css` 已 kill，
+ *     但如果该文件从未 import index.css (应该所有页面都 import)，则 report。
+ *  4. JS 驱动的 `requestAnimationFrame` / `setInterval` — 仅当 interval < 300ms 才可能
+ *     是装饰动画，功能性轮询(polling)豁免。
+ *
+ * 本规则只报告：Svelte scoped `@keyframes` + `animation:` infinite 且 duration > 0.5s。
+ * one-shot 或 duration ≤ 0.5s 的入场动画豁免(WCAG 2.3.1 注释: 重复少于 3 次)。
+ */
+function r8_motion(file, content) {
+  // Check 1: does the file import index.css (or a global CSS that provides the reset)?
+  // We can't reliably track imports in a static scan. Instead, check if scoped @keyframes
+  // use 'infinite' + duration > 0.5s. The index.css reset covers everything else.
+  const suspects = [];
+
+  // Match scoped style blocks: <style>...</style> inside Svelte
+  const styleRe = /<style\b[^>]*>([\s\S]*?)<\/style>/g;
+  let m;
+  while ((m = styleRe.exec(content)) !== null) {
+    const block = m[1];
+
+    // Skip blocks that already contain the prefers-reduced-motion override
+    if (/@media\s*\(prefers-reduced-motion:\s*reduce\)/.test(block)) continue;
+
+    // Find all @keyframes definitions — closing `}` may be at end-of-line or followed by whitespace
+    const keyframeRe = /@keyframes\s+(\w+)[\s\S]*?\{([\s\S]*?)\s*\}/g;
+    let km;
+    while ((km = keyframeRe.exec(block)) !== null) {
+      const name = km[1];
+      const body = km[2];
+
+      // Find animation usage referencing this keyframe
+      // Escape any - or _ in the name for safe regex
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const usageRe = new RegExp(
+        `animation:\\s*([^;}\\n]+?)\\b${escaped}\\b([^;}\\n]*)`,
+        "gi"
+      );
+      let um;
+      while ((um = usageRe.exec(block)) !== null) {
+        const animVal = ((um[1] || "") + (um[2] || "")).trim();
+        const isInfinite = /\binfinite\b/i.test(animVal);
+        if (!isInfinite) continue;
+
+        // Extract duration (e.g. "1s", "0.7s", "1200ms")
+        const durMatch = animVal.match(/(\d+(?:\.\d+)?)\s*(m?s)/i);
+        if (durMatch) {
+          const num = parseFloat(durMatch[1]);
+          const ms = durMatch[2].toLowerCase() === "s" ? num * 1000 : num;
+          if (ms <= 500) continue; // Short animation — WCAG 2.3.1 safe
+        }
+
+        suspects.push({
+          name,
+          animVal: animVal.slice(0, 80),
+          block: block.slice(Math.max(0, um.index - 20), um.index + 50).trim().slice(0, 60),
+        });
+      }
+    }
+  }
+
+  if (suspects.length === 0) return null;
+  const list = suspects
+    .slice(0, 3)
+    .map((s) => `${s.name} [${s.animVal}]`)
+    .join("; ");
+  return {
+    rule: `motion: scoped @keyframes uses infinite animation — add @media (prefers-reduced-motion: reduce) { .class { animation: none } } to disable`,
+    fix: "Wrap the animation class in a scoped @media (prefers-reduced-motion: reduce) { ... } block inside <style>, or remove the 'infinite' keyword if the animation is not essential",
+    evidence: list,
+  };
+}
+
+/**
  * 规则 R7 (REQ-A290): 触摸目标尺寸(WCAG SC 2.5.5 AAA / SC 2.5.8 AA)。
  *
  * 阈值:
@@ -726,6 +810,7 @@ function scan(file) {
     r5_liveRegion,
     r6_contrast,
     r7_targetSize,
+    r8_motion,
   ];
   for (const r of rules) {
     const f = r(file, content);
@@ -911,7 +996,51 @@ function selftest() {
     console.error("  findings:", JSON.stringify(f9b, null, 2));
     process.exit(1);
   }
-  console.log("[a11y-scan] selftest: 12 assertion(s), 0 failure(s).");
+  // sample 10 (REQ-A291): R8 motion.
+  //   bad10: infinite animation in scoped style without @media override → must flag.
+  //   good10: same animation but inside a @media (prefers-reduced-motion: reduce) block → silent.
+  //   good10c: one-shot animation (no infinite) → silent.
+  const bad10 = `<style>
+    .pulse { animation: myPulse 0.7s ease-in-out infinite; }
+    @keyframes myPulse { from { opacity: 0 } to { opacity: 1 } }
+  </style>`;
+  const tmp10 = path.join("/tmp", `a11y-scan-selftest-10-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp10, bad10);
+  const f10 = scan(tmp10);
+  fs.unlinkSync(tmp10);
+  if (!f10.some(x => x.rule.includes("motion"))) {
+    console.error("[a11y-scan selftest] FAIL: scoped infinite animation should be flagged");
+    console.error("  findings:", JSON.stringify(f10, null, 2));
+    process.exit(1);
+  }
+  const good10 = `<style>
+    .pulse { animation: myPulse 0.7s ease-in-out infinite; }
+    @keyframes myPulse { from { opacity: 0 } to { opacity: 1 } }
+    @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+  </style>`;
+  const tmp10a = path.join("/tmp", `a11y-scan-selftest-10a-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp10a, good10);
+  const f10a = scan(tmp10a);
+  fs.unlinkSync(tmp10a);
+  if (f10a.some(x => x.rule.includes("motion"))) {
+    console.error("[a11y-scan selftest] FAIL: animation with @media override should NOT be flagged");
+    console.error("  findings:", JSON.stringify(f10a, null, 2));
+    process.exit(1);
+  }
+  const good10c = `<style>
+    .fade-in { animation: fadeUp 0.2s ease-out both; }
+    @keyframes fadeUp { from { opacity: 0 } to { opacity: 1 } }
+  </style>`;
+  const tmp10c = path.join("/tmp", `a11y-scan-selftest-10c-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp10c, good10c);
+  const f10c = scan(tmp10c);
+  fs.unlinkSync(tmp10c);
+  if (f10c.some(x => x.rule.includes("motion"))) {
+    console.error("[a11y-scan selftest] FAIL: one-shot (non-infinite) animation should be silent");
+    console.error("  findings:", JSON.stringify(f10c, null, 2));
+    process.exit(1);
+  }
+  console.log("[a11y-scan] selftest: 15 assertion(s), 0 failure(s).");
 }
 
 // ─── 入口 ────────────────────────────────────────────────────────────────────
