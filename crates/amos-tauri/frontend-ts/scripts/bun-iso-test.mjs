@@ -21,9 +21,14 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const testsDir = join(root, "src", "__tests__");
+// Scan src/__tests__/ AND src/lib/__tests__/ (the lib/ folder has unit tests for
+// pure modules with DOM-touching helpers — focusTrap, desktopView, etc.). The
+// `src/lib/__tests__` is the conventional location for unit tests next to the
+// modules they cover; otherwise those files would silently never run.
+const testRoots = [join(root, "src", "__tests__"), join(root, "src", "lib", "__tests__")];
 
 function collectTests(dir, acc = []) {
+  if (!existsSync(dir)) return acc;
   for (const ent of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, ent.name);
     if (ent.isDirectory()) collectTests(p, acc);
@@ -45,7 +50,7 @@ function rel(p) {
   return "./" + p.slice(root.length + 1);
 }
 
-const all = collectTests(testsDir).sort();
+const all = testRoots.flatMap((d) => collectTests(d)).sort();
 const pure = all.filter((f) => !isDom(f));
 const dom = all.filter(isDom);
 

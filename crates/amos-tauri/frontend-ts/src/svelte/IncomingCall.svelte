@@ -24,6 +24,7 @@
   } from "../lib/calllog";
   import { CONTACTS_KEY, contactNameFor, normalizeContacts, type Contact } from "../lib/contacts";
   import { callerDisplayLabel, hasPeerNumber } from "../lib/callDisplay";
+  import { attachFocusTrap } from "../lib/focusTrap";
 
   let call = $state<TelephonyCall | null>(null);
   let phase = $state<"ringing" | "talking">("ringing");
@@ -105,6 +106,15 @@
     playIncomingRing();
     return () => stopCallTone();
   });
+
+  // WCAG 2.1.2: keyboard focus trap while the call surface is on screen.
+  // Tab cycles between answer / decline / mute / record / hangup.
+  // Escape is intentionally not bound (a misclick on Esc must not hang up).
+  let rootEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!call || !rootEl) return;
+    return attachFocusTrap(rootEl);
+  });
 </script>
 
 {#if call}
@@ -112,6 +122,7 @@
   {@const label = callerDisplayLabel(call.peer, name, t("phone.unknown"))}
   {@const ringing = phase === "ringing"}
   <div
+    bind:this={rootEl}
     role="dialog"
     aria-label={ringing ? t("phone.incoming") : t("phone.talking")}
     class="pointer-events-auto absolute inset-0 z-[90] flex flex-col items-center overflow-hidden bg-neutral-950 text-white"

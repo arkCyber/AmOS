@@ -11,6 +11,7 @@
   import { appIcon, appTitleKey } from "../lib/appMeta";
   import { shouldShowMissionControl } from "../lib/desktopLayout";
   import { t } from "./locale.svelte";
+  import { attachFocusTrap } from "../lib/focusTrap";
 
   // 关闭由壳决定（浮层从注册表渲染，壳传 `onclose`）——见 Launchpad.svelte 的同一处说明。
   let { onclose }: { onclose?: () => void } = $props();
@@ -59,6 +60,7 @@
   }
 
   // ─── 键盘处理 ───────────────────────────────────────────────────────────
+  let rootEl: HTMLDivElement | undefined = $state();
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") onclose?.();
   }
@@ -66,6 +68,12 @@
   onMount(() => {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  // WCAG 2.1.2: keyboard focus trap while the panel is visible.
+  $effect(() => {
+    if (!rootEl) return;
+    return attachFocusTrap(rootEl, () => onclose?.());
   });
 </script>
 
@@ -80,6 +88,7 @@
 -->
 {#if shouldShowMissionControl(windows.length)}
 <div
+  bind:this={rootEl}
   class="pointer-events-none fixed inset-x-0 bottom-0 z-[100] flex flex-col items-center gap-4 overflow-hidden p-6"
   role="dialog"
   aria-modal="true"

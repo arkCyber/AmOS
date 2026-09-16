@@ -13,6 +13,7 @@
   import { iconSvg, batterySvg } from "../lib/sysIcons";
   import { batteryTone } from "../lib/batteryStatus";
   import { systemStatusWithHostBattery } from "../lib/system";
+  import { attachFocusTrap } from "../lib/focusTrap";
 
   const bus = propsChannel<{ ready?: boolean }>("lock");
 
@@ -47,6 +48,14 @@
   let bad = $state(false);
   let emergency = $state(false);
   let dialFailed = $state(false);
+
+  // Keyboard focus trap (WCAG 2.1.2): Tab cycles inside the lock screen only.
+  // Escape is not handled here (a locked device must not escape without auth).
+  let rootEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!rootEl) return;
+    return attachFocusTrap(rootEl);
+  });
 
   let now = $state(new Date());
   $effect(() => {
@@ -112,6 +121,7 @@
 </script>
 
 <div
+  bind:this={rootEl}
   role="dialog"
   aria-modal="true"
   aria-label={t("shell.lockTitle")}
