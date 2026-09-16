@@ -29,6 +29,27 @@ use amos_sms::{
 use serde::Serialize;
 use tauri::State;
 
+use crate::error::{AmosError, ErrorCode};
+
+/// Wire vocabulary for the SMS module. The UI i18n layer branches on these;
+/// renaming a variant is a wire break. Kept alongside the constants so the
+/// code names match the typed envelopes below without grepping.
+pub mod codes {
+    /// Caller passed a blank `thread_id` / `message_id` / `address` to an SMS command.
+    pub const BLANK_ID: &str = "amos.sms.blank_id";
+    /// Caller passed a thread / message / address id that is over [`super::MAX_SMS_ID_BYTES`].
+    pub const ID_TOO_LONG: &str = "amos.sms.id_too_long";
+    /// Caller passed an unknown folder name (`inbox` | `sent` | `draft` only).
+    pub const UNKNOWN_FOLDER: &str = "amos.sms.unknown_folder";
+    /// Caller asked for messages from a sender the blocklist has blocked for SMS.
+    pub const BLOCKED_SENDER: &str = "amos.sms.blocked_sender";
+    /// The `sms_send` text body exceeds [`super::MAX_SMS_TEXT_BYTES`].
+    pub const TEXT_TOO_LONG: &str = "amos.sms.text_too_long";
+    /// SMS provider rejected the read / send (SmsError kind); the user-visible
+    /// reason lives in `message` and the SmsError kind in `cause[0]`.
+    pub const PROVIDER_REJECTED: &str = "amos.sms.provider_rejected";
+}
+
 /// Hard cap on one provider call. The blocking task itself cannot be cancelled,
 /// but the caller is released with an honest timeout error instead of hanging.
 const SMS_TIMEOUT: Duration = Duration::from_secs(8);
@@ -207,9 +228,13 @@ fn mask_address(address: &str) -> String {
 
 /// Validate a send before dispatch (fast, no I/O); returns the normalized
 /// address and segment count for the audit trail.
-fn checked_send(address: &str, text: &str) -> Result<(String, usize), String> {
-    let addr = normalize_address(address).map_err(|e| e.to_string())?;
-    validate_text(text).map_err(|e| e.to_string())?;
+fn checked_send(address: &str, text: &str) -> Result<(String, usize), AmosError> {
+    let addr = normalize_address(address).map_err(|e| {
+        AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e)
+    })?;
+    validate_text(text).map_err(|e| {
+        AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e)
+    })?;
     Ok((addr, segment_count(text)))
 }
 
@@ -217,14 +242,20 @@ fn checked_send(address: &str, text: &str) -> Result<(String, usize), String> {
 /// paste-sized caller cannot inflate the SMS provider's lookup keys (the keys
 /// are reused on every list / read command — a 1 MiB id would slow every
 /// subsequent operation).
-fn check_sms_id(s: &str) -> Result<(), String> {
+fn check_sms_id(s: &str) -> Result<(), AmosError> {
     if s.is_empty() {
-        return Err("sms id is empty".to_string());
+        return Err(AmosError::new(
+            ErrorCode::SmsBlankId,
+            "sms id is empty",
+        ));
     }
     if s.len() > MAX_SMS_ID_BYTES {
-        return Err(format!(
-            "sms id too long: {} bytes (max {MAX_SMS_ID_BYTES})",
-            s.len()
+        return Err(AmosError::new(
+            ErrorCode::SmsIdTooLong,
+            format!(
+                "sms id too long: {} bytes (max {MAX_SMS_ID_BYTES})",
+                s.len()
+            ),
         ));
     }
     Ok(())
@@ -713,15 +744,20 @@ pub async fn sms_trash_add(
     message_id: String,
     folder: Option<String>,
     trashed_ms: Option<i64>,
-) -> Result<TrashAddOut, String> {
+) -> Result<TrashAddOut, AmosError> {
     if thread_id.trim().is_empty() || message_id.trim().is_empty() {
-        return Err("invalid SMS payload: blank thread/message id".to_string());
+        return Err(AmosError::new(
+            ErrorCode::SmsBlankId,
+            "invalid SMS payload: blank thread/message id",
+        ));
     }
     check_sms_id(&thread_id)?;
     check_sms_id(&message_id)?;
     let folder = match folder.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(name) => Some(amos_sms::SmsFolder::from_wire(name).map_err(|e| e.to_string())?),
+        Some(name) => Some(amos_sms::SmsFolder::from_wire(name).map_err(|e| {
+            AmosError::with_cause(ErrorCode::SmsUnknownFolder, codes::UNKNOWN_FOLDER, e)
+        })?),
     };
     let provider = active_arc(&state);
     let trash = trash_shared();
@@ -739,7 +775,7 @@ pub async fn sms_trash_add(
         )))
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))
 }
 
 /// The trash list, newest first (ids + times only — no content).
@@ -783,12 +819,14 @@ pub fn sms_trash_purge() -> usize {
 pub async fn sms_snapshot(
     state: State<'_, SmsBridge>,
     folder: String,
-) -> Result<Vec<SmsThreadOut>, String> {
-    let folder = amos_sms::SmsFolder::from_wire(&folder).map_err(|e| e.to_string())?;
+) -> Result<Vec<SmsThreadOut>, AmosError> {
+    let folder = amos_sms::SmsFolder::from_wire(&folder).map_err(|e| {
+        AmosError::with_cause(ErrorCode::SmsUnknownFolder, codes::UNKNOWN_FOLDER, e)
+    })?;
     let provider = active_arc(&state);
     let threads = blocking(move || provider.snapshot(folder))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))?;
     let (kept, hidden) = crate::blocklist::filter_threads(threads, &crate::blocklist::shared());
     if hidden > 0 {
         tracing::info!(target: "amos::sms", hidden, "blocked senders filtered from the list");
@@ -830,7 +868,7 @@ pub async fn sms_snapshot(
 /// high). When nothing can be hidden the provider's cheap `counts()` is
 /// authoritative and no extra read happens.
 #[tauri::command]
-pub async fn sms_counts(state: State<'_, SmsBridge>) -> Result<SmsFolderCountsOut, String> {
+pub async fn sms_counts(state: State<'_, SmsBridge>) -> Result<SmsFolderCountsOut, AmosError> {
     let provider = active_arc(&state);
     let rules = crate::blocklist::shared();
     let trash = trash_shared();
@@ -847,7 +885,7 @@ pub async fn sms_counts(state: State<'_, SmsBridge>) -> Result<SmsFolderCountsOu
     })
     .await
     .map(|c| SmsFolderCountsOut::from(&c))
-    .map_err(|e| e.to_string())
+    .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))
 }
 
 /// Per-folder thread counts with blocked senders *and* trashed-hidden threads
@@ -887,25 +925,33 @@ pub async fn sms_messages(
     thread_id: String,
     folder: Option<String>,
     address: Option<String>,
-) -> Result<Vec<SmsMessageOut>, String> {
+) -> Result<Vec<SmsMessageOut>, AmosError> {
     if thread_id.trim().is_empty() {
-        return Err("invalid SMS payload: blank thread id".to_string());
+        return Err(AmosError::new(
+            ErrorCode::SmsBlankId,
+            "invalid SMS payload: blank thread id",
+        ));
     }
     check_sms_id(&thread_id)?;
     if let Some(addr) = address.as_deref().filter(|a| !a.trim().is_empty()) {
         check_sms_id(addr)?;
         if let Some(reason) = crate::blocklist::shared().check(addr, amos_blocklist::Channel::Sms) {
-            return Err(format!("blocked by rule: {reason:?}"));
+            return Err(AmosError::new(
+                ErrorCode::SmsBlockedSender,
+                format!("blocked by rule: {reason:?}"),
+            ));
         }
     }
     let folder = match folder.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(name) => Some(amos_sms::SmsFolder::from_wire(name).map_err(|e| e.to_string())?),
+        Some(name) => Some(amos_sms::SmsFolder::from_wire(name).map_err(|e| {
+            AmosError::with_cause(ErrorCode::SmsUnknownFolder, codes::UNKNOWN_FOLDER, e)
+        })?),
     };
     let provider = active_arc(&state);
     let msgs = blocking(move || provider.messages(&thread_id, folder))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))?;
     // REQ-A42: trashed messages are hidden from the thread read (ids only —
     // the platform store keeps them; restoring brings them back).
     let (visible, trashed) = {
@@ -942,15 +988,18 @@ pub async fn sms_send(
     state: State<'_, SmsBridge>,
     address: String,
     text: String,
-) -> Result<String, String> {
+) -> Result<String, AmosError> {
     check_sms_id(&address)?;
     // Defence-in-depth upper bound — `validate_text` will reject with a
     // user-facing reason, but a megabyte-sized body still costs a JSON round
     // trip per call before the engine sees it.
     if text.len() > MAX_SMS_TEXT_BYTES {
-        return Err(format!(
-            "sms_send text too long: {} bytes (max {MAX_SMS_TEXT_BYTES})",
-            text.len()
+        return Err(AmosError::new(
+            ErrorCode::SmsTextTooLong,
+            format!(
+                "sms_send text too long: {} bytes (max {MAX_SMS_TEXT_BYTES})",
+                text.len()
+            ),
         ));
     }
     let (addr, segments) = checked_send(&address, &text)?;
@@ -974,7 +1023,11 @@ pub async fn sms_send(
                 kind = e.kind(),
                 "SMS send failed"
             );
-            Err(e.to_string())
+            Err(AmosError::with_cause(
+                ErrorCode::SmsProviderRejected,
+                codes::PROVIDER_REJECTED,
+                e,
+            ))
         }
     }
 }
@@ -1719,5 +1772,54 @@ mod tests {
         // A real-looking thread id fits comfortably.
         assert!(check_sms_id("thread_42").is_ok());
         assert!(check_sms_id("+8613800138000").is_ok());
+    }
+
+    /// The sms commands now return `AmosError`; the wire vocabulary (codes
+    /// module + enum side) must stay in lock-step, and the helper's two
+    /// failure modes (blank / oversized) must produce **distinct** stable
+    /// codes — a UI rendering "address is empty" must not be confused with
+    /// "address is too long", so the two need their own branches.
+    #[test]
+    fn sms_error_codes_are_distinct_stability_keys() {
+        use crate::error::{AmosError, ErrorCode};
+        // Wire strings — UI i18n branches on these literals.
+        assert_eq!(codes::BLANK_ID, "amos.sms.blank_id");
+        assert_eq!(codes::ID_TOO_LONG, "amos.sms.id_too_long");
+        assert_eq!(codes::UNKNOWN_FOLDER, "amos.sms.unknown_folder");
+        assert_eq!(codes::BLOCKED_SENDER, "amos.sms.blocked_sender");
+        assert_eq!(codes::TEXT_TOO_LONG, "amos.sms.text_too_long");
+        assert_eq!(codes::PROVIDER_REJECTED, "amos.sms.provider_rejected");
+
+        // Enum side keeps the same strings — drift would be a wire break.
+        assert_eq!(ErrorCode::SmsBlankId.as_str(), codes::BLANK_ID);
+        assert_eq!(ErrorCode::SmsIdTooLong.as_str(), codes::ID_TOO_LONG);
+
+        // Each variant groups under "sms" — a single tracing filter scopes the
+        // whole surface.
+        assert_eq!(ErrorCode::SmsProviderRejected.group(), "sms");
+        assert_eq!(ErrorCode::SmsTextTooLong.group(), "sms");
+
+        // The two failure modes of `check_sms_id` are distinct codes — a UI
+        // rendering one must not be confused with the other.
+        let empty = check_sms_id("").expect_err("empty is refused");
+        let huge = "x".repeat(MAX_SMS_ID_BYTES + 1);
+        let oversized = check_sms_id(&huge).expect_err("oversized is refused");
+        assert_eq!(empty.code, ErrorCode::SmsBlankId);
+        assert_eq!(oversized.code, ErrorCode::SmsIdTooLong);
+        assert_ne!(
+            empty.code, oversized.code,
+            "blank and oversized ids ride distinct codes"
+        );
+
+        // The envelope serialises both fields and the cause chain so a watcher
+        // can read which provider rejected the read without grepping the source.
+        let e = AmosError::with_cause(
+            ErrorCode::SmsProviderRejected,
+            codes::PROVIDER_REJECTED,
+            "permission denied",
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "amos.sms.provider_rejected");
+        assert_eq!(v["cause"][0], "permission denied");
     }
 }

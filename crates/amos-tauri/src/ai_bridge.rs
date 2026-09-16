@@ -22,6 +22,26 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::error::{AmosError, ErrorCode};
+
+/// Wire vocabulary for the AI bridge module. The UI i18n layer branches on
+/// these; renaming a variant is a wire break. Kept alongside the constants
+/// so the code names match the typed envelopes below without grepping.
+pub mod codes {
+    /// Caller passed a `prompt` / `context` string over [`super::MAX_AI_PROMPT_BYTES`].
+    pub const PROMPT_TOO_LONG: &str = "amos.ai.prompt_too_long";
+    /// Caller passed a `session_id` over [`super::MAX_SESSION_ID_BYTES`].
+    pub const SESSION_ID_TOO_LONG: &str = "amos.ai.session_id_too_long";
+    /// Caller passed an `api_key` / `model` / `endpoint` string over its byte cap.
+    pub const BACKEND_PAYLOAD_TOO_LONG: &str = "amos.ai.backend_payload_too_long";
+    /// Caller passed an Android `package_name` that is empty or over the cap.
+    pub const ANDROID_PACKAGE_INVALID: &str = "amos.ai.android_package_invalid";
+    /// Any AI / Android-manager RPC failed (daemon unreachable / rejected).
+    pub const RPC_FAILED: &str = "amos.ai.rpc_failed";
+    /// `ai_backend_switch` could not invoke / complete the `ai-backend.sh` script.
+    pub const BACKEND_SWITCH_FAILED: &str = "amos.ai.backend_switch_failed";
+}
+
 /// Maximum bytes in one `ask_ai_agent` / `chat_agent` prompt string.
 ///
 /// A reasonable AI prompt for a mobile assistant is 1–4 KiB (describing context,
@@ -136,7 +156,7 @@ pub struct ReplyEvent {
 pub async fn ask_daemon(
     bridge: &AiBridge,
     request: AgentRequest,
-) -> Result<Vec<ReplyEvent>, String> {
+) -> Result<Vec<ReplyEvent>, AmosError> {
     // Establish the stream with a single reconnect retry on failure.
     let mut attempt = 0;
     let mut stream = loop {
@@ -147,7 +167,11 @@ pub async fn ask_daemon(
                 attempt += 1;
                 bridge.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("ai stream_chat failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -274,35 +298,47 @@ pub async fn ai_backend_switch(
     api_key: String,
     model: Option<String>,
     endpoint: Option<String>,
-) -> Result<String, String> {
+) -> Result<String, AmosError> {
     // Bound the inputs at the seam: a paste-sized `api_key` would be persisted
     // to the credentials file and broadcast on the live switcher, and an
     // unbounded `model` / `endpoint` would inflate the daemon's env.
     if provider.is_empty() || provider.len() > MAX_AI_BACKEND_ID_BYTES {
-        return Err(format!(
-            "ai backend provider invalid: {} bytes (max {MAX_AI_BACKEND_ID_BYTES})",
-            provider.len()
+        return Err(AmosError::new(
+            ErrorCode::AiBackendPayloadTooLong,
+            format!(
+                "ai backend provider invalid: {} bytes (max {MAX_AI_BACKEND_ID_BYTES})",
+                provider.len()
+            ),
         ));
     }
     if api_key.len() > MAX_AI_API_KEY_BYTES {
-        return Err(format!(
-            "ai api_key too long: {} bytes (max {MAX_AI_API_KEY_BYTES})",
-            api_key.len()
+        return Err(AmosError::new(
+            ErrorCode::AiBackendPayloadTooLong,
+            format!(
+                "ai api_key too long: {} bytes (max {MAX_AI_API_KEY_BYTES})",
+                api_key.len()
+            ),
         ));
     }
     if let Some(m) = model.as_deref() {
         if m.len() > MAX_AI_MODEL_BYTES {
-            return Err(format!(
-                "ai model too long: {} bytes (max {MAX_AI_MODEL_BYTES})",
-                m.len()
+            return Err(AmosError::new(
+                ErrorCode::AiBackendPayloadTooLong,
+                format!(
+                    "ai model too long: {} bytes (max {MAX_AI_MODEL_BYTES})",
+                    m.len()
+                ),
             ));
         }
     }
     if let Some(e) = endpoint.as_deref() {
         if e.len() > MAX_AI_ENDPOINT_BYTES {
-            return Err(format!(
-                "ai endpoint too long: {} bytes (max {MAX_AI_ENDPOINT_BYTES})",
-                e.len()
+            return Err(AmosError::new(
+                ErrorCode::AiBackendPayloadTooLong,
+                format!(
+                    "ai endpoint too long: {} bytes (max {MAX_AI_ENDPOINT_BYTES})",
+                    e.len()
+                ),
             ));
         }
     }
@@ -374,7 +410,24 @@ pub async fn ai_backend_switch(
         }
     })
     .await
-    .map_err(|e| format!("switch task join error: {e}"))?
+    .map_err(|e| {
+        AmosError::with_cause(
+            ErrorCode::AiBackendSwitchFailed,
+            codes::BACKEND_SWITCH_FAILED,
+            format!("switch task join error: {e}"),
+        )
+    })?
+    // `ai-backend.sh` returned a non-zero exit / an error from spawning — keep
+    // the script's exact report in `cause[0]` and the user-visible summary in
+    // `message`. The script's report is **the** fact the UI needs to show, so
+    // it rides verbatim (no synthesis).
+    .map_err(|e| {
+        AmosError::new(
+            ErrorCode::AiBackendSwitchFailed,
+            "ai-backend.sh failed (see cause)".to_string(),
+        )
+        .push_cause(e)
+    })
 }
 
 impl Default for AiBridge {
@@ -392,7 +445,7 @@ impl AiBridge {
     }
 
     /// Return the cached gRPC channel (shared by the AI and Android clients).
-    async fn connect_channel(&self) -> Result<crate::daemon::DaemonChannel, String> {
+    async fn connect_channel(&self) -> Result<crate::daemon::DaemonChannel, AmosError> {
         if let Some(c) = self
             .channel
             .lock()
@@ -411,14 +464,14 @@ impl AiBridge {
     /// Return an AI agent client, reusing the cached channel when healthy.
     pub(crate) async fn connect(
         &self,
-    ) -> Result<AiAgentClient<crate::daemon::DaemonChannel>, String> {
+    ) -> Result<AiAgentClient<crate::daemon::DaemonChannel>, AmosError> {
         Ok(AiAgentClient::new(self.connect_channel().await?))
     }
 
     /// Return an Android-manager client over the same shared channel.
     async fn connect_android(
         &self,
-    ) -> Result<AndroidManagerClient<crate::daemon::DaemonChannel>, String> {
+    ) -> Result<AndroidManagerClient<crate::daemon::DaemonChannel>, AmosError> {
         Ok(AndroidManagerClient::new(self.connect_channel().await?))
     }
 
@@ -430,9 +483,14 @@ impl AiBridge {
     }
 }
 
-/// Open a gRPC channel routed over the amos Unix Domain Socket.
-async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
-    crate::daemon::channel().await
+/// Open a gRPC channel routed over the amos Unix Domain Socket. The internal
+/// error string (a "daemon not connected" sentinel from `daemon::channel`) is
+/// promoted to a typed [`AmosError`] under [`ErrorCode::AiRpcFailed`] so it
+/// rides the same envelope every AI / Android command now returns.
+async fn build_channel() -> Result<crate::daemon::DaemonChannel, AmosError> {
+    crate::daemon::channel().await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::AiRpcFailed, codes::RPC_FAILED, e)
+    })
 }
 
 /// Serializable snapshot of the daemon status (prost types don't impl serde).
@@ -568,7 +626,10 @@ pub struct SessionHistory {
 }
 
 /// Fetch one session's completed conversation history (headless).
-pub async fn get_session_history(bridge: &AiBridge, id: &str) -> Result<SessionHistory, String> {
+pub async fn get_session_history(
+    bridge: &AiBridge,
+    id: &str,
+) -> Result<SessionHistory, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = bridge.connect().await?;
@@ -599,7 +660,11 @@ pub async fn get_session_history(bridge: &AiBridge, id: &str) -> Result<SessionH
                 attempt += 1;
                 bridge.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("ai get_history failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -609,7 +674,7 @@ pub async fn get_session_history(bridge: &AiBridge, id: &str) -> Result<SessionH
 
 /// List the daemon's tracked sessions (most recently active first), headless so
 /// it can be unit/e2e tested like `fetch_status`.
-pub async fn list_sessions(bridge: &AiBridge) -> Result<Vec<SessionInfo>, String> {
+pub async fn list_sessions(bridge: &AiBridge) -> Result<Vec<SessionInfo>, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = bridge.connect().await?;
@@ -635,7 +700,11 @@ pub async fn list_sessions(bridge: &AiBridge) -> Result<Vec<SessionInfo>, String
                 attempt += 1;
                 bridge.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("ai list_sessions failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -644,7 +713,7 @@ pub async fn list_sessions(bridge: &AiBridge) -> Result<Vec<SessionInfo>, String
 }
 
 /// Probe the daemon, retrying once after reconnecting (in case it restarted).
-pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, String> {
+pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = bridge.connect().await?;
@@ -720,7 +789,11 @@ pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, String> {
                 attempt += 1;
                 bridge.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("ai get_status failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -763,21 +836,27 @@ pub async fn ask_ai_agent(
     prompt: String,
     session_id: Option<String>,
     target_window: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), AmosError> {
     let sid = session_id.unwrap_or_else(|| "default".to_string());
 
     // Bound the prompt at the command seam so a misbehaving / malicious caller
     // cannot flood the daemon with a multi-megabyte prompt injection or a loop.
     if prompt.len() > MAX_AI_PROMPT_BYTES {
-        return Err(format!(
-            "prompt too long: {} bytes (max {MAX_AI_PROMPT_BYTES})",
-            prompt.len()
+        return Err(AmosError::new(
+            ErrorCode::AiPromptTooLong,
+            format!(
+                "prompt too long: {} bytes (max {MAX_AI_PROMPT_BYTES})",
+                prompt.len()
+            ),
         ));
     }
     if sid.len() > MAX_SESSION_ID_BYTES {
-        return Err(format!(
-            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
-            sid.len()
+        return Err(AmosError::new(
+            ErrorCode::AiSessionIdTooLong,
+            format!(
+                "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+                sid.len()
+            ),
         ));
     }
 
@@ -822,12 +901,12 @@ pub async fn ask_ai_agent(
 
 /// Tauri command: return a serializable daemon status snapshot.
 #[tauri::command]
-pub async fn get_status(state: State<'_, AiBridge>) -> Result<DaemonStatus, String> {
+pub async fn get_status(state: State<'_, AiBridge>) -> Result<DaemonStatus, AmosError> {
     fetch_status(&state).await
 }
 
 /// Remove every tracked daemon session; returns how many were cleared.
-pub async fn clear_sessions(bridge: &AiBridge) -> Result<u32, String> {
+pub async fn clear_sessions(bridge: &AiBridge) -> Result<u32, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = bridge.connect().await?;
@@ -840,7 +919,11 @@ pub async fn clear_sessions(bridge: &AiBridge) -> Result<u32, String> {
                 attempt += 1;
                 bridge.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("ai clear_sessions failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -850,12 +933,12 @@ pub async fn clear_sessions(bridge: &AiBridge) -> Result<u32, String> {
 
 /// Tauri command: return the daemon's tracked sessions (for a session manager UI).
 #[tauri::command]
-pub async fn get_ai_sessions(state: State<'_, AiBridge>) -> Result<Vec<SessionInfo>, String> {
+pub async fn get_ai_sessions(state: State<'_, AiBridge>) -> Result<Vec<SessionInfo>, AmosError> {
     list_sessions(&state).await
 }
 
 /// Remove a single tracked daemon session by id.
-async fn remove_session(bridge: &AiBridge, id: &str) -> Result<bool, String> {
+async fn remove_session(bridge: &AiBridge, id: &str) -> Result<bool, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = bridge.connect().await?;
@@ -870,7 +953,11 @@ async fn remove_session(bridge: &AiBridge, id: &str) -> Result<bool, String> {
                 attempt += 1;
                 bridge.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("ai remove_session failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -883,11 +970,14 @@ async fn remove_session(bridge: &AiBridge, id: &str) -> Result<bool, String> {
 pub async fn remove_ai_session(
     state: State<'_, AiBridge>,
     session_id: String,
-) -> Result<bool, String> {
+) -> Result<bool, AmosError> {
     if session_id.len() > MAX_SESSION_ID_BYTES {
-        return Err(format!(
-            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
-            session_id.len()
+        return Err(AmosError::new(
+            ErrorCode::AiSessionIdTooLong,
+            format!(
+                "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+                session_id.len()
+            ),
         ));
     }
     remove_session(&state, &session_id).await
@@ -898,11 +988,14 @@ pub async fn remove_ai_session(
 pub async fn get_ai_session_history(
     state: State<'_, AiBridge>,
     session_id: String,
-) -> Result<SessionHistory, String> {
+) -> Result<SessionHistory, AmosError> {
     if session_id.len() > MAX_SESSION_ID_BYTES {
-        return Err(format!(
-            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
-            session_id.len()
+        return Err(AmosError::new(
+            ErrorCode::AiSessionIdTooLong,
+            format!(
+                "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+                session_id.len()
+            ),
         ));
     }
     get_session_history(&state, &session_id).await
@@ -910,7 +1003,7 @@ pub async fn get_ai_session_history(
 
 /// Tauri command: clear all tracked daemon sessions.
 #[tauri::command]
-pub async fn clear_ai_sessions(state: State<'_, AiBridge>) -> Result<u32, String> {
+pub async fn clear_ai_sessions(state: State<'_, AiBridge>) -> Result<u32, AmosError> {
     clear_sessions(&state).await
 }
 
@@ -931,21 +1024,27 @@ pub async fn chat_agent(
     prompt: String,
     session_id: Option<String>,
     target_window: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), AmosError> {
     let sid = session_id.unwrap_or_else(|| "default".to_string());
     let target = target_window.unwrap_or_else(|| "ai".to_string());
 
     // Bound the prompt at the command seam (same rationale as `ask_ai_agent`).
     if prompt.len() > MAX_AI_PROMPT_BYTES {
-        return Err(format!(
-            "prompt too long: {} bytes (max {MAX_AI_PROMPT_BYTES})",
-            prompt.len()
+        return Err(AmosError::new(
+            ErrorCode::AiPromptTooLong,
+            format!(
+                "prompt too long: {} bytes (max {MAX_AI_PROMPT_BYTES})",
+                prompt.len()
+            ),
         ));
     }
     if sid.len() > MAX_SESSION_ID_BYTES {
-        return Err(format!(
-            "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
-            sid.len()
+        return Err(AmosError::new(
+            ErrorCode::AiSessionIdTooLong,
+            format!(
+                "session_id too long: {} bytes (max {MAX_SESSION_ID_BYTES})",
+                sid.len()
+            ),
         ));
     }
 
@@ -965,7 +1064,13 @@ pub async fn chat_agent(
     let mut stream = client
         .chat(with_client_id(request_stream))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            AmosError::with_cause(
+                ErrorCode::AiRpcFailed,
+                codes::RPC_FAILED,
+                format!("ai chat open failed: {e}"),
+            )
+        })?
         .into_inner();
 
     // Remember the outbound sender so `cancel_ai_session` can interrupt it.
@@ -978,7 +1083,13 @@ pub async fn chat_agent(
         payload: Some(Payload::Prompt(prompt)),
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        AmosError::with_cause(
+            ErrorCode::AiRpcFailed,
+            codes::RPC_FAILED,
+            format!("ai chat send failed: {e}"),
+        )
+    })?;
 
     // Consume the token stream and fan it out to the UI on a background task.
     let active = state.active_bidi.clone();
@@ -1012,7 +1123,7 @@ pub async fn chat_agent(
 /// Tauri command: push a `Cancel` on the active bidirectional `Chat` stream, if
 /// one is open, so the UI can stop generation.
 #[tauri::command]
-pub async fn cancel_ai_session(state: State<'_, AiBridge>) -> Result<(), String> {
+pub async fn cancel_ai_session(state: State<'_, AiBridge>) -> Result<(), AmosError> {
     // Take the sender out and drop the guard *before* awaiting, so the future
     // stays Send (a std::sync::MutexGuard cannot be held across an .await).
     let tx = {
@@ -1079,7 +1190,7 @@ fn legacy_surface_label(success: bool, window_id: &str) -> Option<String> {
 
 /// Tauri command: list installed Android apps + the runtime that answered.
 #[tauri::command]
-pub async fn get_android_apps(state: State<'_, AiBridge>) -> Result<AndroidAppsOut, String> {
+pub async fn get_android_apps(state: State<'_, AiBridge>) -> Result<AndroidAppsOut, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = state.connect_android().await?;
@@ -1105,7 +1216,11 @@ pub async fn get_android_apps(state: State<'_, AiBridge>) -> Result<AndroidAppsO
                 attempt += 1;
                 state.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("android get_installed_apps failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1119,11 +1234,14 @@ pub async fn launch_android_app(
     state: State<'_, AiBridge>,
     wm: State<'_, WmState>,
     package_name: String,
-) -> Result<AndroidLaunchResult, String> {
+) -> Result<AndroidLaunchResult, AmosError> {
     if package_name.is_empty() || package_name.len() > MAX_ANDROID_PACKAGE_BYTES {
-        return Err(format!(
-            "android package_name invalid: {} bytes (max {MAX_ANDROID_PACKAGE_BYTES})",
-            package_name.len()
+        return Err(AmosError::new(
+            ErrorCode::AiAndroidPackageInvalid,
+            format!(
+                "android package_name invalid: {} bytes (max {MAX_ANDROID_PACKAGE_BYTES})",
+                package_name.len()
+            ),
         ));
     }
     let mut attempt = 0;
@@ -1168,7 +1286,11 @@ pub async fn launch_android_app(
                 attempt += 1;
                 state.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("android launch failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1181,11 +1303,14 @@ pub async fn launch_android_app(
 pub async fn get_android_app_icon(
     state: State<'_, AiBridge>,
     package_name: String,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<Vec<u8>>, AmosError> {
     if package_name.is_empty() || package_name.len() > MAX_ANDROID_PACKAGE_BYTES {
-        return Err(format!(
-            "android package_name invalid: {} bytes (max {MAX_ANDROID_PACKAGE_BYTES})",
-            package_name.len()
+        return Err(AmosError::new(
+            ErrorCode::AiAndroidPackageInvalid,
+            format!(
+                "android package_name invalid: {} bytes (max {MAX_ANDROID_PACKAGE_BYTES})",
+                package_name.len()
+            ),
         ));
     }
     let mut attempt = 0;
@@ -1205,7 +1330,11 @@ pub async fn get_android_app_icon(
                 attempt += 1;
                 state.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("android get_app_icon failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1229,7 +1358,7 @@ pub struct AndroidLmkTaskInfo {
 #[tauri::command]
 pub async fn android_lmk_tasks(
     state: State<'_, AiBridge>,
-) -> Result<Vec<AndroidLmkTaskInfo>, String> {
+) -> Result<Vec<AndroidLmkTaskInfo>, AmosError> {
     let mut attempt = 0;
     loop {
         let mut client = state.connect_android().await?;
@@ -1250,7 +1379,11 @@ pub async fn android_lmk_tasks(
                 attempt += 1;
                 state.invalidate();
                 if attempt >= 2 {
-                    return Err(e.to_string());
+                    return Err(AmosError::with_cause(
+                        ErrorCode::AiRpcFailed,
+                        codes::RPC_FAILED,
+                        format!("android get_lmk_snapshot failed: {e}"),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1261,10 +1394,11 @@ pub async fn android_lmk_tasks(
 #[cfg(test)]
 mod tests {
     use super::{
-        legacy_surface_label, merge_system_selection, persist_cloud_key,
+        codes, legacy_surface_label, merge_system_selection, persist_cloud_key,
         persist_cloud_key_reporting,
     };
     use crate::clipboard::GlobalClipboard;
+    use crate::rag_client;
     use crate::wm::SystemContext;
     use std::collections::HashMap;
 
@@ -1375,5 +1509,68 @@ mod tests {
         let none = persist_cloud_key_reporting(None, "sk-secret").expect("warning");
         assert!(none.contains("NOT persisted"), "{none}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The AI bridge commands now return `AmosError`. The wire vocabulary
+    /// (codes module + enum side) must stay in lock-step, and every variant
+    /// must group under "ai" so a single tracing filter scopes the whole
+    /// surface. The envelope must serialise `code` + `cause` so a watcher
+    /// can read which daemon call failed without grepping the source.
+    #[test]
+    fn ai_error_codes_are_distinct_stability_keys() {
+        use crate::error::{AmosError, ErrorCode};
+        // Wire strings — UI i18n branches on these literals.
+        assert_eq!(codes::PROMPT_TOO_LONG, "amos.ai.prompt_too_long");
+        assert_eq!(codes::SESSION_ID_TOO_LONG, "amos.ai.session_id_too_long");
+        assert_eq!(
+            codes::BACKEND_PAYLOAD_TOO_LONG,
+            "amos.ai.backend_payload_too_long"
+        );
+        assert_eq!(
+            codes::ANDROID_PACKAGE_INVALID,
+            "amos.ai.android_package_invalid"
+        );
+        assert_eq!(codes::RPC_FAILED, "amos.ai.rpc_failed");
+        assert_eq!(
+            codes::BACKEND_SWITCH_FAILED,
+            "amos.ai.backend_switch_failed"
+        );
+
+        // Enum side keeps the same strings — drift is a wire break.
+        assert_eq!(ErrorCode::AiPromptTooLong.as_str(), codes::PROMPT_TOO_LONG);
+        assert_eq!(ErrorCode::AiRpcFailed.as_str(), codes::RPC_FAILED);
+
+        // Each variant groups under "ai".
+        assert_eq!(ErrorCode::AiRpcFailed.group(), "ai");
+        assert_eq!(ErrorCode::AiBackendSwitchFailed.group(), "ai");
+        assert_eq!(ErrorCode::AiAndroidPackageInvalid.group(), "ai");
+
+        // The envelope serialises both `code` + `cause`, so a watcher (logcat,
+        // devtools) can see which daemon call actually failed.
+        let e = AmosError::with_cause(
+            ErrorCode::AiRpcFailed,
+            codes::RPC_FAILED,
+            "daemon unreachable",
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "amos.ai.rpc_failed");
+        assert_eq!(v["cause"][0], "daemon unreachable");
+    }
+
+    /// RAG / notes-index is the same family (`ai`) — pinning its codes here
+    /// too keeps the whole LLM surface under one i18n / tracing filter.
+    #[test]
+    fn rag_error_codes_are_distinct_stability_keys() {
+        use crate::error::ErrorCode;
+        assert_eq!(
+            rag_client::codes::PAYLOAD_TOO_LONG,
+            "amos.rag.payload_too_long"
+        );
+        assert_eq!(rag_client::codes::RPC_FAILED, "amos.rag.rpc_failed");
+        assert_eq!(
+            ErrorCode::RagPayloadTooLong.as_str(),
+            rag_client::codes::PAYLOAD_TOO_LONG
+        );
+        assert_eq!(ErrorCode::RagRpcFailed.group(), "rag");
     }
 }

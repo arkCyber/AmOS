@@ -1,11 +1,10 @@
 //! `error.rs` — typed error envelope shared across the System UI Rust core.
 //!
-//! Every `#[tauri::command]` that can fail returns [`Result<T, AmosError>`]
-//! (or, for the few commands whose envelope predates this module, the legacy
-//! `Result<T, String>` is preserved). The envelope is two pieces of information
-//! — a **stable code** the UI can branch on, and a **human-readable message**
-//! the UI should not parse — plus an optional cause chain so a watcher can see
-//! where the failure actually originated without grepping the source.
+//! Every `#[tauri::command]` that can fail returns [`Result<T, AmosError>`].
+//! The envelope is two pieces of information — a **stable code** the UI can
+//! branch on, and a **human-readable message** the UI should not parse — plus
+//! an optional cause chain so a watcher can see where the failure actually
+//! originated without grepping the source.
 //!
 //! # Why a code AND a message
 //!
@@ -38,6 +37,57 @@ pub enum ErrorCode {
     TelemetrySpyWatchOpenFailed,
     TelemetrySpyStreamError,
     TelemetrySpyEmitFailed,
+    // --- telephony (REQ-A268 follow-up: dialer / call state surface) ---
+    /// Caller-supplied number exceeds [`telephony::MAX_TELEPHONY_DIAL_BYTES`].
+    TelephonyNumberTooLong,
+    /// Caller-supplied call id exceeds [`telephony::MAX_TELEPHONY_CALL_ID_BYTES`].
+    TelephonyCallIdTooLong,
+    /// Any telephony RPC failed (daemon unreachable / rejected).
+    TelephonyRpcFailed,
+    /// `spawn_telephony_watch` could not open the long-lived `Watch` stream.
+    TelephonyWatchOpenFailed,
+    /// A `Watch` event could not be read off the stream.
+    TelephonyWatchStreamError,
+    // --- radio / Bluetooth (REQ-A202/REQ-A203 carry-over: structured refusal) ---
+    /// Caller asked for a radio key (`wifi` / `bluetooth` / …) the bridge does not know.
+    RadioUnknownKey,
+    /// The Bluetooth MAC address passed to `bluetooth_pair` is empty or too long.
+    RadioAddressInvalid,
+    /// Any radio / Bluetooth provider call failed (Mock refused; Android provider missing).
+    RadioRpcFailed,
+    /// `radio_open_settings` was asked for a switch this app owns — no system surface exists.
+    RadioNoSystemSurface,
+    // --- SMS (REQ-A268 follow-up: messaging surface) ---
+    /// Caller passed blank `thread_id` / `message_id` / `address` to an SMS command.
+    SmsBlankId,
+    /// Caller passed a thread id / message id / address that is over the SMS-id size cap.
+    SmsIdTooLong,
+    /// Caller passed an unknown folder name (`inbox` | `sent` | `draft` only).
+    SmsUnknownFolder,
+    /// Caller asked for messages from a sender the blocklist has blocked for SMS.
+    SmsBlockedSender,
+    /// The `sms_send` text body exceeds [`sms::MAX_SMS_TEXT_BYTES`].
+    SmsTextTooLong,
+    /// SMS provider rejected the read / send (SmsError kind); the user-visible
+    /// reason lives in `message` and the SmsError kind in `cause[0]`.
+    SmsProviderRejected,
+    // --- AI bridge / RAG (REQ-A268 follow-up: LLM surface) ---
+    /// Caller passed a `prompt` / `context` string over the prompt byte cap.
+    AiPromptTooLong,
+    /// Caller passed a `session_id` over the session-id byte cap.
+    AiSessionIdTooLong,
+    /// Caller passed an `api_key` / `model` / `endpoint` string over its byte cap.
+    AiBackendPayloadTooLong,
+    /// Caller passed an Android `package_name` that is empty or over the cap.
+    AiAndroidPackageInvalid,
+    /// Any AI / Android-manager RPC failed (daemon unreachable / rejected).
+    AiRpcFailed,
+    /// `ai_backend_switch` could not invoke / complete the `ai-backend.sh` script.
+    AiBackendSwitchFailed,
+    /// A RAG id / text / query string is over its byte cap.
+    RagPayloadTooLong,
+    /// Any RAG RPC failed (notes-index unreachable / rejected).
+    RagRpcFailed,
 }
 
 impl ErrorCode {
@@ -60,6 +110,29 @@ impl ErrorCode {
             Self::TelemetrySpyWatchOpenFailed => "amos.telemetry_spy.watch_open_failed",
             Self::TelemetrySpyStreamError => "amos.telemetry_spy.stream_error",
             Self::TelemetrySpyEmitFailed => "amos.telemetry_spy.emit_failed",
+            Self::TelephonyNumberTooLong => "amos.telephony.number_too_long",
+            Self::TelephonyCallIdTooLong => "amos.telephony.call_id_too_long",
+            Self::TelephonyRpcFailed => "amos.telephony.rpc_failed",
+            Self::TelephonyWatchOpenFailed => "amos.telephony.watch_open_failed",
+            Self::TelephonyWatchStreamError => "amos.telephony.watch_stream_error",
+            Self::RadioUnknownKey => "amos.radio.unknown_key",
+            Self::RadioAddressInvalid => "amos.radio.address_invalid",
+            Self::RadioRpcFailed => "amos.radio.rpc_failed",
+            Self::RadioNoSystemSurface => "amos.radio.no_system_surface",
+            Self::SmsBlankId => "amos.sms.blank_id",
+            Self::SmsIdTooLong => "amos.sms.id_too_long",
+            Self::SmsUnknownFolder => "amos.sms.unknown_folder",
+            Self::SmsBlockedSender => "amos.sms.blocked_sender",
+            Self::SmsTextTooLong => "amos.sms.text_too_long",
+            Self::SmsProviderRejected => "amos.sms.provider_rejected",
+            Self::AiPromptTooLong => "amos.ai.prompt_too_long",
+            Self::AiSessionIdTooLong => "amos.ai.session_id_too_long",
+            Self::AiBackendPayloadTooLong => "amos.ai.backend_payload_too_long",
+            Self::AiAndroidPackageInvalid => "amos.ai.android_package_invalid",
+            Self::AiRpcFailed => "amos.ai.rpc_failed",
+            Self::AiBackendSwitchFailed => "amos.ai.backend_switch_failed",
+            Self::RagPayloadTooLong => "amos.rag.payload_too_long",
+            Self::RagRpcFailed => "amos.rag.rpc_failed",
         }
     }
 
@@ -175,6 +248,29 @@ mod tests {
             ErrorCode::TelemetrySpyWatchOpenFailed,
             ErrorCode::TelemetrySpyStreamError,
             ErrorCode::TelemetrySpyEmitFailed,
+            ErrorCode::TelephonyNumberTooLong,
+            ErrorCode::TelephonyCallIdTooLong,
+            ErrorCode::TelephonyRpcFailed,
+            ErrorCode::TelephonyWatchOpenFailed,
+            ErrorCode::TelephonyWatchStreamError,
+            ErrorCode::RadioUnknownKey,
+            ErrorCode::RadioAddressInvalid,
+            ErrorCode::RadioRpcFailed,
+            ErrorCode::RadioNoSystemSurface,
+            ErrorCode::SmsBlankId,
+            ErrorCode::SmsIdTooLong,
+            ErrorCode::SmsUnknownFolder,
+            ErrorCode::SmsBlockedSender,
+            ErrorCode::SmsTextTooLong,
+            ErrorCode::SmsProviderRejected,
+            ErrorCode::AiPromptTooLong,
+            ErrorCode::AiSessionIdTooLong,
+            ErrorCode::AiBackendPayloadTooLong,
+            ErrorCode::AiAndroidPackageInvalid,
+            ErrorCode::AiRpcFailed,
+            ErrorCode::AiBackendSwitchFailed,
+            ErrorCode::RagPayloadTooLong,
+            ErrorCode::RagRpcFailed,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in codes {
@@ -195,6 +291,14 @@ mod tests {
             ErrorCode::FlashlightStoredShapeInvalid.group(),
             "flashlight"
         );
+        // The follow-up groups added when migrating telephony / sms / radio /
+        // ai / rag to typed envelopes: each module's variants must collapse to
+        // the same group so a single tracing filter scopes the whole surface.
+        assert_eq!(ErrorCode::TelephonyRpcFailed.group(), "telephony");
+        assert_eq!(ErrorCode::RadioRpcFailed.group(), "radio");
+        assert_eq!(ErrorCode::SmsProviderRejected.group(), "sms");
+        assert_eq!(ErrorCode::AiRpcFailed.group(), "ai");
+        assert_eq!(ErrorCode::RagRpcFailed.group(), "rag");
     }
 
     #[test]

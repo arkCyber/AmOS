@@ -24,6 +24,7 @@ use amos_proto::ai_agent::client_message::Payload;
 use amos_proto::ai_agent::{AgentChunk, ClientMessage};
 
 use crate::ai_bridge::{with_client_id, AiBridge};
+use crate::error::{AmosError, ErrorCode};
 
 /// Tauri event name for every assistant-voice status/reply frame.
 pub const VOICE_EVENT: &str = "assistant-voice-event";
@@ -140,7 +141,7 @@ impl VoiceLink {
         bridge: &AiBridge,
         session: String,
         mut emit: F,
-    ) -> Result<VoiceLink, String>
+    ) -> Result<VoiceLink, AmosError>
     where
         F: FnMut(VoiceEvent) + Send + 'static,
     {
@@ -151,7 +152,13 @@ impl VoiceLink {
         let mut stream = client
             .chat(with_client_id(request))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                AmosError::with_cause(
+                    ErrorCode::AiRpcFailed,
+                    crate::ai_bridge::codes::RPC_FAILED,
+                    format!("assistant voice chat open failed: {e}"),
+                )
+            })?
             .into_inner();
 
         let session_for_loop = session.clone();
@@ -297,14 +304,17 @@ pub async fn assistant_voice_start(
     state: State<'_, AiBridge>,
     voice: State<'_, VoiceSession>,
     session_id: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), AmosError> {
     let session = session_id.unwrap_or_else(|| "default".to_string());
     // Bound the session id before opening the bidi stream (the daemon echoes
     // it back on every chunk — a paste-sized id would inflate every event).
     if session.len() > MAX_VOICE_SESSION_ID_BYTES {
-        return Err(format!(
-            "voice session_id too long: {} bytes (max {MAX_VOICE_SESSION_ID_BYTES})",
-            session.len()
+        return Err(AmosError::new(
+            ErrorCode::AiSessionIdTooLong,
+            format!(
+                "voice session_id too long: {} bytes (max {MAX_VOICE_SESSION_ID_BYTES})",
+                session.len()
+            ),
         ));
     }
 
@@ -483,7 +493,9 @@ pub async fn device_mic_start(
     let emit = move |e: VoiceEvent| {
         let _ = app.emit(VOICE_EVENT, to_payload(&e));
     };
-    let link = VoiceLink::open(&state, session, emit).await?;
+    let link = VoiceLink::open(&state, session, emit)
+        .await
+        .map_err(|e: AmosError| e.to_string())?;
 
     // Trailing-silence segmentation (end_silence_frames = 3 × ~10 ms); feed
     // silence too so a real VAD recognizer (sherpa) sees the true audio cadence.

@@ -24,6 +24,23 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, State};
 
+use crate::error::{AmosError, ErrorCode};
+
+/// Wire vocabulary for the radio module. The UI i18n layer branches on these;
+/// renaming a variant is a wire break. Kept alongside the constants so callers
+/// can refer to the wire string without re-typing it.
+pub mod codes {
+    /// Caller passed a radio key (`wifi` / `bluetooth` / …) the bridge does not know.
+    pub const UNKNOWN_KEY: &str = "amos.radio.unknown_key";
+    /// The Bluetooth MAC address passed to `bluetooth_pair` is empty or too long.
+    pub const ADDRESS_INVALID: &str = "amos.radio.address_invalid";
+    /// Any radio / Bluetooth provider call failed (Mock refused; Android provider missing).
+    pub const RPC_FAILED: &str = "amos.radio.rpc_failed";
+    /// `radio_open_settings` was asked for a switch this app owns — there is no
+    /// system surface to hand the user to.
+    pub const NO_SYSTEM_SURFACE: &str = "amos.radio.no_system_surface";
+}
+
 /// The provider every command goes through, and the seed the Mock was built from.
 ///
 /// Process-wide (not Tauri state) because the Android glue reaches Rust through a
@@ -225,9 +242,13 @@ fn persist_radios(app: &AppHandle, store: &SharedStore, snap: RadioSnapshot) {
 
 /// Read the current radio state.
 #[tauri::command]
-pub async fn radio_status(bridge: State<'_, RadioBridge>) -> Result<RadioPayload, String> {
-    let snap = bridge.manager.snapshot().await.map_err(|e| e.to_string())?;
-    Ok(snap.into())
+pub async fn radio_status(bridge: State<'_, RadioBridge>) -> Result<RadioPayload, AmosError> {
+    bridge
+        .manager
+        .snapshot()
+        .await
+        .map(|s| s.into())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /* ---- Bluetooth details (REQ-A199): beyond the on/off bit, a screen shows what the
@@ -259,12 +280,14 @@ impl From<amos_radio::BtPeer> for BluetoothPeerPayload {
 /// then keeps showing its remembered value **as a preference**; that difference is the
 /// whole point of this command existing instead of reusing the store.
 #[tauri::command]
-pub async fn bluetooth_adapter_name(bridge: State<'_, RadioBridge>) -> Result<String, String> {
+pub async fn bluetooth_adapter_name(
+    bridge: State<'_, RadioBridge>,
+) -> Result<String, AmosError> {
     bridge
         .manager
         .bluetooth_local_name()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /// Rename the adapter; answers with the name the **adapter** reports afterwards (it may
@@ -279,12 +302,12 @@ pub async fn bluetooth_adapter_name(bridge: State<'_, RadioBridge>) -> Result<St
 pub async fn bluetooth_rename_adapter(
     bridge: State<'_, RadioBridge>,
     name: String,
-) -> Result<String, String> {
+) -> Result<String, AmosError> {
     bridge
         .manager
         .set_bluetooth_local_name(&name)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /// The devices the adapter is paired with. An empty list is a real answer ("paired with
@@ -296,13 +319,13 @@ pub async fn bluetooth_rename_adapter(
 #[tauri::command]
 pub async fn bluetooth_paired_devices(
     bridge: State<'_, RadioBridge>,
-) -> Result<Vec<BluetoothPeerPayload>, String> {
+) -> Result<Vec<BluetoothPeerPayload>, AmosError> {
     bridge
         .manager
         .bluetooth_paired_devices()
         .await
         .map(|peers| peers.into_iter().map(Into::into).collect())
-        .map_err(|e| e.to_string())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /* ---- Bluetooth discovery (REQ-A200): start/stop a scan, read its state, ask the
@@ -386,37 +409,39 @@ impl From<amos_radio::BtScan> for BluetoothScanPayload {
 /// `BLUETOOTH_SCAN` not granted) — the screen then says the search could not start
 /// rather than showing an empty list.
 #[tauri::command]
-pub async fn bluetooth_start_scan(bridge: State<'_, RadioBridge>) -> Result<bool, String> {
+pub async fn bluetooth_start_scan(
+    bridge: State<'_, RadioBridge>,
+) -> Result<bool, AmosError> {
     bridge
         .manager
         .bluetooth_start_discovery()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /// Cancel a running scan. Called when the screen leaves the Bluetooth page (and by the
 /// explicit stop button) — a scan left running costs battery and the platform would end
 /// it silently ~12 s later anyway.
 #[tauri::command]
-pub async fn bluetooth_stop_scan(bridge: State<'_, RadioBridge>) -> Result<bool, String> {
+pub async fn bluetooth_stop_scan(bridge: State<'_, RadioBridge>) -> Result<bool, AmosError> {
     bridge
         .manager
         .bluetooth_stop_discovery()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /// Read the scan state (what was found + whether it is still running).
 #[tauri::command]
 pub async fn bluetooth_scan_state(
     bridge: State<'_, RadioBridge>,
-) -> Result<BluetoothScanPayload, String> {
+) -> Result<BluetoothScanPayload, AmosError> {
     bridge
         .manager
         .bluetooth_scan_state()
         .await
         .map(Into::into)
-        .map_err(|e| e.to_string())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /// Ask the platform to pair with `address`.
@@ -428,18 +453,21 @@ pub async fn bluetooth_scan_state(
 pub async fn bluetooth_pair(
     bridge: State<'_, RadioBridge>,
     address: String,
-) -> Result<bool, String> {
+) -> Result<bool, AmosError> {
     if address.is_empty() || address.len() > MAX_BT_ADDRESS_BYTES {
-        return Err(format!(
-            "bluetooth address too long or empty: {} bytes (max {MAX_BT_ADDRESS_BYTES})",
-            address.len()
+        return Err(AmosError::new(
+            ErrorCode::RadioAddressInvalid,
+            format!(
+                "bluetooth address too long or empty: {} bytes (max {MAX_BT_ADDRESS_BYTES})",
+                address.len()
+            ),
         ));
     }
     bridge
         .manager
         .bluetooth_pair(&address)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e))
 }
 
 /// Maximum bytes in a Bluetooth MAC address handed in via `bluetooth_pair`.
@@ -594,8 +622,13 @@ impl RadioSetPayload {
 pub async fn radio_control(
     bridge: State<'_, RadioBridge>,
     key: String,
-) -> Result<RadioControlPayload, String> {
-    let radio = RadioMode::from_key(&key).ok_or_else(|| format!("unknown radio key: {key:?}"))?;
+) -> Result<RadioControlPayload, AmosError> {
+    let radio = RadioMode::from_key(&key).ok_or_else(|| {
+        AmosError::new(
+            ErrorCode::RadioUnknownKey,
+            format!("unknown radio key: {key:?}"),
+        )
+    })?;
     let control = bridge.manager.control(radio).await;
     Ok(RadioControlPayload::new(radio, control))
 }
@@ -609,18 +642,26 @@ pub async fn radio_control(
 pub async fn radio_open_settings(
     bridge: State<'_, RadioBridge>,
     key: String,
-) -> Result<bool, String> {
-    let radio = RadioMode::from_key(&key).ok_or_else(|| format!("unknown radio key: {key:?}"))?;
+) -> Result<bool, AmosError> {
+    let radio = RadioMode::from_key(&key).ok_or_else(|| {
+        AmosError::new(
+            ErrorCode::RadioUnknownKey,
+            format!("unknown radio key: {key:?}"),
+        )
+    })?;
     match bridge.manager.control(radio).await {
-        RadioControl::AppControlled => Err(format!(
-            "`{key}` is switched by this app on this device — there is no system surface to open"
+        RadioControl::AppControlled => Err(AmosError::new(
+            ErrorCode::RadioNoSystemSurface,
+            format!(
+                "`{key}` is switched by this app on this device — there is no system surface to open"
+            ),
         )),
         RadioControl::PlatformManaged { surface, .. } => bridge
             .manager
             .open_system_surface(surface)
             .await
             .map(|()| true)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e)),
     }
 }
 
@@ -642,8 +683,13 @@ pub async fn radio_set(
     store: State<'_, SharedStore>,
     key: String,
     enabled: bool,
-) -> Result<RadioSetPayload, String> {
-    let radio = RadioMode::from_key(&key).ok_or_else(|| format!("unknown radio key: {key:?}"))?;
+) -> Result<RadioSetPayload, AmosError> {
+    let radio = RadioMode::from_key(&key).ok_or_else(|| {
+        AmosError::new(
+            ErrorCode::RadioUnknownKey,
+            format!("unknown radio key: {key:?}"),
+        )
+    })?;
     match bridge.manager.set(radio, enabled).await {
         Ok(snap) => {
             persist_radios(&app, &store, snap);
@@ -881,5 +927,58 @@ mod tests {
         assert_eq!(p.bonds.len(), 1);
         assert_eq!(p.bonds[0].address, "AA:BB");
         assert_eq!(p.bonds[0].state, 10);
+    }
+
+    /// The commands now return `AmosError` instead of `String`. The wire
+    /// vocabulary (codes module + enum side) must stay in lock-step, and the
+    /// envelope must serialise both `code` and `cause` so a watcher can see
+    /// which provider RPC actually failed without grepping the source.
+    #[test]
+    fn radio_error_codes_are_distinct_stability_keys() {
+        use crate::error::{AmosError, ErrorCode};
+        // Wire strings: every one the UI i18n layer branches on.
+        assert_eq!(codes::UNKNOWN_KEY, "amos.radio.unknown_key");
+        assert_eq!(codes::ADDRESS_INVALID, "amos.radio.address_invalid");
+        assert_eq!(codes::RPC_FAILED, "amos.radio.rpc_failed");
+        assert_eq!(codes::NO_SYSTEM_SURFACE, "amos.radio.no_system_surface");
+
+        // Enum side keeps the same strings — a drift is a wire break.
+        assert_eq!(ErrorCode::RadioUnknownKey.as_str(), codes::UNKNOWN_KEY);
+        assert_eq!(ErrorCode::RadioRpcFailed.as_str(), codes::RPC_FAILED);
+
+        // Whole surface groups under "radio".
+        assert_eq!(ErrorCode::RadioRpcFailed.group(), "radio");
+        assert_eq!(ErrorCode::RadioNoSystemSurface.group(), "radio");
+
+        // The cause chain survives serialisation so a watcher can read which
+        // provider rejected without grepping the source.
+        let e = AmosError::with_cause(
+            ErrorCode::RadioRpcFailed,
+            codes::RPC_FAILED,
+            "BLUETOOTH_SCAN not granted",
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "amos.radio.rpc_failed");
+        assert_eq!(v["cause"][0], "BLUETOOTH_SCAN not granted");
+    }
+
+    /// The MAC-address validator uses the same code regardless of whether the
+    /// input was empty or oversized — both are a malformed request, not a
+    /// device refusal (so we do **not** invent a separate `RadioAddressEmpty`
+    /// code: the message keeps the byte count for diagnostics, and the UI
+    /// renders the single "invalid address" branch).
+    #[test]
+    fn radio_address_too_long_and_empty_share_the_same_code() {
+        // We can't run the Tauri command headlessly without a State, but the
+        // shape of the error envelope (the only thing the UI depends on) is
+        // pinned by the constants used inside `bluetooth_pair`.
+        assert_eq!(
+            crate::error::ErrorCode::RadioAddressInvalid.as_str(),
+            "amos.radio.address_invalid"
+        );
+        assert_eq!(
+            crate::error::ErrorCode::RadioAddressInvalid.group(),
+            "radio"
+        );
     }
 }

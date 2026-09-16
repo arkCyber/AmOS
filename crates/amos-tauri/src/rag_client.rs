@@ -20,6 +20,17 @@ use amos_proto::ai_agent::{
 };
 use serde::Serialize;
 
+use crate::error::{AmosError, ErrorCode};
+
+/// Wire vocabulary for the RAG / notes-index module. The UI i18n layer branches
+/// on these; renaming a variant is a wire break.
+pub mod codes {
+    /// Caller passed a RAG id / text / query string that is over its byte cap.
+    pub const PAYLOAD_TOO_LONG: &str = "amos.rag.payload_too_long";
+    /// Any RAG RPC failed (notes-index unreachable / rejected).
+    pub const RPC_FAILED: &str = "amos.rag.rpc_failed";
+}
+
 async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
     crate::daemon::channel().await
 }
@@ -110,25 +121,33 @@ fn to_query(r: &RagQueryReply) -> RagQueryOut {
 
 /// Index (or re-index on edit) a passage under an id in the daemon.
 #[tauri::command]
-pub async fn rag_index(id: String, text: String) -> Result<RagIndexOut, String> {
+pub async fn rag_index(id: String, text: String) -> Result<RagIndexOut, AmosError> {
     // Bound at the command seam — same rationale as `ask_ai_agent`'s prompt cap.
     if id.len() > MAX_RAG_ID_BYTES {
-        return Err(format!(
-            "rag id too long: {} bytes (max {MAX_RAG_ID_BYTES})",
-            id.len()
+        return Err(AmosError::new(
+            ErrorCode::RagPayloadTooLong,
+            format!(
+                "rag id too long: {} bytes (max {MAX_RAG_ID_BYTES})",
+                id.len()
+            ),
         ));
     }
     if text.len() > MAX_RAG_TEXT_BYTES {
-        return Err(format!(
-            "rag text too long: {} bytes (max {MAX_RAG_TEXT_BYTES})",
-            text.len()
+        return Err(AmosError::new(
+            ErrorCode::RagPayloadTooLong,
+            format!(
+                "rag text too long: {} bytes (max {MAX_RAG_TEXT_BYTES})",
+                text.len()
+            ),
         ));
     }
-    let mut client = RagClient::new(build_channel().await?);
+    let mut client = RagClient::new(build_channel().await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
+    })?);
     let reply = client
         .index(RagIndexRequest { id, text })
         .await
-        .map_err(|e| format!("notes-index failed: {e}"))?
+        .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?
         .into_inner();
     Ok(RagIndexOut {
         indexed: reply.indexed,
@@ -138,18 +157,23 @@ pub async fn rag_index(id: String, text: String) -> Result<RagIndexOut, String> 
 
 /// Drop an indexed passage from retrieval in the daemon.
 #[tauri::command]
-pub async fn rag_remove(id: String) -> Result<RagRemoveOut, String> {
+pub async fn rag_remove(id: String) -> Result<RagRemoveOut, AmosError> {
     if id.len() > MAX_RAG_ID_BYTES {
-        return Err(format!(
-            "rag id too long: {} bytes (max {MAX_RAG_ID_BYTES})",
-            id.len()
+        return Err(AmosError::new(
+            ErrorCode::RagPayloadTooLong,
+            format!(
+                "rag id too long: {} bytes (max {MAX_RAG_ID_BYTES})",
+                id.len()
+            ),
         ));
     }
-    let mut client = RagClient::new(build_channel().await?);
+    let mut client = RagClient::new(build_channel().await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
+    })?);
     let reply = client
         .remove(RagRemoveRequest { id })
         .await
-        .map_err(|e| format!("notes-index remove failed: {e}"))?
+        .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?
         .into_inner();
     Ok(RagRemoveOut {
         removed: reply.removed,
@@ -158,30 +182,37 @@ pub async fn rag_remove(id: String) -> Result<RagRemoveOut, String> {
 
 /// Retrieve the nearest indexed passages to `query` (embed + top-k in the daemon).
 #[tauri::command]
-pub async fn rag_query(query: String, top_k: u32) -> Result<RagQueryOut, String> {
+pub async fn rag_query(query: String, top_k: u32) -> Result<RagQueryOut, AmosError> {
     if query.len() > MAX_RAG_QUERY_BYTES {
-        return Err(format!(
-            "rag query too long: {} bytes (max {MAX_RAG_QUERY_BYTES})",
-            query.len()
+        return Err(AmosError::new(
+            ErrorCode::RagPayloadTooLong,
+            format!(
+                "rag query too long: {} bytes (max {MAX_RAG_QUERY_BYTES})",
+                query.len()
+            ),
         ));
     }
-    let mut client = RagClient::new(build_channel().await?);
+    let mut client = RagClient::new(build_channel().await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
+    })?);
     let reply = client
         .query(RagQueryRequest { query, top_k })
         .await
-        .map_err(|e| format!("notes search failed: {e}"))?
+        .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?
         .into_inner();
     Ok(to_query(&reply))
 }
 
 /// Read the daemon's current index size / dimension / honest embedder label.
 #[tauri::command]
-pub async fn rag_status() -> Result<RagStatusOut, String> {
-    let mut client = RagClient::new(build_channel().await?);
+pub async fn rag_status() -> Result<RagStatusOut, AmosError> {
+    let mut client = RagClient::new(build_channel().await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e)
+    })?);
     let reply = client
         .status(RagStatusRequest {})
         .await
-        .map_err(|e| format!("notes-index status failed: {e}"))?
+        .map_err(|e| AmosError::with_cause(ErrorCode::RagRpcFailed, codes::RPC_FAILED, e))?
         .into_inner();
     Ok(to_status(&reply))
 }
