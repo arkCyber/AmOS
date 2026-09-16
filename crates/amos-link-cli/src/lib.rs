@@ -2756,7 +2756,15 @@ async fn run_hz(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
                 // uses, so the two can be read side by side).
                 match Envelope::decode_header(&ingress.frame) {
                     Ok((header, _payload)) => {
-                        rates.observe(&header.publisher, &ingress.topic, Instant::now());
+                        // The framed size travels with the arrival: one observation carries both
+                        // halves of the reading (rate and bandwidth), so they cannot come from
+                        // two windows that disagree (see `rate.rs`'s docs).
+                        rates.observe(
+                            &header.publisher,
+                            &ingress.topic,
+                            Instant::now(),
+                            ingress.frame.len(),
+                        );
                     }
                     // A frame this crate's own decoder refuses is not an arrival of any stream —
                     // counted and named, never silently folded into a rate.
@@ -2774,6 +2782,7 @@ async fn run_hz(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
     }
 
     let frames = rates.frames();
+    let bytes = rates.bytes();
     let untracked = rates.untracked();
     if opts.json {
         println!(
@@ -2782,6 +2791,7 @@ async fn run_hz(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
                 "event": "hz_summary",
                 "streams": rates.streams(),
                 "frames": frames,
+                "bytes": bytes,
                 "untracked": untracked,
                 "undecodable": undecodable,
                 "complete": rates.is_complete(),
@@ -2797,9 +2807,10 @@ async fn run_hz(node: &Arc<LinkNode>, opts: &Opts) -> Result<()> {
             );
         }
         println!(
-            "summary streams={} frames={} untracked={} undecodable={} complete={} ran={}s",
+            "summary streams={} frames={} bytes={} untracked={} undecodable={} complete={} ran={}s",
             rates.streams(),
             frames,
+            bytes,
             untracked,
             undecodable,
             if rates.is_complete() { "yes" } else { "no" },
@@ -2825,23 +2836,60 @@ fn print_rate(rate: &StreamRate, json: bool) -> Result<()> {
         (None, Some(why)) => format!("unknown({})", why.detail()),
         (None, None) => "unknown".to_string(),
     };
+    // The bandwidth shares the rate's window and its refusal, so it is rendered the same way —
+    // `bytes` is always printed (it is a fact about what arrived, even when no rate is stateable).
+    let bandwidth = match rate.bytes_per_sec {
+        Some(bps) => format_bytes_per_sec(bps),
+        None => "unknown".to_string(),
+    };
     println!(
-        "rate publisher={} topic={} frames={} span={} rate={}",
-        rate.publisher, rate.topic, rate.frames, span, figure
+        "rate publisher={} topic={} frames={} span={} rate={} bytes={} bw={}",
+        rate.publisher, rate.topic, rate.frames, span, figure, rate.bytes, bandwidth
     );
     Ok(())
 }
 
-/// The same reading as one JSON object — `rate_hz` is `null` (never `0`) when it cannot be stated,
-/// and `why` carries the stable reason token so a script never parses prose.
+/// Bytes per second, in the units a person reads (`512B/s`, `62.5KiB/s`, `4.88MiB/s`).
+///
+/// Binary prefixes (KiB/MiB/GiB) because the byte counts this reports are binary quantities of
+/// memory and wire, and because mixing decimal prefixes with them is how a "1 MB" camera frame
+/// turns out to be 1.048 MB. Below 1 KiB the plain figure is clearer than `0.5KiB/s`.
+fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
+    const KIB: f64 = 1024.0;
+    if !bytes_per_sec.is_finite() || bytes_per_sec <= 0.0 {
+        // A rate of zero bytes is a *number* a caller may legitimately compute (a stream of empty
+        // payloads still has a header), but a non-finite one is not: it says so rather than
+        // printing `NaN`.
+        if bytes_per_sec == 0.0 {
+            return "0B/s".to_string();
+        }
+        return "unknown".to_string();
+    }
+    if bytes_per_sec < KIB {
+        return format!("{bytes_per_sec:.0}B/s");
+    }
+    if bytes_per_sec < KIB * KIB {
+        return format!("{:.1}KiB/s", bytes_per_sec / KIB);
+    }
+    if bytes_per_sec < KIB * KIB * KIB {
+        return format!("{:.2}MiB/s", bytes_per_sec / (KIB * KIB));
+    }
+    format!("{:.2}GiB/s", bytes_per_sec / (KIB * KIB * KIB))
+}
+
+/// The same reading as one JSON object — `rate_hz` and `bytes_per_sec` are `null` (never `0`)
+/// when they cannot be stated, `bytes` is always a number, and `why` carries the stable reason
+/// token (for both figures at once) so a script never parses prose.
 fn rate_json(rate: &StreamRate) -> serde_json::Value {
     serde_json::json!({
         "event": "hz",
         "publisher": rate.publisher.as_str(),
         "topic": rate.topic.as_str(),
         "frames": rate.frames,
+        "bytes": rate.bytes,
         "span_ms": rate.span.map(|span| span.as_millis() as u64),
         "rate_hz": rate.rate_hz,
+        "bytes_per_sec": rate.bytes_per_sec,
         "why": rate.evidence().map(|why| why.key()),
     })
 }
@@ -3882,7 +3930,8 @@ mod tests {
     }
 
     /// A rate that cannot be stated is `null` **with a reason** in the machine form — never `0`
-    /// (which a script would read as "this stream stopped").
+    /// (which a script would read as "this stream stopped"). The bandwidth shares the window, so
+    /// it is `null` for the same reason; `bytes` is a number either way.
     #[test]
     fn a_rate_without_evidence_is_null_and_names_why() {
         let peer = PeerId::new("dog1").expect("peer");
@@ -3892,26 +3941,50 @@ mod tests {
             publisher: peer.clone(),
             topic: topic.clone(),
             frames: 1,
+            bytes: 2048,
             span: None,
             rate_hz: None,
+            bytes_per_sec: None,
         });
         assert_eq!(unknown["event"], "hz");
         assert_eq!(unknown["publisher"], "dog1");
         assert_eq!(unknown["frames"], 1);
+        assert_eq!(unknown["bytes"], 2048);
         assert_eq!(unknown["span_ms"], serde_json::Value::Null);
         assert_eq!(unknown["rate_hz"], serde_json::Value::Null);
+        assert_eq!(unknown["bytes_per_sec"], serde_json::Value::Null);
         assert_eq!(unknown["why"], "single-frame");
 
         let measurable = rate_json(&StreamRate {
             publisher: peer,
             topic,
             frames: 121,
+            bytes: 124_000,
             span: Some(Duration::from_secs(2)),
             rate_hz: Some(60.0),
+            bytes_per_sec: Some(62_000.0),
         });
         assert_eq!(measurable["span_ms"], 2000);
         assert_eq!(measurable["rate_hz"], 60.0);
+        assert_eq!(measurable["bytes_per_sec"], 62000.0);
         assert_eq!(measurable["why"], serde_json::Value::Null);
+    }
+
+    /// The human form of a bandwidth: binary prefixes, and a figure that says `unknown` rather
+    /// than printing `NaN`.
+    #[test]
+    fn a_bandwidth_is_rendered_in_units_a_person_reads() {
+        assert_eq!(format_bytes_per_sec(512.0), "512B/s");
+        assert_eq!(format_bytes_per_sec(1024.0), "1.0KiB/s");
+        assert_eq!(format_bytes_per_sec(64_000.0), "62.5KiB/s");
+        assert_eq!(format_bytes_per_sec(1_048_576.0), "1.00MiB/s");
+        assert_eq!(format_bytes_per_sec(6_291_456.0), "6.00MiB/s");
+        assert_eq!(format_bytes_per_sec(1_073_741_824.0), "1.00GiB/s");
+        // Zero bytes per second is a number (a stream may carry empty payloads), a non-finite one
+        // is not — and neither is ever rendered as `NaN`.
+        assert_eq!(format_bytes_per_sec(0.0), "0B/s");
+        assert_eq!(format_bytes_per_sec(f64::NAN), "unknown");
+        assert_eq!(format_bytes_per_sec(-1.0), "unknown");
     }
 
     /// Every command, in documentation order — so the scope tests below cannot silently skip

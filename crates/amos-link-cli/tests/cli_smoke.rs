@@ -925,10 +925,14 @@ fn hz_reports_a_rate_per_stream_and_never_invents_one() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("no frames observed"), "got: {stdout}");
     assert!(
-        !stdout.contains("rate="),
-        "no rate line without a stream: {stdout}"
+        !stdout.contains("rate=") && !stdout.contains("bw="),
+        "no rate or bandwidth line without a stream: {stdout}"
     );
     assert!(stdout.contains("summary streams=0"), "got: {stdout}");
+    assert!(
+        stdout.contains("bytes=0"),
+        "the summary still states the bytes it saw (zero): {stdout}"
+    );
     // The profile rule is the same one `sub` prints (`--qos` › the pattern's channel › sensor).
     assert!(
         stdout.contains("from default (no channel in the pattern)"),

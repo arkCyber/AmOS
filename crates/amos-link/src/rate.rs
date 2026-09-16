@@ -34,6 +34,20 @@
 //! IMU reports two rates, and the table is bounded ([`MAX_TRACKED_STREAMS`]) because its keys come
 //! off the wire: past the ceiling a new stream is refused and *counted*
 //! ([`RateTracker::untracked`]), never silently dropped into a clean-looking figure.
+//!
+//! **The same window also carries the bandwidth** (`docs/amos-link.md` §3.20), because "how fast"
+//! and "how much" are two halves of one question — a stereo pair at 60 Hz and at 10 Hz are
+//! different links, and so are 60 Hz of 160×120 and 60 Hz of 1920×1080. Two commands (or two
+//! windows) answering that would be two things to keep in step; instead [`StreamRate`] reports
+//! `frames`, `bytes`, one `span`, and *both* figures, and [`StreamRate::evidence`] explains a
+//! refusal **once** for the pair. The bytes counted are the frames' **framed size** — what the
+//! middleware actually moved (`magic │ ver │ hdr │ crc32 │ payload`, see
+//! [`Received::frame_len`](crate::pubsub::Received::frame_len)) — not a guessed payload size.
+//!
+//! Bandwidth is `bytes / span` (not `(bytes − first) / span`): the printed total is then the
+//! numerator a reader can divide by the printed span and check. The bias that buys is stated in
+//! `docs/amos-link.md` §3.20 (one frame's bytes inside the total but outside the span, under a
+//! per-mille once there are a few frames).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -113,7 +127,7 @@ impl RateEvidence {
     }
 }
 
-/// One stream's arrival rate, with the evidence it was derived from.
+/// One stream's arrival rate **and bandwidth**, with the evidence they were derived from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamRate {
     /// Who publishes the stream.
@@ -122,18 +136,25 @@ pub struct StreamRate {
     pub topic: Topic,
     /// How many frames of this stream have arrived.
     pub frames: u64,
+    /// Framed bytes those frames carried (header + CRC + payload, what the link moved).
+    pub bytes: u64,
     /// `last − first` arrival instant; `None` while only one frame was seen.
     pub span: Option<Duration>,
     /// Arrival rate in Hz — `intervals / span`, i.e. `(frames − 1) / span`. `None` when it cannot
     /// be stated (see [`StreamRate::evidence`]); **never** a placeholder zero.
     pub rate_hz: Option<f64>,
+    /// `bytes / span` in bytes per second. `None` **together with** `rate_hz`: both come from one
+    /// window and one rule ([`MIN_RATE_SPAN`]), so a stream cannot report a rate it has no
+    /// bandwidth for (or the other way round).
+    pub bytes_per_sec: Option<f64>,
 }
 
 impl StreamRate {
-    /// Why this rate cannot be stated (`None` when it can).
+    /// Why the figures cannot be stated (`None` when they can).
     ///
-    /// Derived from the same two facts the rate is: a reader that prints the reason and a reader
-    /// that prints the number can never disagree about which case they are in.
+    /// Derived from the same two facts the figures are: a reader that prints the reason and a
+    /// reader that prints the numbers can never disagree about which case they are in. Both
+    /// figures share the rule — a window too short for a rate is too short for a rate *of bytes*.
     pub fn evidence(&self) -> Option<RateEvidence> {
         if self.rate_hz.is_some() {
             return None;
@@ -152,10 +173,14 @@ impl StreamRate {
     }
 }
 
-/// How many arrivals one stream has been seen with, and when they were.
+/// How many arrivals one stream has been seen with, how big they were, and when they arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Arrivals {
     frames: u64,
+    /// Framed bytes of those frames (saturating: a consumer that runs for weeks on a 16 MiB-per-
+    /// frame stream must not wrap into a *smaller* figure — a wrapped total would make the
+    /// bandwidth read lower than the link's real load, the one direction that must never happen).
+    bytes: u64,
     first: Instant,
     last: Instant,
 }
@@ -183,14 +208,25 @@ impl RateTracker {
         Self::default()
     }
 
-    /// Record one arrival of `topic` from `publisher`, seen at `at` (a **monotonic** instant —
-    /// taken while receiving the frame, never from the frame's own `stamp`, so a rate cannot
-    /// inherit another board's clock error).
-    pub fn observe(&mut self, publisher: &PeerId, topic: &Topic, at: Instant) -> RateEvent {
+    /// Record one arrival of `topic` from `publisher`, of `bytes` framed bytes, seen at `at` (a
+    /// **monotonic** instant — taken while receiving the frame, never from the frame's own `stamp`,
+    /// so the figures cannot inherit another board's clock error).
+    ///
+    /// The byte count is part of the same call on purpose: a rate and a bandwidth that came from
+    /// different observations would be two windows to keep in step (`docs/amos-link.md` §3.20).
+    pub fn observe(
+        &mut self,
+        publisher: &PeerId,
+        topic: &Topic,
+        at: Instant,
+        bytes: usize,
+    ) -> RateEvent {
+        let bytes = bytes as u64;
         let key = StreamKey::new(publisher.clone(), topic.clone());
         match self.streams.get_mut(&key) {
             Some(arrivals) => {
                 arrivals.frames += 1;
+                arrivals.bytes = arrivals.bytes.saturating_add(bytes);
                 // Keep the *last* arrival, and never let the window run backwards.
                 arrivals.last = arrivals.last.max(at);
                 RateEvent::Counted {
@@ -206,6 +242,7 @@ impl RateTracker {
                     key,
                     Arrivals {
                         frames: 1,
+                        bytes,
                         first: at,
                         last: at,
                     },
@@ -215,13 +252,14 @@ impl RateTracker {
         }
     }
 
-    /// Record one arriving frame (the stream it belongs to is what its own header says).
+    /// Record one arriving frame (the stream it belongs to, and its framed size, are what its own
+    /// header says — so a caller never has to know the payload's type).
     pub fn observe_received<T: Message>(
         &mut self,
         received: &Received<T>,
         at: Instant,
     ) -> RateEvent {
-        self.observe(&received.publisher, &received.topic, at)
+        self.observe(&received.publisher, &received.topic, at, received.frame_len)
     }
 
     /// The rate of one stream (`None` = never observed).
@@ -263,6 +301,14 @@ impl RateTracker {
         self.streams.values().map(|a| a.frames).sum()
     }
 
+    /// Total framed bytes those measured arrivals carried (same boundary as
+    /// [`RateTracker::frames`]: untracked streams are outside it, and `is_complete()` says so).
+    pub fn bytes(&self) -> u64 {
+        self.streams
+            .values()
+            .fold(0u64, |total, a| total.saturating_add(a.bytes))
+    }
+
     /// Forget every stream (what a consumer does after a deliberate reconnect). Untracked frames
     /// stay counted: they are a fact about what this tracker *could not* measure, and a reset that
     /// hid them would erase evidence.
@@ -275,22 +321,25 @@ impl RateTracker {
 ///
 /// The rate is `intervals / span` — **not** `frames / span`: `n` arrivals span `n − 1` intervals,
 /// and dividing by `frames` would make every stream read ~1.7% fast at 60 Hz (and 100% fast at
-/// two frames, where the answer would be `2 / span`). A reader who wants to check the arithmetic
-/// has both numbers on the same line.
+/// two frames, where the answer would be `2 / span`). The bandwidth is `bytes / span` — the
+/// printed total over the printed span, the arithmetic a reader can check on the line itself
+/// (§3.20 states the one-frame bias that buys).
+///
+/// **One rule for both figures**: when the span cannot carry a rate, it cannot carry a bandwidth
+/// either, so `rate_hz` and `bytes_per_sec` are `None` together and [`StreamRate::evidence`]
+/// explains it once.
 fn stream_rate(key: &StreamKey, arrivals: &Arrivals) -> StreamRate {
     let intervals = arrivals.frames.saturating_sub(1);
     let span = arrivals.span();
-    let rate_hz = if intervals == 0 || span < MIN_RATE_SPAN {
-        None
-    } else {
-        Some(intervals as f64 / span.as_secs_f64())
-    };
+    let measurable = intervals > 0 && span >= MIN_RATE_SPAN;
     StreamRate {
         publisher: key.publisher().clone(),
         topic: key.topic().clone(),
         frames: arrivals.frames,
+        bytes: arrivals.bytes,
         span: (arrivals.frames > 1).then_some(span),
-        rate_hz,
+        rate_hz: measurable.then(|| intervals as f64 / span.as_secs_f64()),
+        bytes_per_sec: measurable.then(|| arrivals.bytes as f64 / span.as_secs_f64()),
     }
 }
 
@@ -306,7 +355,7 @@ mod tests {
         Topic::new(s).expect("topic")
     }
 
-    /// Inject `frames` arrivals of one stream `gap` apart, starting at `t0`.
+    /// Inject `frames` arrivals of one stream `gap` apart, starting at `t0`, each `bytes` big.
     ///
     /// Deterministic by construction: the instants are handed in, so the expected rate is
     /// arithmetic rather than a measurement of this machine's scheduler.
@@ -320,8 +369,69 @@ mod tests {
     ) {
         let (p, t) = (peer(publisher), topic(topic_str));
         for n in 0..frames {
-            tracker.observe(&p, &t, t0 + gap * n as u32);
+            tracker.observe(&p, &t, t0 + gap * n as u32, 1024);
         }
+    }
+
+    #[test]
+    fn a_bandwidth_is_bytes_over_the_same_span_and_is_refused_with_the_rate() {
+        // The two figures share one window and one rule: a span that cannot carry a rate cannot
+        // carry a bandwidth either, so a stream can never report one and refuse the other.
+        let mut tracker = RateTracker::new();
+        let t0 = Instant::now();
+        let (p, t) = (peer("dog1"), topic("amos/dog1/sensor/stereo_left"));
+        // 5 frames of 1 KiB, 250 ms apart: span 1 s ⇒ 4 Hz and 5 KiB/s.
+        for n in 0..5 {
+            tracker.observe(&p, &t, t0 + Duration::from_millis(250) * n, 1024);
+        }
+        let rate = tracker.rate(&p, &t).expect("observed");
+        assert_eq!(rate.frames, 5);
+        assert_eq!(rate.bytes, 5 * 1024);
+        let bw = rate
+            .bytes_per_sec
+            .expect("1 s of span is enough for both figures");
+        assert!((bw - 5120.0).abs() < 1e-9, "got {bw}");
+        assert!((rate.rate_hz.expect("rate") - 4.0).abs() < 1e-9);
+        assert_eq!(tracker.bytes(), 5 * 1024);
+
+        // One frame: the bytes are known, the *rates* are not — and both say so.
+        let mut one = RateTracker::new();
+        one.observe(&p, &t, t0, 4096);
+        let rate = one.rate(&p, &t).expect("observed");
+        assert_eq!(rate.bytes, 4096, "the size of a frame is a fact even alone");
+        assert_eq!(rate.rate_hz, None);
+        assert_eq!(rate.bytes_per_sec, None, "never a placeholder zero either");
+        assert_eq!(rate.evidence(), Some(RateEvidence::SingleFrame));
+
+        // Too short a window: refused for both, with the same reason.
+        let mut short = RateTracker::new();
+        for n in 0..3 {
+            short.observe(&p, &t, t0 + Duration::from_millis(20) * n, 1024);
+        }
+        let rate = short.rate(&p, &t).expect("observed");
+        assert_eq!(rate.bytes_per_sec, None);
+        assert_eq!(
+            rate.evidence(),
+            Some(RateEvidence::SpanTooShort {
+                span: Duration::from_millis(40)
+            })
+        );
+    }
+
+    #[test]
+    fn a_byte_total_saturates_instead_of_wrapping() {
+        // A consumer that runs for weeks must not report a *smaller* bandwidth than the link's
+        // real load: the total saturates at `u64::MAX` (the crate's rule for every counter —
+        // `telemetry::next_seq`, `LinkMetrics`), and the figure stays a lower bound rather than
+        // becoming a wrapped lie.
+        let mut tracker = RateTracker::new();
+        let t0 = Instant::now();
+        let (p, t) = (peer("dog1"), topic("amos/dog1/sensor/imu"));
+        tracker.observe(&p, &t, t0, usize::MAX);
+        tracker.observe(&p, &t, t0 + Duration::from_secs(1), usize::MAX);
+        let rate = tracker.rate(&p, &t).expect("observed");
+        assert_eq!(rate.bytes, u64::MAX, "saturated, not wrapped");
+        assert!(rate.bytes_per_sec.expect("measurable") > 0.0);
     }
 
     #[test]
@@ -357,7 +467,8 @@ mod tests {
             tracker.observe(
                 &peer("dog1"),
                 &topic("amos/dog1/sensor/stereo_left"),
-                Instant::now()
+                Instant::now(),
+                512,
             ),
             RateEvent::Counted { frames: 1 }
         );
@@ -469,8 +580,9 @@ mod tests {
             &peer("dog1"),
             &topic("amos/dog1/sensor/imu"),
             now + Duration::from_secs(9),
+            512,
         );
-        tracker.observe(&peer("dog1"), &topic("amos/dog1/sensor/imu"), now);
+        tracker.observe(&peer("dog1"), &topic("amos/dog1/sensor/imu"), now, 512);
         let rate = tracker
             .rate(&peer("dog1"), &topic("amos/dog1/sensor/imu"))
             .expect("observed");
@@ -485,13 +597,23 @@ mod tests {
         let t0 = Instant::now();
         for n in 0..MAX_TRACKED_STREAMS {
             assert_eq!(
-                tracker.observe(&peer("dog1"), &topic(&format!("amos/dog1/sensor/t{n}")), t0),
+                tracker.observe(
+                    &peer("dog1"),
+                    &topic(&format!("amos/dog1/sensor/t{n}")),
+                    t0,
+                    512,
+                ),
                 RateEvent::Counted { frames: 1 }
             );
         }
         assert!(tracker.is_complete(), "nothing refused yet");
         assert_eq!(
-            tracker.observe(&peer("dog1"), &topic("amos/dog1/sensor/one-too-many"), t0),
+            tracker.observe(
+                &peer("dog1"),
+                &topic("amos/dog1/sensor/one-too-many"),
+                t0,
+                512,
+            ),
             RateEvent::Untracked
         );
         assert_eq!(tracker.untracked(), 1);
@@ -507,7 +629,12 @@ mod tests {
         let mut tracker = RateTracker::new();
         let t0 = Instant::now();
         for n in 0..=MAX_TRACKED_STREAMS {
-            tracker.observe(&peer("dog1"), &topic(&format!("amos/dog1/sensor/t{n}")), t0);
+            tracker.observe(
+                &peer("dog1"),
+                &topic(&format!("amos/dog1/sensor/t{n}")),
+                t0,
+                512,
+            );
         }
         assert_eq!(tracker.untracked(), 1);
         tracker.reset();
