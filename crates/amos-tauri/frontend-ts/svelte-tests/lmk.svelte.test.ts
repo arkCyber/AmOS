@@ -5,8 +5,9 @@
  * and their freeze/thaw/reclaim actions.
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { cleanup, render } from "@testing-library/svelte";
+import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import LmkDebugPanel from "../src/svelte/LmkDebugPanel.svelte";
+import { zh } from "../src/i18n/locales/zh";
 import {
   RECONCILE_INTERVAL_MS,
   startPeriodicReconcile,
@@ -51,6 +52,71 @@ describe("LmkDebugPanel.svelte", () => {
     expect(txt(host)).toContain("com.example.photo");
     expect(txt(host)).toContain("解冻"); // cached → thaw
     expect(txt(host)).toContain("回收"); // cached → reclaim
+  });
+
+  /**
+   * A refused reclaim must not be shown as "frozen" (REQ-A299): both carry
+   * `killed: false`, and the panel used to read exactly that boolean — so a kill the
+   * container refused was displayed as a freeze that never happened. The daemon's
+   * observed `outcome` is now what the row reads, and the container's own reason is
+   * shown with it.
+   */
+  test("a refused reclaim reads 'refused' with the container's reason, never 'frozen'", async () => {
+    const invoke = async (cmd: string) => {
+      if (cmd === "android_lmk_tasks") return [];
+      if (cmd === "android_lmk_debug") {
+        return {
+          note: "trigger_lmk returned 2 victim(s)",
+          victims: [
+            {
+              package_name: "com.example.busy",
+              window_id: "w9",
+              killed: false,
+              outcome: "refused",
+              refusal_reason: "waydroid: `am force-stop` exited 1",
+            },
+            {
+              package_name: "com.example.idle",
+              window_id: "w8",
+              killed: false,
+              outcome: "frozen",
+              refusal_reason: "",
+            },
+          ],
+        };
+      }
+      return null;
+    };
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke,
+      listen: async () => () => {},
+    };
+
+    const host = render(LmkDebugPanel);
+    await settle();
+    const trigger = [...host.container.querySelectorAll("button")].find(
+      (b) => b.getAttribute("aria-label") === zh["lmk.ariaTrigger"],
+    ) as HTMLButtonElement;
+    await fireEvent.click(trigger);
+    await settle();
+    await settle();
+
+    // The row text: the outermost span whose text carries the package name.
+    const rowText = (pkg: string) =>
+      [...host.container.querySelectorAll("span")].find((s) =>
+        (s.textContent ?? "").includes(pkg),
+      )?.textContent ?? "";
+
+    expect(rowText("com.example.busy")).toContain("refused");
+    expect(rowText("com.example.busy")).toContain("am force-stop"); // the container's reason
+    expect(rowText("com.example.busy")).not.toContain("frozen");
+    expect(rowText("com.example.idle")).toContain("frozen");
+
+    // A refusal is a warning colour, not the reclaimed (danger) one.
+    const warned = [...host.container.querySelectorAll("span")].some(
+      (s) => (s.textContent ?? "").includes("refused") && s.className.includes("amber"),
+    );
+    expect(warned).toBe(true);
   });
 });
 
@@ -126,5 +192,73 @@ describe("startPeriodicReconcile (bridged, fake timers)", () => {
     await flush();
     expect(closed).toEqual([]);
     stop();
+  });
+});
+
+/**
+ * REQ-A297 phase-2 §4 cont.4: `lib/backend.ts::invoke` resolves `null` on a
+ * refused command and **never** rejects. The panel's pre-fix `try/catch` /
+ * `.catch(() => …)` patterns were dead code (a refused command manifested
+ * as the same observable state — a `null` reply — the success arm already
+ * handled). These two cases pin the move to explicit `null` checks plus a
+ * typed diagnostic in the ledger.
+ */
+describe("LmkDebugPanel — honest error surfacing (REQ-A297 phase-2 §4 cont.4)", () => {
+  test("a refused android_lmk_tasks shows the offline line and logs the typed error", async () => {
+    // A bridge that always returns `null` simulates "host refused / not bridged".
+    const invoke = async () => null;
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke,
+      listen: async () => () => {},
+    };
+    const warns: unknown[] = [];
+    const orig = console.warn;
+    console.warn = (...args: unknown[]) => warns.push(args);
+    try {
+      const host = render(LmkDebugPanel);
+      await settle();
+      await settle();
+      // The offline line is still visible (an explicit `null` reply — the
+      // pre-fix path — already produced it; the change is **diagnostic
+      // surfacing**, not UI).
+      expect(txt(host)).toContain(zh["lmk.offline"]);
+      // The .catch that used to flip `offline = true` is gone: nothing
+      // should have come out of `console.warn` for an unhandled rejection,
+      // because there was no rejection.
+      const rejections = warns.filter((w) =>
+        String(w[0] ?? "").includes("unhandled"),
+      );
+      expect(rejections).toEqual([]);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  test("a refused android_lmk_debug surfaces the localised fail note (no .catch needed)", async () => {
+    // List returns a real task (so the panel shows the row) but debug refuses.
+    const invoke = async (cmd: string) =>
+      cmd === "android_lmk_tasks"
+        ? [{ window_id: "w1", package_name: "com.example.a", state: "cached" }]
+        : null;
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke,
+      listen: async () => () => {},
+    };
+    const host = render(LmkDebugPanel);
+    await settle();
+    await settle();
+    // Find the trigger button (the first of the action buttons at the
+    // top). Clicking it sends `trigger` -> `android_lmk_debug`.
+    const btn = host.container.querySelector(
+      "button",
+    ) as HTMLButtonElement | null;
+    expect(btn).not.toBeNull();
+    await fireEvent.click(btn!);
+    await settle();
+    await settle();
+    // The local i18n line — `lmk.fail` — is now the *typed* error path,
+    // not the .catch fallback. The user sees the same text; the launcher
+    // ledger now sees the typed reason.
+    expect(txt(host)).toContain(zh["lmk.fail"]);
   });
 });

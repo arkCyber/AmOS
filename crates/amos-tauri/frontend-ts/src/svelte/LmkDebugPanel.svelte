@@ -7,9 +7,12 @@
   import {
     androidLmkDebug,
     androidLmkTasks,
+    victimState,
     type AndroidLmkTask,
     type LmkVictim,
+    type LmkVictimState,
   } from "../lib/lmk";
+  import { bridgeDiag, isCommandFailed } from "../lib/backend";
   import { t } from "./locale.svelte";
 
   const GROUP =
@@ -44,6 +47,26 @@
     }
   }
 
+  /** Which state token to show for a victim. The daemon's `outcome` is authoritative
+   *  (REQ-A299): `killed: false` alone cannot tell "frozen to Cached" from "the
+   *  container refused", and showing the latter as frozen is a claim that did not
+   *  happen. */
+  const VICTIM_KEY: Record<LmkVictimState, string> = {
+    reclaimed: "lmk.killed",
+    frozen: "lmk.frozen",
+    refused: "lmk.refused",
+    unknown: "lmk.unknown",
+  };
+  const VICTIM_CLASS: Record<LmkVictimState, string> = {
+    reclaimed: "text-red-500",
+    frozen: "opacity-60",
+    // A refusal is not a failure — nothing happened — so it is a warning, not danger.
+    refused: "text-amber-600 dark:text-amber-500",
+    unknown: "opacity-40",
+  };
+  /** The container's own reason, appended only when it refused the action. */
+  const reasonSuffix = (v: LmkVictim) => (v.refusal_reason ? ` (${v.refusal_reason})` : "");
+
   let busy = $state(false);
   let note = $state<string | null>(null);
   let tasks = $state<AndroidLmkTask[]>([]);
@@ -66,12 +89,29 @@
   };
 
   const refresh = () => {
+    // REQ-A297 phase-2 §4 cont.4: `androidLmkTasks()` (and every other
+    // `lib/backend.ts` wrapper) resolves `null` on a refused command and
+    // **never** rejects — see `lib/backend.ts::invoke`. The pre-fix
+    // `.catch(() => (offline = true))` was dead code: a refused
+    // `android_lmk_tasks` returns `null`, and the success arm already
+    // flips `offline` on that exact value (`offline = l === null`). What
+    // was silently empty before was the *typed* error code, which now
+    // lands in the diagnostic ledger (P1-3) so ops can tell "the daemon
+    // refused" from "the daemon is offline".
     androidLmkTasks()
       .then((l) => {
         tasks = l ?? [];
         offline = l === null;
-      })
-      .catch(() => (offline = true));
+        if (l === null) {
+          // `isCommandFailed` narrows `BridgeDiag` to its `kind: "command-failed"`
+          // arm (REQ-A296's typed contract). "not-bridged" is the same as `l === null`
+          // already, so it isn't interesting on this path.
+          const diag = bridgeDiag("android_lmk_tasks");
+          if (isCommandFailed(diag)) {
+            console.warn("🛟 [LmkDebugPanel] android_lmk_tasks refused:", diag.detail);
+          }
+        }
+      });
   };
   $effect(() => {
     refresh();
@@ -97,10 +137,18 @@
             ].slice(0, 5);
           }
           refresh();
+        } else {
+          // REQ-A297 phase-2 §4 cont.4: a refused `android_lmk_debug` returns
+          // `null`; the user-facing "fail" note is correct for that (same as
+          // before), but the .catch that used to host this branch was dead
+          // because `invoke` never rejects (lib/backend.ts). The typed
+          // reason now lives in the diagnostic ledger.
+          showNote(t("lmk.fail"));
+          const diag = bridgeDiag("android_lmk_debug");
+          if (isCommandFailed(diag)) {
+            console.warn("🛟 [LmkDebugPanel] android_lmk_debug refused:", diag.detail);
+          }
         }
-      })
-      .catch(() => {
-        showNote(t("lmk.fail"));
       })
       .finally(() => (busy = false));
   };
@@ -176,11 +224,10 @@
           <li class="opacity-80">
             <span class="mr-1 opacity-50">{r.at}</span>
             {#each r.victims as v, j (j)}
+              {@const st = victimState(v)}
               <span class="mr-2">
                 {v.package_name}
-                <span class={v.killed ? "text-red-500" : "opacity-60"}>
-                  {t(v.killed ? "lmk.killed" : "lmk.frozen")}
-                </span>
+                <span class={VICTIM_CLASS[st]}>{t(VICTIM_KEY[st])}{reasonSuffix(v)}</span>
               </span>
             {/each}
           </li>
