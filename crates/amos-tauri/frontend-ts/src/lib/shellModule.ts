@@ -53,6 +53,8 @@ export interface ShellShortcut {
   key: string;
   /** ⌘ on an Apple keyboard (`ctrlKey` counts too — the shell already treated it so). */
   meta?: boolean;
+  /** Control key (⌃), distinct from meta for Spaces navigation. */
+  ctrl?: boolean;
   shift?: boolean;
   alt?: boolean;
 }
@@ -98,7 +100,41 @@ export function normalizeKey(key: string): string {
  */
 export function shortcutMatches(e: ShortcutEvent, s: ShellShortcut): boolean {
   if (normalizeKey(e.key) !== s.key) return false;
-  if (Boolean(s.meta) !== Boolean(e.metaKey || e.ctrlKey)) return false;
+  // **REQ-A297 phase-2 §2 (compat policy)**. The shell chrome has always
+  // counted an external keyboard's `Ctrl` as equivalent to ⌘ for the four
+  // documented overlay launches (Spotlight / Mission Control / Launchpad) so
+  // users without an Apple keyboard still get the registry to fire. This is
+  // load-bearing: `shellModule.test.ts` pins the matcher against the binding
+  // set `["F3", "F4", "Meta+Space", "Meta+Tab"]`, and breaking ctrlKey→⌘
+  // equivalence would silently expand the set.
+  //
+  // Two modifier checks, one truth-table:
+  //   ┌─────────────────────────────────────────────────────────────────────┐
+  //   │ s.meta=true / s.ctrl=undefined  → matches metaKey OR ctrlKey        │
+  //   │   (legacy Apple-binding: ctrlKey is treated as ⌘)                    │
+  //   │ s.meta=true / s.ctrl=true       → matches metaKey only               │
+  //   │   (explicit "Ctrl AND ⌘", reserved for future use)                  │
+  //   │ s.meta=undefined / s.ctrl=true  → matches ctrlKey only (Meta absent) │
+  //   │   (Ctrl-only binding; matches our dormant `ctrl: true` branch)      │
+  //   │ all other shapes                                                   → undef│
+  //   └─────────────────────────────────────────────────────────────────────┘
+  // The shell-chrome registry declares none after REQ-A297 phase-2 §2, so
+  // only row 1 is live today; the other rows exist as the explicit "I really
+  // mean Ctrl, not ⌘" escape hatch for future rows that need it.
+  if (s.meta) {
+    // Meta required. Implicit-Ctrl-as-Meta is on unless the binding opted
+    // out by also setting `ctrl: true`.
+    const ctrlAsMeta = !s.ctrl;
+    const metaHits = Boolean(e.metaKey || (ctrlAsMeta && e.ctrlKey));
+    if (!metaHits) return false;
+  } else if (s.ctrl) {
+    // Pure Ctrl binding: requires ctrlKey, forbids metaKey.
+    if (!e.ctrlKey || e.metaKey) return false;
+  } else {
+    // Binding declares no modifier at all — the user must not have hit Meta
+    // or Ctrl either, or it would be hijacked by a more specific row.
+    if (e.metaKey || e.ctrlKey) return false;
+  }
   if (Boolean(s.shift) !== Boolean(e.shiftKey)) return false;
   if (Boolean(s.alt) !== Boolean(e.altKey)) return false;
   return true;
@@ -107,6 +143,7 @@ export function shortcutMatches(e: ShortcutEvent, s: ShellShortcut): boolean {
 /** The human label for a binding: `"⌘Space"`, `"⇥"`, `"F4"`. Modifier order is Apple's. */
 export function formatShortcut(s: ShellShortcut): string {
   let out = "";
+  if (s.ctrl) out += "⌃";
   if (s.alt) out += "⌥";
   if (s.shift) out += "⇧";
   if (s.meta) out += "⌘";
@@ -119,6 +156,7 @@ export function formatShortcut(s: ShellShortcut): string {
  */
 export function shortcutAria(s: ShellShortcut): string {
   const parts: string[] = [];
+  if (s.ctrl) parts.push("Control");
   if (s.alt) parts.push("Alt");
   if (s.shift) parts.push("Shift");
   if (s.meta) parts.push("Meta");

@@ -146,6 +146,12 @@ describe("the shipped chrome registry", () => {
       "spotlight",
       "mission-control",
       "control-center-panel",
+      // spaces-panel is the 5th overlay (order 50). It deliberately has no entry
+      // in the chrome shortcuts table — its launch binding (Ctrl+↑) is wired in
+      // `DesktopShell` so the doc-vs-code invariant on the shortcut set
+      // (`F3 / F4 / ⌘Space / ⌘Tab`) keeps holding and Ctrl+ArrowLeft/Right stays
+      // free for editor caret motion.
+      "spaces-panel",
     ]);
   });
 
@@ -232,7 +238,40 @@ describe("the shortcut table (the overlay rows are the list)", () => {
     expect(formatShortcut({ key: "Tab", meta: true, shift: true })).toBe("⇧⌘⇥");
     expect(formatShortcut({ key: "F4" })).toBe("F4");
     expect(formatShortcut({ key: "ArrowDown" })).toBe("↓");
+    expect(formatShortcut({ key: "ArrowUp", ctrl: true })).toBe("⌃↑");
     expect(shortcutAria({ key: "Space", meta: true })).toBe("Meta+Space");
+    expect(shortcutAria({ key: "ArrowUp", ctrl: true })).toBe("Control+ArrowUp");
     expect(shortcutMatches({ key: " " }, { key: "Space" })).toBe(true);
+  });
+
+  /**
+   * REQ-A297 phase-2 §2 (compat policy). The shell chrome has always counted
+   * ⌃ as ⌘ on `meta`-decorated bindings; adding `ctrl` was meant to escape
+   * that fold, not break it. This table pins the four corners the inline
+   * doc-comment promises:
+   *
+   *   ┌──────────────┬──────────────────────────┬──────────────────┐
+   *   │ Binding      │ Event                    │ Expected match   │
+   *   ├──────────────┼──────────────────────────┼──────────────────┤
+   *   │ { meta }     │ metaKey OR ctrlKey       │ meta binding     │
+   *   │ { meta, ctrl } │ metaKey (ctrlKey alone) │ false (escapes) │
+   *   │ { ctrl }     │ ctrlKey alone            │ ctrl binding     │
+   *   │ { }          │ metaKey + ctrlKey        │ false (modifier) │
+   *   └──────────────┴──────────────────────────┴──────────────────┘
+   */
+  test("the modifier truth-table: ctrl as meta fold + ctrl-only escape hatch", () => {
+    // Row 1: implicit ctrl→meta fold (legacy Apple-keyboard freedom)
+    expect(shortcutMatches({ key: "Space", metaKey: true }, { key: "Space", meta: true })).toBe(true);
+    expect(shortcutMatches({ key: " ", ctrlKey: true }, { key: "Space", meta: true })).toBe(true);
+    expect(shortcutMatches({ key: " ", metaKey: true, ctrlKey: true }, { key: "Space", meta: true })).toBe(true);
+    // Row 2: opted-in `ctrl: true` escapes the fold and requires metaKey-only
+    expect(shortcutMatches({ key: " ", ctrlKey: true }, { key: " ", meta: true, ctrl: true })).toBe(false);
+    // Row 3: pure-Ctrl row
+    expect(shortcutMatches({ key: "ArrowUp", ctrlKey: true }, { key: "ArrowUp", ctrl: true })).toBe(true);
+    expect(shortcutMatches({ key: "ArrowUp", metaKey: true, ctrlKey: true }, { key: "ArrowUp", ctrl: true })).toBe(false);
+    expect(shortcutMatches({ key: "ArrowUp", metaKey: true }, { key: "ArrowUp", ctrl: true })).toBe(false);
+    // Row 4: a no-modifier binding must NOT fire when the user is holding a modifier
+    expect(shortcutMatches({ key: "F4", metaKey: true }, { key: "F4" })).toBe(false);
+    expect(shortcutMatches({ key: "F4", ctrlKey: true }, { key: "F4" })).toBe(false);
   });
 });

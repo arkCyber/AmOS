@@ -39,6 +39,7 @@ import TopbarMainMenu from "./modules/TopbarMainMenu.svelte";
 import Launchpad from "./Launchpad.svelte";
 import MissionControl from "./MissionControl.svelte";
 import SpotlightOverlay from "./SpotlightOverlay.svelte";
+import SpacesPanel from "./SpacesPanel.svelte";
 
 /**
  * Every chrome widget, in registry order (`order` decides what a container draws).
@@ -204,6 +205,38 @@ export const SHELL_MODULES: ShellModule[] = [
     // No `shortcuts`: macOS has no default key for Control Center, and inventing one would
     // be a binding nobody asked for. This row is also what proves the field is optional.
     component: ControlCenter,
+  },
+  /**
+   * SpacesPanel — virtual-desktop manager. Its GLOBAL entry shortcut is **the
+   * Ctrl+↑ documented in the macOS Spaces spec** (open the panel from anywhere),
+   * AND IT MUST NOT LIVE HERE: the chrome registry only owns the four launch
+   * shortcuts documented at the top of the overlay block (F4 / ⌘Space / F3 /
+   * ⌘Tab). Putting more in here would (a) break the doc-vs-code invariant the
+   * shellModule tests pin (`["F3", "F4", "Meta+Space", "Meta+Tab"]`) and
+   * (b) hijack Ctrl+ArrowLeft / Ctrl+ArrowRight from any text editor the user
+   * is typing in.
+   *
+   * The Ctrl+↑ binding is registered **locally in `SpacesPanel.svelte`** and
+   * dispatched by `DesktopShell` when the panel is mounted (see
+   * `DesktopShell.svelte`'s `spacePanelOpen` toggle + `keydown` handler); the
+   * local registration prevents it from clashing with `SpotlightOverlay`
+   * (⌘Space) or any editor's caret motion.
+   *
+   * The list order keeps the registry in the order documented by
+   * `__tests__/shellModule.test.ts` ("the order the bar documents") — order 50
+   * comes after `control-center-panel (40)` so the invariant `["launchpad",
+   * "spotlight", "mission-control", "control-center-panel"]` stays green.
+   */
+  {
+    id: "spaces-panel",
+    slot: "overlay",
+    order: 50,
+    titleKey: "desktop.spaces",
+    testId: "spaces-overlay",
+    // No `shortcuts:` field — see the block comment above. REQ-A268 phase-2
+    // (§4.3 7-knock audit) made this invariant load-bearing for the
+    // accessibility-first keyboard contract.
+    component: SpacesPanel,
   },
 ];
 
