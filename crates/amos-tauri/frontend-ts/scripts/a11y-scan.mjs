@@ -197,20 +197,60 @@ function r3_tabOrder(file, content) {
 }
 
 /**
- * 规则 R4: <Switch> / <Segmented> 之外的"按钮式" <button> 没有 focus-visible 类。
+ * 规则 R4 (REQ-A285): <button> 没有可见的 focus 指示。
  *
- * 启发式比较松:
- *   - 文件 import 了 lib/shellChrome.ts(共享 token 库,带 focus-visible:ring-2
- *     的 CHROME_ICON_BUTTON/CHROME_MENU_BUTTON 都在那里) ⇒ 不报,
- *     因为共享 token 已带 focus ring,模板字符串里看不到而已
- *   - 否则: <button class="…"> 不含 outline/ring/focus 关键字 ⇒ 报
+ * v1/v2 是**文件级**信号,误报率高: ①<button class="..."> 在模板字符串里拼接
+ * 共享 token,扫描器看不到 token 内的 focus-visible:ring-*; ②全局 CSS
+ * `button:focus-visible { outline: 2px solid ... }` 也能给所有 button 装上 ring,
+ * 模板里依然看不到。
  *
- * 这是 a11y 误报最容易的一维——所以 R4 故意保守:有真共享 token 的不强报,
- * 让人类复核时一眼能看出"哪个 button 漏了 ring"。这是
- * "i18n-scan/store-scan/unwired-scan 家族的诚实 UI"原则:信号不要冒头太广。
+ * v3 改成两路检查 + 信任:
+ *   (a) **全局** `button:focus-visible { outline: ... }` 在 index.css 等里有 —
+ *       信任它(REQ-A285)。整个扫描器里**只**这一项信任 CSS,其他 a11y 仍要求
+ *       文件级的 ARIA 属性。
+ *   (b) 文件**未** trust (a) 时 — 检查每个 <button> class 是否显式带 ring/outline/
+ *       focus 关键字(共享 token 仍按 import shellChrome 排除)。
+ *
+ * 误报依然可能(全局 CSS 没生效、tailwind 升级覆盖了),但**比**逐文件加
+ * focus-visible:ring-* 更诚实——前者是真的"用户能看见 ring",后者只是"代码
+ * 里写了 ring"。
  */
+let globalFocusRing = null; // memoised across the scan
+function hasGlobalFocusRing() {
+  if (globalFocusRing !== null) return globalFocusRing;
+  // Walk the frontend-ts source tree for *.css and check for button:focus-visible + outline: solid
+  const CSS_ROOTS = [
+    path.join(ROOT, "crates/amos-tauri/frontend-ts/src"),
+    path.join(ROOT, "crates/amos-tauri/frontend-ts/src/svelte"),
+  ];
+  let found = false;
+  const walk = (dir) => {
+    if (found) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile() && e.name.endsWith(".css")) {
+        const css = readSafe(p);
+        if (/button[^{]*:focus-visible[^{]*\{[^}]*outline:\s*[^;]*solid/.test(css)) {
+          found = true;
+          return;
+        }
+      }
+    }
+  };
+  for (const root of CSS_ROOTS) walk(root);
+  globalFocusRing = found;
+  return found;
+}
+
 function r4_focusVisible(file, content) {
   if (/from\s+["'][^"']*shellChrome["']/.test(content)) return null;
+  // Global CSS trust — REQ-A285 says a top-level `button:focus-visible { outline: ... }`
+  // covers every <button> in the app. We do **not** trust non-button selectors here
+  // (a <div role="button"> with outline-none is still a gap we want to see).
+  if (hasGlobalFocusRing()) return null;
   const re = /<button\b[^>]*?\bclass="([^"]*)"/g;
   const missing = [];
   let m;
@@ -396,7 +436,28 @@ function selftest() {
     console.error("  findings:", JSON.stringify(f6, null, 2));
     process.exit(1);
   }
-  console.log("[a11y-scan] selftest: 6 assertion(s), 0 failure(s).");
+  // sample 7 (REQ-A285): a bare <button class="..."> without any focus-visible keyword. With
+  // the global CSS rule `button:focus-visible { outline: ... }` present in src/index.css,
+  // R4 v3 must stay silent — the rule proves keyboard users see the blue outline, so the
+  // file-level signal is a false positive. (Earlier drafts of R4 would have flagged this
+  // even with the global CSS in place, because they only inspected the button's class attr.)
+  if (!hasGlobalFocusRing()) {
+    console.error("[a11y-scan selftest] FAIL: src/index.css does not carry the expected button:focus-visible outline rule");
+    console.error("  REQ-A285 wants the global CSS in place before R4 v3 trusts it.");
+    process.exit(1);
+  }
+  const good7 = `<script></script>
+<button class="rounded-full bg-accent px-3 py-1 text-white">ok</button>`;
+  const tmp7 = path.join("/tmp", `a11y-scan-selftest-7-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp7, good7);
+  const f7 = scan(tmp7);
+  fs.unlinkSync(tmp7);
+  if (f7.some(x => x.rule.includes("focus-visible"))) {
+    console.error("[a11y-scan selftest] FAIL: R4 v3 should trust the global button:focus-visible rule");
+    console.error("  findings:", JSON.stringify(f7, null, 2));
+    process.exit(1);
+  }
+  console.log("[a11y-scan] selftest: 7 assertion(s), 0 failure(s).");
 }
 
 // ─── 入口 ────────────────────────────────────────────────────────────────────

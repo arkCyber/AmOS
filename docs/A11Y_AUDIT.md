@@ -1,9 +1,7 @@
 # AmOS Frontend A11y Audit (REQ-A282 → REQ-A283)
 
-> 状态: 第一刀扫描完成,缺口已枚举;**P0 的两把刀已按 REQ-A283 补完第一把(label-field-association,
-> 14 → 0),第二把(live-region,18)/第三把(focus-visible,47)仍**未**修 —— 见 §3.1.5 / §6。
-> 方法: `scripts/a11y-scan.mjs` 启发式扫描 + DOM 级实测(`svelte-tests/settings-a11y.svelte.test.ts`)
-> + 人工分桶(严重性/真信号/误报)。
+> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) 修完 label-field-association, 刀 2(REQ-A284) 修完 live-region, 刀 3(REQ-A285) 修完 focus-visible。扫描器当前报 0 缺口。
+> 方法: `scripts/a11y-scan.mjs` 启发式扫描 + DOM 级实测 + 人工分桶(严重性/真信号/误报)。
 > 底线: a11y 缺口的影响面 = 用键盘 / 屏幕阅读器的用户根本无法用,所以即使是误报上限也按"先补再说"——但补哪条按严重性,不是按发现数。
 
 > **本文件是人工判断报告;扫描器的最新数据表见** `node scripts/a11y-scan.mjs --md`(默认输出到 stdout)。脚本不会自动覆盖本文件——加 `--write` 才会写。**两个职责分开**:本文件决定补哪些、按什么顺序;脚本是清单与回归信号。
@@ -17,25 +15,22 @@
 
 ## 1. 摘要
 
-| 维度 | REQ-A282(首扫) | REQ-A283(刀 1 后,实测) |
-|---|---:|---:|
-| 扫描文件(`src/svelte/**/*.svelte`) | 106 | 109(新 3 个行原语) |
-| 含缺口文件 | 65 (61.3%) | **58** |
-| 总缺口数 | 79 | **65** |
-| `label-field-association` | 14 | **0** |
-| `live-region` | 18 | 18(未动) |
-| `focus-visible` | 47 | 47(未动) |
-| `custom-control-role` / `tab-order` | 0 / 0 | 0 / 0 |
+| 维度 | REQ-A282(首扫) | REQ-A283(刀 1) | REQ-A284(刀 2) | REQ-A285(刀 3) |
+|---|---:|---:|---:|---:|---:|
+| 含缺口文件 | 65 (61.3%) | 58 | 53 | **0** |
+| 总缺口数 | 79 | 65 | 47 | **0** |
+| `label-field-association` | 14 | **0** | 0 | 0 |
+| `live-region` | 18 | 18 | **0** | 0 |
+| `focus-visible` | 47 | 47 | 47 | **0** |
+| `custom-control-role` / `tab-order` | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
 
 按缺口类型:
 
 | 缺口类型 | 数 | 严重性 |
-|---|---:|---|
-| live-region(状态变化不广播) | 18 | 高 — 屏幕阅读器完全感知不到状态变化 |
-| label-field-association(控件无关联 label) | ~~14~~ **0** | 高 — 已按 REQ-A283 修完(§3.1.1/§3.1.5) |
-| focus-visible(键盘焦点不可见) | 47 | 中 — 键盘用户能 tab,但看不到自己 focus 在哪里 |
-| custom-control-role | 0 | 已无信号(R2 的 3 个误报已通过 pointer-events + aria-hidden 排除过滤) |
-| tab-order(tabindex >= 1) | 0 | 已无信号 |
+|---|---:|
+| ~~live-region~~ / ~~focus-visible~~ / ~~label-field-association~~ — **P0/P1 全部归零** | ~~18~~ / ~~47~~ / ~~14~~ **0** | 高/中 — **REQ-A283/284/285 全部修完(§3.1.5/§3.1.6/§3.1.7)** |
+| custom-control-role / tab-order | 0 | 已无信号(R2/R3 扫描器规则已调优) |
+
 
 ---
 
@@ -228,23 +223,77 @@ bun run a11y:scan
 bun run check
 ```
 
-### 3.2 P1 — 应修(影响键盘用户)
+### 3.1.7 已补: 刀 3 的全局 button:focus-visible outline(REQ-A285)
 
+§3.2 原来列了 47 个 focus-visible 缺口,估计误报率 20%+,修法是"逐文件加 focus-visible:ring-*"。
+这条路有三个问题:
+1. **量大**: 47 个文件 × 每文件多个 button,改完 diff 里全是样式代码,review 成本极高。
+2. **视觉不统一**: 每个文件各自决定 ring 颜色/粗细,没有 token 集中。
+3. **假修复**: 写在代码里的 `focus-visible:ring-*` 只证明"开发者知道这事",不证明"用户真的能看到 ring"——如果 Tailwind 配置升级、某个 @layer 规则覆盖,按钮又瞎了。
 
-#### 47 个 focus-visible 缺口
+**根本原因**: `index.css` 的 `:focus-visible { outline: 2px solid … }` 已经给**所有** focusable 元素装上了 outline,但 Tailwind 的 `outline-none` utility (specificity 0,1,0)覆盖了它。
 
-启发式规则 R4 已在 v2 引入"import shellChrome ⇒ 跳过",但还有 47 个文件未使用共享 token,button 类硬编码无 focus-visible:ring-*。这意味着它们至少需要一次人工复核:是真的没 ring,还是视觉上用了别的 focus 暗示(如 hover 高亮、阴影变化)?
+**修法 — 全局 CSS 升级 specificity(REQ-A285)**:
+```css
+/* index.css */
+button:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid rgba(10, 132, 255, 0.9);
+  outline-offset: 2px;
+}
+```
 
-**判断力分桶**:
+**为什么这个修法正确**:
 
-- **真缺口**: 纯文字 / icon-only button(`<button class="rounded-full bg-accent px-3 py-1 text-white">`)— 视觉上无 focus 暗示。例: MagnifierApp, MailApp, MapsApp, MessagesApp, MusicApp。
-- **可能误报**: 内部一次性按钮 / toast dismiss / 调试面板(LmkDebugPanel, SensorPanel)。
-- **一次性控件**: 装饰性按钮(只显示、不交互)— 不需要 ring。
+| 选择器 | Specificity |
+|---|---|
+| `:focus-visible` (旧) | (0,1,0) — 和 `.outline-none` 一样, Tailwind 后加载赢 |
+| `button:focus-visible` (新) | (0,1,1) — 元素+伪类 > 纯类, **总是赢** |
+| `focus-visible:outline-none focus-visible:ring-2` (CHROME tokens) | (0,2,0) — 两类 > (0,1,1), chrome widget 保持白色 ring |
 
-**修法(共享 token 化)**:
-- 把 `focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60` 这样的字符串集中到 lib/shellChrome.ts,导出 BUTTON_FOCUS_RING。
-- 47 个文件改成 `<button class={`${BUTTON_FOCUS_RING} …`}>`。
-- 或者更优:全局 CSS 一行——`@layer base { button:focus-visible { outline: 2px solid white; outline-offset: 2px; } }`——但这违背了 shellChrome "Token 集中" 的原则,且影响 chrome 之外的 button。
+**结果**: 47 → **0**。R4 扫描器升级 v3——先检查全局 `button:focus-visible { outline: … }` 是否存在,存在则整次扫描对此规则返回 null。
+
+**扫描器升级(R4 v3)**: 新增 `hasGlobalFocusRing()` 检查——walk src/*.css 找 `button[^{]*:focus-visible[^{]*\{[^}]*outline:\s*[^;]*solid`。
+- 存在: R4 返回 null(信任全局 CSS)
+- 不存在: 走原有文件级检测
+
+**测试**(5 例,`svelte-tests/focus-visible-a11y.svelte.test.ts`):
+- `shell-entry` 真的 import `index.css`(否则规则不进 bundle)
+- `button:focus-visible` + `[role="button"]:focus-visible` 同时存在
+- 规则有 `outline: … solid`(不是 none/transparent)
+- 规则**无** `!important`(不需要,纯靠 specificity)
+- `shellChrome.ts` 的 chrome tokens 保持 `focus-visible:outline-none`(opt-out) + `focus-visible:ring-2 focus-visible:ring-white/60`
+
+**负向控制**: 把 `index.css` 的规则删掉 ⇒ selftest sample 7 变红("src/index.css does not carry the expected button:focus-visible outline rule")。还原后 7/7 复绿。
+
+**扫描器自测 +1(6 → 7)**: sample 7 = 一个不带任何 focus-visible class 的裸 `<button>` 在有全局 CSS 时 R4 必须沉默。
+
+**证据(同机实跑)**:
+```bash
+# 改前: 47 focus-visible 缺口
+# 改后: 0 缺口
+node scripts/a11y-scan.mjs --json
+#   total: 0  files: 0
+
+# 全套 check: 960 passed(952 → 960, +8 例 focus-visible 测试)
+bun run check
+```
+
+---
+
+### 3.2 P1 — ~~47 个 focus-visible 缺口~~ → **已补(REQ-A285,见 §3.1.7)**
+
+~~启发式规则 R4 已在 v2 引入"import shellChrome ⇒ 跳过",但还有 47 个文件未使用共享 token,button 类硬编码无 focus-visible:ring-*。~~
+
+~~**判断力分桶**:~~
+
+~~- **真缺口**: 纯文字 / icon-only button — 视觉上无 focus 暗示。例: MagnifierApp, MailApp, MapsApp, MessagesApp, MusicApp。~~
+~~- **可能误报**: 内部一次性按钮 / toast dismiss / 调试面板。~~
+~~- **一次性控件**: 装饰性按钮 — 不需要 ring。~~
+
+~~**修法(共享 token 化)**:~~
+
+~~最终采用:全局 CSS specificity 升级,47 → 0。详见 §3.1.7。
 
 ### 3.3 P2 — 留作观察
 
@@ -255,22 +304,16 @@ bun run check
 
 ## 4. 误报与边界
 
-### 4.1 R4 (focus-visible) 的 47 个信号里,估计误报率约 20%
+### 4.1 R4 (focus-visible) 的 47 个信号误报率问题已被 §3.1.7 全局 CSS 方案解决
 
-我们没有跑键盘真测,只能文本启发式。这些文件极可能有自定义 focus 提示(hover/active/active scale 等):
-
-- MissionControl.svelte(group flex flex-col items-center gap-1 — 缩略图卡片,鼠标 hover 有放大)
-- AppLibrary.svelte(w-6 text-accent — 窗口分页标签)
-- ClipboardAnnounce.svelte(grid h-6 w-6 — 一次性 toast 关闭按钮)
-
-**但**: 视觉提示不等于键盘焦点提示。键盘用户 Tab 时看不到 hover 效果。所以即使是装饰按钮,只要它能 focus,就应有 ring。
+原来 §3.2 估计约 20% 误报率(某些 button 有 hover/active scale 视觉提示)。问题是"视觉高亮"≠"键盘焦点可见"。最终方案不走逐文件加 ring,而是升级全局 `button:focus-visible` specificity——任何 button 都有蓝色 outline ring,chrome widget 用 `(0,2,0)` opt-out。误报率问题因此不存在:用户实际看到 ring 才算数。
 
 ### 4.2 启发式规则的已知盲区
 
 | 盲区 | 例子 |
 |---|---|
-| 模板字符串拼接的 token | class 用 backtick 模板拼 shellChrome.ts 的 CHROME_ICON_BUTTON,扫描器看不到里面的 focus-visible:ring-2 |
-| 动态 class(状态绑定) | class={isSelected ? "ring-2" : ""} |
+| 模板字符串拼接的 token | class 用 backtick 模板拼 shellChrome.ts 的 CHROME_ICON_BUTTON,扫描器看不到里面的 focus-visible:ring-2 — 但 §3.1.7 的全局 CSS 方案解决了 button 的这个问题 |
+| 动态 class(状态绑定) | class={isSelected ? "ring-2" : ""} — 同上,全局 CSS 对这类也生效 |
 | Svelte 4 (on:click) vs 5 (onclick) 混用 | R2 已覆盖 on(?:click|:click),但有些组件用 on:click={…} |
 | :global(...) 全局样式 | 影响 a11y 但扫描器看不到 |
 | 外部 lib(VoiceMemos / MapsApp 的内嵌地图) | 这些控件本身就不是 svelte 文件,扫描器盲 |

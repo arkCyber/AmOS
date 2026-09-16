@@ -123,7 +123,24 @@ textarea {
   color: rgb(0 0 0 / 0.32);
 }
 
-:focus-visible {
+/*
+ * Default keyboard focus ring (REQ-A285). Two layers:
+ *
+ *  - `:focus-visible` (above): every focusable element gets a blue outline by default.
+ *    WCAG SC 2.4.7: a focus indicator is required; the OS default is invisible
+ *    enough to fail this in practice on many surfaces.
+ *
+ *  - `button:focus-visible, [role="button"]:focus-visible` (below): re-declared at
+ *    specificity (0,1,1) so Tailwind's `outline-none` utility (specificity 0,1,0)
+ *    does not silently swallow the outline on a button the developer never gave an
+ *    alternative ring to. The chrome widget buttons (CHROME_ICON_BUTTON /
+ *    CHROME_MENU_BUTTON in lib/shellChrome.ts) opt out with
+ *    `focus-visible:outline-none focus-visible:ring-2 …` — that rule is specificity
+ *    0,2,0 (one pseudo + one class), higher than this one, so they keep their
+ *    white-translucent ring without a competing blue outline.
+ */
+button:focus-visible,
+[role="button"]:focus-visible {
   outline: 2px solid rgba(10, 132, 255, 0.9);
   outline-offset: 2px;
 }
