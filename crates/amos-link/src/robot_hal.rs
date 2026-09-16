@@ -47,10 +47,39 @@ use crate::platform::{IntentClass, Vocabulary};
 use crate::pubsub::Publisher;
 
 /// Frame start bytes (`0xAA55`).
+///
+/// ```
+/// use amos_link::robot_hal::FRAME_SOF;
+///
+/// assert_eq!(FRAME_SOF, [0xAA, 0x55]);
+/// // The SOF is the first two bytes of every wire frame — callers can check
+/// // a frame claims this bus without decoding the rest:
+/// let frame = amos_link::robot_hal::MotorFrame::new(
+///     amos_link::robot_hal::JointId::new(0).unwrap(),
+///     amos_link::robot_hal::MotorOp::Enable,
+///     0,
+/// );
+/// assert_eq!(&frame.encode()[..2], &FRAME_SOF);
+/// ```
 pub const FRAME_SOF: [u8; 2] = [0xAA, 0x55];
 /// Bytes of one encoded motor frame: SOF + id + op + arg(i32) + crc16.
+///
+/// ```
+/// use amos_link::robot_hal::FRAME_LEN;
+///
+/// // The frame is always 10 bytes: 2 SOF + 1 id + 1 op + 4 arg + 2 crc.
+/// assert_eq!(FRAME_LEN, 10);
+/// ```
 pub const FRAME_LEN: usize = 2 + 1 + 1 + 4 + 2;
 /// Joints of the reference quadruped: 4 legs x (hip, thigh, knee).
+///
+/// ```
+/// use amos_link::robot_hal::{JOINTS, MAX_JOINT};
+///
+/// assert_eq!(JOINTS, 12, "four legs × three joints");
+/// // MAX_JOINT is the last valid index (0-indexed):
+/// assert_eq!(MAX_JOINT as usize, JOINTS - 1);
+/// ```
 pub const JOINTS: usize = 12;
 /// Largest accepted joint index.
 pub const MAX_JOINT: u8 = (JOINTS - 1) as u8;
@@ -61,8 +90,37 @@ pub const MAX_JOINT: u8 = (JOINTS - 1) as u8;
 /// **compiler**, so no reviewer has to remember it.
 const _: () = assert!(JOINTS == MAX_JOINT as usize + 1);
 /// Travel limit of any joint, in milli-degrees (±90°).
+///
+/// ```
+/// use amos_link::robot_hal::{JointId, JointTarget, MAX_JOINT_MILLI_DEG};
+///
+/// let j = JointId::new(0).unwrap();
+/// // The limit is ± the constant:
+/// assert!(JointTarget::new(j, MAX_JOINT_MILLI_DEG).is_ok());
+/// assert!(JointTarget::new(j, -MAX_JOINT_MILLI_DEG).is_ok());
+/// // Just past it is refused:
+/// assert!(JointTarget::new(j, MAX_JOINT_MILLI_DEG + 1).is_err());
+/// ```
 pub const MAX_JOINT_MILLI_DEG: i32 = 90_000;
 /// Largest torque limit a frame may carry, in milli-percent of rated torque (100%).
+///
+/// ```
+/// use amos_link::robot_hal::{JointId, MAX_TORQUE_MILLI_PERCENT};
+/// use amos_link::robot_hal::MotorFrame;
+/// use amos_link::robot_hal::MotorOp;
+///
+/// let j = JointId::new(0).unwrap();
+/// // The limit is 0..=MAX_TORQUE_MILLI_PERCENT (non-negative by design):
+/// assert!(MotorFrame::new(j, MotorOp::SetTorque, MAX_TORQUE_MILLI_PERCENT)
+///     .validate()
+///     .is_ok());
+/// // Below 0 is refused:
+/// assert!(MotorFrame::new(j, MotorOp::SetTorque, -1).validate().is_err());
+/// // Above the limit is refused:
+/// assert!(MotorFrame::new(j, MotorOp::SetTorque, MAX_TORQUE_MILLI_PERCENT + 1)
+///     .validate()
+///     .is_err());
+/// ```
 pub const MAX_TORQUE_MILLI_PERCENT: i32 = 100_000;
 
 /// A joint under closed-loop position control.
@@ -1732,6 +1790,41 @@ impl<H: RobotHal> RobotBridge<H> {
     /// This is the deadman switch a field robot needs: with a 1 s period on a control
     /// topic that is refreshed at 10–50 Hz, a lost link stops the robot instead of
     /// letting the last command run forever.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use amos_link::broker::Broker;
+    /// use amos_link::codec::Clock;
+    /// use amos_link::keyexpr::Topic;
+    /// use amos_link::metrics::LinkMetrics;
+    /// use amos_link::pubsub::Subscriber;
+    /// use amos_link::qos::Qos;
+    /// use amos_link::robot_hal::{AgentAction, MockRobotHal, RobotBridge};
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let metrics = Arc::new(LinkMetrics::new());
+    /// let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+    /// let _clock = Arc::new(Clock::host()); // not consumed by the bridge
+    /// let subscriber = Subscriber::<AgentAction>::subscribe(
+    ///     Arc::clone(&transport),
+    ///     Topic::pattern("amos/test/control/*").expect("pattern"),
+    ///     Qos::control(),
+    ///     Arc::clone(&metrics),
+    /// )
+    /// .await
+    /// .expect("subscribe");
+    /// let bridge = RobotBridge::with_watchdog(
+    ///     subscriber,
+    ///     MockRobotHal::new(),
+    ///     Duration::from_millis(250),
+    /// );
+    /// // The period is what the bridge will read out of `watchdog()` — and what a
+    /// // report carries on the link:
+    /// assert_eq!(bridge.watchdog(), Some(Duration::from_millis(250)));
+    /// assert_eq!(bridge.state().watchdog_ms, Some(250));
+    /// # });
+    /// ```
     pub fn with_watchdog(
         subscriber: crate::pubsub::Subscriber<AgentAction>,
         hal: H,
@@ -1800,6 +1893,17 @@ impl<H: RobotHal> RobotBridge<H> {
 
     /// Which machine this bridge speaks for (`quadruped`, `drone`, …): the profile's kind, or the
     /// reference machine's for a bridge built by [`RobotBridge::new`].
+    ///
+    /// ```
+    /// use amos_link::platform::Platform;
+    ///
+    /// // The label is the kind key — a bridge reports the kind of the profile it was
+    /// // built for, not the constructor name. The same key surfaces in `PlatformKind::key`
+    /// // and in profile documents, so an operator can `grep` a single word across docs,
+    /// // logs, and a UI rendering this label.
+    /// assert_eq!(Platform::quadruped().kind().key(), "quadruped");
+    /// assert_eq!(Platform::drone().kind().key(), "drone");
+    /// ```
     pub fn platform_label(&self) -> &'static str {
         self.vocabulary.label()
     }
@@ -1834,6 +1938,55 @@ impl<H: RobotHal> RobotBridge<H> {
 
     /// What the bridge would report right now (also the honest answer for a caller with no
     /// publisher attached).
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use amos_link::broker::Broker;
+    /// use amos_link::codec::Clock;
+    /// use amos_link::keyexpr::Topic;
+    /// use amos_link::metrics::LinkMetrics;
+    /// use amos_link::pubsub::Subscriber;
+    /// use amos_link::qos::Qos;
+    /// use amos_link::robot_hal::{AgentAction, MockRobotHal, RobotBridge, RobotHal};
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// // The bridge needs a Subscriber<AgentAction> on a real transport. The construction
+    /// // is the same as the integration tests' `TestLink`, inlined here so the public
+    /// // surface can be exercised from a doc:
+    /// let metrics = Arc::new(LinkMetrics::new());
+    /// let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+    /// let _clock = Arc::new(Clock::host());
+    /// let subscriber = Subscriber::<AgentAction>::subscribe(
+    ///     Arc::clone(&transport),
+    ///     Topic::pattern("amos/test/control/*").expect("pattern"),
+    ///     Qos::control(),
+    ///     Arc::clone(&metrics),
+    /// )
+    /// .await
+    /// .expect("subscribe");
+    /// let bridge = RobotBridge::with_watchdog(
+    ///     subscriber,
+    ///     MockRobotHal::new(),
+    ///     Duration::from_millis(40),
+    /// );
+    ///
+    /// // Query methods on a fresh bridge — the state an operator sees before any action:
+    /// assert!(!bridge.is_estopped(), "no e-stop until a watchdog trips or an estop arrives");
+    /// assert_eq!(bridge.watchdog(), Some(Duration::from_millis(40)));
+    /// assert_eq!(bridge.platform_label(), "quadruped");
+    /// assert!(!bridge.hal().armed(), "the bus starts de-energized");
+    ///
+    /// let s = bridge.state();
+    /// assert_eq!(s.seq, None, "no action has arrived yet");
+    /// assert_eq!(s.gait, None);
+    /// assert_eq!(s.frames, 0);
+    /// assert!(!s.armed && !s.estopped);
+    /// assert_eq!(s.estop_reason, None);
+    /// assert_eq!(s.watchdog_ms, Some(40));
+    /// assert_eq!(s.last_refusal, None);
+    /// # });
+    /// ```
     pub fn state(&self) -> ActuationState {
         ActuationState {
             seq: self.last_seq,
