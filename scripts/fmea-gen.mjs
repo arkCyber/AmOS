@@ -150,6 +150,9 @@ const KNOWN_FAILURES = [
   // on Android 10+ — the code claimed it worked; the production path (full-screen-intent
   // notification) is registered but deliberately NOT shipped untested.
   { id: 'F-TAU-012', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmReceiver.kt', 'docs/native-alarm-bridge.md'], markers: ['background-activity-start', 'Background activity start', 'F-TAU-012'], severity: 4 },
+  // REQ-A374: the ledger bounded its keys but not its size (a WebView-callable command), and the
+  // settings path read an Activity reference across threads without a happens-before edge.
+  { id: 'F-TAU-013', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['MAX_ALARM_ENTRIES', 'check_alarm_capacity', '@Volatile'], severity: 2 },
   { id: 'F-TAU-008', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/uiFailures.ts'], markers: ['unhandledrejection', 'error'], severity: 3 },
 
   // 机器人中间件

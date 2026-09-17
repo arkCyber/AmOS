@@ -40,6 +40,18 @@ use tauri::State;
 /// ledger's id set.
 pub const MAX_ALARM_ID_BYTES: usize = 256;
 
+/// Maximum number of *distinct* alarms the ledger will hold.
+///
+/// `MAX_ALARM_ID_BYTES` bounds one id; nothing bounded **how many** ids a caller could register,
+/// and `scheduler_alarm_register` is callable from the WebView — so a frontend loop (or a
+/// hostile script in the same origin) could grow the map without limit (REQ-A374). A real alarm
+/// list is dozens of entries (`CHAT_MSG_CAP` / `MAX_IME_SESSIONS` in this repo are the same
+/// "bounded on purpose" shape), so 256 is generous while keeping the ledger's memory a constant.
+///
+/// Re-registering an **existing** id (the daily alarm's re-arm, or an edit) is unaffected: the
+/// cap counts distinct ids, not calls.
+pub const MAX_ALARM_ENTRIES: usize = 256;
+
 /// Wall-clock epoch (ms) now, never panicking / never negative.
 fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -88,6 +100,16 @@ impl AlarmSchedState {
     /// Earliest future wake instant (feeds an OS exact-wake / poll sleep).
     pub fn next_at(&self, now: u64) -> Option<u64> {
         self.lock().next_at(now)
+    }
+
+    /// How many distinct alarms are outstanding (the ledger's size, for the entry cap).
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether this id is already registered (re-registration must be allowed at capacity).
+    pub fn contains(&self, id: &str) -> bool {
+        self.lock().contains(&JobId::new(id.to_string()))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ExactAlarmClock> {
@@ -183,6 +205,7 @@ pub fn scheduler_alarm_register(
     at_ms: u64,
 ) -> Result<AlarmArmed, String> {
     check_alarm_id(&id)?;
+    check_alarm_capacity(&state, &id)?;
     state.register(id.clone(), at_ms);
     let device = arm_device(&id, at_ms);
     Ok(AlarmArmed { id, at_ms, device })
@@ -251,6 +274,22 @@ fn cancel_device(id: &str) -> DeviceOutcome {
 #[cfg(not(feature = "android"))]
 fn cancel_device(_id: &str) -> DeviceOutcome {
     DeviceOutcome::HostOnly
+}
+
+/// Bound the ledger's **size**, not just its keys (REQ-A374).
+///
+/// The command is WebView-callable, so an unbounded map is a caller-controlled memory growth path
+/// — the same class this repo bounds everywhere else (`CHAT_MSG_CAP`, `MAX_IME_SESSIONS`,
+/// `FrameCap`). The cap counts **distinct ids**: re-registering an existing id (a daily alarm's
+/// re-arm, an edit, the sensor-style idempotent callers) keeps working at capacity, which is the
+/// case that must never fail.
+fn check_alarm_capacity(state: &AlarmSchedState, id: &str) -> Result<(), String> {
+    if state.contains(id) || state.len() < MAX_ALARM_ENTRIES {
+        return Ok(());
+    }
+    Err(format!(
+        "scheduler alarm capacity reached: {MAX_ALARM_ENTRIES} entries (re-registering an existing id still works; cancel the ones you no longer need)"
+    ))
 }
 
 /// Bound a scheduler alarm id at the command seam so the ledger keys never
@@ -499,6 +538,37 @@ mod tests {
         // The caller re-arms the next day.
         s.register("daily".into(), 2 * 86_400_000);
         assert_eq!(s.next_at(86_400_001), Some(2 * 86_400_000));
+    }
+
+    /// REQ-A374: the ledger's *size* is bounded, and the case that must never break is the
+    /// re-registration of an existing id (a daily alarm's re-arm runs into a full list).
+    #[test]
+    fn the_ledger_refuses_a_new_id_at_capacity_but_always_allows_a_re_register() {
+        let s = state();
+        // Fill exactly to the cap.
+        for i in 0..MAX_ALARM_ENTRIES {
+            let id = format!("alarm:{i}");
+            check_alarm_capacity(&s, &id).expect("room left");
+            s.register(id, 1_000 + i as u64);
+        }
+        assert_eq!(s.len(), MAX_ALARM_ENTRIES);
+        // A *new* id is refused, and the message names the limit and the way out.
+        let err = check_alarm_capacity(&s, "alarm:one-too-many").expect_err("at capacity");
+        assert!(err.contains("capacity reached"), "{err}");
+        assert!(err.contains(&MAX_ALARM_ENTRIES.to_string()), "{err}");
+        assert!(
+            err.contains("re-registering an existing id still works"),
+            "{err}"
+        );
+        // …and nothing was added by the refusal.
+        assert_eq!(s.len(), MAX_ALARM_ENTRIES);
+        // The daily re-arm of an id that is *already* there still goes through.
+        check_alarm_capacity(&s, "alarm:0").expect("re-registering is allowed at capacity");
+        s.register("alarm:0".to_string(), 9_999);
+        assert_eq!(s.len(), MAX_ALARM_ENTRIES);
+        // Cancelling makes room again — the documented way out.
+        assert!(s.cancel("alarm:0"));
+        check_alarm_capacity(&s, "alarm:one-too-many").expect("room after a cancel");
     }
 
     /// The glue's status words are the Kotlin↔Rust contract: `AlarmGlue.kt` spells them,

@@ -95,7 +95,12 @@ object AlarmGlue {
      * The foreground Activity the settings screen must be posted from — a **weak** reference: the
      * glue outlives any Activity (it is attached from `MainActivity.onStart` and the process keeps
      * it), and holding it strongly would leak the Activity across a rotation.
+     *
+     * **`@Volatile` is load-bearing**: it is written on the main thread (attach) and read on a
+     * Rust/JNI worker thread (the settings command), so without it the reader may keep seeing
+     * `null` and answer `false` for an Activity that is right there (REQ-A374).
      */
+    @Volatile
     private var activity: WeakReference<Activity>? = null
 
     /** Hand the glue the current foreground Activity (from `MainActivity.onStart`, like the role/
@@ -103,9 +108,6 @@ object AlarmGlue {
     fun attachActivity(activity: Activity) {
         this.activity = WeakReference(activity)
     }
-
-    /** Is a foreground Activity attached (i.e. can [openExactAlarmSettings] even work)? */
-    fun canOpenSettings(): Boolean = activity?.get() != null
 
     /**
      * Open the per-app **Alarms & reminders** screen (API 31+) so the user can grant exact alarms.
