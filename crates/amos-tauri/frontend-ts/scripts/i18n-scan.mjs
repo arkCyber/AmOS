@@ -186,6 +186,38 @@ const SLUG_ID = /^[a-z0-9]+(?:[-_.][a-z0-9]+)+$/;
  * expression counts too). Returns `[{ literal, kind }]` — the copy a localised UI
  * must not hard-code in one language.
  */
+/**
+ * Copy written **inline in a `<script>` block** — the half `hardcodedCopy` cannot see
+ * (REQ-A357).
+ *
+ * `hardcodedCopy` reads the markup section only, so a message built inside the script block
+ * (`exportMsg = "已复制 .md 到剪贴板（未连接后端）"`) was invisible to **every** gate — which is
+ * precisely how it shipped, in Chinese, to every locale, while `i18n-scan` stayed green
+ * (F-SH-020, F-SH-022).
+ *
+ * The shape is deliberately narrow: a CJK string literal that is the **right-hand side of an
+ * assignment** or a `$state(...)`/`$derived(...)` initialiser. A data table
+ * (`const CITIES = ["北京", …]`) is *not* matched — its elements are not assignments — because
+ * place names, seeds and fixtures are data, not copy, and flagging them would bury the real
+ * findings under a list nobody reads. Comments are skipped for the same reason.
+ */
+export function assignedCJKCopy(src) {
+  const end = src.indexOf("</script>");
+  const body = end >= 0 ? src.slice(0, end) : src;
+  const out = [];
+  const re =
+    /(?:\$state\(\s*|\$derived\(\s*|(?<![\w.$])[A-Za-z_$][\w$]*\s*=\s*)(["'`])((?:\\.|(?!\1).)*)\1/g;
+  body.split("\n").forEach((line, i) => {
+    const stripped = line.trimStart();
+    if (stripped.startsWith("//") || stripped.startsWith("*")) return;
+    for (const m of line.matchAll(re)) {
+      const literal = m[2] ?? "";
+      if (CJK.test(literal)) out.push({ line: i + 1, literal, kind: "script" });
+    }
+  });
+  return out;
+}
+
 export function hardcodedCopy(src) {
   const html = markupOf(src);
   const out = [];
@@ -535,6 +567,27 @@ export function runSelftest() {
   ok("a <style> block is not copy", !lits.includes("样式"));
   ok("a t(...) key is not copy", !lits.includes("note.add"));
   ok("plain markup yields nothing", hardcodedCopy("<div>ok</div>").length === 0);
+  // Script-block copy (REQ-A357) — the shape that hid F-SH-020's hard-coded Chinese.
+  ok(
+    "an assigned CJK literal is copy",
+    assignedCJKCopy('<script>let m = $state(""); m = "已复制到剪贴板";</script>').length === 1,
+  );
+  ok(
+    "a $state() CJK initialiser is copy",
+    assignedCJKCopy('<script>let label = $state("北京");</script>').length === 1,
+  );
+  ok(
+    "a CJK data table is not copy",
+    assignedCJKCopy('<script>const CITIES = ["北京", "上海"];</script>').length === 0,
+  );
+  ok(
+    "a CJK comment is not copy",
+    assignedCJKCopy("<script>// 已复制到剪贴板\nlet x = 1;</script>").length === 0,
+  );
+  ok(
+    "a t(...) call is not copy",
+    assignedCJKCopy('<script>let m = t("note.exportCopyFailed");</script>').length === 0,
+  );
 
   const enMarkup = [
     '<button aria-label="Edit home screen"></button>',
@@ -783,6 +836,28 @@ const nameless = [];
   }
 }
 
+// Check 10 (REQ-A357) — copy written inline in a `<script>` block (see `assignedCJKCopy`).
+// This is the gate the NotesApp defect walked straight through: `hardcodedCopy` reads the
+// markup section only, so a hard-coded Chinese message built in the script block was invisible
+// while every check stayed green.
+const scriptCopy = [];
+{
+  for (const { file, src } of corpus.prodSources) {
+    if (!file.endsWith(".svelte")) continue;
+    const rel = file.slice(file.indexOf("/src/") + 1);
+    for (const h of assignedCJKCopy(src)) {
+      if (allowedLiterals.has(h.literal)) continue;
+      scriptCopy.push({ file: rel, ...h });
+    }
+  }
+}
+
+// A literal exemption that matches nothing any more is rot — the same discipline the key
+// allow-list got in REQ-A353: an exemption nobody prunes hides the next real finding.
+const staleLiterals = literalAllow
+  .map((e) => e.literal)
+  .filter((literal) => !corpus.prod.includes(literal));
+
 const keyErrors = [];
 const placeholderErrors = [];
 for (const k of en.keys()) {
@@ -832,6 +907,8 @@ if (process.argv.includes("--json")) {
         allowlisted: [...allowed].sort(),
         staleAllowlist: staleAllow,
         allowlistedLiterals: [...allowedLiterals].sort(),
+        scriptCopy,
+        staleLiterals,
       },
       null,
       2,
@@ -872,6 +949,21 @@ if (process.argv.includes("--json")) {
   }
   if (hardcoded.length === 0) {
     console.log("[i18n-scan] OK — no user-visible copy is hard-coded in a .svelte markup section.");
+  }
+  for (const e of scriptCopy) {
+    console.error(
+      `[i18n-scan] FAIL — hard-coded copy in a <script> block: ${e.file}:${e.line} ${JSON.stringify(e.literal)} ` +
+        "(build it with t(...) — the markup check cannot see this half)",
+    );
+  }
+  if (scriptCopy.length === 0) {
+    console.log("[i18n-scan] OK — no <script>-block copy is hard-coded in one language.");
+  }
+  for (const literal of staleLiterals) {
+    console.error(
+      `[i18n-scan] FAIL — stale literal exemption (no source contains it any more): ${JSON.stringify(literal)} ` +
+        "(delete the entry from scripts/i18n-literal-allowlist.json)",
+    );
   }
   for (const e of english) {
     console.error(
@@ -929,6 +1021,8 @@ process.exit(
     dead.length === 0 &&
     deadTestOnly.length === 0 &&
     hardcoded.length === 0 &&
+    scriptCopy.length === 0 &&
+    staleLiterals.length === 0 &&
     english.length === 0 &&
     staleAllow.length === 0 &&
     slugLabels.length === 0 &&

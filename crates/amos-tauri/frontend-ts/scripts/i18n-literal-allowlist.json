@@ -26,5 +26,9 @@
   {
     "literal": "error",
     "reason": "A log level rendered as diagnostic data in the AI diagnostics ledger, not UI copy — see `settings/AiPage.svelte`."
+  },
+  {
+    "literal": "北京",
+    "reason": "The map's default place label (`let label = $state(\"北京\")` in `MapsApp.svelte`) is **data** — a place name, exactly like the city table in `lib/cityIndex.ts` — not UI copy: the label names a location, and translating it would name a different place. Found by the new <script>-block check (REQ-A357), which is why it is the only entry here that is CJK."
   }
 ]
