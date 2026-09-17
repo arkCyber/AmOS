@@ -1,20 +1,29 @@
 /**
  * mediaPaging.ts — cumulative paging over several collections (REQ-A316).
  *
- * The host caps a listing and hands back a cursor; a screen that shows a *merged* view
- * (Photos = camera + screenshots, Files = downloads + pictures + …, Player = movies + music)
- * therefore has to keep **one cursor per collection** and merge the pages itself. That logic
- * is here, pure and injectable, because it is the part that can be wrong in a way nobody
- * sees: a pager that repeats or skips an item looks exactly like a working one until the
- * user counts their photos.
+ * **What the host actually gives us (measured, REQ-A354)** — not what an earlier draft of this
+ * comment assumed: `media_list(state, collection) -> Vec<MediaItem>` returns the **whole**
+ * collection, sorted by `ts` descending and nothing else (`crates/amos-media/src/hostfs.rs`
+ * and `provider.rs`: `sort_by_key(|i| cmp::Reverse(i.ts))`). There is **no cursor parameter,
+ * no page size and no total**, and among items that share a timestamp the order is whatever
+ * the directory scan produced. Paging is therefore **ours**: we hold the list in our own total
+ * order (`(ts desc, id asc)`, `newestFirst`) and slice it ourselves (`pageOf`), which is also
+ * why a resume point can never be "the host's last item" alone.
+ *
+ * A screen that shows a *merged* view (Photos = camera + screenshots, Files = downloads +
+ * pictures + …, Player = movies + music) has to keep **one cursor per collection** and merge
+ * the pages itself. That logic is here, pure and injectable, because it is the part that can
+ * be wrong in a way nobody sees: a pager that repeats or skips an item looks exactly like a
+ * working one until the user counts their photos.
  *
  * Three rules make it correct, and each is tested:
- *  1. **A page's cursor comes from the host's own last item** — never from the merged view,
- *     whose order is ours, not the host's. `foldPage` read it off `listing.items.last()`.
+ *  1. **A page's cursor is read off the page, in our order** — `foldPage` takes it from the
+ *     listing's last item, and `afterCursor`/`pageOf` express resuming in the same order, so a
+ *     boundary inside a tie group neither drops nor repeats the rest of it.
  *  2. **Items are deduped by id** — a host that re-serves an item (or two collections that
  *     contain the same one) cannot show it twice.
- *  3. **An empty page ends that collection** — that is the only signal the host gives that
- *     nothing is left after the cursor, and it is also the loop's stop condition.
+ *  3. **An empty page ends that collection** — that is the only signal there is that nothing is
+ *     left after the cursor, and it is also the loop's stop condition.
  *
  * Nothing here touches the bridge: the caller injects `fetch`, so the whole state machine is
  * unit-testable offline.
@@ -55,16 +64,14 @@ export function foldPage(state: PagingState, dir: StandardDir, listing: MediaLis
   const fresh = listing.items.filter((i) => !seen.has(i.id));
   const items = [...state.items, ...fresh].sort(newestFirst);
   const exhausted = listing.items.length === 0;
-  // Rule 1: the cursor comes from the **host's own last item** — so it is read off the page the
-  // host just sent, never off the merged view (whose order is ours). `cursorOf` takes the page and
-  // picks its last entry; passing a single item here (the pre-REQ-A343 shape) made it read
-  // `undefined.length` and silently produced no cursor, which is what broke these cases.
+  // Rule 1: the cursor is the page's **last item in our order** — which holds because the page
+  // came from `pageOf` (the host's own order has no tiebreaker and cannot be resumed on; see
+  // `afterCursor`). The pre-REQ-A343 shape passed a single item here, which read
+  // `undefined.length` and silently produced no cursor — that is what broke these cases.
   const cursor = cursorOf(listing.items);
-  // The host's `total` counts what is left **after the cursor** (i.e. including the page it
-  // just sent, like `Content-Range`'s denominator). What a caller rendering "N of M" needs is
-  // what is left *after* the items it now holds — so it is this page's items subtracted here,
-  // once, instead of at every call site.
-  const left = Math.max(0, listing.total - listing.items.length);
+  // `remaining` is what `pageOf` computed for the collection it sliced (the host reports no
+  // total); an empty page means nothing is left, whatever a caller passed.
+  const left = exhausted ? 0 : listing.remaining;
   return {
     items,
     remaining: { ...state.remaining, [dir]: left },
@@ -92,9 +99,9 @@ export function hasMore(state: PagingState, dirs: readonly StandardDir[]): boole
  *
  * `hasMore` alone is not enough to render a button: a collection is *retired* only by an
  * empty page, so after the last real page it stays "pending" until the next round asks and
- * gets nothing. The host has already said how much is left (`remaining`, from its own
- * `total`), so a button keyed on `hasMore` alone would offer "load more (0 left)" — a
- * control whose only effect is a round-trip that returns nothing. The screens ask *this*.
+ * gets nothing. `remaining` is what `pageOf` said was left (the host reports no total, so this
+ * is our own count), and a button keyed on `hasMore` alone would offer "load more (0 left)" —
+ * a control whose only effect is a round-trip that returns nothing. The screens ask *this*.
  */
 export function canLoadMore(state: PagingState, dirs: readonly StandardDir[]): boolean {
   return hasMore(state, dirs) && remainingTotal(state, dirs) > 0;
@@ -103,6 +110,49 @@ export function canLoadMore(state: PagingState, dirs: readonly StandardDir[]): b
 /** Items the host says it still has after the cursors (the "M" of "N of M"). */
 export function remainingTotal(state: PagingState, dirs: readonly StandardDir[]): number {
   return dirs.reduce((sum, d) => sum + (state.remaining[d] ?? 0), 0);
+}
+
+/**
+ * Is `it` strictly after `cursor` in **our** order — `(ts desc, id asc)`, the same order
+ * `newestFirst` sorts by?
+ *
+ * The host cannot answer this for us. Measured (REQ-A354) against the code we actually run:
+ * `crates/amos-media/src/hostfs.rs` and `provider.rs` both do
+ * `items.sort_by_key(|i| std::cmp::Reverse(i.ts))` — **`ts` descending only, with no
+ * tiebreaker at all**, so among items that share a timestamp the host's order is whatever the
+ * directory scan produced, and `media_list(state, collection) -> Vec<MediaItem>` carries
+ * neither a cursor nor a total. "The last item of the page the host sent" is therefore not a
+ * well-defined resume point on its own: a client that resumes by timestamp alone repeats the
+ * rest of a tie group or drops it, which is exactly the invisible failure this module exists
+ * to prevent. The resume point has to be expressed in *our* total order, and this is where
+ * that order is written down (`pageOf` below applies it).
+ */
+export function afterCursor(it: MediaItem, cursor: MediaCursor): boolean {
+  if (it.ts !== cursor.last_ts) return it.ts < cursor.last_ts;
+  return it.id > cursor.last_id;
+}
+
+/**
+ * One page of `all` — which must already be in our order — after `cursor`, plus how many
+ * items are left after it.
+ *
+ * This is the `fetch` a screen hands to `fetchInto`. No screen calls it yet — that gap is the
+ * `media.loadMore` entry in `scripts/i18n-allowlist.json` — which is exactly why the slicing
+ * lives here, exported and tested, instead of being written fresh inside whichever screen
+ * wires the pager first. A cursor that is not in `all` still works: `afterCursor` is monotone
+ * in our order, so `findIndex` lands on the first item that would follow it.
+ */
+export function pageOf(
+  all: readonly MediaItem[],
+  cursor: MediaCursor | null,
+  limit: number,
+): MediaListing {
+  const from = cursor === null ? 0 : (() => {
+    const i = all.findIndex((it) => afterCursor(it, cursor));
+    return i < 0 ? all.length : i;
+  })();
+  const items = all.slice(from, from + Math.max(0, limit));
+  return { items, remaining: Math.max(0, all.length - (from + items.length)) };
 }
 
 /** What one round of paging produced. */

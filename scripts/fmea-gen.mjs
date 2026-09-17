@@ -97,6 +97,7 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-016', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/mediaExport.ts', 'crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/vmemos.svelte.test.ts'], markers: ['exportToSharedCollection', 'RECORDING_EXPORT_DIR', 'REQ-A350'], severity: 2 },
   { id: 'F-SH-017', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/PhotosApp.svelte', 'crates/amos-tauri/frontend-ts/src/lib/mediaExport.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/photos.svelte.test.ts'], markers: ['copyText', 'photo.shareFailed', 'camera.exportToSystem'], severity: 3 },
   { id: 'F-SH-018', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/i18n-scan.mjs', 'crates/amos-tauri/frontend-ts/scripts/i18n-allowlist.json'], markers: ['staleAllowList', 'stale allow-list entry', 'REQ-A353'], severity: 3 },
+  { id: 'F-SH-019', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/mediaPaging.ts', 'crates/amos-tauri/frontend-ts/src/__tests__/mediaPaging.test.ts', 'crates/amos-media/src/hostfs.rs'], markers: ['afterCursor', 'pageOf', 'Reverse(i.ts)'], severity: 3 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
