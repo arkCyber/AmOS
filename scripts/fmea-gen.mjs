@@ -109,6 +109,7 @@ const KNOWN_FAILURES = [
   { id: 'F-DEV-001', module: 'process', files: ['scripts/device-probe-media-export.js', 'scripts/device-ui-eval.mjs'], markers: ['__probeExpect', 'settledMs', 'IS_PENDING'], severity: 3 },
   { id: 'F-TAU-007', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['scheduler_alarm_register', 'AlarmGlue.schedule', 'setExactAndAllowWhileIdle'], severity: 4 },
   { id: 'F-DEV-002', module: 'process', files: ['scripts/fmea-gen.mjs', 'docs/FMEA.md'], markers: ['tableShapeProblems', 'cell count != their header', 'FMEA_DOC'], severity: 3 },
+  { id: 'F-SH-025', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte'], markers: ['没有可显示的界面', 'monitor'], severity: 3 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
