@@ -54,6 +54,15 @@ class AlarmReceiver : BroadcastReceiver() {
         } catch (e: Exception) {
             Log.w(TAG, "could not foreground System UI: ${e.message}")
         }
+        // The platform-sanctioned half (REQ-A375): a full-screen-intent notification can put the
+        // ring in front of the user even when the background-activity-start rule above drops the
+        // startActivity. Additive on purpose — a refusal here (notifications off, the 33+ runtime
+        // permission not granted) leaves the alarm itself intact, and the status word is logged.
+        val atMs = intent.getLongExtra(AlarmGlue.EXTRA_AT_MS, System.currentTimeMillis())
+        val notify = AlarmGlue.notifyAlarm(ctx, id, atMs)
+        if (notify != AlarmGlue.NOTIFY_POSTED) {
+            Log.w(TAG, "no full-screen ring for $id: $notify")
+        }
     }
 
     private companion object {

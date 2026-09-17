@@ -156,6 +156,32 @@ export const API_FAMILIES = [
     runtime: [],
     why: "AlarmManager#setExactAndAllowWhileIdle (through AlarmGlue.schedule, from scheduler_alarm_register): SCHEDULE_EXACT_ALARM (API 31/32 app-op) + USE_EXACT_ALARM (API 33+, install-time for an alarm-clock app)",
   },
+  {
+    // The **firing** ring (REQ-A375, closing F-TAU-012): a full-screen-intent notification is what
+    // can bring an alarm to the front while the app is in the background — a `startActivity` from
+    // a receiver is dropped by the Android 10+ background-activity-start rules.
+    //
+    // The family exists so the declaration and the call site cannot drift apart in either
+    // direction: REQ-A369 deliberately did **not** declare `POST_NOTIFICATIONS` because nothing
+    // posted anything (a declaration with no call site), and this entry is what makes the new call
+    // site *require* the declaration. `POST_NOTIFICATIONS` is a runtime permission on API 33+, so
+    // it must also be requested from Kotlin (`PermissionWire.notificationsIfNeeded`).
+    family: "alarm-notification",
+    tokens: [
+      "notifyAlarm",
+      "NotificationCompat",
+      "setFullScreenIntent",
+      "NotificationManagerCompat",
+      "POST_NOTIFICATIONS",
+      "USE_FULL_SCREEN_INTENT",
+    ],
+    permissions: [
+      "android.permission.POST_NOTIFICATIONS",
+      "android.permission.USE_FULL_SCREEN_INTENT",
+    ],
+    runtime: ["android.permission.POST_NOTIFICATIONS"],
+    why: "NotificationManagerCompat#notify + NotificationCompat.Builder#setFullScreenIntent (through AlarmGlue.notifyAlarm, from AlarmReceiver at the alarm instant): POST_NOTIFICATIONS (runtime, API 33+ — without it the notification is silently not posted) + USE_FULL_SCREEN_INTENT (install-time for an alarm/call app)",
+  },
 ];
 
 /** `true` when the fragment declares `permission` (any `maxSdkVersion`). */
@@ -322,6 +348,28 @@ export function runSelftest() {
   // them would let the other half disappear silently (that is how F-TAU-007 shipped).
   ok("familiesIn finds exact alarms from the Rust command name", familiesIn("scheduler_alarm_register").some((f) => f.family === "exact-alarm"));
   ok("familiesIn finds exact alarms from the Kotlin API", familiesIn("am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMs, pending(context, id))").some((f) => f.family === "exact-alarm"));
+  // REQ-A375: the firing ring. `POST_NOTIFICATIONS` is the one permission whose *absence* is
+  // silent (the notification is simply not posted), so the family must be found from the call site
+  // and must demand the runtime request too.
+  ok("familiesIn finds the firing notification from the call site", familiesIn("NotificationCompat.Builder(context, ALARM_CHANNEL)").some((f) => f.family === "alarm-notification"));
+  ok(
+    "a declared-but-unrequested POST_NOTIFICATIONS is found",
+    permissionFindings({
+      fragment:
+        '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />' +
+        '<uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />',
+      kotlin: "// nothing asks the user for it",
+      sources: [{ file: "crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmReceiver.kt", text: "AlarmGlue.notifyAlarm(ctx, id, atMs)" }],
+    }).findings.some((f) => f.kind === "not-requested" && f.permission === "android.permission.POST_NOTIFICATIONS"),
+  );
+  ok(
+    "an undeclared USE_FULL_SCREEN_INTENT is a finding",
+    permissionFindings({
+      fragment: '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+      kotlin: "Manifest.permission.POST_NOTIFICATIONS",
+      sources: [{ file: "crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt", text: ".setFullScreenIntent(show, true)" }],
+    }).findings.some((f) => f.kind === "undeclared" && f.permission === "android.permission.USE_FULL_SCREEN_INTENT"),
+  );
   ok(
     "a missing exact-alarm declaration is a finding",
     permissionFindings({

@@ -49,9 +49,25 @@ object PermissionWire {
         MicPermissionGlue.ensureBound(activity)
         val want = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO).filter {
             ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
-        } + bluetoothConnectIfNeeded(activity) + bluetoothScanIfNeeded(activity)
+        } + bluetoothConnectIfNeeded(activity) + bluetoothScanIfNeeded(activity) + notificationsIfNeeded(activity)
         if (want.isEmpty()) return
         ActivityCompat.requestPermissions(activity, want.toTypedArray(), REQ_CAMERA)
+    }
+
+    /**
+     * `POST_NOTIFICATIONS` — the API 33+ **runtime** permission the firing ring needs: the alarm's
+     * full-screen-intent notification is **silently not posted** without it (and it is off by
+     * default for a fresh install), so the one moment the user cares about would pass with nothing
+     * on screen (REQ-A375 / F-TAU-012). Below 33 notifications need no permission.
+     */
+    private fun notificationsIfNeeded(activity: Activity): List<String> {
+        if (Build.VERSION.SDK_INT < 33) return emptyList()
+        val perm = Manifest.permission.POST_NOTIFICATIONS
+        return if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) {
+            emptyList()
+        } else {
+            listOf(perm)
+        }
     }
 
     /**

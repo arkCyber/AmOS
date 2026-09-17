@@ -141,13 +141,21 @@
              alarm will not wake the phone" instead of a false success), and
              `AlarmGlue.openExactAlarmSettings` opens the system screen.
 
-         POST_NOTIFICATIONS is deliberately **not** declared: the ring is drawn by
-         the WebView after `AlarmReceiver` foregrounds the app, and nothing in this
-         tree posts a notification — a declaration with no call site is the stale
-         entry scripts/android-permission-scan.mjs reports (the same reason
-         BLUETOOTH_ADVERTISE above is absent). Declare it when a notification path
-         actually exists. -->
+         POST_NOTIFICATIONS is now **declared** (REQ-A375): the firing path posts a full-screen-intent
+         notification, so it is no longer a declaration without a call site — REQ-A369 deliberately
+         left it out while nothing posted one, which is exactly why it is added together with
+         `AlarmGlue.notifyAlarm` and the runtime request in `PermissionWire`. -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
+    <!-- The firing ring (REQ-A375 / F-TAU-012): a **full-screen-intent** notification is the
+         platform-sanctioned way to bring an alarm to the front when the app is in the background
+         (a `startActivity` from a receiver is dropped on Android 10+). USE_FULL_SCREEN_INTENT is
+         install-time for apps whose core function is alarms/calls (this one ships a clock);
+         POST_NOTIFICATIONS is the API 33+ **runtime** permission, requested by
+         `PermissionWire.requestNeeded` — without it the notification is silently not posted, so
+         the alarm keeps its in-process ring and the receiver logs the refusal. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
 </manifest>

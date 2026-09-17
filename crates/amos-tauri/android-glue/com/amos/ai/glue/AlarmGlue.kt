@@ -1,15 +1,25 @@
 package com.amos.ai.glue
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlarmManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.text.format.DateFormat
 import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import java.lang.ref.WeakReference
+import java.util.Date
 
 /**
  * AmOS System UI — **AlarmManager exact-wake binding** (device step, §9 ③).
@@ -47,6 +57,12 @@ object AlarmGlue {
     private const val REQUEST_BASE = 0x414c // "AL"
     /** Scheme of the per-alarm identity URI (see [alarmIdentity]). */
     private const val ALARM_SCHEME = "amos-alarm"
+    /** Notification channel for a firing alarm (created on demand, idempotent). */
+    private const val ALARM_CHANNEL = "amos-alarm-firing"
+    /** Notification tag; the id is the notification's own id, so two alarms do not overwrite each other. */
+    private const val ALARM_NOTIFY_TAG = "amos.alarm"
+    /** Intent extra carrying the alarm's instant (epoch ms), so the ring can say when it was set for. */
+    const val EXTRA_AT_MS = "amos.alarm.atMs"
 
     /**
      * Status strings the Rust host maps to a typed device outcome and surfaces to the
@@ -61,6 +77,100 @@ object AlarmGlue {
     const val STATUS_UNAVAILABLE = "unavailable"
     /** `setExact…` threw `SecurityException` even though `canScheduleExactAlarms()` said yes. */
     const val STATUS_DENIED = "denied"
+
+    /**
+     * Status words for the **firing** path (see [notifyAlarm]); mirrored by the tests in
+     * `android-glue/tests/.../AlarmNotifyStatusTest.kt`.
+     */
+    const val NOTIFY_POSTED = "posted"
+    /** Notifications are switched off for this app (the 33+ runtime permission, or the user's toggle). */
+    const val NOTIFY_DENIED = "notify-denied"
+    /** No notification service on this device. */
+    const val NOTIFY_UNAVAILABLE = "notify-unavailable"
+
+    /**
+     * The decision behind [notifyAlarm], isolated so it is testable on the host JVM (no Android
+     * types): posting needs a notification service, the user's toggle, and — from API 33 — the
+     * runtime `POST_NOTIFICATIONS` grant, which is **off by default for a fresh install**.
+     */
+    internal fun notifyStatus(apiLevel: Int, servicePresent: Boolean, enabled: Boolean, granted: Boolean): String = when {
+        !servicePresent -> NOTIFY_UNAVAILABLE
+        apiLevel >= 33 && !granted -> NOTIFY_DENIED
+        !enabled -> NOTIFY_DENIED
+        else -> NOTIFY_POSTED
+    }
+
+    /**
+     * Post the **firing notification with a full-screen intent** — the platform-sanctioned way to
+     * put an alarm in front of the user when the app is in the background; a plain `startActivity`
+     * from a receiver is dropped on Android 10+ (F-TAU-012).
+     *
+     * **Additive by construction**: this does not replace [AlarmReceiver]'s foreground attempt or
+     * the WebView's ring — if nothing can be posted (no service, notifications off, the 33+ runtime
+     * permission not granted — which is the default for a fresh install) it returns a status word
+     * and the alarm still rings whenever the app gets to run. That is why it is safe to ship before
+     * a device round can confirm it: the failure mode is "no visible ring", never "no alarm".
+     *
+     * The copy is **the OS's own**: the title is the app label and the text is the alarm instant
+     * formatted with the device locale, so nothing here hard-codes a language.
+     */
+    fun notifyAlarm(context: Context, id: String, atMs: Long): String {
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE)
+            as? NotificationManager
+        val status = notifyStatus(
+            apiLevel = Build.VERSION.SDK_INT,
+            servicePresent = manager != null,
+            enabled = NotificationManagerCompat.from(context).areNotificationsEnabled(),
+            granted = Build.VERSION.SDK_INT < 33 ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED,
+        )
+        if (status != NOTIFY_POSTED) {
+            Log.w(TAG, "alarm $id fired but its notification was not posted: $status")
+            return status
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Idempotent: an existing channel keeps its settings (the user's choices win). The name
+            // and description are the OS's own app label, so no language is hard-coded here.
+            val label = context.applicationInfo.loadLabel(context.packageManager)
+            manager?.createNotificationChannel(
+                NotificationChannel(ALARM_CHANNEL, label, NotificationManager.IMPORTANCE_HIGH)
+                    .apply { setDescription(label.toString()) },
+            )
+        }
+        val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            ?: return NOTIFY_UNAVAILABLE
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        launch.putExtra(EXTRA_ID, id)
+        val show = PendingIntent.getActivity(
+            context,
+            requestCode(id),
+            launch,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val time = DateFormat.getTimeFormat(context).format(Date(atMs))
+        val notification = NotificationCompat.Builder(context, ALARM_CHANNEL)
+            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+            .setContentTitle(context.applicationInfo.loadLabel(context.packageManager))
+            .setContentText(time)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(true)
+            .setAutoCancel(true)
+            .setContentIntent(show)
+            .setFullScreenIntent(show, true)
+            .build()
+        return try {
+            // One notification id per alarm: two alarms cannot overwrite each other's ring.
+            NotificationManagerCompat.from(context).notify(ALARM_NOTIFY_TAG, requestCode(id), notification)
+            Log.i(TAG, "posted the firing notification for $id (full-screen intent)")
+            NOTIFY_POSTED
+        } catch (e: SecurityException) {
+            Log.w(TAG, "notify denied for $id: ${e.message}")
+            NOTIFY_DENIED
+        }
+    }
 
     /**
      * Hand the Rust host the app `Context` so `scheduler_alarm_register/_cancel` can
@@ -152,11 +262,12 @@ object AlarmGlue {
      */
     internal fun alarmIdentity(id: String): String = "$ALARM_SCHEME://$id"
 
-    private fun pending(context: Context, id: String): PendingIntent {
+    private fun pending(context: Context, id: String, atMs: Long): PendingIntent {
         val target = Intent(context, AlarmReceiver::class.java)
             .setAction(ACTION_EXACT)
             .setData(Uri.parse(alarmIdentity(id)))
             .putExtra(EXTRA_ID, id)
+            .putExtra(EXTRA_AT_MS, atMs)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         return PendingIntent.getBroadcast(context, requestCode(id), target, flags)
     }
@@ -177,9 +288,9 @@ object AlarmGlue {
         }
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMs, pending(context, id))
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMs, pending(context, id, atMs))
             } else {
-                am.setExact(AlarmManager.RTC_WAKEUP, atMs, pending(context, id))
+                am.setExact(AlarmManager.RTC_WAKEUP, atMs, pending(context, id, atMs))
             }
             Log.i(TAG, "scheduled exact alarm $id at $atMs")
             STATUS_SCHEDULED
@@ -193,7 +304,10 @@ object AlarmGlue {
     fun cancel(context: Context, id: String): String {
         val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
             ?: return STATUS_UNAVAILABLE
-        am.cancel(pending(context, id))
+        // The instant is *not* part of the PendingIntent's identity (extras never are — that is
+        // exactly the defect F-TAU-011 fixed, where the request code had to stop being the
+        // identity), so cancelling does not need to know when the alarm was set for.
+        am.cancel(pending(context, id, atMs = 0L))
         Log.i(TAG, "cancelled exact alarm $id")
         return STATUS_CANCELLED
     }
