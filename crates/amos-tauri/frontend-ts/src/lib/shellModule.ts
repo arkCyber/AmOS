@@ -91,7 +91,13 @@ const KEY_GLYPHS: Record<string, string> = {
 
 /** `" "` (what a browser reports for the space bar) → `"Space"`; everything else untouched. */
 export function normalizeKey(key: string): string {
-  return key === " " || key === "Spacebar" ? "Space" : key;
+  const k = key === " " || key === "Spacebar" ? "Space" : key;
+  // FMEA finding: `KeyboardEvent.key` for letter keys is lowercase ("w"), but
+  // human-written shortcuts are uppercase ("W"). Normalise to upper so a ⌘W typed
+  // by a real user matches a `closeWindow: { key: "W", meta: true }` binding.
+  // Function keys ("F1"…F24), arrows, named keys ("Tab"/"Enter"/"Escape") are
+  // already case-stable, so this only widens letter matching without shifting them.
+  return k.length === 1 ? k.toUpperCase() : k;
 }
 
 /**
@@ -99,7 +105,10 @@ export function normalizeKey(key: string): string {
  * on ⌘F4, so every modifier the binding does not list must be absent.
  */
 export function shortcutMatches(e: ShortcutEvent, s: ShellShortcut): boolean {
-  if (normalizeKey(e.key) !== s.key) return false;
+  // Both sides are run through `normalizeKey` so a single-letter binding declared
+  // either case ("W" or "w") matches a typed event whose `key` is always the
+  // browser's lowercased form. `normalizeKey` is also responsible for " "→"Space".
+  if (normalizeKey(e.key) !== normalizeKey(s.key)) return false;
   // **REQ-A297 phase-2 §2 (compat policy)**. The shell chrome has always
   // counted an external keyboard's `Ctrl` as equivalent to ⌘ for the four
   // documented overlay launches (Spotlight / Mission Control / Launchpad) so

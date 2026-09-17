@@ -234,6 +234,11 @@ describe("the shortcut table (the overlay rows are the list)", () => {
     expect(normalizeKey(" ")).toBe("Space");
     expect(normalizeKey("Spacebar")).toBe("Space");
     expect(normalizeKey("F4")).toBe("F4");
+    // FMEA: letter keys from `KeyboardEvent.key` are lowercase, but human-written
+    // shortcuts are uppercase. `normalizeKey` widens matching on both sides so a
+    // typed ⌘W matches a binding declared as `{ key: "W", meta: true }`.
+    expect(normalizeKey("w")).toBe("W");
+    expect(normalizeKey("W")).toBe("W");
     expect(formatShortcut({ key: "Space", meta: true })).toBe("⌘Space");
     expect(formatShortcut({ key: "Tab", meta: true, shift: true })).toBe("⇧⌘⇥");
     expect(formatShortcut({ key: "F4" })).toBe("F4");
@@ -273,5 +278,13 @@ describe("the shortcut table (the overlay rows are the list)", () => {
     // Row 4: a no-modifier binding must NOT fire when the user is holding a modifier
     expect(shortcutMatches({ key: "F4", metaKey: true }, { key: "F4" })).toBe(false);
     expect(shortcutMatches({ key: "F4", ctrlKey: true }, { key: "F4" })).toBe(false);
+  });
+
+  test("letter keys match case-insensitively (FMEA: ⌘W from a real keyboard)", () => {
+    // `KeyboardEvent.key` for "W" is "w". A binding declared `{ key: "W", meta: true }`
+    // must still match — the comparison must widen to upper on both sides.
+    expect(shortcutMatches({ key: "w", metaKey: true }, { key: "W", meta: true })).toBe(true);
+    expect(shortcutMatches({ key: "W", metaKey: true }, { key: "w", meta: true })).toBe(true);
+    expect(shortcutMatches({ key: "L", metaKey: true }, { key: "l", meta: true })).toBe(true);
   });
 });

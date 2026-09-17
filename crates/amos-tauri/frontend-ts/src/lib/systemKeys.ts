@@ -2,6 +2,8 @@
  * systemKeys.ts — which **physical keys the touch shell admits**, decided from the chrome
  * registry instead of from a second list (REQ-A335).
  *
+ * Phase 3: 支持从键盘设置页面读取用户自定义配置。
+ *
  * The problem this closes: `svelte/shellModules.ts` *is* the shell's shortcut table — its
  * overlay rows carry `shortcuts: [{ key: "F4" }]`, `[{ key: "Space", meta: true }]`,
  * `[{ key: "F3" }, { key: "Tab", meta: true }]`, and Control Center deliberately has none at
@@ -35,6 +37,7 @@ import {
   type ShellShortcut,
   type ShortcutEvent,
 } from "./shellModule";
+import { readKeyboardConfig } from "./keyboardConfig";
 
 /** A surface the touch shell can open by key. */
 export type TouchOverlay = "spot" | "recents" | "library";
@@ -56,19 +59,6 @@ export type ShellKeyIntent =
   | { kind: "settings" }
   /** Not ours — leave the keystroke alone. */
   | { kind: "none" };
-
-
-/** The same event fields `shortcutMatches` reads, plus the three reasons to stand down. */
-export interface ShellKeyEvent extends ShortcutEvent {
-  /** An IME (the pinyin overlay) is mid-composition: never steal the keystroke. */
-  isComposing?: boolean;
-  /** Key repeat: a held key must not toggle a sheet over and over. */
-  repeat?: boolean;
-  /** Someone closer to the event (a focused widget) already handled it. */
-  defaultPrevented?: boolean;
-}
-
-const NONE: ShellKeyIntent = { kind: "none" };
 
 /**
  * The touch shell's counterpart of a chrome-registry overlay id, or `null` when that row has
@@ -100,6 +90,30 @@ const TOUCH_LABEL_KEYS: Record<TouchOverlay, string> = {
 };
 
 /**
+ * Get merged overlay bindings (user config + defaults).
+ * Phase 3: 读取用户自定义配置，与注册表合并。
+ */
+function getMergedOverlayBindings(modules: readonly ShellModule[]): Map<string, ShellShortcut[]> {
+  const config = readKeyboardConfig();
+  const bindings = new Map<string, ShellShortcut[]>();
+
+  for (const m of modulesFor("overlay", modules)) {
+    if (!m.shortcuts) continue;
+    const custom = config.overlays[m.id];
+    if (custom === undefined) {
+      // 使用默认值
+      bindings.set(m.id, m.shortcuts);
+    } else if (custom !== null) {
+      // 使用自定义
+      bindings.set(m.id, custom);
+    }
+    // null = 禁用，不添加到绑定
+  }
+
+  return bindings;
+}
+
+/**
  * The shortcut panel's content, **generated** from the same two sources the engine reads
  * (REQ-A338).
  *
@@ -109,6 +123,8 @@ const TOUCH_LABEL_KEYS: Record<TouchOverlay, string> = {
  * catalog walks the registry rows and `TOUCH_SYSTEM_SHORTCUTS` instead, and
  * `systemKeys.test.ts` pins the result. Adding a key anywhere therefore fails a test until the
  * panel is told about it.
+ *
+ * Phase 3: 现在从合并后的绑定中读取快捷键。
  *
  * Rows are: the platform's own navigation keys first (⌘[ / ⌘,), then the registry's overlay rows
  * in **registry order** (the same order the desktop chrome documents). A row with two bindings
@@ -120,12 +136,26 @@ export function touchShortcutCatalog(modules: readonly ShellModule[]): TouchShor
     keys: formatShortcut(shortcut),
     labelKey,
   }));
-  const overlays = modulesFor("overlay", modules).flatMap((m) => {
-    const target = touchTargetForOverlay(m.id);
-    const labelKey = target ? TOUCH_LABEL_KEYS[target] : null;
-    if (!target || !labelKey || !m.shortcuts?.length) return [];
-    return [{ keys: m.shortcuts.map((s) => formatShortcut(s)).join(" / "), labelKey }];
-  });
+
+  // Phase 3: 使用合并后的绑定
+  const mergedBindings = getMergedOverlayBindings(modules);
+  const overlays = modulesFor("overlay", modules)
+    .map((m) => {
+      const target = touchTargetForOverlay(m.id);
+      const labelKey = target ? TOUCH_LABEL_KEYS[target] : null;
+      if (!target || !labelKey) return null;
+
+      // 从合并后的绑定中获取快捷键
+      const shortcuts = mergedBindings.get(m.id);
+      if (!shortcuts?.length) return null;
+
+      return {
+        keys: shortcuts.map((s) => formatShortcut(s)).join(" / "),
+        labelKey,
+      };
+    })
+    .filter((r): r is TouchShortcutHint => r !== null);
+
   return [...system, ...overlays];
 }
 
@@ -180,6 +210,8 @@ const TOUCH_SYSTEM_SHORTCUTS: ReadonlyArray<{
  * "dismiss" means at its own position (`lib/backNav.ts`) and whether the shell is in a state
  * where a surface may be opened at all (the lock screen is the caller's call, not this
  * function's).
+ *
+ * Phase 3: 现在使用合并后的绑定（用户自定义 + 系统默认）。
  */
 export function shellKeyIntent(
   e: ShellKeyEvent,
@@ -196,10 +228,21 @@ export function shellKeyIntent(
   //    all, and the caller must also let the event through then).
   if (e.key === "Escape") return { kind: "dismiss", via: "escape" };
 
-  // 3. The registry — the one place that knows the surface-launch keys.
-  const row = moduleForShortcut("overlay", modules, e);
-  const target = row ? touchTargetForOverlay(row.id) : null;
-  if (target) return { kind: "toggle", target };
+  // 3. Phase 3: 使用合并后的绑定
+  const mergedBindings = getMergedOverlayBindings(modules);
+
+  // Walk the merged bindings and route a match to the touch target. We use the
+  // shared `shortcutMatches` (case-insensitive letter folding included — see
+  // `shellModule.normalizeKey`) instead of re-implementing the matcher here:
+  // the same code that powers desktop chrome and the ⌘-hold panel catalog also
+  // powers this admission, so the truth lives in one place.
+  for (const [id, shortcuts] of mergedBindings) {
+    for (const s of shortcuts) {
+      if (!shortcutMatches(e, s)) continue;
+      const target = touchTargetForOverlay(id);
+      if (target) return { kind: "toggle", target };
+    }
+  }
 
   // 4. The platform's navigation keys (⌘[ / ⌘,), matched with the same rules.
   for (const { intent, shortcut } of TOUCH_SYSTEM_SHORTCUTS) {
@@ -208,3 +251,4 @@ export function shellKeyIntent(
   return NONE;
 }
 
+const NONE: ShellKeyIntent = { kind: "none" };

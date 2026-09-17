@@ -27,6 +27,15 @@ const MODULES = [
   { id: "control-center-panel", slot: "overlay", order: 40 },
 ] as unknown as ShellModule[];
 
+/**
+ * A registry whose key is a single uppercase letter. Tests the same FMEA finding as
+ * `keyboardConfigHook.test.ts` — `KeyboardEvent.key` is lowercase for letters, so the
+ * declared key must be normalised on both sides or the binding silently misses.
+ */
+const LETTER_MODULES = [
+  { id: "launchpad", slot: "overlay", order: 10, shortcuts: [{ key: "L", meta: true }] },
+] as unknown as ShellModule[];
+
 const press = (key: string, mod: Partial<KeyboardEvent> = {}) =>
   ({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mod }) as KeyboardEvent;
 
@@ -139,6 +148,16 @@ describe("shellKeyIntent (touch keyboard admission, REQ-A335)", () => {
       via: "cmd-bracket",
     });
     expect(shellKeyIntent(press(",", { metaKey: true }), [])).toEqual({ kind: "settings" });
+  });
+
+  test("letter shortcuts match case-insensitively (FMEA finding from keyboardConfigHook)", () => {
+    // Today no overlay row uses a single letter, but a future row or user override might.
+    // The FMEA finding: `KeyboardEvent.key` for letters is lowercase ("l"), while the
+    // registry declares the binding as uppercase ("L"). A strict `===` silently misses.
+    expect(shellKeyIntent(press("l", { metaKey: true }), LETTER_MODULES)).toEqual({
+      kind: "toggle",
+      target: "library",
+    });
   });
 });
 
