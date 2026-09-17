@@ -24,7 +24,7 @@ use jni::{JNIEnv, JavaVM};
 use serde_json::Value as Json;
 
 use crate::error::{MediaError, Result};
-use crate::mapping::mime_for;
+use crate::mapping::{kind_and_mime_for_name, mime_for};
 use crate::provider::{ensure_loadable, MediaProvider};
 use crate::spec::{MediaItem, MediaKind, StandardDir};
 
@@ -133,7 +133,16 @@ impl MediaProvider for AndroidMediaProvider {
         let tag: JObject = mk(dir.tag())?.into();
         let nm: JObject = mk(&name)?.into();
         let kd: JObject = mk(kind.as_str())?.into();
-        let mi: JObject = mk(mime_for(kind))?.into();
+        // The MIME is what Android's MediaProvider normalises the display name to, so it must
+        // agree with the name we were handed. Sending the kind's default
+        // (`mime_for(Audio) = "audio/mpeg"`) for an `Amos-…wav` export made MediaStore rewrite
+        // the file to `Amos-….wav.mp3` — a user-visible lie about the content (measured on the
+        // device, S5 / Android 14, 2026-09-17). Prefer the name's own type, and fall back to the
+        // kind only when the name says nothing.
+        let mime = kind_and_mime_for_name(&name)
+            .map(|(_, m)| m)
+            .unwrap_or_else(|| mime_for(kind));
+        let mi: JObject = mk(mime)?.into();
         let b64: JObject = mk(&STANDARD.encode(data))?.into();
         let args = [
             JValue::Object(&tag),

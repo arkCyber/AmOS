@@ -103,6 +103,7 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-022', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/i18n-scan.mjs', 'crates/amos-tauri/frontend-ts/scripts/i18n-literal-allowlist.json'], markers: ['assignedCJKCopy', 'hard-coded copy in a <script> block', 'stale literal exemption'], severity: 4 },
   { id: 'F-SH-023', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appLinks.ts', 'crates/amos-tauri/frontend-ts/src/svelte/CameraApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/camera.svelte.test.ts'], markers: ['openPhoto', 'PHOTOS_CHANNEL', 'a11y.lastPhoto'], severity: 3 },
   { id: 'F-SH-024', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/a11y-scan.mjs'], markers: ['r9_deadControl', 'buttonTags', 'dead-control'], severity: 3 },
+  { id: 'F-MED-001', module: 'amos-media', files: ['crates/amos-media/src/android.rs', 'crates/amos-media/src/mapping.rs'], markers: ['kind_and_mime_for_name(&name)', 'audio/mpeg'], severity: 4 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
