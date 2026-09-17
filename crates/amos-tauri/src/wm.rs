@@ -888,6 +888,8 @@ impl WmState {
                         let url = WebviewUrl::App(format!("{APP_ENTRY}#window={label}").into());
                         // On desktop, hide the native title bar so the app window
                         // renders edge-to-edge (REQ-A249 / PC_DESKTOP_ARCHITECTURE.md §4.3).
+                        // `mut` is only used by the desktop-gated line below.
+                        #[cfg_attr(not(desktop), allow(unused_mut))]
                         let mut builder = WebviewWindowBuilder::new(app, label.clone(), url)
                             .title(app_window_title(&label))
                             .inner_size(f64::from(opens_at.width), f64::from(opens_at.height))
@@ -898,6 +900,15 @@ impl WmState {
                                 f64::from(policy.min_pane.width),
                                 f64::from(policy.min_pane.height),
                             );
+                        // macOS title-bar overlay (REQ-A249 / PC_DESKTOP_ARCHITECTURE.md
+                        // §4.3). `title_bar_style` exists on desktop Tauri only: on
+                        // Android/iOS the method is absent, so a *runtime*
+                        // `FormFactor::Desktop` guard is not enough — the call still has
+                        // to resolve at compile time. Ungated, this single line broke
+                        // `make android-app` for the whole APK with E0599 (measured
+                        // 2026-09-16; see FMEA F-WM-019). Same host pattern as
+                        // `window_maximize` above: a cross-target no-op.
+                        #[cfg(desktop)]
                         if policy.form == FormFactor::Desktop {
                             builder = builder.title_bar_style(tauri::TitleBarStyle::Overlay);
                         }

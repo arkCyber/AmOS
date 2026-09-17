@@ -1,4 +1,4 @@
-.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs device-eval frontend-dist frontend-fresh app-open
+.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-app-check android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs device-eval frontend-dist frontend-fresh app-open
 
 all: build
 
@@ -614,7 +614,7 @@ mobile-check:
 # build (a multi-GB NDK image) — `make ci-local` covers the rest of that gate.
 verify: lint test check cov ci-local honesty-smoke hot-loop
 verify: smoke sup-smoke timesync-smoke e2e-local gated-check
-verify: android-glue-check android-audio-check android-ai-sherpa-check
+verify: android-glue-check android-audio-check android-ai-sherpa-check android-app-check
 verify: pdf-android-check vector-db-check mobile-check
 	@echo "[verify] all offline verification targets passed"
 
@@ -689,6 +689,19 @@ vector-db-check:
 	cargo clippy -p amos-vector-db --all-targets -- -D warnings
 	cargo fmt -p amos-vector-db -- --check
 	cargo run -p amos-vector-db --example bench_arm -- 2000 64
+
+# Cross-compile gate for the Tauri host crate on Android — the gate that was missing.
+# `mobile-check` only *reports* the toolchain (it never fails); `pdf-android-check` and
+# `vector-db-check` cross-compile their own crates. So nothing compiled `amos-tauri`
+# for aarch64: a desktop-only API used without a cfg gate (a *runtime* `FormFactor`
+# guard does not help — the method must resolve) kept the host green and broke the
+# whole APK with E0599 (measured 2026-09-16: `make android-app` died on
+# `WebviewWindowBuilder::title_bar_style`, see F-WM-019). The NDK's `cc` shim
+# (`aarch64-linux-android-clang`) does not exist under its unversioned name, so the
+# env has to come from cargo-ndk — same tool the audio gate uses. API 31 matches the
+# linker pinned in .cargo/config.toml.
+android-app-check:
+	cargo ndk -t arm64-v8a -P 31 check -p amos-tauri --features android
 
 
 # Local CI-parity gate: shell-syntax + workflow YAML + native-toolchain pin

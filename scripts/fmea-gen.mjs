@@ -60,6 +60,7 @@ const KNOWN_FAILURES = [
   { id: 'F-WM-016', module: 'amos-tauri', files: ['crates/amos-tauri/src/wm.rs'], markers: ['resizable(policy.free_resize)', 'min_inner_size'], severity: 2 },
   { id: 'F-WM-017', module: 'amos-tauri', files: ['crates/amos-tauri/src/wm.rs'], markers: ['reclamp_windows', 'reclamp_target'], severity: 3 },
   { id: 'F-WM-018', module: 'amos-tauri', files: ['crates/amos-tauri/src/wm.rs', 'crates/amos-wm/src/form.rs'], markers: ['check_new_app_window', 'AppWindowRefusal'], severity: 3 },
+  { id: 'F-WM-019', module: 'amos-tauri', files: ['crates/amos-tauri/src/wm.rs', 'Makefile'], markers: ['title_bar_style', 'android-app-check', 'window_maximize'], severity: 4 },
 
   // 输入法 (amos-ime / amos-tauri)
   { id: 'F-IME-001', module: 'amos-ime', files: ['crates/amos-ime/src/engine.rs', 'crates/amos-tauri/src/ime.rs'], markers: ['PinyinCore', 'with_core'], severity: 3 },
