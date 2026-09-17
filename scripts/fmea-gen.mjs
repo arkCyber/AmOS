@@ -105,6 +105,7 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-024', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/a11y-scan.mjs'], markers: ['r9_deadControl', 'buttonTags', 'dead-control'], severity: 3 },
   { id: 'F-MED-001', module: 'amos-media', files: ['crates/amos-media/src/android.rs', 'crates/amos-media/src/mapping.rs'], markers: ['kind_and_mime_for_name(&name)', 'audio/mpeg'], severity: 4 },
   { id: 'F-DEV-001', module: 'process', files: ['scripts/device-probe-media-export.js', 'scripts/device-ui-eval.mjs'], markers: ['__probeExpect', 'settledMs', 'IS_PENDING'], severity: 3 },
+  { id: 'F-TAU-007', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['scheduler_alarm_register', 'AlarmGlue.schedule', 'setExactAndAllowWhileIdle'], severity: 4 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
