@@ -93,6 +93,7 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-013', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/Shell.svelte', 'crates/amos-tauri/frontend-ts/src/lib/backNav.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/shell.svelte.test.ts'], markers: ['pushDecision', 'history.pushState', 'REQ-A347'], severity: 3 },
   { id: 'F-SH-014', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte', 'crates/amos-tauri/frontend-ts/src/lib/desktopKeys.ts', 'crates/amos-tauri/frontend-ts/src/i18n/locales/en.ts'], markers: ['desktopShortcutLabel', 'desktop.menu.file.closeWindow'], severity: 3 },
   { id: 'F-SH-015', module: 'process', files: ['crates/amos-tauri/frontend-ts/scripts/orphan-test-scan.mjs', 'crates/amos-tauri/frontend-ts/scripts/test-reach-allowlist.json'], markers: ['orphan-test-scan', 'testreach:scan'], severity: 2 },
+  { id: 'F-SH-016', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/mediaExport.ts', 'crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/vmemos.svelte.test.ts'], markers: ['exportToSharedCollection', 'RECORDING_EXPORT_DIR', 'REQ-A350'], severity: 2 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
