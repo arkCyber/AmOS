@@ -57,6 +57,18 @@ object AlarmGlue {
     private const val REQUEST_BASE = 0x414c // "AL"
     /** Scheme of the per-alarm identity URI (see [alarmIdentity]). */
     private const val ALARM_SCHEME = "amos-alarm"
+
+    /*
+     * KOTLIN → RUST CONTRACT (the reason this file's Rust-callable members carry `@JvmStatic`):
+     *
+     * `alarm_sched.rs` reaches these through `JNIEnv::call_static_method` / `PendingIntent.getActivity`
+     * style static lookups, and a Kotlin `object`'s member is an **instance** method on `INSTANCE`
+     * unless it is annotated. Without `@JvmStatic` the JVM raises
+     * `java.lang.NoSuchMethodError: no static method …` at the first call — which the compiler on
+     * either side cannot see, and which the device found immediately (REQ-A376: every
+     * `scheduler_alarm_register` failed, and `dumpsys alarm` stayed empty). Keep `@JvmStatic` on
+     * anything Rust calls by name.
+     */
     /** Notification channel for a firing alarm (created on demand, idempotent). */
     private const val ALARM_CHANNEL = "amos-alarm-firing"
     /** Notification tag; the id is the notification's own id, so two alarms do not overwrite each other. */
@@ -229,6 +241,7 @@ object AlarmGlue {
      * when no Activity is attached (or the platform refuses) rather than reporting a screen that
      * never opened; the caller can then say "could not open it" honestly.
      */
+    @JvmStatic
     fun openExactAlarmSettings(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
         val target = activity?.get() ?: return false
@@ -279,6 +292,7 @@ object AlarmGlue {
      * will not wake the phone"* instead of reporting a success that is only true while
      * our process happens to be alive.
      */
+    @JvmStatic
     fun schedule(context: Context, id: String, atMs: Long): String {
         val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
             ?: return STATUS_UNAVAILABLE
@@ -301,6 +315,7 @@ object AlarmGlue {
     }
 
     /** Cancel a previously scheduled exact alarm for `id`. Returns a `STATUS_*` string. */
+    @JvmStatic
     fun cancel(context: Context, id: String): String {
         val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
             ?: return STATUS_UNAVAILABLE

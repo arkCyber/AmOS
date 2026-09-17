@@ -401,8 +401,20 @@ mod android {
             Ok(value) => value
                 .z()
                 .map_err(|e| format!("the glue's answer was not a boolean: {e}")),
-            Err(e) => Err(format!("AlarmGlue.openExactAlarmSettings threw: {e}")),
+            Err(e) => {
+                clear_pending(&env);
+                Err(format!("AlarmGlue.openExactAlarmSettings threw: {e}"))
+            }
         }
+    }
+
+    /// Clear a pending Java exception left by a failed call, so it cannot escape into the IPC
+    /// return path (REQ-A376: a `NoSuchMethodError` — the missing `@JvmStatic` — was surfaced by the
+    /// JVM as "Java exception was raised during method invocation" *and* the call failed, instead of
+    /// coming back as an honest `DeviceOutcome::Unknown`). `amos_jni::clear_pending` is the repo's
+    /// helper for exactly this, and the other JNI call sites already follow the rule.
+    fn clear_pending(env: &JNIEnv<'_>) {
+        amos_jni::clear_pending(env);
     }
 
     /// `AlarmGlue.schedule(context, id, atMs)` → one `STATUS_*` word.
@@ -416,7 +428,10 @@ mod android {
         };
         let jid = match env.new_string(id) {
             Ok(s) => s,
-            Err(e) => return DeviceOutcome::Unknown(format!("could not build the id string: {e}")),
+            Err(e) => {
+                clear_pending(&env);
+                return DeviceOutcome::Unknown(format!("could not build the id string: {e}"));
+            }
         };
         let ms = match i64::try_from(at_ms) {
             Ok(v) => v,
@@ -435,7 +450,10 @@ mod android {
                 Ok(status) => super::device_outcome_from_status(&status),
                 Err(reason) => DeviceOutcome::Unknown(reason),
             },
-            Err(e) => DeviceOutcome::Unknown(format!("AlarmGlue.schedule threw: {e}")),
+            Err(e) => {
+                clear_pending(&env);
+                DeviceOutcome::Unknown(format!("AlarmGlue.schedule threw: {e}"))
+            }
         }
     }
 
@@ -450,7 +468,10 @@ mod android {
         };
         let jid = match env.new_string(id) {
             Ok(s) => s,
-            Err(e) => return DeviceOutcome::Unknown(format!("could not build the id string: {e}")),
+            Err(e) => {
+                clear_pending(&env);
+                return DeviceOutcome::Unknown(format!("could not build the id string: {e}"));
+            }
         };
         let args = [
             JValue::Object(binding.context.as_obj()),
@@ -462,7 +483,10 @@ mod android {
                 Ok(status) => super::device_outcome_from_status(&status),
                 Err(reason) => DeviceOutcome::Unknown(reason),
             },
-            Err(e) => DeviceOutcome::Unknown(format!("AlarmGlue.cancel threw: {e}")),
+            Err(e) => {
+                clear_pending(&env);
+                DeviceOutcome::Unknown(format!("AlarmGlue.cancel threw: {e}"))
+            }
         }
     }
 

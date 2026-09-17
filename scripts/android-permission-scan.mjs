@@ -178,6 +178,9 @@ export const API_FAMILIES = [
     permissions: [
       "android.permission.POST_NOTIFICATIONS",
       "android.permission.USE_FULL_SCREEN_INTENT",
+      // Measured on the device (REQ-A376): this ROM's NotificationService refuses to post the
+      // full-screen-intent ring without it (`SecurityException: … has android.permission.WAKE_LOCK`).
+      "android.permission.WAKE_LOCK",
     ],
     runtime: ["android.permission.POST_NOTIFICATIONS"],
     why: "NotificationManagerCompat#notify + NotificationCompat.Builder#setFullScreenIntent (through AlarmGlue.notifyAlarm, from AlarmReceiver at the alarm instant): POST_NOTIFICATIONS (runtime, API 33+ — without it the notification is silently not posted) + USE_FULL_SCREEN_INTENT (install-time for an alarm/call app)",

@@ -158,4 +158,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
+    <!-- `WAKE_LOCK` — measured on the device (REQ-A376): posting the full-screen-intent ring threw
+         `SecurityException: Neither user 10172 nor current process has android.permission.WAKE_LOCK`
+         on this ROM, so the notification never appeared while the alarm itself fired normally. It is
+         a **normal** (install-time) permission, and waking the screen for an alarm is exactly what it
+         is for; without the declaration the ring is silently absent — the one failure this path
+         cannot tolerate. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
 </manifest>

@@ -153,6 +153,13 @@ const KNOWN_FAILURES = [
   // REQ-A374: the ledger bounded its keys but not its size (a WebView-callable command), and the
   // settings path read an Activity reference across threads without a happens-before edge.
   { id: 'F-TAU-013', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['MAX_ALARM_ENTRIES', 'check_alarm_capacity', '@Volatile'], severity: 2 },
+  // REQ-A376 (device-found): a Kotlin `object`'s member is not a static method unless it is
+  // annotated, so every Rust `call_static_method` into AlarmGlue threw NoSuchMethodError — and no
+  // gate could see it (both sides compile, the class exists, the signature string is right).
+  { id: 'F-TAU-014', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt', 'crates/amos-tauri/src/alarm_sched.rs'], markers: ['@JvmStatic', 'KOTLIN → RUST CONTRACT', 'clear_pending'], severity: 3 },
+  // REQ-A376 (device-found): this ROM's NotificationService refuses a full-screen-intent
+  // notification without WAKE_LOCK, so the ring vanished while the alarm itself still fired.
+  { id: 'F-TAU-015', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/AndroidManifest.permissions.xml', 'scripts/android-permission-scan.mjs'], markers: ['WAKE_LOCK', 'alarm-notification'], severity: 3 },
   { id: 'F-TAU-008', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/uiFailures.ts'], markers: ['unhandledrejection', 'error'], severity: 3 },
 
   // 机器人中间件
