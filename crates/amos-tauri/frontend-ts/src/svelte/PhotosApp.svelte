@@ -26,26 +26,9 @@
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { fmtTime } from "../lib/notes";
-  import {
-    cursorOf,
-    hasMediaBridge,
-    mediaList,
-    mediaGrantRead,
-    mediaStreamBase,
-  } from "../lib/media";
-  import type { MediaCursor, MediaListing } from "../lib/media";
-  import {
-    canLoadMore,
-    emptyPaging,
-    fetchInto,
-    remainingTotal,
-    type PagingState,
-  } from "../lib/mediaPaging";
-  import {
-    nativePhotoFromItem,
-    nativeStreamUrl,
-    nativeTileKind,
-  } from "../lib/photoLibrary";
+  import { hasMediaBridge, mediaList, mediaGrantRead } from "../lib/media";
+  import type { MediaItem } from "../lib/media";
+  import { nativePhotoFromItem } from "../lib/photoLibrary";
   import type { NativePhoto } from "../lib/photoLibrary";
   import { t } from "./locale.svelte";
   import { currentFormFactor } from "../lib/desktopApps";
@@ -74,13 +57,9 @@
   let selecting = $state(false);
   let selected = $state<ReadonlySet<string>>(new Set());
   // Native (real external-storage) stills from the media_* bridge, shown as a
-  // read-only strip above the local grid (only when a bridge is present). The
-  // list itself is **derived** from `nativePage.items` — the merge / dedup /
-  // ordering lives in `lib/mediaPaging`, so the screen never has to write the
-  // paged-list math itself.
-  const nativeShown = $derived(
-    !favOnly && !vidsOnly && !selecting && native.length > 0,
-  );
+  // read-only strip above the local grid (only when a bridge is present).
+  let native = $state<NativePhoto[]>([]);
+  const nativeShown = $derived(!favOnly && !vidsOnly && !selecting && native.length > 0);
 
   // The gallery grid scales with the device class (REQ-A292): iOS keeps 3 columns
   // on the phone; iPadOS Photos uses 5 columns in My Photos; the desktop class
@@ -102,70 +81,27 @@
   let nativeLoaded = false;
   let nativeBlocked = $state(false);
   let nativeBusy = $state(false);
-  // The host's streaming base for native bytes (`media_stream_base_url`,
-  // REQ-A303). `null` = no host / an unusable answer → tiles keep their kind
-  // glyph (the honest fallback); the actual photo is *not* shown and we never
-  // pretend a broken image is the photo. Resolved **once** per `loadNative`
-  // because the engine's base form is a build-time fact, not a per-tile fact.
-  let nativeBase = $state<string | null>(null);
-  // Native items whose bytes this engine could not decode (e.g. HEIC): fall
-  // back to the glyph and stay there, instead of leaving a permanently
-  // broken tile.
-  let nativeFailed = $state<ReadonlySet<string>>(new Set());
-
-  // The host caps each listing (REQ-A314) and the strip pulls one page per call,
-  // so the merge / dedup / cursor logic lives in `lib/mediaPaging` and the screen
-  // just consumes the resulting state. `cursors` is per-collection (a merged
-  // view's order is ours, not the host's — only the host's own last item sets the
-  // next cursor).
-  let nativePage = $state<PagingState>(emptyPaging(NATIVE_COLLECTIONS));
-  const native = $derived(nativePage.items.map(nativePhotoFromItem));
-  // The host's "M of M total" answer, summed across collections, drives the
-  // "showing the newest part of the library" notice (REQ-A314). When the
-  // `remainingTotal` is zero the listing really is everything, and the notice
-  // disappears.
-  const nativeRemaining = $derived(remainingTotal(nativePage, NATIVE_COLLECTIONS));
-  const nativeHasMore = $derived(canLoadMore(nativePage, NATIVE_COLLECTIONS));
-  // "M of N" — how many we hold vs. how many the host says exist. The truncated
-  // notice (`native-truncated`) reads `native.length` for the M and
-  // `native.length + nativeRemaining` for the N: the pager subtracts the
-  // current page once, so the screen only has to add and never worry about
-  // double-counting.
-  const nativeTruncated = $derived(nativeRemaining > 0);
 
   const loadNative = async () => {
     if (!hasMediaBridge()) return;
     nativeBusy = true;
-    // Resolve the streaming base **once** per load — its form is a build-time
-    // fact, and the same answer covers every page.
-    nativeBase = await mediaStreamBase();
-    nativeFailed = new Set();
-    // One round of paging (the first call = the first page; later calls resume
-    // from the cursors the host handed back). `failed` is a denial / refused /
-    // host error — never rendered as "you have no photos".
-    const { state, failed } = await fetchInto(
-      nativePage,
-      NATIVE_COLLECTIONS,
-      (dir, after) => mediaList(dir, after),
-    );
-    nativePage = state;
-    nativeBlocked = failed.length > 0;
-    nativeBusy = false;
-  };
-
-  /** Pull the next page from every collection that still owes one. */
-  const loadMoreNative = async () => {
-    if (!hasMediaBridge() || nativeBusy) return;
-    nativeBusy = true;
-    const { state, failed } = await fetchInto(
-      nativePage,
-      NATIVE_COLLECTIONS,
-      (dir, after) => mediaList(dir, after),
-    );
-    nativePage = state;
-    // Loading more after a denial: the strip keeps the prompt up so the user
-    // can grant and retry — we don't replace the denial with "no more photos".
-    nativeBlocked = nativeBlocked || failed.length > 0;
+    const settled = await Promise.allSettled(NATIVE_COLLECTIONS.map((c) => mediaList(c)));
+    const items: MediaItem[] = [];
+    for (const r of settled) {
+      if (r.status === "fulfilled" && Array.isArray(r.value)) items.push(...r.value);
+    }
+    // Any rejection is a daemon-side error (a denial) — never render it as
+    // "you have no photos".
+    nativeBlocked = settled.some((r) => r.status === "rejected");
+    const seen = new Set<string>();
+    const tiles: NativePhoto[] = [];
+    for (const it of items) {
+      if (seen.has(it.uri)) continue;
+      seen.add(it.uri);
+      tiles.push(nativePhotoFromItem(it));
+    }
+    tiles.sort((a, b) => b.ts - a.ts);
+    native = tiles;
     nativeBusy = false;
   };
 
@@ -496,63 +432,16 @@
     {:else}
       {#if nativeShown}
         <div class="mb-2" role="region" aria-label={t("a11y.nativePhotos")}>
-          {#if nativeTruncated}
-            <p
-              data-testid="native-truncated"
-              role="status"
-              class="mb-1 px-1 text-[11px] text-white/60"
-            >
-              {t("photo.nativePartial", {
-                shown: native.length,
-                total: native.length + nativeRemaining,
-              })}
-            </p>
-          {/if}
           <div class="flex gap-1 overflow-x-auto px-1">
             {#each native as n (n.id)}
-              {@const url = nativeStreamUrl(n, nativeBase)}
-              {@const kind = nativeTileKind(n.kind)}
-              {@const failed = nativeFailed.has(n.id)}
               <div
                 class="relative grid aspect-square w-16 shrink-0 place-items-center overflow-hidden rounded-lg bg-black/20 text-2xl ring-1 ring-white/10"
                 title={n.name}
               >
-                {#if url && kind === "image" && !failed}
-                  <img
-                    src={url}
-                    alt={n.name}
-                    class="absolute inset-0 h-full w-full object-cover"
-                    onerror={() => (nativeFailed = new Set([...nativeFailed, n.id]))}
-                  />
-                {:else if url && kind === "video" && !failed}
-                  <video
-                    src={url}
-                    muted
-                    playsinline
-                    preload="metadata"
-                    aria-label={n.name}
-                    class="absolute inset-0 h-full w-full object-cover"
-                    onerror={() => (nativeFailed = new Set([...nativeFailed, n.id]))}
-                  />
-                {/if}
-                {#if !url || failed}
-                  <span aria-hidden="true">{n.emoji ?? "🗂"}</span>
-                {/if}
+                <span aria-hidden="true">{n.emoji ?? "🗂"}</span>
               </div>
             {/each}
           </div>
-          {#if nativeHasMore && !nativeBlocked}
-            <button
-              data-testid="native-load-more"
-              type="button"
-              disabled={nativeBusy}
-              onclick={() => void loadMoreNative()}
-              aria-label={t("a11y.nativeLoadMore")}
-              class="mt-1 rounded-full bg-white/10 px-2.5 py-1 text-[11px] font-medium text-white/90 active:scale-95 disabled:opacity-50"
-            >
-              {t("photo.nativeLoadMore", { n: nativeRemaining })}
-            </button>
-          {/if}
         </div>
       {/if}
       {#each sections as sec (sec.key)}
