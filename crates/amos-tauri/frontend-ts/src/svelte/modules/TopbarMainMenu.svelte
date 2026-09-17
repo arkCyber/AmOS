@@ -8,6 +8,9 @@
    * and named with the reason.
    */
   import { bridgeDiag, invoke } from "../../lib/backend";
+  // 表派生的键帽（REQ-A342）：菜单不再自持一份"快捷键字符串"，行里的 `shortcut` 要么来自
+  // 这张表（壳真正绑定的键），要么是平台自己的编辑键（⌘C/⌘V/⌘A）——后者不可改、也不可翻译。
+  import { desktopShortcutLabel } from "../../lib/desktopKeys";
   import { clipboardRead, clipboardWrite } from "../../lib/clipboard";
   import { t } from "../locale.svelte";
   import { toggleDesktopView } from "../../lib/desktopView";
@@ -24,7 +27,22 @@
   interface MenuRow {
     id: string;
     labelKey?: string;
-    shortcutKey?: string;
+    /**
+     * The keycap drawn at the right edge of the row.
+     *
+     * Two kinds of value, and the difference matters (REQ-A342):
+     *   * a **shell** key ⇒ `desktopShortcutLabel(…)`, derived from the table that actually binds
+     *     it, so hint and engine cannot drift;
+     *   * a **platform** key (⌘C/⌘V/⌘A — the WebView's own editing commands, which this shell does
+     *     not bind and cannot change) ⇒ the literal keycap, in one place, with that reason stated.
+     *
+     * There used to be a third kind: an **i18n key** (`shortcutKey: "desktop.menu.file.…Shortcut"`).
+     * No locale defined those keys and `translate()` falls back to `raw ?? key`, so the menu printed
+     * the key *name* on screen — and a keycap is not translatable anyway. A row whose key **nothing**
+     * binds simply has no `shortcut` (see `file.new-window`): a menu may not advertise a binding
+     * that does not exist.
+     */
+    shortcut?: string;
     separatorBefore?: boolean;
     run?: () => void;
   }
@@ -84,7 +102,6 @@
     {
       id: "file.new-window",
       labelKey: "desktop.menu.file.newWindow",
-      shortcutKey: "desktop.menu.file.newWindowShortcut",
       run: () => {
         // REQ-A297 phase-2 §4 cont.2: pre-fix this row used
         // `.catch(() => undefined)` — dead code, since `invoke`
@@ -97,7 +114,7 @@
     {
       id: "file.close",
       labelKey: "desktop.menu.file.closeWindow",
-      shortcutKey: "desktop.menu.file.closeWindowShortcut",
+      shortcut: desktopShortcutLabel("close-window"),
       run: () => {
         // Empty `label` is the macOS "close the focused window" idiom;
         // a refused close surfaces honestly through `noteFailure`.
@@ -112,7 +129,7 @@
     {
       id: "edit.copy",
       labelKey: "desktop.menu.edit.copy",
-      shortcutKey: "desktop.menu.edit.copyShortcut",
+      shortcut: "⌘C",
       run: () => {
         const text = window.getSelection?.()?.toString() ?? "";
         if (text.length > 0) {
@@ -125,7 +142,7 @@
     {
       id: "edit.paste",
       labelKey: "desktop.menu.edit.paste",
-      shortcutKey: "desktop.menu.edit.pasteShortcut",
+      shortcut: "⌘V",
       run: () => {
         clipboardRead().then((entry) => {
           if (entry?.payload.kind === "text") {
@@ -151,7 +168,7 @@
     {
       id: "edit.select-all",
       labelKey: "desktop.menu.edit.selectAll",
-      shortcutKey: "desktop.menu.edit.selectAllShortcut",
+      shortcut: "⌘A",
       run: () => {
         window.dispatchEvent(
           new KeyboardEvent("keydown", { key: "a", metaKey: true }),
@@ -192,7 +209,7 @@
     {
       id: "window.minimize",
       labelKey: "desktop.menu.window.minimize",
-      shortcutKey: "desktop.menu.window.minimizeShortcut",
+      shortcut: desktopShortcutLabel("minimize-window"),
       run: () => {
         // Empty `label` is the macOS "minimize the focused window"
         // idiom — same as File→Close above. A refused minimize is
@@ -298,8 +315,8 @@
             >
               <span class="flex w-full items-center justify-between gap-3">
                 <span>{t(row.labelKey!)}</span>
-                {#if row.shortcutKey}
-                  <span class="text-[11px] text-white/45">{t(row.shortcutKey)}</span>
+                {#if row.shortcut}
+                  <span class="text-[11px] text-white/45">{row.shortcut}</span>
                 {/if}
               </span>
             </button>

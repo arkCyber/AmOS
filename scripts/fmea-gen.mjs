@@ -89,6 +89,7 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-010', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopStage.svelte'], markers: ['unionRange(anchorId, id)', 'wasSelected'], severity: 3 },
   // REQ-A278: 顶栏 Edit → Select All 与键盘 ⌘A 必须走同一条选区
   { id: 'F-SH-011', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/DesktopStage.svelte'], markers: ['edit.select-all', 'onWindowKeyDown'], severity: 2 },
+  { id: 'F-SH-012', module: 'process', files: ['crates/amos-tauri/frontend-ts/src/lib/desktopKeys.ts', 'crates/amos-tauri/frontend-ts/scripts/orphan-test-scan.mjs'], markers: ['desktopShortcutLabel', 'orphan-test-scan'], severity: 4 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },

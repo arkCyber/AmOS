@@ -635,6 +635,8 @@ export type TelephonyDialResult = { id: string };
 
 /** Tauri event carrying one live-call state snapshot (incoming/connected/ended). */
 export const TELEPHONY_EVENT = "telephony-event";
+/** The host's native-menu activation channel (`crates/amos-tauri/src/menu.rs`). */
+export const MENU_EVENT = "menu-event";
 
 /** Place a call. `emergency` (or an emergency number) uses the privileged path. */
 export async function telephonyDial(
@@ -732,7 +734,36 @@ export function onTelephonyEvent(
   };
 }
 
-/** Start recording a live call; returns its authoritative snapshot. */
+/**
+ * Subscribe to the host's **native menu** activations.
+ *
+ * The Rust side installs the macOS menu bar and forwards every item activation as a `menu-event`
+ * carrying the item id (`crates/amos-tauri/src/menu.rs`, `app.emit("menu-event", id)`); the shell
+ * maps a small subset of those ids (Preferences / New Window / Close Window / Enter Full Screen).
+ *
+ * This function is why `DesktopShell.svelte` could not mount for a while (REQ-A342): it imported
+ * `onMenuEvent` from this module, the export did not exist, and calling `undefined` threw inside
+ * the component's `onMount` — so the whole desktop chrome failed to initialise, while the event
+ * the host emits had **no consumer at all**. Both halves of that sentence are now fixed: the
+ * subscriber exists here (same shape as `onTelephonyEvent`: a synchronously returned unsubscribe,
+ * a no-op outside Tauri), and the emit has a reader again.
+ */
+export function onMenuEvent(onEvent: (id: string) => void): () => void {
+  let cancelled = false;
+  let unsub: (() => void) | null = null;
+  void subscribe(MENU_EVENT, (payload) => {
+    if (typeof payload === "string" && payload) onEvent(payload);
+  }).then((u) => {
+    if (cancelled) u();
+    else unsub = u;
+  });
+  return () => {
+    cancelled = true;
+    unsub?.();
+  };
+}
+
+
 export async function telephonyStartRecording(
   callId: string,
 ): Promise<TelephonyCall | null> {

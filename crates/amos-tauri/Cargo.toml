@@ -135,3 +135,6 @@ amos-link = { path = "../amos-link" }
 # The device-care domain crate, for building audit events in the bridge e2e the
 # same way `devcare_clean` does.
 amos-devocare = { path = "../amos-devocare" }
+# Used by recording.rs tests to create ephemeral directories without needing
+# platform-specific /tmp logic.
+tempfile = "3"
