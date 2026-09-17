@@ -229,6 +229,13 @@ lint:
 	# it guards the gates that follow. `--selftest` pins the parser/resolver first.
 	node scripts/lint-inputs-scan.mjs --selftest
 	node scripts/lint-inputs-scan.mjs
+	# The device tool's *device-free* half (see scripts/device-ui-eval.mjs --selftest): the stall
+	# diagnosis — "a page that never answers names the window that is in front of it" — is the one
+	# part of that tool that can be pinned without hardware, and its **must-not-blame** cases are
+	# exactly what a later edit would break, sending the next device session after a window that is
+	# not there (REQ-A367 / F-DEV-004). The rest of the tool needs a phone and stays a manual target
+	# (`make device-eval`).
+	node scripts/device-ui-eval.mjs --selftest
 	# The reverse direction (see scripts/unwired-script-scan.mjs): a script that ships but
 	# that the Makefile, the CI workflows and every reachable script never name is dead
 	# weight — and the *executable* layer is the one every gate above depends on. Wired by

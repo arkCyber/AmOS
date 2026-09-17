@@ -165,12 +165,43 @@ patched):
 node scripts/device-ui-eval.mjs 'document.title'                       # → "Amos System UI"
 node scripts/device-ui-eval.mjs 'document.querySelectorAll("[data-testid]").length'
 node scripts/device-ui-eval.mjs --await 'await window.__probe()'       # async expressions
+node scripts/device-ui-eval.mjs --wait 45000 'document.title'          # bound the readiness wait
 node scripts/device-ui-eval.mjs --list                                 # devtools targets
+node scripts/device-ui-eval.mjs --selftest                             # no device needed
 ```
 It finds the app pid, forwards `@webview_devtools_remote_<pid>` and evaluates in the
 real page — so a control's presence, its rendered text and the **real bridge's**
 answer are all observable. Native (non-WebView) UI — permission dialogs, system
 bars — is still `uiautomator`'s job; the two together cover a device round.
+
+**A stalled page now names its cause (REQ-A367).** `Runtime.evaluate` **never returns**
+while the WebView is paused, and Android pauses an obscured WebView. Measured on the S5
+with the notification shade pulled down: `dumpsys window` reported
+`mCurrentFocus=Window{… NotificationShade}` while `com.amos.ai/.MainActivity` was still the
+resumed activity — the app was on screen and running, and its JS had simply stopped. That
+state used to be reported as a bare `devtools evaluate timed out` /
+`page never became ready within 30000ms`, which reads like a broken tool and cost one
+session's worth of chasing ANR/crash logs that had already scrolled away. The failure path
+now reads `dumpsys window` and `dumpsys activity activities` and prints `mCurrentFocus` /
+`mFocusedApp` / `ResumedActivity` **plus a decision** — one that is required to be able to
+answer "the device state is **not** the reason" (the app's own window in front, or the IME
+taking focus). `--selftest` pins the parsers and that decision table on captured device
+output: no phone, no debug build, and it runs in `make lint`.
+
+**Correction (REQ-A368).** The shade was *a* cause, not *the* cause. Collapsing it (a swipe up —
+`cmd statusbar collapse` alone did not work) returned `mCurrentFocus` to
+`com.amos.ai/com.amos.ai.MainActivity`, and the page *still* never answered, through a
+`force-stop` + relaunch as well. What does explain it is the **renderer** reading: `logcat` showed
+`ActivityManager: Unable to launch app com.amos.ai/10172 for service Intent { cmp=com.amos.ai/
+org.chromium.content.app.SandboxedProcessService0:0 }: process is bad`, and
+`dumpsys activity processes` still lists the app's four
+`ConnectionRecord{… u0 CR DEAD …SandboxedProcessService…}` entries — **no WebView renderer**, so the
+page has no JS engine at all (the process meanwhile spins at ~50% of a core, which is how "paused"
+and "stuck" can be told apart). The failure path reports that reading first, together with the
+device-side step (reboot the phone; this is ActivityManager bookkeeping, not an app defect). A
+logcat *window* was not good enough for it: the decisive lines appeared 12 times, all within the
+launch second, and had scrolled out of `logcat -d -t 600` two minutes later — so the verdict comes
+from the current state, and the log line is only corroboration.
 
 Permission ground truth (what the installed APK may actually call) is
 `dumpsys`, not the source:

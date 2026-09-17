@@ -109,6 +109,18 @@ const KNOWN_FAILURES = [
   { id: 'F-DEV-001', module: 'process', files: ['scripts/device-probe-media-export.js', 'scripts/device-ui-eval.mjs'], markers: ['__probeExpect', 'settledMs', 'IS_PENDING'], severity: 3 },
   { id: 'F-TAU-007', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['scheduler_alarm_register', 'AlarmGlue.schedule', 'setExactAndAllowWhileIdle'], severity: 4 },
   { id: 'F-DEV-002', module: 'process', files: ['scripts/fmea-gen.mjs', 'docs/FMEA.md'], markers: ['tableShapeProblems', 'cell count != their header', 'FMEA_DOC'], severity: 3 },
+  // REQ-A365 收口: `pidof` exits 1 when the app is gone — a normal *answer*, not "adb is broken"
+  { id: 'F-DEV-003', module: 'process', files: ['scripts/device-ui-eval.mjs'], markers: ['adbRaw', 'exited ${r.status}', 'app is not running'], severity: 2 },
+  // REQ-A367: a stalled page used to report a symptom with no cause; the cause is now read from
+  // the device, and the table is required to be able to say "the device state is NOT the reason"
+  { id: 'F-DEV-004', module: 'process', files: ['scripts/device-ui-eval.mjs'], markers: ['explainUnready', 'mCurrentFocus', 'PAUSES', 'NOT** the reason'], severity: 2 },
+  // REQ-A367: `--wait <ms>`'s value was taken for the expression (`evaluate(5000)` printed as the
+  // page's answer, exit 0) — an instrument that silently answers a different question
+  { id: 'F-DEV-005', module: 'process', files: ['scripts/device-ui-eval.mjs'], markers: ['expressionArg', 'VALUE_FLAGS'], severity: 2 },
+  // REQ-A368: the shade was a coincidence — the renderer never started; and my first version of
+  // that check read a logcat *window*, so the decisive line had already scrolled away (F-DEV-001's
+  // lesson: never make a time-windowed sample the verdict; read the current state instead)
+  { id: 'F-DEV-006', module: 'process', files: ['scripts/device-ui-eval.mjs'], markers: ['parseDeadRendererConnection', 'CR DEAD', 'dumpsys activity processes'], severity: 2 },
   { id: 'F-SH-025', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte'], markers: ['没有可显示的界面', 'monitor'], severity: 3 },
 
   // System UI 桥
