@@ -22,6 +22,10 @@
  *        • **Dynamic namespaces** — any `` `prefix.${…}` `` template in production
  *          puts every key under `prefix.` in play (`t(\`message.folder.${f}\`)`).
  *        • Allow-listed keys (a reason is mandatory) — deliberate ahead-of-host copy.
+ *      An exemption that no longer earns its reason is itself a finding (check 9,
+ *      REQ-A353): `live` (production references the key now, so the entry hides
+ *      nothing) or `absent` (the key is in **neither** dictionary, so it protects
+ *      nothing). An allow-list nobody prunes swallows the next real dead key.
  *      A dead key is a **hard gate** (no baseline): after this audit the dictionary
  *      has none, and any future one is a real defect, not debt.
  *   4. **Hard-coded CJK copy in markup** — text nodes / translatable attributes /
@@ -110,6 +114,32 @@ export function isLive(key, prod, contract, prefixes) {
   if (contract.includes(quoted)) return "contract";
   for (const p of prefixes) if (key.startsWith(p)) return "dynamic";
   return null;
+}
+
+/**
+ * Allow-list entries that no longer earn their exemption (REQ-A353).
+ *
+ * The allow-list admits dictionary keys that **no code can reach**, each with a written
+ * reason. Two ways an entry stops being that and becomes a lie instead:
+ *
+ *   - `live`   — production references the key now, so the exemption hides nothing (and
+ *                the dead-key gate would pass without it). The reason text is stale too:
+ *                it usually still says "not yet wired" about something that is wired.
+ *   - `absent` — the key is in **neither** dictionary, so the entry protects nothing at
+ *                all. (A key that is only in one dictionary is *not* this: the parity
+ *                check owns that, and the exemption still exempts the locale that has it.)
+ *
+ * Both are findings. The other scans in this repo prune their exemptions the same way
+ * (`orphan-test-scan`, `unwired-scan`): an allow-list nobody prunes quietly swallows the
+ * *next* real dead key, which is the whole failure mode it was meant to expose.
+ */
+export function staleAllowList(allow, isReferenced, inDictionaries) {
+  const out = [];
+  for (const e of allow) {
+    if (!inDictionaries(e.key)) out.push({ key: e.key, kind: "absent" });
+    else if (isReferenced(e.key)) out.push({ key: e.key, kind: "live" });
+  }
+  return out;
 }
 
 /**
@@ -614,6 +644,21 @@ export function runSelftest() {
   ok("live via dynamic prefix", isLive("message.folder.sent", prod, contract, pre) === "dynamic");
   ok("dead key", isLive("nobody.uses.me", prod, contract, pre) === null);
 
+  // A stale exemption (REQ-A353): the entry exists, the reason does not hold any more.
+  const allowDemo = [
+    { key: "live.now", reason: "r" },
+    { key: "gone.away", reason: "r" },
+    { key: "still.dark", reason: "r" },
+  ];
+  const staleDemo = staleAllowList(
+    allowDemo,
+    (k) => k === "live.now",
+    (k) => k !== "gone.away",
+  );
+  ok("an exemption whose key production references now is stale", staleDemo.some((e) => e.key === "live.now" && e.kind === "live"));
+  ok("an exemption whose key left the dictionaries is stale", staleDemo.some((e) => e.key === "gone.away" && e.kind === "absent"));
+  ok("an exemption that still earns its reason is kept", !staleDemo.some((e) => e.key === "still.dark"));
+
   let failed = 0;
   for (const [name, cond] of checks) {
     if (!cond) {
@@ -761,6 +806,13 @@ for (const k of zh.keys()) {
 dead.sort();
 deadTestOnly.sort();
 
+// Check 9 (REQ-A353) — an exemption that no longer earns its reason.
+const staleAllow = staleAllowList(
+  allow,
+  (k) => isLive(k, corpus.prod, corpus.contract, corpus.prefixes) !== null,
+  (k) => zh.has(k) || en.has(k),
+);
+
 if (process.argv.includes("--json")) {
   console.log(
     JSON.stringify(
@@ -778,6 +830,7 @@ if (process.argv.includes("--json")) {
         nameless,
         prefixes: [...corpus.prefixes].sort(),
         allowlisted: [...allowed].sort(),
+        staleAllowlist: staleAllow,
         allowlistedLiterals: [...allowedLiterals].sort(),
       },
       null,
@@ -787,7 +840,8 @@ if (process.argv.includes("--json")) {
 } else {
   console.log(
     `[i18n-scan] ${zh.size} key(s) (en ${en.size}); ${corpus.prefixes.size} dynamic namespace(s); ` +
-      `${allow.length} allow-listed key(s); ${literalAllow.length} allow-listed literal(s).`,
+      `${allow.length} allow-listed key(s); ${literalAllow.length} allow-listed literal(s).` +
+      (staleAllow.length > 0 ? ` ${staleAllow.length} STALE allow-list entry/entries.` : ""),
   );
   if (keyErrors.length === 0) console.log("[i18n-scan] OK — en and zh expose the same keys.");
   if (placeholderErrors.length === 0) {
@@ -803,6 +857,12 @@ if (process.argv.includes("--json")) {
   for (const k of dead) console.error(`[i18n-scan] FAIL — dead key (referenced nowhere): ${k}`);
   for (const k of deadTestOnly) {
     console.error(`[i18n-scan] FAIL — dead key (only a test references it): ${k}`);
+  }
+  for (const e of staleAllow) {
+    console.error(
+      `[i18n-scan] FAIL — stale allow-list entry (${e.kind === "live" ? "production references this key now" : "this key is in neither dictionary"}): ${e.key} ` +
+        "(delete the entry from scripts/i18n-allowlist.json — an exemption nobody prunes hides the next real dead key)",
+    );
   }
   for (const h of hardcoded) {
     console.error(
@@ -870,6 +930,7 @@ process.exit(
     deadTestOnly.length === 0 &&
     hardcoded.length === 0 &&
     english.length === 0 &&
+    staleAllow.length === 0 &&
     slugLabels.length === 0 &&
     unresolved.length === 0 &&
     nameless.length === 0
