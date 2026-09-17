@@ -54,8 +54,12 @@ export function foldPage(state: PagingState, dir: StandardDir, listing: MediaLis
   const seen = new Set(state.items.map((i) => i.id));
   const fresh = listing.items.filter((i) => !seen.has(i.id));
   const items = [...state.items, ...fresh].sort(newestFirst);
-  const last = listing.items[listing.items.length - 1];
   const exhausted = listing.items.length === 0;
+  // Rule 1: the cursor comes from the **host's own last item** — so it is read off the page the
+  // host just sent, never off the merged view (whose order is ours). `cursorOf` takes the page and
+  // picks its last entry; passing a single item here (the pre-REQ-A343 shape) made it read
+  // `undefined.length` and silently produced no cursor, which is what broke these cases.
+  const cursor = cursorOf(listing.items);
   // The host's `total` counts what is left **after the cursor** (i.e. including the page it
   // just sent, like `Content-Range`'s denominator). What a caller rendering "N of M" needs is
   // what is left *after* the items it now holds — so it is this page's items subtracted here,
@@ -64,7 +68,7 @@ export function foldPage(state: PagingState, dir: StandardDir, listing: MediaLis
   return {
     items,
     remaining: { ...state.remaining, [dir]: left },
-    cursors: last ? { ...state.cursors, [dir]: cursorOf(last) } : state.cursors,
+    cursors: cursor ? { ...state.cursors, [dir]: cursor } : state.cursors,
     exhausted: exhausted
       ? state.exhausted.includes(dir)
         ? state.exhausted
