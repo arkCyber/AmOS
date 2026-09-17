@@ -1,4 +1,4 @@
-.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-app-check android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs device-eval frontend-dist frontend-fresh app-open
+.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-app-check android-glue-check android-audio-check android-ai-sherpa-check android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop release-artifacts api-docs device-eval device-media-probe frontend-dist frontend-fresh app-open
 
 all: build
 
@@ -727,5 +727,14 @@ clean:
 # Drive + inspect the running System UI on a connected device (debuggable build).
 # Not part of lint: it needs hardware. See docs/REAL_DEVICE_SYSTEM_UI_AUDIT.md §5.5.
 #   make device-eval JS='document.title'
+#   make device-media-probe                  # REQ-A350 acceptance: camera + recordings
 device-eval:
 	node scripts/device-ui-eval.mjs $(JS)
+
+# Device-side acceptance for REQ-A350 (a memo must be a file the user can find):
+# reads the camera + recordings collections through the *real* host bridge on the
+# device, so "the row said 已保存 but nothing appeared in Files" becomes measurable.
+# Read-only (no permission dialog). Run before and after tapping 保存到「录音」 —
+# see the header of the probe. Requires a debuggable build (debug APK) + one device.
+device-media-probe:
+	node scripts/device-ui-eval.mjs --await --file scripts/device-probe-media-export.js
