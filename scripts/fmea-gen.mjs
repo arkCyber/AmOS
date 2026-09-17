@@ -121,6 +121,10 @@ const KNOWN_FAILURES = [
   // that check read a logcat *window*, so the decisive line had already scrolled away (F-DEV-001's
   // lesson: never make a time-windowed sample the verdict; read the current state instead)
   { id: 'F-DEV-006', module: 'process', files: ['scripts/device-ui-eval.mjs'], markers: ['parseDeadRendererConnection', 'CR DEAD', 'dumpsys activity processes'], severity: 2 },
+  // REQ-A371: the requirements ledger (docs/TRACEABILITY_MATRIX.md) had no gate at all, so a
+  // duplicated REQ id and a status cell outside the document's own legend survived in the one
+  // artefact every reader is sent to (the F-DEV-002 family, one document over).
+  { id: 'F-DEV-007', module: 'process', files: ['scripts/trace-scan.mjs'], markers: ['duplicateReqIds', 'missing-status', 'STATUS_MARKS'], severity: 2 },
   { id: 'F-SH-025', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte'], markers: ['没有可显示的界面', 'monitor'], severity: 3 },
 
   // System UI 桥

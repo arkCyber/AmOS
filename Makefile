@@ -378,6 +378,13 @@ lint:
 	# `--selftest` pins the verifyMitigation logic so a false-green is impossible.
 	node scripts/fmea-gen.mjs --self-test
 	node scripts/fmea-gen.mjs --check
+	# The requirements ledger checks itself (see scripts/trace-scan.mjs, REQ-A371). The matrix is
+	# the "requirement → code → test" index a reader is sent to, and it had **no gate at all**:
+	# a duplicated requirement ID (`REQ-A250` used by two different rounds) and a row whose status
+	# cell read `###` where the document's own legend says `✅`/`🟡`/`⬜` both lived in it while every
+	# gate stayed green. `TRACE_DOC=<path>` checks a historical copy (the negative control).
+	node scripts/trace-scan.mjs --selftest
+	node scripts/trace-scan.mjs
 	# Crate-door documentation (see scripts/crate-readme-scan.mjs): every workspace member
 	# ships a README.md in the standard shape — title naming the crate, a link back to the
 	# root README, the six sections, and its own `-p <crate>` command — and its `examples/`
