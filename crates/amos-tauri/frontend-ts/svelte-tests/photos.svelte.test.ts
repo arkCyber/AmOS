@@ -364,3 +364,137 @@ describe("PhotosApp.svelte - form-aware gallery columns (REQ-A292)", () => {
     expect(galleryCols(host.container)).toBe(3);
   });
 });
+
+/**
+ * Export to the shared camera roll (REQ-A352).
+ *
+ * `lib/photos.ts` is a **private** store: without an export the shot exists only inside AmOS, so
+ * the system gallery and every other app see nothing. The six `camera.export*` keys shipped with
+ * **no producer at all** until this wiring — an entire UX (button label, in-flight line, one
+ * message per outcome) that no code path could reach. These cases pin the wiring: the bytes really
+ * go to the host, the name and collection are the camera ones, and no outcome is invented.
+ */
+describe("PhotosApp — export to the shared camera roll (REQ-A352)", () => {
+  /** A fake host recording the media commands (the pair the service's own tests drive). */
+  function installMediaHost(reply: "item" | "refused") {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "media_save") {
+          // A refusal is a **rejected** invoke: `null` would mean "no bridge" (offline).
+          if (reply === "refused") throw new Error("media: not authorized to write camera");
+          return { id: "saved-1", name: (args?.name as string) ?? "x.png" };
+        }
+        if (cmd === "media_list") return [];
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+  const clipboardDescriptor = Object.getOwnPropertyDescriptor(window.navigator, "clipboard");
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    if (clipboardDescriptor) Object.defineProperty(window.navigator, "clipboard", clipboardDescriptor);
+    else delete (window.navigator as unknown as { clipboard?: unknown }).clipboard;
+  });
+
+  /** Poll for text instead of sleeping a fixed time (the repo's anti-flake discipline). */
+  async function waitFor(host: { container: HTMLElement }, needle: string, ms = 500) {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      if (txt(host).includes(needle)) return true;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return txt(host).includes(needle);
+  }
+  const btnByText = (host: { container: HTMLElement }, text: string) =>
+    [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes(text),
+    ) as HTMLButtonElement | undefined;
+  /** The export lives in the viewer, so open the first tile first. */
+  async function openFirstTile(host: { container: HTMLElement }) {
+    await fireEvent.click(firstTile(host)!);
+    await tick();
+  }
+
+  test("writes the still's own bytes into DCIM/Camera as an image", async () => {
+    writeStoreValue(PHOTOS_KEY, [
+      // A PNG data URL: the extension must follow this, not a guessed `.jpg`.
+      { id: "p1", ts: new Date(2026, 8, 16, 18, 5, 7).getTime(), data: "data:image/png;base64,AAAA" },
+    ]);
+    const calls = installMediaHost("item");
+    const host = render(PhotosApp);
+    await tick();
+    await openFirstTile(host);
+    const exportBtn = btnByText(host, zh["camera.exportToSystem"]!);
+    expect(exportBtn, "the viewer offers a real export").toBeTruthy();
+    await fireEvent.click(exportBtn!);
+    expect(
+      await waitFor(host, zh["camera.exported"]!),
+      `the outcome is shown, not assumed — got: ${txt(host)}`,
+    ).toBe(true);
+    expect(calls.map((c) => c.cmd)).toContain("media_grant_write");
+    const save = calls.find((c) => c.cmd === "media_save");
+    expect(save, "the file was written through the host").toBeTruthy();
+    // A byte array (the host's own type), the **camera** collection, and the name from the
+    // photo's own stamp.
+    expect(Array.isArray((save?.args as { data?: unknown })?.data)).toBe(true);
+    expect((save?.args as { collection?: string })?.collection).toBe("camera");
+    expect((save?.args as { kind?: string })?.kind).toBe("image");
+    expect(String((save?.args as { name?: string })?.name ?? "")).toBe("Amos-20260916-180507.png");
+  });
+
+  test("a refusal is reported as a refusal, never as a save", async () => {
+    writeStoreValue(PHOTOS_KEY, [{ id: "p1", ts: Date.now(), data: "data:image/jpeg;base64,AAAA" }]);
+    installMediaHost("refused");
+    const host = render(PhotosApp);
+    await tick();
+    await openFirstTile(host);
+    await fireEvent.click(btnByText(host, zh["camera.exportToSystem"]!)!);
+    expect(await waitFor(host, zh["camera.exportRefused"]!)).toBe(true);
+    expect(txt(host), "…and it never claims otherwise").not.toContain(zh["camera.exported"]!);
+  });
+
+  test("a demo tile with no pixels says so and never touches the host's write path", async () => {
+    writeStoreValue(PHOTOS_KEY, [{ id: "p2", ts: Date.now(), emoji: "🏔️" }]);
+    const calls = installMediaHost("item");
+    const host = render(PhotosApp);
+    await tick();
+    await openFirstTile(host);
+    await fireEvent.click(btnByText(host, zh["camera.exportToSystem"]!)!);
+    expect(await waitFor(host, zh["camera.exportFailed"]!)).toBe(true);
+    // An empty file in the user's gallery would claim a photo that is not there, so nothing is
+    // attempted. (`media_list`, from the native strip, is a read — not counted here.)
+    expect(calls.filter((c) => c.cmd === "media_save").length).toBe(0);
+    expect(calls.filter((c) => c.cmd === "media_grant_write").length).toBe(0);
+  });
+
+  test("a blocked clipboard is not reported as a successful share", async () => {
+    writeStoreValue(PHOTOS_KEY, [{ id: "p1", ts: Date.now(), data: "data:image/png;base64,AAAA" }]);
+    Object.defineProperty(window.navigator, "clipboard", { value: undefined, configurable: true });
+    const host = render(PhotosApp);
+    await tick();
+    await openFirstTile(host);
+    await fireEvent.click(btnByText(host, zh["photo.share"]!)!);
+    expect(await waitFor(host, zh["photo.shareFailed"]!)).toBe(true);
+    expect(txt(host), "no claim of a copy that did not happen").not.toContain(zh["photo.shared"]!);
+  });
+
+  test("a working clipboard still reports the copy (the case that must keep passing)", async () => {
+    writeStoreValue(PHOTOS_KEY, [{ id: "p1", ts: Date.now(), data: "data:image/png;base64,AAAA" }]);
+    const written: string[] = [];
+    Object.defineProperty(window.navigator, "clipboard", {
+      value: { writeText: async (s: string) => void written.push(s) },
+      configurable: true,
+    });
+    const host = render(PhotosApp);
+    await tick();
+    await openFirstTile(host);
+    await fireEvent.click(btnByText(host, zh["photo.share"]!)!);
+    expect(await waitFor(host, zh["photo.shared"]!)).toBe(true);
+    expect(written.length, "the caption really reached the clipboard").toBe(1);
+  });
+});
+

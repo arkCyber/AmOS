@@ -108,6 +108,21 @@ export function dataUrlToBytes(dataUrl: string): Uint8Array | null {
 }
 
 /**
+ * The media type a `data:` URL declares, or `null` when it declares none.
+ *
+ * The camera keeps its stills as data URLs, so a photo's extension has to come from the URL
+ * itself: naming a PNG `.jpg` puts a file in the user's gallery whose type contradicts its
+ * content (and the Photos/player screens classify by extension). The bare type is returned —
+ * parameters stripped and lowercased — and anything that is not a `type/subtype` is `null`,
+ * which `exportNameFor` renders as `.bin` rather than a guessed image type.
+ */
+export function dataUrlMime(dataUrl: string): string | null {
+  const match = /^data:([^;,]*)/.exec(dataUrl);
+  const essence = (match?.[1] ?? "").trim().toLowerCase();
+  return /^[a-z]+\/[a-z0-9.+-]+$/.test(essence) ? essence : null;
+}
+
+/**
  * Read a Blob into bytes, or `null` when it cannot be read.
  *
  * Used to hand a recorded voice memo (an IndexedDB Blob, `lib/mediaStore.ts`) to

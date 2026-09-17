@@ -9,6 +9,7 @@ import { describe, expect, it } from "bun:test";
 import {
   blobBytes,
   CAMERA_EXPORT_DIR,
+  dataUrlMime,
   RECORDING_EXPORT_DIR,
   dataUrlToBytes,
   exportNameFor,
@@ -27,6 +28,24 @@ function withBridge<T>(
     else w.window = prev;
   });
 }
+
+describe("dataUrlMime", () => {
+  it("reads the media type so a photo's extension matches its content", () => {
+    expect(dataUrlMime("data:image/png;base64,AAAA")).toBe("image/png");
+    expect(dataUrlMime("data:image/jpeg;base64,AAAA")).toBe("image/jpeg");
+    // Case and parameters are normalized the same way `exportNameFor` normalizes them.
+    expect(dataUrlMime("data:IMAGE/WebP;base64,AAAA")).toBe("image/webp");
+    expect(dataUrlMime("data:image/jpeg;charset=utf-8;base64,AAAA")).toBe("image/jpeg");
+  });
+
+  it("is null — never a guess — when the URL declares no usable type", () => {
+    // `exportNameFor` turns null into `.bin`: an unknown type is never claimed to be an image.
+    expect(dataUrlMime("data:;base64,AAAA")).toBeNull();
+    expect(dataUrlMime("data:base64,AAAA")).toBeNull();
+    expect(dataUrlMime("blob:http://localhost/xyz")).toBeNull();
+    expect(dataUrlMime("")).toBeNull();
+  });
+});
 
 describe("exportNameFor", () => {
   it("names the file from the timestamp, so exports sort and never collide", () => {

@@ -3,7 +3,8 @@
   // Still-photo logic reuses pure lib/photos.ts; camera video tiles use
   // lib/cameraCapture (no React VideoThumb thumbnail here → 🎬 tile with
   // duration/res; playback overlay still streams the MediaStore blob).
-  // (WIP Photos port: compilable, NOT yet wired into COMPONENTS.)
+  // Registered as the `photos` screen in `appRegistry.ts` (the older "not yet wired
+  // into COMPONENTS" note was stale — the React-era map is long gone).
   import {
     PHOTOS_KEY,
     favsOf,
@@ -30,6 +31,17 @@
   import type { MediaItem } from "../lib/media";
   import { nativePhotoFromItem } from "../lib/photoLibrary";
   import type { NativePhoto } from "../lib/photoLibrary";
+  // The write half of the media domain (REQ-A352): the camera's own album is a private
+  // store, so exporting to the user-visible camera roll is a real, explicit side effect.
+  import {
+    blobBytes,
+    CAMERA_EXPORT_DIR,
+    dataUrlMime,
+    dataUrlToBytes,
+    exportNameFor,
+    exportToSharedCollection,
+  } from "../lib/mediaExport";
+  import type { ExportOutcome } from "../lib/mediaExport";
   import { t } from "./locale.svelte";
   import { currentFormFactor } from "../lib/desktopApps";
   import { photosCols } from "../lib/formLayout";
@@ -46,6 +58,9 @@
   let list = $state<Photo[]>(seed);
   let sel = $state<Photo | null>(null);
   let wallMsg = $state("");
+  // An export is in flight: the button is disabled so a second tap cannot start a second
+  // write (and cannot produce two outcome lines for one action).
+  let expBusy = $state(false);
   let slide = $state(false);
   let favOnly = $state(false);
   let vidsOnly = $state(false);
@@ -271,15 +286,102 @@
     persist(toggled);
     sel = toggled.find((x) => x.id === id) ?? sel;
   };
+  /**
+   * Write `text` to the system clipboard, reporting whether it actually landed.
+   *
+   * The pre-fix code swallowed the rejection and set `photo.shared` ("已复制分享文本")
+   * unconditionally, so a blocked clipboard — the normal case in a WebView without a secure
+   * context — was reported to the user as a successful share (REQ-A352). A claim has to
+   * follow the effect.
+   */
+  const copyText = async (text: string): Promise<boolean> => {
+    try {
+      if (!navigator.clipboard?.writeText) return false;
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const shareSel = async () => {
     if (!sel) return;
-    const txt = shareCaption(sel, fmtTime(sel.ts));
-    try {
-      await navigator.clipboard?.writeText(txt);
-    } catch {
-      /* clipboard unavailable */
+    wallMsg = t((await copyText(shareCaption(sel, fmtTime(sel.ts)))) ? "photo.shared" : "photo.shareFailed");
+  };
+
+  /** The four export outcomes are four different things to say (REQ-A352). */
+  const outcomeMsg = (o: ExportOutcome): string =>
+    o === "saved"
+      ? t("camera.exported")
+      : o === "offline"
+        ? t("camera.exportOffline")
+        : o === "refused"
+          ? t("camera.exportRefused")
+          : t("camera.exportFailed");
+
+  /**
+   * Copy this still into the user-visible camera roll (`DCIM/Camera`) — the only way the system
+   * gallery or any other app can see it (`lib/photos.ts` is a private store).
+   *
+   * Explicit, never automatic, and nothing is sent that we cannot name: a demo/gradient tile has
+   * no pixels, so it says "no bytes to write" locally **without touching the host** — writing an
+   * empty file into the user's gallery would claim a photo that is not there. The extension comes
+   * from the data URL's own media type, so a PNG is not saved as `.jpg`.
+   */
+  const exportSel = async () => {
+    if (!sel || expBusy) return;
+    const p = sel;
+    if (!p.data) {
+      wallMsg = t("camera.exportFailed");
+      return;
     }
-    wallMsg = t("photo.shared");
+    const bytes = dataUrlToBytes(p.data);
+    if (!bytes || bytes.length === 0) {
+      wallMsg = t("camera.exportFailed");
+      return;
+    }
+    expBusy = true;
+    wallMsg = t("camera.exporting");
+    try {
+      // The `dir` argument is passed explicitly: the service's default is the camera roll too,
+      // but naming it here keeps a future default change from redirecting photos elsewhere.
+      wallMsg = outcomeMsg(
+        await exportToSharedCollection(
+          "image",
+          exportNameFor(p.ts, dataUrlMime(p.data)),
+          bytes,
+          CAMERA_EXPORT_DIR,
+        ),
+      );
+    } finally {
+      expBusy = false;
+    }
+  };
+
+  /** The same contract for a camera video: read the recorded Blob, then write it out. */
+  const exportVideo = async (id: string) => {
+    if (expBusy) return;
+    const cap = vids.find((x) => x.id === id);
+    if (!cap) return;
+    const blob = await captureBlob(id);
+    const bytes = blob ? await blobBytes(blob) : null;
+    if (!bytes || bytes.length === 0) {
+      wallMsg = t("camera.exportFailed");
+      return;
+    }
+    expBusy = true;
+    wallMsg = t("camera.exporting");
+    try {
+      wallMsg = outcomeMsg(
+        await exportToSharedCollection(
+          "video",
+          exportNameFor(cap.ts, cap.mime),
+          bytes,
+          CAMERA_EXPORT_DIR,
+        ),
+      );
+    } finally {
+      expBusy = false;
+    }
   };
   const setWallpaper = () => {
     if (!sel) return;
@@ -319,15 +421,13 @@
     vids = listCaptures();
     closeVideo();
   };
-  const shareVideo = (id: string) => {
+  const shareVideo = async (id: string) => {
     const cap = vids.find((x) => x.id === id);
     if (!cap) return;
-    try {
-      navigator.clipboard?.writeText(`🎬 ${fmtLen(cap.durationMs)} · ${new Date(cap.ts).toLocaleString()}`);
-    } catch {
-      /* clipboard unavailable */
-    }
-    wallMsg = t("photo.shared");
+    const copied = await copyText(
+      `🎬 ${fmtLen(cap.durationMs)} · ${new Date(cap.ts).toLocaleString()}`,
+    );
+    wallMsg = t(copied ? "photo.shared" : "photo.shareFailed");
   };
 
   const chip = (on: boolean, size: "xs" | "md" | "lg" = "xs") =>
@@ -370,6 +470,7 @@
       {#if list.length > 1}
         <button onclick={toggleSlide} class={chip(slide, "lg")}>{slide ? t("photo.slideStop") : t("photo.slidePlay")}</button>
       {/if}
+      <button onclick={() => void exportSel()} disabled={expBusy} class={btn("neutral", "lg")}>{t("camera.exportToSystem")}</button>
       <button onclick={() => void shareSel()} class={btn("neutral", "lg")}>{t("photo.share")}</button>
       <button onclick={closeSel} class={btn("neutral", "lg")}>{t("photo.close")}</button>
       {#if isRealPhoto(sel)}
@@ -514,7 +615,8 @@
             {/if}
             <div class="flex items-center justify-between gap-3 self-stretch">
               <button onclick={closeVideo} aria-label={t("a11y.closeVideo")} data-icon="x" class="grid h-11 w-11 place-items-center rounded-full bg-white/15 text-white ring-1 ring-white/25">{@html iconSvg("x", "h-4 w-4")}</button>
-              <button onclick={() => playId && shareVideo(playId)} class="rounded-full bg-white/15 px-4 py-1.5 text-sm text-white ring-1 ring-white/25">{t("photo.share")}</button>
+              <button onclick={() => playId && void exportVideo(playId)} disabled={expBusy} class="rounded-full bg-white/15 px-4 py-1.5 text-sm text-white ring-1 ring-white/25 disabled:opacity-50">{t("camera.exportToSystem")}</button>
+              <button onclick={() => playId && void shareVideo(playId)} class="rounded-full bg-white/15 px-4 py-1.5 text-sm text-white ring-1 ring-white/25">{t("photo.share")}</button>
               <button onclick={() => playId && void deleteVideo(playId)} class="rounded-full bg-danger/90 px-4 py-1.5 text-sm text-white">{t("photo.delete")}</button>
             </div>
           </div>

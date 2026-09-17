@@ -411,6 +411,7 @@ export const en: Record<MessageKey, string> = {
   "photo.selectNone": "Deselect All",
   "photo.share": "Share",
   "photo.shared": "Share text copied",
+  "photo.shareFailed": "Clipboard unavailable — the share text was not copied",
   "photo.cancel": "Cancel",
   "photo.prev": "Previous",
   "photo.next": "Next",

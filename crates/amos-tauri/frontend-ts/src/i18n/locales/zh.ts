@@ -410,6 +410,7 @@ export const zh = {
   "photo.selectNone": "取消全选",
   "photo.share": "分享",
   "photo.shared": "已复制分享文本",
+  "photo.shareFailed": "剪贴板不可用——分享文本没有复制",
   "photo.cancel": "取消",
   "photo.prev": "上一张",
   "photo.next": "下一张",
