@@ -90,6 +90,9 @@ const KNOWN_FAILURES = [
   // REQ-A278: 顶栏 Edit → Select All 与键盘 ⌘A 必须走同一条选区
   { id: 'F-SH-011', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/DesktopStage.svelte'], markers: ['edit.select-all', 'onWindowKeyDown'], severity: 2 },
   { id: 'F-SH-012', module: 'process', files: ['crates/amos-tauri/frontend-ts/src/lib/desktopKeys.ts', 'crates/amos-tauri/frontend-ts/scripts/orphan-test-scan.mjs'], markers: ['desktopShortcutLabel', 'orphan-test-scan'], severity: 4 },
+  { id: 'F-SH-013', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/Shell.svelte', 'crates/amos-tauri/frontend-ts/src/lib/backNav.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/shell.svelte.test.ts'], markers: ['pushDecision', 'history.pushState', 'REQ-A347'], severity: 3 },
+  { id: 'F-SH-014', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte', 'crates/amos-tauri/frontend-ts/src/lib/desktopKeys.ts', 'crates/amos-tauri/frontend-ts/src/i18n/locales/en.ts'], markers: ['desktopShortcutLabel', 'desktop.menu.file.closeWindow'], severity: 3 },
+  { id: 'F-SH-015', module: 'process', files: ['crates/amos-tauri/frontend-ts/scripts/orphan-test-scan.mjs', 'crates/amos-tauri/frontend-ts/scripts/test-reach-allowlist.json'], markers: ['orphan-test-scan', 'testreach:scan'], severity: 2 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
