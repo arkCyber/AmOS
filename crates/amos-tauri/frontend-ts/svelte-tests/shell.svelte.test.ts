@@ -16,11 +16,14 @@ import {
   enterEdit,
   goHome,
   lock,
+  ncOpen,
   open,
+  recentsOpen,
   resetShellState,
   setNc,
   setRecents,
   setSpot,
+  spotOpen,
   layout,
   pulseId,
   unlock,
@@ -804,4 +807,78 @@ describe("Shell.svelte (telemetry-spy watch)", () => {
   });
 });
 
+
+
+/**
+ * The touch shell's **keyboard admission**, re-wired after the rollback that lost REQ-A335/A336/A338
+ * (REQ-A346). The pure decisions live in `lib/systemKeys.ts` and have their own unit tests; these
+ * cases pin the wiring to the real component, because that is what was missing: the engine could
+ * decide, and nothing asked it.
+ */
+describe("Shell.svelte — keyboard admission (REQ-A346)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 40));
+  const press = (key: string, init: KeyboardEventInit = {}) =>
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init }),
+    );
+  const spot = (c: HTMLElement) => c.querySelector("input[placeholder]");
+  const sheet = (c: HTMLElement) => c.querySelector('[role="dialog"]');
+
+  test("⌘Space opens Spotlight, and the same key closes it", async () => {
+    installHost(() => snap({ form: "phone", columns: 1, multi_window: false }));
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    expect(spot(container)).toBeNull();
+    press(" ", { metaKey: true });
+    await tick();
+    expect(spot(container), "Spotlight opened by key").toBeTruthy();
+    press(" ", { metaKey: true });
+    await tick();
+    expect(spot(container), "…and the same key closed it").toBeNull();
+  });
+
+  test("F4 reaches the App Library, and F4 again comes home", async () => {
+    installHost(() => snap({ form: "phone", columns: 1, multi_window: false }));
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    press("F4");
+    await tick();
+    expect(container.querySelector('[data-testid="app-library"]')).toBeTruthy();
+    press("F4");
+    await tick();
+    expect(container.querySelector('[data-testid="app-library"]')).toBeNull();
+    expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
+  });
+
+  test("Escape undoes exactly one level: the sheet first, the surface after", async () => {
+    installHost(() => snap({ form: "phone", columns: 1, multi_window: false }));
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    press(" ", { metaKey: true }); // Spotlight over home
+    await tick();
+    expect(spot(container)).toBeTruthy();
+    press("Escape");
+    await tick();
+    expect(spot(container), "Escape closed the sheet").toBeNull();
+    expect(sheet(container), "…and nothing else was undone").toBeNull();
+    expect(container.querySelector('[data-testid="home-grid"]'), "still home").toBeTruthy();
+  });
+
+  test("no key opens a surface on the lock screen (a keyboard is not a way around the lock)", async () => {
+    installHost(() => snap({ form: "phone", columns: 1, multi_window: false }));
+    lock();
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    press(" ", { metaKey: true });
+    await tick();
+    expect(spotOpen(), "⌘Space on the lock screen opens nothing").toBe(false);
+    expect(ncOpen()).toBe(false);
+    expect(recentsOpen()).toBe(false);
+    expect(container.querySelector('[role="dialog"]'), "still locked").toBeTruthy();
+  });
+});
 

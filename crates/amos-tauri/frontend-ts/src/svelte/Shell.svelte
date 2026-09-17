@@ -72,6 +72,12 @@
   import NotificationCenter from "./NotificationCenter.svelte";
   import ClipboardAnnounce from "./ClipboardAnnounce.svelte";
   import ImeOverlay from "./ImeOverlay.svelte";
+  // Keyboard admission for the touch shell (re-wired after the rollback that lost REQ-A335/336/338):
+  // the *registry* is the one table that knows "which key opens which surface", `shellKeyIntent` is
+  // the pure decision (its unit tests survived), and the panel is generated from the same table.
+  import { SHELL_MODULES } from "./shellModules";
+  import { shellKeyIntent } from "../lib/systemKeys";
+  import ShortcutHud from "./ShortcutHud.svelte";
   import ExtAppHost from "./ExtAppHost.svelte";
 
   interface HomeProps {
@@ -397,14 +403,59 @@
     };
   });
 
-  // ③c-ext (device-independent): Esc closes any open overlay.
+  // ③c-ext (device-independent): the touch shell's **keyboard admission** (re-wired).
+  //
+  // Before this: one hard-coded "Escape closes the three overlays". It reached *less* than the
+  // platform back gesture (never left an app or edit mode) and the registry's four documented
+  // launches (⌘Space / F3 / ⌘Tab / F4) had no touch counterpart at all — a device with a keyboard
+  // could open nothing. Now the decision comes from `lib/systemKeys` (the registry is the one table
+  // that knows the keys; its unit tests survived the rollback) and "up one level" is the same intent
+  // as the platform gesture.
+  //
+  // Two behaviours that took care to get right:
+  //   * **Escape belongs to the innermost consumer.** `AppLibrary` clears its search box on Escape
+  //     *and* calls `preventDefault()`; registration order puts this listener first, so the home
+  //     step is deferred one tick and yields if someone claimed the keystroke.
+  //   * **No surface opens over the lock screen** — otherwise a keyboard is a way *around* the lock.
+  const overlayTop = $derived(ncOpen() ? "nc" : recentsOpen() ? "recents" : spotOpen() ? "spot" : null);
+  const overlayOpen = $derived(overlayTop !== null);
+
+  function closeTopOverlay() {
+    if (overlayTop === "nc") setNc(false);
+    else if (overlayTop === "recents") setRecents(false);
+    else if (overlayTop === "spot") setSpot(false);
+  }
+
   $effect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setNc(false);
-        setRecents(false);
-        setSpot(false);
+      const intent = shellKeyIntent(e, SHELL_MODULES);
+      if (intent.kind === "none") return;
+
+      if (intent.kind === "toggle" || intent.kind === "settings") {
+        // Opening a surface is a capability: the desktop form owns its own chrome (menus), an
+        // unknown form must not gain anything, and a locked device must teach nothing.
+        if (shellForm === "desktop" || layoutSnap === null) return;
+        if (s.kind === "lock") return;
+        e.preventDefault();
+        if (intent.kind === "settings") void open("settings");
+        else if (intent.target === "spot") setSpot(!spotOpen());
+        else if (intent.target === "recents") setRecents(!recentsOpen());
+        else if (s.kind === "library") goHome();
+        else enterLibrary();
+        return;
       }
+
+      // Dismiss: close the top overlay, else leave the surface — exactly one level.
+      const top = overlayTop;
+      if (top !== null) {
+        closeTopOverlay();
+        return;
+      }
+      if (s.kind !== "app" && s.kind !== "library" && s.kind !== "edit") return; // at home/locked
+      setTimeout(() => {
+        if (e.defaultPrevented) return; // an inner consumer (the library's search box) claimed it
+        goHome();
+      }, 0);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -472,7 +523,7 @@
       {#if s.kind === "edit"}
         <EditHome />
       {:else if s.kind === "library"}
-        <div class="flex h-full flex-col">
+        <div class="flex h-full flex-col" inert={overlayOpen}>
           <Backdrop />
           <div class="relative z-10 flex h-full flex-col">
             <StatusBar form={shellForm} />
@@ -485,6 +536,7 @@
         <div
           class="flex h-full flex-col text-neutral-900 dark:text-neutral-100"
           data-testid="app-surface"
+          inert={overlayOpen}
         >
           <StatusBar form={shellForm} />
           <div class="flex items-center justify-between border-b border-neutral-200/70 bg-white/50 px-3 py-3 backdrop-blur-md dark:border-neutral-800 dark:bg-white/5">
@@ -549,7 +601,7 @@
         </div>
       {:else}
         <!-- home surface -->
-        <div class="flex h-full flex-col">
+        <div class="flex h-full flex-col" inert={overlayOpen}>
           <Backdrop />
           <div class="relative z-10 flex h-full flex-col">
             <StatusBar form={shellForm} />
@@ -569,6 +621,9 @@
       <ClipboardAnnounce />
       <!-- Input method: the pinyin keyboard for whichever text field is focused. -->
       <ImeOverlay />
+      {#if layoutSnap !== null}
+        <ShortcutHud />
+      {/if}
     {/if}
   {/if}
 </div>
