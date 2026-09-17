@@ -61,6 +61,7 @@ REQUIRED=(
   "AmosGlue.onCameraPermissionGranted(|rebind the torch once CAMERA is held"
   "AmosGlue.onStop(|release the producers so the camera/torch is freed"
   "AlarmGlue.bind(|hand the app context to the host's AlarmManager binding (F-TAU-007)"
+  "AlarmGlue.attachActivity(|post the exact-alarm settings screen from the foreground Activity"
 )
 
 missing=""

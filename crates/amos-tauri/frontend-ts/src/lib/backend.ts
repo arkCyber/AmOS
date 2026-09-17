@@ -1231,6 +1231,16 @@ export async function cancelNativeAlarm(id: string): Promise<NativeAlarmCanceled
   return invoke<NativeAlarmCanceled>("scheduler_alarm_cancel", { id });
 }
 
+/**
+ * Ask the host to open the device's per-app **Alarms & reminders** screen, so a user whose OS
+ * refuses exact alarms has a way out — a banner that only states the problem is a dead end
+ * (REQ-A373). Resolves `true` only when a screen was actually started: the Kotlin glue answers
+ * `false` when no foreground Activity is attached, and a host without `AlarmManager` errors.
+ */
+export async function openNativeAlarmSettings(): Promise<boolean | null> {
+  return invoke<boolean>("scheduler_alarm_open_settings");
+}
+
 /** Poll the Rust host for alarms due by `nowMs` (defaults to host wall clock).
  *  Returns { due: string[] } on-device, or null offline. */
 export async function pollNativeAlarms(nowMs?: number): Promise<{ due: string[] } | null> {

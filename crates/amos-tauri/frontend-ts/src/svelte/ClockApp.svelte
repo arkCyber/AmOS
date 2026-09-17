@@ -43,6 +43,7 @@
   import { startAlarmRing, stopAlarmRing, previewAlarmTone, setRingtoneFilesEnabled, activeRingtone } from "../lib/ringtonePlayer";
   import { nativeAlarmDeviceState, nativeWakeArmed } from "./osAlarmArm";
   import type { NativeAlarmDeviceState } from "../lib/backend";
+  import { openNativeAlarmSettings } from "../lib/backend";
   import { restoreTimerState, persistFromTimer } from "../lib/timerStore";
   import { CITY_CATALOG, resolveCity, searchCities } from "../lib/cityIndex";
   import { playNotifyTone } from "../lib/notifyTone";
@@ -205,6 +206,8 @@
   const refreshNativeArm = () => {
     nativeArm = nativeAlarmDeviceState().arm;
   };
+  /** What the last "open the exact-alarm settings" attempt observed (REQ-A373; never optimistic). */
+  let settingsMsg = $state("");
   // Audible ring: start looping the first ringing alarm's tone once a ring
   // begins; stop when nothing rings. Tracked so the 1 Hz tick doesn't restart it.
   let ringStarted = false;
@@ -555,7 +558,10 @@
           <span class="text-xs opacity-50">{t("clock.alarmCount", { n: al.list.length })}</span>
         </div>
         {#if al.list.some((a) => a.enabled) && nativeArm && !nativeWakeArmed()}
-          <!-- The OS half did not happen: say it, with the host's own word for why (REQ-A369). -->
+          <!-- The OS half did not happen: say it, with the host's own word for why (REQ-A369), and
+               offer the way out when the OS *refused* (REQ-A373) — a banner without a path is a
+               dead end. The button only claims what it observed: the command resolves true only
+               when a screen was actually started. -->
           <div
             data-testid="alarm-native-wake"
             data-native-wake={nativeArm.state}
@@ -563,6 +569,21 @@
             class="mt-2 rounded-lg bg-amber-500/15 px-2 py-1 text-[11px] leading-snug text-amber-900 dark:text-amber-200"
           >
             {t("clock.nativeWakeUnavailable", { state: nativeArm.state })}
+            {#if nativeArm.state === "disallowed"}
+              <button
+                data-testid="alarm-native-wake-grant"
+                onclick={async () => {
+                  const opened = await openNativeAlarmSettings().catch(() => null);
+                  settingsMsg = opened ? t("clock.nativeWakeGrantOpened") : t("clock.nativeWakeGrantFailed");
+                }}
+                class="ml-1 underline underline-offset-2"
+              >
+                {t("clock.nativeWakeGrant")}
+              </button>
+              {#if settingsMsg}
+                <span data-testid="alarm-native-wake-msg" class="ml-1 opacity-80">{settingsMsg}</span>
+              {/if}
+            {/if}
           </div>
         {/if}
         {#if editingId}

@@ -142,6 +142,14 @@ const KNOWN_FAILURES = [
   // log line, or the user believes in an alarm that will not wake a dozing phone (F-TAU-007's
   // sibling). Mitigations: the glue's status words, the typed DeviceOutcome, the Clock banner.
   { id: 'F-TAU-010', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/frontend-ts/src/svelte/ClockApp.svelte', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['DeviceOutcome', 'nativeWakeUnavailable', 'STATUS_DISALLOWED'], severity: 2 },
+  // REQ-A373: two alarms whose ids merely *hash* alike collapsed into one PendingIntent (extras are
+  // not part of its equality) — the wrong alarm rings / a cancel hits both. Fixed by a per-id data
+  // URI, pinned by a host-JVM test whose negative control fails 3/3.
+  { id: 'F-TAU-011', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt', 'crates/amos-tauri/android-glue/tests/com/amos/ai/glue/AlarmIdentityTest.kt'], markers: ['alarmIdentity', 'setData(Uri.parse(alarmIdentity(id)))', 'collidingHashCodesStillGetDistinctIdentities'], severity: 3 },
+  // REQ-A373: the alarm fires, but "bring the ring UI to the front" is blocked for a background app
+  // on Android 10+ — the code claimed it worked; the production path (full-screen-intent
+  // notification) is registered but deliberately NOT shipped untested.
+  { id: 'F-TAU-012', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmReceiver.kt', 'docs/native-alarm-bridge.md'], markers: ['background-activity-start', 'Background activity start', 'F-TAU-012'], severity: 4 },
   { id: 'F-TAU-008', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/uiFailures.ts'], markers: ['unhandledrejection', 'error'], severity: 3 },
 
   // 机器人中间件

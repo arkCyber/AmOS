@@ -6,13 +6,20 @@ import android.content.Intent
 import android.util.Log
 
 /**
- * Receives the exact-alarm broadcast scheduled by [AlarmGlue] and brings the
- * AmOS System UI to the foreground so the WebView notifier can show the ring.
- * The actual ringing/screen animation stays in the WebView (already built); this
- * receiver is only the "wake from a dead/dozing process" device side.
+ * Receives the exact-alarm broadcast scheduled by [AlarmGlue], asks the System UI to come forward
+ * so the WebView notifier can show the ring, and says honestly whether that request could be made.
  *
- * Structural delivery only — compile/verify at Android-project / device time.
- * Declare in the manifest (exported=false is fine for an in-package broadcast):
+ * **Production boundary (measured rule, not a guess).** A broadcast receiver runs in the
+ * background, and on Android 10+ a background app may not start an activity: the platform drops
+ * the call and only logs it. This repository already paid for that lesson once — the Call
+ * Screening role dialog "reported success while no dialog appeared" on API 34 — so this receiver
+ * no longer *claims* the UI came up: it logs what it attempted, and the alarm's **visible** ring on
+ * a killed/backgrounded app still needs the documented production path (a full-screen-intent
+ * notification, which needs `POST_NOTIFICATIONS` + `USE_FULL_SCREEN_INTENT` + a channel — see
+ * `docs/native-alarm-bridge.md` §"真机验收清单" and `F-TAU-012`). The alarm itself still fires and
+ * the app's process is started, which is what the in-process ledger/WebView notifier needs.
+ *
+ * Declared in the manifest (an in-package broadcast, so not exported):
  * ```xml
  * <receiver android:name="com.amos.ai.glue.AlarmReceiver"
  *           android:exported="false" android:enabled="true" />
@@ -22,9 +29,15 @@ class AlarmReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context?, intent: Intent?) {
         val ctx = context ?: return
-        val id = intent?.getStringExtra(AlarmGlue.EXTRA_ID) ?: return
+        // Only our own exact-alarm broadcast: an app-internal sender could otherwise craft an
+        // intent that foregrounds the UI with an arbitrary id.
+        if (intent?.action != AlarmGlue.ACTION_EXACT) return
+        val id = intent.getStringExtra(AlarmGlue.EXTRA_ID) ?: return
         Log.i(TAG, "exact alarm fired: $id")
-        // Bring the System UI activity to the front so its WebView runs the notifier.
+        // Ask the System UI to come forward. Subject to the background-activity-start rules above:
+        // when the platform refuses, the log is the only evidence (and the acceptance step in the
+        // docs greps for it) — the alarm has still fired, and the ring is drawn as soon as the
+        // WebView runs.
         val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: run {
             Log.w(TAG, "no launcher intent for package — cannot foreground")
             return
@@ -37,6 +50,7 @@ class AlarmReceiver : BroadcastReceiver() {
         launch.putExtra(AlarmGlue.EXTRA_ID, id)
         try {
             ctx.startActivity(launch)
+            Log.i(TAG, "asked the System UI to foreground for $id (subject to background-start rules)")
         } catch (e: Exception) {
             Log.w(TAG, "could not foreground System UI: ${e.message}")
         }

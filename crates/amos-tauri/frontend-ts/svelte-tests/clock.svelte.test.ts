@@ -555,6 +555,43 @@ describe("ClockApp.svelte", () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
   });
 
+  test("offers the way out when the OS refused exact alarms (REQ-A373)", async () => {
+    const calls: string[] = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
+        calls.push(cmd);
+        if (cmd === "scheduler_alarm_register") {
+          return { id: args.id, atMs: args.atMs, device: { state: "disallowed" } };
+        }
+        if (cmd === "scheduler_alarm_open_settings") return false; // the glue could not post it
+        return null;
+      },
+      listen: async () => async () => {},
+    };
+    resetArmedNativeAlarmsForTest();
+    window.localStorage.setItem(
+      "amos.alarms",
+      JSON.stringify([{ id: "a1", hour: 7, min: 30, label: "", enabled: true, ringing: false, tone: "🔔" }]),
+    );
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+
+    const host = render(ClockApp);
+    await tick();
+    await fireEvent.click(tab(host, "闹钟") as HTMLButtonElement);
+    const grant = host.container.querySelector('[data-testid="alarm-native-wake-grant"]') as HTMLButtonElement;
+    expect(grant).not.toBeNull();
+
+    await fireEvent.click(grant);
+    await tick();
+    expect(calls).toContain("scheduler_alarm_open_settings");
+    // The command resolved `false` (no screen was started) → say *that*, never "已打开".
+    const msg = host.container.querySelector('[data-testid="alarm-native-wake-msg"]');
+    expect(msg?.textContent ?? "").toContain("没能打开");
+    cleanup();
+    resetArmedNativeAlarmsForTest();
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
+  });
+
   test("timer accepts a custom mm:ss and quick presets", async () => {
     const host = render(ClockApp);
     await fireEvent.click(tab(host, "计时器") as HTMLButtonElement);

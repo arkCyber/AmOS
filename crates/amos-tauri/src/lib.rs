@@ -387,6 +387,7 @@ pub fn run() {
             alarm_sched::scheduler_alarm_register,
             alarm_sched::scheduler_alarm_cancel,
             alarm_sched::scheduler_alarm_poll,
+            alarm_sched::scheduler_alarm_open_settings,
             real_dial::real_dial,
             #[cfg(desktop)]
             wine::wine_is_available,

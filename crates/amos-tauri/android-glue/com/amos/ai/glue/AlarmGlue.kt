@@ -1,5 +1,6 @@
 package com.amos.ai.glue
 
+import android.app.Activity
 import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
@@ -8,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
+import java.lang.ref.WeakReference
 
 /**
  * AmOS System UI — **AlarmManager exact-wake binding** (device step, §9 ③).
@@ -43,6 +45,8 @@ object AlarmGlue {
     const val EXTRA_ID = "amos.alarm.id"
 
     private const val REQUEST_BASE = 0x414c // "AL"
+    /** Scheme of the per-alarm identity URI (see [alarmIdentity]). */
+    private const val ALARM_SCHEME = "amos-alarm"
 
     /**
      * Status strings the Rust host maps to a typed device outcome and surfaces to the
@@ -88,17 +92,38 @@ object AlarmGlue {
     }
 
     /**
-     * Open the per-app **Alarms & reminders** screen (API 31+) so the user can grant
-     * exact alarms. Returns whether a screen was actually started — the host then
-     * reports "could not open it" instead of claiming a dialog appeared.
+     * The foreground Activity the settings screen must be posted from — a **weak** reference: the
+     * glue outlives any Activity (it is attached from `MainActivity.onStart` and the process keeps
+     * it), and holding it strongly would leak the Activity across a rotation.
      */
-    fun openExactAlarmSettings(context: Context): Boolean {
+    private var activity: WeakReference<Activity>? = null
+
+    /** Hand the glue the current foreground Activity (from `MainActivity.onStart`, like the role/
+     *  uninstall dialogs in `BlocklistGlue`/`DevCareGlue`). Idempotent. */
+    fun attachActivity(activity: Activity) {
+        this.activity = WeakReference(activity)
+    }
+
+    /** Is a foreground Activity attached (i.e. can [openExactAlarmSettings] even work)? */
+    fun canOpenSettings(): Boolean = activity?.get() != null
+
+    /**
+     * Open the per-app **Alarms & reminders** screen (API 31+) so the user can grant exact alarms.
+     *
+     * It **must** be posted from a foreground Activity: an application-context `startActivity` is
+     * silently dropped by the Android 10+ background-activity-start rules — this repository already
+     * paid for that lesson once (the Call Screening role dialog reported success while no dialog
+     * appeared, device-verified on API 34), and the same rule applies here. So this returns `false`
+     * when no Activity is attached (or the platform refuses) rather than reporting a screen that
+     * never opened; the caller can then say "could not open it" honestly.
+     */
+    fun openExactAlarmSettings(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+        val target = activity?.get() ?: return false
         return try {
             val intent = Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
-                .setData(Uri.fromParts("package", context.packageName, null))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(intent)
+                .setData(Uri.fromParts("package", target.packageName, null))
+            target.startActivity(intent)
             true
         } catch (t: Throwable) {
             Log.w(TAG, "could not open exact-alarm settings: ${t.message}")
@@ -108,9 +133,27 @@ object AlarmGlue {
 
     private fun requestCode(id: String): Int = REQUEST_BASE + id.hashCode()
 
+    /**
+     * **The identity of one alarm's `PendingIntent`.**
+     *
+     * `PendingIntent` equality ignores extras, so two alarms whose ids merely *hash* alike
+     * (`REQUEST_BASE + id.hashCode()`) would be the **same** PendingIntent: scheduling the second
+     * would silently overwrite the first's id extra, and cancelling either would cancel both —
+     * i.e. the wrong alarm rings (or a real one stops ringing). Java's `String.hashCode` makes
+     * that collision easy to construct (`"Aa"` and `"BB"` are the textbook pair), so the request
+     * code cannot be the identity: the intent also carries a per-id **data URI**, which does take
+     * part in `PendingIntent` equality.
+     *
+     * Kept as a pure function (no Android types) so the host-JVM test in
+     * `android-glue/tests/.../AlarmIdentityTest.kt` can pin it — including that colliding-hashCode
+     * ids stay distinct.
+     */
+    internal fun alarmIdentity(id: String): String = "$ALARM_SCHEME://$id"
+
     private fun pending(context: Context, id: String): PendingIntent {
         val target = Intent(context, AlarmReceiver::class.java)
             .setAction(ACTION_EXACT)
+            .setData(Uri.parse(alarmIdentity(id)))
             .putExtra(EXTRA_ID, id)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         return PendingIntent.getBroadcast(context, requestCode(id), target, flags)

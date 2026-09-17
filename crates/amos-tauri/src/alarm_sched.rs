@@ -206,7 +206,30 @@ pub fn scheduler_alarm_cancel(
     })
 }
 
-/// Hand one registration to the OS exact-wake binding (feature `android`).
+/// Open this device's per-app **Alarms & reminders** screen so the user can grant exact alarms.
+///
+/// The companion of the `disallowed` state: a banner that says "the OS has not allowed exact
+/// alarms" without a way to fix it is a dead end (REQ-A373). Returns whether a screen was
+/// actually started — the Kotlin glue refuses when no foreground Activity is attached (the
+/// Android 10+ background-activity-start rules would drop it silently), and this host has no such
+/// screen at all, so both cases are honest errors rather than a `true` that opened nothing.
+#[tauri::command]
+pub fn scheduler_alarm_open_settings() -> Result<bool, String> {
+    open_device_settings()
+}
+
+/// Device half of [`scheduler_alarm_open_settings`].
+#[cfg(feature = "android")]
+fn open_device_settings() -> Result<bool, String> {
+    android::open_settings()
+}
+
+/// Desktop / CI: there is no `AlarmManager`, so there is no "Alarms & reminders" screen either.
+#[cfg(not(feature = "android"))]
+fn open_device_settings() -> Result<bool, String> {
+    Err("this host has no exact-alarm settings screen (no AlarmManager); the in-app alarms ring from the WebView notifier".to_string())
+}
+
 #[cfg(feature = "android")]
 fn arm_device(id: &str, at_ms: u64) -> DeviceOutcome {
     android::schedule(id, at_ms)
@@ -321,6 +344,26 @@ mod android {
         env.get_string((&obj).into())
             .map(|s| s.into())
             .map_err(|e| format!("the glue's answer was not a string: {e}"))
+    }
+
+    /// `AlarmGlue.openExactAlarmSettings()` → whether a screen was started.
+    ///
+    /// Refuses (`Err`) when the binding is missing — including the case where the Kotlin glue is
+    /// attached but no foreground Activity is, which the glue itself reports as `false`.
+    pub(super) fn open_settings() -> Result<bool, String> {
+        let Some(binding) = BINDING.get() else {
+            return Err(
+                "the alarm binding is not attached yet (no Activity has run onStart)".to_string(),
+            );
+        };
+        let mut env = amos_jni::attached(&binding.vm).map_err(|e| e.to_string())?;
+        let args: [JValue<'_, '_>; 0] = [];
+        match env.call_static_method(GLUE_CLASS, "openExactAlarmSettings", "()Z", &args) {
+            Ok(value) => value
+                .z()
+                .map_err(|e| format!("the glue's answer was not a boolean: {e}")),
+            Err(e) => Err(format!("AlarmGlue.openExactAlarmSettings threw: {e}")),
+        }
     }
 
     /// `AlarmGlue.schedule(context, id, atMs)` → one `STATUS_*` word.
@@ -503,6 +546,15 @@ mod tests {
     fn a_host_reports_host_only_for_both_directions() {
         assert_eq!(arm_device("wake", 1_000), DeviceOutcome::HostOnly);
         assert_eq!(cancel_device("wake"), DeviceOutcome::HostOnly);
+    }
+
+    /// Desktop / CI: asking for the "Alarms & reminders" screen is an honest error, not a `true`
+    /// that opened nothing — the same rule the device half follows when no Activity is attached.
+    #[cfg(not(feature = "android"))]
+    #[test]
+    fn a_host_cannot_open_an_exact_alarm_settings_screen() {
+        let err = open_device_settings().expect_err("a host has no exact-alarm settings screen");
+        assert!(err.contains("no exact-alarm settings screen"), "{err}");
     }
 
     /// The reply is what the WebView reads: a tagged device state, the id and the instant.
