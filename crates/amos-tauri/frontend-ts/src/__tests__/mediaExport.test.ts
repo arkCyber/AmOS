@@ -97,7 +97,12 @@ describe("exportToSharedCollection (the write half of the media domain)", () => 
       collection: CAM,
       kind: "video",
       name: "Amos-20260916-180507.mp4",
-      data_b64: "AQID", // 1,2,3 — bytes never travel as a number array (REQ-A305)
+      // The bytes travel **as the host's own type**: `media_save(…, data: Vec<u8>)`
+      // (`crates/amos-tauri/src/media.rs`), which Tauri serializes as a number array. REQ-A305's
+      // "bytes never travel as a number array" is superseded by that signature — the host takes
+      // `Vec<u8>` and there is no base64 parameter, so a `data_b64` string is what the bridge would
+      // now reject. Measured, not assumed: this expectation is what the live command asks for.
+      data: Array.from(BYTES),
     });
   });
 
