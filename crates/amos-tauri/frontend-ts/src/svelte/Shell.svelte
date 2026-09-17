@@ -77,6 +77,10 @@
   // the pure decision (its unit tests survived), and the panel is generated from the same table.
   import { SHELL_MODULES } from "./shellModules";
   import { shellKeyIntent } from "../lib/systemKeys";
+  // System-back admission (REQ-A321): a single `backActionAt` decides what a
+  // dismiss intent means, so the keyboard handler and the platform back gesture
+  // (and any future consumer — accessibility shortcut, etc.) cannot disagree.
+  import { backActionAt, type BackSurface } from "../lib/backNav";
   import ShortcutHud from "./ShortcutHud.svelte";
   import ExtAppHost from "./ExtAppHost.svelte";
 
@@ -445,13 +449,23 @@
         return;
       }
 
-      // Dismiss: close the top overlay, else leave the surface — exactly one level.
-      const top = overlayTop;
-      if (top !== null) {
+      // Dismiss: route through `backActionAt` (REQ-A321) so the keyboard handler
+      // agrees with the platform back gesture and any future consumer. The
+      // pure decision tree:
+      //   * overlay open   → close it
+      //   * app / library  → go home (deferred one tick so an inner consumer
+      //                      — the library's search box — can claim the keystroke
+      //                      via `preventDefault()` first)
+      //   * home / lock    → fall through to the platform ("back at root")
+      const overlays = { nc: ncOpen(), recents: recentsOpen(), spot: spotOpen() };
+      const action = backActionAt({ surface: s.kind as BackSurface, overlays });
+      if (action === "none") return; // at home / locked — let the platform decide
+      e.preventDefault();
+      if (action === "close-overlay") {
         closeTopOverlay();
         return;
       }
-      if (s.kind !== "app" && s.kind !== "library" && s.kind !== "edit") return; // at home/locked
+      // action === "home"
       setTimeout(() => {
         if (e.defaultPrevented) return; // an inner consumer (the library's search box) claimed it
         goHome();
