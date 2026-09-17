@@ -17,11 +17,37 @@
  */
 import { ALARM_KEY, nextArmments } from "../lib/alarmCore";
 import { readStoreValue } from "../lib/amosStore";
-import { cancelNativeAlarm, registerNativeAlarm } from "../lib/backend";
+import { cancelNativeAlarm, registerNativeAlarm, type NativeAlarmDeviceState } from "../lib/backend";
 import { normalizeAlarms } from "../lib/time";
 
 /** Ids currently registered with the host scheduler (`alarm:<id>`). */
 let armed = new Set<string>();
+
+/**
+ * Last **device** outcomes the host reported (REQ-A369).
+ *
+ * The host used to answer nothing at all, so this module could not tell "the OS will wake the
+ * phone at 07:00" from "we wrote a number into a hash map" — which is exactly the difference a
+ * sleeping phone cares about (F-TAU-007, measured: the WebView's call resolved while
+ * `dumpsys alarm` was empty). `arm.state === "scheduled"` is the only state that means the
+ * alarm survives a doze or a killed process; the rest are reported so the UI can warn, never
+ * assumed away.
+ */
+let lastArm: NativeAlarmDeviceState | null = null;
+let lastCancel: NativeAlarmDeviceState | null = null;
+
+/** Device states from the most recent reconcile (diagnostics + the alarm UI's warning). */
+export function nativeAlarmDeviceState(): {
+  arm: NativeAlarmDeviceState | null;
+  cancel: NativeAlarmDeviceState | null;
+} {
+  return { arm: lastArm, cancel: lastCancel };
+}
+
+/** Does the host say the OS actually holds an exact alarm (so a sleeping phone wakes)? */
+export function nativeWakeArmed(): boolean {
+  return lastArm?.state === "scheduled";
+}
 
 /** Ids this module believes are registered (diagnostics / tests). */
 export function armedNativeAlarmIds(): string[] {
@@ -31,6 +57,8 @@ export function armedNativeAlarmIds(): string[] {
 /** Test seam: forget the bookkeeping (the host side is mocked in tests anyway). */
 export function resetArmedNativeAlarmsForTest(): void {
   armed = new Set<string>();
+  lastArm = null;
+  lastCancel = null;
 }
 
 /**
@@ -53,7 +81,8 @@ export async function reconcileNativeAlarms(nowMs = Date.now()): Promise<string[
     if (wanted.has(id)) continue;
     armed.delete(id);
     try {
-      await cancelNativeAlarm(id);
+      const reply = await cancelNativeAlarm(id);
+      if (reply) lastCancel = reply.device;
     } catch {
       /* offline / unsupported */
     }
@@ -62,7 +91,8 @@ export async function reconcileNativeAlarms(nowMs = Date.now()): Promise<string[
   // Arm (idempotently) every enabled alarm's next occurrence.
   for (const arm of desired) {
     try {
-      await registerNativeAlarm(arm.id, arm.atMs);
+      const reply = await registerNativeAlarm(arm.id, arm.atMs);
+      if (reply) lastArm = reply.device;
       armed.add(arm.id);
     } catch {
       /* offline / unsupported */

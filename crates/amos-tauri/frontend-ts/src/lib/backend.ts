@@ -1190,16 +1190,45 @@ export async function exportTxtFile(name: string, text: string): Promise<Exporte
 
 /* ---- Native exact-alarm bridge (docs/native-alarm-bridge.md; §9 ③) ---- */
 
+/**
+ * What the **OS half** of an alarm registration did, as `alarm_sched::DeviceOutcome`
+ * serialises it. Until REQ-A369 the command answered nothing at all, so "registered" meant
+ * only "written to the host's in-memory ledger" — which is why a real device round
+ * (REQ-A362) measured `dumpsys alarm` empty while the WebView saw a success: a dozing or
+ * killed process was never woken. `host_only` is the honest desktop/CI answer.
+ */
+export interface NativeAlarmDeviceState {
+  state: "host_only" | "scheduled" | "cancelled" | "disallowed" | "unattached" | "unavailable" | "denied" | "unknown";
+  /** Present only for `state: "unknown"` — the glue's own words, never rounded up. */
+  detail?: string;
+}
+
+/** Reply of `scheduler_alarm_register` (`AlarmArmed`). */
+export interface NativeAlarmArmed {
+  id: string;
+  atMs: number;
+  device: NativeAlarmDeviceState;
+}
+
+/** Reply of `scheduler_alarm_cancel` (`AlarmCanceled`). */
+export interface NativeAlarmCanceled {
+  id: string;
+  /** The old boolean answer: did the in-process ledger still hold this id? */
+  wasRegistered: boolean;
+  device: NativeAlarmDeviceState;
+}
+
 /** Ask the Rust host to register a one-shot exact alarm at `atMs` (epoch ms).
- *  Offline (no Tauri bridge) → no-op returning null, so the WebView still rings
- *  via its own JS notifier. */
-export async function registerNativeAlarm(id: string, atMs: number): Promise<void> {
-  await invoke("scheduler_alarm_register", { id, atMs });
+ *  Offline (no Tauri bridge) → null, so the WebView still rings via its own JS notifier.
+ *  The reply's `device.state` says whether the **phone** was actually armed: `scheduled`
+ *  means it will wake when asleep, `host_only`/`disallowed`/`unattached` mean it will not. */
+export async function registerNativeAlarm(id: string, atMs: number): Promise<NativeAlarmArmed | null> {
+  return invoke<NativeAlarmArmed>("scheduler_alarm_register", { id, atMs });
 }
 
 /** Ask the Rust host to cancel a pending exact alarm. Offline → null. */
-export async function cancelNativeAlarm(id: string): Promise<boolean | null> {
-  return invoke<boolean>("scheduler_alarm_cancel", { id });
+export async function cancelNativeAlarm(id: string): Promise<NativeAlarmCanceled | null> {
+  return invoke<NativeAlarmCanceled>("scheduler_alarm_cancel", { id });
 }
 
 /** Poll the Rust host for alarms due by `nowMs` (defaults to host wall clock).

@@ -287,6 +287,7 @@ export const zh = {
   "clock.dismissAlarm": "关闭",
   "clock.snooze": "再响",
   "clock.ringSilent": "此环境无法播放声音（静音响铃）",
+  "clock.nativeWakeUnavailable": "锁屏或退出后此闹钟不会响：系统未允许 AmOS 使用精确闹钟（宿主报告：{state}）",
   "clock.snoozeLength": "贪睡(分)",
   "clock.tone": "铃声",
   "clock.repeat": "重复",

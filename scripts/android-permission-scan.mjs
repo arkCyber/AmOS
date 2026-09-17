@@ -125,6 +125,37 @@ export const API_FAMILIES = [
     runtime: [],
     why: "TetheringManager#startTethering needs TETHER_PRIVILEGED (signature|privileged ⇒ never granted to a normal install)",
   },
+  {
+    // Exact alarms (REQ-A369, closing F-TAU-007). Until this family existed, the
+    // permissions were simply not declared anywhere and the *call site* was not made
+    // either: the host wrote its ledger and a sleeping phone was never woken — the
+    // gate had nothing to check because the API the app must call was never called
+    // (docs/native-alarm-bridge.md, F-TAU-007). Both halves are named here so the
+    // declaration and the call site keep each other honest: the Rust command
+    // (`scheduler_alarm_register`, through `AlarmGlue`) and the Kotlin API whose
+    // permission this is.
+    //
+    // `runtime` is empty on purpose: neither permission is a runtime *dialog*. On
+    // API 31/32 `SCHEDULE_EXACT_ALARM` is an app-op the user grants from a Settings
+    // screen (`ACTION_REQUEST_SCHEDULE_EXACT_ALARM`, which the glue opens), and on
+    // API 33+ `USE_EXACT_ALARM` is granted at install for an alarm-clock app.
+    family: "exact-alarm",
+    tokens: [
+      "scheduler_alarm_register",
+      "AlarmGlue",
+      "setExactAndAllowWhileIdle",
+      "canScheduleExactAlarms",
+      "ACTION_REQUEST_SCHEDULE_EXACT_ALARM",
+      "USE_EXACT_ALARM",
+      "SCHEDULE_EXACT_ALARM",
+    ],
+    permissions: [
+      "android.permission.SCHEDULE_EXACT_ALARM",
+      "android.permission.USE_EXACT_ALARM",
+    ],
+    runtime: [],
+    why: "AlarmManager#setExactAndAllowWhileIdle (through AlarmGlue.schedule, from scheduler_alarm_register): SCHEDULE_EXACT_ALARM (API 31/32 app-op) + USE_EXACT_ALARM (API 33+, install-time for an alarm-clock app)",
+  },
 ];
 
 /** `true` when the fragment declares `permission` (any `maxSdkVersion`). */
@@ -286,6 +317,19 @@ export function runSelftest() {
 
   ok("familiesIn finds Wi-Fi state", familiesIn('"isWifiEnabled"').some((f) => f.family === "wifi-state"));
   ok("familiesIn finds tethering", familiesIn("TetheringManager").some((f) => f.family === "tethering"));
+  // REQ-A369: the exact-alarm family must be findable from **both** ends — the Rust command
+  // that schedules and the Kotlin API that needs the permission. A gate that only saw one of
+  // them would let the other half disappear silently (that is how F-TAU-007 shipped).
+  ok("familiesIn finds exact alarms from the Rust command name", familiesIn("scheduler_alarm_register").some((f) => f.family === "exact-alarm"));
+  ok("familiesIn finds exact alarms from the Kotlin API", familiesIn("am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMs, pending(context, id))").some((f) => f.family === "exact-alarm"));
+  ok(
+    "a missing exact-alarm declaration is a finding",
+    permissionFindings({
+      fragment: '<uses-permission android:name="android.permission.CAMERA" />',
+      kotlin: "AlarmGlue",
+      sources: [{ file: "crates/amos-tauri/src/alarm_sched.rs", text: 'call_static_method("com/amos/ai/glue/AlarmGlue", "schedule"' }],
+    }).findings.some((f) => f.kind === "undeclared" && f.permission === "android.permission.USE_EXACT_ALARM"),
+  );
   ok(
     "a declared family permission nobody needs is stale (informational)",
     staleDeclarations('<uses-permission android:name="android.permission.BLUETOOTH" />', new Set()).length === 1,

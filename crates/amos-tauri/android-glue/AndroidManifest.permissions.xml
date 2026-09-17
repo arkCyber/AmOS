@@ -128,4 +128,26 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
+    <!-- Exact alarms — the Clock app's "wake a sleeping phone" half (REQ-A369,
+         closing F-TAU-007). `AlarmGlue.schedule` calls
+         `AlarmManager#setExactAndAllowWhileIdle`, which needs one of these:
+
+           * USE_EXACT_ALARM (API 33+) — granted at install to apps whose core
+             function is alarms/calendar, with no user dialog. This app ships a
+             clock with real alarms, so it is the honest declaration;
+           * SCHEDULE_EXACT_ALARM (API 31/32) — the per-app "Alarms & reminders"
+             grant; `AlarmGlue.schedule` checks `canScheduleExactAlarms()` and,
+             when it is false, answers `disallowed` (the host then reports "this
+             alarm will not wake the phone" instead of a false success), and
+             `AlarmGlue.openExactAlarmSettings` opens the system screen.
+
+         POST_NOTIFICATIONS is deliberately **not** declared: the ring is drawn by
+         the WebView after `AlarmReceiver` foregrounds the app, and nothing in this
+         tree posts a notification — a declaration with no call site is the stale
+         entry scripts/android-permission-scan.mjs reports (the same reason
+         BLUETOOTH_ADVERTISE above is absent). Declare it when a notification path
+         actually exists. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
 </manifest>

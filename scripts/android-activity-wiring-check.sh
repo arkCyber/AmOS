@@ -60,6 +60,7 @@ REQUIRED=(
   "AmosGlue.onStart(|start the sensor/camera/clipboard/torch producers"
   "AmosGlue.onCameraPermissionGranted(|rebind the torch once CAMERA is held"
   "AmosGlue.onStop(|release the producers so the camera/torch is freed"
+  "AlarmGlue.bind(|hand the app context to the host's AlarmManager binding (F-TAU-007)"
 )
 
 missing=""

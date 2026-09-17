@@ -1,7 +1,7 @@
 # 原生精确闹钟桥（Native Exact-Alarm Bridge）— 设计 + 诚实边界
 
 > 目标（§9 ③）：让 Clock 闹钟的「到时 / 响铃」**不依赖时钟 App/WebView 是否在前台计时**——到点唤醒交给原生侧。
-> 状态：**原生纯核心已落地并测试**（`amos-scheduler` 新增 `ExactAlarmClock`）；Tauri 命令与设备侧 `AlarmManager` 绑定是待办（见「边界」）。
+> 状态：**原生纯核心已落地并测试**（`amos-scheduler` 的 `ExactAlarmClock`）；Tauri 命令已落地；**设备侧 `AlarmManager` 绑定已接线**（REQ-A369：Kotlin 上呼 `attachContext` + Rust `alarm_sched::android`）；**真机验收仍待做**（`dumpsys alarm` 从空变非空 + 到点真唤醒；本轮设备未连）。
 
 ## 现状与动机
 - 时钟 App 与 OS 级到点提醒（`frontend-ts/src/lib/alarmCore.ts` 的 `syncDueAlarmAlerts`，由 `svelte/osAlarmWatcher.ts` 每 2s 驱动）都靠 WebView 里 `setInterval` 轮询 `amos.alarms` 计时——只要 **WebView 活着**，切到别处也会到点提醒（前几轮已落地）。
@@ -29,11 +29,15 @@
    - `scheduler_alarm_poll { nowMs? } -> { due: [id, …] }`（到点一次性返回并移除）——**前端刻意未接**：WebView 存活时的到点判定已由 `syncDueAlarmAlerts` 的墙钟对账覆盖，接上 poll 只会多一条可能重复的路径；等真机验证「进程被节流后恢复」再决定是否改走它。
    - 到点后由调用方把 id 抛给 WebView（触发既有响铃动画/横幅）；每日闹钟到点后再 `register` 下一天。
    - 已注册到 `invoke_handler` 与 `.manage`；`cargo test -p amos-tauri --lib alarm_sched::` 3 通过、clippy `-D warnings` 0。
-3. 一个原生线程/`AlarmManager` 回调：`sleep_until(next_at)` → `due(now)` → 把到点 id 抛给 WebView。
+3. **设备侧绑定（REQ-A369 已接线）**：`crates/amos-tauri/src/alarm_sched.rs` 的 `#[cfg(feature = "android")] mod android` 持有 `JavaVM` + `Context` 的 `GlobalRef`（由 Kotlin `AlarmGlue.bind` 在 `MainActivity.onStart` 上呼 `Java_com_amos_ai_glue_AlarmGlue_attachContext` 交进来），两个命令各自调用 `AlarmGlue.schedule(ctx, id, atMs)` / `AlarmGlue.cancel(ctx, id)`（`setExactAndAllowWhileIdle(RTC_WAKEUP, …)`）。到点由 `AlarmReceiver`（`AndroidManifest.components.xml`）拉起 System UI 前台，WebView 既有的 `osAlarmWatcher` → `syncDueAlarmAlerts` 显示响铃动画。
+   - **接线是机器持有的**：生成工程 `crates/amos-tauri/gen/`（git-ignored）里那一行 `AlarmGlue.bind(applicationContext)` 会被 `cargo tauri android init` 重新生成 ⇒ 判据写进 `scripts/android-activity-wiring-check.sh`（REQUIRED 表）与 `scripts/android-glue-mirror.sh`（manifest 片段一致性）✓；权限与调用点的对应关系写进 `scripts/android-permission-scan.mjs` 的 `exact-alarm` 家族 ✓。
+   - **回包是事实，不是空值**：`scheduler_alarm_register` 现在答 `AlarmArmed { id, atMs, device }`，`device` 是类型化的 `DeviceOutcome`（`scheduled` / `disallowed` / `unavailable` / `denied` / `unattached` / `host_only` / `unknown(词)`）；`scheduler_alarm_cancel` 答 `AlarmCanceled { id, wasRegistered, device }`。**只有 `scheduled` 意味着锁屏/息屏后手机真会被叫醒** ✓，其余状态由 Clock 闹钟页的横幅如实显示（`data-testid="alarm-native-wake"`）。
 
 ## 诚实边界（重要）
-- 本环境（无 Android 真机）**无法验证真正的“进程被杀/深度息屏唤醒”**：那需要把 `next_at` 接到设备的 **Android `AlarmManager`（`setExactAndAllowWhileIdle`）+ 常驻前台组件**上——这是设备侧绑定，且需跨真机验收。
-- 即便 WebView 被节流但**进程仍活**，用本核心 + 宿主线程轮询即可让到点判定脱离 JS 计时器（可在 dev/桌面验证）；“进程死→被 OS 复活”才是 AlarmManager 的范畴。
+- **设备侧绑定已接线，但真机验收未做** ✗：`dumpsys alarm | grep -i amos` 应从**空变非空**、`atMs` 前后应看到**真的唤醒**（`AlarmReceiver` 拉起前台 + WebView 响铃）。本轮设备不在线，**没有**任何真机读数 ⇒ 只能给"代码 + 主机编译 + 门"三类证据，不能宣称它已在设备上工作。
+- **系统可以拒绝精确闹钟**（Android 12+）：`canScheduleExactAlarms()==false` 时 `AlarmGlue.schedule` 答 `disallowed`（**不排程、不假装**），`setExact…` 抛 `SecurityException` 时答 `denied`。宿主据此让 Clock 页显示横幅而不是照旧显示"已设置"——**"平台说不行"必须看得见** ✓（`F-TAU-010`）。
+- **权限选择的取舍**：`USE_EXACT_ALARM`（API 33+，闹钟类应用安装即得、无对话框）+ `SCHEDULE_EXACT_ALARM`（API 31/32 的 per-app 授权，`AlarmGlue.openExactAlarmSettings` 打开系统页）。**`POST_NOTIFICATIONS` 故意不声明** ✗ —— 响铃由 WebView 在 `AlarmReceiver` 拉起前台后绘制，本仓没有任何发通知的调用点，声明它只会变成 `android-permission-scan` 报的 stale 条目（与 `BLUETOOTH_ADVERTISE` 同理）；将来真有通知路径时再声明。
+- 即便 WebView 被节流但**进程仍活**，用本核心 + 宿主线程轮询即可让到点判定脱离 JS 计时器（可在 dev/桌面验证）；"进程死→被 OS 复活"才是 AlarmManager 的范畴，且需要**真机 + 省电白名单**才能验。
 - 每日重复由调用方在每次 `due` 后 `register` 下一天（核心保持 fire-once、最小语义）。
 
 ## 设备步骤（Android，已接真机时）

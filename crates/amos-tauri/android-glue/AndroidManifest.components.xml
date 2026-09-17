@@ -64,4 +64,17 @@
         </intent-filter>
     </receiver>
 
+    <!-- Exact alarms (REQ-A369, F-TAU-007): the alarm the user set must wake a
+         sleeping / dozing phone. `AlarmGlue.schedule` arms it with
+         `setExactAndAllowWhileIdle`; this receiver is what runs at that instant —
+         it brings the System UI to the front so the WebView's existing notifier
+         shows the ring (no notification is posted, which is why POST_NOTIFICATIONS
+         is not declared in the permissions fragment).
+         `exported="false"` is correct: the broadcast is in-package, and the intent
+         carries the alarm id (`EXTRA_ID`) the WebView knows. -->
+    <receiver
+        android:name="com.amos.ai.glue.AlarmReceiver"
+        android:enabled="true"
+        android:exported="false" />
+
 </manifest>

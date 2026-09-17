@@ -288,6 +288,7 @@ export const en: Record<MessageKey, string> = {
   "clock.dismissAlarm": "Dismiss",
   "clock.snooze": "Snooze",
   "clock.ringSilent": "This environment can't play sound (ringing silently)",
+  "clock.nativeWakeUnavailable": "This alarm will not wake a sleeping phone: the OS has not allowed AmOS to schedule exact alarms (host reported: {state})",
   "clock.snoozeLength": "Snooze (min)",
   "clock.tone": "Ringtone",
   "clock.repeat": "Repeat",

@@ -41,6 +41,8 @@
   import { locale, t } from "./locale.svelte";
   import { onDestroy, onMount } from "svelte";
   import { startAlarmRing, stopAlarmRing, previewAlarmTone, setRingtoneFilesEnabled, activeRingtone } from "../lib/ringtonePlayer";
+  import { nativeAlarmDeviceState, nativeWakeArmed } from "./osAlarmArm";
+  import type { NativeAlarmDeviceState } from "../lib/backend";
   import { restoreTimerState, persistFromTimer } from "../lib/timerStore";
   import { CITY_CATALOG, resolveCity, searchCities } from "../lib/cityIndex";
   import { playNotifyTone } from "../lib/notifyTone";
@@ -192,6 +194,17 @@
   const ringAlarms = $derived(ringingAlarms(al));
   /** Alarm rows shown earliest-first, as iOS does (store order untouched). */
   const sortedAlarms = $derived(alarmsByTime(al.list));
+  /**
+   * What the host said the **OS** did with the last arming request (REQ-A369), or `null` when
+   * nothing has been reported (offline, or the watcher has not run yet). Only `scheduled` means
+   * the alarm will wake a sleeping phone; anything else is shown to the user instead of implied
+   * away — the device round that found F-TAU-007 saw the WebView believe a registration that
+   * `dumpsys alarm` knew nothing about.
+   */
+  let nativeArm = $state<NativeAlarmDeviceState | null>(null);
+  const refreshNativeArm = () => {
+    nativeArm = nativeAlarmDeviceState().arm;
+  };
   // Audible ring: start looping the first ringing alarm's tone once a ring
   // begins; stop when nothing rings. Tracked so the 1 Hz tick doesn't restart it.
   let ringStarted = false;
@@ -246,6 +259,10 @@
     // (the reducer state still shows the alarms; that they will not survive a reload
     // is exactly what the user must be told).
     storeErr = writeStoreValueChecked("amos.alarms", al.list) ? "" : t("common.storeWriteFailed");
+    // …and re-read what the **device** did with those alarms (REQ-A369): the host now answers
+    // whether the OS actually holds an exact alarm, which is the difference between "07:00 will
+    // ring while AmOS is alive" and "07:00 will wake a sleeping phone" (F-TAU-007).
+    refreshNativeArm();
   });
 
   // ONE 1 Hz interval: advance the clock + latch alarms + tick the running timer.
@@ -255,6 +272,9 @@
       now = d;
       al = alarmsReducer(al, { type: "tick", now: d });
       if (tm.running) tm = timerReducer(tm, { type: "tick", now: d.getTime() });
+      // The host answers the arming call asynchronously (the watcher drives it), so the
+      // banner below would otherwise stay stale until the next list change.
+      refreshNativeArm();
     }, 1000);
     return () => clearInterval(id);
   });
@@ -534,6 +554,17 @@
           <span class="text-xs uppercase tracking-wide opacity-50">{t("clock.alarm")}</span>
           <span class="text-xs opacity-50">{t("clock.alarmCount", { n: al.list.length })}</span>
         </div>
+        {#if al.list.some((a) => a.enabled) && nativeArm && !nativeWakeArmed()}
+          <!-- The OS half did not happen: say it, with the host's own word for why (REQ-A369). -->
+          <div
+            data-testid="alarm-native-wake"
+            data-native-wake={nativeArm.state}
+            role="status"
+            class="mt-2 rounded-lg bg-amber-500/15 px-2 py-1 text-[11px] leading-snug text-amber-900 dark:text-amber-200"
+          >
+            {t("clock.nativeWakeUnavailable", { state: nativeArm.state })}
+          </div>
+        {/if}
         {#if editingId}
           <div class="mt-2 flex items-center justify-between rounded-lg bg-accent/10 px-2 py-1 text-xs">
             <span class="opacity-80">{t("clock.editAlarm")}</span>

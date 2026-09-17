@@ -130,7 +130,11 @@ const KNOWN_FAILURES = [
   { id: 'F-TAU-004', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/svelte/ClipboardAnnounce.svelte'], markers: ['clipboard-changed', 'metadata'], severity: 4 },
   { id: 'F-TAU-005', module: 'amos-tauri', files: ['crates/amos-ai/src/governor_service.rs'], markers: ['mirror_failed'], severity: 3 },
   { id: 'F-TAU-006', module: 'amos-tauri', files: ['crates/amos-tauri/src/devcare.rs'], markers: ['UninstallGuard'], severity: 4 },
-  { id: 'F-TAU-007', module: 'amos-tauri', files: ['crates/amos-tauri/src/ai_bridge.rs'], markers: ['persist_cloud_key', '0600'], severity: 4 },
+  { id: 'F-TAU-009', module: 'amos-tauri', files: ['crates/amos-tauri/src/ai_bridge.rs'], markers: ['persist_cloud_key', '0600'], severity: 4 },
+  // REQ-A369: the OS can *refuse* exact alarms — that refusal has to be a visible state, not a
+  // log line, or the user believes in an alarm that will not wake a dozing phone (F-TAU-007's
+  // sibling). Mitigations: the glue's status words, the typed DeviceOutcome, the Clock banner.
+  { id: 'F-TAU-010', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/frontend-ts/src/svelte/ClockApp.svelte', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['DeviceOutcome', 'nativeWakeUnavailable', 'STATUS_DISALLOWED'], severity: 2 },
   { id: 'F-TAU-008', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/uiFailures.ts'], markers: ['unhandledrejection', 'error'], severity: 3 },
 
   // 机器人中间件
@@ -260,6 +264,33 @@ export function tableShapeProblems(text) {
   return problems;
 }
 
+/**
+ * 同一个 ID 被登记两次。
+ *
+ * 为什么单列一条判据（REQ-A369）：登记册是**所有失效模式的索引**，一个 ID 对应两种失效模式
+ * 会让"按 ID 查找"失去意义 —— 而**没有任何检查看得见**。本仓实测：`F-TAU-007` 被用了两次 ✓
+ * （一次是闹钟的"设备绑定从未被调用" ✓，一次是云端 API key 写失败谎报"已保存" ✓），
+ * **清单与文档里各两条** ✓（清单 110 行与 133 行 ✓、文档 125 行与 164 行 ✓），而 `--check` 一直
+ * 是绿的 ✓ —— 它只问"这个 ID 认识吗" ✗，不问"这个 ID 唯一吗" ✗。
+ *
+ * ID 只从**表格行的首格**读取 ⇒ 正文里引用某个 ID（"见 F-DEV-002"）依旧合法 ✓。
+ */
+export function duplicateIdProblems(text) {
+  const firstLineOf = new Map();
+  const problems = [];
+  text.split('\n').forEach((line, i) => {
+    if (!line.startsWith('|')) return;
+    if (/^\|[\s:|-]+\|\s*$/.test(line)) return;
+    const firstCell = line.split(' | ')[0].replace(/^\|\s*/, '').trim();
+    const m = /^(F-[A-Z]+-\d+)$/.exec(firstCell);
+    if (!m) return;
+    const id = m[1];
+    if (firstLineOf.has(id)) problems.push({ id, line: i + 1, firstLine: firstLineOf.get(id) });
+    else firstLineOf.set(id, i + 1);
+  });
+  return problems;
+}
+
 function cmdCheck() {
   if (!fs.existsSync(FMEA_DOC)) {
     console.error(`[FAIL] fmea-doc: ${FMEA_DOC} not found.`);
@@ -306,6 +337,30 @@ function cmdCheck() {
         `       - line ${p.line}: ${p.cells} cells, but the header on line ${p.headerLine} has ${p.expected}`,
       );
     }
+  }
+
+  // (d) 同一 ID 只能登记一种失效模式（REQ-A369）—— 清单与文档两边都要唯一
+  const dupInDoc = duplicateIdProblems(text);
+  const dupInInventory = (() => {
+    const firstSeen = new Map();
+    const dup = [];
+    for (const f of KNOWN_FAILURES) {
+      if (firstSeen.has(f.id)) dup.push({ id: f.id, first: firstSeen.get(f.id) });
+      else firstSeen.set(f.id, f.id);
+    }
+    return dup;
+  })();
+  if (dupInDoc.length > 0) {
+    bad = true;
+    console.error(`[FAIL] fmea-doc: the same ID is registered twice in ${FMEA_DOC}:`);
+    for (const d of dupInDoc) {
+      console.error(`       - ${d.id} on line ${d.line}, already registered on line ${d.firstLine}`);
+    }
+  }
+  if (dupInInventory.length > 0) {
+    bad = true;
+    console.error(`[FAIL] fmea-doc: the inventory repeats an ID:`);
+    for (const d of dupInInventory) console.error(`       - ${d.id}`);
   }
 
   if (bad) {
@@ -482,6 +537,25 @@ function cmdSelfTest() {
         const TBD_RE = /\(?\bTBD\b\)?/i;
         const unsigned = r.filter(x => !x.accepted_by || TBD_RE.test(x.accepted_by));
         assert(unsigned.length === 0, `unsigned residual risks: ${unsigned.map(x=>x.id).join(',')}`);
+      },
+    },
+    {
+      name: 'duplicateIdProblems names a repeated row ID and ignores prose',
+      run: () => {
+        const text = [
+          '| ID | 失效模式 | 影响 | S | P | D | RPN | 当前缓解 | 测试保护 |',
+          '|----|----------|------|---|---|---|-----|-----------|----------|',
+          '| F-XX-001 | first mode | b | 1 | 1 | 1 | 1 | m | t |',
+          '| F-XX-001 | a second mode reusing the ID | b | 1 | 1 | 1 | 1 | m | t |',
+          'prose may cite F-XX-001 — it is not a row, so it must not count',
+        ].join('\n');
+        const dup = duplicateIdProblems(text);
+        assert(dup.length === 1, `expected 1 duplicate, got ${dup.length}`);
+        assert(dup[0].id === 'F-XX-001' && dup[0].line === 4, `got ${JSON.stringify(dup[0])}`);
+        assert(
+          duplicateIdProblems('| F-XX-002 | a single mode | b | 1 | 1 | 1 | 1 | m | t |').length === 0,
+          'a single row is not a duplicate',
+        );
       },
     },
   ];

@@ -12,6 +12,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import ClockApp from "../src/svelte/ClockApp.svelte";
+import { reconcileNativeAlarms, resetArmedNativeAlarmsForTest } from "../src/svelte/osAlarmArm";
 import { setLocale } from "../src/svelte/locale.svelte";
 
 afterEach(() => {
@@ -520,6 +521,38 @@ describe("ClockApp.svelte", () => {
     expect(txt(host)).toContain("05:00");
     // Still idle (can be started) — not marked "time's up".
     expect(txt(host)).not.toContain("时间到");
+  });
+
+  test("says when the OS will not wake a sleeping phone for an alarm (REQ-A369)", async () => {
+    // What the host now answers: the in-process ledger holds the alarm, but the *device*
+    // half did not happen (exact alarms refused). Before this, the page looked fine and a
+    // dozing phone was never woken (F-TAU-007, measured on a real device).
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) =>
+        cmd === "scheduler_alarm_register"
+          ? { id: args.id, atMs: args.atMs, device: { state: "disallowed" } }
+          : null,
+      listen: async () => async () => {},
+    };
+    resetArmedNativeAlarmsForTest();
+    window.localStorage.setItem(
+      "amos.alarms",
+      JSON.stringify([{ id: "a1", hour: 7, min: 30, label: "", enabled: true, ringing: false, tone: "🔔" }]),
+    );
+    // The watcher does this when the list changes (started from Shell in the real app).
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+
+    const host = render(ClockApp);
+    await tick();
+    await fireEvent.click(tab(host, "闹钟") as HTMLButtonElement);
+
+    const banner = host.container.querySelector('[data-testid="alarm-native-wake"]');
+    expect(banner).not.toBeNull();
+    expect(banner!.getAttribute("data-native-wake")).toBe("disallowed");
+    expect(banner!.textContent).toContain("不会响");
+    cleanup();
+    resetArmedNativeAlarmsForTest();
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
   });
 
   test("timer accepts a custom mm:ss and quick presets", async () => {

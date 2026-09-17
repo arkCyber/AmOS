@@ -276,6 +276,27 @@ object NativeBootGuard {
  * }
  * ```
  */
+/**
+ * AmOS **exact-alarm binding** — the device half of "the alarm must wake a sleeping phone"
+ * (REQ-A369, closing F-TAU-007). The generated `MainActivity.onStart` hands the glue the app
+ * context once:
+ * ```
+ * try {
+ *   AlarmGlue.bind(applicationContext)
+ * } catch (t: Throwable) { Log.w(TAG, "alarm glue unavailable: $t") }
+ * ```
+ * Why it has to be there: `AlarmGlue.bind` installs the Rust host's `Context` through the
+ * `AlarmGlue.attachContext` JNI upcall, and without it `scheduler_alarm_register` can only
+ * write its in-memory ledger — which is exactly how a real device round (REQ-A362) measured
+ * `dumpsys alarm` **empty** after a registration the WebView saw succeed: the phone would not
+ * have woken. `bind` is idempotent and fails soft, so an APK built without the `android`
+ * native feature logs a warning instead of crashing boot.
+ *
+ * `AlarmReceiver` (declared in `AndroidManifest.components.xml`) is what runs at the alarm
+ * instant and brings the System UI forward; `AlarmGlue.kt` documents the status contract
+ * (`scheduled` / `disallowed` / `unavailable` / `denied`) the host surfaces verbatim.
+ */
+
 object AlwaysOn {
 
   private const val TAG = "AmosAlwaysOn"

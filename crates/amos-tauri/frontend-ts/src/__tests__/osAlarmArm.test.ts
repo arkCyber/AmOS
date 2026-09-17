@@ -3,6 +3,8 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { ALARM_KEY } from "../lib/alarmCore";
 import {
   armedNativeAlarmIds,
+  nativeAlarmDeviceState,
+  nativeWakeArmed,
   reconcileNativeAlarms,
   resetArmedNativeAlarmsForTest,
 } from "../svelte/osAlarmArm";
@@ -98,5 +100,48 @@ describe("osAlarmArm — native exact-alarm reconciliation", () => {
 
     window.localStorage.setItem(ALARM_KEY, JSON.stringify({ not: "an array" }));
     await expect(reconcileNativeAlarms()).resolves.toEqual([]);
+  });
+
+  // REQ-A369: the host's answer now says what the **phone** will do. Before this, a
+  // `scheduler_alarm_register` that only reached the in-memory ledger looked identical to one
+  // that armed `AlarmManager` — a sleeping phone was never woken (F-TAU-007, device-measured).
+  test("a device refusal is visible: the phone will not be woken", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
+        calls.push({ cmd, args });
+        if (cmd === "scheduler_alarm_register") {
+          return { id: args.id, atMs: args.atMs, device: { state: "disallowed" } };
+        }
+        return null;
+      },
+      listen: async () => async () => {},
+    };
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+
+    // The registration *did* reach the host (the id is armed there)…
+    expect(armedNativeAlarmIds()).toEqual(["alarm:a1"]);
+    // …but the OS half did not happen, and the module says so instead of implying it did.
+    expect(nativeAlarmDeviceState().arm).toEqual({ state: "disallowed" });
+    expect(nativeWakeArmed()).toBe(false);
+  });
+
+  test("an OS-armed alarm reports that the phone can be woken", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
+        calls.push({ cmd, args });
+        if (cmd === "scheduler_alarm_register") {
+          return { id: args.id, atMs: args.atMs, device: { state: "scheduled" } };
+        }
+        return null;
+      },
+      listen: async () => async () => {},
+    };
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+
+    expect(nativeWakeArmed()).toBe(true);
+    // Desktop/CI honesty in the same shape: `host_only` is a *state*, not a success.
+    expect(nativeAlarmDeviceState().arm?.state).toBe("scheduled");
   });
 });
