@@ -83,6 +83,40 @@ async function listTargets(port) {
 }
 
 /** Evaluate `expression` in the first page target; resolves await when asked. */
+/**
+ * Wait until the page can actually answer (REQ-A365).
+ *
+ * A cold-started WebView on a loaded device keeps the devtools socket open while the document is
+ * still booting — `document.title` is empty and the shell has painted nothing — and in that state
+ * `Runtime.evaluate` simply never comes back, which reads as a tool failure. So we ask the page a
+ * trivial question in a bounded loop first and only then run the caller's expression. Readiness
+ * means: the document is complete, the host bridge is injected, and the shell has painted at least
+ * one button (a blank page has none).
+ */
+async function waitForPage(port, { timeoutMs = 30000, intervalMs = 500 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "(never asked)";
+  for (;;) {
+    try {
+      const probe = `document.readyState + '|' + (typeof window.__TAURI_INTERNALS__?.invoke === 'function' ? 'bridge' : 'no-bridge') + '|' + document.querySelectorAll('button').length`;
+      const state = String(
+        (await evaluate(port, probe, {
+          timeoutMs: Math.max(1000, Math.min(4000, deadline - Date.now())),
+        })) ?? "",
+      );
+      last = state;
+      const [readyState, bridge, buttons] = state.split("|");
+      if (readyState === "complete" && bridge === "bridge" && Number(buttons) > 0) return state;
+    } catch (e) {
+      last = String((e && e.message) || e);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`page never became ready within ${timeoutMs}ms (last: ${last})`);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 async function evaluate(port, expression, { awaitPromise = false, timeoutMs = 15000 } = {}) {
   const list = await listTargets(port);
   const page = list.find((t) => t.type === "page");
@@ -146,8 +180,14 @@ if (!expression) {
   process.exit(2);
 }
 try {
+  // Cold-start robustness: never run the caller's expression against a page that is still booting
+  // (that produced a bare "devtools evaluate timed out" with no hint about the real state).
+  const ready = await waitForPage(PORT, {
+    timeoutMs: Number(opt("--wait", "30000")) || 30000,
+  });
   const value = await evaluate(PORT, expression, { awaitPromise: has("--await") });
   console.log(typeof value === "string" ? value : JSON.stringify(value, null, has("--json") ? 2 : 0));
+  if (process.env.AMOS_EVAL_VERBOSE) console.error(`[device-ui-eval] page ready as ${ready}`);
 } catch (err) {
   console.error(`[device-ui-eval] ${err.message}`);
   process.exit(1);
