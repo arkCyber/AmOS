@@ -305,6 +305,7 @@ export const en: Record<MessageKey, string> = {
   "clock.snooze": "Snooze",
   "clock.ringSilent": "This environment can't play sound (ringing silently)",
   "clock.nativeWakeUnavailable": "This alarm will not wake a sleeping phone: the OS has not allowed AmOS to schedule exact alarms (host reported: {state})",
+  "clock.nativeWakeOther": "This alarm will not wake a sleeping phone: the host could not schedule an exact alarm (reported: {state})",
   "clock.nativeWakeGrant": "Allow it",
   "clock.nativeWakeGrantOpened": "Opened the system Alarms & reminders screen",
   "clock.nativeWakeGrantFailed": "Could not open the system screen (it needs the app in front)",

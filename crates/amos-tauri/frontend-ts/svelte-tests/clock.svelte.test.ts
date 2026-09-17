@@ -592,6 +592,37 @@ describe("ClockApp.svelte", () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
   });
 
+  test("a non-refusal state must not claim the OS refused, and offers no button (REQ-A373)", async () => {
+    // `unattached` = boot ordering (the glue is not bound yet): nothing was refused, so the copy
+    // must not say it was, and there is nothing for the user to grant.
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) =>
+        cmd === "scheduler_alarm_register"
+          ? { id: args.id, atMs: args.atMs, device: { state: "unattached" } }
+          : null,
+      listen: async () => async () => {},
+    };
+    resetArmedNativeAlarmsForTest();
+    window.localStorage.setItem(
+      "amos.alarms",
+      JSON.stringify([{ id: "a1", hour: 7, min: 30, label: "", enabled: true, ringing: false, tone: "🔔" }]),
+    );
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+
+    const host = render(ClockApp);
+    await tick();
+    await fireEvent.click(tab(host, "闹钟") as HTMLButtonElement);
+    const banner = host.container.querySelector('[data-testid="alarm-native-wake"]');
+    expect(banner?.getAttribute("data-native-wake")).toBe("unattached");
+    const text = banner?.textContent ?? "";
+    expect(text).toContain("本机未能安排"); // the neutral sentence
+    expect(text).not.toContain("系统未允许"); // never a cause we did not observe
+    expect(host.container.querySelector('[data-testid="alarm-native-wake-grant"]')).toBeNull();
+    cleanup();
+    resetArmedNativeAlarmsForTest();
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
+  });
+
   test("timer accepts a custom mm:ss and quick presets", async () => {
     const host = render(ClockApp);
     await fireEvent.click(tab(host, "计时器") as HTMLButtonElement);

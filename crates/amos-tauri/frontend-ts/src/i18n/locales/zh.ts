@@ -304,6 +304,7 @@ export const zh = {
   "clock.snooze": "再响",
   "clock.ringSilent": "此环境无法播放声音（静音响铃）",
   "clock.nativeWakeUnavailable": "锁屏或退出后此闹钟不会响：系统未允许 AmOS 使用精确闹钟（宿主报告：{state}）",
+  "clock.nativeWakeOther": "锁屏或退出后此闹钟不会响：本机未能安排精确闹钟（宿主报告：{state}）",
   "clock.nativeWakeGrant": "去授权",
   "clock.nativeWakeGrantOpened": "已打开系统「闹钟和提醒」页",
   "clock.nativeWakeGrantFailed": "没能打开系统页（需在前台操作）",

@@ -208,6 +208,14 @@
   };
   /** What the last "open the exact-alarm settings" attempt observed (REQ-A373; never optimistic). */
   let settingsMsg = $state("");
+  /**
+   * The banner's copy must match the state it is about: the single sentence used before said
+   * "the OS has not allowed exact alarms" for **every** non-`scheduled` state, which is only true
+   * for `disallowed` — for `unattached` (boot ordering: the glue is not bound yet) it would claim
+   * a cause nobody observed (REQ-A373 follow-up, same discipline as F-TAU-010).
+   */
+  const wakeMsgKey = (state: string) =>
+    state === "disallowed" ? "clock.nativeWakeUnavailable" : "clock.nativeWakeOther";
   // Audible ring: start looping the first ringing alarm's tone once a ring
   // begins; stop when nothing rings. Tracked so the 1 Hz tick doesn't restart it.
   let ringStarted = false;
@@ -568,7 +576,7 @@
             role="status"
             class="mt-2 rounded-lg bg-amber-500/15 px-2 py-1 text-[11px] leading-snug text-amber-900 dark:text-amber-200"
           >
-            {t("clock.nativeWakeUnavailable", { state: nativeArm.state })}
+            {t(wakeMsgKey(nativeArm.state), { state: nativeArm.state })}
             {#if nativeArm.state === "disallowed"}
               <button
                 data-testid="alarm-native-wake-grant"
