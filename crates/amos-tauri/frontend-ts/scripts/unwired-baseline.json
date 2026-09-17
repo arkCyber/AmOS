@@ -14,8 +14,8 @@
     "src/lib/externalFiles.ts::mergeDeduped",
     "src/lib/keepAwakeCore.ts::resetHoldBusForTest",
     "src/lib/keyboardConfig.ts::deserializeShortcut",
+    "src/lib/keyboardConfig.ts::isValidShortcut",
     "src/lib/media.ts::mediaStreamBase",
-    "src/lib/mediaExport.ts::dataUrlToBytes",
     "src/lib/mediaPaging.ts::canLoadMore",
     "src/lib/mediaPaging.ts::emptyPaging",
     "src/lib/mediaPaging.ts::fetchInto",
@@ -25,9 +25,10 @@
     "src/lib/sandboxBridge.ts::decideCapabilityRequest",
     "src/lib/sensors.ts::sensorAcquire",
     "src/lib/sensors.ts::sensorPixels",
-    "src/lib/shellChrome.ts::GLASS_LAUNCHPAD_STYLE",
     "src/lib/spaces.ts::getSpacesStatus",
+    "src/lib/spaces.ts::indexOfCreatedSpace",
     "src/lib/spaces.ts::moveWindowToSpace",
+    "src/lib/spaces.ts::newSpaceName",
     "src/lib/uiFailures.ts::resetUiFailuresForTest",
     "src/lib/wm.ts::layoutSurfaces",
     "src/lib/wm.ts::paneCss",
@@ -43,7 +44,5 @@
   "modules": [
     "src/lib/mediaPaging.ts"
   ],
-  "components": [
-    "src/svelte/settings/KeyboardPage.svelte"
-  ]
+  "components": []
 }

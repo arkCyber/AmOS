@@ -70,7 +70,21 @@ export function setThemeMode(m: ThemeMode): void {
   const changed = m !== mode;
   mode = m;
   persistMode(m);
+  
+  // Add transition class before switching
+  if (typeof document !== "undefined") {
+    document.documentElement.classList.add("theme-transitioning");
+  }
+  
   applyDarkClassSafe(dark(mode, osDark));
+  
+  // Remove transition class after animation
+  if (typeof document !== "undefined") {
+    setTimeout(() => {
+      document.documentElement.classList.remove("theme-transitioning");
+    }, 200);
+  }
+  
   if (changed) {
     try {
       window.dispatchEvent(new CustomEvent(AMOS_THEME_CHANGED_EVENT, { detail: m }));
@@ -82,16 +96,22 @@ export function setThemeMode(m: ThemeMode): void {
 
 /** Convenience light<->dark toggle (keeps "auto" resolved to a concrete value). */
 export function toggleTheme(): void {
+  // Use setThemeMode which handles animation
   setThemeMode(themeDark() ? "light" : "dark");
 }
 
 // Track OS preference changes (matches the React provider) so "auto" follows
 // the system. Guarded — safe under SSR/tests without matchMedia.
-if (osPrefersDark() && typeof window !== "undefined" && typeof window.matchMedia === "function") {
+// NOTE: registered on module import. The earlier `if (osPrefersDark() && …)`
+// version **skipped** the listener on light systems, so flipping the OS theme
+// from light→dark never refreshed the UI. Now we always attach (when a real
+// browser matchMedia exists), and the listener body just reads the current
+// `osPrefersDark()` value on each event.
+if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
   window
     .matchMedia("(prefers-color-scheme: dark)")
-    .addEventListener("change", (e: MediaQueryListEvent) => {
-      osDark = e.matches;
+    .addEventListener("change", () => {
+      osDark = osPrefersDark();
       applyDarkClassSafe(dark(mode, osDark));
     });
 }

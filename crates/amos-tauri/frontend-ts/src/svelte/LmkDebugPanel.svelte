@@ -12,7 +12,7 @@
     type LmkVictim,
     type LmkVictimState,
   } from "../lib/lmk";
-  import { bridgeDiag, isCommandFailed } from "../lib/backend";
+  import { bridgeDiag } from "../lib/backend";
   import { t } from "./locale.svelte";
 
   const GROUP =
@@ -103,11 +103,11 @@
         tasks = l ?? [];
         offline = l === null;
         if (l === null) {
-          // `isCommandFailed` narrows `BridgeDiag` to its `kind: "command-failed"`
-          // arm (REQ-A296's typed contract). "not-bridged" is the same as `l === null`
-          // already, so it isn't interesting on this path.
+          // Check diagnostic for refused command (REQ-A296's typed contract).
+          // "not-bridged" is the same as `l === null` already, so it isn't
+          // interesting on this path.
           const diag = bridgeDiag("android_lmk_tasks");
-          if (isCommandFailed(diag)) {
+          if (!diag.ok && diag.kind === "command-failed") {
             console.warn("🛟 [LmkDebugPanel] android_lmk_tasks refused:", diag.detail);
           }
         }
@@ -145,7 +145,7 @@
           // reason now lives in the diagnostic ledger.
           showNote(t("lmk.fail"));
           const diag = bridgeDiag("android_lmk_debug");
-          if (isCommandFailed(diag)) {
+          if (!diag.ok && diag.kind === "command-failed") {
             console.warn("🛟 [LmkDebugPanel] android_lmk_debug refused:", diag.detail);
           }
         }

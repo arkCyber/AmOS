@@ -16,6 +16,7 @@
   import { attachFocusTrap } from "../lib/focusTrap";
   import { propsChannel } from "./propsBus";
   import AppIcon from "./AppIcon.svelte";
+  import { GLASS_SPOTLIGHT_STYLE } from "../lib/shellChrome";
 
   interface SpotlightProps {
     open: boolean;
@@ -157,7 +158,8 @@
 {#if open}
   <div
     bind:this={rootEl}
-    class="sheet-in absolute inset-0 z-40 flex flex-col bg-white/45 p-4 backdrop-blur-2xl backdrop-saturate-150 dark:bg-neutral-950/60"
+    class="sheet-in absolute inset-0 z-40 flex flex-col p-4"
+    style={GLASS_SPOTLIGHT_STYLE}
   >
     <div class="flex items-center justify-between px-1">
       <h2 class="text-xl font-semibold tracking-tight">{t("shell.search")}</h2>

@@ -30,34 +30,30 @@
 
 /**
  * An interactive chrome glyph (a button in the bar): a 24 px hit target (`h-6
- * min-w-6`, macOS-ish for this 40 px bar), a hover wash, and a **focus-visible
+ * min-w-6`, macOS 标准为 24px bar), a hover wash, and a **focus-visible
  * ring** — the bar is reachable by keyboard (⌘Space/F4/F3 are bound, from the
  * registry table; Tab must be able to walk the widgets, and on a dark glass bar a
  * missing focus ring is invisible, not merely ugly).
  *
- * The size is spelled here rather than interpolated from a constant: Tailwind only
- * sees literal class names at build time, so a template string would silently
- * produce an unstyled bar. `chrome-widgets.svelte.test.ts` asserts the rendered
- * buttons actually carry these classes, which is what keeps the "one place" claim
- * true.
+ * macOS 实测字号：13px body（菜单文字）、11px subheadline（次要信息）。
  */
 export const CHROME_ICON_BUTTON =
   "inline-flex h-6 min-w-6 shrink-0 items-center justify-center rounded-md px-1 " +
-  "text-[12px] leading-none text-white/70 transition-colors " +
+  "text-[13px] leading-none text-white/70 transition-colors " +
   "hover:bg-white/10 hover:text-white active:bg-white/15 " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60";
 
 /** A menu entry in the bar (text button, same wash and ring, wider padding). */
 export const CHROME_MENU_BUTTON =
-  "rounded px-2 py-0.5 text-[12px] text-white/80 transition-colors " +
+  "rounded px-2 py-0.5 text-[13px] text-white/80 transition-colors " +
   "hover:bg-white/10 hover:text-white " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60";
 
 /** Read-only chrome text (app name, menu title). */
-export const CHROME_TEXT = "text-[12px] font-medium text-white/90";
+export const CHROME_TEXT = "text-[13px] font-medium text-white/90";
 
 /** A numeric read-out (clock, battery %) — `tabular-nums` so digits do not jitter. */
-export const CHROME_READOUT = "text-[12px] tabular-nums text-white/90";
+export const CHROME_READOUT = "text-[13px] tabular-nums text-white/90";
 
 /**
  * Minimum width for a read-out, so a wider value does not shift every widget to
@@ -78,7 +74,7 @@ export const CHROME_STATUS_GLYPH = "inline-flex items-center justify-center tran
 export const CHROME_TEXT_SHADOW = "0 1px 2px rgba(0,0,0,0.3)";
 
 /**
- * A dock item's icon tile (macOS's 56 px rounded square on the glass shelf).
+ * A dock item's icon tile (macOS 实测 48px 图标 + 16px 圆角).
  *
  * The size / border / font-size stay inline in the widget (`DOCK_ICON_SIZE` is a
  * layout number, `lib/desktopLayout.ts`), while the *look* — radius, gradient, shadow,
@@ -88,20 +84,22 @@ export const CHROME_TEXT_SHADOW = "0 1px 2px rgba(0,0,0,0.3)";
  * The magnification `transform` is deliberately **not** part of this token: the
  * container applies it to a wrapper around the widget (see `Dock.svelte`), which is
  * what keeps a scaled item out of the geometry the container measures.
+ * 
+ * macOS 实测：16px 圆角（约图标尺寸的 1/3），按下时 scale(0.85)。
  */
 export const DOCK_ITEM_TILE =
-  "group flex items-center justify-center rounded-2xl shadow-xl transition-transform " +
-  "duration-100 active:scale-90 " +
+  "group flex items-center justify-center rounded-[16px] shadow-xl transition-transform " +
+  "duration-100 active:scale-85 " +
   "bg-gradient-to-br from-neutral-700/90 to-neutral-900/90";
 
 /** A dock item's wrapper: tile column + the running dot under it. */
 export const DOCK_ITEM_COLUMN = "flex flex-col items-center";
 
 /** The running indicator macOS draws under an open app (`null` when it is not running). */
-export const DOCK_RUNNING_DOT = "mt-1 h-1 w-1 rounded-full bg-white shadow-sm";
+export const DOCK_RUNNING_DOT = "mt-1 h-[5px] w-[5px] rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.3)]";
 
 /** The reserved space the dot would occupy, so a running item does not change height. */
-export const DOCK_RUNNING_DOT_SLOT = "mt-1 h-1 w-1";
+export const DOCK_RUNNING_DOT_SLOT = "mt-1 h-[5px] w-[5px]";
 
 /** The `+N` chip the dock shows for items its width could not fit (never silent). */
 export const DOCK_OVERFLOW_CHIP =
@@ -131,6 +129,8 @@ export const CHROME_MENU_PANEL_STYLE =
  * One row of a menu. `disabled:` is part of the token on purpose: a menu item that
  * cannot act must render as macOS renders one — greyed — and `items/` widgets pass
  * `disabled` rather than dropping the row (see `docs/FMEA.md` F-SH-001).
+ * 
+ * macOS 实测：13px body，1.5rem 行高。
  */
 export const CHROME_MENU_ITEM =
   "block w-full px-4 py-1.5 text-left text-[13px] text-white/85 transition-colors " +
@@ -167,3 +167,63 @@ export const DESKTOP_ICON_FOCUSED =
  */
 export const DESKTOP_SELECTION_RECT =
   "pointer-events-none fixed border border-blue-400/80 bg-blue-400/15 rounded-[2px]";
+
+/**
+ * Glass effect tokens — unified blur/saturate/alpha for all chrome surfaces.
+ * 
+ * macOS uses vibrancy with different blur strengths and background alphas depending
+ * on the surface hierarchy. These tokens replace 6 inline style blocks that used to
+ * spell their own blur/saturate/alpha values.
+ * 
+ * Why: changing the glass effect used to require editing 6 files (TopBar, Dock,
+ * Spotlight, MissionControl, ControlCenter, Launchpad). Now it is one place.
+ */
+
+/** TopBar glass (subtle blur, medium translucency) */
+export const GLASS_TOPBAR_STYLE =
+  "background: rgba(30, 30, 30, 0.72); " +
+  "backdrop-filter: blur(20px) saturate(180%); " +
+  "-webkit-backdrop-filter: blur(20px) saturate(180%);";
+
+/** Dock glass (light tint for contrast, strong blur matching macOS) */
+export const GLASS_DOCK_STYLE =
+  "background: rgba(255, 255, 255, 0.15); " +
+  "backdrop-filter: blur(50px) saturate(180%); " +
+  "-webkit-backdrop-filter: blur(50px) saturate(180%);";
+
+/** Spotlight / search overlay (strong blur, high opacity for readability) */
+export const GLASS_SPOTLIGHT_STYLE =
+  "background: rgba(40, 40, 40, 0.92); " +
+  "backdrop-filter: blur(30px) saturate(200%); " +
+  "-webkit-backdrop-filter: blur(30px) saturate(200%);";
+
+/** Mission Control overlay (medium blur, balanced opacity) */
+export const GLASS_MISSION_CONTROL_STYLE =
+  "background: rgba(20, 20, 20, 0.88); " +
+  "backdrop-filter: blur(24px) saturate(200%); " +
+  "-webkit-backdrop-filter: blur(24px) saturate(200%);";
+
+/** Control Center panel (strong blur, medium-high opacity) */
+export const GLASS_CONTROL_CENTER_STYLE =
+  "background: rgba(40, 40, 40, 0.86); " +
+  "backdrop-filter: blur(30px) saturate(180%); " +
+  "-webkit-backdrop-filter: blur(30px) saturate(180%);";
+
+/** Launchpad overlay (strongest blur, high opacity for app grid contrast) */
+export const GLASS_LAUNCHPAD_STYLE =
+  "background: rgba(15, 15, 15, 0.92); " +
+  "backdrop-filter: blur(40px) saturate(200%); " +
+  "-webkit-backdrop-filter: blur(40px) saturate(200%);";
+
+/** Border style for glass surfaces (subtle hairline) */
+export const GLASS_BORDER_SUBTLE = "border: 1px solid rgba(255,255,255,0.08);";
+
+/** Border style for glass surfaces (medium visibility) */
+export const GLASS_BORDER_MEDIUM = "border: 1px solid rgba(255,255,255,0.10);";
+
+/** Dock border style (macOS light tint edges + top highlight，16px 顶部圆角) */
+export const GLASS_BORDER_DOCK =
+  "border-radius: 16px 16px 0 0; " +
+  "border-top: 1px solid rgba(255, 255, 255, 0.18); " +
+  "border-left: 1px solid rgba(255, 255, 255, 0.12); " +
+  "border-right: 1px solid rgba(255, 255, 255, 0.12);";

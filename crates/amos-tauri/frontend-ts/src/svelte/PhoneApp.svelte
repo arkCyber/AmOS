@@ -34,6 +34,8 @@
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import { phoneChannel } from "./appLinks";
   import { onMount } from "svelte";
+  import { emitDockBounce } from "../lib/dockConfig";
+  import { surface } from "./shellState.svelte";
 
   type PhoneTab = "keys" | "recent" | "frequent" | "emergency" | "block";
   const SUB: Record<string, string> = {
@@ -493,6 +495,11 @@
   const simIncoming = async () => {
     if (calling) return;
     const from = num.trim() !== "" ? num.trim() : "02112345678";
+    // P4: 触发 Dock 弹跳（仅在应用未激活时）
+    const s = surface();
+    if (s.kind !== "app" || s.id !== "phone") {
+      emitDockBounce("phone");
+    }
     await telephonySimulateIncoming(from);
   };
   const pressDtmf = (k: string) => {
@@ -539,10 +546,10 @@
   });
 </script>
 
-<div class="flex h-full w-full flex-col items-center p-3">
+<div class="flex h-full w-full flex-col items-center p-4">
   <StoreErrorBar message={storeErr} />
   {#if !calling}
-    <div role="tablist" aria-label={t("phone.tabs")} class="mb-1 flex w-full max-w-xs gap-1 rounded-full bg-neutral-200/80 p-1 dark:bg-white/10">
+    <div role="tablist" aria-label={t("phone.tabs")} class="mb-2 flex w-full max-w-xs gap-1 rounded-xl bg-neutral-200/80 p-1 dark:bg-white/10">
       {#each [
         { id: "keys", label: t("phone.tabKeys") },
         { id: "recent", label: t("phone.tabRecent") },
@@ -551,33 +558,37 @@
         { id: "block", label: t("phone.tabBlock") },
       ] as tb (tb.id)}
         <button role="tab" aria-selected={tab === tb.id} onclick={() => (tab = tb.id as PhoneTab)}
-          class="flex-1 rounded-full px-2 py-2 text-xs font-medium transition {tab === tb.id ? 'bg-white text-neutral-900 shadow dark:bg-white/20 dark:text-white' : 'text-neutral-600 hover:text-neutral-900 dark:text-white/70 dark:hover:text-white'}">
+          class="flex-1 rounded-lg px-2 py-2.5 text-ios-footnote font-medium transition {tab === tb.id ? 'bg-white text-neutral-900 shadow dark:bg-white/20 dark:text-white' : 'text-neutral-600 hover:text-neutral-900 dark:text-white/70 dark:hover:text-white'}">
           {tb.label}
         </button>
       {/each}
     </div>
   {/if}
   {#if !calling && dialError}
-    <p role="alert" class="my-2 max-w-xs text-center text-xs text-danger">{dialError}</p>
+    <p role="alert" class="my-2 max-w-xs text-center text-ios-footnote text-danger">{dialError}</p>
   {/if}
 
   {#if calling}
     <div class="flex w-full flex-col items-center">
-      <div class="py-4 text-center">
-        <div class="text-3xl tabular-nums tracking-widest">{num || "—"}</div>
-        <div class="mt-1 text-sm opacity-70">{talking ? t("phone.talking") : t("phone.call")}{!talking && num ? " …" : ""}</div>
+      <div class="py-8 text-center">
+        <!-- iOS-style avatar placeholder -->
+        <div class="mx-auto mb-6 grid h-32 w-32 place-items-center rounded-full bg-gradient-to-br from-blue-400 to-blue-600 text-5xl font-light text-white shadow-lg">
+          {num ? num.charAt(0) : "?"}
+        </div>
+        <div class="text-ios-title1 font-semibold tabular-nums">{num || "—"}</div>
+        <div class="mt-2 text-ios-body text-neutral-600 dark:text-neutral-400">{talking ? t("phone.talking") : t("phone.call")}{!talking && num ? " …" : ""}</div>
         {#if talking}
-          <div aria-label={t("a11y.callDuration")} class="mt-0.5 text-xs tabular-nums tracking-widest text-accent/80">{fmtCallDuration(elapsedSec)}</div>
+          <div aria-label={t("a11y.callDuration")} class="mt-3 text-ios-callout tabular-nums font-medium text-accent">{fmtCallDuration(elapsedSec)}</div>
         {/if}
       </div>
       {#if recording === "On"}
-        <p class="flex items-center gap-1.5 text-xs font-medium text-danger"><span class="h-2 w-2 animate-pulse rounded-full bg-danger" aria-hidden="true"></span>{t("phone.recording")}</p>
+        <p class="flex items-center gap-2 text-ios-footnote font-medium text-danger"><span class="h-2 w-2 animate-pulse rounded-full bg-danger" aria-hidden="true"></span>{t("phone.recording")}</p>
       {/if}
       {#if recording === "Failed"}
-        <p class="text-xs opacity-60">{t("phone.recordUnavailable")}</p>
+        <p class="text-ios-footnote text-neutral-600 dark:text-neutral-400">{t("phone.recordUnavailable")}</p>
       {/if}
       {#if muted}
-        <p class="mt-1 text-xs opacity-60">{t("phone.muted")}</p>
+        <p class="mt-2 text-ios-footnote text-neutral-600 dark:text-neutral-400">{t("phone.muted")}</p>
       {/if}
 
 
@@ -600,41 +611,41 @@
           {#if activeId}
             <button onclick={() => void toggleRecord()} aria-label={recording === "On" ? t("phone.recordStop") : t("phone.recordStart")}
               data-icon={recording === "On" ? "stop" : "record"}
-              class={"grid h-14 w-14 place-items-center rounded-full transition active:scale-90 " + (recording === "On" ? "bg-danger text-white" : "bg-neutral-200 text-danger dark:bg-white/10")}>
+              class={"grid h-16 w-16 place-items-center rounded-full transition active:scale-90 " + (recording === "On" ? "bg-danger text-white shadow-lg" : "bg-neutral-200 text-danger dark:bg-white/10")}>
               {@html iconSvg(recording === "On" ? "stop" : "record", "h-7 w-7")}
             </button>
           {/if}
           <button onclick={() => (muted = !muted)} aria-label={muted ? t("phone.unmute") : t("phone.mute")}
             data-icon={muted ? "micOff" : "mic"}
-            class={"grid h-14 w-14 place-items-center rounded-full transition active:scale-90 " + (muted ? "bg-danger text-white" : "bg-neutral-200 text-neutral-700 dark:bg-white/10 dark:text-white")}>
+            class={"grid h-16 w-16 place-items-center rounded-full transition active:scale-90 " + (muted ? "bg-danger text-white shadow-lg" : "bg-neutral-200 text-neutral-700 dark:bg-white/10 dark:text-white")}>
             {@html iconSvg(muted ? "micOff" : "mic", "h-7 w-7")}
           </button>
           <button onclick={() => { padOpen = !padOpen; dtmf = ""; }} aria-label={t("phone.dtmf")} data-icon="dialpad"
-            class="grid h-14 w-14 place-items-center rounded-full bg-neutral-200 text-neutral-700 transition active:scale-90 dark:bg-white/10 dark:text-white">{@html iconSvg("dialpad", "h-7 w-7")}</button>
+            class="grid h-16 w-16 place-items-center rounded-full bg-neutral-200 text-neutral-700 transition active:scale-90 dark:bg-white/10 dark:text-white">{@html iconSvg("dialpad", "h-7 w-7")}</button>
         </div>
       {/if}
       <div class="mt-6">
-        <button onclick={() => void endCall()} aria-label={t("a11y.end")} data-icon="end" class="grid h-16 w-16 place-items-center rounded-full bg-danger text-white transition active:scale-90">{@html iconSvg("x", "h-7 w-7")}</button>
+        <button onclick={() => void endCall()} aria-label={t("a11y.end")} data-icon="end" class="grid h-20 w-20 place-items-center rounded-full bg-danger text-white shadow-[0_8px_24px_rgba(220,38,38,0.4)] transition active:scale-90">{@html iconSvg("x", "h-8 w-8")}</button>
       </div>
     </div>
 
 
   {:else if tab === "keys"}
     <div class="flex w-full flex-col items-center">
-      <div class="flex w-full max-w-xs items-center justify-center px-3 pb-1 pt-2">
-        <span class="block max-w-full truncate font-medium tabular-nums leading-none {num.length > 9 ? 'text-[26px] tracking-[0.02em]' : num.length > 5 ? 'text-[32px] tracking-[0.04em]' : 'text-[40px] tracking-[0.05em]'}">{num}</span>
+      <div class="flex w-full max-w-xs items-center justify-center px-4 pb-3 pt-4">
+        <span class="block max-w-full truncate font-light tabular-nums leading-none {num.length > 9 ? 'text-[32px] tracking-tight' : num.length > 5 ? 'text-[40px] tracking-tight' : 'text-5xl tracking-tight'}">{num}</span>
       </div>
       {#if dialName}
-        <div data-testid="dial-known-name" class="max-w-full truncate px-3 text-xs opacity-60">{dialName}</div>
+        <div data-testid="dial-known-name" class="max-w-full truncate px-4 text-ios-subhead text-neutral-600 dark:text-neutral-400">{dialName}</div>
       {/if}
-      <div class="grid w-full max-w-xs grid-cols-3 justify-items-center gap-x-1 gap-y-3">
+      <div class="grid w-full max-w-xs grid-cols-3 justify-items-center gap-x-3 gap-y-5 py-4">
         {#each KEYS as k (k)}
           <button onclick={() => tap(k)} aria-label={k}
-            class="grid h-[76px] w-[76px] place-items-center rounded-full bg-neutral-300/90 text-neutral-900 transition active:scale-95 dark:bg-white/10 dark:text-white">
+            class="grid h-[72px] w-[72px] place-items-center rounded-full bg-white/90 text-neutral-900 shadow-sm ring-1 ring-black/5 transition active:scale-95 active:bg-neutral-100 dark:bg-white/10 dark:text-white dark:ring-white/10 dark:active:bg-white/[0.15]">
             <span class="flex flex-col items-center leading-none">
-              <span class="text-[26px] font-light leading-none">{k}</span>
+              <span class="text-[34px] font-light leading-none">{k}</span>
               {#if SUB[k]}
-                <span class="mt-1 text-xs tracking-[0.22em] opacity-55">{SUB[k]}</span>
+                <span class="mt-1 text-[9px] font-semibold uppercase tracking-[0.3em] opacity-50">{SUB[k]}</span>
               {/if}
             </span>
           </button>
@@ -642,20 +653,20 @@
       </div>
 
 
-      <div class="mt-3 flex items-start justify-center gap-12">
+      <div class="mt-4 flex items-start justify-center gap-12">
         <div class="flex flex-col items-center gap-2">
           <button onclick={() => (num = backspace(num))} disabled={!num} aria-label={t("a11y.backspace")} data-icon="delete"
-            class="grid h-11 w-11 place-items-center rounded-full bg-neutral-300/90 text-neutral-700 transition active:scale-90 disabled:opacity-25 dark:bg-white/10 dark:text-white">{@html iconSvg("delete", "h-5 w-5")}</button>
-          <button onclick={() => (num = clearDial(num))} disabled={!num} aria-label={t("phone.clear")} class="text-xs text-accent disabled:opacity-25">{t("phone.clear")}</button>
+            class="grid h-12 w-12 place-items-center rounded-full bg-neutral-200/90 text-neutral-700 transition active:scale-95 disabled:opacity-25 dark:bg-white/10 dark:text-white">{@html iconSvg("delete", "h-5 w-5")}</button>
+          <button onclick={() => (num = clearDial(num))} disabled={!num} aria-label={t("phone.clear")} class="text-ios-body text-accent disabled:opacity-25">{t("phone.clear")}</button>
         </div>
         <button onclick={() => void startCall()} disabled={!num} aria-label={t("phone.call")} data-icon="phone"
-          class="grid h-[60px] w-[60px] place-items-center rounded-full bg-green-500 text-white shadow-[0_6px_16px_rgba(52,199,89,0.45)] transition active:scale-90 disabled:opacity-40">
+          class="grid h-[68px] w-[68px] place-items-center rounded-full bg-ios-green text-white shadow-[0_6px_24px_rgba(52,199,89,0.5)] transition active:scale-95 disabled:opacity-40 disabled:shadow-none">
           {@html iconSvg("phone", "h-7 w-7")}
         </button>
-        <div class="w-11" aria-hidden="true"></div>
+        <div class="w-12" aria-hidden="true"></div>
       </div>
       <button onclick={() => void simIncoming()} disabled={calling} aria-label={t("phone.simIncoming")}
-        class="mt-3 text-xs uppercase tracking-widest text-accent/70 transition hover:text-accent disabled:opacity-30">{t("phone.simIncoming")}</button>
+        class="mt-4 text-ios-caption1 uppercase tracking-widest text-accent/70 transition hover:text-accent disabled:opacity-30">{t("phone.simIncoming")}</button>
     </div>
 
 
@@ -690,17 +701,17 @@
         <ul class="w-full max-w-sm divide-y divide-black/5 dark:divide-white/10">
           {#each history as it, i (`${it.num}-${it.ts}-${i}`)}
             {@const missed = it.direction === "missed"}
-            <li class="flex items-center gap-2 py-2" data-testid="history-row" data-direction={it.direction ?? "unknown"}>
+            <li class="flex items-center gap-3 py-3" data-testid="history-row" data-direction={it.direction ?? "unknown"}>
               <span aria-label={dirLabel(it.direction)} title={dirLabel(it.direction)}
-                class={"grid h-7 w-7 shrink-0 place-items-center rounded-full text-sm " + (missed ? "bg-danger/15 text-danger" : "bg-black/5 opacity-70 dark:bg-white/10")}>
+                class={"grid h-9 w-9 shrink-0 place-items-center rounded-full text-ios-body font-medium " + (missed ? "bg-danger/15 text-danger" : "bg-neutral-100 opacity-70 dark:bg-white/10")}>
                 {it.direction === "outgoing" ? "↗" : it.direction === "incoming" || missed ? "↙" : "•"}
               </span>
               <div class="min-w-0 flex-1">
-                <div class={"truncate text-sm " + (missed ? "text-danger" : "")}>{it.label}</div>
+                <div class={"truncate text-ios-body font-medium " + (missed ? "text-danger" : "text-neutral-900 dark:text-white")}>{it.label}</div>
                 {#if it.label !== it.num}
-                  <div class="truncate text-xs opacity-55 tabular-nums">{it.num}{#if whenOf(it.ts)}{" · "}{whenOf(it.ts)}{/if}</div>
+                  <div class="truncate text-ios-footnote text-neutral-500 tabular-nums dark:text-neutral-400">{it.num}{#if whenOf(it.ts)}{" · "}{whenOf(it.ts)}{/if}</div>
                 {:else if whenOf(it.ts)}
-                  <div class="truncate text-xs opacity-55 tabular-nums">{whenOf(it.ts)}</div>
+                  <div class="truncate text-ios-footnote text-neutral-500 tabular-nums dark:text-neutral-400">{whenOf(it.ts)}</div>
                 {/if}
               </div>
               <div class="flex shrink-0 items-center gap-1.5">

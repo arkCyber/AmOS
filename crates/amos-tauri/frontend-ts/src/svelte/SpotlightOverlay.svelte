@@ -15,6 +15,7 @@
   import { createStoreValue } from "./store";
   import { t } from "./locale.svelte";
   import { SPOTLIGHT_WIDTH, SPOTLIGHT_HEIGHT, SPOTLIGHT_INPUT_HEIGHT } from "../lib/desktopLayout";
+  import { GLASS_SPOTLIGHT_STYLE, GLASS_BORDER_SUBTLE } from "../lib/shellChrome";
 
   // 关闭由壳决定（浮层从注册表渲染，壳传 `onclose`）——见 Launchpad.svelte 的同一处说明。
   let { onclose }: { onclose?: () => void } = $props();
@@ -147,14 +148,12 @@
     aria-label={t("desktop.spotlight")}
     tabindex="-1"
     data-testid="spotlight-overlay"
-    style="
-      width:{SPOTLIGHT_WIDTH}px;
-      max-height:{SPOTLIGHT_HEIGHT}px;
-      background:rgba(40, 40, 40, 0.92);
-      backdrop-filter:blur(30px) saturate(200%);
-      -webkit-backdrop-filter:blur(30px) saturate(200%);
-      border:1px solid rgba(255,255,255,0.08);
-    "
+  style="
+    width:{SPOTLIGHT_WIDTH}px;
+    max-height:{SPOTLIGHT_HEIGHT}px;
+    {GLASS_SPOTLIGHT_STYLE}
+    {GLASS_BORDER_SUBTLE}
+  "
   >
     <!-- 搜索输入 -->
     <div class="flex items-center gap-3 border-b border-white/10 px-5 py-4">

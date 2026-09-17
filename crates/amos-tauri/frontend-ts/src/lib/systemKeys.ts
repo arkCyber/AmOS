@@ -30,7 +30,6 @@
  */
 import {
   formatShortcut,
-  moduleForShortcut,
   modulesFor,
   shortcutMatches,
   type ShellModule,

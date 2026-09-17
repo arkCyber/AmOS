@@ -7,6 +7,16 @@
  * tolerate corrupt / partial stored data via {@link normalizeContacts}.
  */
 
+/** Custom avatar data for a contact. */
+export interface CustomAvatar {
+  /** Avatar type: base64-encoded image or file path. */
+  type: "base64" | "file";
+  /** Image data: base64 string or file path. */
+  data: string;
+  /** Optional thumbnail for list display (base64, < 10KB). */
+  thumbnail?: string;
+}
+
 /** A single address-book entry. */
 export interface Contact {
   id: string;
@@ -20,6 +30,10 @@ export interface Contact {
   fav: boolean;
   /** Last modified / created wall-clock ms. */
   ts: number;
+  /** Custom uploaded avatar (overrides emoji theme). */
+  customAvatar?: CustomAvatar;
+  /** Preferred emoji theme (used when no custom avatar). */
+  avatarTheme?: AvatarTheme;
 }
 
 /** Input accepted when creating/editing a contact. */
@@ -78,6 +92,27 @@ export function normalizeOne(
   if (name === "" || phones.length === 0) return null;
   if (used.has(id)) return null; // duplicate id
   used.add(id);
+  
+  // Normalize custom avatar if present
+  let customAvatar: CustomAvatar | undefined;
+  if (o.customAvatar && typeof o.customAvatar === "object") {
+    const avatar = o.customAvatar as Record<string, unknown>;
+    if (
+      (avatar.type === "base64" || avatar.type === "file") &&
+      typeof avatar.data === "string" &&
+      avatar.data !== ""
+    ) {
+      customAvatar = {
+        type: avatar.type,
+        data: avatar.data,
+        thumbnail:
+          typeof avatar.thumbnail === "string" && avatar.thumbnail !== ""
+            ? avatar.thumbnail
+            : undefined,
+      };
+    }
+  }
+  
   return {
     id,
     name,
@@ -85,6 +120,11 @@ export function normalizeOne(
     note: typeof o.note === "string" && o.note.trim() !== "" ? o.note.trim() : undefined,
     fav: o.fav === true,
     ts: typeof o.ts === "number" && Number.isFinite(o.ts) ? o.ts : 0,
+    customAvatar,
+    avatarTheme:
+      typeof o.avatarTheme === "string" && isAvatarTheme(o.avatarTheme)
+        ? o.avatarTheme
+        : undefined,
   };
 }
 
@@ -255,6 +295,97 @@ export function avatarHue(name: string): number {
   return sum;
 }
 
+/** Avatar theme types for contacts. */
+export type AvatarTheme = "animals" | "food" | "nature" | "symbols" | "faces" | "flags" | "sports";
+
+/** Check if a string is a valid avatar theme. */
+export function isAvatarTheme(value: string): value is AvatarTheme {
+  return value === "animals" || value === "food" || value === "nature" || value === "symbols" || value === "faces" || value === "flags" || value === "sports";
+}
+
+/** Cartoon avatar emoji pools organized by theme. */
+const AVATAR_THEMES = {
+  animals: [
+    "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨", "🐯",
+    "🦁", "🐮", "🐷", "🐸", "🐵", "🐔", "🐧", "🐦", "🐤", "🦆",
+    "🦉", "🦇", "🐺", "🐗", "🐴", "🦄", "🐝", "🐛", "🦋", "🐌",
+    "🐞", "🐢", "🐙", "🦑", "🦐", "🦀", "🐡", "🐠", "🐟", "🐬",
+    "🦈", "🐳", "🐋", "🐊", "🐆", "🐅", "🐃", "🐂", "🐄", "🦌",
+  ],
+  food: [
+    "🍎", "🍊", "🍋", "🍌", "🍉", "🍇", "🍓", "🫐", "🍈", "🍒",
+    "🍑", "🥭", "🍍", "🥥", "🥝", "🍅", "🍆", "🥑", "🥦", "🥬",
+    "🥒", "🌶️", "🫑", "🌽", "🥕", "🫒", "🧄", "🧅", "🥔", "🍠",
+    "🥐", "🥯", "🍞", "🥖", "🥨", "🧀", "🥚", "🍳", "🧈", "🥞",
+    "🧇", "🥓", "🥩", "🍗", "🍖", "🦴", "🌭", "🍔", "🍟", "🍕",
+  ],
+  nature: [
+    "🌸", "🏵️", "🌹", "🥀", "🌺", "🌻", "🌼", "🌷", "🌱", "🪴",
+    "🌲", "🌳", "🌴", "🌵", "🌾", "🌿", "☘️", "🍀", "🍁", "🍂",
+    "🍃", "🪹", "🪺", "🌍", "🌎", "🌏", "🌐", "🌑", "🌒", "🌓",
+    "🌔", "🌕", "🌖", "🌗", "🌘", "🌙", "🌚", "🌛", "🌜", "⭐",
+    "🌟", "💫", "✨", "☀️", "🌤️", "⛅", "🌥️", "☁️", "🌦️", "🌈",
+  ],
+  symbols: [
+    "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🤎", "💔",
+    "❣️", "💕", "💞", "💓", "💗", "💖", "💘", "💝", "💟", "☮️",
+    "✝️", "☪️", "🕉️", "☸️", "✡️", "🔯", "🕎", "☯️", "☦️", "🛐",
+    "⛎", "♈", "♉", "♊", "♋", "♌", "♍", "♎", "♏", "♐",
+    "♑", "♒", "♓", "🆔", "⚛️", "🉑", "☢️", "☣️", "📴", "📳",
+  ],
+  faces: [
+    "😀", "😃", "😄", "😁", "😆", "😅", "🤣", "😂", "🙂", "🙃",
+    "😉", "😊", "😇", "🥰", "😍", "🤩", "😘", "😗", "😚", "😙",
+    "😋", "😛", "😜", "🤪", "😝", "🤑", "🤗", "🤭", "🤫", "🤔",
+    "🤐", "🤨", "😐", "😑", "😶", "😏", "😒", "🙄", "😬", "🤥",
+    "😌", "😔", "😪", "🤤", "😴", "😷", "🤒", "🤕", "🤢", "🤮",
+  ],
+  flags: [
+    "🇨🇳", "🇺🇸", "🇬🇧", "🇯🇵", "🇰🇷", "🇩🇪", "🇫🇷", "🇮🇹", "🇪🇸", "🇨🇦",
+    "🇦🇺", "🇧🇷", "🇲🇽", "🇷🇺", "🇮🇳", "🇸🇬", "🇹🇭", "🇻🇳", "🇮🇩", "🇵🇭",
+    "🇲🇾", "🇳🇿", "🇿🇦", "🇦🇷", "🇨🇱", "🇨🇴", "🇵🇪", "🇻🇪", "🇪🇬", "🇸🇦",
+    "🇦🇪", "🇹🇷", "🇬🇷", "🇵🇹", "🇳🇱", "🇧🇪", "🇨🇭", "🇸🇪", "🇳🇴", "🇩🇰",
+    "🇫🇮", "🇵🇱", "🇦🇹", "🇨🇿", "🇮🇪", "🇮🇱", "🇵🇰", "🇧🇩", "🇳🇬", "🇰🇪",
+  ],
+  sports: [
+    "⚽", "🏀", "🏈", "⚾", "🥎", "🎾", "🏐", "🏉", "🥏", "🎱",
+    "🪀", "🏓", "🏸", "🏒", "🏑", "🥍", "🏏", "🪃", "🥅", "⛳",
+    "🪁", "🏹", "🎣", "🤿", "🥊", "🥋", "🎽", "🛹", "🛼", "🛷",
+    "⛸️", "🥌", "🎿", "⛷️", "🏂", "🪂", "🏋️", "🤼", "🤸", "🤺",
+    "⛹️", "🤾", "🏌️", "🏇", "🧘", "🏄", "🏊", "🤽", "🚣", "🧗",
+  ],
+} as const;
+
+/** Current active avatar theme (default: animals). */
+let currentTheme: AvatarTheme = "animals";
+
+/** Set the active avatar theme globally. */
+export function setAvatarTheme(theme: AvatarTheme): void {
+  if (theme in AVATAR_THEMES) {
+    currentTheme = theme;
+  }
+}
+
+/** Get the current avatar theme. */
+export function getAvatarTheme(): AvatarTheme {
+  return currentTheme;
+}
+
+/** Get all available theme names. */
+export function getAvatarThemes(): AvatarTheme[] {
+  return Object.keys(AVATAR_THEMES) as AvatarTheme[];
+}
+
+/** Pick a stable cartoon emoji avatar for a contact name using the current theme. */
+export function avatarEmoji(name: string, theme?: AvatarTheme): string {
+  const pool = AVATAR_THEMES[theme || currentTheme];
+  let hash = 0;
+  for (const ch of cleanName(name)) {
+    hash = ((hash << 5) - hash + ch.codePointAt(0)!) | 0;
+  }
+  return pool[Math.abs(hash) % pool.length] || "";
+}
+
 /** Split an already-sorted contact list into letter sections (pure). */
 export function groupContacts(sorted: Contact[]): { letter: string; items: Contact[] }[] {
   const out: { letter: string; items: Contact[] }[] = [];
@@ -265,5 +396,142 @@ export function groupContacts(sorted: Contact[]): { letter: string; items: Conta
     else out.push({ letter, items: [c] });
   }
   return out;
+}
+
+/* ---- Custom Avatar Upload Functions ---------------------------------------- */
+
+/**
+ * Compress an image to a target max size using Canvas API.
+ * @param imageData - Base64 data URL or Blob
+ * @param maxWidth - Maximum width/height (will maintain aspect ratio)
+ * @param quality - JPEG quality (0-1)
+ * @returns Base64 data URL of compressed image
+ */
+export async function compressImage(
+  imageData: string | Blob,
+  maxWidth: number,
+  quality: number,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    
+    img.onload = () => {
+      // Calculate dimensions (square crop from center)
+      const size = Math.min(img.width, img.height);
+      const sx = (img.width - size) / 2;
+      const sy = (img.height - size) / 2;
+      
+      // Create canvas
+      const canvas = document.createElement("canvas");
+      canvas.width = maxWidth;
+      canvas.height = maxWidth;
+      const ctx = canvas.getContext("2d");
+      
+      if (!ctx) {
+        reject(new Error("Canvas context not available"));
+        return;
+      }
+      
+      // Draw cropped and scaled image
+      ctx.drawImage(img, sx, sy, size, size, 0, 0, maxWidth, maxWidth);
+      
+      // Convert to base64
+      const compressed = canvas.toDataURL("image/jpeg", quality);
+      resolve(compressed);
+    };
+    
+    img.onerror = () => reject(new Error("Failed to load image"));
+    
+    if (typeof imageData === "string") {
+      img.src = imageData;
+    } else {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        img.src = e.target?.result as string;
+      };
+      reader.onerror = () => reject(new Error("Failed to read file"));
+      reader.readAsDataURL(imageData);
+    }
+  });
+}
+
+/**
+ * Process uploaded image: create thumbnail and full-size version.
+ * @param file - File object from file input
+ * @returns CustomAvatar object with thumbnail and data
+ */
+export async function processAvatarUpload(file: File): Promise<CustomAvatar> {
+  // Validate file type
+  if (!file.type.startsWith("image/")) {
+    throw new Error("File must be an image");
+  }
+  
+  // Validate file size (max 10MB)
+  if (file.size > 10 * 1024 * 1024) {
+    throw new Error("Image too large (max 10MB)");
+  }
+  
+  // Create data URL from file
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target?.result as string);
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+  
+  // Generate thumbnail (128x128, 80% quality, ~10KB)
+  const thumbnail = await compressImage(dataUrl, 128, 0.8);
+  
+  // Generate full-size avatar (512x512, 90% quality, ~100KB)
+  const fullSize = await compressImage(dataUrl, 512, 0.9);
+  
+  return {
+    type: "base64",
+    data: fullSize,
+    thumbnail,
+  };
+}
+
+/**
+ * Set custom avatar for a contact.
+ * @param contacts - Current contact list
+ * @param contactId - ID of contact to update
+ * @param avatar - CustomAvatar object or null to remove
+ * @returns Updated contact list
+ */
+export function setContactAvatar(
+  contacts: Contact[],
+  contactId: string,
+  avatar: CustomAvatar | null,
+): Contact[] {
+  return contacts.map((c) =>
+    c.id === contactId
+      ? { ...c, customAvatar: avatar || undefined, ts: Date.now() }
+      : c,
+  );
+}
+
+/**
+ * Get avatar source for a contact (custom or emoji).
+ * @param contact - Contact object
+ * @param forList - If true, use thumbnail for performance
+ * @returns Image source (data URL or emoji)
+ */
+export function getContactAvatarSrc(contact: Contact, forList: boolean = true): string {
+  if (contact.customAvatar) {
+    // Use thumbnail for list view, full data for detail view
+    return forList && contact.customAvatar.thumbnail
+      ? contact.customAvatar.thumbnail
+      : (contact.customAvatar.data || "");
+  }
+  // Fallback to emoji (will be rendered differently)
+  return "";
+}
+
+/**
+ * Check if contact has a custom avatar.
+ */
+export function hasCustomAvatar(contact: Contact): boolean {
+  return !!contact.customAvatar;
 }
 

@@ -45,6 +45,10 @@ export const APP_META: AppMeta[] = [
   { id: "monitor", titleKey: "app.monitor", icon: "📈" },
   { id: "devocare", titleKey: "app.devocare", icon: "🧹" },
   { id: "terminal", titleKey: "app.terminal", icon: "🖥️" },
+  { id: "webman", titleKey: "app.webman", icon: "🌐" },
+  { id: "compass", titleKey: "app.compass", icon: "🧭" },
+  { id: "measure", titleKey: "app.measure", icon: "📏" },
+  { id: "shortcuts", titleKey: "app.shortcuts", icon: "⚡" },
 ];
 
 export function appMetaById(id: string): AppMeta | undefined {

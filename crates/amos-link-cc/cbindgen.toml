@@ -1,0 +1,33 @@
+# cbindgen configuration for amos-link-cc C ABI header generation.
+
+language = "C"
+header = """/* amos-link C/C++ SDK — AmOS-Link robot middleware
+ * Pure C ABI: loadable from any C/C++ toolchain.
+ *
+ * Build:  cargo build -p amos-link-cc
+ * Header: cbindgen --config cbindgen.toml --crate amos-link-cc --output amos_link.h
+ */
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+/* Opaque types */
+typedef struct Topic Topic;
+"""
+
+no_includes = false
+usize_is_size_t = false
+
+# Tell cbindgen these re-exported types exist and what their C declarations look like.
+# The actual definitions live in amos-link's codec.rs / qos.rs with #[repr(C)].
+[export]
+include = [
+    "Timestamp",
+    "Qos",
+]
+exclude = ["Topic"]
+
+# Mark Topic as completely opaque
+[struct]
+derive_eq = false
+derive_neq = false

@@ -9,8 +9,6 @@ import {
   importConfig,
   exportConfig,
   readKeyboardConfig,
-  writeKeyboardConfig,
-  resetKeyboardConfig,
   isValidShortcut,
   mergeOverlayBindings,
 } from "../keyboardConfig";
@@ -119,9 +117,11 @@ describe("detectConflicts", () => {
     };
     const conflicts = detectConflicts(config, registry, labelKeys);
     expect(conflicts).toHaveLength(1);
-    expect(conflicts[0].shortcut).toBe("F4");
-    expect(conflicts[0].usedBy).toHaveLength(2);
-    expect(conflicts[0].usedBy.map((x) => x.id).sort()).toEqual(["launchpad", "spotlight"]);
+    const conflict = conflicts[0];
+    expect(conflict).toBeDefined();
+    expect(conflict!.shortcut).toBe("F4");
+    expect(conflict!.usedBy).toHaveLength(2);
+    expect(conflict!.usedBy.map((x) => x.id).sort()).toEqual(["launchpad", "spotlight"]);
   });
 
   test("detects conflicts in system defaults", () => {
@@ -135,7 +135,9 @@ describe("detectConflicts", () => {
       labelKeys,
     );
     expect(conflicts).toHaveLength(1);
-    expect(conflicts[0].usedBy).toHaveLength(2);
+    const conflict = conflicts[0];
+    expect(conflict).toBeDefined();
+    expect(conflict!.usedBy).toHaveLength(2);
   });
 });
 

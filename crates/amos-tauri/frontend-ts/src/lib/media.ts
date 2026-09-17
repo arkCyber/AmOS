@@ -207,3 +207,40 @@ export async function mediaLoad(item: MediaItem): Promise<Uint8Array | null> {
   const arr = await call<number[]>("media_load", { item });
   return arr === null ? null : bytesFromNumbers(arr);
 }
+
+// ---- Paging support (REQ-A316) ------------------------------------------------
+
+/** Opaque cursor for resuming a collection listing. */
+export interface MediaCursor {
+  last_id: string;
+  last_ts: number;
+}
+
+/** A page of items plus metadata for resuming. */
+export interface MediaListing {
+  items: MediaItem[];
+  /** How many items remain after this page's cursor. */
+  remaining: number;
+}
+
+/** Extract cursor from the last item in a listing (for rule 1). */
+export function cursorOf(items: readonly MediaItem[]): MediaCursor | null {
+  if (items.length === 0) return null;
+  const last = items[items.length - 1];
+  if (!last) return null;
+  return { last_id: last.id, last_ts: last.ts };
+}
+
+/** Sort comparator: newest items first (ts descending, id as tiebreaker). */
+export function newestFirst(a: MediaItem, b: MediaItem): number {
+  if (a.ts !== b.ts) return b.ts - a.ts;
+  return a.id.localeCompare(b.id);
+}
+
+/**
+ * Streaming base URL for native media (e.g., "http://localhost:3456/media/stream").
+ * Returns null offline; the caller prepends this to a URI to form a thumbnail URL.
+ */
+export async function mediaStreamBase(): Promise<string | null> {
+  return call<string>("media_stream_base");
+}

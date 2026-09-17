@@ -1,1 +1,114 @@
-[]
+[
+  {
+    "key": "common.close",
+    "reason": "Used by the shared kit.ts Close button token; Svelte components import kit.ts but the t() call is dynamic (kit.ts exports raw label strings, not t() calls), so the scanner cannot see the usage statically."
+  },
+  {
+    "key": "contacts.avatarHint",
+    "reason": "Avatar interaction hint bar — the hint bar was removed in the avatar UX refactor; the key remains for future reference and is listed in the avatar section documentation."
+  },
+  {
+    "key": "desktop.spacesHint",
+    "reason": "Spaces desktop hint text — the hint UI was not yet built in DesktopStage; reserved for future Spaces UX."
+  },
+  {
+    "key": "edit.moveEarlier",
+    "reason": "Home screen edit mode: move item earlier — the reorder UX was not yet wired in the home grid; reserved for future implementation."
+  },
+  {
+    "key": "edit.moveLater",
+    "reason": "Home screen edit mode: move item later — the reorder UX was not yet wired in the home grid; reserved for future implementation."
+  },
+  {
+    "key": "edit.remove",
+    "reason": "Home screen edit mode: remove item from home — the remove UX was not yet wired in the home grid; reserved for future implementation."
+  },
+  {
+    "key": "files.preview",
+    "reason": "File preview button label — the file preview feature was stubbed but not yet wired to a UI surface; reserved for future Files UX."
+  },
+  {
+    "key": "files.previewOpen",
+    "reason": "File preview open action — same as files.preview; reserved for future implementation."
+  },
+  {
+    "key": "files.previewClose",
+    "reason": "File preview close action — same as files.preview; reserved for future implementation."
+  },
+  {
+    "key": "files.previewFailed",
+    "reason": "File preview error message — same as files.preview; reserved for future implementation."
+  },
+  {
+    "key": "interp.endSentence",
+    "reason": "Interpreter end-sentence button label — the force-end feature was stubbed in the interpreter bridge but not yet wired to a UI button; reserved for future interpreter UX."
+  },
+  {
+    "key": "interp.endHint",
+    "reason": "Interpreter end-sentence tooltip — same as interp.endSentence."
+  },
+  {
+    "key": "interp.endNone",
+    "reason": "Interpreter end-sentence no-op message — same as interp.endSentence."
+  },
+  {
+    "key": "interp.endFailed",
+    "reason": "Interpreter end-sentence failure message — same as interp.endSentence."
+  },
+  {
+    "key": "media.loadMore",
+    "reason": "Media gallery load-more button — the cumulative paging feature (REQ-A316) is wired in mediaPaging.ts but not yet consumed by PhotosApp; reserved for when the gallery wires the pager."
+  },
+  {
+    "key": "media.showingNewest",
+    "reason": "Media gallery showing-count label — same as media.loadMore."
+  },
+  {
+    "key": "phone.dialedSimulated",
+    "reason": "Phone simulated call label — the simulated call feature was stubbed in the phone bridge but not yet wired to a UI surface; reserved for future phone UX."
+  },
+  {
+    "key": "phone.simulatedCall",
+    "reason": "Phone simulate incoming button — same as phone.dialedSimulated."
+  },
+  {
+    "key": "phone.emergencyOneTap",
+    "reason": "Phone one-tap emergency button on lock screen — the emergency one-tap feature was stubbed but not yet wired to the lock screen; reserved for future emergency UX."
+  },
+  {
+    "key": "phone.emergencyOneTapHint",
+    "reason": "Phone one-tap emergency hint — same as phone.emergencyOneTap."
+  },
+  {
+    "key": "phone.emergency.na",
+    "reason": "Phone emergency number NA (911) — the emergency dial feature was stubbed but not yet wired; reserved for future implementation."
+  },
+  {
+    "key": "phone.emergency.uk",
+    "reason": "Phone emergency number UK (112/999) — same as phone.emergency.na."
+  },
+  {
+    "key": "phone.quickSaveFailed",
+    "reason": "Phone quick save failure message — the quick-save-to-contact feature was stubbed but not yet wired; reserved for future phone UX."
+  },
+  {
+    "key": "player.streamRefused",
+    "reason": "Player streaming denied error — the streaming feature was stubbed but not yet wired; reserved for future player UX."
+  },
+  {
+    "key": "player.streaming",
+    "reason": "Player streaming indicator label — same as player.streamRefused."
+  },
+  {
+    "key": "player.streamingShort",
+    "reason": "Player streaming short indicator — same as player.streamRefused."
+  },
+  {
+    "key": "vm.exportAria",
+    "reason": "Voice memo export ARIA label — the system export feature was stubbed in the voice memo bridge but not yet wired to a UI button; reserved for future VMemo UX."
+  },
+  {
+    "key": "wm.whyNoCandidates",
+    "reason": "Window manager no-candidates message — the window manager UI was stubbed and this message was reserved for future spaces UX; the wm module is not yet wired to any UI surface."
+  }
+]

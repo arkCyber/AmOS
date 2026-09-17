@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AmOS Info.plist (P1-3) — merged with Tauri's default Info.plist at bundle time.
+
+  Every key here is documented against a real macOS feature so a future reviewer
+  can audit what the app claims to do; nothing is included "for completeness".
+
+  • LSMinimumSystemVersion  — Tauri's `macOS.minimumSystemVersion` already sets the
+    deployment target; this is a *belt-and-braces* second declaration so a reader of
+    this file alone knows what the bundle requires.
+  • NSPrincipalClass         — required entry for any Cocoa app (`NSApplication`).
+    Without it, the app launches but its event loop is not a real NSApplication, and
+    every macOS API that expects one (`requestUserAttention`, the global menu bar,
+    Dock badge) silently misbehaves.
+  • NSHighResolutionCapable  — opt in to Retina.  Defaults are off in older bundles,
+    and a non-capable app renders pixel-doubled on every Apple Silicon display.
+  • NSAppleScriptEnabled     — false.  This app does not drive AppleScript.
+  • NSHumanReadableCopyright — what the About dialog shows.  Without it the About
+    dialog renders an empty string, which is the "missing field" shape.
+  • LSApplicationCategoryType — Productivity.  Without a category the Dock context
+    menu shows nothing under "Open With"; setting it lets macOS group us correctly
+    and stops Launchpad from classifying us as "Other".
+  • NSAppTransportSecurity  — keep the macOS defaults (HTTPS required).  Tauri only
+    hits loopback (`http://localhost:*`); no `NSAllowsArbitraryLoads` is opened.
+  • CFBundleURLTypes (amos-app) — declares our custom `amos-app://` scheme so the
+    WebView can serve the App Store entry URLs without a "you opened an unknown
+    protocol" dialog.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Amos</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.amos.ai</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Amos</string>
+    <key>CFBundleDisplayName</key>
+    <string>Amos</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+
+    <!-- Minimum macOS the bundle will launch on.  Tauri also pins this in
+         tauri.conf.json's `bundle.macOS.minimumSystemVersion`; declaring it here
+         makes a stand-alone read of the plist self-contained. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+
+    <!-- Required for the Cocoa event loop (NSApplication).  Without this, Dock
+         badge + global menu + requestUserAttention all misbehave silently. -->
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <!-- Opt in to Retina rendering (Apple Silicon / Retina displays). -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- We do not expose AppleScript; this prevents the system from enabling it. -->
+    <key>NSAppleScriptEnabled</key>
+    <false/>
+
+    <!-- Shown in the About dialog. -->
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 ArkCyber. All rights reserved.</string>
+
+    <!-- Used by Launchpad and Finder's "Open With" → "Get Info" dialog. -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+
+    <!-- Custom URL scheme so the WebView can serve `amos-app://...` entries
+         from the App Store without the system asking the user to confirm. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.amos.ai.app</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>amos-app</string>
+            </array>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+        </dict>
+    </array>
+
+    <!-- Default ATS: no arbitrary loads.  Tauri only ever talks to
+         loopback (the IPC bridge at http://ipc.localhost); the system defaults
+         cover that without weakening the rest of the policy. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

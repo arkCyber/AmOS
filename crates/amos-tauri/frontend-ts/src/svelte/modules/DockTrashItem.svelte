@@ -16,12 +16,13 @@
    */
   import { t } from "../locale.svelte";
   import DockTileButton from "./DockTileButton.svelte";
+  import IconTrash from "../../assets/icons/IconTrash.svelte";
 </script>
 
 <DockTileButton
   label={t("desktop.trashUnavailable")}
   testId="dock-trash"
-  glyph="🗑️"
+  icon={IconTrash}
   onclick={() => {}}
   disabled={true}
 />

@@ -4,20 +4,20 @@
  * consistent across every page of the refactored Settings screen.
  */
 export const GROUP =
-  "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
-export const ROW = "flex items-center justify-between gap-3 px-4 py-3";
+  "overflow-hidden rounded-ios-card bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
+export const ROW = "flex items-center justify-between gap-3 px-4 py-3 min-h-[44px]";
 export const ROW_ACTIVE =
-  "flex items-center justify-between gap-3 px-4 py-3 text-left w-full";
-export const LABEL = "text-[15px] text-neutral-800 dark:text-neutral-100";
-export const VALUE = "text-[15px] opacity-50";
+  "flex items-center justify-between gap-3 px-4 py-3 min-h-[44px] text-left w-full";
+export const LABEL = "text-ios-body text-neutral-800 dark:text-neutral-100";
+export const VALUE = "text-ios-body text-neutral-600 dark:text-neutral-400";
 export const SUB = "h-px bg-black/5 dark:bg-white/10";
-export const FIELD = "w-full rounded-lg bg-black/5 px-2.5 py-1.5 text-sm outline-none dark:bg-white/10";
-export const CHEVRON = "opacity-30";
+export const FIELD = "w-full rounded-ios-input bg-black/5 px-3.5 py-2.5 text-ios-body outline-none dark:bg-white/10";
+export const CHEVRON = "text-neutral-400 dark:text-neutral-500";
 export const H1 =
-  "px-1 text-[28px] font-bold tracking-tight text-neutral-900 dark:text-neutral-50";
+  "px-1 text-ios-large-title tracking-tight text-neutral-900 dark:text-neutral-50";
 export const H2 =
-  "text-[15px] font-semibold text-neutral-900 dark:text-neutral-50";
-export const HINT = "text-xs opacity-60";
+  "text-ios-subhead font-semibold text-neutral-900 dark:text-neutral-50";
+export const HINT = "text-ios-footnote text-neutral-600 dark:text-neutral-400";
 
 /**
  * Unique id for one label↔control pair (REQ-A283).

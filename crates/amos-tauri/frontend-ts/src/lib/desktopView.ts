@@ -33,7 +33,7 @@ export const DESKTOP_VIEW_KEY = "amos.settings.view";
 export const DEFAULT_DESKTOP_VIEW: DesktopView = {
   showWallpaper: true,
   showIcons: true,
-  showStageWidgets: true,
+  showStageWidgets: false, // macOS桌面不在右上角显示时钟，时间显示在顶栏
 };
 
 /** What a single View-menu row toggles. */

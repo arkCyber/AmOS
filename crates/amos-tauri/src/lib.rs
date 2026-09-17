@@ -12,6 +12,10 @@
 )]
 
 pub mod ai_bridge;
+pub mod airplay;
+#[cfg(test)]
+#[path = "airplay_tests.rs"]
+mod airplay_tests;
 pub mod alarm_sched;
 #[cfg(feature = "android")]
 pub mod android_glue;
@@ -138,6 +142,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(AiBridge::new())
+        .manage(airplay::AirPlayState::new())
         .manage(assistant_voice::VoiceSession::new())
         .manage(assistant_voice::DeviceMic::new())
         .manage(WmState::new())
@@ -395,6 +400,16 @@ pub fn run() {
             linux_apps::linux_apps,
             #[cfg(desktop)]
             linux_apps::linux_launch,
+            airplay::airplay_available,
+            airplay::airplay_discover,
+            airplay::airplay_stop_discovery,
+            airplay::airplay_get_devices,
+            airplay::airplay_get_status,
+            airplay::airplay_connect,
+            airplay::airplay_disconnect,
+            airplay::airplay_start_stream,
+            airplay::airplay_stop_stream,
+            airplay::airplay_set_volume,
         ])
         .on_window_event(|window, event| {
             // Keep the layout model's screen equal to the **real** window area.

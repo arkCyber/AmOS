@@ -13,6 +13,7 @@
   import { invoke } from "../../lib/backend";
   import { t } from "../locale.svelte";
   import DockTileButton from "./DockTileButton.svelte";
+  import IconFinder from "../../assets/icons/IconFinder.svelte";
 
   /** `wm_open` = create + focus; a failure is recorded in the diagnostics ledger by
    * `lib/backend` and needs no handler here. */
@@ -24,6 +25,6 @@
 <DockTileButton
   label={t("desktop.finder")}
   testId="dock-finder"
-  glyph="💻"
+  icon={IconFinder}
   onclick={openFinder}
 />

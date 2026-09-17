@@ -19,6 +19,7 @@
   import { LAYOUT_KEY, type HomeLayout, getLayout, saveLayout } from "../lib/amosStore";
   import { withoutPhone } from "../lib/phoneApps";
   import { launchpadCols, launchpadRows, LAUNCHPAD_COLS_DEFAULT, LAUNCHPAD_ROWS_DEFAULT, LAUNCHPAD_ICON_SIZE, LAUNCHPAD_ICON_GAP } from "../lib/desktopLayout";
+  import { GLASS_LAUNCHPAD_STYLE } from "../lib/shellChrome";
   import { t } from "./locale.svelte";
   import { wmLayoutSnapshot } from "../lib/wm";
   import { createStoreValue } from "./store";
@@ -172,11 +173,7 @@
 <div
   class="pointer-events-none fixed inset-0 z-50 flex flex-col overflow-hidden"
   data-testid="launchpad-overlay"
-  style="
-    background: rgba(15, 15, 15, 0.92);
-    backdrop-filter: blur(40px) saturate(200%);
-    -webkit-backdrop-filter: blur(40px) saturate(200%);
-  "
+  style={GLASS_LAUNCHPAD_STYLE}
 >
   <!-- 点击空白区域关闭（pointer-events-auto 的子元素除外） -->
   <div

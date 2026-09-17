@@ -15,6 +15,7 @@
   import { t } from "./locale.svelte";
   import { attachFocusTrap } from "../lib/focusTrap";
   import { listSpaces, activeSpace, switchSpace, type Space } from "../lib/spaces";
+  import { GLASS_MISSION_CONTROL_STYLE } from "../lib/shellChrome";
 
   // 关闭由壳决定（浮层从注册表渲染，壳传 `onclose`）——见 Launchpad.svelte 的同一处说明。
   let { onclose }: { onclose?: () => void } = $props();
@@ -158,13 +159,7 @@
   aria-label={t("desktop.missionControl")}
   tabindex="-1"
   data-testid="mission-control"
-  style="
-    background: rgba(20, 20, 20, 0.88);
-    backdrop-filter: blur(24px) saturate(200%);
-    -webkit-backdrop-filter: blur(24px) saturate(200%);
-    height: 280px;
-    border-top: 1px solid rgba(255,255,255,0.1);
-  "
+  style="{GLASS_MISSION_CONTROL_STYLE} height: 280px; border-top: 1px solid rgba(255,255,255,0.1);"
 >
   <!-- 点击空白区域关闭 -->
   <div

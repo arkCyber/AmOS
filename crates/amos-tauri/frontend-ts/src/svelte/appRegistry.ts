@@ -47,6 +47,10 @@ const ALL_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   magnifier: () => import("./MagnifierApp.svelte"),
   monitor: () => import("./MonitorApp.svelte"),
   devocare: () => import("./DeviceCareApp.svelte"),
+  webman: () => import("./WebManApp.svelte"),
+  compass: () => import("./CompassApp.svelte"),
+  measure: () => import("./MeasureApp.svelte"),
+  shortcuts: () => import("./ShortcutsApp.svelte"),
 };
 
 /**

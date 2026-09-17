@@ -64,6 +64,8 @@
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
   import { messagesChannel } from "./appLinks";
+  import { emitDockBounce } from "../lib/dockConfig";
+  import { surface } from "./shellState.svelte";
 
   // Demo seed — **only when the key is absent**: a user who deleted every thread keeps
   // an empty inbox (the seed is a first-run affordance, not a recurring fixture).
@@ -434,7 +436,14 @@
     if (smsMode !== "real") return;
     let un: (() => void) | null = null;
     let cancelled = false;
-    void subscribe(SMS_RECEIVED_EVENT, () => refreshReal()).then((u) => {
+    void subscribe(SMS_RECEIVED_EVENT, () => {
+      refreshReal();
+      // P4: 收到新消息时触发 Dock 弹跳（仅在应用未激活时）
+      const s = surface();
+      if (s.kind !== "app" || s.id !== "messages") {
+        emitDockBounce("messages");
+      }
+    }).then((u) => {
       if (cancelled) u();
       else un = u;
     });
@@ -719,15 +728,15 @@
         <p class="py-10 text-center text-sm opacity-60">{t("message.empty")}</p>
       {:else}
         {#each realMsgs as m, i (m.id + "-" + i)}
-          <div role="group" class={"group flex items-start gap-1.5 max-w-[86%] " + (m.from_me ? "ml-auto" : "")}>
-            <div class={"rounded-2xl px-3 py-2 text-sm " + (m.from_me ? "bg-accent text-white" : "bg-neutral-300 text-neutral-900 dark:bg-neutral-700 dark:text-white")}>
+          <div role="group" class={"group flex items-start gap-1.5 max-w-[80%] " + (m.from_me ? "ml-auto" : "")}>
+            <div class={"rounded-ios-bubble px-4 py-2.5 text-ios-body leading-relaxed shadow-sm " + (m.from_me ? "bg-accent text-white" : "bg-ios-lightGray text-neutral-900 dark:bg-ios-darkGray dark:text-white")}>
               <div class="whitespace-pre-wrap">{m.text}</div>
-              <div class="mt-0.5 text-right text-xs tabular-nums opacity-60">{fmtBubbleTime(m.ts_ms)}</div>
+              <div class="mt-1.5 text-right text-ios-caption1 tabular-nums opacity-70">{fmtBubbleTime(m.ts_ms)}</div>
             </div>
             <!-- Hide this message from AmOS (view-layer trash, REQ-A42): the
                  text stays in the platform store; the panel explains that. -->
             <button onclick={() => void trashOne(m)} disabled={trashBusy} aria-label={t("message.trash")} title={t("message.trash")} data-testid={`trash-msg-btn-${m.id}`}
-              class="mt-1 shrink-0 rounded-full px-1 text-xs opacity-0 transition-opacity group-hover:opacity-60 disabled:opacity-40">{@html iconSvg("trash", "h-3.5 w-3.5")}</button>
+              class="mt-1 shrink-0 rounded-full px-1 text-xs opacity-0 pointer-events-none transition-opacity group-hover:opacity-60 group-hover:pointer-events-auto group-focus-within:opacity-60 group-focus-within:pointer-events-auto disabled:opacity-40">{@html iconSvg("trash", "h-3.5 w-3.5")}</button>
           </div>
         {/each}
       {/if}
@@ -736,8 +745,8 @@
       <p class="mt-1 text-xs text-red-500" role="alert">{realErr}</p>
     {/if}
     <div class="mt-2 flex items-center gap-2 pb-1">
-      <input bind:value={realText} onkeydown={(e) => e.key === "Enter" && sendReal()} placeholder={t("message.placeholder", { name: activeRealName })} data-testid="real-message-input" aria-label={t("message.placeholder", { name: activeRealName })} class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
-      <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label={t("message.send")} data-icon="send" class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
+      <input bind:value={realText} onkeydown={(e) => e.key === "Enter" && sendReal()} placeholder={t("message.placeholder", { name: activeRealName })} data-testid="real-message-input" aria-label={t("message.placeholder", { name: activeRealName })} class="min-w-0 flex-1 rounded-ios-bubble bg-neutral-100 px-4 py-2.5 text-ios-body outline-none dark:bg-white/10" />
+      <button onclick={sendReal} title={t("message.placeholder", { name: activeRealName })} aria-label={t("message.send")} data-icon="send" class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-white shadow-sm transition active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
     </div>
     {/if}
   {:else}
@@ -775,18 +784,18 @@
         {#each msgs as m, i (m.ts + "-" + i)}
           {@const prev = msgs[i - 1]}
           {#if !prev || isNewDay(prev.ts, m.ts)}
-            <p class="py-1 text-center text-xs uppercase tracking-wider text-neutral-500 dark:text-neutral-400">{dayLabelOf(m.ts)}</p>
+            <p class="py-2 text-center text-ios-caption1 font-medium uppercase tracking-wider text-neutral-500 dark:text-neutral-400">{dayLabelOf(m.ts)}</p>
           {/if}
-          <div role="group" class={"group flex items-start gap-1.5 max-w-[86%] " + (m.from === "me" ? "ml-auto" : "")} ontouchstart={(e) => onSwipeStart(e, i)} ontouchend={onSwipeEnd}>
-            <div class={"rounded-2xl px-3 py-2 text-sm " + (m.from === "me" ? "bg-accent text-white" : "bg-neutral-300 text-neutral-900 dark:bg-neutral-700 dark:text-white")}>
+          <div role="group" class={"group flex items-start gap-1.5 max-w-[75%] " + (m.from === "me" ? "ml-auto" : "")} ontouchstart={(e) => onSwipeStart(e, i)} ontouchend={onSwipeEnd}>
+            <div class={"rounded-ios-bubble px-3.5 py-2.5 text-ios-body shadow-sm " + (m.from === "me" ? "bg-accent text-white" : "bg-ios-lightGray text-neutral-900 dark:bg-ios-darkGray dark:text-white")}>
               {#if m.quote}
-                <div class="mb-1 rounded-md bg-white/10 px-1.5 py-0.5 text-xs opacity-70"><span class="inline-flex">{@html iconSvg("reply", "h-3 w-3")}</span> {m.quote}</div>
+                <div class="mb-1.5 rounded-md bg-white/10 px-2 py-1 text-ios-footnote opacity-70"><span class="inline-flex">{@html iconSvg("reply", "h-3 w-3")}</span> {m.quote}</div>
               {/if}
-              <div class="whitespace-pre-wrap">{m.text}</div>
-              <div class="mt-0.5 text-right text-xs tabular-nums opacity-60">{fmtBubbleTime(m.ts)}</div>
+              <div class="whitespace-pre-wrap leading-snug">{m.text}</div>
+              <div class="mt-1 text-right text-ios-caption1 tabular-nums opacity-60">{fmtBubbleTime(m.ts)}</div>
             </div>
-            <button onclick={() => (replyTo = m.text)} aria-label={t("message.reply")} data-icon="reply" class="mt-1 shrink-0 rounded-full px-1 text-xs opacity-0 transition-opacity group-hover:opacity-60">{@html iconSvg("reply", "h-4 w-4")}</button>
-            <button onclick={() => setMsgs(removeMessageAt(msgs, i))} aria-label={t("message.remove")} data-icon="x" class="mt-1 shrink-0 rounded-full px-1 text-xs opacity-0 transition-opacity group-hover:opacity-60">{@html iconSvg("x", "h-3 w-3")}</button>
+            <button onclick={() => (replyTo = m.text)} aria-label={t("message.reply")} data-icon="reply" class="mt-1 shrink-0 rounded-full px-1 text-xs opacity-0 pointer-events-none transition-opacity group-hover:opacity-60 group-hover:pointer-events-auto group-focus-within:opacity-60 group-focus-within:pointer-events-auto">{@html iconSvg("reply", "h-4 w-4")}</button>
+            <button onclick={() => setMsgs(removeMessageAt(msgs, i))} aria-label={t("message.remove")} data-icon="x" class="mt-1 shrink-0 rounded-full px-1 text-xs opacity-0 pointer-events-none transition-opacity group-hover:opacity-60 group-hover:pointer-events-auto group-focus-within:opacity-60 group-focus-within:pointer-events-auto">{@html iconSvg("x", "h-3 w-3")}</button>
           </div>
         {/each}
       {/if}
@@ -798,8 +807,8 @@
       </div>
     {/if}
     <div class="mt-2 flex items-center gap-2 pb-1">
-      <input bind:value={text} onkeydown={(e) => e.key === "Enter" && send()} placeholder={t("message.placeholder", { name: active.name })} data-testid="message-input" aria-label={t("message.placeholder", { name: active.name })} class="min-w-0 flex-1 rounded-full bg-black/5 px-3.5 py-2 text-sm outline-none dark:bg-white/10" />
-      <button onclick={send} title={t("message.placeholder", { name: active.name })} aria-label={t("message.send")} data-icon="send" class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-white active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
+      <input bind:value={text} onkeydown={(e) => e.key === "Enter" && send()} placeholder={t("message.placeholder", { name: active.name })} data-testid="message-input" aria-label={t("message.placeholder", { name: active.name })} class="min-w-0 flex-1 rounded-ios-bubble bg-neutral-100 px-4 py-2.5 text-ios-body outline-none dark:bg-white/10" />
+      <button onclick={send} title={t("message.placeholder", { name: active.name })} aria-label={t("message.send")} data-icon="send" class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-white shadow-sm transition active:scale-90">{@html iconSvg("send", "h-[18px] w-[18px]")}</button>
     </div>
   {:else}
     <p class="py-16 text-center text-sm opacity-60">{t("message.noThreads")}</p>

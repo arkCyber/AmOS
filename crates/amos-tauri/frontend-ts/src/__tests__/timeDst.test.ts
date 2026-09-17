@@ -12,7 +12,7 @@
  * what makes them discriminating rather than decorative — the old alarm tests never crossed a
  * transition and were byte-equivalent before and after the fix.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { addLocalDays, nextAlarmAtMs } from "../lib/time";
 import { dayStamp } from "../lib/messages";
 

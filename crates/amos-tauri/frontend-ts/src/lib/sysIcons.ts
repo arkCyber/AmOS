@@ -19,6 +19,7 @@ export type SysIconName =
   | "wifi"
   | "bluetooth"
   | "airplane"
+  | "airplay"
   | "moon"
   | "mutedBell"
   | "flashlight"
@@ -55,7 +56,8 @@ export type SysIconName =
   | "volume"
   | "volumeX"
   | "maximize"
-  | "film";
+  | "film"
+  | "plus";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -81,6 +83,8 @@ export function quickIcon(key: string): SysIconName {
       return "wifi";
     case "bluetooth":
       return "bluetooth";
+    case "airplay":
+      return "airplay";
     case "darkmode":
       return "appearance";
     case "dnd":
@@ -110,6 +114,9 @@ const INNER: Record<SysIconName, string> = {
   bluetooth: '<path d="m7 7 10 10-5 5V2l5 5L7 17"/>',
   airplane:
     '<path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/>',
+  airplay:
+    '<path d="M5 17H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-1"/>' +
+    '<path d="m12 15 5 6H7Z" fill="currentColor" stroke="none"/>',
   moon: '<path d="M12 3a6 6 0 1 0 9 9 9 9 0 0 1-9-9Z"/>',
   mutedBell:
     '<path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/>' +
@@ -223,6 +230,7 @@ const INNER: Record<SysIconName, string> = {
   film:
     '<rect x="2" y="3" width="20" height="18" rx="2"/>' +
     '<path d="M7 3v18M17 3v18M2 9h5M2 15h5M17 9h5M17 15h5"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
 };
 
 /** Render a named icon as an SVG markup string. */

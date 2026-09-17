@@ -150,6 +150,19 @@ export function openSettingsSearch(query: string): void {
   open("settings");
 }
 
+/**
+ * openApp - 打开应用并导航到指定页面
+ * @param appId - 应用 ID (如 "settings")
+ * @param page - 页面标识符 (如 "dock", "wifi", "bluetooth")
+ */
+export function openApp(appId: string, page?: string): void {
+  if (appId === "settings" && page) {
+    // 使用特殊的 query 格式 "#page" 来触发直接页面导航
+    settingsChannel().set({ query: `#${page}`, nonce: Date.now() });
+  }
+  open(appId);
+}
+
 /** Props-channel name of the Phone screen (shared contract with PhoneApp). */
 export const PHONE_CHANNEL = "phone";
 

@@ -16,12 +16,14 @@
   import { DOCK_ITEM_TILE } from "../../lib/shellChrome";
   import { DOCK_ICON_SIZE } from "../../lib/desktopLayout";
   import type { ShortcutHint } from "../../lib/shellModule";
+  import type { Component } from "svelte";
 
   let {
     /** Accessible name + tooltip — always `t(...)`, never a literal. */
     label,
     testId,
-    glyph,
+    glyph = undefined,
+    icon = undefined,
     onclick,
     /** `true` for a dock item the shell cannot deliver yet (the Trash): greyed and
      * named with the reason, never a tile that soaks up a click (FMEA F-SH-001). */
@@ -32,7 +34,8 @@
   }: {
     label: string;
     testId: string;
-    glyph: string;
+    glyph?: string;
+    icon?: Component;
     onclick: () => void;
     disabled?: boolean;
     shortcut?: ShortcutHint | null;
@@ -43,8 +46,8 @@
   type="button"
   class="{DOCK_ITEM_TILE} {disabled ? 'opacity-40 active:scale-100' : ''}"
   style="
-    width:{DOCK_ICON_SIZE}px;
-    height:{DOCK_ICON_SIZE}px;
+    width:var(--dock-icon-size, {DOCK_ICON_SIZE}px);
+    height:var(--dock-icon-size, {DOCK_ICON_SIZE}px);
     font-size:32px;
     border: 1px solid rgba(255,255,255,0.1);
   "
@@ -55,4 +58,13 @@
   {disabled}
   aria-disabled={disabled ? "true" : undefined}
   {onclick}
->{glyph}</button>
+>
+  {#if icon}
+    {@const Icon = icon}
+    <div class="w-full h-full p-1">
+      <Icon />
+    </div>
+  {:else if glyph}
+    {glyph}
+  {/if}
+</button>

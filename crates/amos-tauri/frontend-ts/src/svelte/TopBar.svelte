@@ -23,6 +23,7 @@
   import { t } from "./locale.svelte";
   import { modulesFor } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
+  import { GLASS_TOPBAR_STYLE, GLASS_BORDER_SUBTLE } from "../lib/shellChrome";
 
   /** Both slots, in registry order (`lib/shellModule.ts` sorts them). */
   const leftModules = modulesFor("topbar-left", SHELL_MODULES);
@@ -31,19 +32,14 @@
 
 <!--
   macOS 顶栏：
-  - 高度 40px（28 内容 + 12 刘海区占位）
+  - 高度 24px（macOS 标准，无刘海设备）
   - 毛玻璃背景（backdrop-filter: blur）
   - 字体：SF Pro（-apple-system fallback）
 -->
 <div
   aria-label={t("desktop.topbar")}
-  class="relative flex h-10 w-full select-none items-center justify-between px-4"
-  style="
-    background: rgba(30, 30, 30, 0.72);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
-    border-bottom: 1px solid rgba(255,255,255,0.08);
-  "
+  class="relative flex h-6 w-full select-none items-center justify-between px-4"
+  style="{GLASS_TOPBAR_STYLE} {GLASS_BORDER_SUBTLE} border-bottom: 1px solid rgba(255,255,255,0.08);"
 >
   <!-- 左侧槽位：Apple 菜单 / 当前 app 名 / 主菜单（注册表里的三个挂件） -->
   <div class="flex items-center gap-4" data-testid="topbar-left-slot">

@@ -172,10 +172,10 @@
             aria-label={k}
             data-icon={confirm ? "check" : back ? "delete" : undefined}
             class={
-              "grid h-[72px] w-[72px] place-items-center rounded-full text-2xl ring-1 transition active:scale-90 " +
+              "grid h-[72px] w-[72px] place-items-center rounded-full text-2xl font-light transition active:scale-95 " +
               (confirm
-                ? "bg-green-500 text-white ring-green-400 active:bg-green-400"
-                : "bg-white/10 text-white ring-white/25 backdrop-blur active:bg-white/25")
+                ? "bg-ios-green text-white shadow-lg active:opacity-90"
+                : "bg-white/15 text-white backdrop-blur-md ring-1 ring-white/30 active:bg-white/25")
             }
           >
             {#if confirm}
@@ -198,7 +198,7 @@
     <button
       onclick={() => void dialEmergency()}
       disabled={emergency}
-      class="mt-10 rounded-full bg-danger/20 px-8 py-3 text-base font-medium text-red-200 ring-1 ring-red-400/40 transition active:bg-danger/30 disabled:opacity-60"
+      class="mt-10 rounded-full bg-danger/20 px-8 py-3 text-ios-body font-medium text-white ring-1 ring-danger/40 backdrop-blur-md transition active:scale-95 active:bg-danger/30 disabled:opacity-60"
       aria-label={t("shell.emergency", { num: EMERGENCY_QUICK_NUMBER })}
     >
       {emergency

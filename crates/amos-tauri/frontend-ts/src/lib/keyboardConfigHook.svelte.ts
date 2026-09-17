@@ -12,14 +12,12 @@
  *   // bindings.system - 合并后的系统快捷键
  *   // bindings.spaces - 合并后的 Spaces 快捷键
  */
-import { onMount, onDestroy } from "svelte";
 import { SHELL_MODULES } from "../svelte/shellModules";
 import { modulesFor, formatShortcut, type ShellShortcut } from "./shellModule";
 import {
   readKeyboardConfig,
   type KeyboardConfig,
 } from "./keyboardConfig";
-import { STORE_CHANGED_EVENT } from "./amosStore";
 
 /** 配置存储键名（用于监听）。 */
 export const KEYBOARD_CONFIG_KEY = "amos.keyboard.config";
@@ -66,7 +64,6 @@ let globalRefresh: (() => void) | null = null;
  */
 export function createKeyboardBindings() {
   let bindings = $state<ResolvedBindings>(resolveBindings(readKeyboardConfig()));
-  let storageListener: (() => void) | null = null;
 
   function resolveBindings(config: KeyboardConfig): ResolvedBindings {
     // ─── 浮层快捷键 ─────────────────────────────────────────────────────
@@ -76,7 +73,7 @@ export function createKeyboardBindings() {
       const custom = config.overlays[m.id];
       if (custom === undefined) {
         // 使用默认值
-        overlays.set(m.id, m.shortcuts);
+        overlays.set(m.id, [...m.shortcuts]);
       } else if (custom === null) {
         // 被禁用，不添加到绑定
       } else {
@@ -216,7 +213,7 @@ function resolveBindings(config: KeyboardConfig): ResolvedBindings {
     if (!m.shortcuts) continue;
     const custom = config.overlays[m.id];
     if (custom === undefined) {
-      overlays.set(m.id, m.shortcuts);
+      overlays.set(m.id, [...m.shortcuts]);
     } else if (custom !== null) {
       overlays.set(m.id, custom);
     }

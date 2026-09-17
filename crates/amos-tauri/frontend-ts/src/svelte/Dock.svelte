@@ -10,9 +10,17 @@
   //
   // 挂件（modules/Dock*Item.svelte）自带名字与动作；它们通过 getContext 拿到壳注入的
   // `SHELL_CHROME_API` 把手（`openLaunchpad`），拿不到 shellState、布局快照或别的挂件。
+
+  // ─── P2 高级功能 ───────────────────────────────────────────────────────────
+  // - Bounce 动画（通知弹跳）
+  // - 自动隐藏（全屏模式）
+  // - 位置切换（底部/左侧/右侧）
   import { appIcon, appTitleKey, APP_META } from "../lib/appMeta";
   import { bridgeDiag, invoke } from "../lib/backend";
-  import { getLayout } from "../lib/amosStore";
+  import { getLayout, readStoreValue } from "../lib/amosStore";
+  import { DOCK_PREFS_KEY, normalizeDockPrefs, DEFAULT_DOCK_PREFS } from "../lib/dockPrefs";
+  import type { DockPrefs } from "../lib/dockPrefs";
+  import { onMount } from "svelte";
   import { withoutPhone } from "../lib/phoneApps";
   import { isDesktopFeatureEnabled } from "../lib/desktopFeatures";
   import { t } from "./locale.svelte";
@@ -20,7 +28,6 @@
   import { SHELL_MODULES } from "./shellModules";
   import {
     DOCK_HEIGHT,
-    DOCK_ICON_SIZE,
     DOCK_MIN_WIDTH,
     dockCapacity,
     dockOverflowCount,
@@ -32,9 +39,91 @@
     DOCK_RUNNING_DOT,
     DOCK_RUNNING_DOT_SLOT,
     DOCK_SEPARATOR,
+    GLASS_DOCK_STYLE,
+    GLASS_BORDER_DOCK,
   } from "../lib/shellChrome";
+  import {
+    dockPositionClass,
+    isFullscreen,
+    onDockBounce,
+  } from "../lib/dockConfig";
   import DockAppItem from "./modules/DockAppItem.svelte";
   import DockContextMenu from "./modules/DockContextMenu.svelte";
+  import DockGlobalContextMenu from "./modules/DockGlobalContextMenu.svelte";
+  import { writeStoreValueChecked } from "../lib/amosStore";
+  import type { DockPosition } from "../lib/dockPrefs";
+  import { openApp } from "./appLinks";
+
+  // ─── P4: 读取用户偏好 ────────────────────────────────────────────────────
+  let prefs = $state<DockPrefs>({ ...DEFAULT_DOCK_PREFS });
+  onMount(() => {
+    const raw = readStoreValue<unknown>(DOCK_PREFS_KEY, {});
+    prefs = normalizeDockPrefs(raw);
+  });
+
+  // ─── P2: Dock 位置配置 ────────────────────────────────────────────────────
+  // 现在从用户偏好读取
+  const dockPosition = $derived(prefs.position);
+  const autoHideEnabled = $derived(prefs.autoHide);
+  
+  // ─── P4: 放大倍数和图标大小配置 ───────────────────────────────────────────
+  const userMagnification = $derived(prefs.magnification);
+  const userIconSize = $derived(prefs.iconSize);
+
+  // ─── P2: 自动隐藏功能 ────────────────────────────────────────────────────
+  let autoHide = $state(false);
+  let dockVisible = $state(true);
+  let hideTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // 监听全屏模式变化 + 用户偏好
+  $effect(() => {
+    const checkFullscreen = () => {
+      const wasFullscreen = autoHide;
+      // 自动隐藏 = 用户启用 && (全屏模式 || 用户偏好始终隐藏)
+      autoHide = autoHideEnabled && isFullscreen();
+      // 全屏时隐藏 Dock
+      if (autoHide && !wasFullscreen) {
+        dockVisible = false;
+      }
+    };
+    document.addEventListener("fullscreenchange", checkFullscreen);
+    checkFullscreen(); // 初始化检查
+    return () => document.removeEventListener("fullscreenchange", checkFullscreen);
+  });
+
+  // 鼠标移近时显示 Dock（自动隐藏功能）
+  function onMouseNearDock(e: MouseEvent) {
+    // 同时更新 mouseX 以维持放大镜效果
+    mouseX = e.clientX;
+    if (!autoHide) return;
+    const threshold = 80; // 底部 80px 范围内显示
+    if (e.clientY > window.innerHeight - threshold) {
+      dockVisible = true;
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = null;
+      }
+      // 3秒后重新隐藏
+      hideTimer = setTimeout(() => {
+        if (autoHide) dockVisible = false;
+      }, 3000);
+    }
+  }
+
+  // ─── P2: Bounce 动画状态 ─────────────────────────────────────────────────
+  let bouncingAppId = $state<string | null>(null);
+
+  // 订阅 bounce 事件
+  $effect(() => {
+    const cleanup = onDockBounce("*", (eventAppId) => {
+      // 通配符订阅：接收任何 app 的 bounce 事件
+      bouncingAppId = eventAppId;
+      setTimeout(() => {
+        if (bouncingAppId === eventAppId) bouncingAppId = null;
+      }, 600);
+    });
+    return cleanup;
+  });
 
   // ─── Home Layout（哪些 app 进 Dock）────────────────────────────────────────
   // 桌面形态下，home layout 的 dock 项就是 Dock 栏显示的内容。
@@ -139,14 +228,12 @@
   }
 
   // ─── 放大镜效果 ────────────────────────────────────────────────────────────
-  // 鼠标 X 坐标（视口坐标）
+  // 鼠标 X 坐标（视口坐标）—— 放大镜 + 自动隐藏共用 `onMouseNearDock`，
+  // 在那里一并更新 `mouseX`。先前 `onMouseMove` 与 `onMouseNearDock` 两个处理器
+  // 各自更新自己的状态，会因为覆盖顺序产生闪烁（自动隐藏处理器先到、放大镜丢一帧）。
   let mouseX = $state(0);
   // Dock 容器 ref
   let dockEl = $state<HTMLElement | null>(null);
-
-  function onMouseMove(e: MouseEvent) {
-    mouseX = e.clientX;
-  }
 
   // 每个图标的 scale：判定复用 `lib/desktopLayout::dockIconScale`（已单测的纯函数），
   // 位置则**实测**——`data-dock-item` 包裹层不带 transform，所以量到的中心是布局中心，
@@ -163,7 +250,8 @@
       const id = item.dataset.dockItem;
       if (!id) continue;
       const rect = item.getBoundingClientRect();
-      scales.set(id, dockIconScale(mouseX, rect.left + rect.width / 2));
+      // P4: 使用用户配置的放大倍数
+      scales.set(id, dockIconScale(mouseX, rect.left + rect.width / 2, userMagnification));
     }
     return scales;
   });
@@ -209,16 +297,68 @@
     ctxMenu = null;
   }
 
+  // ─── 全局右键菜单（macOS Dock 的"右键空白区域 → Dock 偏好设置"）────────
+  interface GlobalCtxMenu {
+    x: number;
+    y: number;
+  }
+  let globalCtxMenu = $state<GlobalCtxMenu | null>(null);
+
+  function onDockContainerContextMenu(e: MouseEvent) {
+    if (!isDesktopFeatureEnabled("dock-context-menu")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    globalCtxMenu = {
+      x: e.clientX,
+      y: e.clientY,
+    };
+  }
+
+  function closeGlobalCtxMenu() {
+    globalCtxMenu = null;
+  }
+
+  function handlePositionChange(position: DockPosition) {
+    prefs.position = position;
+    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+  }
+
+  function handleAutoHideToggle() {
+    prefs.autoHide = !prefs.autoHide;
+    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+  }
+
+  function handleMagnificationChange(delta: number) {
+    const newMag = Math.max(1.0, Math.min(2.0, prefs.magnification + delta));
+    prefs.magnification = parseFloat(newMag.toFixed(1));
+    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+  }
+
+  function handleIconSizeChange(delta: number) {
+    const newSize = Math.max(32, Math.min(64, prefs.iconSize + delta));
+    prefs.iconSize = newSize;
+    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+  }
+
+  function handleOpenPreferences() {
+    openApp("settings", "dock");
+  }
+
   // 点击空白处关闭菜单（与桌面 stage 右键菜单同一条规则）。
   $effect(() => {
     const onDown = (e: MouseEvent) => {
-      if (!ctxMenu) return;
+      if (!ctxMenu && !globalCtxMenu) return;
       const target = e.target as Node | null;
       const menuEl = dockEl?.querySelector('[data-testid="dock-context-menu"]') ?? null;
-      if (target && menuEl && !menuEl.contains(target)) closeCtxMenu();
+      const globalMenuEl = dockEl?.querySelector('[data-testid="dock-global-context-menu"]') ?? null;
+      if (ctxMenu && target && menuEl && !menuEl.contains(target)) closeCtxMenu();
+      if (globalCtxMenu && target && globalMenuEl && !globalMenuEl.contains(target)) closeGlobalCtxMenu();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeCtxMenu();
+      if (e.key === "Escape") {
+        closeCtxMenu();
+        closeGlobalCtxMenu();
+      }
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
@@ -232,7 +372,7 @@
 <!--
   macOS Dock：
   - position: fixed bottom-0
-  - 高度 76px，含顶部圆角 18px
+  - 高度 68px（macOS 标准，含 16px 底部 padding）
   - 毛玻璃背景
   - 放大镜效果（CSS scale，JS 鼠标追踪 + **实测**中心）
   - 已打开 app 底部白点指示
@@ -240,42 +380,51 @@
 -->
 <div
   bind:this={dockEl}
-  class="pointer-events-none absolute bottom-0 left-0 right-0 flex justify-center"
+  class="pointer-events-none absolute flex {dockPositionClass(dockPosition)}"
   style="height:{DOCK_HEIGHT}px;"
   role="toolbar"
   aria-label={t("desktop.dock")}
   aria-orientation="horizontal"
   tabindex="-1"
-  onmousemove={onMouseMove}
+  onmousemove={onMouseNearDock}
 >
   <!-- Dock 容器 -->
   <div
     class="pointer-events-auto flex items-end gap-1 px-6 pb-2"
+    class:flex-col={dockPosition !== "bottom"}
     data-testid="dock-panel"
+    role="list"
+    aria-label={t("desktop.dockApps")}
+    oncontextmenu={onDockContainerContextMenu}
     style="
       min-width: {DOCK_MIN_WIDTH}px;
-      background: rgba(255, 255, 255, 0.18);
-      backdrop-filter: blur(24px) saturate(180%);
-      -webkit-backdrop-filter: blur(24px) saturate(180%);
-      border-radius: 18px 18px 0 0;
-      border-top: 1px solid rgba(255, 255, 255, 0.25);
-      border-left: 1px solid rgba(255, 255, 255, 0.15);
-      border-right: 1px solid rgba(255, 255, 255, 0.15);
+      {GLASS_DOCK_STYLE}
+      {GLASS_BORDER_DOCK}
       box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.15);
+      transition: transform 0.3s ease-in-out;
+      transform: translateY({dockVisible || !autoHide ? '0' : '100%'});
+      --dock-icon-size: {userIconSize}px;
     "
   >
     <!-- 用户 app（数据来自 home layout；不是注册表的东西） -->
     {#each visibleApps as item (item.id)}
       {@const appScale = iconScales.get(item.id) ?? 1.0}
+      {@const isBouncing = bouncingAppId === item.id}
       <div
         class={DOCK_ITEM_COLUMN}
         data-dock-item={item.id}
-        role="presentation"
+        role="listitem"
+        aria-label={item.label}
         oncontextmenu={(e) => onItemContextMenu(e, item.id, null)}
       >
-        <!-- 放大镜只作用在这一层：包裹层自身不缩放，容器才量得到稳定的中心。 -->
+        <!-- 放大镜只作用在这一层：包裹层自身不缩放，容器才量得到稳定的中心。
+             bounce 动画应用在放大镜**内部**的图标上：放大是容器的事、弹跳是
+             应用的事，分两层职责更清晰（先前把 bounce 加在外层 listitem 上，
+             弹跳与放大同时发生时位置计算就漂了）。 -->
         <div style="transform: scale({appScale}); margin-bottom: {appScale > 1.05 ? (appScale - 1) * 16 : 0}px;">
-          <DockAppItem id={item.id} icon={item.icon} label={item.label} />
+          <div class={isBouncing ? "dock-bounce" : ""}>
+            <DockAppItem id={item.id} icon={item.icon} label={item.label} />
+          </div>
         </div>
         <span class={isRunning(item.id, null) ? DOCK_RUNNING_DOT : DOCK_RUNNING_DOT_SLOT}></span>
       </div>
@@ -284,18 +433,22 @@
     <!-- 系统项（启动台 / 访达 / 废纸篓）：注册表决定有哪些、什么顺序、在哪划线 -->
     {#each dockModules as mod, i (mod.id)}
       {#if separatorBefore(i)}
-        <div class={DOCK_SEPARATOR} data-testid="dock-separator"></div>
+        <div class={DOCK_SEPARATOR} data-testid="dock-separator" role="separator" aria-orientation="vertical"></div>
       {/if}
       {@const modScale = iconScales.get(mod.id) ?? 1.0}
+      {@const modIsBouncing = bouncingAppId === mod.id}
       {@const Widget = mod.component}
       <div
         class={DOCK_ITEM_COLUMN}
         data-dock-item={mod.id}
-        role="presentation"
+        role="listitem"
+        aria-label={t(mod.titleKey)}
         oncontextmenu={(e) => onItemContextMenu(e, mod.id, i)}
       >
         <div style="transform: scale({modScale}); margin-bottom: {modScale > 1.05 ? (modScale - 1) * 16 : 0}px;">
-          <Widget />
+          <div class={modIsBouncing ? "dock-bounce" : ""}>
+            <Widget />
+          </div>
         </div>
         <span class={isRunning(mod.id, i) ? DOCK_RUNNING_DOT : DOCK_RUNNING_DOT_SLOT}></span>
       </div>
@@ -307,8 +460,8 @@
         <span
           class={DOCK_OVERFLOW_CHIP}
           style="
-            width:{DOCK_ICON_SIZE}px;
-            height:{DOCK_ICON_SIZE}px;
+            width:{userIconSize}px;
+            height:{userIconSize}px;
             border: 1px solid rgba(255,255,255,0.15);
           "
           title={hiddenNames}
@@ -331,5 +484,20 @@
     x={ctxMenu.x}
     y={ctxMenu.y}
     onclose={closeCtxMenu}
+  />
+{/if}
+
+<!-- Dock 全局右键菜单（macOS 的"右键空白区域 → Dock 偏好设置"） -->
+{#if globalCtxMenu}
+  <DockGlobalContextMenu
+    prefs={prefs}
+    x={globalCtxMenu.x}
+    y={globalCtxMenu.y}
+    onclose={closeGlobalCtxMenu}
+    onPositionChange={handlePositionChange}
+    onAutoHideToggle={handleAutoHideToggle}
+    onMagnificationChange={handleMagnificationChange}
+    onIconSizeChange={handleIconSizeChange}
+    onOpenPreferences={handleOpenPreferences}
   />
 {/if}

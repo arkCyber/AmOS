@@ -21,22 +21,22 @@
  */
 export const DEFAULT_SCREEN = { width: 1440, height: 900 } as const;
 
-/** macOS 顶栏高度（px），包括刘海区占位 12px。 */
-export const TOPBAR_HEIGHT = 28;
+/** macOS 顶栏高度（px）—— macOS 实测标准 24px（无刘海），28px（带刘海感知）。 */
+export const TOPBAR_HEIGHT = 24;
 
-/** macOS Dock 高度（px），不含顶部圆角区。 */
-export const DOCK_HEIGHT = 76;
+/** macOS Dock 高度（px）—— macOS 实测标准 68px（含 16px 底部 padding）。 */
+export const DOCK_HEIGHT = 68;
 
 /** macOS Dock 最小宽度（px），用于极窄窗口 fallback。 */
 export const DOCK_MIN_WIDTH = 320;
 
-/** Dock 图标尺寸（px，正方形）。 */
-export const DOCK_ICON_SIZE = 56;
+/** Dock 图标尺寸（px，正方形）—— macOS 默认 48px（用户可调至 16-128px）。 */
+export const DOCK_ICON_SIZE = 48;
 
-/** Dock 图标间距（px）。 */
+/** Dock 图标间距（px）—— macOS 实测标准 8px。 */
 export const DOCK_ICON_GAP = 8;
 
-/** macOS Dock 两侧边距（px）。 */
+/** macOS Dock 两侧边距（px）—— macOS 实测标准 24px。 */
 export const DOCK_SIDE_PADDING = 24;
 
 /** Launchpad 默认列数（≥1440px 宽屏）。 */
@@ -68,19 +68,18 @@ export const SPOTLIGHT_HEIGHT = 400;
 // (`grid-cols-4`, `h-20 w-20`, `gap-x-6 gap-y-5`, `left-8 top-8`, plus a
 // `width: calc(4 * 80px + 3 * 24px)` line) — so the same 80/24 was written twice, and the
 // stage was the one surface left making its own geometry decisions outside this module
-// (REQ-A249's rule: geometry has exactly one home). They live here now, with **no value
-// changed**: the look is pixel-identical. What "the right numbers are" is still an **open
-// product decision** (two sets exist in this repo — see `docs/multi-window.md` §1.5 and
-// `docs/PC_DESKTOP_AUDIT.md`), but it is now a decision in one place, with a test.
+// (REQ-A249's rule: geometry has exactly one home). They live here now.
+//
+// macOS 实测标准：图标 64px + 标签，整体间距水平 128px / 垂直 112px（含标签高度）
 
-/** Desktop icon tile edge (px) — the same size as the home screen's large tile. */
-export const DESKTOP_TILE_SIZE = 80;
+/** Desktop icon tile edge (px) — macOS 默认 64px。 */
+export const DESKTOP_TILE_SIZE = 64;
 
-/** Gap between desktop icon columns (px). */
-export const DESKTOP_TILE_GAP_X = 24;
+/** Gap between desktop icon columns (px) — macOS 实测 128px（图标中心到中心）。 */
+export const DESKTOP_TILE_GAP_X = 64;
 
-/** Gap between desktop icon rows (px). */
-export const DESKTOP_TILE_GAP_Y = 20;
+/** Gap between desktop icon rows (px) — macOS 实测 112px（含标签，中心到中心）。 */
+export const DESKTOP_TILE_GAP_Y = 48;
 
 /** Inset of the icon grid from the stage's top-left corner (px). */
 export const DESKTOP_GRID_INSET = 32;
@@ -196,20 +195,24 @@ export function shouldShowMissionControl(openWindowCount: number): boolean {
 /**
  * 计算鼠标在 Dock 中的"放大镜"效果 scale 因子。
  *
+ * macOS 使用抛物线衰减（二次函数），不是线性插值。影响范围约 5 个图标宽度。
+ *
  * @param mouseX - 鼠标 X 坐标（视口坐标）
  * @param iconCenterX - 该图标中心的 X 坐标
- * @param maxScale - 最大放大倍数（默认 1.3）
- * @param radius - 放大影响半径（px，默认 80）
+ * @param maxScale - 最大放大倍数（默认 1.5，macOS 实测约 1.5-1.8）
+ * @param radius - 放大影响半径（px，默认 120，约 2.5 个图标）
  */
 export function dockIconScale(
   mouseX: number,
   iconCenterX: number,
-  maxScale = 1.3,
-  radius = 80,
+  maxScale = 1.5,
+  radius = 120,
 ): number {
   if (!Number.isFinite(mouseX) || !Number.isFinite(iconCenterX)) return 1.0;
   const dist = Math.abs(mouseX - iconCenterX);
   if (dist >= radius) return 1.0;
-  // 线性插值：距离 0 → maxScale，距离 radius → 1.0
-  return maxScale - (maxScale - 1.0) * (dist / radius);
+  // 抛物线衰减：(1 - (dist/radius)²) 的加权
+  const normalized = dist / radius;
+  const factor = 1.0 - normalized * normalized;
+  return 1.0 + (maxScale - 1.0) * factor;
 }

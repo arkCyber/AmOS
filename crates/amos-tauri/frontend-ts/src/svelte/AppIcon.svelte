@@ -7,6 +7,7 @@
   let {
     id,
     icon = null,
+    label = undefined,
     tileClassName = "h-14 w-14 rounded-[19px]",
     glyphClassName = "text-[2.5rem]",
     style = "",
@@ -14,6 +15,7 @@
   }: {
     id: string;
     icon?: string | null;
+    label?: string;
     tileClassName?: string;
     glyphClassName?: string;
     style?: string;
@@ -27,6 +29,8 @@
 
 <span
   class="relative grid select-none place-items-center overflow-hidden shadow-md ring-1 ring-black/10 transition-all duration-150 dark:ring-white/10 {tileClassName}"
+  role="img"
+  aria-label={label ?? `App icon: ${id}`}
   style={`background-image:${bg};${style}`}
 >
   <span

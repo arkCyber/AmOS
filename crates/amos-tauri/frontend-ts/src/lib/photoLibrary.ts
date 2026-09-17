@@ -52,3 +52,23 @@ export function nativePhotoFromItem(item: MediaItem): NativePhoto {
     emoji: photoGlyph(item.kind),
   };
 }
+
+/**
+ * Build a streaming URL for a native photo/video thumbnail.
+ * `base` is the streaming base from `mediaStreamBase()`, e.g. "http://localhost:3456/media/stream".
+ * Returns null when base is missing (offline) or the URI is empty.
+ */
+export function nativeStreamUrl(photo: NativePhoto, base: string | null): string | null {
+  if (!base || !photo.uri) return null;
+  // The URI is already a unique handle (content:// or mock://); append it to the base.
+  return `${base}?uri=${encodeURIComponent(photo.uri)}`;
+}
+
+/**
+ * Map a media kind to a tile kind for display purposes.
+ * "image" and "video" are renderable; others become "glyph" placeholders.
+ */
+export function nativeTileKind(kind: MediaItem["kind"]): "image" | "video" | "glyph" {
+  if (kind === "image" || kind === "video") return kind;
+  return "glyph";
+}

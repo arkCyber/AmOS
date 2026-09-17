@@ -38,9 +38,13 @@
   import { createStoreValue } from "./store";
   import { t } from "./locale.svelte";
   import type { RadioControlReply } from "../lib/backend";
+  import { GLASS_CONTROL_CENTER_STYLE, GLASS_BORDER_MEDIUM } from "../lib/shellChrome";
+  import AirPlayPanel from "./AirPlayPanel.svelte";
 
   // The shell renders this overlay and hands it the dismissal (see `DesktopShell`).
   let { onclose }: { onclose?: () => void } = $props();
+  
+  let showAirPlay = $state(false);
 
   /** The three radios the panel switches; the Wi-Fi AP lives in Settings, not here. */
   const RADIO_TILES: readonly RadioKey[] = ["wifi", "bluetooth", "airplane"];
@@ -144,12 +148,7 @@
 >
   <div
     class="absolute right-3 top-11 w-[300px] overflow-hidden rounded-2xl p-3 shadow-2xl"
-    style="
-      background: rgba(40, 40, 40, 0.86);
-      backdrop-filter: blur(30px) saturate(180%);
-      -webkit-backdrop-filter: blur(30px) saturate(180%);
-      border: 1px solid rgba(255,255,255,0.10);
-    "
+    style="{GLASS_CONTROL_CENTER_STYLE} {GLASS_BORDER_MEDIUM}"
     role="dialog"
     aria-label={t("desktop.controlCenter")}
     tabindex="-1"
@@ -218,6 +217,34 @@
         </span>
         <span class="text-[12px] font-medium">{t("q.dnd")}</span>
       </button>
+    </div>
+
+    <!-- AirPlay tile -->
+    <div class="mt-2">
+      <button
+        class="w-full flex items-center justify-between rounded-xl px-2.5 py-2.5 text-left transition-colors {showAirPlay
+          ? 'bg-sky-500/20 text-white border border-sky-500/30'
+          : 'bg-white/10 text-white/80 hover:bg-white/15'}"
+        aria-pressed={showAirPlay}
+        aria-label={t("airplay.title")}
+        title={t("airplay.title")}
+        data-testid="cc-airplay"
+        onclick={() => showAirPlay = !showAirPlay}
+      >
+        <div class="flex items-center gap-2">
+          <span data-icon="airplay" class="grid h-5 w-5 place-items-center">
+            {@html iconSvg(quickIcon("airplay"), "h-5 w-5")}
+          </span>
+          <span class="text-[12px] font-medium">{t("airplay.title")}</span>
+        </div>
+        <span class="text-[18px] leading-none transition-transform" style="transform: rotate({showAirPlay ? 180 : 0}deg)">›</span>
+      </button>
+      
+      {#if showAirPlay}
+        <div class="mt-2">
+          <AirPlayPanel />
+        </div>
+      {/if}
     </div>
 
     <!-- What the platform owns, and whether a tap could hand the user to it (REQ-A202) -->

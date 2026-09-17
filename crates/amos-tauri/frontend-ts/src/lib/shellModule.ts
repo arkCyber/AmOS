@@ -66,6 +66,9 @@ export interface ShortcutEvent {
   ctrlKey?: boolean;
   shiftKey?: boolean;
   altKey?: boolean;
+  defaultPrevented?: boolean;
+  isComposing?: boolean;
+  repeat?: boolean;
 }
 
 /**

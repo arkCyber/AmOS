@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AmOS macOS Entitlements (P1-3).
+
+  Sandboxing is OPTIONAL for the local dev build: this file is meant for the
+  notarized + sandbox-on distribution build.  Leaving sandbox=false in the default
+  `cargo tauri build` keeps the dev experience unconstrained (a sandboxed app
+  cannot read $HOME, cannot talk to the daemon UDS, etc., without a long list of
+  exceptions — and that work is a separate iteration).
+
+  Keys below are the *minimum* an AmOS desktop build is likely to need:
+
+  • com.apple.security.app-sandbox            — opt in (commented out by default)
+  • com.apple.security.network.client         — outbound HTTP/HTTPS (AI daemon, store)
+  • com.apple.security.network.server         — host a small HTTP server (dev only)
+  • com.apple.security.files.user-selected.read-write  — open/save panels
+  • com.apple.security.device.camera          — CameraManager torch / video
+  • com.apple.security.device.microphone      — push-to-talk interpreter
+  • com.apple.security.device.bluetooth       — BT adapter rename / scan
+  • com.apple.security.automation.apple-events — not granted: this app does not
+                                                  drive AppleScript from inside the
+                                                  sandbox.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Distribution: enable.  Local dev: leave false to keep UDS + $HOME readable. -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+
+    <!-- Network: client + server (dev HTTP / IPC bridge / loopback). -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!-- File access: only what the user picks (no automatic whole-disk access). -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!-- Hardware: camera (torch / video), microphone (interpreter), bluetooth. -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.device.microphone</key>
+    <true/>
+    <key>com.apple.security.device.bluetooth</key>
+    <true/>
+</dict>
+</plist>

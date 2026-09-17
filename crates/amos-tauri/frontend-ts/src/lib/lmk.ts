@@ -135,6 +135,18 @@ export interface LmkVictim {
   package_name: string;
   window_id: string;
   killed: boolean;
+  outcome?: string;
+  refusal_reason?: string;
+}
+
+export type LmkVictimState = "reclaimed" | "frozen" | "refused" | "unknown";
+
+/** Determine victim state from daemon outcome. */
+export function victimState(v: LmkVictim): LmkVictimState {
+  if (v.killed) return "reclaimed";
+  if (v.outcome === "frozen") return "frozen";
+  if (v.outcome === "refused") return "refused";
+  return "unknown";
 }
 
 /** Outcome of an `android_lmk_debug` call (serialized from `LmkDebugOutcome`). */

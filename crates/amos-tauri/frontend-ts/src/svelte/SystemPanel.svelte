@@ -13,7 +13,7 @@
     memUsedPct,
     type SystemStatus,
   } from "../lib/system";
-  import { bridgeDiag, isCommandFailed } from "../lib/backend";
+  import { bridgeDiag } from "../lib/backend";
   import { t } from "./locale.svelte";
 
   const REFRESH_MS = 2500;
@@ -41,7 +41,7 @@
         if (raw) sys = raw;
         else {
           const diag = bridgeDiag("system_health");
-          if (isCommandFailed(diag)) {
+          if (!diag.ok && diag.kind === "command-failed") {
             console.warn("🛟 [SystemPanel] system_health refused:", diag.detail);
           }
           // `raw === null` (host down) — keep whatever `sys` already shows.

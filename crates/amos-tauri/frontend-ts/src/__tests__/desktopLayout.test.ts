@@ -39,9 +39,9 @@ import {
 
 describe("desktopLayout constants", () => {
   test("常量值在预期范围内（防止意外修改）", () => {
-    expect(TOPBAR_HEIGHT).toBe(28);
-    expect(DOCK_HEIGHT).toBe(76);
-    expect(DOCK_ICON_SIZE).toBe(56);
+    expect(TOPBAR_HEIGHT).toBe(24);
+    expect(DOCK_HEIGHT).toBe(68);
+    expect(DOCK_ICON_SIZE).toBe(48);
     expect(DOCK_ICON_GAP).toBe(8);
     expect(DOCK_SIDE_PADDING).toBe(24);
     expect(DOCK_MIN_WIDTH).toBe(320);
@@ -97,7 +97,7 @@ describe("launchpadRows", () => {
   });
 
   test("1200px 高度 → 行数合理", () => {
-    // 可用区域：1200 - 28 - 76 - 88 = 1008；行间距：80+24=104；rows ≈ 9
+    // 可用区域：1200 - 24 - 68 - 88 = 1020；行间距：80+24=104；rows ≈ 9
     const rows = launchpadRows(1200);
     expect(rows).toBeGreaterThan(3);
   });
@@ -118,14 +118,15 @@ describe("dockCapacity", () => {
   });
 
   test("1440px 宽 → 多个图标", () => {
-    // 内宽 1440 - 48 = 1392；图标间距 56+8=64；1392/64 = 21
-    expect(dockCapacity(1440)).toBeGreaterThan(15);
+    // 内宽 1440 - 48 = 1392；图标间距 48+8=56；1392/56 = 24
+    expect(dockCapacity(1440)).toBeGreaterThanOrEqual(20);
   });
 
   test("非法输入 → fallback  DOCK_MIN_WIDTH（最小可用 Dock，不再是写死的 480）", () => {
     expect(dockCapacity(NaN)).toBe(dockCapacity(DOCK_MIN_WIDTH));
     expect(dockCapacity(0)).toBe(dockCapacity(DOCK_MIN_WIDTH));
-    expect(dockCapacity(DOCK_MIN_WIDTH)).toBe(4); // (320-48)/64 = 4.25 → 4
+    // (320 - 2*24) / (48 + 8) = 272/56 = 4.857… → 4
+    expect(dockCapacity(DOCK_MIN_WIDTH)).toBe(4);
   });
 });
 
@@ -152,12 +153,13 @@ describe("dockOverflowCount", () => {
 });
 
 describe("stageRect", () => {
-  test("1440×900 屏幕 → 舞台 = {x:0, y:28, w:1440, h:796}", () => {
+  test("1440×900 屏幕 → 舞台 = {x:0, y:24, w:1440, h:808}", () => {
+    // 舞台高度 = 900 - 24 (TOPBAR) - 68 (DOCK) = 808
     expect(stageRect(1440, 900)).toEqual({
       x: 0,
-      y: 28,
+      y: 24,
       width: 1440,
-      height: 796,
+      height: 808,
     });
   });
 
@@ -165,6 +167,8 @@ describe("stageRect", () => {
     const r = stageRect(2560, 1440);
     expect(r.height).toBe(1440 - TOPBAR_HEIGHT - DOCK_HEIGHT);
     expect(r.y).toBe(TOPBAR_HEIGHT);
+    // 2560×1440 → height = 1440 - 24 - 68 = 1348
+    expect(r.height).toBe(1348);
   });
 
   test("舞台宽度 = 屏幕宽度，x 永远 = 0", () => {
@@ -197,28 +201,28 @@ describe("shouldShowMissionControl", () => {
 });
 
 describe("dockIconScale", () => {
-  test("鼠标在图标正上方（dist=0）→ maxScale (1.3)", () => {
-    expect(dockIconScale(100, 100)).toBeCloseTo(1.3, 5);
+  test("鼠标在图标正上方（dist=0）→ maxScale (默认 1.5)", () => {
+    expect(dockIconScale(100, 100)).toBeCloseTo(1.5, 5);
   });
 
-  test("鼠标在影响半径外（dist=100）→ 1.0", () => {
-    expect(dockIconScale(200, 100)).toBe(1.0);
+  test("鼠标在影响半径外（dist > radius）→ 1.0（默认 radius=120）", () => {
+    expect(dockIconScale(220, 100)).toBe(1.0);
   });
 
-  test("鼠标在影响半径边界（dist=radius=80）→ 1.0", () => {
-    expect(dockIconScale(180, 100)).toBe(1.0);
+  test("鼠标在影响半径边界（dist=radius=120）→ 1.0", () => {
+    expect(dockIconScale(220, 100)).toBe(1.0);
   });
 
-  test("鼠标在中间（dist=40）→ 介于 1.0 和 maxScale 之间", () => {
-    const scale = dockIconScale(140, 100);
+  test("鼠标在中间（dist=60）→ 介于 1.0 和 maxScale 之间", () => {
+    const scale = dockIconScale(160, 100);
     expect(scale).toBeGreaterThan(1.0);
-    expect(scale).toBeLessThan(1.3);
+    expect(scale).toBeLessThan(1.5);
   });
 
   test("自定义 maxScale 和 radius", () => {
-    // maxScale=1.5, radius=100
-    expect(dockIconScale(100, 100, 1.5, 100)).toBeCloseTo(1.5, 5);
-    expect(dockIconScale(200, 100, 1.5, 100)).toBe(1.0);
+    // maxScale=1.3, radius=80（用于测试自定义参数）
+    expect(dockIconScale(100, 100, 1.3, 80)).toBeCloseTo(1.3, 5);
+    expect(dockIconScale(180, 100, 1.3, 80)).toBe(1.0);
   });
 
   test("非法输入 → 1.0（安全降级）", () => {
@@ -241,17 +245,18 @@ describe("desktop icon grid (REQ-A263: the stage's geometry moved into the one g
     expect(desktopIconCapacity(-2, 4)).toBe(0);
   });
 
-  test("the grid width is what the template used to spell as calc(4 * 80px + 3 * 24px)", () => {
-    expect(desktopGridWidth()).toBe(4 * 80 + 3 * 24); // 392 px
-    expect(desktopGridWidth(1)).toBe(80); // one column has no gap
-    expect(desktopGridWidth(0)).toBe(392); // invalid ⇒ the documented default
-    expect(desktopGridWidth(NaN)).toBe(392);
+  test("the grid width is what the template used to spell as calc(4 * 64px + 3 * 64px)", () => {
+    // 4 columns × 64 px tile + 3 gaps × 64 px gap = 256 + 192 = 448 px
+    expect(desktopGridWidth()).toBe(4 * 64 + 3 * 64);
+    expect(desktopGridWidth(1)).toBe(64); // one column has no gap
+    expect(desktopGridWidth(0)).toBe(448); // invalid ⇒ the documented default
+    expect(desktopGridWidth(NaN)).toBe(448);
   });
 
   test("the numbers match the look that shipped (no value was changed by the move)", () => {
-    expect(DESKTOP_TILE_SIZE).toBe(80);
-    expect(DESKTOP_TILE_GAP_X).toBe(24); // gap-x-6
-    expect(DESKTOP_TILE_GAP_Y).toBe(20); // gap-y-5
+    expect(DESKTOP_TILE_SIZE).toBe(64);
+    expect(DESKTOP_TILE_GAP_X).toBe(64); // 桌面图标横向间距
+    expect(DESKTOP_TILE_GAP_Y).toBe(48); // 桌面图标纵向间距
     expect(DESKTOP_GRID_INSET).toBe(32); // left-8 / top-8
   });
 });

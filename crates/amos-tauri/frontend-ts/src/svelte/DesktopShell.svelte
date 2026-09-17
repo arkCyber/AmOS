@@ -35,36 +35,28 @@
     activeSpace,
     listSpaces,
     switchSpace,
-    createSpace,
     prevSpaceIndex,
     nextSpaceIndex,
-    newSpaceName,
-    indexOfCreatedSpace,
   } from "../lib/spaces";
   import { stageRect, DEFAULT_SCREEN } from "../lib/desktopLayout";
   import {
     SHELL_CHROME_API,
     moduleForShortcut,
     modulesFor,
-    formatShortcut,
     overlayShortcutHint,
     type ShellChromeApi,
-    type ShellShortcut,
   } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
   import { lock } from "./shellState.svelte";
   import { isDesktopFeatureEnabled, loadDesktopFeatures } from "../lib/desktopFeatures";
   import {
     createKeyboardBindings,
-    findMatchingBinding,
     matchesShortcut,
-    SYSTEM_DEFAULTS,
-    SPACES_DEFAULTS,
-    type ResolvedBindings,
   } from "../lib/keyboardConfigHook.svelte";
   import TopBar from "./TopBar.svelte";
   import Dock from "./Dock.svelte";
   import DesktopStage from "./DesktopStage.svelte";
+  import { t } from "./locale.svelte";
 
   // ─── 布局状态 ───────────────────────────────────────────────────────────────
   let layoutSnap = $state<LayoutSnapshot | null>(null);
@@ -118,7 +110,6 @@
   const keyboardBindings = createKeyboardBindings();
   keyboardBindings.startListening();
   const customSystemBindings = $derived(keyboardBindings.bindings.system);
-  const customSpacesBindings = $derived(keyboardBindings.bindings.spaces);
 
   // ─── 系统快捷键（macOS 作用于焦点窗口的那一组）────────────────────────
   // 故意与「浮层快捷键」分两层处理：
@@ -382,6 +373,15 @@
   - Dock 在底部
   - 浮层按需叠加（清单与快捷键都来自注册表）
 -->
+
+<!-- 跳过导航链接 (WCAG 2.4.1) -->
+<a
+  href="#main-content"
+  class="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-[9999] focus:rounded-lg focus:bg-accent focus:px-4 focus:py-2 focus:text-white focus:shadow-lg focus:outline-none"
+>
+  {t("a11y.skipToMain")}
+</a>
+
 <div
   class="relative h-full w-full overflow-hidden font-system"
   style="
@@ -391,6 +391,8 @@
 >
   <!-- 桌面舞台（壁纸 + 桌面图标 + stage 槽位 + 右键菜单） -->
   <div
+    id="main-content"
+    tabindex="-1"
     class="absolute"
     style="
       left:{stage.x}px;

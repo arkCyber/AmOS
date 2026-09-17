@@ -53,12 +53,15 @@
   import NetGuardPage from "./settings/NetGuardPage.svelte";
   import NotificationsPage from "./settings/NotificationsPage.svelte";
   import SoundPage from "./settings/SoundPage.svelte";
+  import RingtonePage from "./settings/RingtonePage.svelte";
   import AboutPage from "./settings/AboutPage.svelte";
   import CellularPage from "./settings/CellularPage.svelte";
   import HotspotPage from "./settings/HotspotPage.svelte";
   import FocusPage from "./settings/FocusPage.svelte";
   import WindowPage from "./settings/WindowPage.svelte";
   import LinkPage from "./settings/LinkPage.svelte";
+  import KeyboardPage from "./settings/KeyboardPage.svelte";
+  import DockPage from "./settings/DockPage.svelte";
 
   type Sub =
     | "account"
@@ -68,11 +71,14 @@
     | "hotspot"
     | "notifications"
     | "sound"
+    | "ringtone"
     | "focus"
     | "display"
     | "wallpaper"
+    | "dock"
     | "language"
     | "ime"
+    | "keyboard"
     | "lock"
     | "ai"
     | "privacy"
@@ -92,11 +98,14 @@
     hotspot: "settings.hotspot",
     notifications: "settings.notifications",
     sound: "settings.soundHaptics",
+    ringtone: "settings.ringtone",
     focus: "settings.focus",
     display: "settings.displayBrightness",
     wallpaper: "settings.wallpaper",
+    dock: "settings.dock.title",
     language: "settings.language",
     ime: "settings.ime",
+    keyboard: "settings.keyboard",
     lock: "settings.passcode",
     ai: "settings.ai",
     privacy: "settings.privacy",
@@ -121,9 +130,11 @@
     hotspot: ["hotspot", "tether", "tethering", "share", "ap", "个人热点", "热点", "网络共享", "共享"],
     notifications: ["alert", "badge", "提醒", "角标", "横幅", "勿扰", "banner"],
     sound: ["ringtone", "volume", "铃声", "音量", "静音", "mute"],
+    ringtone: ["ringtone", "来电铃声", "铃声", "振动", "ring", "vibrate"],
     focus: ["勿扰", "dnd", "sleep", "睡眠", "专注"],
     display: ["brightness", "dark", "亮度", "深色", "浅色"],
     wallpaper: ["background", "背景", "图片"],
+    dock: ["程序坞", "底部", "左侧", "右侧", "放大", "自动隐藏", "magnification", "auto-hide", "position"],
     language: ["简体", "中文", "english", "语言"],
     ime: ["pinyin", "keyboard", "input method", "输入法", "拼音", "键盘", "模糊音"],
     lock: ["password", "passcode", "pin", "密码", "面容"],
@@ -173,13 +184,31 @@
   // We take the text and go back to the index — **we do not pick a page**: the index
   // search below already matches pages, their synonyms and their live values, so it
   // decides. The link is a request and is consumed once (a later remount starts clean).
+  // NEW: Support direct page navigation via "#page" query format (e.g., "#dock")
   let linkNonce = 0;
   $effect(() => {
     return settingsChannel().subscribe((v) => {
       if (!v || v.query.trim() === "" || v.nonce === linkNonce) return;
       linkNonce = v.nonce;
-      page = "index";
-      q = v.query;
+      const query = v.query.trim();
+      
+      // 检查是否为直接页面导航格式 "#page"
+      if (query.startsWith("#")) {
+        const targetPage = query.slice(1) as Page;
+        // 验证页面是否有效
+        if (targetPage in PAGE_KEY || targetPage === "index") {
+          nav(targetPage);
+        } else {
+          // 无效页面，回退到 index
+          page = "index";
+          q = "";
+        }
+      } else {
+        // 原有的搜索行为
+        page = "index";
+        q = query;
+      }
+      
       resetTop();
       settingsChannel().set({ query: "", nonce: linkNonce });
     });
@@ -295,16 +324,18 @@
       { kind: "nav", page: "cellular", key: "settings.cellular", sub: () => cellularSub },
       { kind: "nav", page: "hotspot", key: "settings.hotspot", sub: () => hotspotSub },
     ],
-    // 通用：通知 / 声音与触感 / 专注模式
+    // 通用：通知 / 声音与触感 / 来电铃声 / 专注模式
     [
       { kind: "nav", page: "notifications", key: "settings.notifications" },
       { kind: "nav", page: "sound", key: "settings.soundHaptics" },
+      { kind: "nav", page: "ringtone", key: "settings.ringtone" },
       { kind: "nav", page: "focus", key: "settings.focus", sub: () => focusSub },
     ],
-    // 显示：显示与亮度 / 壁纸 / 锁屏密码
+    // 显示：显示与亮度 / 壁纸 / 桌面与程序坞 / 锁屏密码
     [
       { kind: "nav", page: "display", key: "settings.displayBrightness" },
       { kind: "nav", page: "wallpaper", key: "settings.wallpaper" },
+      { kind: "nav", page: "dock", key: "settings.dock.title" },
       { kind: "nav", page: "lock", key: "settings.passcode", sub: () => lockSub },
     ],
     // 账户与功能：语言 / iCloud / AI 与智能 / 隐私与安全性
@@ -373,19 +404,19 @@
 
     <!-- Search field (iOS: sits under the big title, live-filters the rows) -->
     <div class="relative mt-3">
-      <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm opacity-40">🔍</span>
+      <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ios-body opacity-40">🔍</span>
       <input
         bind:value={q}
         type="search"
         placeholder={t("settings.searchPlaceholder")}
         aria-label={t("settings.searchPlaceholder")}
-        class="w-full rounded-[10px] bg-black/5 py-2 pl-9 pr-8 text-sm outline-none dark:bg-white/10"
+        class="w-full rounded-ios-input bg-black/5 px-4 py-2.5 pl-10 text-ios-body outline-none placeholder:text-neutral-400 dark:bg-white/10 dark:placeholder:text-neutral-500"
       />
       {#if searching}
         <button
           onclick={() => (q = "")}
           aria-label={t("settings.searchClear")}
-          class="absolute right-2 top-1/2 -translate-y-1/2 rounded-full px-1 text-sm opacity-50 active:scale-90"
+          class="absolute right-2 top-1/2 -translate-y-1/2 grid h-6 w-6 place-items-center rounded-full text-ios-footnote opacity-50 active:scale-90"
         >
           ✕
         </button>
@@ -396,7 +427,7 @@
       <!-- Live search results (same canonical rows, flat) -->
       <div class="mt-3">
         {#if hits.length === 0}
-          <p class="px-1 py-4 text-center text-sm opacity-50">{t("settings.noResults")}</p>
+          <p class="px-1 py-4 text-center text-ios-body text-neutral-500 dark:text-neutral-400">{t("settings.noResults")}</p>
         {:else}
           <section class={GROUP}>
             {#each hits as hit, i (hit.id)}
@@ -417,8 +448,8 @@
           A
         </div>
         <div class="min-w-0 flex-1 py-3">
-          <p class="text-[16px] font-semibold text-neutral-900 dark:text-neutral-50">{t("settings.accountName")}</p>
-          <p class="truncate text-xs opacity-60">{t("settings.accountHint")}</p>
+          <p class="text-ios-body font-semibold text-neutral-900 dark:text-neutral-50">{t("settings.accountName")}</p>
+          <p class="truncate text-ios-footnote text-neutral-600 dark:text-neutral-400">{t("settings.accountHint")}</p>
         </div>
         <span class={CHEVRON}>›</span>
       </button>
@@ -461,6 +492,8 @@
         <DisplayPage />
       {:else if page === "wallpaper"}
         <WallpaperPage />
+      {:else if page === "dock"}
+        <DockPage />
       {:else if page === "language"}
         <LanguagePage />
       {:else if page === "ime"}
@@ -483,12 +516,16 @@
         <NotificationsPage />
       {:else if page === "sound"}
         <SoundPage />
+      {:else if page === "ringtone"}
+        <RingtonePage />
       {:else if page === "about"}
         <AboutPage />
       {:else if page === "window"}
         <WindowPage />
       {:else if page === "link"}
         <LinkPage />
+      {:else if page === "keyboard"}
+        <KeyboardPage />
       {/if}
     </div>
   {/if}

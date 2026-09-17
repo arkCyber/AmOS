@@ -67,7 +67,11 @@ describe("dock widgets (mounted alone)", () => {
     await tick();
     const tile = container.querySelector<HTMLButtonElement>('[data-testid="dock-launchpad"]')!;
     expect(tile.getAttribute("aria-label")).toBe(zh["desktop.launchpad"]);
-    expect(tile.textContent).toBe("🚀");
+    // The Launchpad tile now uses a vector icon (IconLaunchpad.svelte), not the
+    // historical 🚀 glyph — verify the SVG is in the slot rather than text, so
+    // a future "fall back to an emoji" doesn't silently desync the tile from
+    // the design that replaced the emoji.
+    expect(tile.querySelector("svg")).toBeTruthy();
     expect(tile.className).toContain("rounded-[16px]");
     // Mounted outside a shell there is no handle: the tile must do nothing, not throw.
     await fireEvent.click(tile);

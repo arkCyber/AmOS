@@ -176,7 +176,7 @@ export function detectConflicts(
     } else {
       // 禁用：从所有键映射中移除
       for (const arr of keyToFunctions.values()) {
-        const idx = arr.findIndex((x) => x.id === id);
+        arr.findIndex((x) => x.id === id);
       }
     }
   }

@@ -11,6 +11,7 @@
   import { SHELL_CHROME_API, type ShellChromeApi } from "../../lib/shellModule";
   import { t } from "../locale.svelte";
   import DockTileButton from "./DockTileButton.svelte";
+  import IconLaunchpad from "../../assets/icons/IconLaunchpad.svelte";
 
   const api = getContext<ShellChromeApi | undefined>(SHELL_CHROME_API);
 </script>
@@ -18,7 +19,7 @@
 <DockTileButton
   label={t("desktop.launchpad")}
   testId="dock-launchpad"
-  glyph="🚀"
+  icon={IconLaunchpad}
   shortcut={api?.overlayShortcut("launchpad") ?? null}
   onclick={() => api?.openLaunchpad()}
 />
