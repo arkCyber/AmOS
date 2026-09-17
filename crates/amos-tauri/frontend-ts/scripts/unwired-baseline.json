@@ -4,7 +4,6 @@
     "src/lib/backend.ts::pollNativeAlarms",
     "src/lib/backend.ts::realDial",
     "src/lib/backend.ts::storeFind",
-    "src/lib/backend.ts::storeSearch",
     "src/lib/backend.ts::storeStatus",
     "src/lib/backend.ts::translateText",
     "src/lib/calculator.ts::calcDisplay",
@@ -14,12 +13,21 @@
     "src/lib/emergency.ts::quickEmergencyNumber",
     "src/lib/externalFiles.ts::mergeDeduped",
     "src/lib/keepAwakeCore.ts::resetHoldBusForTest",
-    "src/lib/media.ts::mediaGrantWrite",
-    "src/lib/media.ts::mediaSave",
+    "src/lib/keyboardConfig.ts::deserializeShortcut",
+    "src/lib/media.ts::mediaStreamBase",
+    "src/lib/mediaExport.ts::dataUrlToBytes",
+    "src/lib/mediaPaging.ts::canLoadMore",
+    "src/lib/mediaPaging.ts::emptyPaging",
+    "src/lib/mediaPaging.ts::fetchInto",
+    "src/lib/photoLibrary.ts::nativeStreamUrl",
+    "src/lib/photoLibrary.ts::nativeTileKind",
     "src/lib/realtimeTts.ts::onInterpFinal",
     "src/lib/sandboxBridge.ts::decideCapabilityRequest",
     "src/lib/sensors.ts::sensorAcquire",
     "src/lib/sensors.ts::sensorPixels",
+    "src/lib/shellChrome.ts::GLASS_LAUNCHPAD_STYLE",
+    "src/lib/spaces.ts::getSpacesStatus",
+    "src/lib/spaces.ts::moveWindowToSpace",
     "src/lib/uiFailures.ts::resetUiFailuresForTest",
     "src/lib/wm.ts::layoutSurfaces",
     "src/lib/wm.ts::paneCss",
@@ -32,6 +40,10 @@
     "src/svelte/osAlarmArm.ts::resetArmedNativeAlarmsForTest",
     "src/svelte/propsBus.ts::resetPropsChannels"
   ],
-  "modules": [],
-  "components": []
+  "modules": [
+    "src/lib/mediaPaging.ts"
+  ],
+  "components": [
+    "src/svelte/settings/KeyboardPage.svelte"
+  ]
 }
