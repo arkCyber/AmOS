@@ -1,7 +1,7 @@
 {
   "policy": "Known production unsafe surface, per file. Counts were captured on 2026-09-12 after documenting every site with a '// SAFETY:' note or a '# Safety' doc section (see scripts/unsafe-scan.mjs). This file is a RATCHET: adding an unsafe site to an existing file, or introducing a new file with unsafe, fails the gate until the addition is acknowledged here. Lowering a count is reported as stale so the file cannot rot. The sites are, in practice, FFI/JNI glue for the Android platform APIs plus 'unsafe impl Send/Sync' for handles that must be moved across threads.",
-  "captured": "2026-09-13 (round 187: +crates/amos-tauri/src/android_log.rs — the logcat sink's __android_log_write FFI call, documented with a SAFETY note; the file was renamed to host_log.rs in REQ-A229/REQ-A231, same site, so the entry follows the path)",
-  "total": 114,
+  "captured": "2026-09-13 (round 187: +crates/amos-tauri/src/android_log.rs — the logcat sink's __android_log_write FFI call, documented with a SAFETY note; the file was renamed to host_log.rs in REQ-A229/REQ-A231, same site, so the entry follows the path) | 2026-09-17 (REQ-A373: +crates/amos-tauri/src/alarm_sched.rs — the alarm device binding added in REQ-A369: `unsafe impl Send/Sync` for the JavaVM+GlobalRef handle and the `attachContext` JNI entry, every site carrying a SAFETY note; the same shape and count as crates/amos-tauri/src/flashlight.rs)",
+  "total": 119,
   "files": {
     "crates/amos-audio/src/android/aaudio.rs": 20,
     "crates/amos-audio/src/android/tinyalsa.rs": 10,
@@ -15,6 +15,7 @@
     "crates/amos-sensor/src/android.rs": 2,
     "crates/amos-sms/src/android.rs": 2,
     "crates/amos-tauri/src/android_glue.rs": 5,
+    "crates/amos-tauri/src/alarm_sched.rs": 5,
     "crates/amos-tauri/src/blocklist.rs": 6,
     "crates/amos-tauri/src/buttons.rs": 2,
     "crates/amos-tauri/src/clipboard_glue.rs": 6,
