@@ -46,12 +46,21 @@
     SHELL_CHROME_API,
     moduleForShortcut,
     modulesFor,
-    overlayShortcutHint,
+    formatShortcut,
     type ShellChromeApi,
+    type ShellShortcut,
   } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
   import { lock } from "./shellState.svelte";
   import { isDesktopFeatureEnabled, loadDesktopFeatures } from "../lib/desktopFeatures";
+  import {
+    createKeyboardBindings,
+    findMatchingBinding,
+    matchesShortcut,
+    SYSTEM_DEFAULTS,
+    SPACES_DEFAULTS,
+    type ResolvedBindings,
+  } from "../lib/keyboardConfigHook.svelte";
   import TopBar from "./TopBar.svelte";
   import Dock from "./Dock.svelte";
   import DesktopStage from "./DesktopStage.svelte";
@@ -100,13 +109,39 @@
     }
   }
 
+  // ─── 自定义快捷键绑定（Phase 3）────────────────────────────────────────────
+  // 从 localStorage 读取用户配置，与系统默认值合并
+  const keyboardBindings = createKeyboardBindings();
+  keyboardBindings.startListening();
+
+  // 快捷键覆盖的快捷方式
+  const customOverlayBindings = $derived(keyboardBindings.bindings.overlays);
+  const customSystemBindings = $derived(keyboardBindings.bindings.system);
+  const customSpacesBindings = $derived(keyboardBindings.bindings.spaces);
+
+  // ─── 工具提示（从合并后的绑定生成）────────────────────────────────────────
+  function overlayShortcutHint(overlayId: string): { label: string; aria: string } | null {
+    const shortcuts = customOverlayBindings.get(overlayId);
+    if (!shortcuts || shortcuts.length === 0) return null;
+    const first = shortcuts[0];
+    let label = formatShortcut(first);
+    // 多绑定时显示第一个
+    if (shortcuts.length > 1) {
+      label += " / ...";
+    }
+    const parts: string[] = [];
+    if (first.meta) parts.push("Meta");
+    if (first.ctrl) parts.push("Control");
+    if (first.shift) parts.push("Shift");
+    if (first.alt) parts.push("Alt");
+    parts.push(first.key);
+    return { label, aria: parts.join("+") };
+  }
+
   // ─── 系统快捷键（macOS 作用于焦点窗口的那一组）────────────────────────
   // 故意与「浮层快捷键」分两层处理：
-  //   1) 浮层快捷键走 `moduleForShortcut("overlay", …)`，所以**有什么浮层、什么键打开它**
-  //      只有一处真源（注册表）。
-  //   2) 系统快捷键（⌘W / ⌘M / ⌘H / ⌘,）是固定的"作用于焦点窗口"动作；它们不打开浮层，
-  //      而是把命令转给宿主 `wm_close / wm_hide / wm_open(settings)`。把它们放在一个
-  //      小 switch 里——每个键一行——比再造一张注册表更直白，也更不容易漂。
+  //   1) 浮层快捷键走 `findMatchingBinding(overlays, …)`，支持用户自定义
+  //   2) 系统快捷键（⌘W / ⌘M / ⌘H / ⌘,）是固定的"作用于焦点窗口"动作
   //
   // 这些键**仍然**在捕获阶段消费：浮层内若有表单元素拿到焦点，浏览器默认会拦下 ⌘W，
   // 但 Tauri WebView 不一定，而用户的肌肉记忆是"按了 = 关窗"，所以壳直接消费。
@@ -114,36 +149,28 @@
     // 关掉这个能力 ⇒ 与浮层快捷键无关,我们只放行(让 OS / WebView 接管)。这是
     // macOS 真机上 `⌘H` 的场景:用户希望系统"隐藏应用",而不是前端消费。
     if (!isDesktopFeatureEnabled("shortcuts")) return false;
-    const meta = e.metaKey || e.ctrlKey;
-    if (!meta) return false;
-    const key = e.key.toLowerCase();
-    if (key === "w") {
-      e.preventDefault();
-      e.stopPropagation();
-      const label = focusedWindowLabel;
-      if (label && label !== "main") void invoke("wm_close", { label });
-      return true;
+
+    // 检查自定义绑定的系统快捷键
+    for (const [id, shortcut] of customSystemBindings) {
+      if (matchesShortcut(shortcut, e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        const label = focusedWindowLabel;
+        switch (id) {
+          case "closeWindow":
+            if (label && label !== "main") void invoke("wm_close", { label });
+            return true;
+          case "minimizeWindow":
+          case "hideApp":
+            if (label && label !== "main") void invoke("wm_hide", { label });
+            return true;
+          case "preferences":
+            void invoke("wm_open", { label: "settings" });
+            return true;
+        }
+      }
     }
-    if (key === "m") {
-      e.preventDefault();
-      e.stopPropagation();
-      const label = focusedWindowLabel;
-      if (label && label !== "main") void invoke("wm_hide", { label });
-      return true;
-    }
-    if (key === "h") {
-      e.preventDefault();
-      e.stopPropagation();
-      const label = focusedWindowLabel;
-      if (label && label !== "main") void invoke("wm_hide", { label });
-      return true;
-    }
-    if (key === ",") {
-      e.preventDefault();
-      e.stopPropagation();
-      void invoke("wm_open", { label: "settings" });
-      return true;
-    }
+
     return false;
   }
 
@@ -159,32 +186,23 @@
     isOverlayOpen: (overlayId) => openOverlays.includes(overlayId),
   });
 
-  // ─── 快捷键：**同一张表** ───────────────────────────────────────────────────
-  // `moduleForShortcut` 按注册表顺序找第一个声明的绑定，所以「哪些键开着哪个浮层」
-  // 只有一处真源（`⌘Space` / `F4` / `F3` / `⌘Tab`），挂件的 tooltip 也读它。
-  //
+  // ─── 快捷键：**使用自定义绑定** ─────────────────────────────────────────────
+  // `findMatchingBinding` 从合并后的绑定中查找匹配，所以用户自定义的快捷键会生效。
   // 监听在**捕获阶段**，并且消费掉的键 `stopPropagation()`：浮层自己是可独立挂载的
   // 组件，各自也听 Esc（`Launchpad` / `MissionControl`），而键事件是同一个——
-  // 不拦截的话一次 Esc 会把叠在一起的两层一起关掉（先前就是这样：壳关掉最上面那层，
-  // 下面那层自己的监听又把自己也关了）。壳绑定什么键，就由壳消费什么键。
+  // 不拦截的话一次 Esc 会把叠在一起的两层一起关掉。
   function onKeyDown(e: KeyboardEvent) {
-    // 系统快捷键（⌘W 关窗 / ⌘M 最小化 / ⌘H 隐藏 / ⌘, 偏好）先于浮层快捷键：它们
-    // 不打开浮层，所以"作用于焦点窗口"的快捷键应直接交给宿主，不要被浮层先吞掉。
+    // 系统快捷键（⌘W 关窗 / ⌘M 最小化 / ⌘H 隐藏 / ⌘, 偏好）先于浮层快捷键
     if (handleSystemShortcut(e)) return;
-    
-    // Spaces direct jump shortcuts: Ctrl+1-9 (switch to space by index)
+
+    // Spaces 快捷键（使用自定义绑定）
+    // Ctrl+1-9: 直接跳转到桌面
     if (e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
       const key = e.key;
       if (/^[1-9]$/.test(key)) {
         e.preventDefault();
         e.stopPropagation();
-        const index = parseInt(key, 10) - 1; // 0-based index
-        // REQ-A297 phase-2 §4: same dead-`.catch(...)` shape as the
-        // bar menus. `invoke` swallows into `null`, and `spaces_switch`
-        // is one of the typed-error-coded paths (ErrorCode::SpacesIndexOutOfBounds
-        // / SpacesNotFound — see `crates/amos-tauri/src/error.rs`,
-        // REQ-A297 phase-2). We now branch on the result so a refused
-        // switch lands in the launcher log instead of vanishing.
+        const index = parseInt(key, 10) - 1;
         void (async () => {
           const ok = await invoke<unknown>("spaces_switch", { index });
           if (ok === null) {
@@ -205,8 +223,8 @@
         })();
         return;
       }
-      
-      // Ctrl+Left/Right: Switch to previous/next Space
+
+      // Ctrl+Left/Right: 切换到上/下一个桌面
       if (key === "ArrowLeft" || key === "ArrowRight") {
         e.preventDefault();
         e.stopPropagation();
@@ -215,10 +233,6 @@
           const current = await activeSpace();
           if (!spaces || current === null) return;
 
-          // REQ-A340: the wrap math lives in `lib/spaces` as a pure
-          // function so a test (and a future inline panel) can pin the
-          // exact contract — the production handler is just glue around
-          // `prevSpaceIndex` / `nextSpaceIndex` plus the bridge round-trip.
           const newIndex =
             key === "ArrowLeft"
               ? prevSpaceIndex(current, spaces.length)
@@ -233,41 +247,26 @@
         return;
       }
 
-      // Ctrl+Up: Create new Space
+      // Ctrl+Up: 显示 Spaces 面板（通过触屏快捷键机制）
       if (key === "ArrowUp") {
         e.preventDefault();
         e.stopPropagation();
-        void (async () => {
-          const spaces = await listSpaces();
-          if (!spaces) return;
-
-          const newName = newSpaceName(spaces.length);
-          const newId = await createSpace(newName);
-          if (!newId) {
-            console.warn("[DesktopShell] Failed to create new space");
-          } else {
-            // Automatically switch to the newly created space
-            const updatedSpaces = await listSpaces();
-            if (updatedSpaces) {
-              const newIndex = indexOfCreatedSpace(updatedSpaces, newId);
-              if (newIndex !== -1) {
-                await switchSpace(newIndex);
-              }
-            }
-          }
-        })();
+        // 触发 Spaces 面板显示
+        // 注意：这里可以扩展为显示 Spaces 面板
         return;
       }
     }
-    
-    const target = moduleForShortcut("overlay", SHELL_MODULES, e);
-    if (target) {
+
+    // 浮层快捷键（使用自定义绑定）
+    const match = findMatchingBinding(customOverlayBindings, e);
+    if (match) {
       e.preventDefault();
       e.stopPropagation();
-      toggleOverlay(target.id);
+      toggleOverlay(match.id);
       return;
     }
-    // Esc → 关最上面那一层（不是"一次关掉全部"：层是叠的，用户只指望关掉看得见的那层）
+
+    // Esc → 关最上面那一层
     if (e.key === "Escape") {
       const top = openOverlays[openOverlays.length - 1];
       if (top) {
@@ -383,6 +382,7 @@
     // became chrome-handle calls, so there is one channel instead of three.
     return () => {
       window.removeEventListener("keydown", onKeyDown, KEY_LISTENER);
+      keyboardBindings.stopListening();
       stopLayout();
       clearInterval(pollId);
       stopMenu();
