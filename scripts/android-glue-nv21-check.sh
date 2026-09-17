@@ -15,10 +15,13 @@
 #      platform's own verdict on the two claims the compiler cannot check: **does the API
 #      exist on `minSdk` (26)**, and **does the call need a permission nobody checks**
 #      (REQ-A380: the first run found 20 errors in our glue — 5 × `NewApi`, 8 ×
-#      `MissingPermission` — plus an API-29-only `MediaStore` path that was silently dead
-#      on API 26..28). Errors in our glue fail the gate; warnings are printed grouped by
-#      issue id ("reported, not judged"); findings in the generated project are reported
-#      only, because those files are machine-owned.
+#      `MissingPermission` — plus 16 warnings, among them an API-29-only `MediaStore` path
+#      that was silently dead on API 26..28). **Our glue must come out with zero findings,
+#      errors and warnings alike**: every accepted one is suppressed *in the source* with its
+#      reason (`@SuppressLint("…") // why`), so a new warning is a decision nobody made.
+#      Findings outside our glue (the generated project, Tauri's own files, and the merged
+#      manifest's `<uses-feature>` implications of our permissions) are printed grouped by
+#      issue id — reported, not judged, because those files are machine-owned.
 #
 # Requirements:
 #   * `cargo tauri android init` has been run once (crates/amos-tauri/gen/ exists),
@@ -175,11 +178,24 @@ if [[ -n "$FINDINGS" ]]; then
   rm -f "$LINT_LOG"
   exit 1
 fi
-WARN_COUNT=$(glue_warnings "$LINT_REPORT" | wc -l | tr -d ' ')
-if [[ "$WARN_COUNT" -gt 0 ]]; then
-  echo "[glue] note — $WARN_COUNT Android Lint warning(s) in our glue (reported, not judged):"
-  glue_warnings "$LINT_REPORT" | sed -E 's#.*/glue/##; s/: Warning: .*\[([A-Za-z]+)\]$/: \1/' | sort | uniq -c | sed 's/^/       /'
+# Warnings are judged too: every one we accept is suppressed **in the source** with its reason
+# (@SuppressLint("…") // why), so a *new* warning is a decision nobody made — the same rule the
+# Kotlin-warning phase above follows. The findings that remain in the generated project are
+# printed (machine-owned: reported, not judged).
+WARNINGS=$(glue_warnings "$LINT_REPORT")
+if [[ -n "$WARNINGS" ]]; then
+  echo >&2
+  echo "[glue] FAIL — Android Lint reports warning(s) in our glue that nobody judged." >&2
+  echo "       Fix it, or suppress it in the source with a reason (REQ-A380):" >&2
+  echo "$WARNINGS" >&2
+  rm -f "$LINT_LOG"
+  exit 1
 fi
-echo "[glue] OK — Android Lint: 0 error(s) in our glue; $WARN_COUNT warning(s) reported."
+OTHER=$(grep -E ': (Error|Warning): .*\[[A-Za-z]+\]$' "$LINT_REPORT" | grep -v '/com/amos/ai/glue/' || true)
+if [[ -n "$OTHER" ]]; then
+  echo "[glue] note — $(printf '%s\n' "$OTHER" | wc -l | tr -d ' ') Lint finding(s) outside our glue (generated project / Tauri, reported not judged), by issue:"
+  printf '%s\n' "$OTHER" | sed -E 's/.*\[([A-Za-z]+)\]$/\1/' | sort | uniq -c | sort -rn | head -10 | sed 's/^/       /'
+fi
+echo "[glue] OK — Android Lint: 0 finding(s) in our glue (every suppression carries its reason); generated-project findings reported above."
 rm -f "$LINT_LOG"
 rm -f "$LOG"

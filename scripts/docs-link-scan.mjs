@@ -24,18 +24,21 @@
  *
  * The scan is a **hard gate** (no baseline): a broken link is a defect.
  *
- * **Current state (measured 2026-09-17, REQ-A377/A379 rounds): the gate is RED — 125
- * findings in 15 files.** 119 of them are in the 12 files under `docs/archive/2026-09/zh/`
- * (a committed snapshot copy of the Chinese docs, `d474f9ce`; its relative links describe
- * the tree as it was *before* the copy): 116 name a file that still exists elsewhere in the
- * repo, 3 name targets that no longer exist anywhere (`本文档`, `REQ_TRACEABILITY.md`). The
- * other 6 are in untracked, root-level audit documents from other sessions.
- * **The fix is a decision, not a mechanical edit** — either rewrite the archived links so
- * they resolve to today's paths (the archive then claims today's tree, which is not what an
- * archived snapshot is) or record that a frozen snapshot's links are out of scope (with a
- * reason, as the other scans do). It was **reported** rather than decided unilaterally; see
- * `docs/TRACEABILITY_MATRIX.md` REQ-A377 / REQ-A379 boundaries. The number drifts as other
- * sessions add documents: read it with `node scripts/docs-link-scan.mjs | grep -c FAIL`.
+ * **Current state (measured 2026-09-17, REQ-A381): the gate is GREEN again — 438 markdown
+ * files judged, 656 relative links resolved, 0 broken — and it got there by *deciding* two
+ * things rather than by weakening the check.** ①`docs/archive/` is now out of scope **with a
+ * reason** (`SKIP_PATHS` below): it is a committed frozen snapshot whose links describe the
+ * tree as it was when the document was written, and the measurement behind that decision is
+ * in the comment — 40 of its 53 files have no identical copy anywhere else, i.e. they are the
+ * only surviving copy of that content; ②the 6 remaining findings were in three *untracked*
+ * root documents that had been copied out of `docs/` / `frontend-ts/` and kept the original
+ * directory's relative paths; those were fixed as link hygiene (`./docs/X.md` → `docs/X.md`,
+ * `./src/lib/Y.ts` → the real frontend path, and two links that pointed at documents marked
+ * `待创建` / at the placeholder word `计划中` became plain text — a link to something that does
+ * not exist is a promise the document cannot keep).
+ *
+ * The exclusion is **reported on every run** ("N markdown file(s) … were NOT judged") and by
+ * `--json` (`skipped`), because a silent skip is the very defect this gate exists to prevent.
  *
  * Usage (repo root):
  *   node scripts/docs-link-scan.mjs             # gate (exit 1 on any break)
@@ -43,12 +46,42 @@
  *   node scripts/docs-link-scan.mjs --selftest  # pin strip/extract/classify
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repo = resolve(join(dirname(fileURLToPath(import.meta.url)), ".."));
 
 const SKIP_DIRS = new Set(["node_modules", "target", ".git", "dist"]);
+
+/**
+ * Paths whose markdown is **not a live index** and is therefore out of scope (REQ-A381).
+ *
+ * `docs/archive/` is a frozen snapshot: its relative links describe the tree **as it was when
+ * the document was written**, not as it is today. Measured on 2026-09-17: the 12 archived
+ * files with broken links held 119 of them — 111 point at a file that exists today *outside*
+ * the archive (the document has since moved), 3 at a sibling inside the archive, and 5 at
+ * targets that no longer exist anywhere; the archived copies themselves are not duplicates
+ * (40 of the 53 files in `docs/archive/2026-09/zh/` have no identical copy elsewhere, i.e.
+ * they are the only surviving copy of that content).
+ *
+ * Rewriting those links to today's paths would make an archived audit report cite **current**
+ * documents it never referenced — a false claim about what it documented — so the exclusion
+ * is a **recorded decision** rather than a rewrite. It is *reported on every run* (a silent
+ * skip is the very defect this gate exists to prevent): the script prints how many markdown
+ * files it did not judge, and `--json` carries them.
+ */
+const SKIP_PATHS = ["docs/archive/"];
+
+/** Markdown files under a deliberately skipped path (counted, never silently dropped). */
+function countMarkdown(dir, acc = []) {
+  for (const ent of readdirSync(dir, { withFileTypes: true })) {
+    if (SKIP_DIRS.has(ent.name)) continue;
+    const p = join(dir, ent.name);
+    if (ent.isDirectory()) countMarkdown(p, acc);
+    else if (ent.name.endsWith(".md")) acc.push(p);
+  }
+  return acc;
+}
 
 /**
  * Remove fenced + inline code so `[x](y)` inside code is not a link.
@@ -122,12 +155,18 @@ function walk(dir, acc = []) {
   for (const ent of readdirSync(dir, { withFileTypes: true })) {
     if (SKIP_DIRS.has(ent.name)) continue;
     const p = join(dir, ent.name);
+    const rel = p.slice(repo.length + 1).split(sep).join("/");
+    if (SKIP_PATHS.some((s) => rel.startsWith(s))) {
+      countMarkdown(p, skipped);
+      continue;
+    }
     if (ent.isDirectory()) walk(p, acc);
     else if (ent.name.endsWith(".md")) acc.push(p);
   }
   return acc;
 }
 
+const skipped = [];
 const mdFiles = walk(repo).sort();
 const broken = [];
 let checked = 0;
@@ -151,11 +190,20 @@ for (const file of mdFiles) {
 }
 
 if (process.argv.includes("--json")) {
-  console.log(JSON.stringify({ files: mdFiles.length, checked, broken }, null, 2));
+  console.log(
+    JSON.stringify({ files: mdFiles.length, skipped: skipped.length, checked, broken }, null, 2),
+  );
 } else {
   console.log(
     `[docs-link-scan] ${mdFiles.length} markdown file(s), ${checked} relative link(s) checked.`,
   );
+  if (skipped.length > 0) {
+    console.log(
+      `[docs-link-scan] note — ${skipped.length} markdown file(s) under ${SKIP_PATHS.join(", ")} were NOT judged: ` +
+        "an archived snapshot's relative links describe the tree as it was, and rewriting them to today's paths would " +
+        "make it cite documents it never referenced (recorded decision, REQ-A381).",
+    );
+  }
   if (broken.length === 0) {
     console.log("[docs-link-scan] OK — every relative link resolves.");
   }

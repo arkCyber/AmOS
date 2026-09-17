@@ -176,7 +176,7 @@
         id="serverUrl"
         type="url"
         class="form-input"
-        value={config.serverUrl}
+        value={config?.serverUrl ?? ""}
         oninput={updateServerUrl}
         placeholder="https://mdm.company.com"
         disabled={!config?.enabled}
@@ -188,7 +188,7 @@
         id="organizationId"
         type="text"
         class="form-input"
-        value={config.organizationId}
+        value={config?.organizationId ?? ""}
         oninput={updateOrganizationId}
         placeholder="org-12345"
         disabled={!config?.enabled}
@@ -200,7 +200,7 @@
         id="deviceId"
         type="text"
         class="form-input disabled-input"
-        value={config.deviceId}
+        value={config?.deviceId ?? ""}
         disabled
         readonly
       />
@@ -347,7 +347,7 @@
     
     <div class="sync-info">
       <span class="sync-label">最后同步:</span>
-      <span class="sync-time">{formatDate(lastSyncTime || config?.enrolledAt)}</span>
+      <span class="sync-time">{formatDate(lastSyncTime || config?.enrolledAt || 0)}</span>
     </div>
     
     <div class="action-buttons">

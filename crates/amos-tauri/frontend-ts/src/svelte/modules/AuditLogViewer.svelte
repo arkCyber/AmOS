@@ -340,23 +340,23 @@
     <h3 class="section-title">统计概览</h3>
     <div class="stats-grid">
       <div class="stat-item">
-        <div class="stat-value">{stats.total}</div>
+        <div class="stat-value">{stats.totalLogs}</div>
         <div class="stat-label">总计</div>
       </div>
       <div class="stat-item success">
-        <div class="stat-value">{stats.success}</div>
+        <div class="stat-value">{stats.successCount}</div>
         <div class="stat-label">成功</div>
       </div>
       <div class="stat-item failure">
-        <div class="stat-value">{stats.failure}</div>
+        <div class="stat-value">{stats.failureCount}</div>
         <div class="stat-label">失败</div>
       </div>
       <div class="stat-item warning">
-        <div class="stat-value">{stats.warning}</div>
+        <div class="stat-value">{stats.warningCount}</div>
         <div class="stat-label">警告</div>
       </div>
       <div class="stat-item blocked">
-        <div class="stat-value">{stats.blocked}</div>
+        <div class="stat-value">{stats.blockedCount}</div>
         <div class="stat-label">阻止</div>
       </div>
     </div>
@@ -490,10 +490,10 @@
               <span class="detail-label">邮箱:</span>
               <span class="detail-value">{selectedLog.userEmail}</span>
             </div>
-            {#if selectedLog.ipAddress}
+            {#if selectedLog.metadata?.ipAddress}
               <div class="detail-item">
                 <span class="detail-label">IP 地址:</span>
-                <span class="detail-value">{selectedLog.ipAddress}</span>
+                <span class="detail-value">{selectedLog.metadata.ipAddress}</span>
               </div>
             {/if}
           </div>

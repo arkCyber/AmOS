@@ -27,6 +27,7 @@
 
 package com.amos.ai.glue
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentUris
 import android.content.ContentValues
@@ -175,6 +176,7 @@ class MediaStoreGlue(private val context: Context) {
     // ---- load (read bytes back for a thumbnail / open) ----
 
     /** Read back the bytes of a content URI as {"base64":…} or {"error":…}. */
+    @SuppressLint("UseKtx") // Uri.parse is the platform API; androidx.core.net.toUri needs core-ktx, which the generated project does not depend on (REQ-A380)
     fun loadContent(uriStr: String): String {
         return try {
             if (!MediaPermissions.hasReadAccess(context)) {

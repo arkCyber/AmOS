@@ -11,14 +11,14 @@
 
   import { apiClient, webhookManager } from "../../lib/enterprise";
   import type { APIConfig } from "../../lib/enterprise/api";
-  import type { Webhook } from "../../lib/enterprise/webhooks";
+  import type { WebhookConfig } from "../../lib/enterprise/webhooks";
 
   // ============================================================================
   // 状态管理
   // ============================================================================
 
   let apiConfig = $state<APIConfig>(apiClient.getConfig());
-  let webhooks = $state<Webhook[]>(webhookManager.getAllWebhooks());
+  let webhooks = $state<WebhookConfig[]>(webhookManager.getWebhooks());
   let showTokenPlaintext = $state(false);
   let testingConnection = $state(false);
   let connectionStatus = $state<"success" | "error" | null>(null);
@@ -27,8 +27,8 @@
 
   // Webhook 编辑状态
   let showWebhookModal = $state(false);
-  let editingWebhook = $state<Webhook | null>(null);
-  let webhookForm = $state<Partial<Webhook>>({
+  let editingWebhook = $state<WebhookConfig | null>(null);
+  let webhookForm = $state<Partial<WebhookConfig>>({
     name: "",
     url: "",
     method: "POST",
@@ -117,7 +117,7 @@
   // 事件处理 - Webhook 管理
   // ============================================================================
 
-  function openWebhookModal(webhook?: Webhook) {
+  function openWebhookModal(webhook?: WebhookConfig) {
     if (webhook) {
       editingWebhook = webhook;
       webhookForm = { ...webhook };
@@ -175,11 +175,11 @@
 
     try {
       if (editingWebhook) {
-        webhookManager.updateWebhook(editingWebhook.id, webhookForm as Webhook);
+        webhookManager.updateWebhook(editingWebhook.id, webhookForm as Partial<WebhookConfig>);
       } else {
-        webhookManager.addWebhook(webhookForm as Omit<Webhook, "id" | "createdAt" | "updatedAt">);
+        webhookManager.addWebhook(webhookForm as Omit<WebhookConfig, "id" | "createdAt" | "updatedAt" | "lastTriggeredAt" | "triggerCount" | "successCount" | "failureCount">);
       }
-      webhooks = webhookManager.getAllWebhooks();
+      webhooks = webhookManager.getWebhooks();
       closeWebhookModal();
     } catch (error) {
       alert(`保存失败: ${error instanceof Error ? error.message : "未知错误"}`);
@@ -189,18 +189,19 @@
   function deleteWebhook(webhookId: string) {
     if (confirm("确定要删除这个 Webhook 吗？")) {
       webhookManager.deleteWebhook(webhookId);
-      webhooks = webhookManager.getAllWebhooks();
+      webhooks = webhookManager.getWebhooks();
     }
   }
 
   async function testWebhook(webhookId: string) {
     testingWebhook = true;
     try {
-      await webhookManager.trigger("test_event", {
-        message: "这是一个测试事件",
-        timestamp: Date.now(),
-      }, webhookId);
-      alert("测试事件已发送，请检查 Webhook 端点");
+      const result = await webhookManager.testWebhook(webhookId);
+      if (result.success) {
+        alert(`测试成功！响应时间: ${result.duration}ms`);
+      } else {
+        alert(`测试失败: ${result.error || "未知错误"}`);
+      }
     } catch (error) {
       alert(`测试失败: ${error instanceof Error ? error.message : "未知错误"}`);
     } finally {
@@ -212,7 +213,7 @@
     const webhook = webhooks.find(w => w.id === webhookId);
     if (webhook) {
       webhookManager.updateWebhook(webhookId, { ...webhook, enabled: !webhook.enabled });
-      webhooks = webhookManager.getAllWebhooks();
+      webhooks = webhookManager.getWebhooks();
     }
   }
 
@@ -230,11 +231,7 @@
     { id: "mdm_policy_change", label: "MDM 策略变更" },
   ];
 
-  function formatTriggerCount(webhook: Webhook): string {
-    return `${webhook.successCount || 0} / ${webhook.triggerCount || 0}`;
-  }
-
-  function getSuccessRate(webhook: Webhook): number {
+  function getSuccessRate(webhook: WebhookConfig): number {
     if (!webhook.triggerCount) return 0;
     return Math.round(((webhook.successCount || 0) / webhook.triggerCount) * 100);
   }

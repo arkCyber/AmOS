@@ -58,7 +58,6 @@
   let showSettings = $state(false);
   let showMenu = $state(false);
   let isDesktop = $state(false);
-  let isNavigating = $state(false);
 
   // 设置
   let settings = $state<WebManSettings>(loadSettings());
@@ -124,7 +123,6 @@
     // 应用安全搜索
     const finalUrl = applySafeSearch(safeUrl, settings.safeSearch);
 
-    isNavigating = true;
     inputValue = finalUrl;
 
     // 更新标签
@@ -140,7 +138,6 @@
 
     // 模拟加载完成
     setTimeout(() => {
-      isNavigating = false;
       tabs = tabs.map((tab) =>
         tab.id === activeTabId ? { ...tab, loading: false } : tab
       );
@@ -157,13 +154,11 @@
   // iframe 事件处理
   function handleIframeLoad() {
     logger.info('Iframe loaded successfully');
-    isNavigating = false;
   }
 
   function handleIframeError() {
     logger.error('Iframe failed to load');
     showToast(t("webman.toast.pageLoadFailed"));
-    isNavigating = false;
   }
 
   // Iframe 通信安全 (P1)

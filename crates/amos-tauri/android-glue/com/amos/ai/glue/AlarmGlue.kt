@@ -1,5 +1,6 @@
 package com.amos.ai.glue
 
+import android.annotation.SuppressLint
 import android.Manifest
 import android.app.Activity
 import android.app.AlarmManager
@@ -141,15 +142,17 @@ object AlarmGlue {
             Log.w(TAG, "alarm $id fired but its notification was not posted: $status")
             return status
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // Idempotent: an existing channel keeps its settings (the user's choices win). The name
-            // and description are the OS's own app label, so no language is hard-coded here.
-            val label = context.applicationInfo.loadLabel(context.packageManager)
-            manager?.createNotificationChannel(
-                NotificationChannel(ALARM_CHANNEL, label, NotificationManager.IMPORTANCE_HIGH)
-                    .apply { setDescription(label.toString()) },
-            )
-        }
+        // No `SDK_INT >= O` guard: `minSdk` is 26 (== `O`), so it was dead code — Lint said
+        // so (`ObsoleteSdkInt`), and a dead API-level claim is the defect class this repo
+        // treats as real (REQ-A380). `minSdk` in the generated build.gradle.kts is the
+        // authority for that.
+        // Idempotent: an existing channel keeps its settings (the user's choices win). The name
+        // and description are the OS's own app label, so no language is hard-coded here.
+        val label = context.applicationInfo.loadLabel(context.packageManager)
+        manager?.createNotificationChannel(
+            NotificationChannel(ALARM_CHANNEL, label, NotificationManager.IMPORTANCE_HIGH)
+                .apply { setDescription(label.toString()) },
+        )
         val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
             ?: return NOTIFY_UNAVAILABLE
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -275,6 +278,7 @@ object AlarmGlue {
      */
     internal fun alarmIdentity(id: String): String = "$ALARM_SCHEME://$id"
 
+    @SuppressLint("UseKtx") // Uri.parse is the platform API; androidx.core.net.toUri needs core-ktx, which the generated project does not depend on (REQ-A380)
     private fun pending(context: Context, id: String, atMs: Long): PendingIntent {
         val target = Intent(context, AlarmReceiver::class.java)
             .setAction(ACTION_EXACT)
@@ -301,11 +305,9 @@ object AlarmGlue {
             return STATUS_DISALLOWED
         }
         return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMs, pending(context, id, atMs))
-            } else {
-                am.setExact(AlarmManager.RTC_WAKEUP, atMs, pending(context, id, atMs))
-            }
+            // `setExactAndAllowWhileIdle` is API 23 and `minSdk` is 26, so the
+            // `setExact` fallback was dead code (Lint: `ObsoleteSdkInt`; REQ-A380).
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMs, pending(context, id, atMs))
             Log.i(TAG, "scheduled exact alarm $id at $atMs")
             STATUS_SCHEDULED
         } catch (e: SecurityException) {

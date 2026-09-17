@@ -32,7 +32,7 @@
 
 ### 📋 阶段性报告
 
-5. **[Phase 1 完成报告](P3_DESKTOP_PHASE1_COMPLETE.md)** (310 行)
+5. **[Phase 1 完成报告](P3_DESKTOP_ENHANCEMENTS_PHASE1_COMPLETE.md)** (310 行)
    - **范围**: 热角实现 + Finder 单元测试强化
    - **时间**: 2.5 天
    - **成果**: 54 单元测试、热角 5 种动作

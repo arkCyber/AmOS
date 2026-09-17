@@ -3,7 +3,6 @@ package com.amos.ai.glue
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 
@@ -32,7 +31,6 @@ import android.os.Looper
 object FlashlightGlue {
 
     /** `CameraManager#setTorchMode`/torch callbacks require API 23+. */
-    private const val TORCH_API = 23
 
     private var boundCameraId: String? = null
 
@@ -45,7 +43,9 @@ object FlashlightGlue {
      */
     fun bind(context: Context) {
         if (boundCameraId != null) return // already bound the real device picture
-        if (Build.VERSION.SDK_INT < TORCH_API) return // no torch APIs on this device
+        // No `SDK_INT` guard here: the torch API is API 23 and `minSdk` is 26, so the old
+        // early-return was dead code (Lint: `ObsoleteSdkInt`; REQ-A380). A torch-less device
+        // is still handled below — `torchCamera` returns null and the glue stays inert.
         val app = context.applicationContext
         val cm = app.getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return
         val (cameraId, hasFlash) = torchCamera(cm)

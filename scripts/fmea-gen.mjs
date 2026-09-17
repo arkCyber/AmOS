@@ -128,6 +128,11 @@ const KNOWN_FAILURES = [
   // REQ-A372: the ledger's *completeness* claim was never checked — 54 requirement numbers are
   // cited by shipped code and have no row, and the header read as if it were the whole index.
   { id: 'F-DEV-008', module: 'process', files: ['scripts/trace-scan.mjs', 'docs/TRACEABILITY_MATRIX.md'], markers: ['danglingCitations', 'partial', 'REQ-A372'], severity: 2 },
+  // REQ-A381: the link gate called itself a hard gate while the tree was red — a committed
+  // archive snapshot (40/53 files unique in the repo) contributed 119 broken links and nobody
+  // had ever decided whether a frozen snapshot is in scope; 6 more came from three untracked
+  // root documents written with another directory's relative paths.
+  { id: 'F-DEV-009', module: 'process', files: ['scripts/docs-link-scan.mjs'], markers: ['SKIP_PATHS', 'were NOT judged', 'skipped'], severity: 2 },
   { id: 'F-SH-025', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte'], markers: ['没有可显示的界面', 'monitor'], severity: 3 },
 
   // System UI 桥

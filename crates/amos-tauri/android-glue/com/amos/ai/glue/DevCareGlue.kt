@@ -37,6 +37,7 @@
 
 package com.amos.ai.glue
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -57,6 +58,7 @@ import java.io.File
 import java.lang.ref.WeakReference
 
 /** System-UI-side device-care glue handed to Rust via `attach`. */
+@SuppressLint("StaticFieldLeak") // an APPLICATION context is not a leak: the process and it share a lifetime (REQ-A380)
 object DevCareGlue {
 
     private const val TAG = "DevCareGlue"
@@ -91,6 +93,7 @@ object DevCareGlue {
     private const val BATTERY_STATUS_ABSENT = -1
 
     @Volatile
+    @SuppressLint("StaticFieldLeak") // an APPLICATION context is not a leak: the process and it share a lifetime (REQ-A380)
     private var app: Context? = null
 
     /** The foreground Activity, needed for the uninstall dialog on Android 10+. */
@@ -366,6 +369,7 @@ object DevCareGlue {
      * reports the result asynchronously, so the reply says `launched`, never
      * "removed". The Rust `UninstallGuard` policy has already run by this point.
      */
+    @SuppressLint("UseKtx") // Uri.parse is the platform API; androidx.core.net.toUri needs core-ktx, which the generated project does not depend on (REQ-A380)
     fun uninstallApp(id: String): String {
         val ctx = app ?: return err("DevCareGlue not bound")
         if (id.isBlank()) return err("empty package id")
@@ -511,6 +515,7 @@ object DevCareGlue {
      * too — this is defence in depth). A directory is deleted with a plain
      * `delete()`, which only succeeds when empty (never a recursive delete).
      */
+    @SuppressLint("UseKtx") // Uri.parse is the platform API; androidx.core.net.toUri needs core-ktx, which the generated project does not depend on (REQ-A380)
     fun removeJunk(uri: String): String {
         val ctx = app ?: return err("DevCareGlue not bound")
         return try {

@@ -12,8 +12,8 @@
    */
 
   import { templateManager } from "../../lib/enterprise";
-  import type { EnterpriseTemplate, TemplateParameter } from "../../lib/enterprise/templates";
-  import { loadShortcuts, type Shortcut } from "../../lib/shortcuts";
+  import type { EnterpriseTemplate } from "../../lib/enterprise/templates";
+  import { loadShortcuts } from "../../lib/shortcuts";
 
   // ============================================================================
   // 状态管理
@@ -37,7 +37,7 @@
       search: searchQuery.trim() || undefined,
       category: selectedCategory,
       department: selectedDepartment,
-      publishStatus: "published",
+      status: "published",
     })
   );
 
@@ -56,14 +56,14 @@
   // 辅助函数
   // ============================================================================
 
-  function getInstallCount(templateId: string): number {
-    const installations = templateManager.getInstallations({ templateId });
-    return installations.length;
+  function getInstallCount(_templateId: string): number {
+    // 简化实现：暂不支持安装计数
+    return 0;
   }
 
   function isInstalled(templateId: string): boolean {
-    const installations = templateManager.getInstallations({ templateId });
-    return installations.some(i => i.status === "active");
+    // 检查是否已安装此模板
+    return installedShortcuts.some((s: any) => s.templateId === templateId);
   }
 
   function getCategoryIcon(category: string): string {

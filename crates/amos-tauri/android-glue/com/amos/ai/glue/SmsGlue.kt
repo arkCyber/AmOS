@@ -20,6 +20,7 @@
 
 package com.amos.ai.glue
 
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -53,6 +54,7 @@ object SmsPermissions {
 }
 
 /** System-UI-side SMS glue handed to the Rust `AndroidSmsProvider` via `attach`. */
+@SuppressLint("StaticFieldLeak") // an APPLICATION context is not a leak: the process and it share a lifetime (REQ-A380)
 object SmsGlue {
 
     /** Caps mirroring crates/amos-sms/src/wire.rs (protocol contract). */
@@ -75,12 +77,14 @@ object SmsGlue {
      */
     private const val SNAPSHOT_ROW_LIMIT = 4000
 
+    @SuppressLint("UseKtx") // Uri.parse is the platform API; androidx.core.net.toUri needs core-ktx, which the generated project does not depend on (REQ-A380)
     private val URI: Uri = Uri.parse("content://sms")
 
     /** Log tag (registration/delivery diagnostics must never be silent). */
     private const val TAG = "SmsGlue"
 
     @Volatile
+    @SuppressLint("StaticFieldLeak") // an APPLICATION context is not a leak: the process and it share a lifetime (REQ-A380)
     private var app: Context? = null
 
     /** Registered once in [bind]; delivers `SMS_RECEIVED` as a live refresh. */

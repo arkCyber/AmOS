@@ -336,10 +336,19 @@ manifest）—— 它可以照旧通过，而两边写着**同一个错名字** 
 | `BluetoothGlue.kt` ×8 | `MissingPermission` | **不是缺陷**：每个调用都在 `try/catch (Throwable)` 里，平台拒绝会被转成如实的 `false` / 日志 ✓（`startDiscovery` 还先过 `canScan()` ✓）—— lint 两边都看不见 ✗ ⇒ **逐点 `@SuppressLint("MissingPermission")` + 写明理由** ✓（第一处写了完整理由，其余七处引用它） |
 | `MediaStoreGlue.kt` ×4（warning `InlinedApi`） | `MediaStore.VOLUME_EXTERNAL_PRIMARY`（API 29） | **真的缺陷** ✓：`MediaStore.*.getContentUri(String volume)` **本身就是 API 29 的 API** ⇒ 在 API 26..28 上是 `NoSuchMethodError`，被本类的错误路径接住 ⇒ **那些路径在 26..28 上等于静默死亡** ✗（而 `minSdk` 就是 26 ✓）。修法：`mediaCollection(legacy, volumeBased)` —— API ≥ 29 用卷形式、以下退回 `EXTERNAL_CONTENT_URI` ✓ |
 
+### 16 条 warning 逐条裁定（这一半才是「报告不是决定」的地方）
+
+| 判据 | 条数 | 裁定 |
+|---|---|---|
+| `ObsoleteSdkInt` | 3 | **删掉死代码** ✓（`minSdk 26` 是权威）：`AlarmGlue` 的 `SDK_INT >= O`（26）与 `SDK_INT >= M`（23）分支、`FlashlightGlue` 的 `SDK_INT < 23` 早退 —— 三条都**永远为真/为假**，删掉是**行为等价**的，留着的只是"一个什么也不做的 API 级别声称" ✓（`TORCH_API` 常量随之删除，否则会变成未使用的私有常量，被编译门抓住 ✓） |
+| `StaticFieldLeak` | 6 | **抑制 + 理由** ✓：三个 `object` 单例（`ClipboardGlue`/`DevCareGlue`/`SmsGlue`）存的都是 `context.applicationContext` ✓（`bind()` 里赋值 ✓，`ClipboardGlue.unbind()` 还置空 ✓）⇒ **与进程同生命周期，不是泄漏** ✗；lint 分不清 Activity context 与 application context（它看不穿 `bind()` 的调用者）✓ |
+| `UseKtx` | 5 | **抑制 + 理由** ✓：lint 建议 `String.toUri()`，那是 **androidx.core-ktx** 的扩展 ✓ —— 生成工程不依赖 core-ktx ✓，而 `Uri.parse` 是平台 API ✓（加依赖要手改 git-ignored 的 `gen/`，比这 5 处建议贵得多 ✓） |
+| `InlinedApi` | 2 | **抑制 + 理由** ✓：`Manifest.permission.BLUETOOTH_SCAN`（API 31）与 `Settings.Panel.ACTION_INTERNET_CONNECTIVITY`（API 29）都是**编译期内联的常量**（值被内联，不是 API 调用 ✓）；后者在 29 以下**不解析** ⇒ 被 catch 接住并**回退到 `ACTION_WIRELESS_SETTINGS`** ✓（已有行为 ✓，只是 lint 看不见 ✓） |
+
 **门现在做什么**：`make android-glue-check` 的第三阶段跑 `:app:lintArmDebug`（默认 `--offline`）并：
-①**我们 glue 里的 error 必须为 0**（有即列出文件:行 并失败 ✗）；
-②**warning 只报告不判定** ✓（当前 16 条，按 issue id 归类打印：`StaticFieldLeak` ×6（`object` 单例持有 Context，lint 分不清 application context ✓）、`UseKtx` ×5（建议用 androidx.core-ktx 的 `String.toUri`，本仓不依赖 core-ktx ✓）、`ObsoleteSdkInt` ×3（`minSdk 26` 下恒真的版本判断 ✓）、`InlinedApi` ×2（`Manifest.permission.BLUETOOTH_SCAN` / `Settings.Panel.ACTION_INTERNET_CONNECTIVITY`，都是编译期内联的常量 ✓））；
-③**生成工程里的 findings 只报告** ✓（machine-owned，与 `gen/` 的既有约定一致）；
+①**我们 glue 的 findings 必须为 0** ✓（**error 与 warning 都算** ✓ —— 上表满 16 条已全部裁定 ✓）；有则按 `文件:行` 列出并失败 ✗；
+②**「接受」只能写在源码里** ✓（`@SuppressLint("…") // 理由` ✓）⇒ **新出现的 warning 就是"没人做过的决定"** ✓，而不是被基线悄悄吞掉 ✓；
+③**生成工程 / Tauri 自己的 findings 只报告** ✓（按 issue id 归类打印：`UnusedResources` 12 ✓、`PermissionImpliesUnsupportedHardware` 8 ✓、`GradleDependency` 8 ✓、`SelectedPhotoAccess` 2 ✓ ……）—— 其中 **`PermissionImpliesUnsupportedHardware` / `…ChromeOsHardware` / `SelectedPhotoAccess` 其实源自我们声明的权限** ✓（`CAMERA`/`RECORD_AUDIO`/`BLUETOOTH_*`/`READ_MEDIA_*` ⇒ Android/Play 会推断"需要这些硬件" ✓）。**本轮的决定**：**接受**（AmOS 是装到**已知硬件**上的系统 UI，走 adb 不走 Play ✓）⇒ 若要上 Play，得加一份 `<uses-feature android:required="false">` 片段并接进手工合并流程 ✓（记为下一步 ✓）；
 ④**没有报告文件 ⇒ 失败** ✓（"读不到"不等于"没问题"）；
 ⑤分类器带**自检** ✓（一条 glue error + 一条 generated error + 一条 glue warning ⇒ 必须数出 1/1 ✓）。
 

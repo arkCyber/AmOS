@@ -352,8 +352,8 @@ src/lib/__tests__/enterprise.test.ts:
 ## 📚 相关文档
 
 - [企业功能代码审计报告](./ENTERPRISE_CODE_AUDIT_REPORT.md)
-- [企业功能开发指南](./docs/ENTERPRISE_GUIDE.md) (待创建)
-- [安全最佳实践](./docs/SECURITY.md) (待创建)
+- 企业功能开发指南：`docs/ENTERPRISE_GUIDE.md`（待创建）
+- 安全最佳实践：`docs/SECURITY.md`（待创建）
 
 ---
 

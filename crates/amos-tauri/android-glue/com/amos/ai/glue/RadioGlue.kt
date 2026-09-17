@@ -1,5 +1,6 @@
 package com.amos.ai.glue
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -103,6 +104,7 @@ object RadioGlue {
      * activity-start restrictions do not apply.
      */
     @JvmStatic
+    @SuppressLint("InlinedApi") // Settings.Panel.ACTION_INTERNET_CONNECTIVITY (API 29) is a compile-time-inlined String constant; below 29 the panel does not resolve and the catch retries ACTION_WIRELESS_SETTINGS (REQ-A380)
     fun openSystemSurface(context: Context, surface: String): Boolean {
         val intent = try {
             when (surface) {

@@ -1,5 +1,6 @@
 package com.amos.ai.glue
 
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -30,12 +31,14 @@ import android.os.SystemClock
  * Bring-up skeleton like `SensorGlue`/`CameraGlue`: verified at device time after
  * `tauri android init` once the System UI APK ships `libamos_tauri_lib.so`.
  */
+@SuppressLint("StaticFieldLeak") // an APPLICATION context is not a leak: the process and it share a lifetime (REQ-A380)
 object ClipboardGlue : ClipboardManager.OnPrimaryClipChangedListener {
 
     /** Copies we mirrored *out* (Rust push) are not re-ingested as inbound ones. */
     private const val SUPPRESS_WINDOW_MS = 500L
 
     private var clip: ClipboardManager? = null
+    @SuppressLint("StaticFieldLeak") // an APPLICATION context is not a leak: the process and it share a lifetime (REQ-A380)
     private var context: Context? = null
 
     // Suppress echo of our own Rust ─► Android pushes on the change listener.

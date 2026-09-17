@@ -168,8 +168,10 @@ object BluetoothGlue {
      * Lint's `MissingPermission` check cannot follow either guard, so each site carries this
      * suppression **with this reason** rather than a permission check that would only
      * duplicate it (REQ-A380). The same reason applies to the other eight sites in this file.
+     * `InlinedApi` is suppressed for the same kind of reason: the `BLUETOOTH_SCAN` field below
+     * is a compile-time-inlined String constant (the value, not an API-31 call).
      */
-    @SuppressLint("MissingPermission")
+    @SuppressLint("MissingPermission", "InlinedApi")
     @JvmStatic
     fun startDiscovery(context: Context): Boolean {
         val app = context.applicationContext
