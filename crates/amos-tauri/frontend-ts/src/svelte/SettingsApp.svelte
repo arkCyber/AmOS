@@ -62,6 +62,7 @@
   import LinkPage from "./settings/LinkPage.svelte";
   import KeyboardPage from "./settings/KeyboardPage.svelte";
   import DockPage from "./settings/DockPage.svelte";
+  import HotCornersPage from "./settings/HotCornersPage.svelte";
 
   type Sub =
     | "account"
@@ -76,6 +77,7 @@
     | "display"
     | "wallpaper"
     | "dock"
+    | "hotcorners"
     | "language"
     | "ime"
     | "keyboard"
@@ -103,6 +105,7 @@
     display: "settings.displayBrightness",
     wallpaper: "settings.wallpaper",
     dock: "settings.dock.title",
+    hotcorners: "settings.hotCorners",
     language: "settings.language",
     ime: "settings.ime",
     keyboard: "settings.keyboard",
@@ -135,6 +138,7 @@
     display: ["brightness", "dark", "亮度", "深色", "浅色"],
     wallpaper: ["background", "背景", "图片"],
     dock: ["程序坞", "底部", "左侧", "右侧", "放大", "自动隐藏", "magnification", "auto-hide", "position"],
+    hotcorners: ["hot corners", "热角", "角落", "触发", "trigger", "mission control", "launchpad", "desktop"],
     language: ["简体", "中文", "english", "语言"],
     ime: ["pinyin", "keyboard", "input method", "输入法", "拼音", "键盘", "模糊音"],
     lock: ["password", "passcode", "pin", "密码", "面容"],
@@ -336,6 +340,7 @@
       { kind: "nav", page: "display", key: "settings.displayBrightness" },
       { kind: "nav", page: "wallpaper", key: "settings.wallpaper" },
       { kind: "nav", page: "dock", key: "settings.dock.title" },
+      { kind: "nav", page: "hotcorners", key: "settings.hotCorners" },
       { kind: "nav", page: "lock", key: "settings.passcode", sub: () => lockSub },
     ],
     // 账户与功能：语言 / iCloud / AI 与智能 / 隐私与安全性
@@ -494,6 +499,8 @@
         <WallpaperPage />
       {:else if page === "dock"}
         <DockPage />
+      {:else if page === "hotcorners"}
+        <HotCornersPage />
       {:else if page === "language"}
         <LanguagePage />
       {:else if page === "ime"}

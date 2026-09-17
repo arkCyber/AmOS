@@ -73,11 +73,19 @@ hyper-util.workspace = true
 serde.workspace = true
 serde_json = "1.0"
 base64 = "0.21"
+chrono = { version = "0.4", features = ["serde"] }
 # PTY for the terminal backend; enabled only by the `terminal-pty` feature.
 portable-pty = { version = "0.8", optional = true }
 # dirs: home dir / XDG paths used by wine.rs and linux_apps.rs (both desktop-only modules).
 dirs = "5.0"
 tracing.workspace = true
+
+# macOS/iOS AirPlay integration via AVFoundation
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSNotification", "NSValue"] }
+objc2-av-foundation = { version = "0.3", features = ["AVRouteDetector", "AVPlayer", "AVAudioSession"] }
+block2 = "0.5"
 
 # Opt-in local streaming ASR: compiles + links the native sherpa-onnx lib.
 # Enable with `--features sherpa-asr` (or via tauri), and set AMOS_SHERPA_MODEL_DIR

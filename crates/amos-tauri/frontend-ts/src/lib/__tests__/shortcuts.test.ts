@@ -410,8 +410,8 @@ describe("快捷指令核心功能", () => {
 
   describe("数据持久化", () => {
     test("保存和加载快捷指令", () => {
-      const shortcut1 = createShortcut("快捷指令1");
-      const shortcut2 = createShortcut("快捷指令2");
+      createShortcut("快捷指令1");
+      createShortcut("快捷指令2");
 
       const loaded = loadShortcuts();
       expect(loaded).toHaveLength(2);

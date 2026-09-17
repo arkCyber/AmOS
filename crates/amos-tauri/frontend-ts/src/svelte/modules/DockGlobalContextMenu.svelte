@@ -10,7 +10,13 @@
    *   • 打开"程序坞偏好设置"入口
    *
    * 这遵循 macOS 的 UX 模式：快速调整常用配置 + "更多选项..." 入口。
+   * 
+   * A11y 特性：
+   *   • 自动焦点管理（打开时聚焦第一个菜单项）
+   *   • 键盘导航（Arrow keys, Home/End）
+   *   • Escape 关闭（由 Dock.svelte 处理）
    */
+  import { onMount } from "svelte";
   import { t } from "../locale.svelte";
   import {
     CHROME_MENU_ITEM,
@@ -41,6 +47,51 @@
     onIconSizeChange?: (delta: number) => void;
     onOpenPreferences?: () => void;
   } = $props();
+
+  let menuEl: HTMLDivElement | undefined = $state();
+  let menuItems: HTMLButtonElement[] = $state([]);
+  let currentFocusIndex = $state(0);
+
+  onMount(() => {
+    // 收集所有可聚焦的菜单项（排除禁用的）
+    if (!menuEl) return;
+    
+    menuItems = Array.from(
+      menuEl.querySelectorAll('button[role^="menuitem"]:not([disabled])')
+    ) as HTMLButtonElement[];
+    
+    // 自动聚焦第一个菜单项
+    if (menuItems.length > 0) {
+      menuItems[0]?.focus();
+    }
+  });
+
+  function handleKeyDown(e: KeyboardEvent) {
+    if (!menuItems || menuItems.length === 0) return;
+
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        currentFocusIndex = (currentFocusIndex + 1) % menuItems.length;
+        menuItems[currentFocusIndex]?.focus();
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        currentFocusIndex = (currentFocusIndex - 1 + menuItems.length) % menuItems.length;
+        menuItems[currentFocusIndex]?.focus();
+        break;
+      case "Home":
+        e.preventDefault();
+        currentFocusIndex = 0;
+        menuItems[0]?.focus();
+        break;
+      case "End":
+        e.preventDefault();
+        currentFocusIndex = menuItems.length - 1;
+        menuItems[menuItems.length - 1]?.focus();
+        break;
+    }
+  }
 
   function handlePositionChange(position: DockPosition) {
     onclose?.();
@@ -83,8 +134,10 @@
   - 玻璃质感（与 Dock 一致）
   - 分组显示配置选项
   - 支持快速切换和调整
+  - 键盘导航（Arrow keys, Home/End）
 -->
 <div
+  bind:this={menuEl}
   class="fixed z-[200] {CHROME_MENU_PANEL}"
   style="
     left:{x}px;
@@ -92,8 +145,10 @@
     {CHROME_MENU_PANEL_STYLE}
   "
   role="menu"
+  tabindex="-1"
   aria-label={t("desktop.dockGlobalCtxDockPrefs")}
   data-testid="dock-global-context-menu"
+  onkeydown={handleKeyDown}
 >
   <!-- 位置 -->
   <div class="px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-neutral-500 dark:text-neutral-400">
@@ -161,7 +216,7 @@
   <button
     type="button"
     role="menuitem"
-    class={CHROME_MENU_ITEM}
+    class="{CHROME_MENU_ITEM} {prefs.magnification >= 2.0 ? 'opacity-40 cursor-not-allowed' : ''}"
     onclick={handleMagnificationIncrease}
     disabled={prefs.magnification >= 2.0}
     aria-disabled={prefs.magnification >= 2.0 ? "true" : undefined}
@@ -174,7 +229,7 @@
   <button
     type="button"
     role="menuitem"
-    class={CHROME_MENU_ITEM}
+    class="{CHROME_MENU_ITEM} {prefs.magnification <= 1.0 ? 'opacity-40 cursor-not-allowed' : ''}"
     onclick={handleMagnificationDecrease}
     disabled={prefs.magnification <= 1.0}
     aria-disabled={prefs.magnification <= 1.0 ? "true" : undefined}
@@ -194,7 +249,7 @@
   <button
     type="button"
     role="menuitem"
-    class={CHROME_MENU_ITEM}
+    class="{CHROME_MENU_ITEM} {prefs.iconSize >= 64 ? 'opacity-40 cursor-not-allowed' : ''}"
     onclick={handleIconSizeIncrease}
     disabled={prefs.iconSize >= 64}
     aria-disabled={prefs.iconSize >= 64 ? "true" : undefined}
@@ -207,7 +262,7 @@
   <button
     type="button"
     role="menuitem"
-    class={CHROME_MENU_ITEM}
+    class="{CHROME_MENU_ITEM} {prefs.iconSize <= 32 ? 'opacity-40 cursor-not-allowed' : ''}"
     onclick={handleIconSizeDecrease}
     disabled={prefs.iconSize <= 32}
     aria-disabled={prefs.iconSize <= 32 ? "true" : undefined}

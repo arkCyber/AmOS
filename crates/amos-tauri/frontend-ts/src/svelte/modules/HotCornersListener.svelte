@@ -11,7 +11,7 @@
    * - Modifier key support
    * - No DOM manipulation (delegates to shellModule)
    */
-  import { onMount } from "svelte";
+  import { onMount, getContext } from "svelte";
   import { readStoreValue } from "../../lib/amosStore";
   import {
     DEFAULT_HOT_CORNERS,
@@ -23,7 +23,9 @@
     type HotCornerAction,
     type HotCornerConfig,
   } from "../../lib/hotCorners";
-  import { openModule } from "../../lib/shellModule";
+  import { SHELL_CHROME_API, type ShellChromeApi } from "../../lib/shellModule";
+
+  const api = getContext<ShellChromeApi>(SHELL_CHROME_API);
 
   let configs = $state<HotCornerConfig[]>(
     normalizeHotCorners(readStoreValue(HOT_CORNER_KEY, DEFAULT_HOT_CORNERS))
@@ -88,12 +90,17 @@
   }
 
   function triggerAction(action: HotCornerAction) {
+    if (!api) {
+      console.warn("ShellChromeApi not available");
+      return;
+    }
+
     switch (action) {
       case "mission-control":
-        openModule("spaces");
+        api.toggleOverlay("spaces");
         break;
       case "launchpad":
-        openModule("launchpad");
+        api.openLaunchpad();
         break;
       case "desktop":
         // TODO: Minimize all windows (show desktop)
@@ -101,10 +108,10 @@
         console.log("🖥️ Show Desktop (not yet implemented)");
         break;
       case "lock-screen":
-        openModule("lock");
+        api.lockScreen();
         break;
       case "notification-center":
-        openModule("control-center");
+        api.toggleOverlay("control-center-panel");
         break;
       case "disabled":
         // Should never reach here

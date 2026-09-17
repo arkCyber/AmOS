@@ -41,8 +41,8 @@ export interface Measurement {
 export const MEASURE_SETTINGS_KEY = "amos.measure.settings";
 export const MEASURE_HISTORY_KEY = "amos.measure.history";
 
-/** Default reference distance (mm) - assumes ~500mm (50cm) from camera. */
-const DEFAULT_REFERENCE_DISTANCE = 500;
+/** Default reference distance (mm) - assumes ~1000mm (1m) from camera. */
+const DEFAULT_REFERENCE_DISTANCE = 1000;
 
 /** Default settings. */
 export function defaultMeasureSettings(): MeasureSettings {
@@ -90,8 +90,8 @@ export function normalizeMeasureHistory(raw: unknown): Measurement[] {
         end: obj.end as MeasurePoint,
         distance: obj.distance,
         timestamp: obj.timestamp,
-        label: typeof obj.label === "string" ? obj.label : undefined,
-      };
+        ...(typeof obj.label === "string" ? { label: obj.label } : {}),
+      } satisfies Measurement;
     })
     .filter((m): m is Measurement => m !== null)
     .slice(0, 50); // Keep last 50 measurements
@@ -200,33 +200,39 @@ export function parseDistance(input: string): number | null {
   
   // Metric
   const mmMatch = trimmed.match(/^([\d.]+)\s*mm$/);
-  if (mmMatch) return parseFloat(mmMatch[1]);
+  if (mmMatch?.[1]) return parseFloat(mmMatch[1]);
   
   const cmMatch = trimmed.match(/^([\d.]+)\s*cm$/);
-  if (cmMatch) return parseFloat(cmMatch[1]) * 10;
+  if (cmMatch?.[1]) return parseFloat(cmMatch[1]) * 10;
   
   const mMatch = trimmed.match(/^([\d.]+)\s*m$/);
-  if (mMatch) {
+  if (mMatch?.[1]) {
     const val = parseFloat(mMatch[1]);
     return isNaN(val) ? null : val * 1000;
   }
   
   // Imperial (must come before bare number check)
   const inMatch = trimmed.match(/^([\d.]+)\s*(?:in|")$/);
-  if (inMatch) return parseFloat(inMatch[1]) * 25.4;
+  if (inMatch?.[1]) return parseFloat(inMatch[1]) * 25.4;
   
   const ftMatch = trimmed.match(/^([\d.]+)\s*(?:ft|')$/);
-  if (ftMatch) return parseFloat(ftMatch[1]) * 304.8;
+  if (ftMatch?.[1]) return parseFloat(ftMatch[1]) * 304.8;
   
   // Feet + inches (e.g. "5' 6\"", "5ft 6in")
   const ftInMatch = trimmed.match(/^([\d.]+)\s*(?:ft|')\s*([\d.]+)\s*(?:in|")?$/);
-  if (ftInMatch) {
+  if (ftInMatch?.[1] && ftInMatch?.[2]) {
     const feet = parseFloat(ftInMatch[1]);
     const inches = parseFloat(ftInMatch[2]);
     return (feet * 12 + inches) * 25.4;
   }
   
   return null;
+}
+
+export interface CalibrationResult {
+  success: boolean;
+  value: number;
+  reason?: "too_close" | "too_far" | "success";
 }
 
 /**
@@ -238,7 +244,7 @@ export function calibrateReference(
   measuredPixels: number,
   viewportWidth: number,
   currentReference: number,
-): number {
+): CalibrationResult {
   // Reverse the estimation formula
   const fovRadians = (60 * Math.PI) / 180;
   const pixelRatio = measuredPixels / viewportWidth;
@@ -246,19 +252,26 @@ export function calibrateReference(
   const newReference = referenceWidth / (2 * Math.tan(fovRadians / 2));
   
   // Sanity check: reference distance should be 100-2000mm
-  if (newReference < 100 || newReference > 2000) {
-    return currentReference; // Keep current if calibration seems wrong
+  if (newReference < 100) {
+    return { success: false, value: currentReference, reason: "too_close" };
+  }
+  if (newReference > 2000) {
+    return { success: false, value: currentReference, reason: "too_far" };
   }
   
-  return newReference;
+  return { success: true, value: newReference, reason: "success" };
 }
 
 /** Common reference objects for calibration. */
 export const REFERENCE_OBJECTS = {
   creditCard: { name: "credit_card", size: 85.6, unit: "mm" as const },
   a4Paper: { name: "a4_paper", size: 297, unit: "mm" as const },
-  usDollar: { name: "us_dollar", size: 156, unit: "mm" as const },
-  usLetter: { name: "us_letter", size: 279.4, unit: "mm" as const },
+  basketball: { name: "basketball", size: 240, unit: "mm" as const },
+  tennis: { name: "tennis", size: 67, unit: "mm" as const },
+  brick: { name: "brick", size: 190, unit: "mm" as const },
+  ipad: { name: "ipad", size: 178.5, unit: "mm" as const },
+  iphone: { name: "iphone", size: 160.8, unit: "mm" as const },
+  hand: { name: "hand", size: 90, unit: "mm" as const },
 } as const;
 
 /** Get reference object by name. */

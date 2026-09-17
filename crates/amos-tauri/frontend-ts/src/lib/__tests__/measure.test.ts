@@ -31,7 +31,7 @@ describe("measure", () => {
       const partial = { unit: "metric" as const };
       const result = normalizeMeasureSettings(partial);
       expect(result.unit).toBe("metric");
-      expect(result.referenceDistance).toBe(500);
+      expect(result.referenceDistance).toBe(1000);
       expect(result.showGuides).toBe(true);
     });
 
@@ -39,7 +39,7 @@ describe("measure", () => {
       const invalid = { unit: "unknown", referenceDistance: -100, showGuides: "yes" };
       const result = normalizeMeasureSettings(invalid);
       expect(result.unit).toBe("metric");
-      expect(result.referenceDistance).toBe(500);
+      expect(result.referenceDistance).toBe(1000);
       expect(result.showGuides).toBe(true);
     });
   });
@@ -58,7 +58,7 @@ describe("measure", () => {
       ];
       const result = normalizeMeasureHistory(mixed);
       expect(result).toHaveLength(1);
-      expect(result[0].id).toBe("m1");
+      expect(result[0]?.id).toBe("m1");
     });
 
     it("keeps optional label field", () => {
@@ -73,7 +73,7 @@ describe("measure", () => {
         },
       ];
       const result = normalizeMeasureHistory(withLabel);
-      expect(result[0].label).toBe("Test measurement");
+      expect(result[0]?.label).toBe("Test measurement");
     });
 
     it("limits to last 50 measurements", () => {
@@ -255,22 +255,39 @@ describe("measure", () => {
       const viewportWidth = 1000;
       const currentRef = 500;
       
-      const newRef = calibrateReference(knownSize, measuredPixels, viewportWidth, currentRef);
+      const result = calibrateReference(knownSize, measuredPixels, viewportWidth, currentRef);
       
-      expect(newRef).toBeGreaterThan(100);
-      expect(newRef).toBeLessThan(2000);
-      expect(newRef).not.toBe(currentRef);
+      expect(result.success).toBe(true);
+      expect(result.value).toBeGreaterThan(100);
+      expect(result.value).toBeLessThan(2000);
+      expect(result.value).not.toBe(currentRef);
+      expect(result.reason).toBe("success");
     });
 
-    it("rejects unrealistic calibrations", () => {
+    it("rejects unrealistic calibrations (too close)", () => {
       const knownSize = 85.6;
       const measuredPixels = 1; // Too small
       const viewportWidth = 1000;
       const currentRef = 500;
       
-      const newRef = calibrateReference(knownSize, measuredPixels, viewportWidth, currentRef);
+      const result = calibrateReference(knownSize, measuredPixels, viewportWidth, currentRef);
       
-      expect(newRef).toBe(currentRef); // Keep current
+      expect(result.success).toBe(false);
+      expect(result.value).toBe(currentRef); // Keep current
+      expect(result.reason).toBe("too_far"); // Very small pixel = far distance
+    });
+
+    it("rejects unrealistic calibrations (too far)", () => {
+      const knownSize = 10; // Small object
+      const measuredPixels = 900; // Large pixel measurement
+      const viewportWidth = 1000;
+      const currentRef = 500;
+      
+      const result = calibrateReference(knownSize, measuredPixels, viewportWidth, currentRef);
+      
+      expect(result.success).toBe(false);
+      expect(result.value).toBe(currentRef);
+      expect(result.reason).toBe("too_close");
     });
 
     it("handles large objects", () => {
@@ -279,10 +296,12 @@ describe("measure", () => {
       const viewportWidth = 1000;
       const currentRef = 500;
       
-      const newRef = calibrateReference(knownSize, measuredPixels, viewportWidth, currentRef);
+      const result = calibrateReference(knownSize, measuredPixels, viewportWidth, currentRef);
       
-      expect(newRef).toBeGreaterThan(100);
-      expect(newRef).toBeLessThan(2000);
+      expect(result.success).toBe(true);
+      expect(result.value).toBeGreaterThan(100);
+      expect(result.value).toBeLessThan(2000);
+      expect(result.reason).toBe("success");
     });
   });
 
@@ -290,8 +309,12 @@ describe("measure", () => {
     it("provides standard reference objects", () => {
       expect(REFERENCE_OBJECTS.creditCard.size).toBe(85.6);
       expect(REFERENCE_OBJECTS.a4Paper.size).toBe(297);
-      expect(REFERENCE_OBJECTS.usDollar.size).toBe(156);
-      expect(REFERENCE_OBJECTS.usLetter.size).toBe(279.4);
+      expect(REFERENCE_OBJECTS.basketball.size).toBe(240);
+      expect(REFERENCE_OBJECTS.tennis.size).toBe(67);
+      expect(REFERENCE_OBJECTS.brick.size).toBe(190);
+      expect(REFERENCE_OBJECTS.ipad.size).toBe(178.5);
+      expect(REFERENCE_OBJECTS.iphone.size).toBe(160.8);
+      expect(REFERENCE_OBJECTS.hand.size).toBe(90);
     });
 
     it("all objects have required fields", () => {

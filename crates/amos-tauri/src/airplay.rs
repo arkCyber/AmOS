@@ -5,12 +5,14 @@
 // same honest-boundary pattern as radio.rs and media.rs: unavailable platforms
 // return well-typed failures rather than silently pretending to work.
 //
-// On macOS / iOS: uses system AirPlay APIs
+// On macOS / iOS: uses system AirPlay APIs (AVFoundation)
 // On Android: supports DLNA / Cast protocols
 // On Linux desktop: supports RAOP (AirPort Express protocol) or Cast
 // On unsupported hosts: returns "unavailable" (no fake success)
 
 use serde::{Deserialize, Serialize};
+
+use crate::airplay_platform::{platform_start_discovery, platform_stop_discovery, platform_get_devices, PlatformDiscovery};
 
 /// AirPlay device type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +100,8 @@ pub struct AirPlayManager {
     status: AirPlayStatus,
     /// Whether discovery is running
     discovering: bool,
+    /// Platform-specific discovery handler
+    platform_discovery: Option<PlatformDiscovery>,
 }
 
 impl Default for AirPlayManager {
@@ -118,6 +122,7 @@ impl AirPlayManager {
                 volume: 0.7,
             },
             discovering: false,
+            platform_discovery: None,
         }
     }
 
@@ -165,23 +170,65 @@ impl AirPlayManager {
 
         self.discovering = true;
 
-        // TODO: Platform-specific discovery implementation
-        // For now, return demo devices in development
-        #[cfg(debug_assertions)]
+        // Platform-specific discovery implementation
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            self.devices = Self::demo_devices();
+            let result = platform_start_discovery(&mut self.platform_discovery);
+            if !matches!(result, AirPlayResult::Ok) {
+                return result;
+            }
+            
+            // Also load platform devices
+            let platform_devices = platform_get_devices(&self.platform_discovery);
+            if !platform_devices.is_empty() {
+                self.devices = platform_devices;
+                return AirPlayResult::Ok;
+            }
+            
+            // Fall back to demo devices in debug mode if no real devices found
+            #[cfg(debug_assertions)]
+            {
+                self.devices = Self::demo_devices();
+            }
+            
+            return AirPlayResult::Ok;
         }
 
-        AirPlayResult::Ok
+        // For other platforms, use demo devices in development
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            #[cfg(debug_assertions)]
+            {
+                self.devices = Self::demo_devices();
+            }
+            
+            AirPlayResult::Ok
+        }
     }
 
     /// Stop device discovery
     pub fn stop_discovery(&mut self) {
         self.discovering = false;
+        
+        // Stop platform-specific discovery
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            platform_stop_discovery(&mut self.platform_discovery);
+        }
     }
 
     /// Get list of discovered devices
     pub fn get_devices(&self) -> Vec<AirPlayDevice> {
+        // Return platform devices if available
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let platform_devices = platform_get_devices(&self.platform_discovery);
+            if !platform_devices.is_empty() {
+                return platform_devices;
+            }
+        }
+        
+        // Otherwise return cached devices (including demo devices in debug mode)
         self.devices.clone()
     }
 
@@ -471,11 +518,11 @@ mod tests {
         assert!(mgr.status.device.is_none());
     }
 
-    #[tokio::test]
-    async fn test_discovery() {
+    #[test]
+    fn test_discovery() {
         let mut mgr = AirPlayManager::new();
         if mgr.is_available() {
-            let result = mgr.start_discovery().await;
+            let result = mgr.start_discovery();
             match result {
                 AirPlayResult::Ok => {
                     #[cfg(debug_assertions)]
@@ -486,20 +533,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_connect_disconnect() {
+    #[test]
+    fn test_connect_disconnect() {
         let mut mgr = AirPlayManager::new();
         if mgr.is_available() {
-            mgr.start_discovery().await;
+            mgr.start_discovery();
             #[cfg(debug_assertions)]
             {
                 let devices = mgr.get_devices();
                 if let Some(device) = devices.first() {
-                    let result = mgr.connect(&device.id).await;
+                    let result = mgr.connect(&device.id);
                     assert!(matches!(result, AirPlayResult::Ok));
                     assert!(mgr.get_status().active);
 
-                    let result = mgr.disconnect().await;
+                    let result = mgr.disconnect();
                     assert!(matches!(result, AirPlayResult::Ok));
                     assert!(!mgr.get_status().active);
                 }

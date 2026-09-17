@@ -52,6 +52,7 @@
 package com.amos.ai.glue
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
@@ -156,6 +157,19 @@ object BluetoothGlue {
      * that into a provider error, so the screen never shows an empty list as if nothing
      * were nearby.
      */
+    /**
+     * Ask the platform to search. `true` = **accepted** (the classic scan started; the LE half
+     * is best-effort and reported in `scanState`).
+     *
+     * `@SuppressLint("MissingPermission")`: every Bluetooth call in this file is either
+     * guarded by a `checkSelfPermission` helper (`canScan`/`hasConnect`) or wrapped in a
+     * `try/catch (Throwable)` that turns the platform's refusal into an honest `false` /
+     * logged reason — the repo's rule is "a refusal is a report, never a crash". Android
+     * Lint's `MissingPermission` check cannot follow either guard, so each site carries this
+     * suppression **with this reason** rather than a permission check that would only
+     * duplicate it (REQ-A380). The same reason applies to the other eight sites in this file.
+     */
+    @SuppressLint("MissingPermission")
     @JvmStatic
     fun startDiscovery(context: Context): Boolean {
         val app = context.applicationContext
@@ -188,6 +202,7 @@ object BluetoothGlue {
     }
 
     /** Cancel a scan. `false` = the platform refused (or there was none to cancel). */
+    @SuppressLint("MissingPermission") // the guard is in canScan/hasConnect or the try/catch below — see startDiscovery (REQ-A380)
     @JvmStatic
     fun stopDiscovery(context: Context): Boolean {
         val adapter = adapter(context.applicationContext) ?: return false
@@ -207,6 +222,7 @@ object BluetoothGlue {
      * their `ScanCallback.SCAN_FAILED_*` code — the state then reports `le: false`, which
      * is how the screen knows LE was **not** searched rather than finding nothing.
      */
+    @SuppressLint("MissingPermission") // the guard is in canScan/hasConnect or the try/catch below — see startDiscovery (REQ-A380)
     private fun startLeScan(adapter: BluetoothAdapter) {
         stopLeScan(adapter)
         val scanner: BluetoothLeScanner = try {
@@ -261,6 +277,7 @@ object BluetoothGlue {
     }
 
     /** Stop the LE scan (idempotent; nothing running is not an error). */
+    @SuppressLint("MissingPermission") // the guard is in canScan/hasConnect or the try/catch below — see startDiscovery (REQ-A380)
     private fun stopLeScan(adapter: BluetoothAdapter) {
         leWindow?.let { main.removeCallbacks(it) }
         leWindow = null
@@ -280,6 +297,7 @@ object BluetoothGlue {
      * `false` = refused (no `BLUETOOTH_CONNECT`, unknown address, or the platform
      * declined).
      */
+    @SuppressLint("MissingPermission") // the guard is in canScan/hasConnect or the try/catch below — see startDiscovery (REQ-A380)
     @JvmStatic
     fun bond(context: Context, address: String): Boolean {
         val adapter = adapter(context.applicationContext) ?: return false
@@ -306,6 +324,7 @@ object BluetoothGlue {
      * * `scan` — whether `BLUETOOTH_SCAN` is granted, so the caller can tell "cannot
      *   look" from "nothing there".
      */
+    @SuppressLint("MissingPermission") // the guard is in canScan/hasConnect or the try/catch below — see startDiscovery (REQ-A380)
     @JvmStatic
     fun scanState(context: Context): String {
         val app = context.applicationContext
@@ -501,6 +520,7 @@ object BluetoothGlue {
     }
 
     /** `BluetoothDevice#getBondState`, or `BOND_NONE` when the read is refused. */
+    @SuppressLint("MissingPermission") // the guard is in canScan/hasConnect or the try/catch below — see startDiscovery (REQ-A380)
     private fun bondStateOf(device: BluetoothDevice): Int = try {
         device.bondState
     } catch (t: Throwable) {
@@ -508,6 +528,7 @@ object BluetoothGlue {
     }
 
     /** `BluetoothDevice#getName`, or `""` when it has none / the read is refused. */
+    @SuppressLint("MissingPermission") // the guard is in canScan/hasConnect or the try/catch below — see startDiscovery (REQ-A380)
     private fun nameOf(device: BluetoothDevice): String = try {
         device.name ?: ""
     } catch (t: Throwable) {

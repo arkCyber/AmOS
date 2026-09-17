@@ -190,15 +190,36 @@ class MediaStoreGlue(private val context: Context) {
 
     // ---- internal helpers: dir tag -> MediaStore collection / path ----
 
+    /**
+     * The collection URI for one media kind.
+     *
+     * `MediaStore.*.getContentUri(String volume)` is itself an **API 29** API, so on API 26..28
+     * the volume form is a `NoSuchMethodError` — caught by this class's error path, which means
+     * the feature was simply **dead below 29** while `minSdk` is 26 (Android Lint's
+     * `InlinedApi` warnings on `VOLUME_EXTERNAL_PRIMARY` were the visible half of that:
+     * REQ-A380). The legacy `EXTERNAL_CONTENT_URI` is the correct collection there, so the
+     * range is now honest instead of silently broken.
+     */
+    private fun mediaCollection(legacy: Uri, volumeBased: (String) -> Uri): Uri =
+        if (Build.VERSION.SDK_INT >= 29) volumeBased(MediaStore.VOLUME_EXTERNAL_PRIMARY) else legacy
+
     private fun collectionUri(dir: String): Uri? = when (dir) {
         "camera", "screenshots", "pictures" ->
-            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            mediaCollection(MediaStore.Images.Media.EXTERNAL_CONTENT_URI) {
+                MediaStore.Images.Media.getContentUri(it)
+            }
         "recordings" ->
-            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            mediaCollection(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) {
+                MediaStore.Audio.Media.getContentUri(it)
+            }
         "music" ->
-            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            mediaCollection(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) {
+                MediaStore.Audio.Media.getContentUri(it)
+            }
         "movies" ->
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            mediaCollection(MediaStore.Video.Media.EXTERNAL_CONTENT_URI) {
+                MediaStore.Video.Media.getContentUri(it)
+            }
         "download" ->
             if (Build.VERSION.SDK_INT >= 29) {
                 MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)

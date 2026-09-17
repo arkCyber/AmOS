@@ -10,13 +10,12 @@
   import {
     COMPASS_SETTINGS_KEY,
     normalizeCompassSettings,
-    defaultCompassSettings,
     cardinalDirection,
     normalizeHeading,
     applyDeclination,
     isOrientationSupported,
     requestOrientationPermission,
-    fetchDeclination,
+    fetchDeclinationWithCache,
     levelPercentage,
     isLevel,
   } from "../lib/compass";
@@ -66,13 +65,34 @@
     
     if (!granted) return;
 
-    // Try to fetch magnetic declination using geolocation
+    // Try to fetch magnetic declination using geolocation (with caching)
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         async (pos) => {
           locationGranted = true;
-          const decl = await fetchDeclination(pos.coords.latitude, pos.coords.longitude);
-          settings = { ...settings, declination: decl };
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+          
+          // Fetch with cache support
+          const result = await fetchDeclinationWithCache(
+            lat,
+            lon,
+            settings.declination,
+            settings.cachedLocation
+          );
+          
+          if (result.fromCache) {
+            // Using cached declination - no need to update
+            console.log("Using cached magnetic declination");
+          } else {
+            // Update with fresh data
+            console.log("Fetched new magnetic declination:", result.declination);
+            settings = {
+              ...settings,
+              declination: result.declination,
+              cachedLocation: result.cachedLocation,
+            };
+          }
         },
         () => {
           // Location denied or unavailable - use 0 declination
@@ -103,7 +123,7 @@
           y: beta ?? 0,
         },
         available: true,
-        accuracy: event.webkitCompassAccuracy ?? undefined,
+        accuracy: (event as any).webkitCompassAccuracy ?? undefined,
       };
     };
 

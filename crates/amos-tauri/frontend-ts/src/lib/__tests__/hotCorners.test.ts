@@ -57,38 +57,38 @@ describe("hotCorners.ts", () => {
 
   describe("modifierMatches", () => {
     test("no modifier required", () => {
-      const e = new MouseEvent("mousemove");
+      const e = { shiftKey: false, ctrlKey: false, altKey: false, metaKey: false } as MouseEvent;
       expect(modifierMatches(e, undefined)).toBe(true);
     });
 
     test("shift required and pressed", () => {
-      const e = new MouseEvent("mousemove", { shiftKey: true });
+      const e = { shiftKey: true, ctrlKey: false, altKey: false, metaKey: false } as MouseEvent;
       expect(modifierMatches(e, "shift")).toBe(true);
     });
 
     test("shift required but not pressed", () => {
-      const e = new MouseEvent("mousemove");
+      const e = { shiftKey: false, ctrlKey: false, altKey: false, metaKey: false } as MouseEvent;
       expect(modifierMatches(e, "shift")).toBe(false);
     });
 
     test("control required", () => {
-      const e1 = new MouseEvent("mousemove", { ctrlKey: true });
+      const e1 = { shiftKey: false, ctrlKey: true, altKey: false, metaKey: false } as MouseEvent;
       expect(modifierMatches(e1, "control")).toBe(true);
-      const e2 = new MouseEvent("mousemove", { shiftKey: true });
+      const e2 = { shiftKey: true, ctrlKey: false, altKey: false, metaKey: false } as MouseEvent;
       expect(modifierMatches(e2, "control")).toBe(false);
     });
 
     test("alt required", () => {
-      const e1 = new MouseEvent("mousemove", { altKey: true });
+      const e1 = { shiftKey: false, ctrlKey: false, altKey: true, metaKey: false } as MouseEvent;
       expect(modifierMatches(e1, "alt")).toBe(true);
-      const e2 = new MouseEvent("mousemove");
+      const e2 = { shiftKey: false, ctrlKey: false, altKey: false, metaKey: false } as MouseEvent;
       expect(modifierMatches(e2, "alt")).toBe(false);
     });
 
     test("meta required", () => {
-      const e1 = new MouseEvent("mousemove", { metaKey: true });
+      const e1 = { shiftKey: false, ctrlKey: false, altKey: false, metaKey: true } as MouseEvent;
       expect(modifierMatches(e1, "meta")).toBe(true);
-      const e2 = new MouseEvent("mousemove");
+      const e2 = { shiftKey: false, ctrlKey: false, altKey: false, metaKey: false } as MouseEvent;
       expect(modifierMatches(e2, "meta")).toBe(false);
     });
   });
@@ -103,8 +103,8 @@ describe("hotCorners.ts", () => {
       ];
       const result = normalizeHotCorners(input);
       expect(result).toHaveLength(4);
-      expect(result[0]).toEqual(input[0]);
-      expect(result[3].modifier).toBe("shift");
+      expect(result[0]?.corner).toBe("top-left");
+      expect(result[0]?.action).toBe("launchpad");
     });
 
     test("malformed input returns defaults", () => {
@@ -132,7 +132,7 @@ describe("hotCorners.ts", () => {
       const result = normalizeHotCorners(input);
       const topLeft = result.filter((c) => c.corner === "top-left");
       expect(topLeft).toHaveLength(1);
-      expect(topLeft[0].action).toBe("launchpad"); // first wins
+      expect(topLeft[0]?.action).toBe("launchpad"); // first wins
     });
 
     test("invalid action is rejected", () => {

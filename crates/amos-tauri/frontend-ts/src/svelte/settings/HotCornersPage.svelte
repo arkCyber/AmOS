@@ -56,7 +56,7 @@
   }
 
   function getConfig(corner: Corner): HotCornerConfig {
-    return configs.find((c) => c.corner === corner) || DEFAULT_HOT_CORNERS[0];
+    return configs.find((c) => c.corner === corner) || DEFAULT_HOT_CORNERS[0]!;
   }
 
   const cornerLabels: Record<Corner, string> = {

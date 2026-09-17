@@ -13,11 +13,11 @@ import {
  * (src/lib/appMeta.ts) — the single source that apps.tsx re-exports as APPS.
  */
 describe("appMeta (React-free built-in app metadata)", () => {
-  test("covers 29 built-in apps with unique ids", () => {
-    expect(APP_META.length).toBe(29);
+  test("covers 33 built-in apps with unique ids", () => {
+    expect(APP_META.length).toBe(33);
     const ids = APP_META.map((a) => a.id);
     expect(new Set(ids).size).toBe(ids.length);
-    expect(appIds().length).toBe(29);
+    expect(appIds().length).toBe(33);
   });
 
   test("lookup helpers resolve titleKey / icon / presence", () => {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { t } from '../i18n';
+  import { t } from './locale.svelte';
   import { iconSvg } from '../lib/sysIcons';
   import * as airplay from '../lib/airplay';
   import type { AirPlayDevice, AirPlayStatus } from '../lib/airplay';

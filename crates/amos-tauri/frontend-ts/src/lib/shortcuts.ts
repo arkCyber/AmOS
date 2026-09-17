@@ -20,6 +20,7 @@
  */
 
 import { readStoreValue, writeStoreValueChecked } from "./amosStore";
+import { mdmManager, auditLogger } from "./enterprise/index";
 
 // ============================================================================
 // 类型定义
@@ -599,18 +600,18 @@ export function validateShortcutName(name: string): { valid: boolean; error?: st
 /** 加载所有快捷指令 */
 export function loadShortcuts(): Shortcut[] {
   try {
-    const raw = readStoreValue(STORE_KEYS.SHORTCUTS);
+    const raw = readStoreValue(STORE_KEYS.SHORTCUTS, "");
     if (!raw) return [];
     
     const data = JSON.parse(raw);
     if (!Array.isArray(data)) {
-      logger.warn("Invalid shortcuts data, resetting");
+      logger.warn("shortcuts", "Invalid shortcuts data, resetting");
       return [];
     }
     
     return data.slice(0, LIMITS.MAX_SHORTCUTS);
   } catch (err) {
-    logger.error("Failed to load shortcuts:", err);
+    logger.error("shortcuts", "Failed to load shortcuts", err);
     return [];
   }
 }
@@ -619,14 +620,14 @@ export function loadShortcuts(): Shortcut[] {
 export function saveShortcuts(shortcuts: Shortcut[]): boolean {
   try {
     if (shortcuts.length > LIMITS.MAX_SHORTCUTS) {
-      logger.warn(`Truncating shortcuts to ${LIMITS.MAX_SHORTCUTS}`);
+      logger.warn("shortcuts", `Truncating shortcuts to ${LIMITS.MAX_SHORTCUTS}`);
       shortcuts = shortcuts.slice(0, LIMITS.MAX_SHORTCUTS);
     }
     
     const json = JSON.stringify(shortcuts);
     return writeStoreValueChecked(STORE_KEYS.SHORTCUTS, json);
   } catch (err) {
-    logger.error("Failed to save shortcuts:", err);
+    logger.error("shortcuts", "Failed to save shortcuts", err);
     return false;
   }
 }
@@ -636,15 +637,22 @@ export function createShortcut(
   name: string,
   options?: Partial<Omit<Shortcut, "id" | "createdAt" | "updatedAt" | "runCount">>
 ): Shortcut | null {
+  // MDM 权限检查
+  const mdmCheck = mdmManager.checkCanCreate();
+  if (!mdmCheck.allowed) {
+    logger.error("shortcuts", "MDM blocked shortcut creation", mdmCheck.reason);
+    return null;
+  }
+
   const validation = validateShortcutName(name);
   if (!validation.valid) {
-    logger.error("Invalid shortcut name:", validation.error);
+    logger.error("shortcuts", "Invalid shortcut name", validation.error ?? "Unknown error");
     return null;
   }
   
   const shortcuts = loadShortcuts();
   if (shortcuts.length >= LIMITS.MAX_SHORTCUTS) {
-    logger.error(`Cannot create shortcut: limit of ${LIMITS.MAX_SHORTCUTS} reached`);
+    logger.error("shortcuts", `Cannot create shortcut: limit of ${LIMITS.MAX_SHORTCUTS} reached`);
     return null;
   }
   
@@ -669,64 +677,118 @@ export function createShortcut(
   
   shortcuts.push(shortcut);
   if (!saveShortcuts(shortcuts)) {
-    logger.error("Failed to save new shortcut");
+    logger.error("shortcuts", "Failed to save new shortcut");
     return null;
   }
   
-  logger.info(`Created shortcut: ${shortcut.name} (${shortcut.id})`);
+  // 审计日志
+  auditLogger.log({
+    eventType: "shortcut_create",
+    eventCategory: "management",
+    eventDescription: `创建快捷指令: ${shortcut.name}`,
+    resourceType: "shortcut",
+    resourceId: shortcut.id,
+    resourceName: shortcut.name,
+    result: "success",
+    tags: ["create", "shortcut"],
+  }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
+  
+  logger.info("shortcuts", `Created shortcut: ${shortcut.name}`, shortcut.id);
   return shortcut;
 }
 
 /** 更新快捷指令 */
 export function updateShortcut(id: string, updates: Partial<Shortcut>): boolean {
+  // MDM 权限检查
+  const mdmCheck = mdmManager.checkCanModify(id);
+  if (!mdmCheck.allowed) {
+    logger.error("shortcuts", "MDM blocked shortcut modification", mdmCheck.reason);
+    return false;
+  }
+
   const shortcuts = loadShortcuts();
   const index = shortcuts.findIndex((s) => s.id === id);
   
   if (index === -1) {
-    logger.error(`Shortcut not found: ${id}`);
+    logger.error("shortcuts", `Shortcut not found: ${id}`);
     return false;
   }
   
   if (updates.name) {
     const validation = validateShortcutName(updates.name);
     if (!validation.valid) {
-      logger.error("Invalid shortcut name:", validation.error);
+      logger.error("shortcuts", "Invalid shortcut name", validation.error);
       return false;
     }
   }
   
+  const oldShortcut = shortcuts[index];
   shortcuts[index] = {
     ...shortcuts[index],
     ...updates,
     id, // 不允许修改 ID
     updatedAt: Date.now(),
-  };
+  } as Shortcut;
   
   if (!saveShortcuts(shortcuts)) {
-    logger.error("Failed to save updated shortcut");
+    logger.error("shortcuts", "Failed to save updated shortcut");
     return false;
   }
   
-  logger.info(`Updated shortcut: ${id}`);
+  // 审计日志
+  auditLogger.log({
+    eventType: "shortcut_update",
+    eventCategory: "management",
+    eventDescription: `更新快捷指令: ${shortcuts[index]?.name}`,
+    resourceType: "shortcut",
+    resourceId: id,
+    resourceName: shortcuts[index]?.name,
+    result: "success",
+    changesBefore: { name: oldShortcut?.name, updatedAt: oldShortcut?.updatedAt },
+    changesAfter: { name: shortcuts[index]?.name, updatedAt: shortcuts[index]?.updatedAt },
+    tags: ["update", "shortcut"],
+  }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
+  
+  logger.info("shortcuts", `Updated shortcut: ${id}`);
   return true;
 }
 
 /** 删除快捷指令 */
 export function deleteShortcut(id: string): boolean {
+  // MDM 权限检查
+  const mdmCheck = mdmManager.checkCanDelete(id);
+  if (!mdmCheck.allowed) {
+    logger.error("shortcuts", "MDM blocked shortcut deletion", mdmCheck.reason);
+    return false;
+  }
+
   const shortcuts = loadShortcuts();
+  const toDelete = shortcuts.find((s) => s.id === id);
   const filtered = shortcuts.filter((s) => s.id !== id);
   
   if (filtered.length === shortcuts.length) {
-    logger.warn(`Shortcut not found for deletion: ${id}`);
+    logger.warn("shortcuts", `Shortcut not found for deletion: ${id}`);
     return false;
   }
   
   if (!saveShortcuts(filtered)) {
-    logger.error("Failed to save after deletion");
+    logger.error("shortcuts", "Failed to save after deletion");
     return false;
   }
   
-  logger.info(`Deleted shortcut: ${id}`);
+  // 审计日志
+  auditLogger.log({
+    eventType: "shortcut_delete",
+    eventCategory: "management",
+    eventDescription: `删除快捷指令: ${toDelete?.name}`,
+    resourceType: "shortcut",
+    resourceId: id,
+    resourceName: toDelete?.name,
+    result: "success",
+    tags: ["delete", "shortcut"],
+  }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
+  
+  logger.info("shortcuts", `Deleted shortcut: ${id}`);
   return true;
 }
 
@@ -736,11 +798,11 @@ export function duplicateShortcut(id: string): Shortcut | null {
   const original = shortcuts.find((s) => s.id === id);
   
   if (!original) {
-    logger.error(`Shortcut not found: ${id}`);
+    logger.error("shortcuts", `Shortcut not found: ${id}`);
     return null;
   }
   
-  return createShortcut(`${original.name} 副本`, {
+  const duplicated = createShortcut(`${original.name} 副本`, {
     icon: original.icon,
     color: original.color,
     description: original.description,
@@ -752,6 +814,23 @@ export function duplicateShortcut(id: string): Shortcut | null {
     requiresConfirmation: original.requiresConfirmation,
     tags: [...original.tags],
   });
+  
+  if (duplicated) {
+    // 审计日志
+    auditLogger.log({
+      eventType: "shortcut_duplicate",
+      eventCategory: "management",
+      eventDescription: `复制快捷指令: ${original.name}`,
+      resourceType: "shortcut",
+      resourceId: duplicated.id,
+      resourceName: duplicated.name,
+      result: "success",
+      actionDetails: { originalId: id, originalName: original.name },
+      tags: ["duplicate", "shortcut"],
+    }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
+  }
+  
+  return duplicated;
 }
 
 /** 获取操作类型 */
@@ -775,19 +854,48 @@ export async function executeShortcut(
   options?: { fromSiri?: boolean; triggerId?: string }
 ): Promise<ExecutionResult> {
   const startTime = Date.now();
-  logger.info(`Executing shortcut: ${shortcutId}`);
+  logger.info("shortcuts", `Executing shortcut: ${shortcutId}`);
   
   const shortcuts = loadShortcuts();
   const shortcut = shortcuts.find((s) => s.id === shortcutId);
   
   if (!shortcut) {
-    logger.error(`Shortcut not found: ${shortcutId}`);
+    logger.error("shortcuts", `Shortcut not found: ${shortcutId}`);
     return {
       success: false,
       error: "快捷指令不存在",
       duration: Date.now() - startTime,
       actionsCompleted: 0,
       actionsTotal: 0,
+    };
+  }
+  
+  // MDM 权限检查
+  const mdmCheck = mdmManager.checkCanExecute(shortcutId, shortcut.actions.length);
+  if (!mdmCheck.allowed) {
+    logger.error("shortcuts", "MDM blocked shortcut execution", mdmCheck.reason);
+    
+    // 审计日志 - 执行被阻止
+    auditLogger.log({
+      eventType: "shortcut_execute_failure",
+      eventCategory: "execution",
+      eventDescription: `快捷指令执行被 MDM 阻止: ${shortcut.name}`,
+      level: "warning",
+      result: "blocked",
+      resourceType: "shortcut",
+      resourceId: shortcutId,
+      resourceName: shortcut.name,
+      errorMessage: mdmCheck.reason,
+      duration: Date.now() - startTime,
+      tags: ["execution", "blocked", "mdm"],
+    }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
+    
+    return {
+      success: false,
+      error: mdmCheck.reason || "执行被 MDM 策略阻止",
+      duration: Date.now() - startTime,
+      actionsCompleted: 0,
+      actionsTotal: shortcut.actions.length,
     };
   }
   
@@ -813,11 +921,11 @@ export async function executeShortcut(
       
       const actionType = getActionType(action.actionTypeId);
       if (!actionType) {
-        logger.warn(`Unknown action type: ${action.actionTypeId}, skipping`);
+        logger.warn("shortcuts", `Unknown action type: ${action.actionTypeId}, skipping`);
         continue;
       }
       
-      logger.debug(`Executing action: ${actionType.name} (${action.id})`);
+      logger.debug("shortcuts", `Executing action: ${actionType.name}`, action.id);
       output = await executeAction(action, actionType, context, output);
       completed++;
     }
@@ -826,7 +934,16 @@ export async function executeShortcut(
     updateShortcut(shortcutId, { runCount: shortcut.runCount + 1 });
     
     const duration = Date.now() - startTime;
-    logger.info(`Shortcut completed in ${duration}ms`);
+    logger.info("shortcuts", `Shortcut completed in ${duration}ms`);
+    
+    // 审计日志 - 执行成功
+    auditLogger.logExecution({
+      shortcutId,
+      shortcutName: shortcut.name,
+      success: true,
+      duration,
+      actionCount: completed,
+    }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
     
     return {
       success: true,
@@ -838,7 +955,17 @@ export async function executeShortcut(
   } catch (err) {
     const duration = Date.now() - startTime;
     const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.error("Shortcut execution failed:", errorMsg);
+    logger.error("shortcuts", "Shortcut execution failed", errorMsg);
+    
+    // 审计日志 - 执行失败
+    auditLogger.logExecution({
+      shortcutId,
+      shortcutName: shortcut.name,
+      success: false,
+      duration,
+      errorMessage: errorMsg,
+      actionCount: shortcut.actions.length,
+    }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
     
     return {
       success: false,
@@ -904,11 +1031,11 @@ async function executeAction(
     case "open_url":
     case "vibrate":
       // 这些操作需要与系统集成，暂时返回模拟结果
-      logger.info(`Action ${actionType.id} executed with params:`, params);
+      logger.info("shortcuts", `Action ${actionType.id} executed with params`, params);
       return input;
     
     default:
-      logger.warn(`Unimplemented action: ${actionType.id}`);
+      logger.warn("shortcuts", `Unimplemented action: ${actionType.id}`);
       return input;
   }
 }

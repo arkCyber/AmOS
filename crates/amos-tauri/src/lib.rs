@@ -13,6 +13,7 @@
 
 pub mod ai_bridge;
 pub mod airplay;
+pub mod airplay_platform;
 #[cfg(test)]
 #[path = "airplay_tests.rs"]
 mod airplay_tests;
@@ -68,6 +69,7 @@ pub mod mic_permission;
 pub mod netguard;
 pub mod note_export;
 pub mod privacy_client;
+pub mod push_notifications;
 pub mod radio;
 pub mod rag_client;
 pub mod real_dial;
@@ -166,6 +168,8 @@ pub fn run() {
         .manage(devcare::DevCareBridge::new())
         // Input method (IME): the on-screen pinyin keyboard's session + learner.
         .manage(ime::ImeBridge::boot())
+        // Push notifications: APNs-compatible service for remote notifications
+        .manage(push_notifications::PushNotificationState::new())
         // The `amos-app://` gateway: one custom-protocol handler for every system
         // asset the WebView may read — the compiled PWA index
         // (`amos-app://index/apps.json` + its icons) and any installed web-bundle
@@ -411,6 +415,18 @@ pub fn run() {
             airplay::airplay_start_stream,
             airplay::airplay_stop_stream,
             airplay::airplay_set_volume,
+            push_notifications::push_register_token,
+            push_notifications::push_get_token,
+            push_notifications::push_request_permission,
+            push_notifications::push_get_permission,
+            push_notifications::push_simulate_receive,
+            push_notifications::push_get_badge,
+            push_notifications::push_set_badge,
+            push_notifications::push_get_history,
+            push_notifications::push_mark_read,
+            push_notifications::push_clear_history,
+            push_notifications::push_get_statistics,
+            push_notifications::push_get_status,
         ])
         .on_window_event(|window, event| {
             // Keep the layout model's screen equal to the **real** window area.

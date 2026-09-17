@@ -3,16 +3,28 @@
 #
 # `crates/amos-tauri/android-glue/` is the tracked source of truth for the Kotlin
 # glue; `crates/amos-tauri/gen/` is the Tauri-generated Android project (git-ignored).
-# This script mirrors the glue files this repo cares about into the generated
-# project, installs the camera packer's JUnit test into the app's unit-test source
-# set, then runs the app's Kotlin **compile** plus that test on the host JVM. The
-# compile half is what gives the other mirrored glue files (currently
-# `TetheringGlue.kt`, the personal hotspot) a place to be type-checked without a
-# device.
+# This script mirrors the glue into the generated project, installs the camera packer's
+# JUnit test into the app's unit-test source set, then runs three phases on the host JVM:
+#
+#   1. the app's Kotlin **compile** plus that test — the compile half is what gives the
+#      other mirrored glue files a place to be type-checked without a device;
+#   2. **our glue's Kotlin warnings are errors** (unused parameters, unreachable branches,
+#      dead declarations — deprecations excepted, because calling an older platform API is
+#      a documented choice);
+#   3. **Android Lint** (`:app:lintArmDebug`), scoped to `com/amos/ai/glue/` — the
+#      platform's own verdict on the two claims the compiler cannot check: **does the API
+#      exist on `minSdk` (26)**, and **does the call need a permission nobody checks**
+#      (REQ-A380: the first run found 20 errors in our glue — 5 × `NewApi`, 8 ×
+#      `MissingPermission` — plus an API-29-only `MediaStore` path that was silently dead
+#      on API 26..28). Errors in our glue fail the gate; warnings are printed grouped by
+#      issue id ("reported, not judged"); findings in the generated project are reported
+#      only, because those files are machine-owned.
 #
 # Requirements:
 #   * `cargo tauri android init` has been run once (crates/amos-tauri/gen/ exists),
-#   * a JDK 17 — AGP/Kotlin reject newer JDKs (JDK 26 makes `:buildSrc` fail).
+#   * a JDK 17 — AGP/Kotlin reject newer JDKs (JDK 26 makes `:buildSrc` fail),
+#   * the Gradle dependency cache for the Android test artifacts (one online
+#     `:app:lintArmDebug` populates it; `GRADLE_ARGS=…` can drop `--offline`).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -106,4 +118,68 @@ if [[ -n "$FINDINGS" ]]; then
   exit 1
 fi
 echo "[glue] OK — $(all_our_warnings "$LOG") Kotlin warning(s) in our glue, all deprecations; no dead declarations."
+
+# --- Android Lint: the platform's own API-level / permission verdicts (REQ-A380) ----
+# WHY: the Kotlin compile above proves the glue *builds*. It says nothing about whether the
+# APIs it calls **exist** on the `minSdk` (26) devices this APK claims to support, nor about a
+# platform call whose permission nobody checks — both of which the platform's own linter
+# answers. Nothing in this repo ran it, and the first run reported **20 errors** in our glue:
+#   * 5 × `NewApi` in `TetheringGlue` — the API-level guard lived in the caller, which Lint
+#     cannot follow (the fix is `@RequiresApi`, so *every* call site is verified),
+#   * 8 × `MissingPermission` in `BluetoothGlue` — every call sits inside the `try/catch` that
+#     reports the refusal (Lint cannot see that either: suppressed *with the reason*),
+#   * plus `InlinedApi` warnings on a `MediaStore.VOLUME_EXTERNAL_PRIMARY` use that is API 29
+#     while `minSdk` is 26 — the volume-based `getContentUri(String)` is a `NoSuchMethodError`
+#     below 29, i.e. that path was silently dead on API 26..28 (it now falls back to
+#     `EXTERNAL_CONTENT_URI`).
+# A finding here is a device-range or permission claim, so it is the same class of defect as
+# the compile gate's warning rule: ours must be zero.
+LINT_LOG=$(mktemp)
+LINT_REPORT=app/build/reports/lint-results-armDebug.txt
+OUR_GLUE_RE='^/.*/com/amos/ai/glue/.*\.kt:[0-9]+: '
+glue_errors() { grep -E "${OUR_GLUE_RE}Error:" "$1" || true; }
+glue_warnings() { grep -E "${OUR_GLUE_RE}Warning:" "$1" || true; }
+
+# Self-check: the classifier must count a glue error, ignore an error in the generated project
+# (machine-owned: reported, not judged) and see a glue warning.
+PROBE2=$(mktemp)
+{
+  printf "/x/app/src/main/java/com/amos/ai/glue/Probe.kt:1: Error: Call requires API level 36 [NewApi]\n"
+  printf "/x/app/src/main/java/com/amos/ai/glue/Probe.kt:2: Warning: Unnecessary [ObsoleteSdkInt]\n"
+  printf "/x/app/src/main/java/com/amos/ai/generated/RustWebView.kt:3: Error: not ours [ViewConstructor]\n"
+} > "$PROBE2"
+if [[ "$(glue_errors "$PROBE2" | wc -l | tr -d ' ')" != "1" || "$(glue_warnings "$PROBE2" | wc -l | tr -d ' ')" != "1" ]]; then
+  echo "[glue] self-check FAILED: the Lint classifier does not classify as documented" >&2
+  exit 1
+fi
+rm -f "$PROBE2"
+
+rm -f "$LINT_REPORT"
+set +e
+./gradlew :app:lintArmDebug ${GRADLE_ARGS:---offline} --console=plain > "$LINT_LOG" 2>&1
+set -e
+# Lint exits non-zero when it finds *any* error (the generated project has some), so the report
+# — not the exit code — is the evidence here. No report means "cannot tell".
+if [[ ! -f "$LINT_REPORT" ]]; then
+  echo "[glue] FAIL — Android Lint produced no report ($LINT_REPORT missing); 'cannot tell' is not 'fine'." >&2
+  tail -20 "$LINT_LOG" >&2
+  exit 1
+fi
+grep -m1 'Lint found' "$LINT_LOG" || true
+FINDINGS=$(glue_errors "$LINT_REPORT")
+if [[ -n "$FINDINGS" ]]; then
+  echo >&2
+  echo "[glue] FAIL — Android Lint reports error(s) in our glue. These are device-range or" >&2
+  echo "       permission claims that the compiler cannot see (REQ-A380):" >&2
+  echo "$FINDINGS" >&2
+  rm -f "$LINT_LOG"
+  exit 1
+fi
+WARN_COUNT=$(glue_warnings "$LINT_REPORT" | wc -l | tr -d ' ')
+if [[ "$WARN_COUNT" -gt 0 ]]; then
+  echo "[glue] note — $WARN_COUNT Android Lint warning(s) in our glue (reported, not judged):"
+  glue_warnings "$LINT_REPORT" | sed -E 's#.*/glue/##; s/: Warning: .*\[([A-Za-z]+)\]$/: \1/' | sort | uniq -c | sed 's/^/       /'
+fi
+echo "[glue] OK — Android Lint: 0 error(s) in our glue; $WARN_COUNT warning(s) reported."
+rm -f "$LINT_LOG"
 rm -f "$LOG"

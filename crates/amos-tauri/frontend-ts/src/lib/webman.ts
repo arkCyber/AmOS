@@ -118,13 +118,6 @@ export interface ValidationResult {
 
 // ==================== 日志系统 ====================
 
-enum LogLevel {
-  DEBUG = 0,
-  INFO = 1,
-  WARN = 2,
-  ERROR = 3,
-}
-
 export const logger = {
   debug: (message: string, ...args: unknown[]): void => {
     if (import.meta.env?.DEV) {
@@ -1122,11 +1115,17 @@ export function closeTab(tabs: Tab[], tabId: string): Tab[] {
 /** 格式化时间戳 */
 export function formatTime(timestamp: number): string {
   try {
-    if (typeof timestamp !== 'number' || timestamp < 0) {
+    if (typeof timestamp !== 'number' || timestamp < 0 || !isFinite(timestamp)) {
       return '未知时间';
     }
 
     const date = new Date(timestamp);
+    
+    // 检查日期是否有效
+    if (isNaN(date.getTime())) {
+      return '未知时间';
+    }
+    
     const now = new Date();
     const diff = now.getTime() - timestamp;
 
@@ -1145,7 +1144,7 @@ export function formatTime(timestamp: number): string {
     // 一周内
     if (diff < 604800000) {
       const weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
-      return weekdays[date.getDay()];
+      return weekdays[date.getDay()] ?? "未知";
     }
 
     // 更早
@@ -1159,7 +1158,7 @@ export function formatTime(timestamp: number): string {
 /** 格式化文件大小 */
 export function formatFileSize(bytes: number): string {
   try {
-    if (typeof bytes !== 'number' || bytes < 0) {
+    if (typeof bytes !== 'number' || bytes < 0 || !isFinite(bytes)) {
       return '0 B';
     }
 

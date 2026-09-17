@@ -425,6 +425,20 @@ lint:
 	# methods, the permission is an install/runtime fact (REQ-A185).
 	node scripts/android-permission-scan.mjs --selftest
 	node scripts/android-permission-scan.mjs
+	# Android *component* integrity (see scripts/android-component-scan.mjs): the manifest
+	# fragment is the only reason the in-call service, the screening service, the SMS
+	# receiver and the exact-alarm receiver exist on device — and every entry is a name the
+	# platform resolves at **instantiation** time. A name with no class, or a class of the
+	# wrong kind (a `<receiver>` on a Service), builds fine and then simply never runs:
+	# the alarm fires and nothing happens. `android-glue-mirror.sh` proves the fragment and
+	# the generated manifest agree (both can spell the same wrong name); this gate proves
+	# the name is a class this app has, that no component-kind class ships unregistered, that
+	# the `<action>` reaching a component is a real platform action **with the sender
+	# permission the platform requires** (an exported `SMS_RECEIVED` receiver without
+	# `BROADCAST_SMS` lets any app inject the broadcast), and that every
+	# `System.loadLibrary` names a library a workspace crate builds.
+	node scripts/android-component-scan.mjs --selftest
+	node scripts/android-component-scan.mjs
 	# JNI hygiene (see scripts/jni-exception-scan.mjs): every provider must attach
 	# through `amos_jni::attached` (a pooled thread can inherit a *pending* exception
 	# and the next JNI call then aborts the process under CheckJNI — device-proven,
@@ -434,6 +448,22 @@ lint:
 	# and a stale entry fails the gate too. `--selftest` pins the classifier first.
 	node scripts/jni-exception-scan.mjs --selftest
 	node scripts/jni-exception-scan.mjs
+	# The JNI *names* on both sides of the boundary (see scripts/jni-contract-scan.mjs).
+	# A JNI name is a string on one side and a declaration on the other, and neither
+	# compiler sees across it. Three rules over the same boundary: **R1** every Rust
+	# `call_static_method` into the glue must hit a Kotlin member with `@JvmStatic`
+	# (without it the JVM throws NoSuchMethodError at the first call — every alarm
+	# registration failed while Kotlin, Rust and the APK all compiled: F-TAU-014,
+	# REQ-A376); **R2** every Kotlin `external fun` must have its Rust `Java_…` export and
+	# vice versa (UnsatisfiedLinkError); **R3** every `call_method` on a glue/bridge handle
+	# must name a Kotlin `fun` **with that signature — arity *and* types** (a rename, a
+	# parameter change or a type drift is the
+	# same invisible NoSuchMethodError — F-TAU-016). `--selftest` pins the parsers, the
+	# handle/class resolvers and the JNI descriptor arity reader first; a site the gate
+	# cannot resolve is a FAILURE unless scripts/jni-contract-allowlist.json records a
+	# reason.
+	node scripts/jni-contract-scan.mjs --selftest
+	node scripts/jni-contract-scan.mjs
 	# Registered Tauri command with no frontend consumer (see
 	# scripts/tauri-command-scan.mjs): the reverse of the unwired-scan — a command
 	# the host exposes but no screen asks for is a capability the UI cannot reach
@@ -681,8 +711,15 @@ android-app:
 # Host-JVM gate for ALL the Android glue's Kotlin (no device needed): mirrors the
 # whole android-glue/ tree into the generated Android project (so the compiled set
 # == the tracked set, reproducibly), VERIFIES the two hand-merged gen/ artefacts
-# (manifest fragments + the generated Activity's glue wiring) and runs the Kotlin
-# compile + the camera packer's JUnit tests. Requires a JDK 17.
+# (manifest fragments + the generated Activity's glue wiring), runs the Kotlin
+# compile + the camera packer's JUnit tests, treats our glue's non-deprecation
+# Kotlin warnings as errors, and finally runs **Android Lint** (`:app:lintArmDebug`):
+# the compiler cannot tell whether an API exists on `minSdk = 26` or whether a call
+# needs a permission nobody checks — the first lint run found 20 such errors in our
+# glue (5 × NewApi, 8 × MissingPermission) plus an API-29-only MediaStore path that
+# was silently dead on API 26..28 (REQ-A380). Errors in our glue fail this gate;
+# warnings are printed grouped by issue id. Requires a JDK 17, an initialised gen/
+# and a warm Gradle cache — which is why it lives in `make verify`, not `make lint`.
 android-glue-check:
 	bash scripts/android-glue-nv21-check.sh
 

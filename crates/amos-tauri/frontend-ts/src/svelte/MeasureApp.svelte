@@ -3,7 +3,7 @@
   // Features: AR-style distance measurement using camera, calibration,
   // unit conversion (metric/imperial), and measurement history.
 
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { t, locale } from "./locale.svelte";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import {
@@ -14,14 +14,18 @@
     defaultMeasureSettings,
     createMeasurement,
     formatDistance,
-    parseDistance,
     calibrateReference,
     getReferenceObject,
     REFERENCE_OBJECTS,
     type MeasureSettings,
     type MeasurePoint,
     type Measurement,
+    type CalibrationResult,
   } from "../lib/measure";
+
+  // Constants
+  const MAX_HISTORY = 50;
+  const MAX_VISIBLE_MEASUREMENTS = 10;
 
   // --- State ---
   let settings = $state<MeasureSettings>(defaultMeasureSettings());
@@ -45,6 +49,7 @@
   let selectedReference = $state<keyof typeof REFERENCE_OBJECTS | null>(null);
   let calibrateStart = $state<MeasurePoint | null>(null);
   let calibrateEnd = $state<MeasurePoint | null>(null);
+  let calibrationMessage = $state<{ type: "success" | "error"; text: string } | null>(null);
   
   // Container dimensions
   let containerWidth = $state(0);
@@ -52,9 +57,16 @@
 
   // Load persisted settings and history
   onMount(async () => {
-    settings = normalizeMeasureSettings(await readStoreValue(MEASURE_SETTINGS_KEY));
-    history = normalizeMeasureHistory(await readStoreValue(MEASURE_HISTORY_KEY));
-    await startCamera();
+    try {
+      settings = normalizeMeasureSettings(await readStoreValue(MEASURE_SETTINGS_KEY, {}));
+      history = normalizeMeasureHistory(await readStoreValue(MEASURE_HISTORY_KEY, []));
+      
+      // Wait for DOM to be ready
+      await tick();
+      await startCamera();
+    } catch (err) {
+      console.error("初始化失败:", err);
+    }
   });
 
   // Persist settings
@@ -76,9 +88,25 @@
         videoEl.srcObject = stream;
         cameraActive = true;
         cameraError = "";
+      } else {
+        // If videoEl is not ready, release stream
+        stream.getTracks().forEach((track) => track.stop());
+        stream = null;
+        cameraError = "Video element not ready";
       }
     } catch (err) {
-      cameraError = err instanceof Error ? err.message : String(err);
+      // Better error handling for different camera errors
+      if (err instanceof DOMException) {
+        if (err.name === "NotAllowedError") {
+          cameraError = t("measure.cameraPermissionDenied");
+        } else if (err.name === "NotFoundError") {
+          cameraError = t("measure.cameraNotFound");
+        } else {
+          cameraError = err.message;
+        }
+      } else {
+        cameraError = err instanceof Error ? err.message : String(err);
+      }
       cameraActive = false;
     }
   }
@@ -118,8 +146,8 @@
           containerHeight,
           settings.referenceDistance,
         );
-        measurements = [measurement, ...measurements].slice(0, 10);
-        history = [measurement, ...history].slice(0, 50);
+        measurements = [measurement, ...measurements].slice(0, MAX_VISIBLE_MEASUREMENTS);
+        history = [measurement, ...history].slice(0, MAX_HISTORY);
       }
       startPoint = null;
       currentPoint = null;
@@ -127,8 +155,16 @@
     }
   }
 
+  // Throttled mouse move handler for better performance
+  let lastMoveTime = 0;
+  const MOVE_THROTTLE_MS = 16; // ~60fps
+
   function handleVideoMove(e: MouseEvent) {
     if (!measuring || !startPoint) return;
+    
+    const now = Date.now();
+    if (now - lastMoveTime < MOVE_THROTTLE_MS) return;
+    lastMoveTime = now;
     
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
@@ -188,19 +224,32 @@
     const pixelDist = Math.sqrt(dx * dx + dy * dy);
 
     // Calibrate
-    const newRef = calibrateReference(
+    const result: CalibrationResult = calibrateReference(
       refObj.size,
       pixelDist,
       containerWidth,
       settings.referenceDistance,
     );
     
-    if (newRef !== settings.referenceDistance) {
-      settings.referenceDistance = newRef;
+    if (result.success) {
+      settings.referenceDistance = result.value;
+      calibrationMessage = { type: "success", text: t("measure.calibrateSuccess") };
       calibrateStep = "select";
       calibrateStart = null;
       calibrateEnd = null;
       selectedReference = null;
+      
+      // Clear success message after 3 seconds
+      setTimeout(() => {
+        calibrationMessage = null;
+      }, 3000);
+    } else {
+      calibrationMessage = { type: "error", text: t("measure.calibrateFailed") };
+      
+      // Clear error message after 5 seconds
+      setTimeout(() => {
+        calibrationMessage = null;
+      }, 5000);
     }
   }
 
@@ -209,6 +258,7 @@
     calibrateStart = null;
     calibrateEnd = null;
     selectedReference = null;
+    calibrationMessage = null;
   }
 
   // Container resize observer
@@ -255,7 +305,7 @@
       class:text-slate-300={tab !== "measure"}
       onclick={() => (tab = "measure")}
     >
-      {$t("measure.measure")}
+      {t("measure.measure")}
     </button>
     <button
       class="flex-1 px-4 py-3 text-sm font-medium transition-colors"
@@ -264,7 +314,7 @@
       class:text-slate-300={tab !== "calibrate"}
       onclick={() => (tab = "calibrate")}
     >
-      {$t("measure.calibrate")}
+      {t("measure.calibrate")}
     </button>
     <button
       class="flex-1 px-4 py-3 text-sm font-medium transition-colors"
@@ -273,7 +323,7 @@
       class:text-slate-300={tab !== "history"}
       onclick={() => (tab = "history")}
     >
-      {$t("measure.history")}
+      {t("measure.history")}
     </button>
   </div>
 
@@ -350,14 +400,14 @@
             class="rounded-full bg-slate-800/90 px-6 py-3 text-sm font-medium text-slate-100 transition-colors hover:bg-slate-700"
             onclick={toggleUnit}
           >
-            {settings.unit === "metric" ? $t("measure.metric") : $t("measure.imperial")}
+            {settings.unit === "metric" ? t("measure.metric") : t("measure.imperial")}
           </button>
           {#if measurements.length > 0}
             <button
               class="rounded-full bg-slate-800/90 px-6 py-3 text-sm font-medium text-slate-100 transition-colors hover:bg-slate-700"
               onclick={clearMeasurements}
             >
-              {$t("measure.clear")}
+              {t("measure.clear")}
             </button>
           {/if}
         </div>
@@ -365,24 +415,24 @@
         <!-- Instruction -->
         <div class="pointer-events-none absolute left-0 right-0 top-4 flex justify-center px-4">
           <div class="rounded-lg bg-slate-900/80 px-4 py-2 text-sm text-slate-200">
-            {measuring ? $t("measure.tapToFinish") : $t("measure.tapToStart")}
+            {measuring ? t("measure.tapToFinish") : t("measure.tapToStart")}
           </div>
         </div>
       {:else if cameraError}
         <div class="flex h-full flex-col items-center justify-center p-6 text-center">
           <div class="mb-4 text-6xl">📹</div>
-          <p class="mb-2 text-lg font-medium text-slate-200">{$t("measure.cameraError")}</p>
+          <p class="mb-2 text-lg font-medium text-slate-200">{t("measure.cameraError")}</p>
           <p class="text-sm text-slate-400">{cameraError}</p>
           <button
             class="mt-6 rounded-lg bg-sky-600 px-6 py-3 text-sm font-medium text-white hover:bg-sky-500"
             onclick={startCamera}
           >
-            {$t("measure.retryCamera")}
+            {t("measure.retryCamera")}
           </button>
         </div>
       {:else}
         <div class="flex h-full items-center justify-center">
-          <div class="text-lg text-slate-400">{$t("measure.loadingCamera")}</div>
+          <div class="text-lg text-slate-400">{t("measure.loadingCamera")}</div>
         </div>
       {/if}
     </div>
@@ -393,8 +443,23 @@
     <div class="flex-1 overflow-auto">
       {#if calibrateStep === "select"}
         <div class="p-6">
-          <h2 class="mb-2 text-xl font-semibold text-slate-100">{$t("measure.calibrateTitle")}</h2>
-          <p class="mb-6 text-sm text-slate-400">{$t("measure.calibrateDesc")}</p>
+          <h2 class="mb-2 text-xl font-semibold text-slate-100">{t("measure.calibrateTitle")}</h2>
+          <p class="mb-6 text-sm text-slate-400">{t("measure.calibrateDesc")}</p>
+
+          {#if calibrationMessage}
+            <div
+              class="mb-4 rounded-lg border p-4 transition-all"
+              class:bg-green-900={calibrationMessage.type === "success"}
+              class:bg-opacity-20={calibrationMessage.type === "success"}
+              class:border-green-600={calibrationMessage.type === "success"}
+              class:text-green-400={calibrationMessage.type === "success"}
+              class:bg-red-900={calibrationMessage.type === "error"}
+              class:border-red-600={calibrationMessage.type === "error"}
+              class:text-red-400={calibrationMessage.type === "error"}
+            >
+              {calibrationMessage.text}
+            </div>
+          {/if}
 
           <div class="space-y-3">
             {#each Object.entries(REFERENCE_OBJECTS) as [key, obj]}
@@ -403,7 +468,7 @@
                 onclick={() => startCalibration(key as keyof typeof REFERENCE_OBJECTS)}
               >
                 <div>
-                  <div class="font-medium text-slate-100">{$t(`measure.ref.${obj.name}`)}</div>
+                  <div class="font-medium text-slate-100">{t(`measure.ref.${obj.name}`)}</div>
                   <div class="text-sm text-slate-400">{obj.size} {obj.unit}</div>
                 </div>
                 <div class="text-sky-400">→</div>
@@ -412,7 +477,7 @@
           </div>
 
           <div class="mt-6 rounded-lg border border-slate-700 bg-slate-800 p-4">
-            <div class="text-sm font-medium text-slate-300">{$t("measure.currentCalibration")}</div>
+            <div class="text-sm font-medium text-slate-300">{t("measure.currentCalibration")}</div>
             <div class="mt-1 text-lg text-slate-100">{settings.referenceDistance.toFixed(0)} mm</div>
           </div>
         </div>
@@ -420,6 +485,7 @@
         <div class="measure-container relative h-full">
           {#if cameraActive}
             <video
+              bind:this={videoEl}
               autoplay
               playsinline
               class="h-full w-full object-cover"
@@ -445,9 +511,9 @@
 
             <div class="pointer-events-none absolute left-0 right-0 top-4 flex justify-center px-4">
               <div class="rounded-lg bg-slate-900/80 px-4 py-2 text-center text-sm text-slate-200">
-                {selectedReference && $t(`measure.ref.${getReferenceObject(selectedReference)?.name || ""}`)}
+                {selectedReference && t(`measure.ref.${getReferenceObject(selectedReference)?.name || ""}`)}
                 <br />
-                {calibrateStart ? $t("measure.tapEndPoint") : $t("measure.tapStartPoint")}
+                {calibrateStart ? t("measure.tapEndPoint") : t("measure.tapStartPoint")}
               </div>
             </div>
 
@@ -456,7 +522,7 @@
                 class="rounded-full bg-slate-800/90 px-6 py-3 text-sm font-medium text-slate-100 hover:bg-slate-700"
                 onclick={cancelCalibration}
               >
-                {$t("measure.cancel")}
+                {t("measure.cancel")}
               </button>
             </div>
           {/if}
@@ -471,7 +537,7 @@
       {#if history.length === 0}
         <div class="flex h-full flex-col items-center justify-center text-center">
           <div class="mb-3 text-6xl">📏</div>
-          <p class="text-slate-400">{$t("measure.noHistory")}</p>
+          <p class="text-slate-400">{t("measure.noHistory")}</p>
         </div>
       {:else}
         <div class="space-y-2">
@@ -485,7 +551,7 @@
                   <div class="mt-1 text-sm text-slate-400">{m.label}</div>
                 {/if}
                 <div class="mt-1 text-xs text-slate-500">
-                  {new Date(m.timestamp).toLocaleString($locale === "zh" ? "zh-CN" : "en-US")}
+                  {new Date(m.timestamp).toLocaleString(locale() === "zh" ? "zh-CN" : "en-US")}
                 </div>
               </div>
               <button

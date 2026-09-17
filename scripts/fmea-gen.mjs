@@ -156,10 +156,27 @@ const KNOWN_FAILURES = [
   // REQ-A376 (device-found): a Kotlin `object`'s member is not a static method unless it is
   // annotated, so every Rust `call_static_method` into AlarmGlue threw NoSuchMethodError — and no
   // gate could see it (both sides compile, the class exists, the signature string is right).
-  { id: 'F-TAU-014', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt', 'crates/amos-tauri/src/alarm_sched.rs'], markers: ['@JvmStatic', 'KOTLIN → RUST CONTRACT', 'clear_pending'], severity: 3 },
+  // REQ-A377 closed the "no gate" half: `jni-contract-scan` R1 checks every static call into the
+  // glue against the Kotlin member's `@JvmStatic` (and R2 pairs `external fun` ↔ `Java_…`).
+  { id: 'F-TAU-014', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt', 'crates/amos-tauri/src/alarm_sched.rs', 'scripts/jni-contract-scan.mjs'], markers: ['@JvmStatic', 'KOTLIN → RUST CONTRACT', 'clear_pending', 'missing-jvmstatic'], severity: 3 },
   // REQ-A376 (device-found): this ROM's NotificationService refuses a full-screen-intent
   // notification without WAKE_LOCK, so the ring vanished while the alarm itself still fired.
   { id: 'F-TAU-015', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/AndroidManifest.permissions.xml', 'scripts/android-permission-scan.mjs'], markers: ['WAKE_LOCK', 'alarm-notification'], severity: 3 },
+  // REQ-A378: the *instance* half of the same boundary — Rust holds a Kotlin handle (the
+  // `object` singleton from `bind()`, the bridge from `attach(bridge)`) and calls it with
+  // `call_method`, which JNI resolves by name *and* arity: a Kotlin rename or a parameter
+  // change is a NoSuchMethodError that neither R1 (static) nor R2 (external fun) could see.
+  { id: 'F-TAU-016', module: 'amos-tauri', files: ['scripts/jni-contract-scan.mjs', 'crates/amos-tauri/src/mic_permission.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/MicPermissionGlue.kt'], markers: ['missing-kotlin-member', 'arity-mismatch'], severity: 3 },
+  // REQ-A379: a manifest component is a name the platform resolves at *instantiation* time — a
+  // name with no class (or of the wrong kind) builds fine and then simply never runs, exactly
+  // the F-TAU-007 symptom on the other side of the same seam. A `System.loadLibrary` name no
+  // crate builds is the same class of defect (UnsatisfiedLinkError at class init).
+  { id: 'F-TAU-017', module: 'amos-tauri', files: ['scripts/android-component-scan.mjs', 'crates/amos-tauri/android-glue/AndroidManifest.components.xml'], markers: ['missing-kotlin-class', 'unknown-library', 'unknown-action', 'missing-sender-permission'], severity: 3 },
+  // REQ-A380: the platform's own linter never ran in this repo — "does this API exist on
+  // minSdk 26" and "does this call need a permission nobody checks" are invisible to the
+  // compiler (20 errors in our glue on the first run: 5 × NewApi, 8 × MissingPermission),
+  // and an API-29-only MediaStore path was silently dead on API 26..28.
+  { id: 'F-TAU-018', module: 'amos-tauri', files: ['scripts/android-glue-nv21-check.sh', 'crates/amos-tauri/android-glue/com/amos/ai/glue/TetheringGlue.kt', 'crates/amos-tauri/android-glue/com/amos/ai/glue/MediaStoreGlue.kt'], markers: ['lintArmDebug', 'RequiresApi(TETHERING_API)', 'mediaCollection'], severity: 3 },
   { id: 'F-TAU-008', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/uiFailures.ts'], markers: ['unhandledrejection', 'error'], severity: 3 },
 
   // 机器人中间件

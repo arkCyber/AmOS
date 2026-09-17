@@ -22,8 +22,20 @@
  *   • `%20` / encoded characters are decoded before the filesystem check.
  *   • A link may point at a **directory** (e.g. `docs/`), which is fine.
  *
- * The scan is a **hard gate** (no baseline): a broken link is a defect, and the
- * repo is currently clean.
+ * The scan is a **hard gate** (no baseline): a broken link is a defect.
+ *
+ * **Current state (measured 2026-09-17, REQ-A377/A379 rounds): the gate is RED — 125
+ * findings in 15 files.** 119 of them are in the 12 files under `docs/archive/2026-09/zh/`
+ * (a committed snapshot copy of the Chinese docs, `d474f9ce`; its relative links describe
+ * the tree as it was *before* the copy): 116 name a file that still exists elsewhere in the
+ * repo, 3 name targets that no longer exist anywhere (`本文档`, `REQ_TRACEABILITY.md`). The
+ * other 6 are in untracked, root-level audit documents from other sessions.
+ * **The fix is a decision, not a mechanical edit** — either rewrite the archived links so
+ * they resolve to today's paths (the archive then claims today's tree, which is not what an
+ * archived snapshot is) or record that a frozen snapshot's links are out of scope (with a
+ * reason, as the other scans do). It was **reported** rather than decided unilaterally; see
+ * `docs/TRACEABILITY_MATRIX.md` REQ-A377 / REQ-A379 boundaries. The number drifts as other
+ * sessions add documents: read it with `node scripts/docs-link-scan.mjs | grep -c FAIL`.
  *
  * Usage (repo root):
  *   node scripts/docs-link-scan.mjs             # gate (exit 1 on any break)

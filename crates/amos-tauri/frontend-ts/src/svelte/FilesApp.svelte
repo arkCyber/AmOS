@@ -29,6 +29,7 @@
   import type { FEntry, SortKey } from "../lib/files";
   import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import StoreErrorBar from "./StoreErrorBar.svelte";
+  import FileErrorBanner from "./modules/FileErrorBanner.svelte";
   import { fmtTime } from "../lib/notes";
   import { canonicalPath, hasMediaBridge, mediaGrantRead, mediaList, type StandardDir } from "../lib/media";
   import {
@@ -43,6 +44,22 @@
   } from "../lib/externalFiles";
   import { t } from "./locale.svelte";
   import { filesChannel } from "./appLinks";
+  import { onMount } from "svelte";
+  import {
+    navNext,
+    createKeyboardHandler,
+    scrollIntoViewIfNeeded,
+    entryAriaLabel,
+    type A11yNavState,
+  } from "../lib/filesA11y";
+  import {
+    createFileError,
+    createErrorHistory,
+    addError,
+    detectErrorStorm,
+    type FileOperationError,
+    type ErrorHistory,
+  } from "../lib/filesError";
 
   /**
    * External collections this screen lists, read-only. The `media_*` bridge is the
@@ -59,7 +76,7 @@
 
   const FOLDER = "📁";
   const FILE = "📄";
-  const GROUP =
+  const CARD_GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
 
   // Demo seed — **only when the key is absent**, so an intentionally emptied store
@@ -84,6 +101,10 @@
   let err = $state("");
   // The store refused a write (full/unavailable): say so and keep showing the truth.
   let storeErr = $state("");
+  // Enhanced error handling with history and storm detection
+  let errorHistory = $state<ErrorHistory>(createErrorHistory(10));
+  let currentError = $state<FileOperationError | null>(null);
+  let isErrorStorm = $state(false);
   let renameId = $state<string | null>(null);
   let renameVal = $state("");
   let cutId = $state<string | null>(null);
@@ -98,13 +119,23 @@
   /** Entry a Spotlight link asked to reveal (marked while on screen; `null` = none). */
   let spotId = $state<string | null>(null);
   let linkNonce = 0;
+  // Keyboard navigation state
+  let focusedId = $state<string | null>(null);
 
   const persist = (l: FEntry[]): boolean => {
     if (!writeStoreValueChecked(FILES_KEY, l)) {
       storeErr = t("common.storeWriteFailed");
+      // Record error with enhanced tracking
+      const error = createFileError("write", "store_locked", { store: FILES_KEY });
+      errorHistory = addError(errorHistory, error);
+      currentError = error;
+      isErrorStorm = detectErrorStorm(errorHistory);
       return false;
     }
     storeErr = "";
+    // Clear error on success
+    currentError = null;
+    isErrorStorm = false;
     list = l;
     return true;
   };
@@ -112,9 +143,15 @@
     const next = toggleFav(favs, id);
     if (!writeStoreValueChecked(FILES_FAV_KEY, next)) {
       storeErr = t("common.storeWriteFailed");
+      const error = createFileError("write", "store_locked", { store: FILES_FAV_KEY });
+      errorHistory = addError(errorHistory, error);
+      currentError = error;
+      isErrorStorm = detectErrorStorm(errorHistory);
       return;
     }
     storeErr = "";
+    currentError = null;
+    isErrorStorm = false;
     favs = next;
   };
   const toggleSel = (id: string) => {
@@ -126,6 +163,7 @@
   const exitSelect = () => {
     selecting = false;
     selIds = new Set();
+    focusedId = null; // clear focus when exiting select mode
   };
   const toggleSelectAll = () => {
     const visible = display.map((e) => e.id);
@@ -135,12 +173,20 @@
   };
   const deleteSelected = () => {
     if (selIds.size === 0) return;
-    persist(deleteEntries(list, selIds));
+    const result = deleteEntries(list, selIds);
+    if (!persist(result)) {
+      // Error already recorded in persist()
+      return;
+    }
     exitSelect();
   };
   const moveSelectedTo = (destId: string) => {
     if (selIds.size === 0) return;
-    persist(moveEntries(list, selIds, destId === "__root" ? undefined : destId));
+    const result = moveEntries(list, selIds, destId === "__root" ? undefined : destId);
+    if (!persist(result)) {
+      // Error already recorded in persist()
+      return;
+    }
     exitSelect();
   };
 
@@ -154,6 +200,69 @@
           : filterByName(sortChildren(list, cwd, sortKey), query),
   );
   const path = $derived(pathOf(list, cwd));
+
+  // Keyboard navigation helpers
+  const handleKeyNav = (dir: "up" | "down" | "home" | "end") => {
+    const state: A11yNavState = {
+      focusedId,
+      visibleIds: display.map((e) => e.id),
+    };
+    const next = navNext(state, dir);
+    if (next) {
+      focusedId = next;
+      // Scroll into view after a short delay to let DOM update
+      setTimeout(() => {
+        const el = document.querySelector(`[data-entry-id="${next}"]`);
+        scrollIntoViewIfNeeded(el as HTMLElement);
+      }, 0);
+    }
+  };
+
+  const handleKeyOpen = () => {
+    if (!focusedId) return;
+    const entry = list.find((e) => e.id === focusedId);
+    if (entry && entry.type === "folder") {
+      openFolder(entry.id);
+      focusedId = null; // reset focus when navigating
+    }
+  };
+
+  const handleKeyDelete = () => {
+    if (!focusedId) return;
+    if (selecting) {
+      // In selecting mode, delete means delete selected items
+      deleteSelected();
+    } else {
+      // Otherwise delete the focused item
+      persist(deleteEntry(list, focusedId));
+      focusedId = null;
+    }
+  };
+
+  const handleKeyToggle = () => {
+    if (!focusedId || !selecting) return;
+    toggleSel(focusedId);
+  };
+
+  const handleKeySelectAll = () => {
+    if (display.length === 0) return;
+    // If not in selecting mode, enter it first
+    if (!selecting) selecting = true;
+    toggleSelectAll();
+  };
+
+  // Install keyboard handler on mount
+  onMount(() => {
+    const handler = createKeyboardHandler({
+      onNav: handleKeyNav,
+      onOpen: handleKeyOpen,
+      onDelete: handleKeyDelete,
+      onToggle: handleKeyToggle,
+      onSelectAll: handleKeySelectAll,
+    });
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  });
 
   // ---- Deep link: Spotlight → one entry ------------------------------------------
   // Spotlight sets the `files` channel and opens this app. This screen has no
@@ -184,6 +293,7 @@
       query = "";
     }
     spotId = null; // navigating away ends the "here it is" mark
+    focusedId = null; // reset keyboard focus when changing folder
     cwd = id;
   };
   const cycleSort = () =>
@@ -199,6 +309,10 @@
     if (!v) return;
     if (hasName(childrenOf(list, cwd), v)) {
       err = t("files.conflict");
+      const error = createFileError("create", "name_conflict", { name: v });
+      errorHistory = addError(errorHistory, error);
+      currentError = error;
+      isErrorStorm = detectErrorStorm(errorHistory);
       return;
     }
     const entry = makeEntry(creating ?? "folder", v, cwd, Date.now());
@@ -206,6 +320,9 @@
     // Keep the create form (and its typed name/content) if the store rejected it.
     if (!persist(addEntry(list, entry))) return;
     creating = null;
+    err = "";
+    currentError = null;
+    isErrorStorm = false;
   };
   const beginRename = (id: string, oldName: string) => {
     renameId = id;
@@ -217,17 +334,30 @@
     const target = list.find((e) => e.id === renameId);
     if (target && v !== target.name && hasName(childrenOf(list, target.parent), v)) {
       err = t("files.conflict");
+      const error = createFileError("rename", "name_conflict", { name: v });
+      errorHistory = addError(errorHistory, error);
+      currentError = error;
+      isErrorStorm = detectErrorStorm(errorHistory);
       return;
     }
     // A rejected rename keeps the inline input open with the typed name.
     if (!persist(renameEntry(list, renameId, v))) return;
     renameId = null;
+    err = "";
+    currentError = null;
+    isErrorStorm = false;
   };
   const doCut = (id: string) => (cutId = id);
   const moveHere = () => {
     if (!cutId) return;
-    persist(moveEntry(list, cutId, cwd));
+    if (!persist(moveEntry(list, cutId, cwd))) {
+      // Error already recorded in persist()
+      return;
+    }
     cutId = null;
+    err = "";
+    currentError = null;
+    isErrorStorm = false;
   };
 
   const chip = (on: boolean) =>
@@ -434,6 +564,26 @@
     <p role="alert" class="mt-2 text-xs text-danger">{err}</p>
   {/if}
 
+  <!-- Enhanced error feedback -->
+  {#if currentError}
+    <FileErrorBanner 
+      error={currentError}
+      isStorm={isErrorStorm}
+      onRetry={() => {
+        // Retry logic: re-attempt the last failed operation
+        // This is a placeholder - actual retry would need operation-specific logic
+        currentError = null;
+        isErrorStorm = false;
+        err = "";
+      }}
+      onDismiss={() => {
+        currentError = null;
+        isErrorStorm = false;
+        err = "";
+      }}
+    />
+  {/if}
+
 
   <!-- list -->
   {#if display.length === 0}
@@ -447,36 +597,51 @@
             : t("files.empty")}
     </p>
   {:else}
-    <div class="divide-y divide-black/5 dark:divide-white/10 mt-2 {GROUP}">
+    <div 
+      class="divide-y divide-black/5 dark:divide-white/10 mt-2 {CARD_GROUP}"
+      role="grid"
+      aria-label={t("files.fileList")}
+    >
       {#each display as e (e.id)}
         {@const isFolder = e.type === "folder"}
         {@const isSel = selecting && selIds.has(e.id)}
+        {@const isFocused = focusedId === e.id}
         {@const actionable = selecting || isFolder}
-        <div class="flex items-center gap-2 {isSel || spotId === e.id ? 'bg-accent/15' : ''}" data-spotlight={spotId === e.id ? "hit" : undefined}>
+        <div 
+          class="flex items-center gap-2 {isSel || spotId === e.id ? 'bg-accent/15' : ''} {isFocused ? 'ring-2 ring-accent ring-inset' : ''}"
+          data-spotlight={spotId === e.id ? "hit" : undefined}
+          data-entry-id={e.id}
+          role="row"
+          aria-selected={isSel}
+        >
           <button
             type="button"
             onclick={actionable ? (selecting ? () => toggleSel(e.id) : () => openFolder(e.id)) : undefined}
             class={"flex min-w-0 flex-1 items-center gap-2 px-3.5 py-2.5 text-left " + (isFolder && !selecting ? "cursor-pointer" : "")}
+            role="gridcell"
+            aria-label={entryAriaLabel(e.name, e.type, favs.includes(e.id), isSel, e.ts)}
+            tabindex={isFocused ? 0 : -1}
+            onfocus={() => (focusedId = e.id)}
           >
             {#if selecting}
               <span class={"grid h-5 w-5 shrink-0 place-items-center rounded-full text-xs font-bold " +
                 (isSel ? "bg-accent text-white" : "bg-black/15 dark:bg-white/15")}>{isSel ? "✓" : ""}</span>
             {/if}
-            <span class="text-xl">{isFolder ? FOLDER : FILE}</span>
+            <span class="text-xl" aria-hidden="true">{isFolder ? FOLDER : FILE}</span>
             <span class="min-w-0 flex-1">
               <span class="block truncate text-sm">{e.name}</span>
               <span class="block text-xs opacity-50">{globalSearch ? folderPath(list, e.id) || t("files.root") : fmtTime(e.ts)}</span>
             </span>
           </button>
           {#if !selecting}
-            <div class="flex gap-1 pr-2">
-              <button onclick={() => fav(e.id)} aria-label={t("a11y.favorite")}
+            <div class="flex gap-1 pr-2" role="gridcell">
+              <button onclick={() => fav(e.id)} aria-label={favs.includes(e.id) ? t("a11y.unfavorite") : t("a11y.favorite")}
                 class={"rounded-full px-2 py-0.5 text-xs " + (favs.includes(e.id) ? "text-amber-500" : "text-neutral-400")}>
                 {favs.includes(e.id) ? "★" : "☆"}
               </button>
-              <button onclick={() => beginRename(e.id, e.name)} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.rename")}</button>
-              <button onclick={() => doCut(e.id)} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.move")}</button>
-              <button onclick={() => persist(deleteEntry(list, e.id))} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs text-danger dark:bg-neutral-700/70">{t("files.delete")}</button>
+              <button onclick={() => beginRename(e.id, e.name)} aria-label={t("files.rename")} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.rename")}</button>
+              <button onclick={() => doCut(e.id)} aria-label={t("files.move")} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.move")}</button>
+              <button onclick={() => persist(deleteEntry(list, e.id))} aria-label={t("files.delete")} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs text-danger dark:bg-neutral-700/70">{t("files.delete")}</button>
             </div>
           {/if}
         </div>
@@ -537,7 +702,7 @@
           {:else}
             {#each extShown as g (g.collection)}
               <div class="mt-2 px-1 text-xs font-semibold opacity-70">{collectionLabel(g.collection)}</div>
-              <div class="mt-1 {GROUP} divide-y divide-black/5 dark:divide-white/10">
+              <div class="mt-1 {CARD_GROUP} divide-y divide-black/5 dark:divide-white/10">
                 {#each g.files as f (f.id)}
                   <div class="flex items-center gap-2 px-3.5 py-2" data-testid="external-file">
                     <span class="text-xl" aria-hidden="true">{externalGlyph(f.kind)}</span>

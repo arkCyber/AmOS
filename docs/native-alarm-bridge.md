@@ -38,7 +38,8 @@
 ## 诚实边界（重要）
 - **设备侧绑定已接线，但真机验收未做** ✗：`dumpsys alarm | grep -i amos` 应从**空变非空**、`atMs` 前后应看到**真的唤醒**（`AlarmReceiver` 拉起前台 + WebView 响铃）。本轮设备不在线，**没有**任何真机读数 ⇒ 只能给"代码 + 主机编译 + 门"三类证据，不能宣称它已在设备上工作。
 - **系统可以拒绝精确闹钟**（Android 12+）：`canScheduleExactAlarms()==false` 时 `AlarmGlue.schedule` 答 `disallowed`（**不排程、不假装**），`setExact…` 抛 `SecurityException` 时答 `denied`。宿主据此让 Clock 页显示横幅而不是照旧显示"已设置"——**"平台说不行"必须看得见** ✓（`F-TAU-010`）。
-- **权限选择的取舍**：`USE_EXACT_ALARM`（API 33+，闹钟类应用安装即得、无对话框）+ `SCHEDULE_EXACT_ALARM`（API 31/32 的 per-app 授权，`AlarmGlue.openExactAlarmSettings` 打开系统页）。**`POST_NOTIFICATIONS` 故意不声明** ✗ —— 响铃由 WebView 在 `AlarmReceiver` 拉起前台后绘制，本仓没有任何发通知的调用点，声明它只会变成 `android-permission-scan` 报的 stale 条目（与 `BLUETOOTH_ADVERTISE` 同理）；将来真有通知路径时再声明。
+- **权限选择的取舍（REQ-A375/A376 已更正）**：`USE_EXACT_ALARM`（API 33+，闹钟类应用安装即得、无对话框）+ `SCHEDULE_EXACT_ALARM`（API 31/32 的 per-app 授权，`AlarmGlue.openExactAlarmSettings` 打开系统页）。**`POST_NOTIFICATIONS` 现在是声明的** ✓（本条此前写着"故意不声明" ✗ —— REQ-A375 落上**全屏 Intent 通知**这条生产路径后就有了调用点，声明随之补上，并由 `PermissionWire.notificationsIfNeeded` 在 API 33+ 运行时申请；`android-permission-scan` 的 `alarm-notification` 家族把"声明 ↔ 申请 ↔ 调用点"钉住 ✓）；**`WAKE_LOCK` 也是声明的** ✓（REQ-A376 真机实测：这台 ROM 的 `NotificationService` 在全屏 Intent 通知上抛 `SecurityException: … has android.permission.WAKE_LOCK` ✗ ⇒ 响铃静默消失 ✓；它是 normal 权限 ⇒ 声明无害 ✓，但"别的 ROM 未必需要"这条仍写在 `F-TAU-015` 里 ✓）。
+- **名字契约（REQ-A377）**：Rust 按名字调 Kotlin 的静态成员（`call_static_method` ↔ Kotlin 的 `@JvmStatic`）与 Kotlin `external fun` ↔ Rust `Java_…` 导出这两条**编译期看不见**的契约，由 `scripts/jni-contract-scan.mjs` 在 `make lint` 里钉住（见 `docs/android-glue.md` 的"Kotlin ↔ Rust 的名字契约"一节）✓ —— F-TAU-014 的"没有门看得见"已完成收口 ✓。
 - 即便 WebView 被节流但**进程仍活**，用本核心 + 宿主线程轮询即可让到点判定脱离 JS 计时器（可在 dev/桌面验证）；"进程死→被 OS 复活"才是 AlarmManager 的范畴，且需要**真机 + 省电白名单**才能验。
 - 每日重复由调用方在每次 `due` 后 `register` 下一天（核心保持 fire-once、最小语义）。
 

@@ -56,6 +56,7 @@
   import TopBar from "./TopBar.svelte";
   import Dock from "./Dock.svelte";
   import DesktopStage from "./DesktopStage.svelte";
+  import HotCornersListener from "./modules/HotCornersListener.svelte";
   import { t } from "./locale.svelte";
 
   // ─── 布局状态 ───────────────────────────────────────────────────────────────
@@ -430,5 +431,8 @@
       </div>
     {/if}
   {/each}
+
+  <!-- Hot Corners Listener (global mousemove handler) -->
+  <HotCornersListener />
 </div>
 

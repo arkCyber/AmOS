@@ -16,14 +16,11 @@
   // - 输入验证 (长度/格式检查)
   // - CSP 兼容 (iframe sandbox)
   import { onMount, onDestroy } from "svelte";
-  import { t } from "./locale.svelte";
-  import { appLinks } from "./appLinks";
   import ErrorBoundary from "./modules/ErrorBoundary.svelte";
+  import { t } from "./locale.svelte";
   import {
     type Tab,
-    type Bookmark,
     type HistoryEntry,
-    type Download,
     type WebManSettings,
     loadBookmarks,
     loadHistory,
@@ -45,26 +42,23 @@
     extractTitle,
     getFaviconUrl,
     formatTime,
-    formatFileSize,
-    generateId,
     sanitizeUrl,
     applySafeSearch,
     debounce,
     logger,
-    DEFAULT_SETTINGS,
   } from "../lib/webman";
 
   // 状态
   let tabs = $state<Tab[]>(loadTabs());
-  let activeTabId = $state<string>(tabs[0]?.id ?? "");
+  let activeTabId = $state<string>("");
   let inputValue = $state("");
-  let isNavigating = $state(false);
   let showBookmarks = $state(false);
   let showHistory = $state(false);
   let showDownloads = $state(false);
   let showSettings = $state(false);
   let showMenu = $state(false);
   let isDesktop = $state(false);
+  let isNavigating = $state(false);
 
   // 设置
   let settings = $state<WebManSettings>(loadSettings());
@@ -76,7 +70,7 @@
   const downloads = $derived(loadDownloads());
 
   // iframe 引用
-  let iframeRef: HTMLIFrameElement | null = null;
+  let iframeRef = $state<HTMLIFrameElement | null>(null);
 
   // Toast 消息
   let toastMessage = $state("");
@@ -102,18 +96,25 @@
     }
   });
 
+  // 初始化 activeTabId
+  $effect(() => {
+    if (!activeTabId && tabs.length > 0) {
+      activeTabId = tabs[0]!.id;
+    }
+  });
+
   // 导航 - 增强安全版
   function navigate(url?: string) {
     const targetUrl = url ?? parseInput(inputValue, settings.searchEngine);
     if (!targetUrl) {
-      showToast("无效的 URL");
+      showToast(t("webman.toast.invalidUrl"));
       return;
     }
 
     // 验证 URL 安全性
     const validation = sanitizeUrl(targetUrl);
     if (!validation.valid) {
-      showToast(validation.error || "URL 验证失败");
+      showToast(validation.error || t("webman.toast.urlValidationFailed"));
       logger.error('Navigation blocked:', validation.error);
       return;
     }
@@ -161,15 +162,8 @@
 
   function handleIframeError() {
     logger.error('Iframe failed to load');
-    showToast("页面加载失败");
+    showToast(t("webman.toast.pageLoadFailed"));
     isNavigating = false;
-  }
-
-  // 错误边界回调
-  function handleAppError(error: Error, errorInfo: { componentStack: string }) {
-    logger.error('Application error caught by boundary:', error);
-    logger.error('Component stack:', errorInfo.componentStack);
-    showToast("应用遇到错误，请重试");
   }
 
   // Iframe 通信安全 (P1)
@@ -279,14 +273,14 @@
       const bookmark = bookmarks.find((b) => b.url === activeTab.url);
       if (bookmark) {
         removeBookmark(bookmark.id);
-        showToast("已取消收藏");
+        showToast(t("webman.toast.bookmarkRemoved"));
       }
     } else {
       const result = addBookmark(activeTab.url, activeTab.title);
       if (result) {
-        showToast("已添加书签");
+        showToast(t("webman.toast.bookmarkAdded"));
       } else {
-        showToast("添加书签失败");
+        showToast(t("webman.toast.bookmarkFailed"));
       }
     }
   }
@@ -345,21 +339,25 @@
     <!-- 标签列表 -->
     <div class="flex flex-1 items-center gap-1 overflow-x-auto">
       {#each tabs as tab (tab.id)}
-        <button
-          onclick={() => selectTab(tab.id)}
+        <div
           class="group flex max-w-[160px] min-w-[100px] items-center gap-1.5 rounded-t-lg px-3 py-1.5 text-sm transition-colors {tab.id === activeTabId
             ? 'bg-white dark:bg-neutral-700'
             : 'bg-neutral-300 hover:bg-neutral-200 dark:bg-neutral-700 dark:hover:bg-neutral-600'}"
         >
-          {#if tab.favicon}
-            <img src={tab.favicon} alt="" class="h-4 w-4 shrink-0" />
-          {:else}
-            <span class="text-base">🌐</span>
-          {/if}
-          <span class="truncate flex-1 text-xs">{tab.title || "新标签页"}</span>
-          {#if tab.loading}
-            <span class="h-3 w-3 animate-spin rounded-full border border-accent border-t-transparent"></span>
-          {/if}
+          <button
+            onclick={() => selectTab(tab.id)}
+            class="flex min-w-0 flex-1 items-center gap-1.5"
+          >
+            {#if tab.favicon}
+              <img src={tab.favicon} alt="" class="h-4 w-4 shrink-0" />
+            {:else}
+              <span class="text-base">🌐</span>
+            {/if}
+            <span class="truncate flex-1 text-xs">{tab.title || t("webman.newTab")}</span>
+            {#if tab.loading}
+              <span class="h-3 w-3 animate-spin rounded-full border border-accent border-t-transparent"></span>
+            {/if}
+          </button>
           {#if !tab.pinned}
             <button
               onclick={(e) => {
@@ -367,11 +365,12 @@
                 removeTab(tab.id);
               }}
               class="opacity-0 transition-opacity group-hover:opacity-100"
+              aria-label={t("webman.closeTab")}
             >
               <span class="text-neutral-500 hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200">✕</span>
             </button>
           {/if}
-        </button>
+        </div>
       {/each}
       
       <!-- 新建标签按钮 -->
@@ -434,7 +433,7 @@
           type="text"
           bind:value={inputValue}
           onkeydown={handleKeydown}
-          placeholder={settings.privateMode ? "隐私模式" : "搜索或输入网址"}
+          placeholder={settings.privateMode ? t("webman.privateMode") : t("webman.searchOrEnterUrl")}
           class="h-10 w-full rounded-full bg-neutral-200 pl-10 pr-4 text-sm outline-none focus:ring-2 focus:ring-accent/50 dark:bg-neutral-800 dark:text-white"
         />
       </div>
@@ -468,19 +467,19 @@
         <!-- 侧边栏头部 -->
         <div class="flex border-b border-neutral-300 p-3 dark:border-neutral-700">
           {#if showBookmarks}
-            <h2 class="flex-1 text-sm font-semibold">书签</h2>
+            <h2 class="flex-1 text-sm font-semibold">{t("webman.bookmarks")}</h2>
           {:else if showHistory}
-            <h2 class="flex-1 text-sm font-semibold">历史记录</h2>
+            <h2 class="flex-1 text-sm font-semibold">{t("webman.history")}</h2>
             <input
               type="text"
               bind:value={historyQuery}
-              placeholder="搜索历史"
+              placeholder={t("webman.searchHistory")}
               class="h-8 rounded-full bg-neutral-200 px-3 text-xs outline-none dark:bg-neutral-700"
             />
           {:else if showDownloads}
-            <h2 class="flex-1 text-sm font-semibold">下载</h2>
+            <h2 class="flex-1 text-sm font-semibold">{t("webman.downloads")}</h2>
           {:else if showSettings}
-            <h2 class="flex-1 text-sm font-semibold">设置</h2>
+            <h2 class="flex-1 text-sm font-semibold">{t("webman.settings")}</h2>
           {/if}
           <button
             onclick={() => {
@@ -490,6 +489,7 @@
               showSettings = false;
             }}
             class="ml-2 text-neutral-500"
+            aria-label={t("webman.closeMenu")}
           >
             ✕
           </button>
@@ -499,7 +499,7 @@
         {#if showBookmarks}
           <div class="p-2">
             {#if bookmarks.length === 0}
-              <p class="p-4 text-center text-sm text-neutral-500">暂无书签</p>
+              <p class="p-4 text-center text-sm text-neutral-500">{t("webman.noBookmarks")}</p>
             {:else}
               {#each bookmarks as bookmark (bookmark.id)}
                 <div class="flex w-full items-center gap-2 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-700">
@@ -542,10 +542,10 @@
               onclick={() => clearHistory()}
               class="mb-2 w-full rounded-lg bg-neutral-200 px-3 py-2 text-xs hover:bg-neutral-300 dark:bg-neutral-700 dark:hover:bg-neutral-600"
             >
-              清除历史
+              {t("webman.clearHistory")}
             </button>
             {#if filteredHistory.length === 0}
-              <p class="p-4 text-center text-sm text-neutral-500">暂无历史记录</p>
+              <p class="p-4 text-center text-sm text-neutral-500">{t("webman.noHistory")}</p>
             {:else}
               {#each filteredHistory as entry (entry.visitedAt)}
                 <button
@@ -578,7 +578,7 @@
         {#if showDownloads}
           <div class="p-2">
             {#if downloads.length === 0}
-              <p class="p-4 text-center text-sm text-neutral-500">暂无下载</p>
+              <p class="p-4 text-center text-sm text-neutral-500">{t("webman.noDownloads")}</p>
             {:else}
               {#each downloads as download (download.id)}
                 <div class="mb-2 rounded-lg border border-neutral-200 p-2 dark:border-neutral-700">
@@ -593,11 +593,11 @@
                       </div>
                       <span class="text-xs text-neutral-500">{download.progress}%</span>
                     {:else if download.status === "completed"}
-                      <span class="text-xs text-green-500">已完成</span>
+                      <span class="text-xs text-green-500">{t("webman.downloadStatus.completed")}</span>
                     {:else if download.status === "failed"}
-                      <span class="text-xs text-red-500">失败</span>
+                      <span class="text-xs text-red-500">{t("webman.downloadStatus.failed")}</span>
                     {:else}
-                      <span class="text-xs text-neutral-500">等待中</span>
+                      <span class="text-xs text-neutral-500">{t("webman.downloadStatus.waiting")}</span>
                     {/if}
                   </div>
                 </div>
@@ -611,7 +611,7 @@
           <div class="p-2">
             <!-- 搜索引擎 -->
             <div class="mb-4">
-              <p class="mb-2 px-2 text-xs text-neutral-500">搜索引擎</p>
+              <p class="mb-2 px-2 text-xs text-neutral-500">{t("webman.searchEngine")}</p>
               <div class="space-y-1">
                 {#each (["google", "bing", "baidu", "duckduckgo"] as const) as engine}
                   <button
@@ -632,14 +632,14 @@
 
             <!-- 安全设置 -->
             <div class="mb-4">
-              <p class="mb-2 px-2 text-xs text-neutral-500">隐私与安全</p>
+              <p class="mb-2 px-2 text-xs text-neutral-500">{t("webman.privacySecurity")}</p>
               <div class="space-y-1">
                 <button
                   onclick={togglePrivateMode}
                   class="flex w-full items-center gap-2 rounded-lg p-2 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
                 >
                   <span class="text-lg">{settings.privateMode ? "🔒" : "🔓"}</span>
-                  <span class="flex-1 text-sm">隐私模式</span>
+                  <span class="flex-1 text-sm">{t("webman.privateMode")}</span>
                   <div class="h-5 w-9 rounded-full bg-accent p-0.5">
                     <div class="h-full w-full rounded-full bg-white transition-transform {settings.privateMode ? 'translate-x-4' : ''}"></div>
                   </div>
@@ -649,7 +649,7 @@
                   class="flex w-full items-center gap-2 rounded-lg p-2 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
                 >
                   <span class="text-lg">🛡️</span>
-                  <span class="flex-1 text-sm">安全搜索</span>
+                  <span class="flex-1 text-sm">{t("webman.safeSearch")}</span>
                   <div class="h-5 w-9 rounded-full bg-accent p-0.5">
                     <div class="h-full w-full rounded-full bg-white transition-transform {settings.safeSearch ? 'translate-x-4' : ''}"></div>
                   </div>
@@ -681,14 +681,14 @@
           <!-- 移动模式: WebView (需要原生支持) -->
           <div class="flex flex-1 flex-col items-center justify-center bg-white p-8 text-center">
             <div class="mb-6 text-6xl">🌐</div>
-            <h2 class="mb-2 text-xl font-semibold">{activeTab.title || "新标签页"}</h2>
+            <h2 class="mb-2 text-xl font-semibold">{activeTab.title || t("webman.newTab")}</h2>
             <p class="mb-4 text-sm text-neutral-500">{activeTab.url}</p>
             <a
               href={activeTab.url}
               target="_blank"
               class="rounded-full bg-accent px-6 py-2 text-sm font-medium text-white hover:opacity-90"
             >
-              在外部浏览器中打开
+              {t("webman.openInBrowser")}
             </a>
           </div>
         {/if}
@@ -698,16 +698,16 @@
           <!-- Logo -->
           <div class="mb-8 flex items-center gap-3">
             <span class="text-5xl">🌐</span>
-            <h1 class="text-4xl font-bold">WebMan</h1>
+            <h1 class="text-4xl font-bold">{t("webman.appName")}</h1>
           </div>
 
           <!-- 快速链接 -->
           <div class="mb-8 grid grid-cols-4 gap-4">
             {#each [
-              { icon: "📧", name: "Gmail", url: "https://mail.google.com" },
-              { icon: "📺", name: "YouTube", url: "https://youtube.com" },
-              { icon: "💬", name: "微信", url: "https://wx.qq.com" },
-              { icon: "🛒", name: "淘宝", url: "https://taobao.com" },
+              { icon: "📧", name: t("webman.quickLinks.gmail"), url: "https://mail.google.com" },
+              { icon: "📺", name: t("webman.quickLinks.youtube"), url: "https://youtube.com" },
+              { icon: "💬", name: t("webman.quickLinks.wechat"), url: "https://wx.qq.com" },
+              { icon: "🛒", name: t("webman.quickLinks.taobao"), url: "https://taobao.com" },
             ] as site}
               <button
                 onclick={() => navigate(site.url)}
@@ -726,7 +726,7 @@
               type="text"
               bind:value={inputValue}
               onkeydown={handleKeydown}
-              placeholder="搜索或输入网址"
+              placeholder={t("webman.searchPlaceholder")}
               class="h-14 w-full rounded-full border border-neutral-300 bg-neutral-100 pl-14 pr-4 text-lg outline-none focus:border-accent focus:ring-2 focus:ring-accent/30 dark:border-neutral-700 dark:bg-neutral-900"
             />
           </div>
@@ -737,25 +737,25 @@
               onclick={() => (showBookmarks = true)}
               class="flex items-center gap-2 rounded-lg px-4 py-2 text-sm text-neutral-600 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
-              <span>⭐</span> 书签
+              <span>⭐</span> {t("webman.bookmarks")}
             </button>
             <button
               onclick={() => (showHistory = true)}
               class="flex items-center gap-2 rounded-lg px-4 py-2 text-sm text-neutral-600 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
-              <span>📜</span> 历史
+              <span>📜</span> {t("webman.history")}
             </button>
             <button
               onclick={() => (showDownloads = true)}
               class="flex items-center gap-2 rounded-lg px-4 py-2 text-sm text-neutral-600 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
-              <span>⬇️</span> 下载
+              <span>⬇️</span> {t("webman.downloads")}
             </button>
             <button
               onclick={() => (showSettings = true)}
               class="flex items-center gap-2 rounded-lg px-4 py-2 text-sm text-neutral-600 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
-              <span>⚙️</span> 设置
+              <span>⚙️</span> {t("webman.settings")}
             </button>
           </div>
         </div>
@@ -765,7 +765,14 @@
 
   <!-- 菜单弹窗 -->
   {#if showMenu}
-    <div class="fixed inset-0 z-50" onclick={() => (showMenu = false)}>
+    <div 
+      class="fixed inset-0 z-50" 
+      role="button" 
+      tabindex="0"
+      onclick={() => (showMenu = false)}
+      onkeydown={(e) => e.key === 'Escape' && (showMenu = false)}
+      aria-label={t("webman.closeMenu")}
+    >
       <div class="absolute bottom-12 right-3 w-56 rounded-xl bg-white shadow-xl dark:bg-neutral-800">
         <button
           onclick={() => {
@@ -775,17 +782,17 @@
           class="flex w-full items-center gap-3 rounded-t-xl px-4 py-3 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
         >
           <span class="text-lg">➕</span>
-          <span class="text-sm">新建标签页</span>
+          <span class="text-sm">{t("webman.newTab")}</span>
         </button>
         <button
           onclick={() => {
-            addTab("", true);
+            addTab(true);
             showMenu = false;
           }}
           class="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
         >
           <span class="text-lg">📌</span>
-          <span class="text-sm">新建固定标签</span>
+          <span class="text-sm">{t("webman.newPinnedTab")}</span>
         </button>
         <div class="border-t border-neutral-200 dark:border-neutral-700">
           <button
@@ -796,7 +803,7 @@
             class="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
           >
             <span class="text-lg">⭐</span>
-            <span class="text-sm">书签</span>
+            <span class="text-sm">{t("webman.bookmarks")}</span>
           </button>
           <button
             onclick={() => {
@@ -806,7 +813,7 @@
             class="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
           >
             <span class="text-lg">📜</span>
-            <span class="text-sm">历史记录</span>
+            <span class="text-sm">{t("webman.history")}</span>
           </button>
           <button
             onclick={() => {
@@ -816,7 +823,7 @@
             class="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
           >
             <span class="text-lg">⬇️</span>
-            <span class="text-sm">下载内容</span>
+            <span class="text-sm">{t("webman.downloads")}</span>
           </button>
         </div>
         <div class="border-t border-neutral-200 dark:border-neutral-700">
@@ -828,7 +835,7 @@
             class="flex w-full items-center gap-3 rounded-b-xl px-4 py-3 text-left hover:bg-neutral-100 dark:hover:bg-neutral-700"
           >
             <span class="text-lg">⚙️</span>
-            <span class="text-sm">设置</span>
+            <span class="text-sm">{t("webman.settings")}</span>
           </button>
         </div>
       </div>

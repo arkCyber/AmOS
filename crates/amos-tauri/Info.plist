@@ -99,5 +99,16 @@
         <key>NSAllowsLocalNetworking</key>
         <true/>
     </dict>
+
+    <!-- Local Network (required for AirPlay device discovery via Bonjour) -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Amos needs local network access to discover and connect to AirPlay devices on your network.</string>
+
+    <!-- Bonjour Services (required for AirPlay device discovery) -->
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_airplay._tcp</string>
+        <string>_raop._tcp</string>
+    </array>
 </dict>
 </plist>

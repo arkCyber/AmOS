@@ -217,7 +217,15 @@
           class="space-card p-4 rounded-lg border-2 transition-all cursor-pointer {currentIndex === index
             ? 'border-blue-600 bg-blue-50 dark:bg-blue-950'
             : 'border-neutral-300 dark:border-neutral-700 hover:border-neutral-400 dark:hover:border-neutral-600'}"
+          role="button"
+          tabindex="0"
           onclick={() => handleSwitch(index)}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              handleSwitch(index);
+            }
+          }}
         >
           <!-- 桌面图标 -->
           <div class="text-3xl mb-2">

@@ -156,11 +156,17 @@ export function openSettingsSearch(query: string): void {
  * @param page - 页面标识符 (如 "dock", "wifi", "bluetooth")
  */
 export function openApp(appId: string, page?: string): void {
-  if (appId === "settings" && page) {
-    // 使用特殊的 query 格式 "#page" 来触发直接页面导航
-    settingsChannel().set({ query: `#${page}`, nonce: Date.now() });
+  const id = appId.trim();
+  if (id === "") return;
+  
+  if (id === "settings" && page) {
+    const p = page.trim();
+    if (p !== "") {
+      // 使用特殊的 query 格式 "#page" 来触发直接页面导航
+      settingsChannel().set({ query: `#${p}`, nonce: Date.now() });
+    }
   }
-  open(appId);
+  open(id);
 }
 
 /** Props-channel name of the Phone screen (shared contract with PhoneApp). */

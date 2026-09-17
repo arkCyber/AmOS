@@ -279,3 +279,127 @@ close 释放了在途图像的内存，回调继续读它 → `buffer is inacces
   **整棵** `android-glue/` 树镜像进生成工程并跑 `:app:compileArmDebugKotlin` —— **真实 SDK 上的
   编译门**（本文件第一版正是在这里被查出用了不存在的 API）。真机运行/权限/线程仍需设备验收。
 
+
+## 组件与库名：平台在**实例化时按名字找类**的东西也得有门（`android-component-scan.mjs`，REQ-A379）
+
+`AndroidManifest.components.xml` 是本仓**跟踪**的片段，那 4 条 `<service>`/`<receiver>` 就是设备上**唯一**让
+在通话界面、来电筛查、短信常驻接收、精确闹钟存在的原因 ✓（片段自己的注释里写着 F-TAU-007 的教训 ✓）。
+而每一条都是一个**平台在实例化时按名字找类**的字符串 ✓：名字对不上类（打错一个字母，或 Kotlin 侧改了名）
+⇒ **编译照样过、启动也不报错** ✗ —— 组件**永远不运行** ✗：
+
+| 组件 | 名字错位的后果 |
+|---|---|
+| `AlarmReceiver` | 闹钟响了，**什么都不发生**（F-TAU-007 的症状出现在同一个 seam 的另一侧） |
+| `SmsReceiver` | 短信只在应用恰好在运行时才到达 |
+| `AmosInCallService` / `AmosCallScreeningService` | 没有在通话界面 / 拦截静默失效，**没有任何错误** |
+
+**既有门管到哪** ✓：`scripts/android-glue-mirror.sh` 证明的是**两个文件**里名字一致 ✓（片段 ↔ 生成的
+manifest）—— 它可以照旧通过，而两边写着**同一个错名字** ✗ ⇒ 没人看过 Kotlin 那一侧 ✓。新门补上三条：
+
+| 判据 | 内容 | 失败即 |
+|---|---|---|
+| **K1** | 片段的每条 `<service>`/`<receiver>` 名字必须解析到本仓 glue 里**存在**的类，且**种类对**（`<receiver>` ⇒ `BroadcastReceiver`；`<service>` ⇒ `Service` 或平台已知子类） | 平台实例化不到（功能静默死亡） |
+| **K2**（反向） | glue 里一个**顶层**且继承组件种类的类必须被片段登记 | 类编进 APK，平台永远不会实例化它 |
+| **K3** | 每个 `System.loadLibrary("x")` 的 `x` 必须是某个 workspace crate 的 `[lib] name`（或包名 `-`→`_`） | 类初始化 `UnsatisfiedLinkError` |
+| **K4** | 声明**内部**的名字：`<action>` 必须是**闭合表** `PLATFORM_ACTIONS` 里的平台 action、必须投递给**这种**组件（`<receiver>` 的动作不能挂在 `<service>` 上），且受保护广播必须声明平台要求的**发送方权限** | 拼错的动作 ⇒ 组件永不触发；`SMS_RECEIVED` 的导出接收器缺 `BROADCAST_SMS` ⇒ **任何应用都能注入假短信** |
+
+`PLATFORM_ACTIONS` 是**故意闭合**的 ✓：表里没有的动作**直接失败** ✓ —— 因为从这里看，"没见过的平台动作"与"拼错的平台动作"**长得一样** ✓，而后者就是一个永不运行的组件 ✓；加一条新动作是**有意的登记**（要把平台要求的发送方权限一起写进去 ✓），不是猜 ✓。`<meta-data>` 的名字没有这样的后果表 ⇒ **只报告** ✓。
+
+**诚实边界**：①**相对名按 `tauri.conf.json` 的 `identifier` 解析**（`.glue.X` → `com.amos.ai.glue.X`），所以
+"命名空间"与"组件名"两处不能悄悄漂开；②`<activity>`/`<provider>` **只报告不判定**（Activity 由 Tauri 生成），
+**app 命名空间之外**的组件（如 `androidx.work.…`）同样只报告（不是本仓的类）；③种类检查读的是**声明里的父类
+文本**（一文件一类的 glue 惯例）；自有基类 ⇒ "读不出来" ⇒ **失败 + allowlist**，而不是放过；④K2 只认识它被指向
+的那一个片段（由别的 manifest 登记的组件要写 allowlist 理由）；⑤K4 的表**闭合**（未列出的 action 失败 ⇒ 必须
+有意登记）；⑥**未在真机上复验** ✗ —— 本门是静态判据。
+
+**自检与负控**：`--selftest` ⇒ **40 断言** ✓（含"注释里的组件不算声明" ✓、"相对名解析" ✓、"无名组件" ✓、
+"读不出父类 ⇒ 失败" ✓、`[lib] name` 优先于包名 ✓、"拼错的动作是发现" ✓、"动作投给了错种类的组件" ✓、
+"导出接收器缺发送方权限" ✓、"发送方权限写错" ✓、"`<meta-data>` 只报告" ✓）；**真树负控（逐字节还原，`cmp` 一致）**
+✓：**(A)** 把 `AlarmReceiver` 改一个字母 ⇒ `missing-kotlin-class` ✓ **并**报反向的 `unregistered-component` ✓；
+**(B)** 把该 `<receiver>` 改成 `<service>` ⇒ `wrong-kind` ✓；**(C)** `SensorGlue` 的 `loadLibrary` 改名 ⇒
+`unknown-library` ✓；**(D)** 去掉 `SmsReceiver` 的 `android:permission="…BROADCAST_SMS"` ⇒ `missing-sender-permission` ✓；
+**(E)** 把 SMS 动作拼错 ⇒ `unknown-action` ✓；**(F)** 把 `InCallService` 动作拼错 ⇒ `unknown-action` ✓。
+当前树 ⇒ **EXIT=0**（4 个组件 ✓、3 个动作 + 发送方权限 ✓、1 条 meta-data 报告 ✓、4 个库名 ✓）。
+
+## Android Lint 终于在这棵树里跑起来了（REQ-A380，2026-09-17）
+
+**为什么之前没看见**：`make android-glue-check` 只做两件事 —— 把整棵 glue 镜像进生成工程、跑
+`:app:compileArmDebugKotlin` +（主机 JVM 单测）、再把**我们自己 glue 的 Kotlin 警告**当错误 ✓。它能证明"**编得过**" ✓，
+但证明不了另外两件事 ✗：**这些 API 在 `minSdk = 26` 的设备上存在吗** ✗、**这个调用需要一枚没人检查的权限吗** ✗ ——
+而这两件事正是**平台自己的 linter**（Android Lint）回答的，本仓**从未跑过它** ✓。
+
+首跑（`./gradlew :app:lintArmDebug`，compileSdk 36 / minSdk 26）在**我们的 glue** 里报了 **20 个 error**：
+
+| 位置 | 判据 | 真身 |
+|---|---|---|
+| `TetheringGlue.kt` ×5 | `NewApi`（API 36 的 `TetheringManager` / `TetheringEventCallback` / `TetheringInterface#getType`、API 28 的 `Context#mainExecutor`） | **不是设备缺陷**：两个调用方都先判了 `SDK_INT` ✓ —— 但 **lint 不跟随调用方里的守卫** ✗。修法：把要求**声明在函数上**（`@RequiresApi(TETHERING_API)`）⇒ lint 会**逐个调用点**核对 ✓（比函数体里再判一次更强：以后有人从无守卫处调用，**lint 当场报错**，而不是真机上 `NoSuchMethodError`）。函数体里那版 `SDK_INT` 复查**故意不留** —— 有注解它就可证明是死代码，`ObsoleteSdkInt` 也这么说 ✓ |
+| `BluetoothGlue.kt` ×8 | `MissingPermission` | **不是缺陷**：每个调用都在 `try/catch (Throwable)` 里，平台拒绝会被转成如实的 `false` / 日志 ✓（`startDiscovery` 还先过 `canScan()` ✓）—— lint 两边都看不见 ✗ ⇒ **逐点 `@SuppressLint("MissingPermission")` + 写明理由** ✓（第一处写了完整理由，其余七处引用它） |
+| `MediaStoreGlue.kt` ×4（warning `InlinedApi`） | `MediaStore.VOLUME_EXTERNAL_PRIMARY`（API 29） | **真的缺陷** ✓：`MediaStore.*.getContentUri(String volume)` **本身就是 API 29 的 API** ⇒ 在 API 26..28 上是 `NoSuchMethodError`，被本类的错误路径接住 ⇒ **那些路径在 26..28 上等于静默死亡** ✗（而 `minSdk` 就是 26 ✓）。修法：`mediaCollection(legacy, volumeBased)` —— API ≥ 29 用卷形式、以下退回 `EXTERNAL_CONTENT_URI` ✓ |
+
+**门现在做什么**：`make android-glue-check` 的第三阶段跑 `:app:lintArmDebug`（默认 `--offline`）并：
+①**我们 glue 里的 error 必须为 0**（有即列出文件:行 并失败 ✗）；
+②**warning 只报告不判定** ✓（当前 16 条，按 issue id 归类打印：`StaticFieldLeak` ×6（`object` 单例持有 Context，lint 分不清 application context ✓）、`UseKtx` ×5（建议用 androidx.core-ktx 的 `String.toUri`，本仓不依赖 core-ktx ✓）、`ObsoleteSdkInt` ×3（`minSdk 26` 下恒真的版本判断 ✓）、`InlinedApi` ×2（`Manifest.permission.BLUETOOTH_SCAN` / `Settings.Panel.ACTION_INTERNET_CONNECTIVITY`，都是编译期内联的常量 ✓））；
+③**生成工程里的 findings 只报告** ✓（machine-owned，与 `gen/` 的既有约定一致）；
+④**没有报告文件 ⇒ 失败** ✓（"读不到"不等于"没问题"）；
+⑤分类器带**自检** ✓（一条 glue error + 一条 generated error + 一条 glue warning ⇒ 必须数出 1/1 ✓）。
+
+**诚实边界**：①这一阶段需要**已初始化的 `gen/` + JDK 17 + Gradle 依赖缓存**（首次需要联网跑一次 `:app:lintArmDebug`；之后 `--offline` 可复现 ✓）⇒ 它挂在 `android-glue-check`（`make verify` 的一条），**不在** `make lint` 里 ✓（CI 的快速路径不需要 SDK）；②**只判我们的 glue** ✓，生成工程的 7 个 error / 若干 warning 只打印 ✓；③**warning 不判定** ✓（下一步：逐条裁定 `StaticFieldLeak`/`UseKtx`/`ObsoleteSdkInt`/`InlinedApi`）；④**真机未复验** ✗（本门是静态判据；`MediaStoreGlue` 的 26..28 回退路径**没有设备**可验，只能给出"API 29 以下走 `EXTERNAL_CONTENT_URI`"这条平台事实 ✓）。
+
+**负控**（逐字节还原，`cmp` 证明）✓：把 `TetheringGlue.bindCallback` 的 `@RequiresApi(TETHERING_API)` 拿掉 ⇒ 门 **FAIL** 并点名
+`TetheringGlue.kt:167/168/169/174: Error: Call requires API level 36 (current min is 26) … [NewApi]` ✓（总 error 数 **7 → 12**，多出来的 5 条全在我们 glue 里 ✓ —— 其余 7 条属生成工程，只打印 ✓）。
+
+## Kotlin ↔ Rust 的名字契约由门钉住（`scripts/jni-contract-scan.mjs`，REQ-A377）
+
+JNI 的名字**一边是字符串、另一边是声明**，两个编译器都看不见对面。REQ-A376 的真机读数把代价记了下来：
+`alarm_sched.rs` 用 `call_static_method` 调 `AlarmGlue.schedule`，而 Kotlin 侧是 `object` 的**成员**
+（实例方法，不是静态方法）⇒ 真机第一次调用就
+`java.lang.NoSuchMethodError: no static method "…AlarmGlue;.schedule(…)Ljava/lang/String;"` ✗ —— 而
+Kotlin 编译过 ✓、Rust 编译过 ✓、APK 里有那个类 ✓、签名串也对 ✓ ⇒ **没有任何门看得见** ✗。
+
+于是 `make lint` 里多了一道门（**三条**判据，同一条边界的三种走法）：
+
+| 判据 | 内容 | 失败时的真机后果 |
+|---|---|---|
+| **R1** | 每一处 `call_static_method(<glue class>, "<成员>", …)` 对应的 Kotlin 成员**必须**带 `@JvmStatic`（顶层 `fun` 也不行 —— 它编译到 `<File>Kt`） | `NoSuchMethodError`：第一次调用即失败（F-TAU-014） |
+| **R2** | 每个 Kotlin `external fun` **必须**有对应的 Rust `Java_…` 导出，反之亦然 | `UnsatisfiedLinkError`：Kotlin 第一次调用即失败 |
+| **R3** | 每一处 `call_method(<glue/bridge 句柄>, "<成员>", <签名>, …)` 对应的 Kotlin `fun` **必须存在且签名一致**：**元数**与**类型**（每个参数 + 返回值）都从 JNI 描述符解析并与 Kotlin 声明比对（R1 同样查类型） | `NoSuchMethodError`：JNI 按**名字 + 签名**解析，Kotlin 改名、改参数或改类型即报错（F-TAU-016） |
+
+**它怎么读 Rust**（调用点持有的是 `JClass`/`GlobalRef`，不是字符串）：字面量 → **本函数内的 `let` 绑定** →
+文件级 `const`/`static` → `fn` 体内的 `self.<字段>`（`amos-radio` 的形状：`let class = self.radio_glue()?`
+→ `self.radio` → `RADIO_CLASS`）→ **外层函数里唯一的那个 glue 字面量**（`incall.rs`/`blocklist.rs` 的
+`find_class(...)`）。成员名若是**参数**（`call_static_bool(method: &str)`、`call0/call1/call2`），就用调用方
+传进去的字面量 —— 只认字面量的门会漏掉这种形状。
+
+**R3 怎么认「句柄」**（这是它唯一需要判断的地方，所以写死成名字规则）：接收者表达式自身出现 `…glue…`/`…bridge…`
+（`bridge.glue.as_obj()`、`glue`、`self.bridge.as_obj()`），**或**接收者是一个本函数内由这类表达式绑定的标识符
+（`let obj = self.bridge.as_obj();`）。**字符串与注释里的提及不算数** ✓ —— 加法测试时它当场纠正过一次误报：
+`real_dial.rs` 的 `Intent#setData/addFlags/startActivity` 因为一句文档字符串写着
+`call TelephonyGlue.nativeAttach at boot` 而被当成 glue 调用 ✗。平台对象（`Intent`/`Location`/`Iterator`）
+按**跳过**计数 ✓（当前 50 处 `call_method` 里 37 处如此）。
+
+**诚实边界**：①**只管本仓的 `com.amos.ai.glue.*`** —— 平台类（`android/net/Uri`、`Location` 等）按跳过计数
+（静态 2 处 / 实例 37 处）；②**R3 查的是「名字 + 元数」，不是类身份**（在整棵 Kotlin glue 树里找），且句柄只按
+上面的名字规则认 —— **句柄名里没有 `glue`/`bridge` 就看不见** ✗（这是 R3 与 R1 并存而不是取代它的原因）；
+③**读不懂就失败**：未解析/有歧义的调用点必须带理由写进 `scripts/jni-contract-allowlist.json`（条目失配即失败），
+因为"静默跳过读不懂的东西"正是这道门要防的缺陷；④Kotlin 侧是**文本阅读、一文件一类**（本仓 glue 均如此），
+`@JvmStatic` 从声明上方的注解行读（中间夹 KDoc/注释无妨），继承来的成员与生成工程（`MainActivity`）不在范围内；
+⑤R2 的**重载**名（`Java_…_m__<签名>`）只**报告**不判定；⑥R3 的**默认参数/`vararg`** 会让 Kotlin 的声明元数与
+JNI 调用元数不同（本仓 glue 未使用；一旦使用，门会失败并要求写进 allowlist，而不是放宽判据）；
+⑦**类型映射是一张表** ✓（基础类型／可空装箱／泛型擦除／按 `import` 解析简单名／本仓 glue 类名 ✓）—— **映射不出来
+的类型（lambda、无 `import` 的裸名）按「报告 + 计数」处理，绝不当成一致** ✗（因此这类参数的**类型漂移**看不见 ✓）。
+
+**自检与负控**（都进仓库）：`node scripts/jni-contract-scan.mjs --selftest` ⇒ **75 断言** ✓；**负控 A**：
+拿掉 `AlarmGlue.schedule` 的 `@JvmStatic` ⇒ 门点名
+`crates/amos-tauri/src/alarm_sched.rs:448 missing-jvmstatic: AlarmGlue.schedule`（并指出
+`AlarmGlue.kt:295`）✓；**负控 B**：把 Rust 的
+`Java_com_amos_ai_glue_ClipboardGlue_onContainerCopy` 改名 ⇒ **两个方向同时报** ✓
+（Kotlin 侧 `missing-export` + Rust 侧 `stale-export`）；**负控 C**：把 `MicPermissionGlue.isGranted` 改名为
+`isGrantedNow` ⇒ 门点名 `crates/amos-tauri/src/mic_permission.rs:120 missing-kotlin-member` ✓；
+**负控 D**：给 `SmsGlue.snapshot` 加一个参数 ⇒ 门点名
+`crates/amos-sms/src/android.rs:79 arity-mismatch`（指出 `SmsGlue.kt:193` 是 2 个参数）✓；**负控 E（类型，R3）**：把
+`SmsGlue.snapshot(folder: String)` 的参数类型改成 `Int` ⇒ `signature-mismatch` ✓；**负控 F（类型，R1，走 `let sig`）**：
+把 `alarm_sched.rs` 里 `let sig = "(…Ljava/lang/String;J)…"` 的 `J` 改成 `I` ⇒ 门点名
+`#3: Kotlin Long (J) vs JNI I` ✓（**连 `let` 里拼出来的描述符也读** ✓）；**负控 G（返回类型，R1）**：把
+`BluetoothGlue.scanState` 的返回类型改成 `Int` ⇒ `return: Kotlin Int (I) vs JNI Ljava/lang/String;` ✓ —— 七次都逐字节还原、
+`cmp` 一致 ✓。
+

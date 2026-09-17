@@ -5,28 +5,23 @@
  */
 import { describe, test, expect } from "vitest";
 import {
-  addEntry,
-  childrenOf,
   deleteEntries,
-  deleteEntry,
-  filterByName,
-  folderPath,
   folderTree,
   hasName,
   isInside,
   makeEntry,
   makeId,
   moveEntries,
-  moveEntry,
   normalizeFiles,
   pathOf,
   recentFiles,
-  renameEntry,
   searchFiles,
   sortChildren,
   toggleFav,
   type FEntry,
 } from "../files";
+
+// Note: childrenOf and filterByName are also exported but not used in this test file
 
 describe("files.ts — pure functions", () => {
   describe("makeId", () => {
@@ -83,8 +78,8 @@ describe("files.ts — pure functions", () => {
       ];
       const result = normalizeFiles(input);
       expect(result).toHaveLength(2);
-      expect(result[0].name).toBe("A");
-      expect(result[1].name).toBe("B");
+      expect(result[0]?.name).toBe("A");
+      expect(result[1]?.name).toBe("B");
     });
 
     test("filters out entries with invalid type", () => {
@@ -95,7 +90,7 @@ describe("files.ts — pure functions", () => {
       ];
       const result = normalizeFiles(input);
       expect(result).toHaveLength(2);
-      expect(result.map((e) => e.name)).toEqual(["A", "C"]);
+      expect(result.map((e) => e?.name)).toEqual(["A", "C"]);
     });
 
     test("filters out entries with empty name", () => {
@@ -106,14 +101,16 @@ describe("files.ts — pure functions", () => {
       ];
       const result = normalizeFiles(input);
       expect(result).toHaveLength(1);
-      expect(result[0].name).toBe("Valid");
+      expect(result[0]?.name).toBe("Valid");
     });
 
     test("back-fills missing id", () => {
       const input = [{ type: "folder", name: "NoId", ts: 0 }];
       const result = normalizeFiles(input);
       expect(result).toHaveLength(1);
-      expect(result[0].id).toMatch(/^n/);
+      if (result[0]) {
+        expect(result[0].id).toMatch(/^n/);
+      }
     });
 
     test("de-duplicates id collisions", () => {
@@ -124,7 +121,7 @@ describe("files.ts — pure functions", () => {
       ];
       const result = normalizeFiles(input);
       expect(result).toHaveLength(3);
-      const ids = result.map((e) => e.id);
+      const ids = result.map((e) => e?.id);
       expect(new Set(ids).size).toBe(3);
       expect(ids[0]).toBe("dup");
       expect(ids[1]).toMatch(/^dup-/);
@@ -160,7 +157,7 @@ describe("files.ts — pure functions", () => {
       ];
       const path = pathOf(list, "loop");
       expect(path).toHaveLength(1);
-      expect(path[0].id).toBe("loop");
+      expect(path[0]?.id).toBe("loop");
     });
 
     test("returns path from root to target", () => {
@@ -171,7 +168,7 @@ describe("files.ts — pure functions", () => {
       ];
       const path = pathOf(list, "grand");
       expect(path).toHaveLength(3);
-      expect(path.map((e) => e.name)).toEqual(["Root", "Child", "Grand"]);
+      expect(path.map((e) => e?.name)).toEqual(["Root", "Child", "Grand"]);
     });
   });
 
@@ -281,7 +278,7 @@ describe("files.ts — pure functions", () => {
       ];
       const result = searchFiles(list, "doc", false);
       expect(result).toHaveLength(1);
-      expect(result[0].name).toBe("Document.txt");
+      expect(result[0]?.name).toBe("Document.txt");
     });
 
     test("searchFiles global mode searches all entries", () => {
@@ -291,7 +288,7 @@ describe("files.ts — pure functions", () => {
       ];
       const result = searchFiles(list, "note", true);
       expect(result).toHaveLength(1);
-      expect(result[0].name).toBe("note.txt");
+      expect(result[0]?.name).toBe("note.txt");
     });
 
     test("sortChildren by name uses locale", () => {
@@ -302,7 +299,7 @@ describe("files.ts — pure functions", () => {
         { id: "b", type: "file", name: "Bob", parent: "root", ts: 300 },
       ];
       const result = sortChildren(list, "root", "name");
-      expect(result.map((e) => e.name)).toEqual(["Alice", "Bob", "Charlie"]);
+      expect(result.map((e) => e?.name)).toEqual(["Alice", "Bob", "Charlie"]);
     });
 
     test("sortChildren by time (newest first)", () => {
@@ -337,8 +334,8 @@ describe("files.ts — pure functions", () => {
       ];
       const result = recentFiles(list, 2);
       expect(result).toHaveLength(2);
-      expect(result[0].name).toBe("New");
-      expect(result[1].name).toBe("Mid");
+      expect(result[0]?.name).toBe("New");
+      expect(result[1]?.name).toBe("Mid");
     });
   });
 

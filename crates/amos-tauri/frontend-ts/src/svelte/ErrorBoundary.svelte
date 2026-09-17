@@ -1,12 +1,10 @@
 <!-- ErrorBoundary.svelte — 错误边界组件 (航空航天级) -->
 <script lang="ts">
-  import { t } from "./locale.svelte";
-  
-  interface Props {
+  interface Props extends Record<string, unknown> {
     children: import('svelte').Snippet;
   }
   
-  let { children }: Props = $props();
+  let { children } = $props<Props>();
   
   let error = $state<Error | null>(null);
   let errorInfo = $state<string>("");

@@ -51,6 +51,7 @@ import android.net.TetheringInterface
 import android.net.TetheringManager
 import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
 import java.util.concurrent.Executor
 
 object TetheringGlue {
@@ -148,7 +149,17 @@ object TetheringGlue {
     /**
      * Register [TetheringManager.TetheringEventCallback] once, so a hotspot
      * toggled outside AmOS is still reported truthfully.
+     *
+     * `@RequiresApi(TETHERING_API)`: the class, the callback and `TetheringInterface#getType`
+     * only exist from API 36, and the two callers guard on `SDK_INT` before coming here — but
+     * Android Lint's `NewApi` check **cannot follow a guard into a caller** (`:app:lintArmDebug`
+     * reported five errors on this file: REQ-A380). The annotation is the guard: Lint verifies
+     * **every call site** against it, which is stronger than a runtime check inside (a later
+     * unguarded caller is then a lint error, not a `NoSuchMethodError` on API 26..35). This is
+     * why there is no `SDK_INT` check in the body: with the annotation it would be provably dead
+     * and `ObsoleteSdkInt` says so.
      */
+    @RequiresApi(TETHERING_API)
     private fun bindCallback(context: Context, tm: TetheringManager) {
         synchronized(callbackLock) {
             if (callbackRegistered) return
@@ -173,6 +184,11 @@ object TetheringGlue {
         }
     }
 
-    /** `Context#getMainExecutor` (API 28+) — only reached on the API 36+ path. */
+    /**
+     * `Context#getMainExecutor` (API 28+). `@RequiresApi(TETHERING_API)`: reachable only from
+     * the API 36+ paths (both annotated above) — stated so Lint can verify it instead of
+     * taking the comment's word for it (REQ-A380).
+     */
+    @RequiresApi(TETHERING_API)
     private fun mainExecutor(context: Context): Executor = context.mainExecutor
 }

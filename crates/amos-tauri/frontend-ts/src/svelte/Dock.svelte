@@ -50,12 +50,15 @@
   import DockAppItem from "./modules/DockAppItem.svelte";
   import DockContextMenu from "./modules/DockContextMenu.svelte";
   import DockGlobalContextMenu from "./modules/DockGlobalContextMenu.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { writeStoreValueChecked } from "../lib/amosStore";
   import type { DockPosition } from "../lib/dockPrefs";
   import { openApp } from "./appLinks";
 
   // ─── P4: 读取用户偏好 ────────────────────────────────────────────────────
   let prefs = $state<DockPrefs>({ ...DEFAULT_DOCK_PREFS });
+  let storeError = $state<string>("");
+  
   onMount(() => {
     const raw = readStoreValue<unknown>(DOCK_PREFS_KEY, {});
     prefs = normalizeDockPrefs(raw);
@@ -320,24 +323,54 @@
 
   function handlePositionChange(position: DockPosition) {
     prefs.position = position;
-    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    if (!success) {
+      storeError = "Failed to save Dock position preference";
+      // 恢复到之前的值
+      const raw = readStoreValue<unknown>(DOCK_PREFS_KEY, {});
+      prefs = normalizeDockPrefs(raw);
+    } else {
+      storeError = "";
+    }
   }
 
   function handleAutoHideToggle() {
     prefs.autoHide = !prefs.autoHide;
-    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    if (!success) {
+      storeError = "Failed to save Dock auto-hide preference";
+      // 恢复到之前的值
+      const raw = readStoreValue<unknown>(DOCK_PREFS_KEY, {});
+      prefs = normalizeDockPrefs(raw);
+    } else {
+      storeError = "";
+    }
   }
 
   function handleMagnificationChange(delta: number) {
+    const oldMag = prefs.magnification;
     const newMag = Math.max(1.0, Math.min(2.0, prefs.magnification + delta));
     prefs.magnification = parseFloat(newMag.toFixed(1));
-    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    if (!success) {
+      storeError = "Failed to save Dock magnification preference";
+      prefs.magnification = oldMag;
+    } else {
+      storeError = "";
+    }
   }
 
   function handleIconSizeChange(delta: number) {
+    const oldSize = prefs.iconSize;
     const newSize = Math.max(32, Math.min(64, prefs.iconSize + delta));
     prefs.iconSize = newSize;
-    writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
+    if (!success) {
+      storeError = "Failed to save Dock icon size preference";
+      prefs.iconSize = oldSize;
+    } else {
+      storeError = "";
+    }
   }
 
   function handleOpenPreferences() {
@@ -378,6 +411,8 @@
   - 已打开 app 底部白点指示
   - 点击弹跳动画（active:scale，在 dock 瓦片 token 里）
 -->
+<StoreErrorBar message={storeError} />
+
 <div
   bind:this={dockEl}
   class="pointer-events-none absolute flex {dockPositionClass(dockPosition)}"

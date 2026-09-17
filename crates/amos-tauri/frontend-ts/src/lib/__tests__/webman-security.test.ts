@@ -15,12 +15,13 @@ import {
   sanitizeUrl,
   validateTitle,
   parseInput,
-  isValidUrl,
   extractDomain,
   extractTitle,
   generateId,
   LIMITS,
 } from "../webman";
+
+// isValidUrl is exported and available if needed
 
 describe("P0 安全测试 - XSS 防护", () => {
   test("阻止 javascript: 协议", () => {
