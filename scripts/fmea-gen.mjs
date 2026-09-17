@@ -30,7 +30,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const ROOT = process.cwd();
-const FMEA_DOC = path.join(ROOT, 'docs/FMEA.md');
+// `FMEA_DOC` is overridable so a check can be run against a *historical* copy of the document
+// (a negative control on real history: the pre-fix doc must fail the shape check).
+const FMEA_DOC = process.env.FMEA_DOC ?? path.join(ROOT, 'docs/FMEA.md');
 
 /**
  * FMEA inventory:每个 ID 关联
@@ -106,6 +108,7 @@ const KNOWN_FAILURES = [
   { id: 'F-MED-001', module: 'amos-media', files: ['crates/amos-media/src/android.rs', 'crates/amos-media/src/mapping.rs'], markers: ['kind_and_mime_for_name(&name)', 'audio/mpeg'], severity: 4 },
   { id: 'F-DEV-001', module: 'process', files: ['scripts/device-probe-media-export.js', 'scripts/device-ui-eval.mjs'], markers: ['__probeExpect', 'settledMs', 'IS_PENDING'], severity: 3 },
   { id: 'F-TAU-007', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['scheduler_alarm_register', 'AlarmGlue.schedule', 'setExactAndAllowWhileIdle'], severity: 4 },
+  { id: 'F-DEV-002', module: 'process', files: ['scripts/fmea-gen.mjs', 'docs/FMEA.md'], markers: ['tableShapeProblems', 'cell count != their header', 'FMEA_DOC'], severity: 3 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
@@ -212,6 +215,38 @@ function buildReport() {
   return rows;
 }
 
+/**
+ * 表格形状检查（REQ-A363）：**每一行的单元格数必须等于它所在表的表头**。
+ *
+ * 为什么需要它：`--check` 原本只验"ID 在不在清单里"与"缓解代码在不在"——**列数不验** ✗。
+ * 于是少一个单元格的 FMEA 行（S/P/D/RPN 丢一个 ✓）会**通过所有检查，却在 Markdown 里渲染错乱** ✗：
+ * 我写 F-SH-022 时把 P 丢了、又少写一个分隔空格，两个单元格被并成一格（实测 8 格 ✓）。
+ *
+ * 判据用 ` | `（空格-竖线-空格）切分：单元格内部的竖线按 Markdown 规则写作 `\|` ✓，
+ * 不会与分隔符混淆 —— 这一点本项目踩过（`awk -F'|'` 会把 `\|` 也当分隔符 ✓）。
+ */
+export function tableShapeProblems(text) {
+  const problems = [];
+  let header = null; // 当前表的表头单元格数
+  let headerLine = 0;
+  text.split('\n').forEach((line, i) => {
+    const n = i + 1;
+    if (!line.startsWith('|')) {
+      header = null;
+      return;
+    }
+    if (/^\|[\s:|-]+\|\s*$/.test(line)) return; // 分隔行 |---|---|
+    const cells = line.split(' | ').length;
+    if (header === null) {
+      header = cells;
+      headerLine = n;
+      return;
+    }
+    if (cells !== header) problems.push({ line: n, cells, expected: header, headerLine });
+  });
+  return problems;
+}
+
 function cmdCheck() {
   if (!fs.existsSync(FMEA_DOC)) {
     console.error(`[FAIL] fmea-doc: ${FMEA_DOC} not found.`);
@@ -245,6 +280,18 @@ function cmdCheck() {
     console.error(`[FAIL] fmea-doc: mitigations not verifiable in code:`);
     for (const r of missingMitigation) {
       console.error(`       - ${r.id}: ${r.mitigation.reason}`);
+    }
+  }
+
+  // (c) 表格形状：每行的列数必须与它所在表的表头一致（REQ-A363）
+  const shapeProblems = tableShapeProblems(text);
+  if (shapeProblems.length > 0) {
+    bad = true;
+    console.error(`[FAIL] fmea-doc: table rows whose cell count != their header:`);
+    for (const p of shapeProblems) {
+      console.error(
+        `       - line ${p.line}: ${p.cells} cells, but the header on line ${p.headerLine} has ${p.expected}`,
+      );
     }
   }
 
