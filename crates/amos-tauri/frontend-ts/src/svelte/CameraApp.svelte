@@ -61,6 +61,7 @@
     type CamResId,
   } from "../lib/camera";
   import { t } from "./locale.svelte";
+  import { openPhoto } from "./appLinks";
   import { amosWarn } from "../lib/debugLog";
 
   // Monotonic counter: burst / rapid captures get unique ids even if two frames
@@ -938,6 +939,7 @@
       <!-- iPhone-style bottom bar: thumbnail · shutter · flip -->
       <div class="flex w-full items-center justify-between px-6 pt-0.5">
         <button
+          onclick={() => last && openPhoto(last.id)}
           aria-label={t("a11y.lastPhoto")}
           disabled={!last}
           class="grid h-12 w-12 place-items-center overflow-hidden rounded-[11px] bg-white/15 ring-1 ring-white/40 disabled:opacity-30"

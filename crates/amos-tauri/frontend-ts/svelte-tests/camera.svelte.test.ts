@@ -16,6 +16,8 @@ import { tick } from "svelte";
 import CameraApp from "../src/svelte/CameraApp.svelte";
 import { PHOTOS_KEY } from "../src/lib/photos";
 import { zh } from "../src/i18n/locales/zh";
+import { photosChannel } from "../src/svelte/appLinks";
+import { resetPropsChannels } from "../src/svelte/propsBus";
 
 afterEach(() => {
   cleanup();
@@ -23,6 +25,7 @@ afterEach(() => {
   gumCalls = 0;
   window.localStorage.removeItem(PHOTOS_KEY);
   window.localStorage.removeItem("amos.captures");
+  resetPropsChannels(); // a channel is process-wide: never leak a link between cases
   delete (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
 });
 
@@ -397,6 +400,39 @@ describe("CameraApp.svelte — export to the system gallery (REQ-A356)", () => {
     const host = render(CameraApp); // no store seed, no getUserMedia → demo frame, no shot
     await settle();
     expect(btnByText(host, zh["camera.exportToSystem"]!)).toBeUndefined();
+  });
+});
+
+
+/**
+ * The last-photo thumbnail is a real link now (REQ-A358).
+ *
+ * It carried `aria-label={t("a11y.lastPhoto")}` and **no handler at all**, so tapping it did
+ * nothing while looking like the way to see the shot just taken. This pins the link: the
+ * thumbnail asks the Photos screen for that item through the shared `appLinks` channel (which
+ * that screen consumes and clears), so the request is observable without standing up the shell.
+ */
+describe("CameraApp.svelte — the thumbnail links to the item it shows (REQ-A358)", () => {
+  test("tapping the thumbnail asks for that photo id", async () => {
+    window.localStorage.setItem(
+      PHOTOS_KEY,
+      JSON.stringify([
+        { id: "p1", ts: Date.now() - 5000, emoji: "🌅" },
+        { id: "p2", ts: Date.now(), data: "data:image/png;base64,AAAA" },
+      ]),
+    );
+    const seen: Array<{ photoId?: string }> = [];
+    const off = photosChannel().subscribe((v) => {
+      if (v) seen.push(v);
+    });
+    const host = render(CameraApp);
+    await settle();
+    const thumb = btnAria(host, zh["a11y.lastPhoto"]!);
+    expect(thumb, "the thumbnail exists and is enabled once a photo is stored").toBeTruthy();
+    await fireEvent.click(thumb as HTMLButtonElement);
+    // `latestPhoto` picks the newest, so the link names `p2` — the item the thumbnail shows.
+    expect(seen.at(-1)?.photoId, "the thumbnail is a real link now").toBe("p2");
+    off();
   });
 });
 

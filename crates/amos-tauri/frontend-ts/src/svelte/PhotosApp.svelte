@@ -43,6 +43,7 @@
   } from "../lib/mediaExport";
   import type { ExportOutcome } from "../lib/mediaExport";
   import { t } from "./locale.svelte";
+  import { photosChannel } from "./appLinks";
   import { currentFormFactor } from "../lib/desktopApps";
   import { photosCols } from "../lib/formLayout";
 
@@ -247,6 +248,22 @@
     const s = Math.max(0, Math.floor(ms / 1000));
     return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
   };
+
+  // ---- Deep link: the camera's "last photo" thumbnail → this item -----------------
+  // The camera's thumbnail sets the `photos` channel and opens this app; we then open the
+  // viewer on that item. The link is *consumed* (channel cleared) so returning to Photos
+  // never re-fires it, and an id we no longer hold is honestly ignored — the grid stays
+  // what is shown, and no tile is invented (REQ-A358).
+  let linkNonce = 0;
+  $effect(() => {
+    return photosChannel().subscribe((v) => {
+      if (!v || v.photoId.trim() === "" || v.nonce === linkNonce) return;
+      linkNonce = v.nonce;
+      const target = list.find((p) => p.id === v.photoId);
+      if (target) sel = target;
+      photosChannel().set({ photoId: "", nonce: linkNonce });
+    });
+  });
 
   // Arrow-key navigation inside the viewer.
   $effect(() => {

@@ -101,6 +101,7 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-020', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/NotesApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/notes.svelte.test.ts'], markers: ['note.exportCopyFailed', 'copiedToClipboard', 'REQ-A355'], severity: 3 },
   { id: 'F-SH-021', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/CameraApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/camera.svelte.test.ts'], markers: ['camera.exportToSystem', 'exportToSystem', 'CAMERA_EXPORT_DIR'], severity: 3 },
   { id: 'F-SH-022', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/i18n-scan.mjs', 'crates/amos-tauri/frontend-ts/scripts/i18n-literal-allowlist.json'], markers: ['assignedCJKCopy', 'hard-coded copy in a <script> block', 'stale literal exemption'], severity: 4 },
+  { id: 'F-SH-023', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appLinks.ts', 'crates/amos-tauri/frontend-ts/src/svelte/CameraApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/camera.svelte.test.ts'], markers: ['openPhoto', 'PHOTOS_CHANNEL', 'a11y.lastPhoto'], severity: 3 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },

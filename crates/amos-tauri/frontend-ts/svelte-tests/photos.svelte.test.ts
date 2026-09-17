@@ -15,12 +15,15 @@ import { writeStoreValue } from "../src/lib/amosStore";
 import { PHOTOS_KEY } from "../src/lib/photos";
 import { CAPTURES_KEY } from "../src/lib/cameraCapture";
 import { zh } from "../src/i18n/locales/zh";
+import { photosChannel } from "../src/svelte/appLinks";
+import { resetPropsChannels } from "../src/svelte/propsBus";
 import { setFormFactor } from "../src/lib/desktopApps";
 
 afterEach(() => {
   cleanup();
   setLocale("zh");
   window.localStorage.clear();
+  resetPropsChannels(); // a channel is process-wide: never leak a link between cases
 });
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
@@ -495,6 +498,41 @@ describe("PhotosApp — export to the shared camera roll (REQ-A352)", () => {
     await fireEvent.click(btnByText(host, zh["photo.share"]!)!);
     expect(await waitFor(host, zh["photo.shared"]!)).toBe(true);
     expect(written.length, "the caption really reached the clipboard").toBe(1);
+  });
+});
+
+
+/**
+ * Deep link from the camera's last-photo thumbnail (REQ-A358).
+ *
+ * That thumbnail had **no handler at all**: it looked like the way to see the shot just taken
+ * and tapping it did nothing — worse than no control, because it implies content. It now asks
+ * this screen for that item through the same `appLinks` channel the Spotlight chooser uses for
+ * notes, and the viewer opens **on the requested item**, not on the newest one. An id this
+ * screen no longer holds is ignored: the grid stays what is shown, and nothing is invented.
+ */
+describe("PhotosApp — deep link from the camera thumbnail (REQ-A358)", () => {
+  test("opens the viewer on the requested item, not on the newest one", async () => {
+    writeStoreValue(PHOTOS_KEY, [
+      // `p1` is deliberately the OLDER one, so "newest first" would open `p2` instead.
+      { id: "p1", ts: Date.now() - 60_000, emoji: "🌅" },
+      { id: "p2", ts: Date.now(), data: "data:image/png;base64,AAAA" },
+    ]);
+    const host = render(PhotosApp);
+    await tick();
+    photosChannel().set({ photoId: "p1", nonce: 1 });
+    await tick();
+    // The viewer's own counter (`{idx} / {len}`) is viewer-only text: `1 / 2` is `p1`.
+    expect(txt(host), `viewer should show the linked item — got: ${txt(host)}`).toContain("1 / 2");
+  });
+
+  test("an id this screen no longer holds is ignored, never fabricated", async () => {
+    writeStoreValue(PHOTOS_KEY, [{ id: "p1", ts: Date.now(), emoji: "🌅" }]);
+    const host = render(PhotosApp);
+    await tick();
+    photosChannel().set({ photoId: "gone", nonce: 2 });
+    await tick();
+    expect(txt(host), "no viewer for an item we do not have").not.toMatch(/\d+ \/ \d+/);
   });
 });
 

@@ -88,6 +88,37 @@ export function composeSmsTo(number: string): void {
   open("messages");
 }
 
+/** Payload the Photos screen reads to open one item (the camera's "看一下刚拍的这张"). */
+export interface PhotosLink {
+  /** Id of the photo to reveal (`""` = nothing pending). */
+  photoId: string;
+  /** Changing marker so asking twice for the same photo re-triggers the reveal. */
+  nonce: number;
+}
+
+/** Props-channel name of the Photos screen (shared contract with PhotosApp). */
+export const PHOTOS_CHANNEL = "photos";
+
+/** The Photos screen's link channel (for `subscribe` / `set`). */
+export function photosChannel() {
+  return propsChannel<PhotosLink>(PHOTOS_CHANNEL);
+}
+
+/**
+ * Open the Photos app **on one item** — the camera's last-photo thumbnail uses this.
+ *
+ * The link is only a *request*: the Photos screen opens its viewer while it still holds
+ * that photo and silently ignores an id it no longer does — it never fabricates one.
+ * (The camera saves into the same `PHOTOS_KEY` album Photos reads, so the id is shared;
+ * see `lib/photos.ts`.)
+ */
+export function openPhoto(photoId: string): void {
+  const id = photoId.trim();
+  if (id === "") return;
+  photosChannel().set({ photoId: id, nonce: Date.now() });
+  open("photos");
+}
+
 /** Props-channel name of the Settings screen (shared contract with SettingsApp). */
 export const SETTINGS_CHANNEL = "settings";
 
