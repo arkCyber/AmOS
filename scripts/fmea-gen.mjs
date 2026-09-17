@@ -125,6 +125,9 @@ const KNOWN_FAILURES = [
   // duplicated REQ id and a status cell outside the document's own legend survived in the one
   // artefact every reader is sent to (the F-DEV-002 family, one document over).
   { id: 'F-DEV-007', module: 'process', files: ['scripts/trace-scan.mjs'], markers: ['duplicateReqIds', 'missing-status', 'STATUS_MARKS'], severity: 2 },
+  // REQ-A372: the ledger's *completeness* claim was never checked — 54 requirement numbers are
+  // cited by shipped code and have no row, and the header read as if it were the whole index.
+  { id: 'F-DEV-008', module: 'process', files: ['scripts/trace-scan.mjs', 'docs/TRACEABILITY_MATRIX.md'], markers: ['danglingCitations', 'partial', 'REQ-A372'], severity: 2 },
   { id: 'F-SH-025', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte'], markers: ['没有可显示的界面', 'monitor'], severity: 3 },
 
   // System UI 桥

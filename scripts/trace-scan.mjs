@@ -29,7 +29,7 @@
  *   node scripts/trace-scan.mjs --selftest   # pin the parsers/classifiers
  *   TRACE_DOC=<path> node scripts/trace-scan.mjs   # check a historical copy (negative control)
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -144,6 +144,80 @@ export function traceFindings(text) {
   };
 }
 
+/** The REQ ids that *do* have a row (used to see which code citations have no row). */
+export function registeredIds(text) {
+  const out = new Set();
+  String(text)
+    .split("\n")
+    .forEach((line) => {
+      if (!line.startsWith("|")) return;
+      const id = firstCell(line);
+      if (/^REQ-[A-Z]?\d+$/.test(id)) out.add(id);
+    });
+  return out;
+}
+
+/**
+ * REQ ids cited by **code** for which the ledger has no row.
+ *
+ * This is deliberately a *report*, not a failure (REQ-A372). Measured when the check was written:
+ * **51** ids are cited in shipped code (`crates/**`, `scripts/**`, the frontend, the Makefile) and
+ * have no row — `REQ-A256` in `wm.rs`, `REQ-A302/303/304/307` in `amos-media/src/protocol.rs`, … —
+ * while the ledger's header read as if it were the complete index. Two honest options existed:
+ * write 51 rows from numbers whose rounds are history (fabricating a record is worse than a gap),
+ * or **make the claim true and keep the gap visible**. This function is the second half; the
+ * header sentence and the ledger row for REQ-A372 are the first.
+ *
+ * A cited id is matched as a whole token (`REQ-A99` does not match `REQ-A099`).
+ */
+export function danglingCitations(sources, ids) {
+  const byId = new Map();
+  for (const { file, text } of sources) {
+    for (const id of new Set(String(text).match(/REQ-[A-Z]?\d+/g) ?? [])) {
+      if (ids.has(id)) continue;
+      if (!byId.has(id)) byId.set(id, new Set());
+      byId.get(id).add(file);
+    }
+  }
+  return [...byId.entries()]
+    .map(([id, files]) => ({ id, files: [...files].sort() }))
+    .sort((a, b) => b.files.length - a.files.length || a.id.localeCompare(b.id));
+}
+
+/** File types that can carry a requirement citation in this repository. */
+const CODE_EXT = [".rs", ".mjs", ".js", ".ts", ".tsx", ".svelte", ".kt", ".sh", ".json", ".toml", ".yml", ".yaml"];
+/** Never walked: build output, dependencies, the git-ignored generated project, archived docs. */
+const SKIP_DIRS = new Set(["target", "node_modules", ".git", "dist", "build", "gen", "archive", "docs"]);
+
+/** Every shipped code file (docs excluded — the ledger's own text is not a citation). */
+export function codeSources(root) {
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // unreadable directory: not a reason to fail the ledger check
+    }
+    for (const ent of entries) {
+      const p = join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (!SKIP_DIRS.has(ent.name)) walk(p);
+        continue;
+      }
+      if (ent.name === "Makefile" || CODE_EXT.some((e) => ent.name.endsWith(e))) {
+        try {
+          out.push({ file: p.slice(root.length + 1), text: readFileSync(p, "utf8") });
+        } catch {
+          /* binary or unreadable: skip */
+        }
+      }
+    }
+  };
+  walk(root);
+  return out;
+}
+
 export function runSelftest() {
   const cases = [];
   const check = (name, ok) => cases.push([name, ok]);
@@ -181,6 +255,21 @@ export function runSelftest() {
   const prose = traceFindings(`${[HEADER, SEP, row("REQ-A1")].join("\n")}\n\nprose cites REQ-A1 — not a row, so it must not count`);
   check("prose that cites an ID is not a row", prose.duplicates.length === 0);
 
+  // REQ-A372: the code→ledger report (informational) must still be *correct* about what it sees.
+  const reg = registeredIds([HEADER, SEP, row("REQ-A1"), row("REQ-B12")].join("\n"));
+  check("registeredIds collects exactly the row ids", reg.size === 2 && reg.has("REQ-A1") && reg.has("REQ-B12"));
+  const dangle = danglingCitations(
+    [
+      { file: "crates/x/src/lib.rs", text: "// REQ-A1 says hello, and REQ-A99 is not registered" },
+      { file: "Makefile", text: "# REQ-A99 again, plus REQ-B12 which is registered" },
+    ],
+    reg,
+  );
+  check("a registered citation is not reported", !dangle.some((d) => d.id === "REQ-A1" || d.id === "REQ-B12"));
+  check("an unregistered citation is reported once, with its files", dangle.length === 1 && dangle[0].id === "REQ-A99" && dangle[0].files.length === 2);
+  check("the busiest citation sorts first", dangle[0].files[0] === "Makefile");
+  check("ids are matched whole (REQ-A9 is not REQ-A99)", danglingCitations([{ file: "f", text: "REQ-A9" }], reg)[0].id === "REQ-A9");
+
   let failed = 0;
   for (const [name, ok] of cases) {
     if (ok) console.log(`  [ok] ${name}`);
@@ -213,9 +302,12 @@ if (invokedDirectly) {
   const text = readFileSync(DOC, "utf8");
   const findings = traceFindings(text);
   const total = findings.shape.length + findings.duplicates.length + findings.rows.length;
+  // Informational, never a failure: how many requirement numbers the code cites that the ledger
+  // has no row for (REQ-A372 — the ledger is a partial index, and the header now says so).
+  const dangling = danglingCitations(codeSources(root), registeredIds(text));
 
   if (process.argv.includes("--json")) {
-    console.log(JSON.stringify({ doc: DOC, ...findings }, null, 2));
+    console.log(JSON.stringify({ doc: DOC, ...findings, dangling }, null, 2));
     process.exit(total === 0 ? 0 : 1);
   }
 
@@ -244,4 +336,16 @@ if (invokedDirectly) {
   console.log(
     "[trace-scan] OK — the requirements ledger reads as an index (unique IDs, legend statuses, evidence in every row).",
   );
+  if (dangling.length > 0) {
+    console.log(
+      `[trace-scan] report — ${dangling.length} REQ id(s) are cited in code with no row in the ledger (informational, not a failure: the ledger is a **partial** index, see its header and REQ-A372):`,
+    );
+    for (const d of dangling.slice(0, 10)) {
+      const files = d.files.slice(0, 2).join(", ");
+      console.log(`  ${d.id}: ${files}${d.files.length > 2 ? ` (+${d.files.length - 2} more)` : ""}`);
+    }
+    if (dangling.length > 10) {
+      console.log(`  …and ${dangling.length - 10} more — \`node scripts/trace-scan.mjs --json\``);
+    }
+  }
 }
