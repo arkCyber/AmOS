@@ -10,9 +10,19 @@
  * - 输入验证逻辑
  */
 
-import { describe, test, expect, beforeEach } from "bun:test";
-import { mdmManager } from "../enterprise";
-import type { MDMRestrictions } from "../enterprise/mdm";
+import { describe, test, expect, beforeEach, beforeAll, afterAll } from "bun:test";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { mdmManager } from "../lib/enterprise";
+import type { MDMRestrictions } from "../lib/enterprise/mdm";
+
+// 注册 happy-dom 全局对象（包括 localStorage）
+beforeAll(() => {
+  GlobalRegistrator.register();
+});
+
+afterAll(() => {
+  GlobalRegistrator.unregister();
+});
 
 describe("MDMPanel UI 逻辑测试", () => {
   beforeEach(() => {

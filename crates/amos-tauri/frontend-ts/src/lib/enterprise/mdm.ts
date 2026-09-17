@@ -175,7 +175,7 @@ export class MDMManager {
    * 初始化 MDM 管理器
    */
   async initialize(): Promise<void> {
-    this.loadConfig();
+    await this.loadConfig();
     this.loadExecutionCounts();
     
     if (this.config?.enabled) {
@@ -187,7 +187,7 @@ export class MDMManager {
         throw new Error(`设备已锁定: ${this.config.lockMessage || "请联系管理员"}`);
       }
       if (this.config.deviceStatus === "wiped") {
-        this.wipeLocalData();
+        await this.wipeLocalData();
         throw new Error("设备数据已被远程擦除");
       }
     }
@@ -195,8 +195,10 @@ export class MDMManager {
 
   /**
    * 加载 MDM 配置
+   * 
+   * 尝试从加密存储加载配置，如果失败则回退到明文格式（向后兼容）。
    */
-  private loadConfig(): void {
+  private async loadConfig(): Promise<void> {
     const raw = readStoreValue(STORE_KEYS.MDM_CONFIG, "");
     if (!raw) {
       this.config = null;
@@ -204,21 +206,100 @@ export class MDMManager {
     }
 
     try {
+      // 尝试加密解密（新格式）
+      const { decryptMDMData, isCryptoAvailable } = await import("../crypto/mdmCrypto");
+      
+      if (isCryptoAvailable()) {
+        try {
+          const decrypted = await decryptMDMData(raw);
+          this.config = JSON.parse(decrypted) as MDMConfig;
+          
+          // 审计日志
+          this.auditLog.push({
+            action: "mdm_config_decrypted",
+            timestamp: Date.now(),
+            success: true,
+          });
+          
+          return;
+        } catch (decryptErr) {
+          // 解密失败，可能是明文格式（旧版本）或数据损坏
+          console.warn("[MDM] 解密失败，尝试明文加载:", decryptErr);
+          
+          this.auditLog.push({
+            action: "mdm_config_decrypt_failed",
+            timestamp: Date.now(),
+            error: String(decryptErr),
+          });
+        }
+      }
+      
+      // 回退：尝试明文格式（向后兼容）
       this.config = JSON.parse(raw) as MDMConfig;
+      
+      // 如果成功加载明文配置，自动迁移到加密格式
+      if (this.config && isCryptoAvailable()) {
+        console.info("[MDM] 检测到明文配置，自动迁移到加密存储");
+        await this.saveConfig(); // 重新保存为加密格式
+      }
     } catch (err) {
       console.error("[MDM] 加载配置失败:", err);
+      this.auditLog.push({
+        action: "mdm_config_load_failed",
+        timestamp: Date.now(),
+        error: String(err),
+      });
       this.config = null;
     }
   }
 
   /**
    * 保存 MDM 配置
+   * 
+   * 使用加密存储保护敏感数据（API 密钥、组织 ID 等）。
    */
-  private saveConfig(): void {
+  private async saveConfig(): Promise<void> {
     if (!this.config) return;
     
-    const serialized = JSON.stringify(this.config);
-    writeStoreValueChecked(STORE_KEYS.MDM_CONFIG, serialized);
+    try {
+      const { encryptMDMData, isCryptoAvailable } = await import("../crypto/mdmCrypto");
+      
+      const plaintext = JSON.stringify(this.config);
+      
+      if (isCryptoAvailable()) {
+        // 加密存储（推荐）
+        const encrypted = await encryptMDMData(plaintext);
+        const success = writeStoreValueChecked(STORE_KEYS.MDM_CONFIG, encrypted);
+        
+        if (success) {
+          this.auditLog.push({
+            action: "mdm_config_encrypted",
+            timestamp: Date.now(),
+            dataSize: encrypted.length,
+          });
+        } else {
+          throw new Error("写入加密配置失败");
+        }
+      } else {
+        // 回退：明文存储（不推荐，仅用于不支持 Web Crypto 的环境）
+        console.warn("[MDM] Web Crypto API 不可用，使用明文存储（不安全）");
+        writeStoreValueChecked(STORE_KEYS.MDM_CONFIG, plaintext);
+        
+        this.auditLog.push({
+          action: "mdm_config_saved_plaintext",
+          timestamp: Date.now(),
+          warning: "encryption_unavailable",
+        });
+      }
+    } catch (err) {
+      console.error("[MDM] 保存配置失败:", err);
+      this.auditLog.push({
+        action: "mdm_config_save_failed",
+        timestamp: Date.now(),
+        error: String(err),
+      });
+      throw err; // 向上传播错误
+    }
   }
 
   /**
@@ -308,7 +389,7 @@ export class MDMManager {
         version: "1.0.0",
       };
 
-      this.saveConfig();
+      await this.saveConfig();
       
       // 首次同步
       await this.syncWithServer();
@@ -341,7 +422,7 @@ export class MDMManager {
 
     // 清理本地数据
     this.config = null;
-    this.saveConfig();
+    await this.saveConfig();
     this.executionCounts.clear();
     this.saveExecutionCounts();
   }
@@ -374,7 +455,7 @@ export class MDMManager {
       if (!response.success || !response.data) {
         this.config.lastSyncStatus = "failure";
         this.config.lastSyncError = response.message;
-        this.saveConfig();
+        await this.saveConfig();
         return {
           success: false,
           message: response.message,
@@ -391,7 +472,7 @@ export class MDMManager {
         lastSyncStatus: "success",
         lastSyncError: undefined,
       };
-      this.saveConfig();
+      await this.saveConfig();
 
       return {
         success: true,
@@ -403,7 +484,7 @@ export class MDMManager {
       if (this.config) {
         this.config.lastSyncStatus = "failure";
         this.config.lastSyncError = err instanceof Error ? err.message : "同步失败";
-        this.saveConfig();
+        await this.saveConfig();
       }
       return {
         success: false,
@@ -732,7 +813,7 @@ export class MDMManager {
   /**
    * 配置 MDM（手动）
    */
-  configure(config: Partial<MDMConfig>): void {
+  async configure(config: Partial<MDMConfig>): Promise<void> {
     if (!this.config) {
       // 如果没有配置，创建默认配置
       this.config = {
@@ -796,20 +877,20 @@ export class MDMManager {
       enrolledBy: config.enrolledBy ?? this.config.enrolledBy,
       version: config.version ?? this.config.version,
     };
-    this.saveConfig();
+    await this.saveConfig();
   }
 
   /**
    * 添加策略
    */
-  addPolicy(policyKey: keyof MDMConfig["restrictions"], value: any): void {
+  async addPolicy(policyKey: keyof MDMConfig["restrictions"], value: any): Promise<void> {
     if (!this.config) {
-      this.configure({});
+      await this.configure({});
     }
     
     if (this.config && this.config.restrictions) {
       (this.config.restrictions as any)[policyKey] = value;
-      this.saveConfig();
+      await this.saveConfig();
     }
   }
 
@@ -861,7 +942,7 @@ export class MDMManager {
     };
     
     (this.config.restrictions as any)[policyKey] = defaults[policyKey];
-    this.saveConfig();
+    await this.saveConfig();
     return true;
   }
 
@@ -910,10 +991,10 @@ export class MDMManager {
   /**
    * 擦除本地数据
    */
-  private wipeLocalData(): void {
+  private async wipeLocalData(): Promise<void> {
     // 清理所有企业数据
     this.config = null;
-    this.saveConfig();
+    await this.saveConfig();
     this.executionCounts.clear();
     this.saveExecutionCounts();
     

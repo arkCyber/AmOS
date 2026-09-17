@@ -155,13 +155,22 @@ describe("MDM 加密模块", () => {
     });
 
     it("加密错误应该包含有用的错误信息", async () => {
+      // 这个测试验证错误消息的格式
+      // null 会被 TextEncoder 转换为字符串 "null"，所以不会抛出错误
+      // 改为测试无效的加密数据包
+      const invalidEncrypted = JSON.stringify({
+        version: 1,
+        ciphertext: "invalid-base64-!!!",
+        iv: "also-invalid-!!!",
+        timestamp: Date.now(),
+      });
+
       try {
-        // 尝试加密非字符串（通过类型断言绕过）
-        await encryptMDMData(null as any);
+        await decryptMDMData(invalidEncrypted);
         expect.fail("应该抛出错误");
       } catch (err) {
         expect(err).toBeInstanceOf(Error);
-        expect((err as Error).message).toContain("加密失败");
+        expect((err as Error).message).toContain("解密失败");
       }
     });
   });

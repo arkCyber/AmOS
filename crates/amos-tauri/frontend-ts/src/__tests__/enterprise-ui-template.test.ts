@@ -10,9 +10,19 @@
  * - 安装状态管理
  */
 
-import { describe, test, expect, beforeEach } from "bun:test";
-import { templateManager } from "../enterprise";
-import type { EnterpriseTemplate, TemplateParameter } from "../enterprise/templates";
+import { describe, test, expect, beforeEach, beforeAll, afterAll } from "bun:test";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { templateManager } from "../lib/enterprise";
+import type { EnterpriseTemplate, TemplateParameter } from "../lib/enterprise/templates";
+
+// 注册 happy-dom 全局对象
+beforeAll(() => {
+  GlobalRegistrator.register();
+});
+
+afterAll(() => {
+  GlobalRegistrator.unregister();
+});
 
 describe("TemplateLibrary UI 逻辑测试", () => {
   beforeEach(() => {

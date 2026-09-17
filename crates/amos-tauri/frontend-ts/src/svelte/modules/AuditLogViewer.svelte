@@ -192,13 +192,14 @@
   }
 
   function getLevelColor(level: AuditLogLevel): string {
-    const colors = {
-      DEBUG: "#8E8E93",
-      INFO: "#007AFF",
-      WARNING: "#FF9500",
-      ERROR: "#FF3B30",
+    const colors: Record<string, string> = {
+      debug: "#8E8E93",
+      info: "#007AFF",
+      warning: "#FF9500",
+      error: "#FF3B30",
+      critical: "#FF3B30",
     };
-    return colors[level];
+    return colors[level] || "#8E8E93";
   }
 
   function getEventTypeLabel(eventType: string): string {

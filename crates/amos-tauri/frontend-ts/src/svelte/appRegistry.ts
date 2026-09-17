@@ -17,7 +17,13 @@ export interface SvelteAppLoaderLike {
   (): Promise<{ default: unknown }>;
 }
 
-const ALL_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
+/**
+ * The loader table itself, exported so a gate can compare it against the **live** tile
+ * table (`lib/appMeta.ts`) instead of a hand-copied id list (REQ-A382: the registry test
+ * used to iterate 29 hand-written ids while the grid had 33 — a tile with no screen could
+ * not fail any check).
+ */
+export const ALL_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   clock: () => import("./ClockApp.svelte"),
   settings: () => import("./SettingsApp.svelte"),
   calculator: () => import("./CalculatorApp.svelte"),

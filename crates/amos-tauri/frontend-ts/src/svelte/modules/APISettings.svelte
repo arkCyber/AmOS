@@ -30,10 +30,12 @@
   let editingWebhook = $state<WebhookConfig | null>(null);
   let webhookForm = $state<Partial<WebhookConfig>>({
     name: "",
+    description: "",
     url: "",
     method: "POST",
     events: [],
     secret: "",
+    headers: {},
     timeout: 5000,
     retryCount: 3,
     enabled: true,
@@ -174,10 +176,21 @@
     }
 
     try {
-      if (editingWebhook) {
+      if (editingWebhook && editingWebhook.id) {
         webhookManager.updateWebhook(editingWebhook.id, webhookForm as Partial<WebhookConfig>);
       } else {
-        webhookManager.addWebhook(webhookForm as Omit<WebhookConfig, "id" | "createdAt" | "updatedAt" | "lastTriggeredAt" | "triggerCount" | "successCount" | "failureCount">);
+        webhookManager.addWebhook({
+          name: webhookForm.name || "",
+          description: webhookForm.description || "",
+          url: webhookForm.url || "",
+          method: webhookForm.method || "POST",
+          events: webhookForm.events || [],
+          secret: webhookForm.secret || "",
+          headers: webhookForm.headers || {},
+          timeout: webhookForm.timeout || 5000,
+          retryCount: webhookForm.retryCount || 3,
+          enabled: webhookForm.enabled ?? true,
+        });
       }
       webhooks = webhookManager.getWebhooks();
       closeWebhookModal();
@@ -399,7 +412,7 @@
                   <input
                     type="checkbox"
                     checked={webhook.enabled}
-                    onchange={() => toggleWebhook(webhook.id)}
+                    onchange={() => webhook.id && toggleWebhook(webhook.id)}
                   />
                   <span>{webhook.enabled ? "启用" : "禁用"}</span>
                 </label>
@@ -427,12 +440,12 @@
               </button>
               <button
                 class="btn-small"
-                onclick={() => testWebhook(webhook.id)}
+                onclick={() => webhook.id && testWebhook(webhook.id)}
                 disabled={!webhook.enabled || testingWebhook}
               >
                 测试
               </button>
-              <button class="btn-small btn-danger" onclick={() => deleteWebhook(webhook.id)}>
+              <button class="btn-small btn-danger" onclick={() => webhook.id && deleteWebhook(webhook.id)}>
                 删除
               </button>
             </div>

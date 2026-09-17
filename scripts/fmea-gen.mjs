@@ -133,7 +133,13 @@ const KNOWN_FAILURES = [
   // had ever decided whether a frozen snapshot is in scope; 6 more came from three untracked
   // root documents written with another directory's relative paths.
   { id: 'F-DEV-009', module: 'process', files: ['scripts/docs-link-scan.mjs'], markers: ['SKIP_PATHS', 'were NOT judged', 'skipped'], severity: 2 },
-  { id: 'F-SH-025', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte'], markers: ['没有可显示的界面', 'monitor'], severity: 3 },
+  // REQ-A382 corrected this row: the surface IS wired in the tree (the loader line predates the
+  // device round), so the reading came from an APK older than the System Monitor commit — and the
+  // gate gap it named is real: the registry test iterated a hand-copied id list. See F-SH-026.
+  { id: 'F-SH-025', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte'], markers: ['没有可显示的界面', 'monitor'], severity: 2 },
+  // REQ-A382: the tile<->loader consistency test validated a hand-copied list (29 ids) while the
+  // live grid table had 33 — a new tile with no screen could not fail any gate.
+  { id: 'F-SH-026', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/svelte-tests/app-registry.svelte.test.ts', 'crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts'], markers: ['missingLoaders', 'unreachableScreens', 'the comparison itself can fail'], severity: 2 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },

@@ -11,9 +11,19 @@
  * - 日志级别和结果过滤
  */
 
-import { describe, test, expect, beforeEach } from "bun:test";
-import { auditLogger } from "../enterprise";
-import type { AuditLog, AuditEventResult, AuditLogLevel } from "../enterprise/audit";
+import { describe, test, expect, beforeEach, beforeAll, afterAll } from "bun:test";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { auditLogger } from "../lib/enterprise";
+import type { AuditLog, AuditEventResult, AuditLogLevel } from "../lib/enterprise/audit";
+
+// 注册 happy-dom 全局对象
+beforeAll(() => {
+  GlobalRegistrator.register();
+});
+
+afterAll(() => {
+  GlobalRegistrator.unregister();
+});
 
 describe("AuditLogViewer UI 逻辑测试", () => {
   beforeEach(() => {

@@ -108,6 +108,9 @@
         deviceId: config.deviceId,
         enrolledAt: config?.enrolledAt,
         restrictions: {
+          disabledCategories: [],
+          disabledActions: [],
+          maxExecutionTime: 300,
           allowUserCreate: true,
           allowUserModify: true,
           allowUserDelete: true,
@@ -117,7 +120,6 @@
           requireApprovalForCreate: false,
           requireApprovalForModify: false,
           requireApprovalForSharing: false,
-          requireApprovalForDelete: false,
           maxExecutionsPerDay: 1000,
           maxActionsPerShortcut: 100,
           maxShortcutsPerUser: 500,

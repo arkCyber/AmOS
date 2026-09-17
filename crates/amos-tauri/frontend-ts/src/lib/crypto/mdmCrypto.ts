@@ -58,17 +58,17 @@ const PBKDF2_SALT = new Uint8Array([
  */
 async function getDeviceFingerprint(): Promise<string> {
   const components: DeviceFingerprint = {
-    userAgent: navigator.userAgent,
-    language: navigator.language,
-    screen: `${screen.width}x${screen.height}`,
+    userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "test-agent",
+    language: typeof navigator !== "undefined" ? navigator.language : "en-US",
+    screen: typeof screen !== "undefined" ? `${screen.width}x${screen.height}` : "1920x1080",
     timezone: new Date().getTimezoneOffset(),
-    platform: navigator.platform,
+    platform: typeof navigator !== "undefined" ? navigator.platform : "test-platform",
   };
 
   // 尝试获取 Tauri 设备 ID（如果可用）
   try {
     // @ts-ignore - Tauri 特有 API
-    if (window.__TAURI__) {
+    if (typeof window !== "undefined" && window.__TAURI__) {
       const { invoke } = await import("@tauri-apps/api/tauri");
       components.deviceId = await invoke<string>("get_device_id").catch(() => "unknown");
     }
