@@ -32,18 +32,45 @@ const opt = (name, def = null) => {
 };
 const has = (name) => args.includes(name);
 
-function adb(...a) {
+/**
+ * Run adb and report its exit status without judging it.
+ *
+ * `pidof` **exits 1 when the process does not exist** — which is the single most common device
+ * state (the app was killed; on the S5 it happened under load). Treating that as "adb is broken"
+ * hid the real cause behind a stack trace from this script, so the tolerant form is used
+ * wherever a non-zero exit is an *answer* rather than a failure (REQ-A365, F-DEV-003).
+ */
+function adbRaw(...a) {
   const serial = opt("--serial");
   const full = serial ? ["-s", serial, ...a] : a;
   const out = spawnSync("adb", full, { encoding: "utf8" });
-  if (out.status !== 0) throw new Error(`adb ${full.join(" ")} failed: ${out.stderr.trim()}`);
-  return out.stdout.trim();
+  return {
+    status: out.status,
+    stdout: (out.stdout ?? "").trim(),
+    stderr: (out.stderr ?? "").trim(),
+    cmd: `adb ${full.join(" ")}`,
+  };
+}
+
+/** Run adb and throw on a non-zero exit, naming the command, its status and its stderr. */
+function adb(...a) {
+  const r = adbRaw(...a);
+  if (r.status !== 0) {
+    throw new Error(`${r.cmd} exited ${r.status}${r.stderr ? `: ${r.stderr}` : ""}`);
+  }
+  return r.stdout;
 }
 
 /** The debuggable WebView's devtools socket, forwarded to a local port. */
 function targets(port) {
-  const pid = adb("shell", "pidof", opt("--package", "com.amos.ai"));
-  if (!pid) throw new Error("app is not running (adb shell pidof found nothing)");
+  const pkg = opt("--package", "com.amos.ai");
+  const pid = adbRaw("shell", "pidof", pkg).stdout;
+  if (!pid) {
+    throw new Error(
+      `app is not running (no process for ${pkg}) — launch it first:\n` +
+        `  adb shell monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`,
+    );
+  }
   const socket = adb("shell", "cat", "/proc/net/unix").split("\n").find((l) => l.includes("webview_devtools_remote"));
   if (!socket) throw new Error("no webview_devtools_remote socket — is this build debuggable?");
   adb("forward", `tcp:${port}`, `localabstract:${socket.trim().split(/\s+/).pop().replace(/^@/, "")}`);
