@@ -9,6 +9,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import VoiceMemosApp from "../src/svelte/VoiceMemosApp.svelte";
 import { readStoreValue } from "../src/lib/amosStore";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
 
@@ -99,3 +100,71 @@ describe("VoiceMemosApp.svelte (list surface)", () => {
     expect(txt(host)).toContain("暂无语音备忘录");
   });
 });
+
+/**
+ * Export to the shared collection (REQ-A350).
+ *
+ * The `mediaExport` service — and its own tests — existed while **nothing called it**: a memo lived
+ * only in this app's internal store, so Files, the gallery and every other app could not see it,
+ * which is exactly what REQ-A313 promised would not happen ("a recording must be a file the user can
+ * find"). These cases pin the wiring: the button reaches the same two host commands the service was
+ * tested against, and the outcome is rendered **as it came back**.
+ */
+describe("VoiceMemosApp — export to the shared collection (REQ-A350)", () => {
+  /** A fake host recording the media commands (the same pair the service's own tests use). */
+  function installMediaHost(reply: "item" | "refused" | "missing") {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "media_save") {
+          // A refusal is a **rejected** invoke, not a `null`: the service documents that `null`
+          // means "no bridge at all" (offline), and a rejection means the host said no.
+          if (reply === "refused") throw new Error("media: not authorized to write recordings");
+          if (reply === "missing") return null;
+          return { id: "saved-1", name: (args?.name as string) ?? "x.wav" };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  /** Poll for text instead of sleeping a fixed time (the repo's own anti-flake discipline). */
+  async function waitFor(host: { container: HTMLElement }, needle: string, ms = 500) {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      if (txt(host).includes(needle)) return true;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return txt(host).includes(needle);
+  }
+
+  test("the button writes a real file: grant, then media_save with the memo's own bytes", async () => {
+    const calls = installMediaHost("item");
+    const host = render(VoiceMemosApp);
+    await fireEvent.click(buttonsByAria(host, "保存到「录音」目录")[0]);
+    expect(await waitFor(host, zh["vm.exportSaved"]!), `the outcome is shown, not assumed — got: ${txt(host)}`).toBe(true);
+    expect(calls.map((c) => c.cmd)).toContain("media_grant_write");
+    const save = calls.find((c) => c.cmd === "media_save");
+    expect(save, "the file was written through the host").toBeTruthy();
+    // The payload is the host's own type (a byte array), the name comes from the memo's stamp, and
+    // the collection is **recordings** — not the service's default (the camera roll).
+    expect(Array.isArray((save?.args as { data?: unknown })?.data)).toBe(true);
+    expect((save?.args as { collection?: string })?.collection).toBe("recordings");
+    expect(String((save?.args as { name?: string })?.name ?? "")).toMatch(/^Amos-\d{8}-\d{6}\.wav$/);
+  });
+
+  test("a refusal is reported as a refusal, never as a save", async () => {
+    installMediaHost("refused");
+    const host = render(VoiceMemosApp);
+    await fireEvent.click(buttonsByAria(host, "保存到「录音」目录")[0]);
+    expect(await waitFor(host, zh["vm.exportRefused"]!)).toBe(true);
+    expect(txt(host), "…and it never claims otherwise").not.toContain(zh["vm.exportSaved"]!);
+  });
+});
+

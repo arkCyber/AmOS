@@ -48,6 +48,7 @@ export type SysIconName =
   | "delete"
   | "check"
   | "rotateCcw"
+  | "download"
   | "dialpad"
   | "archive"
   | "shuffle"
@@ -179,6 +180,10 @@ const INNER: Record<SysIconName, string> = {
     '<path d="M20 5H9l-7 7 7 7h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Z"/>' +
     '<path d="m18 9-6 6M12 9l6 6"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
+  // `square.and.arrow.down` (SF Symbols) — "write this out to a file". Added by REQ-A350 so the
+  // voice-memo export action does not borrow an icon whose meaning is different (`check` reads as
+  // "already saved", which is exactly what the button must not promise before it ran).
+  download: '<path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/>',
   rotateCcw:
     '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>' +
     '<path d="M3 3v5h5"/>',

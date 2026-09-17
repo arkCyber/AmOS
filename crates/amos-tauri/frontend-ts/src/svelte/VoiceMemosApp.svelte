@@ -6,6 +6,7 @@
   // real capture needs a microphone (device acceptance), while the
   // list CRUD / seed rows are fully browser-testable.
   import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import { amosWarn } from "../lib/debugLog";
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import { defaultMediaStore } from "../lib/mediaStore";
   import { capSet, loadLedger } from "../lib/permissions";
@@ -27,6 +28,10 @@
     type VoiceMemo,
   } from "../lib/voiceMemos";
   import { startVoiceRecording, type ActiveRecording } from "../lib/voiceRecorder";
+  // The write half of the media domain (REQ-A313: "a recording must be a file the user can find").
+  // It existed — with its own tests — and **nothing called it** until REQ-A350, so a memo lived only
+  // in this app's internal store: invisible to Files, to the gallery, and to any other app.
+  import { blobBytes, exportNameFor, exportToSharedCollection, RECORDING_EXPORT_DIR } from "../lib/mediaExport";
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
@@ -127,6 +132,68 @@
   const deleteMemo = (m: VoiceMemo) => {
     persist(removeMemo(memos, m.id));
     if (m.audio.kind === "recorded") void defaultMediaStore().del(m.id);
+  };
+
+  /* ---- export to the shared collection (REQ-A350) ------------------------------------------ */
+  /** The last attempt's outcome, per memo. Rendered **as it came back** — never as "saved". */
+  let exportOutcome = $state<{ id: string; outcome: string } | null>(null);
+  let exporting = $state<string | null>(null);
+
+  /**
+   * The bytes this memo would be saved as: the recorded payload, or the synthesized clip a seed row
+   * plays (mirroring `audioUrlFor`, so what is saved is what was heard).
+   */
+  const exportBytesFor = async (m: VoiceMemo): Promise<Uint8Array | null> => {
+    if (m.audio.kind === "seed") {
+      return buildWavBytes({
+        seconds: m.audio.seconds,
+        sampleRate: 8000,
+        toneHz: m.audio.toneHz,
+        amplitude: 0.3,
+      });
+    }
+    const blob = await defaultMediaStore().get(m.id);
+    return blob ? await blobBytes(blob) : null;
+  };
+
+  const exportMemo = async (m: VoiceMemo) => {
+    exporting = m.id;
+    exportOutcome = null;
+    try {
+      const bytes = await exportBytesFor(m);
+      if (!bytes || bytes.length === 0) {
+        // Nothing to write (the store lost the payload) — an honest "offline", not a silent no-op.
+        exportOutcome = { id: m.id, outcome: "offline" };
+        return;
+      }
+      const outcome = await exportToSharedCollection(
+        "audio",
+        exportNameFor(m.createdAt, m.mime),
+        bytes,
+        // The **recordings** collection, not the default (which is the camera roll): a voice memo
+        // saved into DCIM/Camera would be a file the user cannot find where it belongs. The default
+        // exists for photos/videos; omitting this argument was a real bug in the first wiring.
+        RECORDING_EXPORT_DIR,
+      );
+      exportOutcome = { id: m.id, outcome };
+    } catch (e) {
+      // The service returns an outcome for every host answer; a throw here means something outside
+      // its contract failed. Say so instead of leaving the row silent — a stale "nothing happened"
+      // is the one thing an export button must never do.
+      amosWarn("vmemos", "export threw", { id: m.id, error: String(e) });
+      exportOutcome = { id: m.id, outcome: "offline" };
+    } finally {
+      exporting = null;
+    }
+  };
+
+  /** The i18n key for an outcome, or the raw outcome when the host invents a new one. */
+  const exportLabel = (outcome: string): string => {
+    if (outcome === "saved") return t("vm.exportSaved");
+    if (outcome === "refused") return t("vm.exportRefused");
+    if (outcome === "offline") return t("vm.exportOffline");
+    if (outcome === "empty") return t("vm.exportEmpty");
+    return outcome;
   };
 
   /* ---- rename ---- */
@@ -262,6 +329,13 @@
                 </p>
               </div>
               <div class="flex shrink-0 items-center gap-1.5">
+                <span
+                  class="text-[11px] text-neutral-500 dark:text-neutral-400"
+                  aria-live="polite"
+                >{exportOutcome?.id === m.id ? exportLabel(exportOutcome.outcome) : ""}</span>
+                <button onclick={() => void exportMemo(m)} aria-label={t("vm.export")} title={t("vm.exportHint")} data-icon="download" class="grid h-6 w-6 place-items-center text-accent active:scale-90" disabled={exporting === m.id}>
+                  {@html iconSvg("download", "h-4 w-4")}
+                </button>
                 <button onclick={() => beginRename(m)} aria-label={t("vm.rename")} data-icon="pencil" class="grid h-6 w-6 place-items-center text-accent active:scale-90">
                   {@html iconSvg("pencil", "h-4 w-4")}
                 </button>

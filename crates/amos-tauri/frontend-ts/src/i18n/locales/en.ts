@@ -1142,6 +1142,12 @@ export const en: Record<MessageKey, string> = {
   "vm.startHint": "Tap to start recording",
   "vm.empty": "No recordings yet",
   "vm.rename": "Rename",
+  "vm.export": "Save to Recordings",
+  "vm.exportHint": "Write this memo out as a real file other apps can find",
+  "vm.exportSaved": "Saved",
+  "vm.exportRefused": "The host refused the write",
+  "vm.exportOffline": "Could not read the audio",
+  "vm.exportEmpty": "Nothing to save",
   "vm.delete": "Delete",
   // REQ-A313: see the zh locale.
   "vm.exportAria": "Save {title} into the system Recordings folder",
