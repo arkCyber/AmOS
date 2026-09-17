@@ -50,9 +50,29 @@ function rel(p) {
   return "./" + p.slice(root.length + 1);
 }
 
+/**
+ * A file may declare its zone: `// bun-iso-tz: <IANA zone>`.
+ *
+ * Those files get **their own process with `TZ` set**, because a zone is a property of the process,
+ * not of a test: switching `process.env.TZ` mid-run made a case depend on which zone happened to run
+ * before it (measured in REQ-A343 — the same file passed alone and failed in the batch). One file,
+ * one zone, one process is deterministic; the file also asserts its own offset so a moved zone fails
+ * loudly instead of quietly testing nothing.
+ */
+function tzOf(file) {
+  try {
+    const m = readFileSync(file, "utf8").match(/\/\/\s*bun-iso-tz:\s*([A-Za-z0-9_+\-/]+)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 const all = testRoots.flatMap((d) => collectTests(d)).sort();
-const pure = all.filter((f) => !isDom(f));
-const dom = all.filter(isDom);
+const zoned = all.filter((f) => tzOf(f) !== null);
+const rest = all.filter((f) => tzOf(f) === null);
+const pure = rest.filter((f) => !isDom(f));
+const dom = rest.filter(isDom);
 
 function run(binArgs, opts = {}) {
   const r = spawnSync("bun", binArgs, { cwd: root, stdio: "inherit", ...opts });
@@ -63,10 +83,16 @@ const mode = process.argv[2] ?? "test";
 let ok = true;
 
 if (mode === "test") {
-  console.log(`\n[bun-iso] ${pure.length} pure file(s) in one process, ${dom.length} DOM file(s) isolated.\n`);
+  console.log(
+    `\n[bun-iso] ${pure.length} pure file(s) in one process, ${dom.length} DOM file(s) isolated, ${zoned.length} zoned file(s) in their own process.\n`,
+  );
   ok = run(["test", ...pure.map(rel)]) && ok;
   for (const f of dom) {
     ok = run(["test", rel(f)]) && ok;
+  }
+  for (const f of zoned) {
+    // Own process **and** its declared zone: a zone cannot be switched for an instant reliably.
+    ok = run(["test", rel(f)], { env: { ...process.env, TZ: tzOf(f) } }) && ok;
   }
 } else if (mode === "coverage") {
   // P2-1 gate measures src/lib only; pure files carry that coverage. DOM files
