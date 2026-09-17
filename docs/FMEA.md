@@ -115,7 +115,11 @@
 
 
 
+| F-SH-020 | **导出的兜底路径在吞掉失败之后仍声称成功；而且那条消息是**硬编码中文**（英文用户看到中文）——`i18n-scan` 的硬编码检查只看 `.svelte` 的 **markup 段**，脚本段里的中文字面量是**门的盲区**（REQ-A355 收口，F-SH-017 同族）**：`NotesApp.svelte` 的 `doExportOne` 在"无后端"时回退到剪贴板 ✗，写法是 `try { await copySelection(text) } catch { /* clipboard unavailable */ }` 然后**无条件** `exportMsg = t("note.exportCopied")` ✗ —— 而 `copySelection`（`lib/clipboard.ts:98`）**本来就返回 boolean** ✓（`clipboardWrite(...) !== null` ✓）⇒ 返回值被丢掉 ✓；`doExportMd` 更直接：`exportMsg = "已复制 .md 到剪贴板（未连接后端）"` ✗ 是**字面量中文** ✓✓ | 用户在无宿主的 WebView 里点"导出" ⇒ 看到"**已复制到剪贴板（未连接后端）**" ✓ 而笔记**既没成文件、也没进剪贴板** ✗ ⇒ 与"数据全损"对用户等价 ✓（他关掉页面以后再也找不回来 ✓）；英文用户更糟 ✓：看到的是一句**中文** ✓（语言被无视 ✓）。工程侧为什么全绿：单测 ✓、`tsc` ✓、`i18n-scan` ✓ —— 因为该门**只扫 markup 段**（`markupOf()` ✓），**脚本段字面量不在其视野** ✗ | 3 | 3 | 4 | 36 | ①**声明跟随效果** ✓：新增 `copiedToClipboard(text)` ✓ —— `copySelection` 的 boolean **被使用** ✓，抛出的写也算失败 ✓；`doExportOne` 改为三态 ✓（真文件 ⇒ `note.exportedTo {name}` ✓；剪贴板真的落地 ⇒ `note.exportCopied` ✓；否则 ⇒ `note.exportCopyFailed` ✓ = "导出失败，且剪贴板不可用——**笔记仍在 AmOS 内，没有丢失**" ✓，先安抚且为真 ✓）；②`doExportMd` 同样改为按结果分支 ✓（成功才有 `note.exportMdCopied` ✓），并把 `"未命名"` 与 `已导入「…」` 两处**脚本段中文**一并键化 ✓（`note.untitled` ✓ / `note.imported {title}` ✓）；③4 个键 zh+en **同步** ✓；④**测试不再替缺陷背书** ✓：原有用例断言的就是那句**错误**文案 ✗ ⇒ 改为断言"**诚实失败**" ✓ 并补"剪贴板可用仍报已复制"的正例 ✓ | `svelte-tests/notes.svelte.test.ts`（**+1 并重写 2**：无剪贴板 ⇒ `note.exportCopyFailed` 且**不含** `note.exportCopied` ✓；剪贴板可用（假桥应答 `clipboard_write`）⇒ `note.exportCopied` 且**载荷真的到达**（`written[0].text` 含正文 ✓）；`.md` 路径同样断言"成功措辞只留给真的复制" ✓）。套件：notes + note-editor **47/47** ✓；`i18n-scan` 我新增的 4 键**无死键** ✓ |
+
+
 ### 2.2b 输入法 (amos-ime / amos-tauri)
+
 
 | ID | 失效模式 | 影响 | S | P | D | RPN | 当前缓解 | 测试保护 |
 |----|----------|------|---|---|---|-----|-----------|----------|

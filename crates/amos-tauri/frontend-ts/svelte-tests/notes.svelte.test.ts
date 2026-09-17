@@ -191,7 +191,7 @@ describe("NotesApp.svelte", () => {
     const stored = readStoreValue<{ state?: string }[]>("amos.notes", []);
     expect(stored.filter((n) => n.state === "archived").length).toBe(2);
   });
-  test("exporting a note without a backend copies it and shows a fallback message", async () => {
+  test("exporting a note without a backend reports a failed clipboard fallback honestly", async () => {
     const host = render(NotesApp);
     const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
     await fireEvent.input(ta, { target: { value: "导出正文" } });
@@ -202,7 +202,39 @@ describe("NotesApp.svelte", () => {
     expect(exportBtn).toBeTruthy();
     await fireEvent.click(exportBtn);
     await new Promise((r) => setTimeout(r, 20));
-    expect(txt(host)).toContain("已复制到剪贴板（未连接后端）");
+    // happy-dom has no clipboard bridge, so `copySelection` reports false: the honest outcome is
+    // the failure line (REQ-A355). The pre-fix code claimed the copy had happened — telling the
+    // user their note was on the clipboard when it was nowhere at all.
+    expect(txt(host)).toContain(zh["note.exportCopyFailed"]!);
+    expect(txt(host), "…and it never claims the copy landed").not.toContain(zh["note.exportCopied"]!);
+  });
+
+  test("exporting a note with a working clipboard still reports the copy", async () => {
+    const written: Array<Record<string, unknown>> = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        // `notes_export_txt` stays null (no writer), so the clipboard fallback runs; the
+        // clipboard itself answers, which is what "copied" is allowed to mean.
+        if (cmd === "clipboard_write") {
+          written.push(args?.payload as Record<string, unknown>);
+          return { kind: "text", text: (args?.payload as { text?: string })?.text ?? "", seq: 1 };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(NotesApp);
+    const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
+    await fireEvent.input(ta, { target: { value: "导出正文" } });
+    await fireEvent.click(btnTrim(host, "保存")!);
+    const exportBtn = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("导出"),
+    ) as HTMLButtonElement;
+    await fireEvent.click(exportBtn);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(txt(host)).toContain(zh["note.exportCopied"]!);
+    expect(written.length, "the text really reached the clipboard").toBe(1);
+    expect(String(written[0]?.text ?? "")).toContain("导出正文");
   });
 });
 
@@ -383,7 +415,7 @@ describe("NotesApp.svelte — Markdown import / export", () => {
     expect(txt(host)).toContain("已导入");
   });
 
-  test("⇩ .md export affordance is present and reports the clipboard fallback", async () => {
+  test("⇩ .md export affordance is present and reports the clipboard outcome honestly", async () => {
     const host = render(NotesApp);
     const compose = host.container.querySelector(
       'textarea[data-testid="note-compose"]',
@@ -396,7 +428,12 @@ describe("NotesApp.svelte — Markdown import / export", () => {
     expect(mdBtn).toBeTruthy();
     await fireEvent.click(mdBtn as HTMLButtonElement);
     await tick();
-    expect(txt(host)).toContain("已复制 .md");
+    // No clipboard bridge here, so the honest line is the failure one — the pre-fix code showed
+    // a hard-coded Chinese "已复制 .md …" to every locale, whatever the write did (REQ-A355).
+    expect(txt(host)).toContain(zh["note.exportCopyFailed"]!);
+    expect(txt(host), "the success wording is reserved for a copy that landed").not.toContain(
+      zh["note.exportMdCopied"]!,
+    );
   });
 });
 

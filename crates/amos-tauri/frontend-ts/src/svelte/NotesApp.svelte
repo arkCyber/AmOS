@@ -346,19 +346,28 @@
   const bRestore = () => runBatch((s) => setManyState(notes, s, undefined));
   const bDelete = () => runBatch((s) => removeMany(notes, s));
   let exportMsg = $state("");
+  /**
+   * Copy `text`, reporting whether it landed.
+   *
+   * The claim has to follow the effect (REQ-A355): the export fallback copies to the clipboard,
+   * and claiming "已复制…" after a **swallowed** failure tells the user their note is on the
+   * clipboard when it is nowhere at all — no file, no clipboard. A thrown write is a failed
+   * write, and `copySelection` already reports `false` when the bridge has no clipboard.
+   */
+  const copiedToClipboard = async (text: string): Promise<boolean> => {
+    try {
+      return await copySelection(text);
+    } catch {
+      return false;
+    }
+  };
   const doExportOne = async (n: Note) => {
     const name = exportBaseName(new Date());
     const text = noteExportText([n]);
     const res = await exportTxtFile(name, text);
     if (res?.path) exportMsg = `${t("note.exportedTo")} ${res.name}`;
-    else {
-      try {
-        await copySelection(text);
-      } catch {
-        /* clipboard unavailable — message still informs */
-      }
-      exportMsg = t("note.exportCopied");
-    }
+    else if (await copiedToClipboard(text)) exportMsg = t("note.exportCopied");
+    else exportMsg = t("note.exportCopyFailed");
   };
   const composeStats = $derived(noteStats(text));
   const statsOf = (n: Note) => noteStats(n.text);
@@ -371,25 +380,24 @@
     const now = Date.now();
     persist(prependNote(notes, parsed.body, now));
     text = "";
-    exportMsg = `已导入「${parsed.title || "未命名"}」`;
+    exportMsg = t("note.imported", { title: parsed.title || t("note.untitled") });
   };
 
-  // "Export .md": serialise one note as a Markdown file and copy to the AmOS
-  // clipboard (no on-device md writer yet — same honest fallback as the .txt path
-  // without a backend).
+  // "Export .md": serialise one note as Markdown and copy it to the AmOS clipboard (no
+  // on-device md writer yet — same honest fallback as the .txt path without a backend).
+  // The fallback reports **whether the copy landed** (REQ-A355): this used to end in an
+  // unconditional, hard-coded Chinese string, so an English user saw Chinese *and* was told
+  // the copy succeeded even when the clipboard write had failed.
   const doExportMd = async (n: Note) => {
     const fileText = toMarkdownFile({
-      title: markdownTitleOf(n.text) || noteTitle(n.text) || "未命名",
+      title: markdownTitleOf(n.text) || noteTitle(n.text) || t("note.untitled"),
       text: n.text,
       created: createdOf(n),
       modified: n.ts,
     });
-    try {
-      await copySelection(fileText);
-    } catch {
-      /* clipboard unavailable — message still informs */
-    }
-    exportMsg = "已复制 .md 到剪贴板（未连接后端）";
+    exportMsg = (await copiedToClipboard(fileText))
+      ? t("note.exportMdCopied")
+      : t("note.exportCopyFailed");
   };
 
   // "Ask my notes": index (upsert) the active notes, prune stale ids, then
