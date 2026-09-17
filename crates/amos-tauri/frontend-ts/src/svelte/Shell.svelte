@@ -80,7 +80,7 @@
   // System-back admission (REQ-A321): a single `backActionAt` decides what a
   // dismiss intent means, so the keyboard handler and the platform back gesture
   // (and any future consumer — accessibility shortcut, etc.) cannot disagree.
-  import { backActionAt, type BackSurface } from "../lib/backNav";
+  import { backActionAt, levelOf, pushDecision, rewindCount, type BackPosition, type BackSurface } from "../lib/backNav";
   import ShortcutHud from "./ShortcutHud.svelte";
   import ExtAppHost from "./ExtAppHost.svelte";
 
@@ -473,6 +473,97 @@
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  });
+
+  /**
+   * System-back admission, history half (REQ-A321, re-wired in REQ-A347).
+   *
+   * The host turns the platform back gesture into
+   * `if (webView.canGoBack()) goBack() else exit()` (Tauri's generated `WryActivity`). Nothing in
+   * this app ever pushed a history entry, so `canGoBack()` was **always false**: pressing back
+   * inside an app — or in the App Library, edit mode, or with a sheet open — left AmOS entirely.
+   * One entry **per level** is what makes the host's own question agree with what the user sees,
+   * and `lib/backNav` (whose 12 unit tests survived the rollback) is the decision tree.
+   *
+   * Both directions are covered and each half is **idempotent**, so neither can double-step:
+   *   * the shell moves deeper  → push an entry (the host now has somewhere to go);
+   *   * the shell moves back by itself (home indicator, an in-app back control) → pop the entry it
+   *     no longer needs; the resulting `popstate` finds the shell already at that depth and does
+   *     nothing;
+   *   * a real back press → `popstate` reconciles the shell to the browser's own depth, one level
+   *     at a time. At the root nothing happens here **on purpose**: the platform's "back at the
+   *     root" (= leave the app) is the correct behaviour there, not something the shell swallows.
+   *
+   * Desktop is deliberately excluded: the macOS shell has real windows and its own close semantics.
+   */
+  const backPosition = $derived<BackPosition>({
+    surface: s.kind as BackPosition["surface"],
+    overlays: { nc: ncOpen(), recents: recentsOpen(), spot: spotOpen() },
+  });
+  /** How many of our own entries the browser is above the shell's root entry. */
+  let historyDepth = 0;
+  /**
+   * The previous position, so "deeper" and "how many pops" are pure decisions. It starts at the
+   * **root**: the page load is the browser's first entry, so a shell that mounts already inside an
+   * app (the host boots app windows at `index.html#window=<label>`) still gets an entry for that
+   * level — otherwise back would leave AmOS from an app the user never opened from the launcher.
+   */
+  let lastPosition: BackPosition = {
+    surface: "home",
+    overlays: { nc: false, recents: false, spot: false },
+  };
+  /** The position read fresh — the reconciler must see every setter's effect. */
+  const readBackPosition = (): BackPosition => ({
+    surface: s.kind as BackPosition["surface"],
+    overlays: { nc: ncOpen(), recents: recentsOpen(), spot: spotOpen() },
+  });
+  /** Apply back presses until the shell is at the browser's depth (idempotent). */
+  function reconcileBackTo(target: number): void {
+    let guard = 0;
+    while (levelOf(readBackPosition()) > target && guard++ < 8) {
+      const here = readBackPosition();
+      const action = backActionAt(here);
+      if (action === "close-overlay") {
+        const top = here.overlays;
+        if (top.nc) setNc(false);
+        else if (top.recents) setRecents(false);
+        else setSpot(false);
+      } else if (action === "home") {
+        goHome();
+      } else break; // nothing left inside the shell — the platform may exit
+    }
+  }
+  $effect(() => {
+    const to = backPosition;
+    if (layoutSnap === null || shellForm === "desktop") return;
+    if (pushDecision(lastPosition, to) === "push") {
+      // **One entry per level**, never one per transition: the shell can jump two levels at once
+      // (home → an app with a sheet over it), and a single entry there would make one back press
+      // undo both.
+      let d = levelOf(lastPosition);
+      while (d < levelOf(to)) {
+        d += 1;
+        historyDepth = d;
+        history.pushState({ amosDepth: d }, "");
+      }
+    } else {
+      const back = rewindCount(lastPosition, to);
+      if (back > 0) {
+        historyDepth = levelOf(to);
+        history.go(-back);
+      }
+    }
+    lastPosition = to;
+  });
+  $effect(() => {
+    if (layoutSnap === null || shellForm === "desktop") return;
+    const onPop = (e: PopStateEvent) => {
+      const state = e.state as { amosDepth?: number } | null;
+      historyDepth = typeof state?.amosDepth === "number" ? state.amosDepth : 0;
+      reconcileBackTo(historyDepth);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
   });
 
   function appTitle(id: string): string {

@@ -882,3 +882,70 @@ describe("Shell.svelte — keyboard admission (REQ-A346)", () => {
   });
 });
 
+
+/**
+ * The **history half** of system back (REQ-A347, re-wired): the host asks
+ * `webView.canGoBack()` and the answer is only true if the shell pushed an entry **per level**.
+ * Without it a back press inside an app leaves AmOS entirely — a device behaviour nobody can see in
+ * a unit test of the decision tree, which is why these cases assert the *entries*, not the intent.
+ */
+describe("Shell.svelte — system back pushes one history entry per level (REQ-A347)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 40));
+  const phone = () => installHost(() => snap({ form: "phone", columns: 1, multi_window: false }));
+
+  test("an app is one entry, a sheet over it is a second — never one per transition", async () => {
+    const pushes: unknown[] = [];
+    vi.spyOn(window.history, "pushState").mockImplementation((s: unknown) => {
+      pushes.push(s);
+    });
+    phone();
+    await open("notes");
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    expect(pushes, "opening an app pushed exactly one entry").toHaveLength(1);
+    expect(pushes[0]).toEqual({ amosDepth: 1 });
+
+    setNc(true);
+    await tick();
+    await settle();
+    expect(pushes, "the sheet over it is a second entry (one back press = one level)").toHaveLength(2);
+    expect(pushes[1]).toEqual({ amosDepth: 2 });
+    expect(container.querySelector('[role="dialog"]')).toBeTruthy();
+    vi.restoreAllMocks();
+  });
+
+  test("stepping back inside the shell pops the entry it no longer needs", async () => {
+    const goes: number[] = [];
+    vi.spyOn(window.history, "pushState").mockImplementation(() => {});
+    vi.spyOn(window.history, "go").mockImplementation((n?: number) => {
+      goes.push(n ?? 0);
+    });
+    phone();
+    await open("notes");
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    await fireEvent.click(container.querySelector<HTMLElement>('[aria-label]')!);
+    goHome();
+    await tick();
+    await settle();
+    expect(goes, "the shell rewinds the entry it no longer needs").toContain(-1);
+    vi.restoreAllMocks();
+  });
+
+  test("the desktop form pushes nothing (real windows have their own close semantics)", async () => {
+    const pushes: unknown[] = [];
+    vi.spyOn(window.history, "pushState").mockImplementation((s: unknown) => {
+      pushes.push(s);
+    });
+    installHost(() => snap({ form: "desktop", multi_window: true }));
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="home-grid"]') ?? container.firstElementChild).toBeTruthy();
+    expect(pushes, "no history entries on the desktop form").toHaveLength(0);
+    vi.restoreAllMocks();
+  });
+});
+
