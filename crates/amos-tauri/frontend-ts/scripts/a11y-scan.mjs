@@ -798,6 +798,89 @@ function r6_contrast(file, content) {
   };
 }
 
+/**
+ * 规则 R9: **永远无法动作的控件** —— 一个 `<button>` 既没有任何事件处理函数
+ * （`onclick` / `on:click` / `onpointerdown` / `onkeydown` …），也没有别的出路
+ * （`href` / `type="submit"` / `form=` / 插槽转发），于是用户点它**什么都不会发生**。
+ *
+ * 这就是 F-SH-023 那个缩略图：它有 `aria-label`、有 `disabled={!last}`、显示着刚拍那张，
+ * 却没有任何处理函数 ⇒ 用户读成"我的照片丢了"。比没有这个控件更糟：它**暗示有内容**。
+ *
+ * 判据边界（都经过实测 ✓，见 F-SH-024）：
+ *   - **静态** `disabled` / `aria-disabled="true"` 的控件拦下了点击 ⇒ 不报 ✓
+ *     （`DockContextMenu` 的「选项 ›」正是这种**诚实的禁用占位** ✓）。
+ *     注意只排除**静态** disabled：`disabled={!last}` 是**动态**的 ⇒ 控件在非禁用态
+ *     仍然会被点 ⇒ **必须报** ✓（F-SH-023 就是这种 ⇒ 这道门会抓住它 ✓）。
+ *   - `src/svelte/modules/` 下的**通用**组件不报 ✓：它们的处理函数由调用方通过
+ *     props/插槽传进来，本文件里看不到 ✓（实测：ChromeIconButton / DockTileButton ✓）。
+ *   - 脚本段不参与 ✓（只扫 `<style>` 之前的标记段 ✓）。
+ */
+/**
+ * Every `<button …>` open tag in `html`, with **brace- and quote-aware** scanning.
+ *
+ * A naive `/<button[^>]*>/` stops at the `>` inside an arrow function
+ * (`onclick={() => { … }`), so the handler looks absent and every such button reads as dead —
+ * that is exactly the false positive this helper exists to avoid (measured twice: first in the
+ * probe, then in R9's first version).
+ */
+function buttonTags(html) {
+  const out = [];
+  let i = html.indexOf("<button");
+  while (i >= 0) {
+    let depth = 0;
+    let quote = "";
+    let j = i + "<button".length;
+    for (; j < html.length; j++) {
+      const c = html[j];
+      if (quote) {
+        if (c === quote) quote = "";
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        quote = c;
+        continue;
+      }
+      if (c === "{") depth++;
+      else if (c === "}") depth = depth > 0 ? depth - 1 : 0;
+      else if (c === ">" && depth === 0) break;
+    }
+    out.push(html.slice(i, j + 1));
+    i = html.indexOf("<button", j);
+  }
+  return out;
+}
+
+function r9_deadControl(file, content) {
+  if (!file.endsWith(".svelte")) return null;
+  const end = content.lastIndexOf("</script>");
+  const after = end >= 0 ? content.slice(end) : content;
+  const style = after.indexOf("<style");
+  const html = style >= 0 ? after.slice(0, style) : after;
+  if (file.replace(/\\/g, "/").includes("/src/svelte/modules/")) return null;
+  const findings = [];
+  for (const tag of buttonTags(html)) {
+    const attrs = tag.slice("<button".length, -1);
+    if (/\bon[a-z]+\s*=|on:[a-z]+=/.test(attrs)) continue; // has a handler
+    if (/\bhref\s*=|\btype\s*=\s*["']?submit|\bform\s*=/.test(attrs)) continue; // another way to act
+    // A **statically** disabled control cannot be tapped at all — that is the honest
+    // placeholder (`DockContextMenu`'s greyed 「选项 ›」). `disabled={…}` is dynamic: the
+    // control is tappable in every other state, so it still needs a handler (F-SH-023's
+    // thumbnail was exactly this) and must **not** be exempted here.
+    const staticallyDisabled =
+      /(^|\s)disabled(\s|$)/.test(attrs) || /aria-disabled\s*=\s*["']true["']/.test(attrs);
+    const dynamicallyDisabled = /disabled\s*=\s*\{/.test(attrs);
+    if (staticallyDisabled && !dynamicallyDisabled) continue;
+    if (/\{\s*\.\.\./.test(attrs)) continue; // spreads props (a handler may arrive from the caller)
+    findings.push(tag.replace(/\s+/g, " ").slice(0, 110));
+  }
+  if (findings.length === 0) return null;
+  return {
+    rule: "dead-control: <button> with no handler and no other way to act (tapping it can never do anything)",
+    evidence: findings[0] + (findings.length > 1 ? ` …(+${findings.length - 1} more)` : ""),
+    fix: "give it the action it implies; if it is a deliberate placeholder, mark it `disabled aria-disabled=\"true\"` with an explanatory title so it cannot be tapped at all",
+  };
+}
+
 // ─── 主扫描 ──────────────────────────────────────────────────────────────────
 function scan(file) {
   const content = readSafe(file);
@@ -811,6 +894,7 @@ function scan(file) {
     r6_contrast,
     r7_targetSize,
     r8_motion,
+    r9_deadControl,
   ];
   for (const r of rules) {
     const f = r(file, content);
@@ -1040,7 +1124,34 @@ function selftest() {
     console.error("  findings:", JSON.stringify(f10c, null, 2));
     process.exit(1);
   }
-  console.log("[a11y-scan] selftest: 15 assertion(s), 0 failure(s).");
+  // sample 11 (REQ-A359): R9 dead control. The `bad` case is the **exact** historical shape of
+  // F-SH-023: an aria-label, a *dynamic* `disabled` and a thumbnail — but no handler, so tapping
+  // it could never do anything. The two `good` cases are the exemptions that keep R9 honest.
+  const bad11 = `<button aria-label="上一张照片" disabled={!last}><img src={last.data} alt="" /></button>`;
+  const tmp11 = path.join("/tmp", `a11y-scan-selftest-11-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp11, bad11);
+  const f11 = scan(tmp11);
+  fs.unlinkSync(tmp11);
+  if (!f11.some((x) => x.rule.includes("dead-control"))) {
+    console.error("[a11y-scan selftest] FAIL: R9 must flag a button that can never act (F-SH-023)");
+    process.exit(1);
+  }
+  const goods11 = [
+    ["a statically disabled placeholder", `<button disabled aria-disabled="true" title="x">占位</button>`],
+    ["a props-spreading component", `<button {...rest} class="x">y</button>`],
+    ["a button that does act", `<button onclick={() => go()}>go</button>`],
+  ];
+  for (const [name, src] of goods11) {
+    const tmp = path.join("/tmp", `a11y-scan-selftest-11g-${Date.now()}.svelte`);
+    fs.writeFileSync(tmp, src);
+    const f = scan(tmp);
+    fs.unlinkSync(tmp);
+    if (f.some((x) => x.rule.includes("dead-control"))) {
+      console.error(`[a11y-scan selftest] FAIL: R9 must stay silent for ${name}`);
+      process.exit(1);
+    }
+  }
+  console.log("[a11y-scan] selftest: all assertions passed (0 failures).");
 }
 
 // ─── 入口 ────────────────────────────────────────────────────────────────────
