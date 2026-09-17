@@ -1173,7 +1173,6 @@ export const en: Record<MessageKey, string> = {
   "note.exportCopyFailed": "Export failed and the clipboard is unavailable — the note is still in AmOS, nothing was lost",
   "note.exportMdCopied": "Copied .md to the clipboard (daemon not connected)",
   "note.imported": "Imported “{title}”",
-  "note.untitled": "Untitled",
   "note.done": "Done",
   "note.edited": "edited",
   "appLibrary.title": "App Library",

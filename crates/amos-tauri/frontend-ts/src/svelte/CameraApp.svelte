@@ -16,6 +16,18 @@
     type ActiveVideoRecording,
     type VideoCapture,
   } from "../lib/cameraCapture";
+  // The write half of the media domain (REQ-A356): the camera's own album is a private store,
+  // so "存到系统存储" is what puts a shot or a recording where the system gallery — and any
+  // other app — can find it. The six `camera.export*` strings were written for this screen.
+  import {
+    blobBytes,
+    CAMERA_EXPORT_DIR,
+    dataUrlMime,
+    dataUrlToBytes,
+    exportNameFor,
+    exportToSharedCollection,
+    type ExportOutcome,
+  } from "../lib/mediaExport";
   import type { Capability } from "../lib/permissions";
   import { grantCapability } from "./osPermissions";
   import { PHOTOS_KEY, newPhoto, newCapturePhoto, type Photo } from "../lib/photos";
@@ -95,6 +107,66 @@
   let last = $state<Photo | null>(
     latestPhoto(readStoreValue<Photo[]>(PHOTOS_KEY, [])) ?? null,
   );
+  // ── "存到系统存储" (REQ-A356) ─────────────────────────────────────────────────
+  // The camera's own album (`lib/photos.ts` / `lib/cameraCapture.ts`) is private, so a shot or
+  // a recording only reaches the system gallery — and therefore Files or any other app — when
+  // the user asks for it here. Nothing is exported automatically; nothing is exported without
+  // bytes; and the line under the viewfinder reports what the host actually answered.
+  let exporting = $state(false);
+  /** The four outcomes are four different things to say (see `lib/mediaExport`). */
+  const exportMsg = (o: ExportOutcome): string =>
+    o === "saved"
+      ? t("camera.exported")
+      : o === "offline"
+        ? t("camera.exportOffline")
+        : o === "refused"
+          ? t("camera.exportRefused")
+          : t("camera.exportFailed");
+  /** Write `bytes` out as `name`, keeping the in-flight line while the host works. */
+  const exportBytes = async (kind: "image" | "video", name: string, bytes: Uint8Array) => {
+    exporting = true;
+    hint = t("camera.exporting");
+    try {
+      hint = exportMsg(await exportToSharedCollection(kind, name, bytes, CAMERA_EXPORT_DIR));
+    } finally {
+      exporting = false;
+    }
+  };
+  /**
+   * Export what is on screen: in video mode the newest recording, otherwise the still the
+   * thumbnail holds. A demo frame, or a library entry from an earlier session whose bytes are
+   * gone, has nothing to write — and that is said **without touching the host**, because an
+   * empty file in the user's gallery would claim a capture that is not there.
+   */
+  const exportToSystem = async () => {
+    if (exporting) return;
+    if (mode === "video") {
+      const newest = captures.reduce<VideoCapture | null>(
+        (best, c) => (best === null || c.ts > best.ts ? c : best),
+        null,
+      );
+      const blob = newest ? await captureBlob(newest.id) : null;
+      const bytes = blob ? await blobBytes(blob) : null;
+      if (!newest || !bytes || bytes.length === 0) {
+        hint = t("camera.exportFailed");
+        return;
+      }
+      await exportBytes("video", exportNameFor(newest.ts, newest.mime), bytes);
+      return;
+    }
+    if (!last?.data) {
+      hint = t("camera.exportFailed");
+      return;
+    }
+    const bytes = dataUrlToBytes(last.data);
+    if (!bytes || bytes.length === 0) {
+      hint = t("camera.exportFailed");
+      return;
+    }
+    await exportBytes("image", exportNameFor(last.ts, dataUrlMime(last.data)), bytes);
+  };
+
+
 
   // Video recording + capture library.
   let mode = $state<"photo" | "video">("photo");
@@ -798,7 +870,7 @@
   <!-- bottom toolbar (always shown: camera is default-allowed) -->
     <div class="flex flex-col items-center gap-1.5 bg-gradient-to-t from-black to-transparent px-3 pt-1 pb-2">
       {#if hint}
-        <p class="text-xs text-white/70">{hint}</p>
+        <p role="status" class="text-xs text-white/70">{hint}</p>
       {:else}
         <p class="text-[11px] text-white/30">{live ? ratioLabel[ratio] : "· · ·"}</p>
       {/if}
@@ -810,6 +882,13 @@
       {/if}
       {#if recErr}
         <p role="status" class="text-[11px] text-amber-300">{recErr}</p>
+      {/if}
+      {#if last?.data || (mode === "video" && captures.length > 0)}
+        <button
+          onclick={() => void exportToSystem()}
+          disabled={exporting}
+          class="rounded-full bg-white/15 px-4 py-1 text-xs text-white ring-1 ring-white/25 transition active:scale-95 disabled:opacity-50"
+        >{t("camera.exportToSystem")}</button>
       {/if}
       <!-- Photo / Video mode switch -->
       <div class="flex items-center rounded-full bg-white/15 p-0.5 ring-1 ring-white/25">

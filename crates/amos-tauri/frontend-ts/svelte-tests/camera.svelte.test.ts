@@ -307,3 +307,96 @@ describe("CameraApp.svelte (video library)", () => {
     expect(txt(host)).not.toContain("录制中…");
   });
 });
+
+/**
+ * "存到系统存储" (REQ-A356) — the camera-app half of REQ-A350/A352.
+ *
+ * The six `camera.export*` strings were written for this screen and had no producer at all
+ * until now. The camera's own album is private, so a shot only reaches the system gallery
+ * (`DCIM/Camera`) when the user asks for it. These cases pin the wiring and the honesty of the
+ * outcome line: a refusal is never rendered as a save, and a frame with no bytes is refused
+ * locally, without touching the host's write path.
+ *
+ * `last` is seeded through the store (not by driving the shutter) because happy-dom has no
+ * canvas: the capture path falls back to a data-less photo there, and `last` is deliberately
+ * only set for a capture that has pixels.
+ */
+describe("CameraApp.svelte — export to the system gallery (REQ-A356)", () => {
+  const seedLastPhoto = (ts: number, data: string) =>
+    window.localStorage.setItem(PHOTOS_KEY, JSON.stringify([{ id: "p1", ts, data }]));
+
+  /** A fake host recording the media commands (the pair the service's own tests drive). */
+  function installMediaHost(reply: "item" | "refused") {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "media_save") {
+          // A refusal is a **rejected** invoke: `null` would mean "no bridge" (offline).
+          if (reply === "refused") throw new Error("media: not authorized to write camera");
+          return { id: "saved-1", name: (args?.name as string) ?? "x.png" };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  const btnByText = (h: { container: HTMLElement }, text: string) =>
+    [...h.container.querySelectorAll("button")].find((b) => (b.textContent ?? "").includes(text)) as
+      | HTMLButtonElement
+      | undefined;
+  /** Poll for text instead of sleeping a fixed time (the repo's anti-flake discipline). */
+  async function waitFor(h: { container: HTMLElement }, needle: string, ms = 500) {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      if (txt(h).includes(needle)) return true;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return txt(h).includes(needle);
+  }
+
+  test("the last still is written into DCIM/Camera under its own name", async () => {
+    seedLastPhoto(new Date(2026, 8, 16, 18, 5, 7).getTime(), "data:image/png;base64,AAAA");
+    const calls = installMediaHost("item");
+    const host = render(CameraApp);
+    await settle();
+    const exportBtn = btnByText(host, zh["camera.exportToSystem"]!);
+    expect(exportBtn, "the affordance appears once there is a shot to export").toBeTruthy();
+    await fireEvent.click(exportBtn!);
+    expect(
+      await waitFor(host, zh["camera.exported"]!),
+      `the outcome is shown, not assumed — got: ${txt(host)}`,
+    ).toBe(true);
+    expect(calls.map((c) => c.cmd)).toContain("media_grant_write");
+    const save = calls.find((c) => c.cmd === "media_save");
+    expect(save, "the file was written through the host").toBeTruthy();
+    // A byte array (the host's own type), the **camera** collection, and the extension taken
+    // from the data URL's own media type.
+    expect(Array.isArray((save?.args as { data?: unknown })?.data)).toBe(true);
+    expect((save?.args as { collection?: string })?.collection).toBe("camera");
+    expect((save?.args as { kind?: string })?.kind).toBe("image");
+    expect(String((save?.args as { name?: string })?.name ?? "")).toBe("Amos-20260916-180507.png");
+  });
+
+  test("a refusal is reported as a refusal, never as a save", async () => {
+    seedLastPhoto(Date.now(), "data:image/jpeg;base64,AAAA");
+    installMediaHost("refused");
+    const host = render(CameraApp);
+    await settle();
+    await fireEvent.click(btnByText(host, zh["camera.exportToSystem"]!)!);
+    expect(await waitFor(host, zh["camera.exportRefused"]!)).toBe(true);
+    expect(txt(host), "…and it never claims otherwise").not.toContain(zh["camera.exported"]!);
+  });
+
+  test("with nothing captured there is no export affordance at all", async () => {
+    const host = render(CameraApp); // no store seed, no getUserMedia → demo frame, no shot
+    await settle();
+    expect(btnByText(host, zh["camera.exportToSystem"]!)).toBeUndefined();
+  });
+});
+

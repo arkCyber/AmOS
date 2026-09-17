@@ -1177,7 +1177,6 @@ export const zh = {
   "note.exportCopyFailed": "导出失败，且剪贴板不可用——笔记仍在 AmOS 内，没有丢失",
   "note.exportMdCopied": "已复制 .md 到剪贴板（未连接后端）",
   "note.imported": "已导入「{title}」",
-  "note.untitled": "未命名",
   "note.done": "完成",
   "note.edited": "已编辑",
   "appLibrary.title": "App 资源库",
