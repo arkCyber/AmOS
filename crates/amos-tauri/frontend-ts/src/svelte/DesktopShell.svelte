@@ -47,6 +47,7 @@
     moduleForShortcut,
     modulesFor,
     formatShortcut,
+    overlayShortcutHint,
     type ShellChromeApi,
     type ShellShortcut,
   } from "../lib/shellModule";
@@ -110,33 +111,14 @@
   }
 
   // ─── 自定义快捷键绑定（Phase 3）────────────────────────────────────────────
-  // 从 localStorage 读取用户配置，与系统默认值合并
+  // 从 localStorage 读取用户配置，与系统默认值合并。注意：浮层快捷键的真源仍是
+  // `SHELL_MODULES.shortcuts`（见 `onKeyDown`）。`keyboardBindings` 目前只在
+  // 浮层提示与 system 区域里少量读取——浮层 tooltip 仍然读 SHELL_MODULES，所以
+  // tooltip 与按下结果永远来自同一份声明。
   const keyboardBindings = createKeyboardBindings();
   keyboardBindings.startListening();
-
-  // 快捷键覆盖的快捷方式
-  const customOverlayBindings = $derived(keyboardBindings.bindings.overlays);
   const customSystemBindings = $derived(keyboardBindings.bindings.system);
   const customSpacesBindings = $derived(keyboardBindings.bindings.spaces);
-
-  // ─── 工具提示（从合并后的绑定生成）────────────────────────────────────────
-  function overlayShortcutHint(overlayId: string): { label: string; aria: string } | null {
-    const shortcuts = customOverlayBindings.get(overlayId);
-    if (!shortcuts || shortcuts.length === 0) return null;
-    const first = shortcuts[0];
-    let label = formatShortcut(first);
-    // 多绑定时显示第一个
-    if (shortcuts.length > 1) {
-      label += " / ...";
-    }
-    const parts: string[] = [];
-    if (first.meta) parts.push("Meta");
-    if (first.ctrl) parts.push("Control");
-    if (first.shift) parts.push("Shift");
-    if (first.alt) parts.push("Alt");
-    parts.push(first.key);
-    return { label, aria: parts.join("+") };
-  }
 
   // ─── 系统快捷键（macOS 作用于焦点窗口的那一组）────────────────────────
   // 故意与「浮层快捷键」分两层处理：
@@ -257,12 +239,14 @@
       }
     }
 
-    // 浮层快捷键（使用自定义绑定）
-    const match = findMatchingBinding(customOverlayBindings, e);
-    if (match) {
+    // 浮层快捷键（注册表即清单）：⌘Space/F4/F3/⌘Tab 的真源是 `SHELL_MODULES` 的
+    // `shortcuts` 字段。`moduleForShortcut` 按声明顺序找第一个匹配的绑定，浮层
+    // tooltip 也从同一个注册表读，所以"按下会开什么"和"按钮说会开什么"是一份代码。
+    const target = moduleForShortcut("overlay", SHELL_MODULES, e);
+    if (target) {
       e.preventDefault();
       e.stopPropagation();
-      toggleOverlay(match.id);
+      toggleOverlay(target.id);
       return;
     }
 

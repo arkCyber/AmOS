@@ -295,8 +295,13 @@ export function findMatchingBinding(
  * 检查单个快捷键是否匹配事件。
  */
 export function matchesShortcut(s: ShellShortcut, e: KeyboardEvent): boolean {
-  const normalizeKey = (key: string) => 
-    key === " " || key === "Spacebar" ? "Space" : key;
+  // `KeyboardEvent.key` is lowercase for letters ("w") while macOS / human-written
+  // shortcuts are uppercase ("W"). Normalise both sides before comparing so a
+  // ⌘W typed by the user matches a `closeWindow: { key: "W", meta: true }` entry.
+  const normalizeKey = (key: string): string => {
+    const k = key === " " || key === "Spacebar" ? "Space" : key;
+    return k.length === 1 ? k.toUpperCase() : k;
+  };
 
   if (normalizeKey(e.key) !== normalizeKey(s.key)) return false;
   if (Boolean(s.meta) !== Boolean(e.metaKey || e.ctrlKey)) return false;
