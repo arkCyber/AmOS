@@ -1,3 +1,6 @@
+// "yesterday" is a *calendar* day, not 24 hours: across a DST night a fixed 24h subtraction
+// lands two days back and the label lies. `addLocalDays` is the one DST-safe stepper.
+import { addLocalDays } from "./time";
 /**
  * Call log ("最近通话") domain — records of outgoing calls, durable under
  * `amos.calllog`.
@@ -245,7 +248,7 @@ export function callWhenLabel(
   const stamp = callDateStamp(ts);
   if (stamp === "") return "unknown";
   if (stamp === callDateStamp(now)) return "today";
-  if (stamp === callDateStamp(now - 86400000)) return "yesterday";
+  if (stamp === callDateStamp(addLocalDays(now, -1))) return "yesterday";
   return "date";
 }
 

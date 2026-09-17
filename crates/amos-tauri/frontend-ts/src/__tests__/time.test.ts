@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { fmtClock, zoneClock, stopwatchReducer, stopwatchInit, fmtStopwatch, timerReducer, timerInit, fmtCountdown, DEFAULT_SNOOZE_MIN, alarmsReducer, alarmInit, ringingAlarms, alarmKey, dayAllowed, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, WORLD_CITY_MAX, defaultWorldCities, lapDeltas, fastestLap, slowestLap, moveWorldCity, alarmsByTime, nextAlarmAtMs, risingEdge, type Alarm } from "../lib/time";
+import { fmtClock, zoneClock, stopwatchReducer, stopwatchInit, fmtStopwatch, timerReducer, timerInit, fmtCountdown, DEFAULT_SNOOZE_MIN, alarmsReducer, alarmInit, ringingAlarms, alarmKey, dayAllowed, normalizeAlarms, normalizeWorldCities, removeWorldCity, addWorldCity, WORLD_CITY_PRESETS, WORLD_CITY_MAX, defaultWorldCities, lapDeltas, fastestLap, slowestLap, moveWorldCity, alarmsByTime, nextAlarmAtMs, addLocalDays, risingEdge, type Alarm } from "../lib/time";
+import { dayStamp } from "../lib/messages";
 describe("time / status bar", () => {
   test("fmtClock pads hours/minutes", () => {
     expect(fmtClock(new Date(2024, 0, 1, 9, 5))).toBe("09:05");
@@ -537,3 +538,97 @@ describe("world-clock extra (name) cities", () => {
   });
 });
 
+
+
+/**
+ * Wall-clock day arithmetic (REQ-A343) — **DST must not move a clock reading**.
+ *
+ * Every case runs with a zone applied in-file (restored in `afterEach`) and asserts the zone really
+ * took effect before testing anything, so it cannot pass vacuously on a platform that ignores `TZ`.
+ * The first case also asserts what the **naive** form produces (`+ 86_400_000` ⇒ 08:00 / 06:00),
+ * which is what makes it discriminating rather than decorative — the old alarm tests never crossed a
+ * transition and were byte-equivalent before and after the fix.
+ */
+describe("wall-clock day arithmetic (DST)", () => {
+  const realTz = process.env.TZ;
+  afterEach(() => {
+    if (realTz === undefined) delete process.env.TZ;
+    else process.env.TZ = realTz;
+  });
+
+  /** Run `fn` in a zone, after proving the zone is live (winter and summer offsets differ). */
+  function inZone(tz: string, fn: () => void) {
+    process.env.TZ = tz;
+    const jan = new Date(2026, 0, 15).getTimezoneOffset();
+    const jul = new Date(2026, 6, 15).getTimezoneOffset();
+    expect(jan, `${tz}: the runtime ignored TZ — the case below would be vacuous`).not.toBe(jul);
+    fn();
+  }
+
+  const at = (y: number, mo: number, d: number, h: number, mi = 0) => new Date(y, mo - 1, d, h, mi, 0, 0);
+  const hhmm = (ms: number) => {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  };
+
+  test("addLocalDays keeps the wall clock across spring-forward and fall-back", () => {
+    inZone("America/New_York", () => {
+      const beforeSpring = at(2026, 3, 7, 7); // 07:00 EST, DST starts 03-08
+      expect(hhmm(addLocalDays(beforeSpring.getTime(), 1))).toBe("07:00");
+      expect(hhmm(beforeSpring.getTime() + 86_400_000)).toBe("08:00"); // what the bug did
+      const beforeFall = at(2026, 10, 31, 7); // 07:00 EDT, DST ends 11-01
+      expect(hhmm(addLocalDays(beforeFall.getTime(), 1))).toBe("07:00");
+      expect(hhmm(beforeFall.getTime() + 86_400_000)).toBe("06:00");
+    });
+  });
+
+  test("a daily alarm crossing spring-forward still rings at its own HH:MM", () => {
+    inZone("America/New_York", () => {
+      const now = at(2026, 3, 8, 0, 30).getTime();
+      const d = new Date(nextAlarmAtMs({ hour: 7, min: 0, repeat: [] }, now)!);
+      expect([d.getMonth() + 1, d.getDate(), d.getHours()]).toEqual([3, 8, 7]);
+      // The value handed to the native wake-up scheduler is not a fixed-hour offset.
+      expect(hhmm(nextAlarmAtMs({ hour: 7, min: 0, repeat: [] }, now)!)).toBe("07:00");
+    });
+  });
+
+  test("a weekday alarm whose next occurrence is days away crosses the transition correctly", () => {
+    inZone("America/New_York", () => {
+      const now = at(2026, 3, 6, 9).getTime(); // Friday; a Monday-only alarm
+      const d = new Date(nextAlarmAtMs({ hour: 7, min: 0, repeat: [1] }, now)!);
+      expect([d.getMonth() + 1, d.getDate(), d.getHours(), d.getDay()]).toEqual([3, 9, 7, 1]);
+    });
+  });
+
+  test("a daily alarm crossing fall-back still rings at its own HH:MM", () => {
+    inZone("America/New_York", () => {
+      const now = at(2026, 11, 1, 0, 30).getTime(); // 01:00–02:00 repeats tonight
+      const d = new Date(nextAlarmAtMs({ hour: 7, min: 0, repeat: [] }, now)!);
+      expect([d.getMonth() + 1, d.getDate(), d.getHours()]).toEqual([11, 1, 7]);
+    });
+  });
+
+  test("half-hour rules and the southern hemisphere are covered too", () => {
+    inZone("Australia/Lord_Howe", () => {
+      // DST shifts by **30 minutes** here; a calendar step still keeps the reading.
+      const n = at(2026, 4, 4, 7).getTime();
+      expect(hhmm(addLocalDays(n, 1))).toBe("07:00");
+      expect(hhmm(n + 86_400_000)).not.toBe("07:00");
+    });
+    inZone("Australia/Sydney", () => {
+      const n = at(2026, 10, 3, 20).getTime(); // DST starts 2026-10-04
+      const d = new Date(nextAlarmAtMs({ hour: 7, min: 0, repeat: [] }, n)!);
+      expect([d.getMonth() + 1, d.getDate(), d.getHours()]).toEqual([10, 4, 7]);
+    });
+  });
+
+  test('the labels that answer "yesterday" follow the calendar, not 24 h', () => {
+    inZone("America/New_York", () => {
+      const now = at(2026, 3, 8, 0, 30).getTime(); // 00:30 EDT, an hour after the jump
+      const yesterdayNoon = at(2026, 3, 7, 12).getTime();
+      expect(dayStamp(addLocalDays(now, -1))).toBe(dayStamp(yesterdayNoon));
+      // The naive subtraction lands on 03-06 — the label would print a date, not "yesterday".
+      expect(dayStamp(now - 86_400_000)).not.toBe(dayStamp(yesterdayNoon));
+    });
+  });
+});

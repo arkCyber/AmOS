@@ -1,4 +1,7 @@
 import type { Locale } from "../i18n/types";
+// DST-safe day stepping (same helper the alarm path uses): "N days from now" is a calendar step,
+// not `N × 86400000` — a fixed-millisecond step names the wrong weekday across a DST night.
+import { addLocalDays } from "./time";
 
 export interface DayForecast {
   daysFromNow: number;
@@ -30,7 +33,7 @@ export function intlTag(locale: Locale): string {
 
 /** Short weekday name for a day N days from `base`. */
 export function dayLabel(locale: Locale, base: Date, daysFromNow: number): string {
-  const d = new Date(base.getTime() + daysFromNow * 86400000);
+  const d = new Date(addLocalDays(base.getTime(), daysFromNow));
   return d.toLocaleDateString(intlTag(locale), { weekday: "short" });
 }
 

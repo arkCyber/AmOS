@@ -1,3 +1,6 @@
+// "yesterday" is a *calendar* day, not 24 hours: across a DST night a fixed 24h subtraction
+// lands two days back and the label lies. `addLocalDays` is the one DST-safe stepper.
+import { addLocalDays } from "./time";
 export interface Msg {
   from: "me" | "them";
   text: string;
@@ -92,7 +95,7 @@ export function dayStamp(ts: number): string {
 export function messageDayLabel(ts: number, now: number): string {
   const t = dayStamp(ts);
   if (t === dayStamp(now)) return "today";
-  if (t === dayStamp(now - 86400000)) return "yesterday";
+  if (t === dayStamp(addLocalDays(now, -1))) return "yesterday";
   return t;
 }
 

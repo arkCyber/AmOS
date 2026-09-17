@@ -603,18 +603,44 @@ export function dayAllowed(alarm: Pick<Alarm, "repeat">, d: Date): boolean {
 }
 
 /**
+ * Step **calendar days** in the local zone, keeping the wall-clock time of day.
+ *
+ * Why not `+ days * 86_400_000`: a day is not always 24 hours. Across a DST transition the offset
+ * changes, so adding a fixed 24 h to a wall-clock instant moves the *clock reading* by an hour —
+ * a 07:00 alarm becomes 08:00 (spring forward) or 06:00 (fall back). Using the local calendar
+ * (`setDate`) keeps the reading and lets the epoch follow, which is what a user means by "tomorrow
+ * at seven". The two boundary hours are platform behaviour, not ours: a skipped hour lands on the
+ * instant after the transition, a repeated hour takes the **first** occurrence — the same choice
+ * iOS/Android make.
+ *
+ * This is the one helper for that intent: `nextAlarmAtMs` (whose result the native
+ * `AlarmManager` bridge turns into a device wake-up), `messages` / `calllog` "yesterday" labels and
+ * `weather` day names all go through it. `reminders.ts::dayDiff` and the UTC day-number math above
+ * (`Date.UTC(...) / 86_400_000`) compare *day stamps*, which is a different question and stays
+ * as it is.
+ */
+export function addLocalDays(ms: number, days: number): number {
+  const d = new Date(ms);
+  d.setDate(d.getDate() + days);
+  return d.getTime();
+}
+
+/**
  * The next epoch-ms at which an alarm will ring: the first allowed day (repeat /
  * every-day) at its HH:MM strictly after `nowMs`. Returns null if none is found
  * (defensive upper bound of one year). Used to register the alarm with the native
  * exact-wake host (`amos-scheduler` / AlarmManager bridge).
+ *
+ * Each step is a **calendar** day (`addLocalDays`), not a fixed 24 h, so the alarm keeps its
+ * wall-clock HH:MM across DST — the value handed to the native scheduler is the hour the user set.
  */
 export function nextAlarmAtMs(alarm: Pick<Alarm, "hour" | "min" | "repeat">, nowMs: number): number | null {
   const base = new Date(nowMs);
   let cand = new Date(base.getFullYear(), base.getMonth(), base.getDate(), alarm.hour, alarm.min, 0, 0);
-  if (cand.getTime() <= nowMs) cand = new Date(cand.getTime() + 86_400_000);
+  if (cand.getTime() <= nowMs) cand = new Date(addLocalDays(cand.getTime(), 1));
   for (let i = 0; i < 367; i++) {
     if (dayAllowed(alarm, cand)) return cand.getTime();
-    cand = new Date(cand.getTime() + 86_400_000);
+    cand = new Date(addLocalDays(cand.getTime(), 1));
   }
   return null;
 }
