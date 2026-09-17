@@ -37,7 +37,7 @@ import {
   type ShellShortcut,
   type ShortcutEvent,
 } from "./shellModule";
-import { readKeyboardConfig } from "./keyboardConfig";
+import { mergeOverlayBindings, readKeyboardConfig } from "./keyboardConfig";
 
 /** A surface the touch shell can open by key. */
 export type TouchOverlay = "spot" | "recents" | "library";
@@ -91,26 +91,13 @@ const TOUCH_LABEL_KEYS: Record<TouchOverlay, string> = {
 
 /**
  * Get merged overlay bindings (user config + defaults).
- * Phase 3: 读取用户自定义配置，与注册表合并。
+ *
+ * The merge rules live in `mergeOverlayBindings` so this admission (touch
+ * shell) and the chrome keyboard shortcut panel (keyboardConfigHook) cannot
+ * drift — one rule book, two callers.
  */
 function getMergedOverlayBindings(modules: readonly ShellModule[]): Map<string, ShellShortcut[]> {
-  const config = readKeyboardConfig();
-  const bindings = new Map<string, ShellShortcut[]>();
-
-  for (const m of modulesFor("overlay", modules)) {
-    if (!m.shortcuts) continue;
-    const custom = config.overlays[m.id];
-    if (custom === undefined) {
-      // 使用默认值
-      bindings.set(m.id, m.shortcuts);
-    } else if (custom !== null) {
-      // 使用自定义
-      bindings.set(m.id, custom);
-    }
-    // null = 禁用，不添加到绑定
-  }
-
-  return bindings;
+  return mergeOverlayBindings(modules, readKeyboardConfig());
 }
 
 /**
@@ -214,7 +201,7 @@ const TOUCH_SYSTEM_SHORTCUTS: ReadonlyArray<{
  * Phase 3: 现在使用合并后的绑定（用户自定义 + 系统默认）。
  */
 export function shellKeyIntent(
-  e: ShellKeyEvent,
+  e: ShortcutEvent,
   modules: readonly ShellModule[],
 ): ShellKeyIntent {
   // 1. Stand-downs, in the order that keeps the rule honest: if the event was already

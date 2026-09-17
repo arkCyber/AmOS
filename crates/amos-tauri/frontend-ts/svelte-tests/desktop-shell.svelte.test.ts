@@ -1121,7 +1121,8 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     expect(wide.container.querySelector('[data-testid="dock-overflow"]')).toBeNull();
     wide.unmount();
 
-    // 400px: capacity 5 (2 user slots after the 3 system items) → 8 - 2 = 6 hidden.
+    // 400px: dockCapacity(400) = floor((400 − 2·24) / (48+8)) = 6. Minus the 3 dock
+    // modules (launchpad / finder / trash) leaves 3 user slots; 8 apps − 3 = 5 hidden.
     setWindowWidth(400);
     seedDock(MANY_APPS);
     const narrow = render(Dock);
@@ -1129,7 +1130,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     await settle();
     const chip = narrow.container.querySelector('[data-testid="dock-overflow"]');
     expect(chip).toBeTruthy();
-    expect(byAria(narrow.container, zh["desktop.dockOverflow"].replace("{n}", "6"))).toBeTruthy();
+    expect(byAria(narrow.container, zh["desktop.dockOverflow"].replace("{n}", "5"))).toBeTruthy();
     // …and the system items survive the squeeze (macOS never drops the trash).
     expect(byAria(narrow.container, zh["desktop.trashUnavailable"])).toBeTruthy();
     expect(byAria(narrow.container, zh["desktop.finder"])).toBeTruthy();
@@ -1256,4 +1257,6 @@ describe("Dock.svelte — names, grouping and capacity", () => {
       delete (window as { __amosDisabledFeatures?: string[] }).__amosDisabledFeatures;
     }
   });
+
+
 });

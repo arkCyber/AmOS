@@ -51,7 +51,13 @@ afterEach(() => {
 
 describe("dock widgets (mounted alone)", () => {
   test("the shared dock tile is the one implementation the tiles use", () => {
-    for (const cls of ["rounded-2xl", "shadow-xl", "active:scale-90", "flex"]) {
+    // Pinned against the **live** `DOCK_ITEM_TILE` constant — the test used to
+    // assert `rounded-2xl` + `active:scale-90`, but the token is now
+    // `rounded-[16px]` + `active:scale-85` (matches macOS measurements: 16px
+    // ≈ 1/3 of the icon, scale(0.85) is what UIKit uses). Both are kept here
+    // so a future rename does not silently desync the visible widget from
+    // the shared token.
+    for (const cls of ["rounded-[16px]", "shadow-xl", "active:scale-85", "flex"]) {
       expect(DOCK_ITEM_TILE, `the token must carry ${cls}`).toContain(cls);
     }
   });
@@ -62,7 +68,7 @@ describe("dock widgets (mounted alone)", () => {
     const tile = container.querySelector<HTMLButtonElement>('[data-testid="dock-launchpad"]')!;
     expect(tile.getAttribute("aria-label")).toBe(zh["desktop.launchpad"]);
     expect(tile.textContent).toBe("🚀");
-    expect(tile.className).toContain("rounded-2xl");
+    expect(tile.className).toContain("rounded-[16px]");
     // Mounted outside a shell there is no handle: the tile must do nothing, not throw.
     await fireEvent.click(tile);
     expect(tile.disabled).toBe(false);
