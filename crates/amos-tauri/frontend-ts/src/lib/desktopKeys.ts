@@ -26,7 +26,7 @@
  * close the focused window (the old `switch` ignored Shift); now it matches nothing, like every
  * other binding in this shell.
  */
-import { shortcutMatches, formatShortcut, type ShellShortcut, type ShortcutEvent } from "./shellModule";
+import { formatShortcut, type ShellShortcut } from "./shellModule";
 
 /** What a desktop system key asks the focused window to do. */
 export type DesktopKeyIntent =
@@ -49,32 +49,23 @@ export const DESKTOP_SYSTEM_KEYS: ReadonlyArray<{
 /**
  * The keycap to show for an intent.
  *
- * This is the **display** half of the table (REQ-A342): the menu bar renders `⌘W` next to "关闭窗口"
- * by asking this function, so the hint cannot drift from the key the shell actually matches. Before
- * it existed, the menu read an i18n key that no locale defined and printed the key name on screen.
+ * This is the **display** half of the table, and the only production consumer of
+ * `DESKTOP_SYSTEM_KEYS`: the menu bar renders `⌘W` next to "关闭窗口" by asking this function, so the
+ * hint cannot drift from the key the shell matches. Before it existed, the menu read an i18n key that
+ * no locale defined and printed the key *name* on screen.
+ *
+ * The **dispatch** half is deliberately not here (REQ-A348): binding a key to a command is now the
+ * user-configurable layer's job (`lib/keyboardConfig` → `DesktopShell.customSystemBindings`, matched
+ * with the shared `shortcutMatches`), and a second dispatch table would be exactly the "two places
+ * that know the keys" defect this audit keeps removing. This module owns what the *table says*, not
+ * who acts on it.
  */
 export function desktopShortcutLabel(kind: DesktopKeyIntent["kind"]): string {
   const row = DESKTOP_SYSTEM_KEYS.find((r) => r.intent.kind === kind);
   if (!row) return "";
-  // Case, on purpose (REQ-A342): the table stores letter keys lower-case because `shortcutMatches`
-  // compares against `e.key.toLowerCase()`, while macOS *writes* them upper-case (`⌘W`). The two
-  // concerns are separated here rather than in the table, so matching stays case-insensitive and
-  // the menu stays Apple-correct.
+  // Case, on purpose: the table stores letter keys lower-case because matching folds case, while
+  // macOS *writes* them upper-case (`⌘W`).
   const shown = /^[a-z]$/.test(row.shortcut.key) ? row.shortcut.key.toUpperCase() : row.shortcut.key;
   return formatShortcut({ ...row.shortcut, key: shown });
 }
 
-/**
- * The intent of a keystroke, or `null` when the desktop shell has no opinion about it.
- *
- * `KeyboardEvent.key` is lower-cased before matching because a macOS WebView reports `"W"` when
- * Shift is down (and this table's Shift-less rows must not silently accept it) — the same
- * normalisation the pre-table `switch` did by hand.
- */
-export function desktopKeyIntent(e: ShortcutEvent): DesktopKeyIntent | null {
-  const normalised: ShortcutEvent = { ...e, key: e.key.toLowerCase() };
-  for (const { intent, shortcut } of DESKTOP_SYSTEM_KEYS) {
-    if (shortcutMatches(normalised, shortcut)) return intent;
-  }
-  return null;
-}
