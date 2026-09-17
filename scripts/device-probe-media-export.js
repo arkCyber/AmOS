@@ -23,9 +23,23 @@
  *      appeared, the export lied — that is exactly the failure this checks.
  *
  * Errors are reported verbatim, never swallowed: a collection that throws says so.
+ *
+ * **Settling (REQ-A361).** Two device rounds were spent concluding "the export wrote nothing"
+ * because `media_list` was read immediately after the write: Android's MediaStore inserts with
+ * `IS_PENDING=1` and only publishes afterwards, and the shell's `/sdcard` (FUSE) view lags as
+ * well. Both readings were wrong, and the file was there. So the probe can now **wait for its
+ * expectation** instead of sampling once: set `window.__probeExpect = { collection, name }`
+ * (or `{ collection, prefix }`) before running it and it polls until the item appears,
+ * reporting `found` and `settledMs` — or `timedOut` after `window.__probeTimeoutMs`
+ * (default 8000). For filesystem questions always prefer `content query
+ * content://media/...` + the canonical `/storage/emulated/0/...` path over `ls /sdcard/...`.
  */
 (async () => {
   const report = { bridge: "unknown", camera: null, recordings: null, notes: [] };
+  const wait = window.__probeExpect;
+  const timeoutMs = Number(window.__probeTimeoutMs) || 8000;
+  const startedAt = Date.now();
+
   const internals = window.__TAURI_INTERNALS__;
   if (!internals || typeof internals.invoke !== "function") {
     report.bridge = "MISSING";
@@ -48,13 +62,34 @@
     }
   };
 
+  const matches = (listing) =>
+    !!listing &&
+    Array.isArray(listing.names) &&
+    listing.names.some((n) => (wait && wait.name ? n === wait.name : wait && wait.prefix ? n.startsWith(wait.prefix) : false));
+
   report.camera = await list("camera");
   report.recordings = await list("recordings");
   if (report.recordings && Array.isArray(report.recordings.names)) {
-    report.recordings.matches = report.recordings.names.filter((n) => /^Amos-\d{8}-\d{6}\.wav$/.test(n));
+    report.recordings.matches = report.recordings.names.filter((n) => /^Amos-\d{8}-\d{6}\.\w+$/.test(n));
   }
   if (report.camera && report.camera.count === 0) {
     report.notes.push("camera collection is empty — either the device really has no photos, or the DCIM read is not wired");
+  }
+
+  // Bounded settle loop: re-ask the *expected* collection until it shows what we are waiting
+  // for. This is the fix for the two false "nothing was written" readings above.
+  if (wait && wait.collection) {
+    report.expect = { collection: wait.collection, name: wait.name ?? null, prefix: wait.prefix ?? null };
+    let listing = wait.collection === "camera" ? report.camera : wait.collection === "recordings" ? report.recordings : null;
+    while (Date.now() - startedAt < timeoutMs && !matches(listing)) {
+      await new Promise((r) => setTimeout(r, 150));
+      listing = await list(wait.collection);
+      if (wait.collection === "camera") report.camera = listing;
+      if (wait.collection === "recordings") report.recordings = listing;
+    }
+    report.found = matches(listing);
+    report.settledMs = Date.now() - startedAt;
+    if (!report.found) report.timedOut = true;
   }
   return report;
 })()
