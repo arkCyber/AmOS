@@ -103,23 +103,37 @@ if (mode === "test") {
   //
   // Isolation is preserved: every DOM/zoned file still runs in its own process, it just
   // leaves its lcov behind as a part file for the gate to merge (max hit per line).
+  //
+  // REQ-A396 (2026-09-18): the pure **batch** lost per-file attribution at scale. Evidence
+  // (bun 1.2.1, this repo): `enterprise-mdm-policy.test.ts` run **alone** records
+  // `enterprise/mdm.ts` LH=630 with 5 missed lines, but the same file inside the 84-file
+  // pure batch records almost nothing for `mdm.ts` — and the DOM parts' full-set listings
+  // then mark those executed-but-unrecorded lines as **missed** in the union. Same shape
+  // for `settings.ts` (alone: 0 missed / batch: 90 "missed"), `crypto/mdmCrypto.ts`
+  // (alone: 3 / batch: 115), `enterprise/templates.ts` (alone: 0 / batch: 128). The union
+  // was therefore *pessimistic*: tests really executed lines no part recorded. Fix: in
+  // coverage mode **every** file runs in its own process (the DOM files' existing
+  // treatment), so each leaves a full-attribution part; the gate merges as before.
+  // Cost: ~1 process per test file (~180) instead of 1 batch — measured at roughly
+  // +2 min on `make cov`. Correctness still comes from `test` mode's shared batch; only
+  // the *attribution* needed isolation.
   if (existsSync(join(root, "coverage"))) spawnSync("rm", ["-rf", join(root, "coverage")]);
-  ok = run(["test", "--coverage", "--coverage-reporter=lcov", ...pure.map(rel)]) && ok;
-  // Bun always writes `coverage/lcov.info`, so the pure batch has to be moved aside before
-  // the first isolated run overwrites it (measured: forgetting this made the gate read the
-  // *last* DOM file's report instead of everything).
-  {
-    const lcov = join(root, "coverage", "lcov.info");
-    if (existsSync(lcov)) renameSync(lcov, join(root, "coverage", "lcov.part-000.info"));
-  }
-  [...dom, ...zoned].forEach((f, i) => {
+  // Bun always writes `coverage/lcov.info`, so each isolated run's report has to be moved
+  // aside before the next run overwrites it (measured: forgetting this made the gate read
+  // the *last* file's report instead of everything).
+  let part = 0;
+  const all = [...pure, ...dom, ...zoned];
+  for (const f of all) {
     const tz = tzOf(f);
-    ok = run(["test", "--coverage", "--coverage-reporter=lcov", rel(f)], tz ? { env: { ...process.env, TZ: tz } } : {}) && ok;
+    ok =
+      run(["test", "--coverage", "--coverage-reporter=lcov", rel(f)], tz ? { env: { ...process.env, TZ: tz } } : {}) &&
+      ok;
     const lcov = join(root, "coverage", "lcov.info");
     if (existsSync(lcov)) {
-      renameSync(lcov, join(root, "coverage", `lcov.part-${String(i + 1).padStart(3, "0")}.info`));
+      renameSync(lcov, join(root, "coverage", `lcov.part-${String(part).padStart(3, "0")}.info`));
     }
-  });
+    part++;
+  }
   ok = run(["scripts/lib-coverage-gate.mjs"]) && ok;
 } else {
   console.error(`unknown mode: ${mode}`);
