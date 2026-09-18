@@ -30,5 +30,37 @@
   {
     "literal": "北京",
     "reason": "The map's default place label (`let label = $state(\"北京\")` in `MapsApp.svelte`) is **data** — a place name, exactly like the city table in `lib/cityIndex.ts` — not UI copy: the label names a location, and translating it would name a different place. Found by the new <script>-block check (REQ-A357), which is why it is the only entry here that is CJK."
+  },
+  {
+    "literal": "Bearer Token",
+    "reason": "An **authentication scheme name** (RFC 6750) shown as the fixed choice in the API settings' 认证方式 row — the wire protocol's identifier, not copy: translating it would name a scheme that does not exist. Same class as the log levels already excused below (REQ-A384)."
+  },
+  {
+    "literal": "API Key",
+    "reason": "The other authentication scheme's **technical name** (`X-API-Key` family) in the same row — a protocol identifier, not copy (REQ-A384)."
+  },
+  {
+    "literal": "POST",
+    "reason": "An **HTTP method** rendered as the value the webhook will actually send — data, not copy (REQ-A384)."
+  },
+  {
+    "literal": "PUT",
+    "reason": "An **HTTP method** rendered as a selectable value the webhook will actually send — data, not copy (REQ-A384)."
+  },
+  {
+    "literal": "DEBUG",
+    "reason": "An **audit log level** rendered as diagnostic data in the enterprise audit viewer (the level names are part of the log format, also emitted by the daemon) — the uppercase sibling of the `debug` entry above, same reasoning (REQ-A384)."
+  },
+  {
+    "literal": "INFO",
+    "reason": "An **audit log level** rendered as diagnostic data in the enterprise audit viewer — the uppercase sibling of the `info` entry above (REQ-A384)."
+  },
+  {
+    "literal": "WARNING",
+    "reason": "An **audit log level** rendered as diagnostic data in the enterprise audit viewer; the daemon emits this exact token (its `AuditLogLevel` is `warning`, not `warn`) so the UI must show the same string it will be filtering on (REQ-A384)."
+  },
+  {
+    "literal": "ERROR",
+    "reason": "An **audit log level** rendered as diagnostic data in the enterprise audit viewer — the uppercase sibling of the `error` entry above (REQ-A384)."
   }
 ]

@@ -292,35 +292,15 @@ export function modulesFor<T extends ShellModule>(slot: ShellSlot, modules: read
 }
 
 /**
- * The module in `slot` whose binding this event triggers, or `undefined`.
+ * The hint for the **first** binding of an already-merged row.
  *
- * This is the whole shortcut layer: the shell's key handler calls it and does whatever
- * the returned module says (`toggle` its overlay), so **adding a binding is a row in
- * the registry** and cannot disagree with the list the UI shows. It searches in render
- * order, so the first match wins deterministically when two modules claim one key.
+ * 为什么是"一行绑定 → label/aria"而不是"注册表 + overlay id"：桌面壳**接受**的那些键
+ * 是注册表默认 **+** 用户在键盘设置里的覆盖 **+** `null` 禁用合并后的结果
+ * （`mergeOverlayBindings`，触摸壳的准入与 ⌘-hold 面板读的也是它）。提示如果只看得见
+ * 注册表，就会出现"按钮说 ⌘Space、按下去什么都不开"（或反过来）—— 两者必须同源。
+ * 这里只负责把一行绑定折成显示用的形状，行从哪里来由调用方决定。
  */
-export function moduleForShortcut<T extends ShellModule>(
-  slot: ShellSlot,
-  modules: readonly T[],
-  e: ShortcutEvent,
-): T | undefined {
-  return modulesFor(slot, modules).find((m) => m.shortcuts?.some((s) => shortcutMatches(e, s)));
-}
-
-/**
- * The shortcut hint for an overlay id (`"spotlight"` → `{ label: "⌘Space", aria:
- * "Meta+Space" }`), or `null` when that overlay exists with no binding **or** does not
- * exist at all.
- *
- * One implementation for every trigger that shows a hint (the top bar's Launchpad /
- * Spotlight widgets and the Dock's Launchpad item), because "which key opens what" is
- * exactly the fact that used to live in a comment.
- */
-export function overlayShortcutHint<T extends ShellModule>(
-  modules: readonly T[],
-  overlayId: string,
-): ShortcutHint | null {
-  const overlay = modulesFor("overlay", modules).find((m) => m.id === overlayId);
-  const first = overlay?.shortcuts?.[0];
+export function bindingHint(shortcuts: readonly ShellShortcut[] | undefined): ShortcutHint | null {
+  const first = shortcuts?.[0];
   return first ? { label: formatShortcut(first), aria: shortcutAria(first) } : null;
 }

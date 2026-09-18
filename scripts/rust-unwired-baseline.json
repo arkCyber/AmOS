@@ -17,6 +17,9 @@
     "crates/amos-tauri/src/android_glue.rs::is_armed",
     "crates/amos-tauri/src/appstore.rs::installed_name",
     "crates/amos-tauri/src/incall.rs::is_default_dialer_bound",
+    "crates/amos-tauri/src/spaces.rs::active_space_windows",
+    "crates/amos-tauri/src/spaces.rs::is_window_in_active_space",
+    "crates/amos-tauri/src/spaces.rs::space_for_window",
     "crates/amos-timesync/src/timekeeper.rs::with_name",
     "crates/amos-web3/src/secp.rs::to_uncompressed_bytes"
   ]

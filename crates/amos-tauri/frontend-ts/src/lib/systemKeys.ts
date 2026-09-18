@@ -8,10 +8,12 @@
  * overlay rows carry `shortcuts: [{ key: "F4" }]`, `[{ key: "Space", meta: true }]`,
  * `[{ key: "F3" }, { key: "Tab", meta: true }]`, and Control Center deliberately has none at
  * all ("macOS has no default key for Control Center, and inventing one would be a binding
- * nobody asked for"). `DesktopShell.svelte` consumed that table through
- * `moduleForShortcut("overlay", …)`; the **touch** shell consumed nothing — its only key
- * handler hard-coded Escape. So the same iPad that shows Spotlight / Recents / App Library to
- * a finger could not open a single one of them from an attached keyboard, and Escape did
+ * nobody asked for"). `DesktopShell.svelte` and the **touch** shell now both match the
+ * event against the **merged** bindings (`mergeOverlayBindings`: this table's defaults plus
+ * the user's keyboard settings); before REQ-A394 the desktop side read the registry defaults
+ * only, and the touch shell hard-coded Escape — so the same iPad that shows Spotlight /
+ * Recents / App Library to a finger could not open a single one of them from an attached
+ * keyboard, and Escape did
  * *less* than the platform back gesture (it closed overlays only, never left an app or edit
  * mode). Two paths for one intent, one of them silently empty — the same defect class as
  * REQ-A318's missing tablet DOM assertion and REQ-A319's unreachable `wm_open`.

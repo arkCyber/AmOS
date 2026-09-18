@@ -1,6 +1,31 @@
 //! `amos-link-cc` — the C ABI surface of the AmOS-Link robot middleware.
+//!
+//! # The pointer contract this file documents
+//!
+//! Every `pub unsafe extern "C" fn` below says, in its `# Safety` section, what the **C
+//! caller** owes it. The rules repeat because the ABI does:
+//!
+//! * **C strings** (`*const c_char`) are NUL-terminated UTF-8. A null pointer is answered
+//!   with an error code (`amos_link_last_error` explains it) — never undefined behaviour.
+//! * **Handles** come from the matching `amos_link_*_new` / `_clone` / `_spawn_*` and stay
+//!   valid until their `_drop` / `_stop`. A handle used afterwards, or dropped twice, is
+//!   undefined behaviour. They are `Box`es leaked into the ABI, holding `Arc`s where the
+//!   upstream type is shared (`LinkNode` is returned as `Arc<LinkNode>` upstream).
+//! * **Out-buffers** (`*mut c_char` + `cap`, or an out-struct) must be writable for the size
+//!   the note names; the functions truncate (`copy_str`) or refuse (`*_decode_payload`)
+//!   rather than write past it.
+//! * **Input bytes** (`*const u8` + `len`) must point to `len` readable bytes — the caller's
+//!   promise, which this crate cannot check.
+//! * **Error text** from `amos_link_last_error` is thread-local and valid until the next
+//!   `amos-link-cc` call **on the same thread** (`strerror`'s contract).
+//!
+//! Nothing here may panic: an unwinding panic would cross the C ABI boundary, so the P0-1
+//! gate below turns `unwrap`/`expect`/`panic!` into compile errors in production code.
 #![allow(non_camel_case_types)]
-#![allow(clippy::missing_safety_doc)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
 // =============================================================================
 // FFI-safe types (mirrors of amos-link types with explicit #[repr(C)]).
@@ -44,13 +69,21 @@ pub struct Qos {
 
 impl From<amos_link::codec::Timestamp> for Timestamp {
     fn from(t: amos_link::codec::Timestamp) -> Self {
-        Self { secs: t.secs, nanos: t.nanos }
+        Self {
+            secs: t.secs,
+            nanos: t.nanos,
+        }
     }
 }
 impl From<Timestamp> for amos_link::codec::Timestamp {
     fn from(t: Timestamp) -> Self {
-        amos_link::codec::Timestamp::new(t.secs, t.nanos)
-            .expect("FFI Timestamp was validated before crossing the boundary")
+        // A `From` impl can neither report an error nor panic (P0-1). An out-of-range
+        // `nanos` from C is clamped exactly the way `amos_link_timestamp_new` clamps it,
+        // so both entry paths agree on the value instead of one of them aborting.
+        amos_link::codec::Timestamp::new(t.secs, t.nanos).unwrap_or(amos_link::codec::Timestamp {
+            secs: t.secs,
+            nanos: 999_999_999,
+        })
     }
 }
 impl From<amos_link::qos::Reliability> for amos_link_reliability {
@@ -96,31 +129,47 @@ impl From<amos_link::qos::Qos> for Qos {
 }
 impl From<Qos> for amos_link::qos::Qos {
     fn from(q: Qos) -> Self {
-        amos_link::qos::Qos::new(
-            q.reliability.into(),
-            q.depth as usize,
-            q.drop_policy.into(),
-        )
+        amos_link::qos::Qos::new(q.reliability.into(), q.depth as usize, q.drop_policy.into())
     }
 }
 
 impl Qos {
     pub const MAX_DEPTH: usize = 4096;
 
-    pub const fn new(reliability: amos_link_reliability, depth: u32, drop_policy: amos_link_drop_policy) -> Self {
-        Self { reliability, depth, drop_policy }
+    pub const fn new(
+        reliability: amos_link_reliability,
+        depth: u32,
+        drop_policy: amos_link_drop_policy,
+    ) -> Self {
+        Self {
+            reliability,
+            depth,
+            drop_policy,
+        }
     }
 
     pub const fn sensor() -> Self {
-        Self::new(amos_link_reliability::ReliabilityBestEffort, 1, amos_link_drop_policy::DropPolicyDropOldest)
+        Self::new(
+            amos_link_reliability::ReliabilityBestEffort,
+            1,
+            amos_link_drop_policy::DropPolicyDropOldest,
+        )
     }
 
     pub const fn state() -> Self {
-        Self::new(amos_link_reliability::ReliabilityBestEffort, 8, amos_link_drop_policy::DropPolicyDropNewest)
+        Self::new(
+            amos_link_reliability::ReliabilityBestEffort,
+            8,
+            amos_link_drop_policy::DropPolicyDropNewest,
+        )
     }
 
     pub const fn control() -> Self {
-        Self::new(amos_link_reliability::ReliabilityReliable, 64, amos_link_drop_policy::DropPolicyDropNewest)
+        Self::new(
+            amos_link_reliability::ReliabilityReliable,
+            64,
+            amos_link_drop_policy::DropPolicyDropNewest,
+        )
     }
 
     pub const fn default_qos() -> Self {
@@ -158,7 +207,10 @@ use amos_link::keyexpr::Topic as InnerTopic;
 impl Timestamp {
     pub fn now() -> Self {
         let inner = amos_link::codec::Timestamp::now();
-        Self { secs: inner.secs, nanos: inner.nanos }
+        Self {
+            secs: inner.secs,
+            nanos: inner.nanos,
+        }
     }
 
     pub fn new(secs: u64, nanos: u32) -> Result<Self, LinkError> {
@@ -204,22 +256,34 @@ pub struct Topic {
 impl Topic {
     pub fn new(expr: &str) -> Result<Self, LinkError> {
         let inner = InnerTopic::new(expr)?;
-        Ok(Self { _inner: Arc::new(inner) })
+        Ok(Self {
+            _inner: Arc::new(inner),
+        })
     }
 
     pub fn pattern(expr: &str) -> Result<Self, LinkError> {
         let inner = InnerTopic::pattern(expr)?;
-        Ok(Self { _inner: Arc::new(inner) })
+        Ok(Self {
+            _inner: Arc::new(inner),
+        })
     }
 
-    pub fn channel_topic(peer: &str, channel: amos_link::keyexpr::Channel, name: &str) -> Result<Self, LinkError> {
+    pub fn channel_topic(
+        peer: &str,
+        channel: amos_link::keyexpr::Channel,
+        name: &str,
+    ) -> Result<Self, LinkError> {
         let inner = InnerTopic::channel_topic(peer, channel, name)?;
-        Ok(Self { _inner: Arc::new(inner) })
+        Ok(Self {
+            _inner: Arc::new(inner),
+        })
     }
 
     pub fn peer_pattern(peer: &str) -> Result<Self, LinkError> {
         let inner = InnerTopic::peer_pattern(peer)?;
-        Ok(Self { _inner: Arc::new(inner) })
+        Ok(Self {
+            _inner: Arc::new(inner),
+        })
     }
 
     pub fn matches(&self, pattern: &Topic) -> bool {
@@ -253,20 +317,28 @@ use amos_link::VERSION as AMLINK_VERSION;
 // ---------------------------------------------------------------------------
 
 // Lazy static runtime for federation tasks that need tokio::spawn
-fn global_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+fn global_runtime() -> Result<&'static tokio::runtime::Runtime, LinkError> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
             .thread_name("amos-link-cc-runtime")
             .build()
-            .expect("failed to create tokio runtime")
+            .map_err(|e| format!("tokio runtime: {e}"))
     })
+    .as_ref()
+    .map_err(|e| LinkError::Transport(e.clone()))
 }
 
 thread_local! {
     static LAST_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The NUL-terminated copy handed out by [`amos_link_last_error`]. Refreshed on every
+    /// call, so the pointer stays valid until the next `amos-link-cc` call **on the same
+    /// thread** — the ordinary `strerror` contract. Before REQ-A388 this function
+    /// `Box::leak`ed a fresh string per call: a C error loop leaked every byte it read.
+    static LAST_ERROR_C: std::cell::RefCell<Option<std::ffi::CString>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn set_error(err: &LinkError) -> i32 {
@@ -291,26 +363,29 @@ fn set_error(err: &LinkError) -> i32 {
 pub struct BincodePayload(pub Vec<u8>);
 
 /// Run an async block synchronously.
-fn block_on_sync<F: std::future::Future>(f: F) -> F::Output {
+fn block_on_sync<F: std::future::Future>(f: F) -> Result<F::Output, LinkError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("tokio runtime");
-    rt.block_on(f)
+        .map_err(|e| LinkError::Transport(format!("tokio runtime: {e}")))?;
+    Ok(rt.block_on(f))
 }
 
 fn cstr_to_str<'a>(ptr: *const c_char) -> Result<&'a str, LinkError> {
     if ptr.is_null() {
         return Err(LinkError::Codec("null C string".into()));
     }
+    // SAFETY: `ptr` was checked non-null above and the C ABI requires a NUL-terminated string; the loop stops at the first NUL, so it only reads bytes the caller promised.
     let len = unsafe {
         let mut n = 0;
-        while *ptr.add(n) != 0 { n += 1; }
+        while *ptr.add(n) != 0 {
+            n += 1;
+        }
         n
     };
+    // SAFETY: `len` was measured by scanning this very pointer for its NUL just above, so `ptr` holds `len` readable bytes.
     let bytes = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
-    std::str::from_utf8(bytes)
-        .map_err(|e| LinkError::Codec(format!("invalid UTF-8: {e}")))
+    std::str::from_utf8(bytes).map_err(|e| LinkError::Codec(format!("invalid UTF-8: {e}")))
 }
 
 /// Copy a Rust string into a caller-provided buffer, NUL-terminated.
@@ -322,6 +397,7 @@ fn copy_str(s: &str, dst: *mut c_char, cap: usize) -> i32 {
     let bytes = s.as_bytes();
     // Copy at most cap-1 bytes so we can always NUL-terminate.
     let n = bytes.len().min(cap - 1);
+    // SAFETY: `dst` is the caller's out-buffer with `cap > 0` (checked above) and `n <= cap - 1`; `src` is our own Rust string, so the two ranges cannot overlap.
     unsafe {
         ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, dst, n);
         *dst.add(n) = 0;
@@ -330,6 +406,11 @@ fn copy_str(s: &str, dst: *mut c_char, cap: usize) -> i32 {
 }
 
 /// Write a NUL at offset `off` in a C array stored in a raw pointer.
+/// # Safety
+///
+/// `arr` must be writable at `off` bytes past its base: callers pass either an out-struct's
+/// fixed-size array (see `amos_link_received` / `amos_link_frame_header` in the C header) or
+/// a buffer whose capacity they documented in the same call.
 unsafe fn write_nul(arr: *mut c_char, off: usize) {
     *arr.add(off) = 0;
 }
@@ -512,6 +593,10 @@ pub struct amos_link_heartbeat_fields {
 // PeerId
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `id` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+/// never undefined behaviour).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_peer_id_validate(id: *const c_char) -> i32 {
     match cstr_to_str(id) {
@@ -523,6 +608,10 @@ pub unsafe extern "C" fn amos_link_peer_id_validate(id: *const c_char) -> i32 {
     }
 }
 
+/// # Safety
+///
+/// `id` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+/// never undefined behaviour); `out` must be writable for `AMLK_MAX_PEER_ID_LEN + 1` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_peer_id_new(id: *const c_char, out: *mut c_char) -> i32 {
     match cstr_to_str(id) {
@@ -538,6 +627,10 @@ pub unsafe extern "C" fn amos_link_peer_id_new(id: *const c_char, out: *mut c_ch
 // Topic / keyexpr
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `expr` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+/// never undefined behaviour).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_topic_validate(expr: *const c_char) -> i32 {
     match cstr_to_str(expr) {
@@ -549,6 +642,10 @@ pub unsafe extern "C" fn amos_link_topic_validate(expr: *const c_char) -> i32 {
     }
 }
 
+/// # Safety
+///
+/// `expr` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+/// never undefined behaviour).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_topic_validate_pattern(expr: *const c_char) -> i32 {
     match cstr_to_str(expr) {
@@ -570,6 +667,11 @@ fn ch_to_channel(ch: amos_link_channel) -> amos_link::keyexpr::Channel {
     }
 }
 
+/// # Safety
+///
+/// `peer` and `name` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an
+/// error code, never undefined behaviour); `out` must be writable for `AMLK_MAX_TOPIC_LEN + 1`
+/// bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_topic_channel(
     peer: *const c_char,
@@ -591,8 +693,15 @@ pub unsafe extern "C" fn amos_link_topic_channel(
     }
 }
 
+/// # Safety
+///
+/// `peer` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+/// never undefined behaviour); `out` must be writable for `AMLK_MAX_TOPIC_LEN + 1` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_topic_peer_pattern(peer: *const c_char, out: *mut c_char) -> i32 {
+pub unsafe extern "C" fn amos_link_topic_peer_pattern(
+    peer: *const c_char,
+    out: *mut c_char,
+) -> i32 {
     match cstr_to_str(peer) {
         Ok(s) => match InnerTopic::peer_pattern(s) {
             Ok(t) => copy_str(t.as_str(), out, AMLK_MAX_TOPIC_LEN + 1),
@@ -602,6 +711,12 @@ pub unsafe extern "C" fn amos_link_topic_peer_pattern(peer: *const c_char, out: 
     }
 }
 
+/// # Safety
+///
+/// `topic` and `pattern` must be live pointers to this crate's `#[repr(C)]` mirror of `Topic` (null
+/// answers `false`). NOTE: no entry point hands a `Topic` out yet, so a C caller cannot obtain a
+/// valid argument — this function is unreachable until a constructor exists (recorded in
+/// `CHANGELOG.md`, REQ-A388).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_topic_matches(
     topic: *const Topic,
@@ -610,7 +725,9 @@ pub unsafe extern "C" fn amos_link_topic_matches(
     if topic.is_null() || pattern.is_null() {
         return false;
     }
+    // SAFETY: `topic` was checked non-null above; per the C ABI it is a live pointer to this crate's `#[repr(C)]` mirror of `Topic`, and only a shared reference is taken.
     let t = unsafe { &*topic };
+    // SAFETY: `pattern` was checked non-null above; same contract as `topic` above.
     let p = unsafe { &*pattern };
     // Use the upstream matches method.
     amos_link::keyexpr::Topic::matches(&t._inner, &p._inner)
@@ -621,7 +738,7 @@ pub unsafe extern "C" fn amos_link_topic_matches(
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_qos_new(
+pub extern "C" fn amos_link_qos_new(
     reliability: amos_link_reliability,
     depth: u32,
     drop_policy: amos_link_drop_policy,
@@ -630,24 +747,32 @@ pub unsafe extern "C" fn amos_link_qos_new(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_qos_sensor() -> Qos { Qos::sensor() }
+pub extern "C" fn amos_link_qos_sensor() -> Qos {
+    Qos::sensor()
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_qos_state() -> Qos { Qos::state() }
+pub extern "C" fn amos_link_qos_state() -> Qos {
+    Qos::state()
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_qos_control() -> Qos { Qos::control() }
+pub extern "C" fn amos_link_qos_control() -> Qos {
+    Qos::control()
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_qos_default() -> Qos { Qos::default() }
+pub extern "C" fn amos_link_qos_default() -> Qos {
+    Qos::default()
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_qos_for_channel(channel: amos_link_channel) -> Qos {
+pub extern "C" fn amos_link_qos_for_channel(channel: amos_link_channel) -> Qos {
     Qos::for_channel(ch_to_channel(channel))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_qos_validate(qos: Qos) -> i32 {
+pub extern "C" fn amos_link_qos_validate(qos: Qos) -> i32 {
     match qos.validate() {
         Ok(()) => 0,
         Err(e) => set_error(&e),
@@ -659,33 +784,35 @@ pub unsafe extern "C" fn amos_link_qos_validate(qos: Qos) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_timestamp_now() -> Timestamp {
+pub extern "C" fn amos_link_timestamp_now() -> Timestamp {
     Timestamp::now()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_timestamp_new(secs: u64, nanos: u32) -> Timestamp {
-    Timestamp::new(secs, nanos)
-        .unwrap_or(Timestamp { secs, nanos: 999_999_999 })
+pub extern "C" fn amos_link_timestamp_new(secs: u64, nanos: u32) -> Timestamp {
+    Timestamp::new(secs, nanos).unwrap_or(Timestamp {
+        secs,
+        nanos: 999_999_999,
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_timestamp_as_nanos(stamp: Timestamp) -> u64 {
+pub extern "C" fn amos_link_timestamp_as_nanos(stamp: Timestamp) -> u64 {
     stamp.as_nanos()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_timestamp_unix_ms(stamp: Timestamp) -> u64 {
+pub extern "C" fn amos_link_timestamp_unix_ms(stamp: Timestamp) -> u64 {
     stamp.unix_ms()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_timestamp_since_secs(earlier: Timestamp, later: Timestamp) -> f64 {
+pub extern "C" fn amos_link_timestamp_since_secs(earlier: Timestamp, later: Timestamp) -> f64 {
     Timestamp::since_secs(earlier, later)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_timestamp_is_valid(stamp: Timestamp) -> bool {
+pub extern "C" fn amos_link_timestamp_is_valid(stamp: Timestamp) -> bool {
     stamp.is_valid()
 }
 
@@ -694,6 +821,12 @@ pub unsafe extern "C" fn amos_link_timestamp_is_valid(stamp: Timestamp) -> bool 
 // ---------------------------------------------------------------------------
 
 /// Encode a bincode payload into a full wire frame synchronously.
+/// # Safety
+///
+/// `topic_str` and `peer_id_str` must be a NUL-terminated UTF-8 C string (a null pointer is
+/// answered with an error code, never undefined behaviour); `payload` must point to `payload_len`
+/// readable bytes (`NULL, 0` is the empty payload, `NULL, n>0` is refused); `frame_out` must be
+/// writable for `frame_out_cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_frame_encode(
     topic_str: *const c_char,
@@ -711,14 +844,22 @@ pub unsafe extern "C" fn amos_link_frame_encode(
     }
     let topic_s = match cstr_to_str(topic_str) {
         Ok(s) => s,
-        Err(e) => { set_error(&e); return 0; }
+        Err(e) => {
+            set_error(&e);
+            return 0;
+        }
     };
     let peer_s = match cstr_to_str(peer_id_str) {
         Ok(s) => s,
-        Err(e) => { set_error(&e); return 0; }
+        Err(e) => {
+            set_error(&e);
+            return 0;
+        }
     };
     if payload.is_null() && payload_len > 0 {
-        set_error(&LinkError::Codec("null payload with non-zero length".into()));
+        set_error(&LinkError::Codec(
+            "null payload with non-zero length".into(),
+        ));
         return 0;
     }
     let payload_slice = if payload.is_null() || payload_len == 0 {
@@ -729,11 +870,17 @@ pub unsafe extern "C" fn amos_link_frame_encode(
 
     let topic = match Topic::new(topic_s) {
         Ok(t) => t,
-        Err(e) => { set_error(&e); return 0; }
+        Err(e) => {
+            set_error(&e);
+            return 0;
+        }
     };
     let peer = match PeerId::new(peer_s) {
         Ok(p) => p,
-        Err(e) => { set_error(&e); return 0; }
+        Err(e) => {
+            set_error(&e);
+            return 0;
+        }
     };
 
     // The payload bytes are already encoded by the caller (e.g., C code did the serialization),
@@ -743,7 +890,10 @@ pub unsafe extern "C" fn amos_link_frame_encode(
     let envelope = Envelope::new(&topic._inner, &peer, seq, stamp.into(), payload_vec);
     let wire = match envelope.encode() {
         Ok(w) => w,
-        Err(e) => { set_error(&e); return 0; }
+        Err(e) => {
+            set_error(&e);
+            return 0;
+        }
     };
     let n = wire.len().min(frame_out_cap);
     if n > 0 {
@@ -753,13 +903,20 @@ pub unsafe extern "C" fn amos_link_frame_encode(
 }
 
 /// Decode only the frame header (payload slice is borrowed, not copied).
+/// # Safety
+///
+/// `frame` must point to `frame_len` readable bytes — this function does **not** check for null or
+/// zero, it decodes immediately; `h` must be a caller-owned `amos_link_frame_header` whose
+/// `topic`/`peer_id` arrays use the header's sizes (`AMLK_MAX_TOPIC_LEN` / `AMLK_MAX_PEER_ID_LEN`).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_frame_decode_header(
     frame: *const u8,
     frame_len: usize,
     h: *mut amos_link_frame_header,
 ) -> i32 {
-    if check_null(h).is_none() { return -2; }
+    if check_null(h).is_none() {
+        return -2;
+    }
     let frame_slice = slice::from_raw_parts(frame, frame_len);
     match Envelope::decode_header(frame_slice) {
         Ok((header, _payload)) => {
@@ -793,6 +950,11 @@ pub unsafe extern "C" fn amos_link_frame_decode_header(
 }
 
 /// Decode a wire frame and return its payload bytes.
+/// # Safety
+///
+/// `frame` must point to `frame_len` readable bytes (null/0 is refused with an error);
+/// `payload_out` must be writable for `payload_cap` bytes — a payload that does not fit is refused,
+/// not truncated.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_frame_decode_payload(
     frame: *const u8,
@@ -823,6 +985,9 @@ pub unsafe extern "C" fn amos_link_frame_decode_payload(
 }
 
 /// CRC32 of a single buffer.
+/// # Safety
+///
+/// `data` must point to `len` readable bytes (`NULL`/`0` returns `0`).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_crc32(data: *const u8, len: usize) -> u32 {
     if data.is_null() || len == 0 {
@@ -833,17 +998,25 @@ pub unsafe extern "C" fn amos_link_crc32(data: *const u8, len: usize) -> u32 {
 }
 
 /// CRC32 of header || payload combined.
+/// # Safety
+///
+/// `header`/`payload` must each point to their `_len` readable bytes; a null or zero-length part is
+/// skipped.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_crc32_combine(
-    header: *const u8, h_len: usize,
-    payload: *const u8, p_len: usize,
+    header: *const u8,
+    h_len: usize,
+    payload: *const u8,
+    p_len: usize,
 ) -> u32 {
     let mut hasher = Hasher::new();
     if !header.is_null() && h_len > 0 {
+        // SAFETY: the null/zero-length case is excluded by the branch above, so `header` points to `h_len` readable bytes per the caller contract.
         let h = unsafe { slice::from_raw_parts(header, h_len) };
         hasher.update(h);
     }
     if !payload.is_null() && p_len > 0 {
+        // SAFETY: as above for `header`: the branch above guarantees `payload` points to `p_len` readable bytes.
         let p = unsafe { slice::from_raw_parts(payload, p_len) };
         hasher.update(p);
     }
@@ -874,6 +1047,11 @@ fn aml_kind_to_node(kind: &NodeKind) -> amos_link_node_kind {
     }
 }
 
+/// # Safety
+///
+/// `peer_id` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error
+/// code, never undefined behaviour). The returned handle owns a `Box<Arc<LinkNode>>` and must be
+/// released with `amos_link_node_drop` (each clone counts separately).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_new(
     peer_id: *const c_char,
@@ -881,19 +1059,30 @@ pub unsafe extern "C" fn amos_link_node_new(
 ) -> *mut amos_link_node {
     let peer_s = match cstr_to_str(peer_id) {
         Ok(s) => s,
-        Err(e) => { set_error(&e); return ptr::null_mut(); }
+        Err(e) => {
+            set_error(&e);
+            return ptr::null_mut();
+        }
     };
     let pid = match PeerId::new(peer_s) {
         Ok(p) => p,
-        Err(e) => { set_error(&e); return ptr::null_mut(); }
+        Err(e) => {
+            set_error(&e);
+            return ptr::null_mut();
+        }
     };
     let node = LinkNode::in_process(pid, node_kind_to_aml(kind));
     Box::into_raw(Box::new(node)) as *mut amos_link_node
 }
 
+/// # Safety
+///
+/// `node` must be a live handle from `amos_link_node_new`/`amos_link_node_clone` that has not been
+/// dropped. The returned handle is a new owned reference and must be dropped too.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_clone(node: *const amos_link_node) -> *mut amos_link_node {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed `check_null` above and is a live `Box<Arc<LinkNode>>`. The cast is the same shape `amos_link_node_new` created (`Box::into_raw(Box::new(Arc<LinkNode>))`), so reading it as an `Arc` is the correct type — `Arc::clone` below is what makes the new handle a real second owner.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         let cloned: Arc<LinkNode> = Arc::clone(n);
         Box::into_raw(Box::new(cloned)) as *mut amos_link_node
@@ -902,13 +1091,23 @@ pub unsafe extern "C" fn amos_link_node_clone(node: *const amos_link_node) -> *m
     }
 }
 
+/// # Safety
+///
+/// `node` must be a handle from `amos_link_node_new`/`_clone` that has **not** been dropped: this
+/// takes ownership back. Using the handle afterwards (including a second drop) is undefined
+/// behaviour. A null pointer is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_drop(node: *mut amos_link_node) {
     if !node.is_null() {
+        // SAFETY: takes back the `Box` that `amos_link_node_new`/`_clone` leaked. The C contract is that a handle reaches its drop exactly once and is never used afterwards (the null case is excluded above).
         drop(unsafe { Box::from_raw(node as *mut Arc<LinkNode>) });
     }
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `buf` must be writable for `cap`
+/// bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_peer_id(
     node: *const amos_link_node,
@@ -916,6 +1115,7 @@ pub unsafe extern "C" fn amos_link_node_peer_id(
     cap: usize,
 ) -> i32 {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         copy_str(n.peer().as_str(), buf, cap)
     } else {
@@ -923,9 +1123,15 @@ pub unsafe extern "C" fn amos_link_node_peer_id(
     }
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); null answers `NodeTool`.
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_node_get_kind(node: *const amos_link_node) -> amos_link_node_kind {
+pub unsafe extern "C" fn amos_link_node_get_kind(
+    node: *const amos_link_node,
+) -> amos_link_node_kind {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         aml_kind_to_node(&n.kind())
     } else {
@@ -933,9 +1139,13 @@ pub unsafe extern "C" fn amos_link_node_get_kind(node: *const amos_link_node) ->
     }
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); null answers `0`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_uptime_ms(node: *const amos_link_node) -> u64 {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         n.uptime_ms()
     } else {
@@ -944,16 +1154,21 @@ pub unsafe extern "C" fn amos_link_node_uptime_ms(node: *const amos_link_node) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_version() -> *const c_char {
+pub extern "C" fn amos_link_version() -> *const c_char {
     AMLINK_VERSION.as_ptr() as *const c_char
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `buf` must be writable for
+/// `AMLK_MAX_TOPIC_LEN + 1` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_heartbeat_topic(
     node: *const amos_link_node,
     buf: *mut c_char,
 ) -> i32 {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         match n.heartbeat_topic() {
             Ok(t) => copy_str(t.as_ref(), buf, AMLK_MAX_TOPIC_LEN + 1),
@@ -976,11 +1191,19 @@ struct SimplePublisher {
 impl SimplePublisher {
     fn publish_sync(&self, payload: &[u8]) -> Result<amos_link::broker::PublishReport, LinkError> {
         let bp = BincodePayload(payload.to_vec());
-        let pubr = self.node.publisher::<BincodePayload>((*self.topic._inner).clone());
-        block_on_sync(pubr.publish(&bp))
+        let pubr = self
+            .node
+            .publisher::<BincodePayload>((*self.topic._inner).clone());
+        block_on_sync(pubr.publish(&bp))?
     }
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `topic_str` must be a NUL-terminated
+/// UTF-8 C string (a null pointer is answered with an error code, never undefined behaviour). The
+/// returned publisher must be released with `amos_link_publisher_drop` **before** the node it was
+/// built from.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_publisher_new(
     node: *const amos_link_node,
@@ -988,13 +1211,20 @@ pub unsafe extern "C" fn amos_link_publisher_new(
 ) -> *mut amos_link_publisher {
     let topic_s = match cstr_to_str(topic_str) {
         Ok(s) => s,
-        Err(e) => { set_error(&e); return ptr::null_mut(); }
+        Err(e) => {
+            set_error(&e);
+            return ptr::null_mut();
+        }
     };
     let topic = match Topic::new(topic_s) {
         Ok(t) => t,
-        Err(e) => { set_error(&e); return ptr::null_mut(); }
+        Err(e) => {
+            set_error(&e);
+            return ptr::null_mut();
+        }
     };
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         let sp = Box::new(SimplePublisher {
             node: Arc::clone(n),
@@ -1006,13 +1236,23 @@ pub unsafe extern "C" fn amos_link_publisher_new(
     }
 }
 
+/// # Safety
+///
+/// `pubr` must be a publisher from `amos_link_publisher_new` that has not been dropped; this takes
+/// ownership back (a second drop, or publishing afterwards, is undefined behaviour). A null pointer
+/// is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_publisher_drop(pubr: *mut amos_link_publisher) {
     if !pubr.is_null() {
+        // SAFETY: takes back the `Box<SimplePublisher>` created by `amos_link_publisher_new`; the handle must reach its drop exactly once (the null case is excluded above).
         drop(unsafe { Box::from_raw(pubr as *mut SimplePublisher) });
     }
 }
 
+/// # Safety
+///
+/// `pubr` must be a live publisher handle; `payload` must point to `payload_len` readable bytes
+/// (`NULL, 0` publishes an empty payload, `NULL, n>0` is refused).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_publisher_publish(
     pubr: *const amos_link_publisher,
@@ -1020,8 +1260,23 @@ pub unsafe extern "C" fn amos_link_publisher_publish(
     payload_len: usize,
 ) -> i32 {
     if let Some(pubr) = check_null(pubr) {
+        // SAFETY: `pubr` passed `check_null` above and is a live `Box<SimplePublisher>` handle.
         let sp = unsafe { &*(pubr as *const SimplePublisher) };
-        let payload_slice = unsafe { slice::from_raw_parts(payload, payload_len) };
+        // `NULL, 0` is how C spells "empty payload" and `amos_link_frame_encode` accepts
+        // it; `slice::from_raw_parts` does **not** (a null pointer is UB even for len 0),
+        // so build the empty slice here. `NULL, n>0` is a caller bug and is reported
+        // instead of silently publishing nothing (same sentence as frame_encode).
+        if payload.is_null() && payload_len > 0 {
+            return set_error(&LinkError::Codec(
+                "null payload with non-zero length".into(),
+            ));
+        }
+        let payload_slice: &[u8] = if payload.is_null() || payload_len == 0 {
+            &[]
+        } else {
+            // SAFETY: the null/empty cases are handled by the guard just above, so `payload` points to `payload_len` readable bytes (the caller's promise, stated in this function's `# Safety`).
+            unsafe { slice::from_raw_parts(payload, payload_len) }
+        };
         match sp.publish_sync(payload_slice) {
             Ok(_) => 0,
             Err(e) => set_error(&e),
@@ -1031,6 +1286,9 @@ pub unsafe extern "C" fn amos_link_publisher_publish(
     }
 }
 
+/// # Safety
+///
+/// `pubr` must be a live publisher handle; `buf` must be writable for `cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_publisher_topic(
     pubr: *const amos_link_publisher,
@@ -1038,6 +1296,7 @@ pub unsafe extern "C" fn amos_link_publisher_topic(
     cap: usize,
 ) -> i32 {
     if let Some(pubr) = check_null(pubr) {
+        // SAFETY: `pubr` passed `check_null` above and is a live `Box<SimplePublisher>` handle.
         let sp = unsafe { &*(pubr as *const SimplePublisher) };
         copy_str(sp.topic._inner.as_str(), buf, cap)
     } else {
@@ -1070,6 +1329,12 @@ impl Drop for SimpleSubscriber {
     }
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `pattern_str` must be a NUL-terminated
+/// UTF-8 C string (a null pointer is answered with an error code, never undefined behaviour). The
+/// returned subscriber owns a background thread and must be released with
+/// `amos_link_subscriber_drop`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_subscriber_new(
     node: *const amos_link_node,
@@ -1078,21 +1343,36 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
 ) -> *mut amos_link_subscriber {
     let pattern_s = match cstr_to_str(pattern_str) {
         Ok(s) => s,
-        Err(e) => { set_error(&e); return ptr::null_mut(); }
+        Err(e) => {
+            set_error(&e);
+            return ptr::null_mut();
+        }
     };
     let pattern = match InnerTopic::pattern(pattern_s) {
         Ok(t) => t,
-        Err(e) => { set_error(&e); return ptr::null_mut(); }
+        Err(e) => {
+            set_error(&e);
+            return ptr::null_mut();
+        }
     };
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         let node_clone = Arc::clone(n);
         let pattern_clone = pattern.clone();
         let qos_clone = qos;
 
-        let sub = block_on_sync(async move {
-            node_clone.subscriber::<BincodePayload>(pattern_clone, qos_clone.into()).await
-        });
+        let sub = match block_on_sync(async move {
+            node_clone
+                .subscriber::<BincodePayload>(pattern_clone, qos_clone.into())
+                .await
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                set_error(&e);
+                return ptr::null_mut();
+            }
+        };
 
         match sub {
             Ok(mut subscription) => {
@@ -1102,10 +1382,19 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
                 let closed_clone = closed.clone();
 
                 let thread = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
+                    let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .expect("tokio runtime for subscriber background task");
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => {
+                            // No runtime means no reader: mark the subscription closed so
+                            // `poll`/`recv` answer `Closed` instead of a caller waiting
+                            // forever — and never panic in a thread we spawned (P0-1).
+                            closed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return;
+                        }
+                    };
                     rt.block_on(async {
                         loop {
                             if closed_clone.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1118,7 +1407,10 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
                                         rx.topic.to_string(),
                                         rx.publisher.to_string(),
                                         rx.seq,
-                                        Timestamp { secs: ts.secs, nanos: ts.nanos },
+                                        Timestamp {
+                                            secs: ts.secs,
+                                            nanos: ts.nanos,
+                                        },
                                         rx.frame_len as u32,
                                     );
                                     if payload_tx.send(rx.message).is_err() {
@@ -1156,20 +1448,33 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
                 });
                 Box::into_raw(ss) as *mut amos_link_subscriber
             }
-            Err(e) => { set_error(&e); ptr::null_mut() }
+            Err(e) => {
+                set_error(&e);
+                ptr::null_mut()
+            }
         }
     } else {
         ptr::null_mut()
     }
 }
 
+/// # Safety
+///
+/// `sub` must be a subscriber from `amos_link_subscriber_new` that has not been dropped; this takes
+/// ownership back and stops its background thread. A second drop, or polling afterwards, is
+/// undefined behaviour. A null pointer is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_subscriber_drop(sub: *mut amos_link_subscriber) {
     if !sub.is_null() {
+        // SAFETY: takes back the `Box<SimpleSubscriber>` created by `amos_link_subscriber_new`; the handle must reach its drop exactly once (the null case is excluded above).
         drop(unsafe { Box::from_raw(sub as *mut SimpleSubscriber) });
     }
 }
 
+/// # Safety
+///
+/// `sub` must be a live subscriber handle; `received` must be a caller-owned `amos_link_received`
+/// with the header's array sizes; `payload_buf` must be writable for `payload_cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_subscriber_poll(
     sub: *const amos_link_subscriber,
@@ -1177,9 +1482,14 @@ pub unsafe extern "C" fn amos_link_subscriber_poll(
     payload_buf: *mut u8,
     payload_cap: usize,
 ) -> amos_link_poll {
-    if check_null(sub).is_none() { return amos_link_poll::Closed; }
-    if check_null(received).is_none() { return amos_link_poll::Closed; }
+    if check_null(sub).is_none() {
+        return amos_link_poll::Closed;
+    }
+    if check_null(received).is_none() {
+        return amos_link_poll::Closed;
+    }
 
+    // SAFETY: `sub` passed the null checks above and is a live `Box<SimpleSubscriber>` handle.
     let s = unsafe { &*(sub as *const SimpleSubscriber) };
 
     if s.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1188,9 +1498,12 @@ pub unsafe extern "C" fn amos_link_subscriber_poll(
 
     match s.meta_rx.try_recv() {
         Ok((topic, peer, seq, stamp, frame_len)) => {
-            let payload_bytes =
-                s.payload_rx.try_recv().unwrap_or_else(|_| BincodePayload(Vec::new()));
+            let payload_bytes = s
+                .payload_rx
+                .try_recv()
+                .unwrap_or_else(|_| BincodePayload(Vec::new()));
 
+            // SAFETY: `received` was checked non-null above and the C header fixes its array sizes (topic `AMLK_MAX_TOPIC_LEN`, peer_id `AMLK_MAX_PEER_ID_LEN`); every copy is bounded by `min(len, max - 1)` and the payload by `payload_cap`.
             unsafe {
                 let max_topic = 1024usize;
                 let max_peer = 64usize;
@@ -1219,13 +1532,15 @@ pub unsafe extern "C" fn amos_link_subscriber_poll(
             }
             amos_link_poll::Ready
         }
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            amos_link_poll::Closed
-        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => amos_link_poll::Closed,
         Err(_) => amos_link_poll::Pending,
     }
 }
 
+/// # Safety
+///
+/// `sub` must be a live subscriber handle; `received` must be a caller-owned `amos_link_received`
+/// with the header's array sizes; `payload_buf` must be writable for `payload_cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_subscriber_recv(
     sub: *const amos_link_subscriber,
@@ -1233,9 +1548,14 @@ pub unsafe extern "C" fn amos_link_subscriber_recv(
     payload_buf: *mut u8,
     payload_cap: usize,
 ) -> amos_link_poll {
-    if check_null(sub).is_none() { return amos_link_poll::Closed; }
-    if check_null(received).is_none() { return amos_link_poll::Closed; }
+    if check_null(sub).is_none() {
+        return amos_link_poll::Closed;
+    }
+    if check_null(received).is_none() {
+        return amos_link_poll::Closed;
+    }
 
+    // SAFETY: `sub` passed the null checks above and is a live `Box<SimpleSubscriber>` handle.
     let s = unsafe { &*(sub as *const SimpleSubscriber) };
 
     if s.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1265,7 +1585,10 @@ pub unsafe extern "C" fn amos_link_subscriber_recv(
     };
 
     let payload_bytes = loop {
-        match s.payload_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+        match s
+            .payload_rx
+            .recv_timeout(std::time::Duration::from_millis(10))
+        {
             Ok(b) => break b,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if s.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1276,6 +1599,7 @@ pub unsafe extern "C" fn amos_link_subscriber_recv(
         }
     };
 
+    // SAFETY: `received` was checked non-null above and the C header fixes its array sizes (topic `AMLK_MAX_TOPIC_LEN`, peer_id `AMLK_MAX_PEER_ID_LEN`); every copy is bounded by `min(len, max - 1)` and the payload by `payload_cap`.
     unsafe {
         let max_topic = 1024usize;
         let max_peer = 64usize;
@@ -1305,15 +1629,25 @@ pub unsafe extern "C" fn amos_link_subscriber_recv(
     amos_link_poll::Ready
 }
 
+/// # Safety
+///
+/// `sub` must be a live subscriber handle; `stats` must be a caller-owned, writable
+/// `amos_link_sub_stats`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_subscriber_stats(
     sub: *const amos_link_subscriber,
     stats: *mut amos_link_sub_stats,
 ) -> i32 {
-    if check_null(stats).is_none() { return -2; }
-    if check_null(sub).is_none() { return -2; }
+    if check_null(stats).is_none() {
+        return -2;
+    }
+    if check_null(sub).is_none() {
+        return -2;
+    }
+    // SAFETY: `sub` passed the null checks above and is a live `Box<SimpleSubscriber>` handle.
     let _s = unsafe { &*(sub as *const SimpleSubscriber) };
     // Stats are maintained in the background thread; return zeros for now.
+    // SAFETY: `stats` was checked non-null above and is a caller-owned, writable `amos_link_sub_stats` (the header's contract for this parameter).
     unsafe {
         (*stats).received = 0;
         (*stats).dropped = 0;
@@ -1322,9 +1656,15 @@ pub unsafe extern "C" fn amos_link_subscriber_stats(
     0
 }
 
+/// # Safety
+///
+/// `sub` must be a live subscriber handle; null answers `false`.
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_subscriber_has_pending(sub: *const amos_link_subscriber) -> bool {
+pub unsafe extern "C" fn amos_link_subscriber_has_pending(
+    sub: *const amos_link_subscriber,
+) -> bool {
     if check_null(sub).is_some() {
+        // SAFETY: `sub` passed the null checks above and is a live `Box<SimpleSubscriber>` handle.
         let _s = unsafe { &*(sub as *const SimpleSubscriber) };
         // mpsc::Receiver doesn't have is_empty, so conservatively
         // return true to indicate there might be pending data.
@@ -1334,20 +1674,29 @@ pub unsafe extern "C" fn amos_link_subscriber_has_pending(sub: *const amos_link_
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `metrics` must be a caller-owned,
+/// writable `amos_link_metrics`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_metrics(
     node: *const amos_link_node,
     metrics: *mut amos_link_metrics,
 ) -> i32 {
-    if check_null(node).is_none() { return -2; }
-    if check_null(metrics).is_none() { return -2; }
+    if check_null(node).is_none() {
+        return -2;
+    }
+    if check_null(metrics).is_none() {
+        return -2;
+    }
+    // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
     let n = unsafe { &*(node as *const Arc<LinkNode>) };
     let snap = n.metrics().snapshot();
+    // SAFETY: `metrics` was checked non-null above and is a caller-owned, writable `amos_link_metrics` the caller handed us for exactly this write.
     unsafe {
         (*metrics).published = snap.published;
         (*metrics).delivered = snap.delivered;
@@ -1359,9 +1708,14 @@ pub unsafe extern "C" fn amos_link_node_metrics(
     0
 }
 
+/// # Safety
+///
+/// `m` must point to a readable `amos_link_metrics` — normally the struct a caller filled through
+/// `amos_link_node_metrics` or `amos_link_evaluate_health`; null answers `0`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_metrics_delivery_ratio(m: *const amos_link_metrics) -> u32 {
     if let Some(m) = check_null(m) {
+        // SAFETY: `m` passed `check_null` above and points to a readable `amos_link_metrics` — normally the struct a caller filled through `amos_link_node_metrics`.
         let snap = unsafe {
             MetricsSnapshot {
                 published: (*m).published,
@@ -1388,6 +1742,11 @@ pub unsafe extern "C" fn amos_link_metrics_delivery_ratio(m: *const amos_link_me
 // Health
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `metrics` must point to a readable `amos_link_metrics`; `peers` must point to `num_peers`
+/// `amos_link_peer_view` values whose `id` arrays are NUL-terminated (a null pointer or `0` counts
+/// as an empty peer list).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_evaluate_health(
     metrics: *const amos_link_metrics,
@@ -1396,8 +1755,12 @@ pub unsafe extern "C" fn amos_link_evaluate_health(
     clock_synced: bool,
 ) -> amos_link_health {
     if check_null(metrics).is_none() {
-        return amos_link_health { state: amos_link_health_state::Unknown, reason: [0; 256] };
+        return amos_link_health {
+            state: amos_link_health_state::Unknown,
+            reason: [0; 256],
+        };
     }
+    // SAFETY: `metrics` was checked non-null above and points to a readable `amos_link_metrics`; the fields are copied out by value, nothing is retained.
     let snap = unsafe {
         MetricsSnapshot {
             published: (*metrics).published,
@@ -1412,20 +1775,29 @@ pub unsafe extern "C" fn amos_link_evaluate_health(
     let peer_views: Vec<PeerView> = if peers.is_null() || num_peers == 0 {
         Vec::new()
     } else {
+        // SAFETY: the null/zero case is excluded by the branch above, so `peers` points to `num_peers` `amos_link_peer_view` values the caller owns.
         let slice = unsafe { slice::from_raw_parts(peers, num_peers) };
-        slice.iter().filter_map(|pv| {
-            let pid_str = unsafe {
-                let mut n = 0;
-                while *pv.id.as_ptr().add(n) != 0 { n += 1; }
-                std::str::from_utf8(slice::from_raw_parts(pv.id.as_ptr() as *const u8, n)).ok()?.to_string()
-            };
-            let pid = PeerId::new(pid_str).ok()?;
-            Some(PeerView {
-                info: PeerInfo::new(pid, NodeKind::Robot),
-                last_seen_ms: pv.last_seen_ms,
-                beacons: pv.beacons,
+        slice
+            .iter()
+            .filter_map(|pv| {
+                // SAFETY: each `id` array is a fixed-size `char` array the caller filled and NUL-terminated (the header's contract, repeated in this function's `# Safety`); the scan stops at the first NUL, and `pv` comes from the slice above, which is in bounds.
+                let pid_str = unsafe {
+                    let mut n = 0;
+                    while *pv.id.as_ptr().add(n) != 0 {
+                        n += 1;
+                    }
+                    std::str::from_utf8(slice::from_raw_parts(pv.id.as_ptr() as *const u8, n))
+                        .ok()?
+                        .to_string()
+                };
+                let pid = PeerId::new(pid_str).ok()?;
+                Some(PeerView {
+                    info: PeerInfo::new(pid, NodeKind::Robot),
+                    last_seen_ms: pv.last_seen_ms,
+                    beacons: pv.beacons,
+                })
             })
-        }).collect()
+            .collect()
     };
 
     let verdict = LinkHealth::evaluate(&snap, &peer_views, clock_synced, None);
@@ -1438,7 +1810,11 @@ pub unsafe extern "C" fn amos_link_evaluate_health(
         reason: [0; 256],
     };
     if let LinkHealth::Degraded { reasons } = verdict {
-        let reason_str = reasons.iter().map(HealthReason::detail).collect::<Vec<_>>().join("; ");
+        let reason_str = reasons
+            .iter()
+            .map(HealthReason::detail)
+            .collect::<Vec<_>>()
+            .join("; ");
         let bytes = reason_str.as_bytes();
         let copy_len = bytes.len().min(255);
         for (i, &b) in bytes.iter().take(copy_len).enumerate() {
@@ -1453,18 +1829,34 @@ pub unsafe extern "C" fn amos_link_evaluate_health(
 // Peer / topic listing
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `peers_out` must be writable for
+/// `max_peers` `amos_link_peer_view` values (fewer are written if there are fewer).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_peers(
     node: *const amos_link_node,
     peers_out: *mut amos_link_peer_view,
     max_peers: usize,
 ) -> usize {
-    if check_null(node).is_none() { return 0; }
-    if check_null_mut(peers_out).is_none() { return 0; }
+    if check_null(node).is_none() {
+        return 0;
+    }
+    if check_null_mut(peers_out).is_none() {
+        return 0;
+    }
+    // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
     let n = unsafe { &*(node as *const Arc<LinkNode>) };
-    let peers = block_on_sync(n.peers());
+    let peers = match block_on_sync(n.peers()) {
+        Ok(p) => p,
+        Err(e) => {
+            set_error(&e);
+            return 0;
+        }
+    };
     let n_write = peers.len().min(max_peers);
     for (i, view) in peers.iter().take(n_write).enumerate() {
+        // SAFETY: `peers_out` was checked non-null above and `i` runs over `min(peers.len(), max_peers)`, so each `add(i)` stays inside the caller's array; the loop writes each element once, so no two `&mut` overlap.
         let entry = unsafe { &mut *peers_out.add(i) };
         let id_s = view.info.id.as_str();
         copy_str(id_s, entry.id.as_ptr() as *mut c_char, 64);
@@ -1477,18 +1869,34 @@ pub unsafe extern "C" fn amos_link_node_peers(
     n_write
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `topics_out` must be writable for
+/// `max_topics` `amos_link_topic_entry` values (fewer are written if there are fewer).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_topics(
     node: *const amos_link_node,
     topics_out: *mut amos_link_topic_entry,
     max_topics: usize,
 ) -> usize {
-    if check_null(node).is_none() { return 0; }
-    if check_null_mut(topics_out).is_none() { return 0; }
+    if check_null(node).is_none() {
+        return 0;
+    }
+    if check_null_mut(topics_out).is_none() {
+        return 0;
+    }
+    // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
     let n = unsafe { &*(node as *const Arc<LinkNode>) };
-    let topics = block_on_sync(n.topics());
+    let topics = match block_on_sync(n.topics()) {
+        Ok(t) => t,
+        Err(e) => {
+            set_error(&e);
+            return 0;
+        }
+    };
     let n_write = topics.len().min(max_topics);
     for (i, t) in topics.iter().take(n_write).enumerate() {
+        // SAFETY: `topics_out` was checked non-null above and `i` runs over `min(topics.len(), max_topics)`, so each `add(i)` stays inside the caller's array.
         let entry = unsafe { &mut *topics_out.add(i) };
         copy_str(t.as_str(), entry.topic.as_ptr() as *mut c_char, 1024);
     }
@@ -1499,11 +1907,16 @@ pub unsafe extern "C" fn amos_link_node_topics(
 // Heartbeat
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`). The returned heartbeat owns a
+/// `Box<Heartbeat>` and must be released with `amos_link_heartbeat_drop`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_heartbeat(
     node: *const amos_link_node,
 ) -> *mut amos_link_heartbeat {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         let beat = n.heartbeat();
         Box::into_raw(Box::new(beat)) as *mut amos_link_heartbeat
@@ -1512,12 +1925,21 @@ pub unsafe extern "C" fn amos_link_node_heartbeat(
     }
 }
 
+/// # Safety
+///
+/// `beat` must be a live heartbeat handle; `frame_out` must be writable for `AMLK_MAX_FRAME_BYTES`
+/// bytes — the signature carries no capacity parameter, so that constant *is* the capacity contract
+/// (a heartbeat frame is far smaller in practice; see the `CHANGELOG.md` note, REQ-A388).
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_heartbeat_encode(
     beat: *const amos_link_heartbeat,
     frame_out: *mut u8,
 ) -> i32 {
+    if frame_out.is_null() {
+        return set_error(&LinkError::Codec("null output buffer".into()));
+    }
     if let Some(beat) = check_null(beat) {
+        // SAFETY: `beat` passed `check_null` above and is a live heartbeat handle created by `amos_link_node_heartbeat` (a `Box` leaked to the ABI, released by `amos_link_heartbeat_drop`).
         let b = unsafe { &*(beat as *const Heartbeat) };
         let topic_str = format!("amos/{}/telemetry/beat", b.peer);
         let topic = match Topic::new(&topic_str) {
@@ -1542,45 +1964,56 @@ pub unsafe extern "C" fn amos_link_heartbeat_encode(
     }
 }
 
+/// # Safety
+///
+/// `beat` must be a heartbeat from `amos_link_node_heartbeat` that has not been dropped; this takes
+/// ownership back. A null pointer is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_heartbeat_drop(beat: *mut amos_link_heartbeat) {
     if !beat.is_null() {
+        // SAFETY: takes back the `Box` created by `amos_link_node_heartbeat`; the handle must reach its drop exactly once (the null case is excluded above).
         drop(unsafe { Box::from_raw(beat as *mut Heartbeat) });
     }
 }
 
+/// # Safety
+///
+/// `frame` must point to `frame_len` readable bytes; `fields` must be a caller-owned, writable
+/// `amos_link_heartbeat_fields` with the header's array sizes.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_heartbeat_decode(
     frame: *const u8,
     frame_len: usize,
     fields: *mut amos_link_heartbeat_fields,
 ) -> i32 {
-    if check_null(fields).is_none() { return -2; }
+    if check_null(fields).is_none() {
+        return -2;
+    }
+    // SAFETY: `frame` points to `frame_len` readable bytes — the caller's contract (this is the inverse of `amos_link_heartbeat_encode`, which produced such a frame); `fields` was checked non-null above.
     let frame_slice = unsafe { slice::from_raw_parts(frame, frame_len) };
     match Envelope::decode(frame_slice) {
-        Ok(env) => {
-            match Heartbeat::decode(&env.payload) {
-                Ok(beat) => {
-                    let max_peer = 64usize;
-                    let pid_s = beat.peer.as_str();
-                    let copy_pid = pid_s.len().min(max_peer - 1);
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            pid_s.as_ptr() as *const c_char,
-                            (*fields).peer_id.as_ptr() as *mut c_char,
-                            copy_pid,
-                        );
-                        write_nul((*fields).peer_id.as_ptr() as *mut c_char, copy_pid);
-                        (*fields).seq = beat.seq;
-                        (*fields).stamp_secs = beat.stamp.secs;
-                        (*fields).stamp_nanos = beat.stamp.nanos;
-                        (*fields).uptime_ms = beat.uptime_ms;
-                    }
-                    0
+        Ok(env) => match Heartbeat::decode(&env.payload) {
+            Ok(beat) => {
+                let max_peer = 64usize;
+                let pid_s = beat.peer.as_str();
+                let copy_pid = pid_s.len().min(max_peer - 1);
+                // SAFETY: `fields` was checked non-null above and the header fixes its array sizes (`peer_id` is `AMLK_MAX_PEER_ID_LEN`); the copy is bounded by `min(len, max - 1)` and followed by a NUL.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        pid_s.as_ptr() as *const c_char,
+                        (*fields).peer_id.as_ptr() as *mut c_char,
+                        copy_pid,
+                    );
+                    write_nul((*fields).peer_id.as_ptr() as *mut c_char, copy_pid);
+                    (*fields).seq = beat.seq;
+                    (*fields).stamp_secs = beat.stamp.secs;
+                    (*fields).stamp_nanos = beat.stamp.nanos;
+                    (*fields).uptime_ms = beat.uptime_ms;
                 }
-                Err(e) => set_error(&e),
+                0
             }
-        }
+            Err(e) => set_error(&e),
+        },
         Err(e) => set_error(&e),
     }
 }
@@ -1589,29 +2022,48 @@ pub unsafe extern "C" fn amos_link_heartbeat_decode(
 // Federation
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`). The returned task must be stopped with
+/// `amos_link_federation_stop`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_spawn_federation(
     node: *const amos_link_node,
     period_ms: u64,
 ) -> *mut amos_link_federation_task {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         let node_clone = Arc::clone(n);
         let period = Duration::from_millis(period_ms);
-        
+
         // Use the global runtime to provide context for tokio::spawn
-        let rt = global_runtime();
+        let rt = match global_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                set_error(&e);
+                return ptr::null_mut();
+            }
+        };
         let _guard = rt.enter();
-        
+
         match node_clone.spawn_federation(period) {
             Ok(t) => Box::into_raw(Box::new(t)) as *mut amos_link_federation_task,
-            Err(e) => { set_error(&e); ptr::null_mut() }
+            Err(e) => {
+                set_error(&e);
+                ptr::null_mut()
+            }
         }
     } else {
         ptr::null_mut()
     }
 }
 
+/// # Safety
+///
+/// `node` must be a live handle (see `amos_link_node_drop`); `endpoint` must be a NUL-terminated
+/// UTF-8 C string (a null pointer is answered with an error code, never undefined behaviour). The
+/// returned task must be stopped with `amos_link_federation_stop`.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_node_spawn_federation_advertising(
     node: *const amos_link_node,
@@ -1619,36 +2071,60 @@ pub unsafe extern "C" fn amos_link_node_spawn_federation_advertising(
     endpoint: *const c_char,
 ) -> *mut amos_link_federation_task {
     if let Some(node) = check_null(node) {
+        // SAFETY: `node` passed the null check above and is a live handle from `amos_link_node_new`/`_clone` — a `Box<Arc<LinkNode>>` that stays allocated until `amos_link_node_drop`; a shared reference for the duration of the call is sound, and the `Arc` is what lets several threads read the same node.
         let n = unsafe { &*(node as *const Arc<LinkNode>) };
         let endpoints: Vec<String> = if !endpoint.is_null() {
             match cstr_to_str(endpoint) {
                 Ok(s) => vec![s.to_string()],
-                Err(e) => { set_error(&e); return ptr::null_mut(); }
+                Err(e) => {
+                    set_error(&e);
+                    return ptr::null_mut();
+                }
             }
         } else {
             vec![]
         };
         let node_clone = Arc::clone(n);
         let period = Duration::from_millis(period_ms);
-        
+
         // Use the global runtime to provide context for tokio::spawn
-        let rt = global_runtime();
+        let rt = match global_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                set_error(&e);
+                return ptr::null_mut();
+            }
+        };
         let _guard = rt.enter();
-        
+
         match node_clone.spawn_federation_advertising(period, endpoints) {
             Ok(t) => Box::into_raw(Box::new(t)) as *mut amos_link_federation_task,
-            Err(e) => { set_error(&e); ptr::null_mut() }
+            Err(e) => {
+                set_error(&e);
+                ptr::null_mut()
+            }
         }
     } else {
         ptr::null_mut()
     }
 }
 
+/// # Safety
+///
+/// `task` must be a task handle from `amos_link_node_spawn_federation*` that has not been stopped;
+/// any use afterwards is undefined behaviour. A null pointer is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn amos_link_federation_stop(task: *mut amos_link_federation_task) {
-    if task.is_null() { return; }
+    if task.is_null() {
+        return;
+    }
+    // SAFETY: takes back the `Box<FederationTask>` created by `amos_link_node_spawn_federation*`; the handle must be stopped exactly once, and the null case is excluded above.
     let t = unsafe { Box::from_raw(task as *mut FederationTask) };
-    block_on_sync(async move { t.stop().await });
+    // The task is stopped either way; if the runtime itself could not be built, the caller
+    // still learns why through the thread-local error (`amos_link_last_error`).
+    if let Err(e) = block_on_sync(async move { t.stop().await }) {
+        set_error(&e);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1656,20 +2132,19 @@ pub unsafe extern "C" fn amos_link_federation_stop(task: *mut amos_link_federati
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_last_error() -> *const c_char {
-    LAST_ERROR.with(|buf| {
-        let s = &*buf.borrow();
-        if s.is_empty() {
-            static EMPTY: &[u8] = b"\0";
-            EMPTY.as_ptr() as *const c_char
-        } else {
-            let leaked = Box::leak(s.clone().into_boxed_str());
-            leaked.as_ptr() as *const c_char
-        }
+pub extern "C" fn amos_link_last_error() -> *const c_char {
+    LAST_ERROR_C.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let text = LAST_ERROR.with(|buf| buf.borrow().clone());
+        // A `LinkError` message cannot contain NUL, but `unwrap_or_default` keeps this
+        // panic-free if that ever changes.
+        *slot = Some(std::ffi::CString::new(text).unwrap_or_default());
+        slot.as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char)
     })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn amos_link_error_clear() {
+pub extern "C" fn amos_link_error_clear() {
     LAST_ERROR.with(|buf| buf.borrow_mut().clear());
 }

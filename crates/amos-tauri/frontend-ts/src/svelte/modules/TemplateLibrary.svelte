@@ -14,6 +14,8 @@
   import { templateManager } from "../../lib/enterprise";
   import type { EnterpriseTemplate } from "../../lib/enterprise/templates";
   import { loadShortcuts } from "../../lib/shortcuts";
+  import { t } from "../locale.svelte";
+  import { attachFocusTrap } from "../../lib/focusTrap";
 
   // ============================================================================
   // 状态管理
@@ -27,6 +29,13 @@
   let selectedTemplate = $state<EnterpriseTemplate | null>(null);
   let installing = $state(false);
   let parameterValues = $state<Record<string, any>>({});
+
+  /** 详情模态的根元素（焦点陷阱 + Escape 关闭挂在它身上）。 */
+  let modalEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!showDetailModal || !modalEl) return;
+    return attachFocusTrap(modalEl, closeDetailModal);
+  });
 
   // ============================================================================
   // 计算属性
@@ -109,7 +118,7 @@
       .map(p => p.name);
 
     if (missingParams.length > 0) {
-      alert(`请填写必填参数: ${missingParams.join(", ")}`);
+      alert(t("templates.missingParams", { params: missingParams.join(", ") }));
       return;
     }
 
@@ -121,15 +130,19 @@
       );
 
       if (result.success) {
-        alert(`模板安装成功！快捷指令 ID: ${result.shortcutId}`);
+        alert(t("templates.installSuccess", { id: result.shortcutId ?? "" }));
         closeDetailModal();
         // 刷新模板列表以更新安装数量
         templates = templateManager.getTemplates();
       } else {
-        alert(`安装失败: ${result.message ?? "未知错误"}`);
+        alert(t("templates.installFailed", { reason: result.message ?? t("templates.unknownError") }));
       }
     } catch (error) {
-      alert(`安装失败: ${error instanceof Error ? error.message : "未知错误"}`);
+      alert(
+        t("templates.installFailed", {
+          reason: error instanceof Error ? error.message : t("templates.unknownError"),
+        }),
+      );
     } finally {
       installing = false;
     }
@@ -148,8 +161,8 @@
 
 <div class="template-library">
   <header class="library-header">
-    <h2>📦 企业模板库</h2>
-    <p class="subtitle">使用预制模板快速创建标准化快捷指令</p>
+    <h2>📦 {t("templates.title")}</h2>
+    <p class="subtitle">{t("templates.subtitle")}</p>
   </header>
 
   <!-- 搜索和筛选 -->
@@ -159,7 +172,7 @@
       <input
         type="text"
         class="search-input"
-        placeholder="搜索模板名称或描述..."
+        placeholder={t("templates.searchPlaceholder")}
         bind:value={searchQuery}
       />
       {#if searchQuery}
@@ -173,7 +186,7 @@
         value={selectedCategory || ""}
         onchange={(e) => selectedCategory = (e.target as HTMLSelectElement).value || undefined}
       >
-        <option value="">全部类别</option>
+        <option value="">{t("templates.allCategories")}</option>
         {#each categories as category}
           <option value={category}>{getCategoryIcon(category)} {category}</option>
         {/each}
@@ -184,7 +197,7 @@
         value={selectedDepartment || ""}
         onchange={(e) => selectedDepartment = (e.target as HTMLSelectElement).value || undefined}
       >
-        <option value="">全部部门</option>
+        <option value="">{t("templates.allDepartments")}</option>
         {#each departments as dept}
           <option value={dept}>{dept}</option>
         {/each}
@@ -192,13 +205,13 @@
 
       {#if searchQuery || selectedCategory || selectedDepartment}
         <button class="reset-filters-btn" onclick={resetFilters}>
-          重置筛选
+          {t("templates.resetFilters")}
         </button>
       {/if}
     </div>
 
     <div class="results-count">
-      找到 {filteredTemplates.length} 个模板
+      {t("templates.foundCount", { count: filteredTemplates.length })}
     </div>
   </section>
 
@@ -207,8 +220,8 @@
     {#if filteredTemplates.length === 0}
       <div class="empty-state">
         <div class="empty-icon">📦</div>
-        <p class="empty-title">暂无模板</p>
-        <p class="empty-text">请尝试调整筛选条件</p>
+        <p class="empty-title">{t("templates.emptyTitle")}</p>
+        <p class="empty-text">{t("templates.emptyHint")}</p>
       </div>
     {:else}
       {#each filteredTemplates as template}
@@ -219,10 +232,10 @@
           <div class="card-header">
             <span class="card-icon">{getCategoryIcon(template.category)}</span>
             {#if template.isForced}
-              <span class="badge badge-required">必装</span>
+              <span class="badge badge-required">{t("templates.badgeRequired")}</span>
             {/if}
             {#if isInstalled(template.id)}
-              <span class="badge badge-installed">已安装</span>
+              <span class="badge badge-installed">{t("templates.badgeInstalled")}</span>
             {/if}
           </div>
           
@@ -232,11 +245,11 @@
           <div class="card-meta">
             <span class="meta-item">
               <span class="meta-icon">📊</span>
-              版本 {template.version}
+              {t("templates.version", { version: template.version })}
             </span>
             <span class="meta-item">
               <span class="meta-icon">👥</span>
-              {getInstallCount(template.id)} 次安装
+              {t("templates.installCount", { count: getInstallCount(template.id) })}
             </span>
           </div>
           
@@ -254,53 +267,68 @@
 
 <!-- 模板详情模态框 -->
 {#if showDetailModal && selectedTemplate}
-  <div class="modal-overlay" onclick={closeDetailModal}>
-    <div class="modal-content" onclick={(e) => e.stopPropagation()}>
+  <!-- 遮罩是**内容后面的一枚真按钮**：自己可点、可聚焦、有名字（点它 = 关闭），
+       于是内容不再需要 `stopPropagation`（点击内容根本到不了遮罩），
+       Escape 与焦点陷阱交给仓库共享的 `attachFocusTrap`（REQ-A386）。 -->
+  <div class="modal-overlay">
+    <button
+      class="modal-backdrop"
+      aria-label={t("templates.close")}
+      onclick={closeDetailModal}
+    ></button>
+    <div
+      class="modal-content"
+      bind:this={modalEl}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="tpl-modal-title"
+      tabindex="-1"
+    >
       <header class="modal-header">
         <div class="modal-title-row">
           <span class="modal-icon">{getCategoryIcon(selectedTemplate.category)}</span>
-          <h3 class="modal-title">{selectedTemplate.name}</h3>
+          <h3 id="tpl-modal-title" class="modal-title">{selectedTemplate.name}</h3>
         </div>
-        <button class="close-btn" onclick={closeDetailModal} aria-label="关闭">×</button>
+        <button class="close-btn" onclick={closeDetailModal} aria-label={t("templates.close")}>×</button>
       </header>
 
       <div class="modal-body">
         <!-- 基本信息 -->
         <section class="info-section">
           <div class="info-row">
-            <span class="info-label">版本:</span>
+            <span class="info-label">{t("templates.versionLabel")}</span>
             <span class="info-value">{selectedTemplate.version}</span>
           </div>
           <div class="info-row">
-            <span class="info-label">类别:</span>
+            <span class="info-label">{t("templates.categoryLabel")}</span>
             <span class="info-value">{selectedTemplate.category}</span>
           </div>
           {#if selectedTemplate.department}
             <div class="info-row">
-              <span class="info-label">部门:</span>
+              <span class="info-label">{t("templates.departmentLabel")}</span>
               <span class="info-value">{selectedTemplate.department}</span>
             </div>
           {/if}
           <div class="info-row">
-            <span class="info-label">安装次数:</span>
+            <span class="info-label">{t("templates.installCountLabel")}</span>
             <span class="info-value">{getInstallCount(selectedTemplate.id)}</span>
           </div>
         </section>
 
         <!-- 描述 -->
         <section class="description-section">
-          <h4 class="section-title">描述</h4>
+          <h4 class="section-title">{t("templates.descriptionLabel")}</h4>
           <p class="description-text">{selectedTemplate.description}</p>
         </section>
 
         <!-- 参数配置 -->
         {#if selectedTemplate.parameters.length > 0}
           <section class="parameters-section">
-            <h4 class="section-title">参数配置</h4>
+            <h4 class="section-title">{t("templates.parametersTitle")}</h4>
             <div class="parameter-list">
               {#each selectedTemplate.parameters as param}
                 <div class="parameter-item">
-                  <label class="parameter-label">
+                  <label for={`tpl-param-${param.key}`} class="parameter-label">
                     {param.name}
                     {#if param.required}
                       <span class="required-mark">*</span>
@@ -309,6 +337,7 @@
                   
                   {#if param.type === "text"}
                     <input
+                      id={`tpl-param-${param.key}`}
                       type="text"
                       class="parameter-input"
                       value={parameterValues[param.key] || ""}
@@ -317,6 +346,7 @@
                     />
                   {:else if param.type === "number"}
                     <input
+                      id={`tpl-param-${param.key}`}
                       type="number"
                       class="parameter-input"
                       value={parameterValues[param.key] || ""}
@@ -325,6 +355,7 @@
                     />
                   {:else if param.type === "url"}
                     <input
+                      id={`tpl-param-${param.key}`}
                       type="url"
                       class="parameter-input"
                       value={parameterValues[param.key] || ""}
@@ -334,6 +365,7 @@
                   {:else if param.type === "boolean"}
                     <label class="checkbox-label">
                       <input
+                        id={`tpl-param-${param.key}`}
                         type="checkbox"
                         checked={parameterValues[param.key] || false}
                         onchange={(e) => updateParameter(param.key, (e.target as HTMLInputElement).checked)}
@@ -342,11 +374,12 @@
                     </label>
                   {:else if param.type === "select" && param.options}
                     <select
+                      id={`tpl-param-${param.key}`}
                       class="parameter-select"
                       value={parameterValues[param.key] || ""}
                       onchange={(e) => updateParameter(param.key, (e.target as HTMLSelectElement).value)}
                     >
-                      <option value="">请选择...</option>
+                      <option value="">{t("templates.selectPlaceholder")}</option>
                       {#each param.options as option}
                         <option value={option}>{option}</option>
                       {/each}
@@ -377,14 +410,14 @@
 
       <footer class="modal-footer">
         <button class="btn-secondary" onclick={closeDetailModal}>
-          取消
+          {t("templates.cancel")}
         </button>
         <button
           class="btn-primary"
           onclick={installTemplate}
           disabled={installing}
         >
-          {installing ? "安装中..." : "安装模板"}
+          {installing ? t("templates.installing") : t("templates.install")}
         </button>
       </footer>
     </div>
@@ -505,8 +538,11 @@
     cursor: pointer;
   }
 
-  .reset-filters-btn:hover {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .reset-filters-btn:hover {
     background: #E5E5EA;
+  }
   }
 
   .results-count {
@@ -531,10 +567,13 @@
     transition: all 0.2s;
   }
 
-  .template-card:hover {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .template-card:hover {
     transform: translateY(-2px);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
     border-color: #007AFF;
+  }
   }
 
   .card-header {
@@ -579,6 +618,9 @@
     margin: 0 0 12px 0;
     line-height: 1.4;
     display: -webkit-box;
+    /* 标准属性也要写：只写 `-webkit-` 版本时，非 WebKit 引擎（以及未来的
+       WebKit）会忽略它，截断就静默失效（svelte-check 的兼容性判据）。 */
+    line-clamp: 2;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
@@ -658,7 +700,6 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.5);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -666,7 +707,18 @@
     padding: 20px;
   }
 
+  /* 遮罩层：一枚铺满的真按钮（背景在这里，不在 overlay 上）。 */
+  .modal-backdrop {
+    position: absolute;
+    inset: 0;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    background: rgba(0, 0, 0, 0.5);
+  }
+
   .modal-content {
+    position: relative; /* 盖在遮罩之上（同层内后出现的元素在上） */
     background: #fff;
     border-radius: 16px;
     max-width: 600px;
@@ -717,8 +769,11 @@
     justify-content: center;
   }
 
-  .close-btn:hover {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .close-btn:hover {
     background: #E5E5EA;
+  }
   }
 
   .modal-body {
@@ -870,8 +925,11 @@
     color: white;
   }
 
-  .btn-primary:hover:not(:disabled) {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-primary:hover:not(:disabled) {
     opacity: 0.8;
+  }
   }
 
   .btn-secondary {
@@ -879,8 +937,11 @@
     color: #007AFF;
   }
 
-  .btn-secondary:hover {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-secondary:hover {
     background: #E5E5EA;
+  }
   }
 
   button:disabled {

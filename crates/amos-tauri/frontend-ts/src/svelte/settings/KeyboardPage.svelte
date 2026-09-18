@@ -34,6 +34,14 @@
     importConfig,
     eventToShortcut,
   } from "../../lib/keyboardConfig";
+  // 默认值是**引擎那一份**（`keyboardConfigHook` 导出）。这里曾把三张表逐字再抄一遍
+  // （同一个键、同一个修饰符，只是包成了数组）—— 那是典型的两处真相：改引擎默认值时
+  // 设置页会继续显示旧键，而"用户没改过"的行会按旧默认值写回配置。
+  import {
+    SYSTEM_DEFAULTS,
+    SPACES_DEFAULTS,
+    TOUCH_DEFAULTS,
+  } from "../../lib/keyboardConfigHook.svelte";
   import { GROUP, SUB } from "./kit";
 
   // ─── 类型定义 ─────────────────────────────────────────────────────────────
@@ -54,24 +62,7 @@
   }
 
   // ─── 系统默认快捷键定义 ──────────────────────────────────────────────────
-  const SYSTEM_DEFAULTS: Record<string, ShellShortcut[]> = {
-    closeWindow: [{ key: "W", meta: true }],
-    minimizeWindow: [{ key: "M", meta: true }],
-    hideApp: [{ key: "H", meta: true }],
-    preferences: [{ key: ",", meta: true }],
-  };
-
-  const SPACES_DEFAULTS: Record<string, ShellShortcut[]> = {
-    spacesPrev: [{ key: "ArrowLeft", ctrl: true }],
-    spacesNext: [{ key: "ArrowRight", ctrl: true }],
-    spacesPanel: [{ key: "ArrowUp", ctrl: true }],
-    spacesDirect: [{ key: "1", ctrl: true }], // 注意：1-9 需要特殊处理
-  };
-
-  const TOUCH_DEFAULTS: Record<string, ShellShortcut[]> = {
-    back: [{ key: "[", meta: true }],
-    dismiss: [{ key: "Escape" }],
-  };
+  // 见上面的 import：这三张表来自引擎（`keyboardConfigHook`），本文件不再自带副本。
 
   // ─── 从注册表生成浮层快捷键 ─────────────────────────────────────────────
   function buildOverlayRows(): EditableShortcutRow[] {
@@ -100,7 +91,7 @@
     const config = readKeyboardConfig();
     return Object.entries(SYSTEM_DEFAULTS).map(([id, defaults]) => {
       const custom = config.system[id];
-      const shortcuts: ShellShortcut[] = custom !== undefined ? (custom ? [custom] : []) : [...defaults];
+      const shortcuts: ShellShortcut[] = custom !== undefined ? (custom ? [custom] : []) : [defaults];
       const disabled = custom === null;
       const first = shortcuts[0];
       return {
@@ -118,7 +109,7 @@
     const config = readKeyboardConfig();
     return Object.entries(SPACES_DEFAULTS).map(([id, defaults]) => {
       const custom = config.spaces[id];
-      const shortcuts: ShellShortcut[] = custom !== undefined ? (custom ? [custom] : []) : [...defaults];
+      const shortcuts: ShellShortcut[] = custom !== undefined ? (custom ? [custom] : []) : [defaults];
       const disabled = custom === null;
       const first = shortcuts[0];
       return {
@@ -136,7 +127,7 @@
     const config = readKeyboardConfig();
     return Object.entries(TOUCH_DEFAULTS).map(([id, defaults]) => {
       const custom = config.touch[id];
-      const shortcuts: ShellShortcut[] = custom !== undefined ? (custom ? [custom] : []) : [...defaults];
+      const shortcuts: ShellShortcut[] = custom !== undefined ? (custom ? [custom] : []) : [defaults];
       const disabled = custom === null;
       const first = shortcuts[0];
       return {

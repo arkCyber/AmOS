@@ -13,10 +13,11 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import SettingsApp from "../src/svelte/SettingsApp.svelte";
 import RadioPage from "../src/svelte/settings/RadioPage.svelte";
 import AiPage from "../src/svelte/settings/AiPage.svelte";
+import NotificationsPage from "../src/svelte/settings/NotificationsPage.svelte";
 import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
 import { readQuarantine } from "../src/lib/amosStore";
-import { SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
-import { BACKUP_KEY, BACKUP_VERSION } from "../src/lib/cloud";
+import { NOTIF_KEY, SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
+import { BACKUP_KEY, BACKUP_VERSION, SYNC_STORES } from "../src/lib/cloud";
 import { NOTES_KEY } from "../src/lib/notes";
 import { CONTACTS_KEY } from "../src/lib/contacts";
 import { WIFI_KEY } from "../src/lib/wifi";
@@ -210,10 +211,10 @@ describe("Settings real sub pages (interactions)", () => {
 
     await fireEvent.click(buttonContaining(host, "立即同步") as HTMLButtonElement);
     // The snapshot is real and readable, and the page says what it holds: one of the
-    // 17 stores carries content (the untouched ones are the `[]` default).
+    // stores in the backup set carries content (the rest are the `[]` default).
     const blob = readStoreValue<string>(BACKUP_KEY, "");
     expect(blob).toContain(`"${NOTES_KEY}"`);
-    expect(txt(host)).toContain("本地备份：1/17 个存储有内容");
+    expect(txt(host)).toContain(`本地备份：1/${SYNC_STORES.length} 个存储有内容`);
 
     // The user loses the notes; restoring the backup brings them back.
     writeStoreValue(NOTES_KEY, []);
@@ -221,7 +222,7 @@ describe("Settings real sub pages (interactions)", () => {
     expect(readStoreValue<Array<{ id: string }>>(NOTES_KEY, [])).toEqual([
       { id: "n1", text: "记一笔", ts: 1 },
     ]);
-    expect(txt(host)).toContain("已恢复 17 个存储");
+    expect(txt(host)).toContain(`已恢复 ${SYNC_STORES.length} 个存储`);
   });
 
   test("iCloud restore refuses non-content keys (a forged backup cannot re-grant a capability)", async () => {
@@ -332,7 +333,7 @@ describe("Settings real sub pages (interactions)", () => {
       expect(txt(host)).toContain("备份写入失败（存储空间不足或不可用），未做任何更改");
       // The summary still describes what IS actually stored (the previous backup) —
       // not the attempt that failed.
-      expect(txt(host)).toContain("本地备份：1/17 个存储有内容");
+      expect(txt(host)).toContain(`本地备份：1/${SYNC_STORES.length} 个存储有内容`);
       const onDisk = JSON.parse(readStoreValue<string>(BACKUP_KEY, "{}")) as {
         stores?: Record<string, Array<{ id: string }>>;
       };
@@ -1301,6 +1302,7 @@ describe("AiPage — client diagnostics ledger (audit P1-3)", () => {
     setDiagMinLevel("info");
   });
 
+
   test("shows recent client failures together with what the ring dropped", async () => {
     amosWarn("backend", "get_status failed");
     setDiagMinLevel("warn");
@@ -1532,3 +1534,142 @@ describe("RadioPage — a switch the platform owns (REQ-A202)", () => {
   });
 });
 
+describe("NotificationsPage — the push backend section (REQ-A383)", () => {
+  type PushStatusReply = {
+    available: boolean;
+    device_token: { token: string; environment: string; registered_at: string } | null;
+    permission: string;
+    badge_count: number;
+    statistics: {
+      total_received: number;
+      with_badge: number;
+      with_sound: number;
+      silent: number;
+      last_received: string | null;
+    };
+  };
+
+  const status = (over: Partial<PushStatusReply> = {}): PushStatusReply => ({
+    available: true,
+    device_token: null,
+    permission: "notdetermined",
+    badge_count: 0,
+    statistics: { total_received: 0, with_badge: 0, with_sound: 0, silent: 0, last_received: null },
+    ...over,
+  });
+
+  /** A host that answers the push commands, so the page's wiring is observable. */
+  function installPushBridge(initial: PushStatusReply, after: Partial<PushStatusReply> = {}) {
+    const calls: string[] = [];
+    let current = initial;
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        calls.push(cmd);
+        switch (cmd) {
+          case "push_get_status":
+            return current;
+          case "push_request_permission":
+            current = status({ ...after, permission: after.permission ?? "authorized" });
+            return { kind: "ok" };
+          case "push_clear_history":
+            return null;
+          default:
+            return null;
+        }
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.restoreAllMocks();
+  });
+
+  test("with no host it says the backend is unavailable instead of inventing a status", async () => {
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushSettings.unavailable"]));
+    expect(buttonContaining(host, zh["pushSettings.retry"])).toBeTruthy();
+    // And not a single control that could not work.
+    expect(buttonContaining(host, zh["pushPermission.request"])).toBeUndefined();
+  });
+
+  test("a platform without push support is reported as unavailable, not as 'not determined'", async () => {
+    installPushBridge(status({ available: false }));
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushSettings.unavailable"]));
+    expect(txt(host)).not.toContain(zh["pushPermission.description"]);
+  });
+
+  test("the permission request goes to the backend and the page re-reads the device", async () => {
+    const calls = installPushBridge(status());
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushPermission.description"]));
+
+    await fireEvent.click(buttonContaining(host, zh["pushPermission.request"]) as HTMLButtonElement);
+    await vi.waitFor(() =>
+      expect(txt(host)).toContain(zh["pushPermission.successDescription"]),
+    );
+    expect(calls).toContain("push_request_permission");
+    // The authorized state no longer offers the request button.
+    expect(buttonContaining(host, zh["pushPermission.request"])).toBeUndefined();
+  });
+
+  test("a denied permission says so, and points at the system settings", async () => {
+    installPushBridge(status({ permission: "denied" }));
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushPermission.denied"]));
+    expect(txt(host)).toContain(zh["pushPermission.deniedHint"]);
+    expect(buttonContaining(host, zh["pushPermission.request"])).toBeUndefined();
+  });
+
+  test("the token, its environment and the statistics come from the device", async () => {
+    installPushBridge(
+      status({
+        device_token: {
+          token: "a1".repeat(32),
+          environment: "production",
+          registered_at: "2026-09-17T10:00:00+00:00",
+        },
+        statistics: {
+          total_received: 4,
+          with_badge: 2,
+          with_sound: 1,
+          silent: 1,
+          last_received: "2026-09-17T10:00:00+00:00",
+        },
+      }),
+    );
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain("a1a1"));
+    expect(txt(host)).toContain(zh["pushSettings.envProduction"]);
+    expect(txt(host)).toContain(zh["pushSettings.registeredAt"]);
+    expect(txt(host)).toContain(zh["pushSettings.statistics"]);
+    expect(txt(host)).toContain(zh["pushSettings.lastReceived"]);
+    expect(txt(host)).not.toContain(zh["pushSettings.never"]);
+  });
+
+  test("clearing push history wipes the deliveries and leaves the shell's own notifications", async () => {
+    installPushBridge(status({ permission: "authorized" }));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    writeStoreValue(NOTIF_KEY, [
+      { id: "p1", app: "Mail", time: 20, source: "push", read: false },
+      { id: "s1", app: "时钟", time: 10 },
+    ]);
+
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushSettings.clearAll"]));
+    await fireEvent.click(buttonContaining(host, zh["pushSettings.clearAll"]) as HTMLButtonElement);
+
+    await vi.waitFor(() =>
+      expect(
+        (readStoreValue<Array<{ id: string }>>(NOTIF_KEY, []) ?? []).some((n) => n.id === "p1"),
+      ).toBe(false),
+    );
+    // The shell's own row is untouched: push does not own the whole list.
+    expect((readStoreValue<Array<{ id: string }>>(NOTIF_KEY, []) ?? []).map((n) => n.id)).toEqual([
+      "s1",
+    ]);
+  });
+});

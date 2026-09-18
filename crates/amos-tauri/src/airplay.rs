@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::airplay_platform::{platform_start_discovery, platform_stop_discovery, platform_get_devices, PlatformDiscovery};
+use crate::airplay_platform::{
+    platform_get_devices, platform_start_discovery, platform_stop_discovery, PlatformDiscovery,
+};
 
 /// AirPlay device type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,21 +179,21 @@ impl AirPlayManager {
             if !matches!(result, AirPlayResult::Ok) {
                 return result;
             }
-            
+
             // Also load platform devices
             let platform_devices = platform_get_devices(&self.platform_discovery);
             if !platform_devices.is_empty() {
                 self.devices = platform_devices;
                 return AirPlayResult::Ok;
             }
-            
+
             // Fall back to demo devices in debug mode if no real devices found
             #[cfg(debug_assertions)]
             {
                 self.devices = Self::demo_devices();
             }
-            
-            return AirPlayResult::Ok;
+
+            AirPlayResult::Ok
         }
 
         // For other platforms, use demo devices in development
@@ -201,7 +203,7 @@ impl AirPlayManager {
             {
                 self.devices = Self::demo_devices();
             }
-            
+
             AirPlayResult::Ok
         }
     }
@@ -209,7 +211,7 @@ impl AirPlayManager {
     /// Stop device discovery
     pub fn stop_discovery(&mut self) {
         self.discovering = false;
-        
+
         // Stop platform-specific discovery
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
@@ -227,7 +229,7 @@ impl AirPlayManager {
                 return platform_devices;
             }
         }
-        
+
         // Otherwise return cached devices (including demo devices in debug mode)
         self.devices.clone()
     }
@@ -288,29 +290,25 @@ impl AirPlayManager {
     }
 
     /// Start streaming media
-    pub fn start_stream(
-        &mut self,
-        kind: StreamKind,
-        url: Option<String>,
-    ) -> AirPlayResult {
+    pub fn start_stream(&mut self, kind: StreamKind, url: Option<String>) -> AirPlayResult {
         if !self.is_available() {
             return AirPlayResult::Unavailable {
                 reason: self.unavailable_reason(),
             };
         }
 
-        if self.status.device.is_none() {
-            return AirPlayResult::Failed {
-                reason: "No device connected".to_string(),
-            };
-        }
+        let device = match self.status.device.as_ref() {
+            Some(device) => device,
+            None => {
+                return AirPlayResult::Failed {
+                    reason: "No device connected".to_string(),
+                }
+            }
+        };
 
-        // TODO: Platform-specific streaming logic
-        self.status.stream_kind = Some(kind);
-        self.status.playing = true;
-
-        // Validate device capabilities
-        let device = self.status.device.as_ref().unwrap();
+        // Validate the device **before** touching `status`: the old order set
+        // `playing = true` first and then returned `Failed`, so a refused stream left the
+        // status claiming a stream that never started.
         match kind {
             StreamKind::Video if !device.supports_video => {
                 return AirPlayResult::Failed {
@@ -329,6 +327,10 @@ impl AirPlayManager {
             }
             _ => {}
         }
+
+        // TODO: Platform-specific streaming logic
+        self.status.stream_kind = Some(kind);
+        self.status.playing = true;
 
         // Suppress unused variable warning
         let _ = url;
@@ -455,9 +457,7 @@ pub async fn airplay_get_devices(
 
 /// Tauri command: Get current status
 #[tauri::command]
-pub async fn airplay_get_status(
-    state: State<'_, AirPlayState>,
-) -> Result<AirPlayStatus, String> {
+pub async fn airplay_get_status(state: State<'_, AirPlayState>) -> Result<AirPlayStatus, String> {
     let mgr = state.0.lock().map_err(|e| e.to_string())?;
     Ok(mgr.get_status())
 }
@@ -528,7 +528,16 @@ mod tests {
                     #[cfg(debug_assertions)]
                     assert!(!mgr.get_devices().is_empty());
                 }
-                _ => {}
+                // Every other outcome is a refusal, and all three refusal variants that can
+                // carry a reason must carry one: "it did not work" with no sentence is the
+                // defect worth failing on. Before REQ-A388 this was a single-pattern `match`
+                // with a `_ => {}` arm, so *every* outcome passed silently.
+                AirPlayResult::Unavailable { reason }
+                | AirPlayResult::PermissionDenied { reason }
+                | AirPlayResult::Failed { reason } => {
+                    assert!(!reason.is_empty(), "a refusal must explain itself");
+                }
+                AirPlayResult::DeviceNotFound => {}
             }
         }
     }

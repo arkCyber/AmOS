@@ -56,6 +56,13 @@ pub struct PushPayload {
 }
 
 /// APNs standard payload structure
+///
+/// The wire keys are the **APNs-standard kebab-case names** (`content-available`,
+/// `mutable-content`, `thread-id`) — which is also what `pushNotifications.ts`
+/// declares on the TypeScript side. Without the renames serde published
+/// `content_available` / `mutable_content` / `thread_id`, so a real APNs payload
+/// arriving with `content-available` fell through to the flattened `custom` map and
+/// `isSilentPush()` could never see it (`PUSH_PHASE3_DAY3_RESEARCH_AND_DESIGN.md` §8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApsPayload {
     /// Alert content (string or object)
@@ -68,13 +75,13 @@ pub struct ApsPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sound: Option<String>,
     /// Content available flag (silent push)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "content-available", skip_serializing_if = "Option::is_none")]
     pub content_available: Option<i32>,
     /// Mutable content flag (media attachments)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mutable-content", skip_serializing_if = "Option::is_none")]
     pub mutable_content: Option<i32>,
     /// Thread ID (notification grouping)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "thread-id", skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// Category identifier
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -405,26 +412,26 @@ pub fn push_register_token(
         });
     }
 
-    let mut manager = state.manager.lock()
+    let mut manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.register_token(token, environment))
 }
 
 /// Get current device token
 #[tauri::command]
-pub fn push_get_token(
-    state: State<PushNotificationState>,
-) -> Result<Option<DeviceToken>, String> {
-    let manager = state.manager.lock()
+pub fn push_get_token(state: State<PushNotificationState>) -> Result<Option<DeviceToken>, String> {
+    let manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.get_token())
 }
 
 /// Request push notification permission
 #[tauri::command]
-pub fn push_request_permission(
-    state: State<PushNotificationState>,
-) -> Result<PushResult, String> {
+pub fn push_request_permission(state: State<PushNotificationState>) -> Result<PushResult, String> {
     if !is_platform_available() {
         return Ok(PushResult::Unavailable {
             reason: "Push notifications not available on this platform".to_string(),
@@ -433,7 +440,9 @@ pub fn push_request_permission(
 
     // Platform-specific permission request would go here
     // For now, simulate authorization
-    let mut manager = state.manager.lock()
+    let mut manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     manager.set_permission(PermissionStatus::Authorized);
     Ok(PushResult::Ok)
@@ -444,7 +453,9 @@ pub fn push_request_permission(
 pub fn push_get_permission(
     state: State<PushNotificationState>,
 ) -> Result<PermissionStatus, String> {
-    let manager = state.manager.lock()
+    let manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.get_permission())
 }
@@ -455,28 +466,29 @@ pub fn push_simulate_receive(
     payload: PushPayload,
     state: State<PushNotificationState>,
 ) -> Result<String, String> {
-    let mut manager = state.manager.lock()
+    let mut manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     manager.receive_notification(payload)
 }
 
 /// Get badge count
 #[tauri::command]
-pub fn push_get_badge(
-    state: State<PushNotificationState>,
-) -> Result<i32, String> {
-    let manager = state.manager.lock()
+pub fn push_get_badge(state: State<PushNotificationState>) -> Result<i32, String> {
+    let manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.get_badge())
 }
 
 /// Set badge count
 #[tauri::command]
-pub fn push_set_badge(
-    count: i32,
-    state: State<PushNotificationState>,
-) -> Result<(), String> {
-    let mut manager = state.manager.lock()
+pub fn push_set_badge(count: i32, state: State<PushNotificationState>) -> Result<(), String> {
+    let mut manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     manager.set_badge(count);
     Ok(())
@@ -488,28 +500,29 @@ pub fn push_get_history(
     limit: Option<usize>,
     state: State<PushNotificationState>,
 ) -> Result<Vec<NotificationRecord>, String> {
-    let manager = state.manager.lock()
+    let manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.get_history(limit))
 }
 
 /// Mark notification as read
 #[tauri::command]
-pub fn push_mark_read(
-    id: String,
-    state: State<PushNotificationState>,
-) -> Result<bool, String> {
-    let mut manager = state.manager.lock()
+pub fn push_mark_read(id: String, state: State<PushNotificationState>) -> Result<bool, String> {
+    let mut manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.mark_read(&id))
 }
 
 /// Clear notification history
 #[tauri::command]
-pub fn push_clear_history(
-    state: State<PushNotificationState>,
-) -> Result<(), String> {
-    let mut manager = state.manager.lock()
+pub fn push_clear_history(state: State<PushNotificationState>) -> Result<(), String> {
+    let mut manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     manager.clear_history();
     Ok(())
@@ -517,20 +530,116 @@ pub fn push_clear_history(
 
 /// Get push statistics
 #[tauri::command]
-pub fn push_get_statistics(
-    state: State<PushNotificationState>,
-) -> Result<PushStatistics, String> {
-    let manager = state.manager.lock()
+pub fn push_get_statistics(state: State<PushNotificationState>) -> Result<PushStatistics, String> {
+    let manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.get_statistics())
 }
 
 /// Get push notification status
 #[tauri::command]
-pub fn push_get_status(
-    state: State<PushNotificationState>,
-) -> Result<PushStatus, String> {
-    let manager = state.manager.lock()
+pub fn push_get_status(state: State<PushNotificationState>) -> Result<PushStatus, String> {
+    let manager = state
+        .manager
+        .lock()
         .map_err(|e| format!("Failed to lock state: {}", e))?;
     Ok(manager.get_status())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire names are a contract with `pushNotifications.ts` (`PushPayload`):
+    /// a real APNs payload spells these three keys kebab-case, so a rename that
+    /// silently went back to snake_case would drop a silent push on the floor
+    /// (`isSilentPush()` would never see `content-available`).
+    #[test]
+    fn aps_payload_uses_the_apns_standard_wire_keys() {
+        let json = r#"{"alert":"hi","badge":3,"sound":"default","content-available":1,"mutable-content":1,"thread-id":"news-1"}"#;
+        let aps: ApsPayload = serde_json::from_str(json).expect("an APNs payload must parse");
+        assert_eq!(aps.content_available, Some(1));
+        assert_eq!(aps.mutable_content, Some(1));
+        assert_eq!(aps.thread_id.as_deref(), Some("news-1"));
+
+        let out = serde_json::to_value(&aps).expect("must serialize");
+        assert!(out.get("content-available").is_some());
+        assert!(out.get("mutable-content").is_some());
+        assert!(out.get("thread-id").is_some());
+        assert!(
+            out.get("content_available").is_none(),
+            "the pre-rename snake_case key must not come back on the wire"
+        );
+    }
+
+    /// A silent push is a *recorded* delivery with no alert — which is exactly how
+    /// the frontend bridge decides to keep it off the screen (history only).
+    #[test]
+    fn a_silent_push_is_counted_as_silent_and_keeps_its_custom_data() {
+        let payload: PushPayload =
+            serde_json::from_str(r#"{"aps":{"content-available":1},"kind":"sync"}"#)
+                .expect("a silent payload must parse");
+        assert!(payload.aps.alert.is_none());
+        assert_eq!(payload.aps.content_available, Some(1));
+        // Custom data survives the flatten, so the app can still route the update.
+        assert_eq!(
+            payload.custom.get("kind").and_then(|v| v.as_str()),
+            Some("sync")
+        );
+
+        let mut manager = PushNotificationManager::new();
+        let id = manager
+            .receive_notification(payload)
+            .expect("a silent delivery is still a delivery");
+        let stats = manager.get_statistics();
+        assert_eq!(stats.total_received, 1);
+        assert_eq!(stats.silent, 1);
+        assert_eq!(stats.with_badge, 0);
+        assert!(manager.get_history(None).iter().any(|r| r.id == id));
+    }
+
+    /// Delivery → history is unread, and `mark_read` is the only thing that flips
+    /// it — the flag the notification centre reflects must come from here.
+    #[test]
+    fn a_delivery_enters_the_history_unread_until_it_is_marked_read() {
+        let payload: PushPayload =
+            serde_json::from_str(r#"{"aps":{"alert":"ping","badge":2}}"#).expect("must parse");
+        let mut manager = PushNotificationManager::new();
+        let id = manager.receive_notification(payload).expect("must record");
+
+        let record = manager
+            .get_history(None)
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("the delivery must be in the history");
+        assert!(!record.read, "a fresh delivery is unread");
+        assert_eq!(
+            manager.get_badge(),
+            2,
+            "the badge is the payload's absolute value"
+        );
+
+        assert!(manager.mark_read(&id), "an existing id is marked");
+        assert!(
+            !manager.mark_read("notif_does_not_exist"),
+            "an unknown id is not"
+        );
+    }
+
+    /// The 4 KB APNs bound is enforced at the seam, not trusted from the caller.
+    #[test]
+    fn an_oversized_payload_is_refused_rather_than_stored() {
+        let filler = "x".repeat(MAX_PAYLOAD_SIZE + 1);
+        let payload: PushPayload = serde_json::from_value(serde_json::json!({
+            "aps": { "alert": "hi" },
+            "filler": filler,
+        }))
+        .expect("must parse");
+        let mut manager = PushNotificationManager::new();
+        assert!(manager.receive_notification(payload).is_err());
+        assert!(manager.get_history(None).is_empty(), "nothing was stored");
+        assert_eq!(manager.get_statistics().total_received, 0);
+    }
 }

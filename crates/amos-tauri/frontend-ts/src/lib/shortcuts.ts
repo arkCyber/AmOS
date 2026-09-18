@@ -558,12 +558,20 @@ export const BUILTIN_ACTIONS: ActionType[] = [
 
 // ============================================================================
 // 存储键
+//
+// 每个键都以**具名常量**导出：`lib/cloud.ts` 的 `SYNC_STORES` 只允许引用模块
+// 自己的键常量，不许重写字面量（历史上重写导致 `amos.files.fav` 与
+// `FILES_FAV_KEY` 不匹配、备份静默漏掉一个 store）。
 // ============================================================================
 
+export const SHORTCUTS_KEY = "amos.shortcuts";
+export const SHORTCUT_FOLDERS_KEY = "amos.shortcuts.folders";
+export const SHORTCUT_EXEC_LOG_KEY = "amos.shortcuts.execLog";
+
 const STORE_KEYS = {
-  SHORTCUTS: "amos.shortcuts",
-  FOLDERS: "amos.shortcuts.folders",
-  EXECUTION_LOG: "amos.shortcuts.execLog",
+  SHORTCUTS: SHORTCUTS_KEY,
+  FOLDERS: SHORTCUT_FOLDERS_KEY,
+  EXECUTION_LOG: SHORTCUT_EXEC_LOG_KEY,
 } as const;
 
 // ============================================================================

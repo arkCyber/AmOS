@@ -18,6 +18,13 @@ import { CALENDAR_KEY, CALENDARS_KEY } from "./calendar";
 import { ALARM_KEY } from "./alarmCore";
 import { CALLLOG_KEY } from "./calllog";
 import { INTERP_LOG_KEY } from "./interp";
+// 这些 store 装的是**用户自己创建的内容**，此前不在备份集合里（store-scan 逐条
+// 点名）：用户的快捷指令与文件夹、浏览器的书签与下载列表、管理员/用户装的企业
+// 模板、审计记录。它们各自模块的键常量现在是导出的，这里直接引用，不重写字符串。
+import { SHORTCUTS_KEY, SHORTCUT_FOLDERS_KEY } from "./shortcuts";
+import { BOOKMARKS_KEY, DOWNLOADS_KEY } from "./webman";
+import { TEMPLATES_KEY } from "./enterprise/templates";
+import { AUDIT_LOGS_KEY } from "./enterprise/audit";
 
 export const SETTINGS_KEY = "amos.settings";
 export const BACKUP_KEY = "amos.cloud.backup";
@@ -61,6 +68,15 @@ export const SYNC_STORES = [
   ALARM_KEY,
   CALLLOG_KEY,
   INTERP_LOG_KEY,
+  // 用户自己创建的内容（REQ-A384）：这些此前**不在**备份集合里，是 store-scan
+  // 逐条点名后才补上的 —— 快捷指令、它们所在的文件夹、浏览器书签与下载列表、
+  // 企业模板、审计记录。
+  SHORTCUTS_KEY,
+  SHORTCUT_FOLDERS_KEY,
+  BOOKMARKS_KEY,
+  DOWNLOADS_KEY,
+  TEMPLATES_KEY,
+  AUDIT_LOGS_KEY,
 ] as const;
 
 export interface CloudPrefs {

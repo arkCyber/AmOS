@@ -208,14 +208,11 @@ pub fn sanitize_label(label: Option<String>) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn dock_badge_set(
-    app: AppHandle,
-    state: tauri::State<'_, DockBadgeState>,
-    label: Option<String>,
-) -> Result<(), String> {
-    // The command's `State` parameter gives us the same handle `apply()` mutates
-    // — we pass it through so the boot fact + frontend echo stays accurate.
-    let _ = state;
+pub fn dock_badge_set(app: AppHandle, label: Option<String>) -> Result<(), String> {
+    // No `State<DockBadgeState>` parameter: this command only *applies* a label, and
+    // `apply` reaches the same handle through the app. The parameter that used to sit here
+    // existed solely to be ignored (`let _ = state;`) — the state is for readers
+    // (`current()`), not for the writer.
     apply(&app, label)
 }
 

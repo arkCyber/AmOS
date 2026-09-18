@@ -109,9 +109,14 @@ export function dynamicPrefixes(sources) {
  * are concatenated corpora; `prefixes` are the dynamic namespaces.
  */
 export function isLive(key, prod, contract, prefixes) {
-  const quoted = `"${key}"`;
-  if (prod.includes(quoted)) return "prod";
-  if (contract.includes(quoted)) return "contract";
+  // **两种引号都算引用**。代码库里 `t("nc.title")` 与 `t('airplay.title')` 并存，
+  // 而这里原先只找双引号 ⇒ 一个只用单引号的组件（`AirPlayPanel.svelte` 通篇是
+  // 单引号）会让它**真正在用**的键被报成"死键"，逼出错误的豁免条目
+  // （REQ-A384：20 个 airplay 死键里有一半其实是活的）。
+  const doubleQuoted = `"${key}"`;
+  const singleQuoted = `'${key}'`;
+  if (prod.includes(doubleQuoted) || prod.includes(singleQuoted)) return "prod";
+  if (contract.includes(doubleQuoted) || contract.includes(singleQuoted)) return "contract";
   for (const p of prefixes) if (key.startsWith(p)) return "dynamic";
   return null;
 }
@@ -696,6 +701,15 @@ export function runSelftest() {
   ok("live via contract", isLive("care.uninstall.protected", prod, contract, pre) === "contract");
   ok("live via dynamic prefix", isLive("message.folder.sent", prod, contract, pre) === "dynamic");
   ok("dead key", isLive("nobody.uses.me", prod, contract, pre) === null);
+  // 负控：只用单引号的引用也必须算"活的" —— 放开这条就是原缺陷（REQ-A384）。
+  ok(
+    "a single-quoted reference counts as live",
+    isLive("single.quoted", "const x = t('single.quoted');", "", new Set()) === "prod",
+  );
+  ok(
+    "a single-quoted contract key counts as live",
+    isLive("care.protected", "", "reason_key: 'care.protected'", new Set()) === "contract",
+  );
 
   // A stale exemption (REQ-A353): the entry exists, the reason does not hold any more.
   const allowDemo = [

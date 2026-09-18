@@ -52,6 +52,7 @@
   import TelemetrySpyPage from "./settings/TelemetrySpyPage.svelte";
   import NetGuardPage from "./settings/NetGuardPage.svelte";
   import NotificationsPage from "./settings/NotificationsPage.svelte";
+  import PushNotificationSettings from "./modules/PushNotificationSettings.svelte";
   import SoundPage from "./settings/SoundPage.svelte";
   import RingtonePage from "./settings/RingtonePage.svelte";
   import AboutPage from "./settings/AboutPage.svelte";
@@ -71,6 +72,7 @@
     | "cellular"
     | "hotspot"
     | "notifications"
+    | "push_management"
     | "sound"
     | "ringtone"
     | "focus"
@@ -99,6 +101,7 @@
     cellular: "settings.cellular",
     hotspot: "settings.hotspot",
     notifications: "settings.notifications",
+    push_management: "settings.push_management",
     sound: "settings.soundHaptics",
     ringtone: "settings.ringtone",
     focus: "settings.focus",
@@ -132,6 +135,7 @@
     cellular: ["mobile data", "data", "sim", "网络", "流量", "数据"],
     hotspot: ["hotspot", "tether", "tethering", "share", "ap", "个人热点", "热点", "网络共享", "共享"],
     notifications: ["alert", "badge", "提醒", "角标", "横幅", "勿扰", "banner"],
+    push_management: ["push", "remote", "apns", "token", "device", "推送", "远程", "令牌", "历史", "测试", "设备", "统计"],
     sound: ["ringtone", "volume", "铃声", "音量", "静音", "mute"],
     ringtone: ["ringtone", "来电铃声", "铃声", "振动", "ring", "vibrate"],
     focus: ["勿扰", "dnd", "sleep", "睡眠", "专注"],
@@ -328,9 +332,10 @@
       { kind: "nav", page: "cellular", key: "settings.cellular", sub: () => cellularSub },
       { kind: "nav", page: "hotspot", key: "settings.hotspot", sub: () => hotspotSub },
     ],
-    // 通用：通知 / 声音与触感 / 来电铃声 / 专注模式
+    // 通用：通知 / 推送通知管理 / 声音与触感 / 来电铃声 / 专注模式
     [
       { kind: "nav", page: "notifications", key: "settings.notifications" },
+      { kind: "nav", page: "push_management", key: "settings.push_management" },
       { kind: "nav", page: "sound", key: "settings.soundHaptics" },
       { kind: "nav", page: "ringtone", key: "settings.ringtone" },
       { kind: "nav", page: "focus", key: "settings.focus", sub: () => focusSub },
@@ -521,6 +526,8 @@
         <NetGuardPage />
       {:else if page === "notifications"}
         <NotificationsPage />
+      {:else if page === "push_management"}
+        <PushNotificationSettings />
       {:else if page === "sound"}
         <SoundPage />
       {:else if page === "ringtone"}

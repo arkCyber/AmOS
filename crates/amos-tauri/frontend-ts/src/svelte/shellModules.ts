@@ -18,8 +18,9 @@
  * Round 2 (REQ-A262): the table now covers **all five slots** — the bar's left group
  * (Apple menu / app name / main menu), the bar's right group, the stage clock, the
  * dock's system items and the three overlays — and the overlay rows are the shell's
- * **shortcut list** (see `DesktopShell.svelte`: the key handler asks
- * `moduleForShortcut("overlay", …)`, it does not know F4 from ⌘Space by heart).
+ * **shortcut list** (see `DesktopShell.svelte`: the key handler matches the event against the
+ * **merged** bindings — this table's defaults plus the user's keyboard settings
+ * (`mergeOverlayBindings`) — so the shell does not know F4 from ⌘Space by heart).
  */
 import type { ShellModule } from "../lib/shellModule";
 import BatteryWidget from "./modules/BatteryWidget.svelte";
@@ -216,11 +217,17 @@ export const SHELL_MODULES: ShellModule[] = [
    * (b) hijack Ctrl+ArrowLeft / Ctrl+ArrowRight from any text editor the user
    * is typing in.
    *
-   * The Ctrl+↑ binding is registered **locally in `SpacesPanel.svelte`** and
-   * dispatched by `DesktopShell` when the panel is mounted (see
-   * `DesktopShell.svelte`'s `spacePanelOpen` toggle + `keydown` handler); the
-   * local registration prevents it from clashing with `SpotlightOverlay`
-   * (⌘Space) or any editor's caret motion.
+   * The Ctrl+↑ binding is **not owned here** either: it lives in the keyboard
+   * config's `spaces` domain (`SPACES_DEFAULTS.spacesPanel`, overridable or
+   * disable-able from the keyboard settings page) and `DesktopShell` dispatches it
+   * from the **merged** `bindings.spaces` — so the registry stays a four-entry
+   * launch list while the panel still has a documented global key.
+   *
+   * (It used to be swallowed: the old shell had a hand-written `Ctrl+↑` branch that
+   * called `preventDefault()` + `stopPropagation()` and then did nothing — an
+   * earlier version of this comment claimed the binding was "registered locally in
+   * `SpacesPanel.svelte` and dispatched by `DesktopShell`", which described a path
+   * that did not exist. REQ-A395 replaced both with the config-driven dispatch.)
    *
    * The list order keeps the registry in the order documented by
    * `__tests__/shellModule.test.ts` ("the order the bar documents") — order 50

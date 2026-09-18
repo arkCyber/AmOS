@@ -44,6 +44,9 @@ export async function initializeEnterprise(): Promise<void> {
  * 关闭所有企业功能
  */
 export async function shutdownEnterprise(): Promise<void> {
+  // MDM 的自动同步定时器要显式停掉：壳长期存活，留着它就会一直按 syncInterval
+  // 醒来（REQ-A385）。其余三个各自在自己的 shutdown 里收拾。
+  mdmManager.stopAutoSync();
   await auditLogger.shutdown();
   webhookManager.shutdown();
 }

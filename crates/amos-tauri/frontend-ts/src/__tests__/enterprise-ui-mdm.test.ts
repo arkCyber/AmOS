@@ -12,7 +12,7 @@
 
 import { describe, test, expect, beforeEach, beforeAll, afterAll } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
-import { mdmManager } from "../lib/enterprise";
+import { MDMManager, mdmManager } from "../lib/enterprise/mdm";
 import type { MDMRestrictions } from "../lib/enterprise/mdm";
 
 // 注册 happy-dom 全局对象（包括 localStorage）
@@ -30,14 +30,13 @@ describe("MDMPanel UI 逻辑测试", () => {
   });
 
   describe("配置管理", () => {
-    test("应该能够启用和禁用 MDM", () => {
-      const config = mdmManager.getConfig();
-      expect(config?.enabled).toBe(false);
-
-      mdmManager.configure({ ...config, enabled: true });
+    test("应该能够启用和禁用 MDM", async () => {
+      // `configure` 是异步的（写盘之后才算配好），所以这里 await；
+      // 也不能假设初始 config 一定是 null —— 它是模块级单例，前面的用例会留下状态。
+      await mdmManager.configure({ enabled: true });
       expect(mdmManager.getConfig()?.enabled).toBe(true);
 
-      mdmManager.configure({ ...mdmManager.getConfig(), enabled: false });
+      await mdmManager.configure({ enabled: false });
       expect(mdmManager.getConfig()?.enabled).toBe(false);
     });
 
@@ -99,23 +98,32 @@ describe("MDMPanel UI 逻辑测试", () => {
       expect(restrictions?.maxExecutionsPerDay).toBe(500);
     });
 
-    test("禁用 MDM 时应该返回默认宽松限制", () => {
-      const config = mdmManager.getConfig();
-      
-      mdmManager.configure({
-        ...config,
-        enabled: false,
+    test("禁用 MDM 时限制不再生效（由 enabled 门控，而不是丢弃配置）", async () => {
+      // 真实语义：`getRestrictions()` 返回**配置里写的值**（管理员的设定），
+      // 禁用后生效与否由 `checkPermission` 的 `!enabled ⇒ allowed: true` 决定。
+      // 原来的断言要求"禁用时返回宽松默认值"——代码里没有这个行为，而且不该有：
+      // 丢掉配置等于用户重新启用后要再配一遍。
+      // 先"启用 + 收紧"，确认限制真的在起作用
+      await mdmManager.configure({
+        enabled: true,
         restrictions: {
-          ...config?.restrictions,
+          ...mdmManager.getRestrictions(),
           allowUserCreate: false,
           allowUserModify: false,
-        } as MDMRestrictions,
+        },
       });
+      expect(mdmManager.checkCanCreate().allowed).toBe(false);
 
-      const restrictions = mdmManager.getRestrictions();
-      // 禁用时应该返回宽松的默认值
-      expect(restrictions?.allowUserCreate).toBe(true);
-      expect(restrictions?.allowUserModify).toBe(true);
+      // 再禁用：限制不再生效
+      await mdmManager.configure({ enabled: false });
+
+      const stored = mdmManager.getRestrictions();
+      // 配置值仍在（管理员的设定没有被丢掉）……
+      expect(stored.allowUserCreate).toBe(false);
+      expect(stored.allowUserModify).toBe(false);
+      // ……但**执行**被门控放行：禁用即不限制。
+      expect(mdmManager.isEnabled()).toBe(false);
+      expect(mdmManager.checkCanCreate().allowed).toBe(true);
     });
   });
 
@@ -275,22 +283,25 @@ describe("MDMPanel UI 逻辑测试", () => {
   });
 
   describe("数据持久化", () => {
-    test("配置应该自动保存到 localStorage", () => {
-      const config = mdmManager.getConfig();
-      mdmManager.configure({
-        ...config,
+    test("配置应该自动保存（真实键名 amos.shortcuts.mdm.config，且能被重新读回）", async () => {
+      await mdmManager.configure({
         enabled: true,
         serverUrl: "https://persist.test.com",
         organizationId: "persist-org-123",
       });
 
-      const stored = localStorage.getItem("enterprise:mdm_config");
+      // 真实键名来自 `mdm.ts` 的 `STORE_KEYS.MDM_CONFIG`；原来断言的是
+      // `enterprise:mdm_config` —— 代码从不写这个键。
+      const stored = localStorage.getItem("amos.shortcuts.mdm.config");
       expect(stored).toBeTruthy();
 
-      const parsed = JSON.parse(stored!);
-      expect(parsed.enabled).toBe(true);
-      expect(parsed.serverUrl).toBe("https://persist.test.com");
-      expect(parsed.organizationId).toBe("persist-org-123");
+      // 存储里可能是**密文**（Web Crypto 可用时），所以断言的是"重新读回来
+      // 是同一份配置"，而不是"存储里是明文 JSON"——后者会把加密实现钉死。
+      const reloaded = new MDMManager();
+      await reloaded.initialize();
+      expect(reloaded.getConfig()?.enabled).toBe(true);
+      expect(reloaded.getConfig()?.serverUrl).toBe("https://persist.test.com");
+      expect(reloaded.getConfig()?.organizationId).toBe("persist-org-123");
     });
   });
 

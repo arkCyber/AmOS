@@ -66,5 +66,13 @@
   {
     "name": "perm_granted",
     "reason": "Per-app grant list from the daemon authority. The privacy dashboard reviews with `perm_grants_all` (one round-trip for every app) and gates with `perm_authorize`, so the per-app call has no consumer."
+  },
+  {
+    "name": "dock_badge_set",
+    "reason": "Registered host API with no consumer **yet**: `crates/amos-tauri/src/dock_badge.rs` applies the macOS Dock badge (`NSApplication.dockTile`) and requests attention, and both commands are wired into the invoke handler since REQ-A389. Nothing calls them: the Dock tile in this shell does not paint a badge, and there is no notification-to-badge bridge (the notification store has a `badge` field since REQ-A383, so the wiring is a small UI decision, not host work). Recorded here so the gate reads the truth — a ready API with no caller — instead of a missing call site."
+  },
+  {
+    "name": "dock_request_attention",
+    "reason": "Registered host API with no consumer **yet**: `crates/amos-tauri/src/dock_badge.rs` applies the macOS Dock badge (`NSApplication.dockTile`) and requests attention, and both commands are wired into the invoke handler since REQ-A389. Nothing calls them: the Dock tile in this shell does not paint a badge, and there is no notification-to-badge bridge (the notification store has a `badge` field since REQ-A383, so the wiring is a small UI decision, not host work). Recorded here so the gate reads the truth — a ready API with no caller — instead of a missing call site."
   }
 ]

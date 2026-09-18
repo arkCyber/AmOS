@@ -385,8 +385,10 @@ mod tests {
 
     #[test]
     fn roundtrip_is_lossless() {
-        let mut f = WindowStateFile::default();
-        f.version = SCHEMA_VERSION;
+        let mut f = WindowStateFile {
+            version: SCHEMA_VERSION,
+            ..Default::default()
+        };
         f.windows.insert(
             "settings".into(),
             WindowState {

@@ -680,7 +680,7 @@
           {/if}
           {#if historyTotal > 0}
             {#if confirmClear}
-              <button onclick={clearLog} data-testid="history-clear-confirm" class="rounded-full bg-danger/15 px-2.5 py-1 text-xs text-danger active:scale-95">{t("phone.historyClearConfirm")}</button>
+              <button onclick={clearLog} data-testid="history-clear-confirm" class="rounded-full bg-danger/8 px-2.5 py-1 text-xs text-danger active:scale-95">{t("phone.historyClearConfirm")}</button>
               <button onclick={() => (confirmClear = false)} data-testid="history-clear-cancel" class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClearCancel")}</button>
             {:else}
               <button onclick={() => (confirmClear = true)} data-testid="history-clear" title={t("phone.historyClear")} class="rounded-full bg-black/5 px-2.5 py-1 text-xs active:scale-95 dark:bg-white/10">{t("phone.historyClear")}</button>
@@ -703,7 +703,7 @@
             {@const missed = it.direction === "missed"}
             <li class="flex items-center gap-3 py-3" data-testid="history-row" data-direction={it.direction ?? "unknown"}>
               <span aria-label={dirLabel(it.direction)} title={dirLabel(it.direction)}
-                class={"grid h-9 w-9 shrink-0 place-items-center rounded-full text-ios-body font-medium " + (missed ? "bg-danger/15 text-danger" : "bg-neutral-100 opacity-70 dark:bg-white/10")}>
+                class={"grid h-9 w-9 shrink-0 place-items-center rounded-full text-ios-body font-medium " + (missed ? "bg-danger/8 text-danger" : "bg-neutral-100 opacity-70 dark:bg-white/10")}>
                 {it.direction === "outgoing" ? "↗" : it.direction === "incoming" || missed ? "↙" : "•"}
               </span>
               <div class="min-w-0 flex-1">
@@ -718,9 +718,9 @@
                 <button onclick={() => callBack(it.num)} aria-label={`call-back-${it.num}`} title={t("phone.callBack")} data-icon="phone"
                   class="grid h-10 w-10 place-items-center rounded-full bg-emerald-500/15 text-emerald-600 active:scale-90 dark:text-emerald-300">{@html iconSvg("phone", "h-[18px] w-[18px]")}</button>
                 <button onclick={() => smsBack(it.num)} aria-label={`sms-back-${it.num}`} title={t("phone.smsBack")} data-icon="messageCircle"
-                  class="grid h-10 w-10 place-items-center rounded-full bg-accent/15 text-accent active:scale-90">{@html iconSvg("messageCircle", "h-[18px] w-[18px]")}</button>
+                  class="grid h-10 w-10 place-items-center rounded-full bg-accent/10 text-accent active:scale-90">{@html iconSvg("messageCircle", "h-[18px] w-[18px]")}</button>
                 <button onclick={() => blockFromRecents(it.num)} aria-label={`block-caller-${it.num}`} title={t("phone.blockThisNumber")} data-icon="x"
-                  class="grid h-10 w-10 place-items-center rounded-full bg-danger/15 text-danger active:scale-90 dark:bg-danger/30">{@html iconSvg("x", "h-[18px] w-[18px]")}</button>
+                  class="grid h-10 w-10 place-items-center rounded-full bg-danger/8 text-danger active:scale-90 dark:bg-danger/20">{@html iconSvg("x", "h-[18px] w-[18px]")}</button>
               </div>
             </li>
           {/each}
@@ -822,7 +822,7 @@
       {#if blockErr}
         <p class="mb-1 text-xs text-red-500" role="alert">{blockErr}</p>
       {/if}
-      <button onclick={() => void toggleBlockUnknown()} aria-pressed={blockUnknown} data-testid="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/15 text-accent" : "bg-black/5 dark:bg-white/10")}>
+      <button onclick={() => void toggleBlockUnknown()} aria-pressed={blockUnknown} data-testid="block-unknown" class={"mb-2 w-full max-w-sm rounded-2xl px-4 py-2 text-left text-sm " + (blockUnknown ? "bg-accent/10 text-accent" : "bg-black/5 dark:bg-white/10")}>
         {t("phone.blockUnknown")} · {blockUnknown ? t("phone.on") : t("phone.off")}
       </button>
       {#if blockRules.length > 0}

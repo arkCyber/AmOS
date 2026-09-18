@@ -1,9 +1,8 @@
 /**
- * enterprise/api.ts — API 集成和 Webhook 支持
+ * enterprise/api.ts — API 集成
  * 
  * 功能:
  * - RESTful API 客户端
- * - Webhook 管理
  * - 认证和授权
  * - 速率限制
  * 
@@ -12,12 +11,16 @@
  * - 请求签名
  * - 速率限制
  * - IP 白名单
+ *
+ * **Webhook 不在这里**：本文件曾自带一份 `WebhookManager`，与 `enterprise/webhooks.ts`
+ * 的那一份重复，而 `enterprise/index.ts` 只把后者接进生产（`APISettings.svelte` 用的是
+ * `webhooks.ts` 的 `testWebhook` 等方法，本文件那份没有）。按仓库判据
+ * （"wire it, delete it, or baseline it"）删掉重复实现 —— 它那份的 `retryCount`
+ * 从未被使用、`eventQueue` 也没有上限，留着只是"两处真相"。
  */
 
 import { readStoreValue, writeStoreValueChecked } from "../amosStore";
-// import { logger } from "./logger";
-// import { mdmManager } from "./mdm";
-import type { AuditEventType } from "./audit";
+import { logger } from "./logger";
 import { auditLogger } from "./audit";
 
 // ============================================================================
@@ -66,45 +69,6 @@ export interface RateLimitConfig {
   requestsPerDay: number;
 }
 
-/** Webhook 配置 */
-export interface WebhookConfig {
-  id: string;
-  name: string;
-  description: string;
-  url: string;
-  
-  // 触发事件
-  events: AuditEventType[];
-  
-  // 认证
-  secret: string;               // 用于签名验证
-  headers: Record<string, string>;
-  
-  // 配置
-  enabled: boolean;
-  method: HTTPMethod;
-  timeout: number;
-  retryCount: number;
-  
-  // 过滤器
-  filters?: {
-    userIds?: string[];
-    organizationIds?: string[];
-    resourceTypes?: string[];
-  };
-  
-  // 统计
-  successCount: number;
-  failureCount: number;
-  lastTriggeredAt?: number;
-  lastStatus?: "success" | "failure";
-  lastError?: string;
-  
-  // 元数据
-  createdAt: number;
-  updatedAt: number;
-}
-
 /** API 请求选项 */
 export interface APIRequestOptions {
   method: HTTPMethod;
@@ -124,23 +88,12 @@ export interface APIResponse<T = unknown> {
   headers: Record<string, string>;
 }
 
-/** Webhook 事件 */
-export interface WebhookEvent {
-  id: string;
-  webhookId: string;
-  eventType: AuditEventType;
-  payload: Record<string, unknown>;
-  timestamp: number;
-  signature: string;
-}
-
 // ============================================================================
 // 常量
 // ============================================================================
 
 const STORE_KEYS = {
   API_CONFIG: "amos.shortcuts.api.config",
-  WEBHOOKS: "amos.shortcuts.api.webhooks",
   RATE_LIMITS: "amos.shortcuts.api.rate_limits",
 };
 
@@ -444,7 +397,10 @@ export class APIClient {
   saveConfig(config: Partial<APIConfig>): void {
     this.config = { ...this.config, ...config };
     const serialized = JSON.stringify(this.config);
-    writeStoreValueChecked(STORE_KEYS.API_CONFIG, serialized);
+    // 写不进去 = 用户的 API 配置重启后消失，必须报（write-scan 判据）。
+    if (!writeStoreValueChecked(STORE_KEYS.API_CONFIG, serialized)) {
+      logger.error("api", "API 配置写入被存储拒绝 —— 重启后会回落到默认配置");
+    }
   }
 
   /**
@@ -471,7 +427,10 @@ export class APIClient {
       data[key] = timestamps;
     });
     const serialized = JSON.stringify(data);
-    writeStoreValueChecked(STORE_KEYS.RATE_LIMITS, serialized);
+    // 速率限制只是本会话的窗口；丢了会放宽限制，仍要说出来。
+    if (!writeStoreValueChecked(STORE_KEYS.RATE_LIMITS, serialized)) {
+      logger.warn("api", "速率限制写入被存储拒绝 —— 重启后计数从零开始（限制会短暂放宽）");
+    }
   }
 
   /**
@@ -527,273 +486,7 @@ export class APIClient {
 }
 
 // ============================================================================
-// Webhook 管理器
-// ============================================================================
-
-export class WebhookManager {
-  private webhooks: Map<string, WebhookConfig> = new Map();
-  private eventQueue: WebhookEvent[] = [];
-  private processingTimer: number | null = null;
-
-  /**
-   * 初始化 Webhook 管理器
-   */
-  async initialize(): Promise<void> {
-    this.loadWebhooks();
-    this.startProcessing();
-  }
-
-  /**
-   * 添加 Webhook
-   */
-  addWebhook(config: Omit<WebhookConfig, "id" | "successCount" | "failureCount" | "createdAt" | "updatedAt">): string {
-    const webhook: WebhookConfig = {
-      ...config,
-      id: this.generateWebhookId(),
-      successCount: 0,
-      failureCount: 0,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-
-    this.webhooks.set(webhook.id, webhook);
-    this.saveWebhooks();
-
-    return webhook.id;
-  }
-
-  /**
-   * 更新 Webhook
-   */
-  updateWebhook(id: string, updates: Partial<WebhookConfig>): boolean {
-    const webhook = this.webhooks.get(id);
-    if (!webhook) return false;
-
-    const updated = {
-      ...webhook,
-      ...updates,
-      id: webhook.id,
-      updatedAt: Date.now(),
-    };
-
-    this.webhooks.set(id, updated);
-    this.saveWebhooks();
-
-    return true;
-  }
-
-  /**
-   * 删除 Webhook
-   */
-  deleteWebhook(id: string): boolean {
-    const deleted = this.webhooks.delete(id);
-    if (deleted) {
-      this.saveWebhooks();
-    }
-    return deleted;
-  }
-
-  /**
-   * 获取所有 Webhook
-   */
-  getWebhooks(): WebhookConfig[] {
-    return Array.from(this.webhooks.values());
-  }
-
-  /**
-   * 获取 Webhook
-   */
-  getWebhook(id: string): WebhookConfig | null {
-    return this.webhooks.get(id) || null;
-  }
-
-  /**
-   * 触发 Webhook
-   */
-  async trigger(eventType: AuditEventType, payload: Record<string, unknown>): Promise<void> {
-    // 查找匹配的 webhook
-    const matchingWebhooks = Array.from(this.webhooks.values()).filter(
-      webhook => webhook.enabled && webhook.events.includes(eventType)
-    );
-
-    for (const webhook of matchingWebhooks) {
-      // 应用过滤器
-      if (webhook.filters) {
-        if (webhook.filters.userIds && !webhook.filters.userIds.includes(payload.userId as string)) {
-          continue;
-        }
-        if (webhook.filters.organizationIds && !webhook.filters.organizationIds.includes(payload.organizationId as string)) {
-          continue;
-        }
-        if (webhook.filters.resourceTypes && !webhook.filters.resourceTypes.includes(payload.resourceType as string)) {
-          continue;
-        }
-      }
-
-      // 创建事件
-      const event: WebhookEvent = {
-        id: this.generateEventId(),
-        webhookId: webhook.id,
-        eventType,
-        payload,
-        timestamp: Date.now(),
-        signature: await this.signPayload(payload, webhook.secret),
-      };
-
-      // 添加到队列
-      this.eventQueue.push(event);
-    }
-  }
-
-  /**
-   * 处理事件队列
-   */
-  private async processQueue(): Promise<void> {
-    if (this.eventQueue.length === 0) return;
-
-    const event = this.eventQueue.shift();
-    if (!event) return;
-
-    const webhook = this.webhooks.get(event.webhookId);
-    if (!webhook) return;
-
-    try {
-      const response = await fetch(webhook.url, {
-        method: webhook.method,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Webhook-Signature": event.signature,
-          "X-Webhook-Event": event.eventType,
-          "X-Webhook-Timestamp": event.timestamp.toString(),
-          ...webhook.headers,
-        },
-        body: JSON.stringify({
-          event: event.eventType,
-          timestamp: event.timestamp,
-          payload: event.payload,
-        }),
-        signal: AbortSignal.timeout(webhook.timeout),
-      });
-
-      if (response.ok) {
-        webhook.successCount++;
-        webhook.lastTriggeredAt = Date.now();
-        webhook.lastStatus = "success";
-        delete webhook.lastError;
-      } else {
-        webhook.failureCount++;
-        webhook.lastTriggeredAt = Date.now();
-        webhook.lastStatus = "failure";
-        webhook.lastError = `HTTP ${response.status}: ${response.statusText}`;
-      }
-
-      this.saveWebhooks();
-    } catch (err) {
-      webhook.failureCount++;
-      webhook.lastTriggeredAt = Date.now();
-      webhook.lastStatus = "failure";
-      webhook.lastError = err instanceof Error ? err.message : String(err);
-      this.saveWebhooks();
-
-      console.error(`[Webhook] 触发失败 (${webhook.name}):`, err);
-    }
-  }
-
-  /**
-   * 启动处理循环
-   */
-  private startProcessing(): void {
-    if (typeof globalThis.setInterval !== "function") {
-      console.warn("[Webhook] setInterval not available, skipping processing");
-      return;
-    }
-
-    this.processingTimer = globalThis.setInterval(() => {
-      this.processQueue().catch(err => {
-        console.error("[Webhook] 处理队列失败:", err);
-      });
-    }, 1000) as unknown as number; // 每秒处理一次
-  }
-
-  /**
-   * 停止处理
-   */
-  shutdown(): void {
-    if (this.processingTimer) {
-      globalThis.clearInterval(this.processingTimer);
-      this.processingTimer = null;
-    }
-  }
-
-  /**
-   * 签名 payload - 使用标准 HMAC-SHA256
-   */
-  private async signPayload(payload: Record<string, unknown>, secret: string): Promise<string> {
-    const data = JSON.stringify(payload);
-    const encoder = new TextEncoder();
-    const messageData = encoder.encode(data);
-    const keyData = encoder.encode(secret);
-
-    // 使用 Web Crypto API 生成真正的 HMAC-SHA256
-    const key = await crypto.subtle.importKey(
-      "raw",
-      keyData,
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-
-    const signature = await crypto.subtle.sign("HMAC", key, messageData);
-    const hashArray = Array.from(new Uint8Array(signature));
-    return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  /**
-   * 生成 Webhook ID
-   */
-  private generateWebhookId(): string {
-    return `webhook-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  }
-
-  /**
-   * 生成事件 ID
-   */
-  private generateEventId(): string {
-    return `event-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  }
-
-  /**
-   * 加载 Webhook
-   */
-  private loadWebhooks(): void {
-    const raw = readStoreValue(STORE_KEYS.WEBHOOKS, "");
-    if (!raw) {
-      this.webhooks = new Map();
-      return;
-    }
-
-    try {
-      const data = JSON.parse(raw) as WebhookConfig[];
-      this.webhooks = new Map(data.map(w => [w.id, w]));
-    } catch (err) {
-      console.error("[Webhook] 加载失败:", err);
-      this.webhooks = new Map();
-    }
-  }
-
-  /**
-   * 保存 Webhook
-   */
-  private saveWebhooks(): void {
-    const data = Array.from(this.webhooks.values());
-    const serialized = JSON.stringify(data);
-    writeStoreValueChecked(STORE_KEYS.WEBHOOKS, serialized);
-  }
-}
-
-// ============================================================================
 // 导出单例
 // ============================================================================
 
 export const apiClient = new APIClient();
-export const webhookManager = new WebhookManager();

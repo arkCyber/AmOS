@@ -35,6 +35,15 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SKIP = new Set(["node_modules", "target", ".git", "dist"]);
 
+/** Frozen snapshots are out of scope — same rule (and same reason) as `docs-link-scan.mjs`:
+ *  an archived document describes the tree **as it was when it was written**, so a `make X`
+ *  inside it is a historical mention, not an instruction about today. Measured 2026-09-17:
+ *  `docs/archive/2026-09/zh/CHANGELOG.md:215` narrates the REQ-A196 defect ("the doc said
+ *  `make fmt` and there is no such rule") and this gate read that narrative as a promise —
+ *  `make check` was red on it. The root `CHANGELOG.md` is already excluded for the same
+ *  reason; this closes the gap for its archived copies. */
+const SKIP_PATHS = ["docs/archive/"];
+
 /** Target names a Makefile defines: `name:` rules plus the `.PHONY:` list. */
 export function parseTargets(makefileText) {
   const out = new Set();
@@ -90,6 +99,15 @@ export function runSelftest() {
   ok("ignores prose 'make any'", refs("that would make any change risky").length === 0);
   ok("code inside a fence ignores inline scan", refs("```\nmake lint\n```").length === 1);
   ok("reports the line number", makeRefs("x\n\n`make verify`")[0].line === 3);
+  // REQ-A387: the corpus must never include a frozen snapshot — an archived doc's `make X`
+  // is history (see SKIP_PATHS). Without this, an archive that narrates a *defect* in a
+  // documented command reads as if the doc promises that command today.
+  const corpus = walk(join(root, "docs"));
+  ok("walk() collects current docs", corpus.length > 0);
+  ok(
+    "walk() skips docs/archive (frozen snapshots)",
+    !corpus.some((p) => p.split("\\").join("/").includes("/docs/archive/")),
+  );
 
   let failed = 0;
   for (const [name, cond] of checks) {
@@ -106,6 +124,9 @@ if (process.argv.includes("--selftest")) runSelftest();
 // --- corpus -----------------------------------------------------------------
 function walk(dir, acc = []) {
   if (!existsSync(dir)) return acc;
+  // `docs/archive` and everything under it — see the note above SKIP_PATHS.
+  const rel = relative(root, dir).split("\\").join("/") + "/";
+  if (SKIP_PATHS.some((p) => rel.startsWith(p))) return acc;
   for (const ent of readdirSync(dir, { withFileTypes: true })) {
     if (SKIP.has(ent.name)) continue;
     const p = join(dir, ent.name);

@@ -13,6 +13,7 @@
  * - Silent Notifications: Background content updates without alerts
  * - Priority Handling: Critical alerts and time-sensitive notifications
  */
+import { invoke } from "./backend";
 
 /** Device token for remote push notifications (64 hex chars in production). */
 export type DeviceToken = string;
@@ -130,13 +131,6 @@ export interface PushServiceConfig {
   /** Auto-register on app launch. */
   autoRegister: boolean;
 }
-
-/** Storage keys for push notification service. */
-export const PUSH_REGISTRATION_KEY = "amos.push.registration";
-export const PUSH_CONFIG_KEY = "amos.push.config";
-export const PUSH_BADGES_KEY = "amos.push.badges";
-export const PUSH_HISTORY_KEY = "amos.push.history";
-export const PUSH_STATS_KEY = "amos.push.stats";
 
 /** Default push service configuration. */
 export const DEFAULT_PUSH_CONFIG: PushServiceConfig = {
@@ -475,43 +469,44 @@ export function shouldPresentNotification(
 // ═══════════════════════════════════════════════════════════════════════════
 // Tauri Backend Integration
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Every command below goes through **`lib/backend.ts`'s `invoke`** — the shell's
+// one bridge. It used to reach for `@tauri-apps/api/core` with a top-level
+// `await import(…)`: that package is **not a dependency of this workspace**, so the
+// import always failed, `invoke` became an always-throwing stub, and every `push_*`
+// command silently answered its empty fallback. The push backend was therefore
+// never actually reachable from the UI, in any environment
+// (`PUSH_PHASE3_DAY3_RESEARCH_AND_DESIGN.md` §2). `backend.invoke` returns `null`
+// when the host is not bridged or the command fails, and records *why* in the
+// bridge diagnostics ledger instead of throwing.
 
-// Conditional import for Tauri environment
-let invoke: (cmd: string, args?: Record<string, any>) => Promise<any>;
-try {
-  // @ts-ignore - Dynamic import for Tauri
-  const tauriCore = await import("@tauri-apps/api/core");
-  invoke = tauriCore.invoke;
-} catch {
-  // Fallback for non-Tauri environment (tests)
-  invoke = async () => {
-    throw new Error("Tauri invoke not available in this environment");
-  };
-}
-
-/** Rust PushResult type */
-interface PushResult {
+/** Rust PushResult type — every `push_*` command answers with one of these kinds
+ * instead of throwing, so "the platform said no" stays distinguishable from
+ * "the call failed". Mirrors `push_notifications.rs`' published `kind` strings. */
+export interface PushResult {
   kind: "ok" | "unavailable" | "permissiondenied" | "invalidtoken" | "failed";
   reason?: string;
 }
 
-/** Rust DeviceToken type */
-interface RustDeviceToken {
+/** Rust DeviceToken type. */
+export interface RustDeviceToken {
   token: string;
   environment: string;
   registered_at: string;
 }
 
-/** Rust NotificationRecord type */
-interface RustNotificationRecord {
+/** Rust NotificationRecord type (the shape `push_get_history` really returns:
+ * `received_at` is an **ISO 8601 string**, not a millisecond number, and the
+ * device's own read flag is `read` — not `is_read`). */
+export interface RustNotificationRecord {
   id: string;
   payload: PushPayload;
   received_at: string;
   read: boolean;
 }
 
-/** Rust PushStatistics type */
-interface RustPushStatistics {
+/** Rust PushStatistics type (snake_case, straight from Rust). */
+export interface RustPushStatistics {
   total_received: number;
   with_badge: number;
   with_sound: number;
@@ -519,11 +514,11 @@ interface RustPushStatistics {
   last_received: string | null;
 }
 
-/** Rust PermissionStatus type */
-type RustPermissionStatus = "notdetermined" | "denied" | "authorized" | "provisional";
+/** Rust PermissionStatus type. */
+export type RustPermissionStatus = "notdetermined" | "denied" | "authorized" | "provisional";
 
-/** Rust PushStatus type */
-interface RustPushStatus {
+/** Rust PushStatus type. */
+export interface RustPushStatus {
   available: boolean;
   device_token: RustDeviceToken | null;
   permission: RustPermissionStatus;
@@ -535,158 +530,88 @@ interface RustPushStatus {
  * Register device token for push notifications.
  */
 export async function registerDeviceToken(token: string, environment: string = "production"): Promise<PushResult> {
-  try {
-    return await invoke("push_register_token", { token, environment }) as PushResult;
-  } catch (error) {
-    console.error("Failed to register device token:", error);
-    return { kind: "failed", reason: String(error) };
-  }
+  return (await invoke<PushResult>("push_register_token", { token, environment })) ?? noBridge();
 }
 
-/**
- * Get current device token.
- */
+/** Get current device token. */
 export async function getDeviceToken(): Promise<RustDeviceToken | null> {
-  try {
-    return await invoke("push_get_token") as RustDeviceToken | null;
-  } catch (error) {
-    console.error("Failed to get device token:", error);
-    return null;
-  }
+  return await invoke<RustDeviceToken>("push_get_token");
 }
 
-/**
- * Request push notification permission.
- */
+/** Request push notification permission. */
 export async function requestPushPermission(): Promise<PushResult> {
-  try {
-    return await invoke("push_request_permission") as PushResult;
-  } catch (error) {
-    console.error("Failed to request push permission:", error);
-    return { kind: "failed", reason: String(error) };
-  }
+  return (await invoke<PushResult>("push_request_permission")) ?? noBridge();
 }
 
-/**
- * Get current permission status.
- */
+/** Get current permission status. */
 export async function getPushPermission(): Promise<RustPermissionStatus> {
-  try {
-    return await invoke("push_get_permission") as RustPermissionStatus;
-  } catch (error) {
-    console.error("Failed to get push permission:", error);
-    return "notdetermined";
-  }
+  return (await invoke<RustPermissionStatus>("push_get_permission")) ?? "notdetermined";
 }
 
 /**
  * Simulate receiving a push notification (for testing).
+ *
+ * Answers the new record's id, or `null` when the host could not be reached — the
+ * caller must not treat a missing id as "delivered".
  */
 export async function simulateReceivePush(payload: PushPayload): Promise<string | null> {
-  try {
-    return await invoke("push_simulate_receive", { payload }) as string;
-  } catch (error) {
-    console.error("Failed to simulate push:", error);
-    return null;
-  }
+  return await invoke<string>("push_simulate_receive", { payload });
 }
 
-/**
- * Get badge count.
- */
+/** The honest answer when there is no host to ask. */
+function noBridge(): PushResult {
+  return { kind: "failed", reason: "push backend unreachable (no host bridge)" };
+}
+
+/** One push _statistics snapshot with every counter at zero. */
+function emptyPushStatistics(): RustPushStatistics {
+  return { total_received: 0, with_badge: 0, with_sound: 0, silent: 0, last_received: null };
+}
+
+/** Get badge count. */
 export async function getBadgeCount(): Promise<number> {
-  try {
-    return await invoke("push_get_badge") as number;
-  } catch (error) {
-    console.error("Failed to get badge count:", error);
-    return 0;
-  }
+  return (await invoke<number>("push_get_badge")) ?? 0;
 }
 
-/**
- * Set badge count.
- */
+/** Set badge count. */
 export async function setBadgeCount(count: number): Promise<void> {
-  try {
-    await invoke("push_set_badge", { count });
-  } catch (error) {
-    console.error("Failed to set badge count:", error);
-  }
+  await invoke("push_set_badge", { count });
 }
 
 /**
- * Get notification history.
+ * Get notification history (newest first, as the Rust manager returns it).
+ *
+ * An unreachable host answers `[]` — "I could not ask", which every caller must
+ * treat as *no news*, never as *nothing exists* (see `mergePushHistory`).
  */
 export async function getNotificationHistory(limit?: number): Promise<RustNotificationRecord[]> {
-  try {
-    return await invoke("push_get_history", { limit: limit ?? null }) as RustNotificationRecord[];
-  } catch (error) {
-    console.error("Failed to get notification history:", error);
-    return [];
-  }
+  return (await invoke<RustNotificationRecord[]>("push_get_history", { limit: limit ?? null })) ?? [];
 }
 
-/**
- * Mark notification as read.
- */
+/** Mark notification as read. */
 export async function markNotificationRead(id: string): Promise<boolean> {
-  try {
-    return await invoke("push_mark_read", { id }) as boolean;
-  } catch (error) {
-    console.error("Failed to mark notification as read:", error);
-    return false;
-  }
+  return (await invoke<boolean>("push_mark_read", { id })) ?? false;
 }
 
-/**
- * Clear notification history.
- */
+/** Clear notification history. */
 export async function clearNotificationHistory(): Promise<void> {
-  try {
-    await invoke("push_clear_history");
-  } catch (error) {
-    console.error("Failed to clear notification history:", error);
-  }
+  await invoke("push_clear_history");
 }
 
-/**
- * Get push statistics.
- */
+/** Get push statistics. */
 export async function getPushStatistics(): Promise<RustPushStatistics> {
-  try {
-    return await invoke("push_get_statistics") as RustPushStatistics;
-  } catch (error) {
-    console.error("Failed to get push statistics:", error);
-    return {
-      total_received: 0,
-      with_badge: 0,
-      with_sound: 0,
-      silent: 0,
-      last_received: null,
-    };
-  }
+  return (await invoke<RustPushStatistics>("push_get_statistics")) ?? emptyPushStatistics();
 }
 
-/**
- * Get push notification status.
- */
+/** Get push notification status. */
 export async function getPushStatus(): Promise<RustPushStatus> {
-  try {
-    return await invoke("push_get_status") as RustPushStatus;
-  } catch (error) {
-    console.error("Failed to get push status:", error);
-    return {
+  return (
+    (await invoke<RustPushStatus>("push_get_status")) ?? {
       available: false,
       device_token: null,
       permission: "notdetermined",
       badge_count: 0,
-      statistics: {
-        total_received: 0,
-        with_badge: 0,
-        with_sound: 0,
-        silent: 0,
-        last_received: null,
-      },
-    };
-  }
+      statistics: emptyPushStatistics(),
+    }
+  );
 }

@@ -10,6 +10,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
   mdmManager,
   templateManager,
@@ -21,6 +22,16 @@ import {
   type MDMConfig,
   type EnterpriseTemplate,
 } from "../enterprise/index";
+
+// MDM/模板/审计都写 `amos.*` 共享存储（localStorage）。没有 DOM 时
+// `writeStoreValueChecked` 一律返回 false ⇒ `saveConfig` 抛"写入加密配置失败"
+// ⇒ 用例断言的是"存储坏了"而不是被测逻辑（这层此前被 `mdm.ts` 的语法错误
+// 掩盖着：模块根本没加载，所以没人看见）。与其他 lib 测试同样注册 happy-dom。
+try {
+  GlobalRegistrator.register();
+} catch {
+  /* already registered */
+}
 
 // ============================================================================
 // 辅助函数
@@ -149,9 +160,9 @@ describe("MDM 管理", () => {
     expect(mdmManager.isEnabled()).toBe(false);
   });
 
-  test("应该能够添加和获取策略", () => {
+  test("应该能够添加和获取策略", async () => {
     // 先配置 MDM
-    mdmManager.configure({
+    await mdmManager.configure({
       enabled: true,
       restrictions: {
         allowUserCreate: true,
@@ -172,9 +183,10 @@ describe("MDM 管理", () => {
       },
     });
 
-    // 设置策略值
-    mdmManager.addPolicy("allowUserCreate", false);
-    mdmManager.addPolicy("maxShortcutsPerUser", 50);
+    // 设置策略值（configure/addPolicy 都是异步的：不 await 就是在断言
+    // "微任务还没跑" —— 能过也只是时序恰好）
+    await mdmManager.addPolicy("allowUserCreate", false);
+    await mdmManager.addPolicy("maxShortcutsPerUser", 50);
 
     const policies = mdmManager.getRestrictionPolicies();
     expect(policies).toBeTruthy();
@@ -185,23 +197,23 @@ describe("MDM 管理", () => {
     expect(allowCreate).toBe(false);
   });
 
-  test("应该根据策略检查权限", () => {
+  test("应该根据策略检查权限", async () => {
     // 启用 MDM 并设置策略
-    mdmManager.configure({ enabled: true });
-    mdmManager.addPolicy("allowUserCreate", false);
+    await mdmManager.configure({ enabled: true });
+    await mdmManager.addPolicy("allowUserCreate", false);
 
     const check = mdmManager.checkCanCreate();
     expect(check.allowed).toBe(false);
     expect(check.reason).toBeTruthy();
   });
 
-  test("应该能够删除策略", () => {
-    // 设置策略
-    mdmManager.addPolicy("maxShortcutsPerUser", 50);
+  test("应该能够删除策略", async () => {
+    // 设置策略（addPolicy 异步：不 await 的话这一行还没落地，下一行就在断言空气）
+    await mdmManager.addPolicy("maxShortcutsPerUser", 50);
     expect(mdmManager.getPolicy("maxShortcutsPerUser")).toBe(50);
 
-    // 删除策略（恢复默认值）
-    mdmManager.deletePolicy("maxShortcutsPerUser");
+    // 删除策略（恢复默认值）—— 落盘是异步的，所以删除本身也是异步的
+    await mdmManager.deletePolicy("maxShortcutsPerUser");
     
     // 应该恢复为默认值
     const policy = mdmManager.getPolicy("maxShortcutsPerUser");
@@ -571,34 +583,47 @@ describe("Webhook 管理", () => {
   });
 
   test("应该能够触发 Webhook", async () => {
-    const id = webhookManager.addWebhook({
-      name: "测试 Webhook",
-      description: "用于测试触发",
-      url: "https://webhook.example.com/test",
-      events: ["shortcut_create"],
-      secret: "test-secret",
-      headers: {},
-      enabled: true,
-      method: "POST",
-      timeout: 100, // 使用很短的超时以加快测试
-      retryCount: 1, // 只重试一次
-    });
+    // 这条用例测的是**统计逻辑**：发送失败也必须记一笔（lastTriggeredAt /
+    // triggerCount / failureCount）。它不去测网络 —— 原来把成败交给运行环境的
+    // `fetch`：happy-dom 下这个请求会挂住（连事件处理器都回不来），真实网络又
+    // 不可控。所以这里把 fetch 换成**确定性失败**，事件仍由 1s 的处理器 tick 消费。
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.reject(new Error("ENOTFOUND"))) as unknown as typeof fetch;
+    try {
+      const id = webhookManager.addWebhook({
+        name: "测试 Webhook",
+        description: "用于测试触发",
+        url: "https://webhook.example.com/test",
+        events: ["shortcut_create"],
+        secret: "test-secret",
+        headers: {},
+        enabled: true,
+        method: "POST",
+        timeout: 100, // 使用很短的超时以加快测试
+        retryCount: 1, // 只重试一次
+      });
 
-    // 触发（实际不会发送，因为 URL 不存在）
-    await webhookManager.trigger("shortcut_create", {
-      shortcutId: "test-001",
-      shortcutName: "测试快捷指令",
-    });
+      await webhookManager.trigger("shortcut_create", {
+        shortcutId: "test-001",
+        shortcutName: "测试快捷指令",
+      });
 
-    // 等待处理（100ms timeout + 2000ms retry delay + 100ms timeout = ~2300ms）
-    await new Promise(resolve => setTimeout(resolve, 3000));
+      // 事件处理器每 1s 消费一次队列；轮询比固定 sleep 稳，也有上限。
+      for (let i = 0; i < 40; i++) {
+        if ((webhookManager.getWebhook(id)?.lastTriggeredAt ?? 0) > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
 
-    // 验证 webhook 被触发（会失败，但会更新统计）
-    const webhook = webhookManager.getWebhook(id);
-    expect(webhook).toBeTruthy();
-    expect(webhook?.lastTriggeredAt).toBeGreaterThan(0);
-    expect(webhook?.triggerCount).toBeGreaterThan(0);
-    expect(webhook?.failureCount).toBeGreaterThan(0);
+      // 验证 webhook 被触发（会失败，但会更新统计）
+      const webhook = webhookManager.getWebhook(id);
+      expect(webhook).toBeTruthy();
+      expect(webhook?.lastTriggeredAt).toBeGreaterThan(0);
+      expect(webhook?.triggerCount).toBeGreaterThan(0);
+      expect(webhook?.failureCount).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

@@ -16,6 +16,10 @@
 
 import { readStoreValue, writeStoreValueChecked } from "../amosStore";
 import type { ActionCategory } from "../shortcuts";
+// Type-only import: erased at runtime, so it cannot create the `mdm ⇄ audit`
+// cycle that a value import would (`audit.ts` imports `mdmManager` from here).
+import type { AuditEventCategory, AuditEventType, AuditLogLevel, AuditResult } from "./audit";
+import { localId } from "../localId";
 
 // ============================================================================
 // 类型定义
@@ -170,6 +174,38 @@ const DEFAULT_RESTRICTIONS: MDMRestrictions = {
 export class MDMManager {
   private config: MDMConfig | null = null;
   private executionCounts: Map<string, number> = new Map();
+  /** 自动同步的定时器句柄（`null` = 未启动）。 */
+  private syncTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * 记录一条 MDM 配置事件到**企业审计轨**（`lib/enterprise/audit.ts`
+   * 的 `auditLogger` —— `api.ts` 写的是同一条轨）。
+   *
+   * 两个刻意的性质：
+   * - **动态 import**：`audit.ts` 已经 import 本模块的 `mdmManager`，静态 import
+   *   会形成环；两处调用都在 async 方法里，所以事件真的发生时才加载。
+   * - **永不抛错**：审计写入不得让配置的加载/保存失败（否则它报告的"失败"
+   *   就是它自己造成的）。审计是 best-effort，配置路径才是权威。
+   */
+  private async audit(params: {
+    eventType: AuditEventType;
+    eventCategory: AuditEventCategory;
+    eventDescription: string;
+    level?: AuditLogLevel;
+    result?: AuditResult;
+    resourceType?: "shortcut" | "template" | "config" | "policy";
+    resourceId?: string;
+    resourceName?: string;
+    actionDetails?: Record<string, unknown>;
+    errorMessage?: string;
+  }): Promise<void> {
+    try {
+      const { auditLogger } = await import("./audit");
+      await auditLogger.log(params);
+    } catch {
+      /* 审计轨不可用时静默：配置的权威性不因它而改变 */
+    }
+  }
 
   /**
    * 初始化 MDM 管理器
@@ -214,11 +250,12 @@ export class MDMManager {
           const decrypted = await decryptMDMData(raw);
           this.config = JSON.parse(decrypted) as MDMConfig;
           
-          // 审计日志
-          this.auditLog.push({
-            action: "mdm_config_decrypted",
-            timestamp: Date.now(),
-            success: true,
+          // 审计：配置以加密格式加载成功
+          await this.audit({
+            eventType: "mdm_config_update",
+            eventCategory: "security",
+            eventDescription: "MDM 配置解密加载成功",
+            actionDetails: { storage: "encrypted" },
           });
           
           return;
@@ -226,10 +263,13 @@ export class MDMManager {
           // 解密失败，可能是明文格式（旧版本）或数据损坏
           console.warn("[MDM] 解密失败，尝试明文加载:", decryptErr);
           
-          this.auditLog.push({
-            action: "mdm_config_decrypt_failed",
-            timestamp: Date.now(),
-            error: String(decryptErr),
+          await this.audit({
+            eventType: "error_occurred",
+            eventCategory: "security",
+            eventDescription: "MDM 配置解密失败，回退明文加载",
+            level: "warning",
+            result: "failure",
+            errorMessage: String(decryptErr),
           });
         }
       }
@@ -244,10 +284,13 @@ export class MDMManager {
       }
     } catch (err) {
       console.error("[MDM] 加载配置失败:", err);
-      this.auditLog.push({
-        action: "mdm_config_load_failed",
-        timestamp: Date.now(),
-        error: String(err),
+      await this.audit({
+        eventType: "error_occurred",
+        eventCategory: "system",
+        eventDescription: "MDM 配置加载失败",
+        level: "error",
+        result: "failure",
+        errorMessage: String(err),
       });
       this.config = null;
     }
@@ -272,10 +315,11 @@ export class MDMManager {
         const success = writeStoreValueChecked(STORE_KEYS.MDM_CONFIG, encrypted);
         
         if (success) {
-          this.auditLog.push({
-            action: "mdm_config_encrypted",
-            timestamp: Date.now(),
-            dataSize: encrypted.length,
+          await this.audit({
+            eventType: "mdm_config_update",
+            eventCategory: "security",
+            eventDescription: "MDM 配置加密保存成功",
+            actionDetails: { storage: "encrypted", dataSize: encrypted.length },
           });
         } else {
           throw new Error("写入加密配置失败");
@@ -283,20 +327,31 @@ export class MDMManager {
       } else {
         // 回退：明文存储（不推荐，仅用于不支持 Web Crypto 的环境）
         console.warn("[MDM] Web Crypto API 不可用，使用明文存储（不安全）");
-        writeStoreValueChecked(STORE_KEYS.MDM_CONFIG, plaintext);
-        
-        this.auditLog.push({
-          action: "mdm_config_saved_plaintext",
-          timestamp: Date.now(),
-          warning: "encryption_unavailable",
+        // 这次写入就是本方法的目的：存储拒收必须被当成失败报出来，而不是照旧
+        // 记一条"已保存"（write-scan / audit P1-3 的同一规则）。
+        if (!writeStoreValueChecked(STORE_KEYS.MDM_CONFIG, plaintext)) {
+          throw new Error("写入明文配置失败");
+        }
+
+        // 明文存储是一次**安全降级**，必须留下 warning，而不是静默发生。
+        await this.audit({
+          eventType: "warning_occurred",
+          eventCategory: "security",
+          eventDescription: "MDM 配置以明文保存（Web Crypto 不可用）",
+          level: "warning",
+          result: "warning",
+          actionDetails: { storage: "plaintext", warning: "encryption_unavailable" },
         });
       }
     } catch (err) {
       console.error("[MDM] 保存配置失败:", err);
-      this.auditLog.push({
-        action: "mdm_config_save_failed",
-        timestamp: Date.now(),
-        error: String(err),
+      await this.audit({
+        eventType: "error_occurred",
+        eventCategory: "system",
+        eventDescription: "MDM 配置保存失败",
+        level: "error",
+        result: "failure",
+        errorMessage: String(err),
       });
       throw err; // 向上传播错误
     }
@@ -304,20 +359,43 @@ export class MDMManager {
 
   /**
    * 加载执行计数
+   *
+   * 形状必须与 `saveExecutionCounts` 一致：那里写的是
+   * `{ date: "yyyy-mm-dd", counts: { "<yyyy-mm-dd>-<shortcutId>": n } }`。
+   * 这里原来把**整个对象**当成"键 → 次数"的扁平表读（`new Map(Object.entries(data))`），
+   * 于是读回来的键只会是 `"date"` / `"counts"` 两个字面量 —— **每一个真实计数都被丢掉**，
+   * 而 `raw.includes(today)` 又因为 `date` 字段里就有今天的日期而不清空 ⇒
+   * `checkDailyExecutionLimit` 拿到 `undefined`、按 0 处理 ⇒
+   * **每日执行配额在每次重启/重载后静默失效**（`saveExecutionCounts` 的告警恰好把这句
+   * "当日配额会重新开始"写成"存储拒绝时才会发生"，而正常路径就是那样）。
    */
   private loadExecutionCounts(): void {
     const raw = readStoreValue<string>(STORE_KEYS.MDM_EXECUTION_COUNT, "");
     if (!raw) return;
 
     try {
-      const data = JSON.parse(raw) as Record<string, number>;
-      this.executionCounts = new Map(Object.entries(data));
-      
-      // 清理过期数据（每天重置）
+      const parsed = JSON.parse(raw) as { date?: unknown; counts?: unknown };
       const today = new Date().toISOString().split("T")[0] || "";
-      if (!raw.includes(today)) {
+
+      // 形状不认识、或存的是**别的日子** ⇒ 清空：配额是"每日"的，昨天的计数今天不算数。
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        parsed.date !== today ||
+        parsed.counts === null ||
+        typeof parsed.counts !== "object" ||
+        Array.isArray(parsed.counts)
+      ) {
         this.executionCounts.clear();
+        return;
       }
+
+      const restored = new Map<string, number>();
+      for (const [key, value] of Object.entries(parsed.counts as Record<string, unknown>)) {
+        // 只收自己能解释的条目：一个坏条目不该把整份配额读成 NaN/字符串。
+        if (typeof value === "number" && Number.isFinite(value)) restored.set(key, value);
+      }
+      this.executionCounts = restored;
     } catch (err) {
       console.error("[MDM] 加载执行计数失败:", err);
       this.executionCounts.clear();
@@ -336,7 +414,10 @@ export class MDMManager {
     });
     
     const serialized = JSON.stringify({ date: today, counts: data });
-    writeStoreValueChecked(STORE_KEYS.MDM_EXECUTION_COUNT, serialized);
+    // 每日执行计数丢失 = 管理员设的上限当天会重新开始，必须报（write-scan 判据）。
+    if (!writeStoreValueChecked(STORE_KEYS.MDM_EXECUTION_COUNT, serialized)) {
+      console.error("[MDM] 执行计数写入被存储拒绝 —— 当日配额会在重启后重新开始");
+    }
   }
 
   /**
@@ -420,11 +501,9 @@ export class MDMManager {
       console.error("[MDM] 取消注册失败:", err);
     }
 
-    // 清理本地数据
-    this.config = null;
-    await this.saveConfig();
-    this.executionCounts.clear();
-    this.saveExecutionCounts();
+    // 清理本地数据（同 `clearStoredState`：必须落到**存储**，否则一次"取消注册"之后
+    // 加密配置原样留在盘上，下次启动又把它读回来，设备"退不掉"。）
+    this.clearStoredState();
   }
 
   /**
@@ -496,15 +575,28 @@ export class MDMManager {
 
   /**
    * 启动自动同步
+   *
+   * 定时器**必须留句柄**：原来这里连 id 都不存、也没有任何停止路径，于是
+   * ①重复 `initialize()` 会叠出多只定时器（每次 syncInterval 就多发一轮同步），
+   * ②壳是长期存活的，谁也无法停掉它 —— lifetime-scan 的判据（REQ-A385）。
    */
   private startAutoSync(): void {
     if (!this.config) return;
 
-    setInterval(() => {
-      this.syncWithServer().catch(err => {
+    this.stopAutoSync(); // 幂等：重复启动不得叠加
+    this.syncTimer = setInterval(() => {
+      this.syncWithServer().catch((err) => {
         console.error("[MDM] 自动同步失败:", err);
       });
     }, this.config.syncInterval * 1000);
+  }
+
+  /** 停止自动同步（幂等；`shutdownEnterprise` 会调它）。 */
+  stopAutoSync(): void {
+    if (this.syncTimer !== null) {
+      clearInterval(this.syncTimer);
+      this.syncTimer = null;
+    }
   }
 
   /**
@@ -857,6 +949,10 @@ export class MDMManager {
     // 更新配置（确保必需字段存在）
     if (!this.config) return;
     
+    // 注意：这里逐字段重建，**新增字段必须一起列进来**。`lockMessage` 与
+    // `lastSyncError` 曾经不在表里 ⇒ 每次 `configure()`（ enrolment / 同步 / 手动设置
+    // 都会走到这里）都会把管理员下发的锁定说明与上次同步错误**静默丢掉**：
+    // 锁定屏会显示通用措辞，而"为什么同步失败"再也查不到。
     this.config = {
       enabled: config.enabled ?? this.config.enabled,
       organizationId: config.organizationId ?? this.config.organizationId,
@@ -872,7 +968,9 @@ export class MDMManager {
       syncInterval: config.syncInterval ?? this.config.syncInterval,
       lastSyncAt: config.lastSyncAt ?? this.config.lastSyncAt,
       lastSyncStatus: config.lastSyncStatus ?? this.config.lastSyncStatus,
+      lastSyncError: config.lastSyncError ?? this.config.lastSyncError,
       deviceStatus: config.deviceStatus ?? this.config.deviceStatus,
+      lockMessage: config.lockMessage ?? this.config.lockMessage,
       enrolledAt: config.enrolledAt ?? this.config.enrolledAt,
       enrolledBy: config.enrolledBy ?? this.config.enrolledBy,
       version: config.version ?? this.config.version,
@@ -918,10 +1016,14 @@ export class MDMManager {
 
   /**
    * 删除策略（恢复默认值）
+   *
+   * `async` 不是因为"看起来更现代"：恢复默认值之后必须**持久化**（`saveConfig`），
+   * 而写盘是异步的 —— 一个同步返回的 `true` 会在写入还没落地时就告诉调用方
+   * "已删除"，落盘失败时（`saveConfig` 会抛）调用方已经拿到 `true` 了。
    */
-  deletePolicy(policyKey: keyof MDMConfig["restrictions"]): boolean {
+  async deletePolicy(policyKey: keyof MDMConfig["restrictions"]): Promise<boolean> {
     if (!this.config?.restrictions) return false;
-    
+
     // 恢复默认值
     const defaults: MDMConfig["restrictions"] = {
       allowUserCreate: true,
@@ -940,9 +1042,18 @@ export class MDMManager {
       disabledActions: [],
       disabledCategories: [],
     };
-    
-    (this.config.restrictions as any)[policyKey] = defaults[policyKey];
+
+    // 恢复该键的默认值（类型的键是联合类型，赋值要走一次受控的窄化）
+    (this.config.restrictions as unknown as Record<string, unknown>)[policyKey] = defaults[policyKey];
     await this.saveConfig();
+    await this.audit({
+      eventType: "mdm_policy_change",
+      eventCategory: "management",
+      eventDescription: "MDM 策略被删除（恢复默认值）",
+      resourceType: "policy",
+      resourceId: String(policyKey),
+      actionDetails: { policy: String(policyKey), restoredTo: defaults[policyKey] },
+    });
     return true;
   }
 
@@ -950,7 +1061,7 @@ export class MDMManager {
    * 生成设备 ID
    */
   private generateDeviceId(): string {
-    return `device-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    return localId("device");
   }
 
   /**
@@ -989,15 +1100,36 @@ export class MDMManager {
   }
 
   /**
+   * 把"本机受管状态"从存储里清干净（远程擦除 / 取消注册共用）。
+   *
+   * 关键点是**必须落到存储**：`saveConfig()` 在 `config === null` 时直接 `return`，
+   * 所以"先把内存字段置空、再 saveConfig()"实际上一个字节都没删 —— 下次启动会把
+   * 加密配置（含 apiKey / organizationId）原样读回来。空串是"没有配置"的既有编码
+   * （`readStoreValue(KEY, "")` 为假 ⇒ `loadConfig` 归 null），且仍然走 `amosStore`
+   * 的写路径（durable 副本 + 跨窗口总线），桥那一侧的副本因此也会被清掉。
+   *
+   * 两次写入都**检查结果**：存储拒收必须被说出来（write-scan 判据）—— 静默失败
+   * 正是"已擦除"这句谎话的来源。
+   */
+  private clearStoredState(): void {
+    if (!writeStoreValueChecked(STORE_KEYS.MDM_CONFIG, "")) {
+      console.error("[MDM] 擦除配置写入被存储拒绝 —— 受管配置仍留在本地");
+    }
+    this.config = null;
+    this.executionCounts.clear();
+    if (!writeStoreValueChecked(STORE_KEYS.MDM_EXECUTION_COUNT, "")) {
+      console.error("[MDM] 擦除执行计数写入被存储拒绝 —— 旧计数仍留在本地");
+    }
+  }
+
+  /**
    * 擦除本地数据
    */
   private async wipeLocalData(): Promise<void> {
-    // 清理所有企业数据
-    this.config = null;
-    await this.saveConfig();
-    this.executionCounts.clear();
-    this.saveExecutionCounts();
-    
+    // 见 `clearStoredState` 的说明：擦除必须落到存储，否则设备会永远停在
+    // "每次启动都读到旧配置、又报一次已被擦除"的循环里。
+    this.clearStoredState();
+
     // 清理其他企业数据（快捷指令、模板等）
     // 这里可以添加更多清理逻辑
   }

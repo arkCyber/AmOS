@@ -35,6 +35,7 @@ import { tick } from "svelte";
 import DesktopShell from "../src/svelte/DesktopShell.svelte";
 import Dock from "../src/svelte/Dock.svelte";
 import { LAYOUT_KEY, readStoreValue, writeStoreValue } from "../src/lib/amosStore";
+import { KEYBOARD_CONFIG_KEY } from "../src/lib/keyboardConfigHook.svelte";
 import { resetDesktopFeaturesForTest } from "../src/lib/desktopFeatures";
 import { DEFAULT_DESKTOP_VIEW, type DesktopView } from "../src/lib/desktopView";
 import { DOCK_MIN_WIDTH, SPOTLIGHT_HEIGHT, SPOTLIGHT_WIDTH,
@@ -123,8 +124,17 @@ function installHostWithRecorder() {
   };
 }
 
-function press(key: string, mods: { metaKey?: boolean } = {}) {
-  window.dispatchEvent(new KeyboardEvent("keydown", { key, ...mods }));
+/**
+ * 派发一次 keydown，并把事件对象交回去。
+ *
+ * `cancelable: true` 是必须的：壳用 `preventDefault()` 表示"这个键归我管"，
+ * 而不可取消的事件上 `defaultPrevented` 永远是 `false` —— 那样"壳没有吃掉这个键"
+ * 这类断言就测不出任何东西。
+ */
+function press(key: string, mods: Record<string, boolean> = {}): KeyboardEvent {
+  const ev = new KeyboardEvent("keydown", { key, cancelable: true, ...mods });
+  window.dispatchEvent(ev);
+  return ev;
 }
 
 beforeEach(() => window.localStorage.clear());
@@ -332,6 +342,184 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     await tick();
     await settle();
     expect(container.querySelector('[data-testid="launchpad-overlay"]')).toBeTruthy();
+  });
+
+  test("a key the user changed in keyboard settings is the key the desktop accepts (and hints)", async () => {
+    installHost({
+      // Mission Control 在 0/1 个窗口时**故意**不出现（没有可切换的东西）——
+      // 最后那条断言需要一个真的"多窗口"场景。
+      windows: [
+        { label: "files", kind: "App", state: "Focused" },
+        { label: "notes", kind: "App", state: "Shown" },
+      ],
+    });
+    // 用户把 Launchpad 从 F4 改成 F9，并把 Spotlight（⌘Space）**显式禁用**（null）。
+    writeStoreValue(KEYBOARD_CONFIG_KEY, {
+      version: 1,
+      overlays: { launchpad: [{ key: "F9" }], spotlight: null },
+      system: {},
+      spaces: {},
+      touch: {},
+      updatedAt: 0,
+    });
+
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+
+    // 默认键不再开任何东西：覆盖是**取代**注册表默认值，不是"两个都生效"。
+    // （这一条在修复前必红 —— 那时桌面壳读的是 `moduleForShortcut`，注册表默认值。）
+    press("F4");
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="launchpad-overlay"]')).toBeNull();
+
+    // 用户那把键生效，并且再按一次能关上
+    press("F9");
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="launchpad-overlay"]')).toBeTruthy();
+    press("F9");
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="launchpad-overlay"]')).toBeNull();
+
+    // 提示读的是**同一份合并结果**（否则按钮会说 F4、按下去却是 F9 才开）
+    const barTrigger = container.querySelector<HTMLButtonElement>('[data-testid="chrome-launchpad"]')!;
+    expect(barTrigger.getAttribute("aria-keyshortcuts")).toBe("F9");
+    expect(barTrigger.getAttribute("title")).toBe(`${zh["desktop.launchpad"]} (F9)`);
+
+    // 没被改过的行仍按注册表工作（F3 → Mission Control）
+    press("F3");
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="mission-control"]')).toBeTruthy();
+  });
+
+  test("an overlay the user disabled (null) no longer answers its default key", async () => {
+    installHost();
+    writeStoreValue(KEYBOARD_CONFIG_KEY, {
+      version: 1,
+      overlays: { spotlight: null },
+      system: {},
+      spaces: {},
+      touch: {},
+      updatedAt: 0,
+    });
+
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+
+    press(" ", { metaKey: true });
+    await tick();
+    await settle();
+    expect(container.querySelectorAll('[data-testid="overlay-layer"]')).toHaveLength(0);
+  });
+
+  test("⌃↑ 打开/关闭 Spaces 面板（这个键此前被吃掉却什么都不做）", async () => {
+    installHost();
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+    expect(container.querySelector('[data-testid="overlay-layer"]')).toBeNull();
+
+    const opened = press("ArrowUp", { ctrlKey: true });
+    await tick();
+    await settle();
+    // 壳接了这个键（消费），并真的把面板渲染出来了
+    expect(opened.defaultPrevented).toBe(true);
+    const layers = () =>
+      [...container.querySelectorAll<HTMLElement>('[data-testid="overlay-layer"]')].map(
+        (l) => l.dataset.overlay,
+      );
+    expect(layers()).toEqual(["spaces-panel"]);
+
+    // 再按一次关上
+    press("ArrowUp", { ctrlKey: true });
+    await tick();
+    await settle();
+    expect(layers()).toEqual([]);
+  });
+
+  test("Spaces 键的覆盖与禁用生效（含 Ctrl+1…9 这一族）", async () => {
+    const commands = installHost();
+    writeStoreValue(KEYBOARD_CONFIG_KEY, {
+      version: 1,
+      overlays: {},
+      system: {},
+      spaces: {
+        // 上一个桌面改成 ⌃⌥←；其余三行全部**禁用**
+        spacesPrev: { key: "ArrowLeft", ctrl: true, alt: true },
+        spacesNext: null,
+        spacesDirect: null,
+        spacesPanel: null,
+      },
+      touch: {},
+      updatedAt: 0,
+    });
+
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+
+    // 用户那把键生效：走到 `spaces_list`（宿主没答，函数在那里就返回了 —— 足以证明绑定命中）
+    press("ArrowLeft", { ctrlKey: true, altKey: true });
+    await tick();
+    await settle();
+    expect(commands).toContain("spaces_list");
+
+    // 旧键（注册表默认的 ⌃←）不再触发
+    commands.length = 0;
+    press("ArrowLeft", { ctrlKey: true });
+    await tick();
+    await settle();
+    expect(commands).not.toContain("spaces_list");
+
+    // spacesNext / spacesDirect / spacesPanel 都被禁用：既不发命令、也不开面、也不吃键
+    commands.length = 0;
+    const right = press("ArrowRight", { ctrlKey: true });
+    const one = press("1", { ctrlKey: true });
+    const up = press("ArrowUp", { ctrlKey: true });
+    await tick();
+    await settle();
+    expect(commands).not.toContain("spaces_list");
+    expect(commands).not.toContain("spaces_switch");
+    expect(container.querySelectorAll('[data-testid="overlay-layer"]')).toHaveLength(0);
+    // "未接线"与"吃掉键"是两件事：禁用的行意味着这个键**不归壳管**
+    expect(right.defaultPrevented).toBe(false);
+    expect(one.defaultPrevented).toBe(false);
+    expect(up.defaultPrevented).toBe(false);
+  });
+
+  test("Ctrl+1…9 这一族取的是那一行的**修饰符**（改成 ⌃⌥ 就按 ⌃⌥ 匹配）", async () => {
+    const commands = installHost();
+    writeStoreValue(KEYBOARD_CONFIG_KEY, {
+      version: 1,
+      overlays: {},
+      system: {},
+      // 注意不要用 `meta: true` 来表达"改成 ⌘"：规范匹配器有一条**有意**的兼容
+      // （`s.meta` 且未显式写 `ctrl` ⇒ ⌃ 也算 ⌘，见 `shortcutMatches` 的真值表），
+      // 于是"⌃3 不再生效"会变成假阳性。这里用 ⌃⌥，它不会被任何兼容规则吸收。
+      spaces: { spacesDirect: { key: "1", ctrl: true, alt: true } },
+      touch: {},
+      updatedAt: 0,
+    });
+
+    render(DesktopShell);
+    await tick();
+    await settle();
+
+    press("3", { ctrlKey: true }); // 旧修饰符（只 ⌃）：不再生效
+    await tick();
+    await settle();
+    expect(commands).not.toContain("spaces_switch");
+
+    press("3", { ctrlKey: true, altKey: true }); // 用户那把：跳到第 3 个桌面（index 2）
+    await tick();
+    await settle();
+    expect(commands).toContain("spaces_switch");
+    expect((window as unknown as { __lastCall?: { args?: { index?: number } } }).__lastCall?.args?.index).toBe(2);
   });
 
   test("the Apple menu is real where it can be: 系统设置… opens the app, 锁定屏幕 locks", async () => {

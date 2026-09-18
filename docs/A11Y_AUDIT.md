@@ -1,6 +1,6 @@
 # AmOS Frontend A11y Audit (REQ-A282 → REQ-A283)
 
-> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度, 刀 5(REQ-A290) 触摸目标尺寸, 刀 6(REQ-A291) 动画敏感性, 刀 7(REQ-A292) 焦点陷阱。扫描器当前报 0 AA 缺口,6 处触摸 AAA 警告。
+> 状态: **P0/P1 全部归零** — 刀 1(REQ-A283) label-field-association, 刀 2(REQ-A284) live-region, 刀 3(REQ-A285) focus-visible, 刀 4(REQ-A288) 颜色对比度, 刀 5(REQ-A290) 触摸目标尺寸, 刀 6(REQ-A291) 动画敏感性, 刀 7(REQ-A292) 焦点陷阱。**刀 8(REQ-A387) 把剩下的 17 条启发式建议清到 0** —— 其中 3 条是**扫描器自己两条规则的缺陷**（R2 看不到长 `class` 之后的 `role=`、且被 `=>` 截断；R5 认不出动态 `role={…}`）、2 条是**不承载可感知状态**的定时器、其余 12 条为真缺口（3 处 live region、5 处着色 chip 对比度、6 处触摸目标）。扫描器当前报 **0 AA 缺口、0 触摸 AAA 警告**。
 > 方法: `scripts/a11y-scan.mjs` 启发式扫描 + DOM 级实测 + 人工分桶(严重性/真信号/误报)。
 > 底线: a11y 缺口的影响面 = 用键盘 / 屏幕阅读器的用户根本无法用,所以即使是误报上限也按"先补再说"——但补哪条按严重性,不是按发现数。
 
@@ -359,10 +359,23 @@ bun run check
 - `CHROME_ICON_BUTTON` / `CHROME_MENU_BUTTON`: 顶栏 44px 内嵌,Apple HIG 系统 chrome 用 22pt (WCAG 2.5.5 "essential" 例外)
 - `ImeKeyboard.svelte`: 键盘按键密集排列,等同 iOS Gboard 30-36pt (WCAG 2.5.5 "essential" 例外)
 
-**剩余 6 处 AAA-fail**(全部 ≥32px AA-pass,desktop mouse 主交互可接受):
-- AppLibrary 36px (icon-chooser emoji picker)
-- ClipboardAnnounce 32px (toast close)
-- PlayerApp 36/40px (refresh + fullscreen)
+**剩余 6 处 AAA-fail（REQ-A290 当时记录为"desktop mouse 主交互可接受"，REQ-A387 已全部补掉）**:
+- AppLibrary 36px (icon-chooser emoji picker + 搜索清除 + 分组上/下移) → `h-11 w-11`(44px)
+- ClipboardAnnounce 32px (toast close) → `h-11 w-11`
+- PlayerApp 36/40px (refresh + fullscreen) → `h-11 w-11`
+- ContactsApp 40px (头像预览关闭) → `h-11 w-11`
+- WebManApp 36px (浏览器工具栏 5 处) → `h-11 w-11`
+- settings/DockPage 32px (自动隐藏开关) → **命中区 `h-11 w-14`、轨道仍 `h-8 w-14`**（按钮包住轨道）
+
+补法统一是**只放大命中区、不动视觉**：行内/工具栏里的按钮用 `-my-1`/`-my-2` 把多出来的 4-8px
+抵掉，所以行高与视觉尺寸不变；DockPage 的开关则把轨道下沉到内层 `<span>`。
+
+**证据**（REQ-A387）:
+```bash
+bun run a11y:scan      # 缺口 17 → 0（129 文件 / 0 文件含缺口）
+bun run a11y:selftest  # 全过（新增 2 条负控：长 class + 箭头函数 + role= 不许报；同形无 role 必须报）
+npx vitest run svelte-tests/a11y-regressions.svelte.test.ts   # 3 例，逐项钉住本轮修掉的缺口
+```
 
 **证据**:
 ```bash

@@ -421,7 +421,7 @@
               top: {140 + (reading.tilt.y / 90) * 130 - 20}px;
               opacity: {deviceLevel ? 1 : 0.7};
             "
-          />
+          ></div>
         </div>
 
         <!-- Tilt Angles -->
@@ -449,7 +449,7 @@
               class:bg-orange-500={!deviceLevel && levelPct < 50}
               class:bg-red-500={!deviceLevel && levelPct >= 50}
               style="width: {Math.min(100, levelPct)}%"
-            />
+            ></div>
           </div>
         </div>
       {/if}

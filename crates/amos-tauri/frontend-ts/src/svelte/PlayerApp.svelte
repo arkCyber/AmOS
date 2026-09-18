@@ -497,7 +497,7 @@
           onclick={fullscreen}
           aria-label={t("player.fullscreen")}
           data-icon="maximize"
-          class="absolute right-2 top-2 grid h-10 w-10 place-items-center rounded-full bg-black/50 text-white transition active:scale-90"
+          class="absolute right-2 top-2 grid h-11 w-11 place-items-center rounded-full bg-black/50 text-white transition active:scale-90"
         >{@html iconSvg("maximize", "h-4 w-4")}</button>
       {:else}
         <audio
@@ -615,7 +615,7 @@
         onclick={refresh}
         aria-label={t("player.refresh")}
         data-icon="rotateCcw"
-        class="grid h-9 w-9 place-items-center rounded-full transition active:scale-90 hover:bg-neutral-200/60 dark:hover:bg-white/10"
+        class="grid h-11 w-11 -my-1 place-items-center rounded-full transition active:scale-90 hover:bg-neutral-200/60 dark:hover:bg-white/10"
       >{@html iconSvg("rotateCcw", "h-4 w-4")}</button>
     </div>
 

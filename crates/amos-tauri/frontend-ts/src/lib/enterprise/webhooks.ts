@@ -11,6 +11,7 @@
 
 import { logger } from "./logger";
 import { readStoreValue, writeStoreValueChecked } from "../amosStore";
+import { localId } from "../localId";
 
 // ============================================================================
 // 类型定义
@@ -105,7 +106,7 @@ class WebhookManager {
    * 添加 Webhook
    */
   addWebhook(config: Omit<WebhookConfig, "id" | "createdAt" | "updatedAt" | "lastTriggeredAt" | "triggerCount" | "successCount" | "failureCount">): string {
-    const id = `webhook-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const id = localId("webhook");
     const now = Date.now();
 
     const webhook: WebhookConfig = {

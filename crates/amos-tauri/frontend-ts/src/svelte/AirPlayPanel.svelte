@@ -2,7 +2,16 @@
   import { onMount, onDestroy } from 'svelte';
   import { t } from './locale.svelte';
   import { iconSvg } from '../lib/sysIcons';
-  import * as airplay from '../lib/airplay';
+  import {
+    connect,
+    disconnect,
+    discoverDevices,
+    getDevices,
+    getStatus,
+    isAirPlayAvailable,
+    setVolume,
+    stopDiscovery,
+  } from '../lib/airplay';
   import type { AirPlayDevice, AirPlayStatus } from '../lib/airplay';
 
   let available = $state(false);
@@ -15,7 +24,7 @@
   let refreshInterval: number | null = null;
 
   onMount(async () => {
-    available = await airplay.isAirPlayAvailable();
+    available = await isAirPlayAvailable();
     if (available) {
       await loadStatus();
       await startDiscovery();
@@ -32,21 +41,21 @@
       window.clearInterval(refreshInterval);
     }
     if (discovering) {
-      airplay.stopDiscovery();
+      stopDiscovery();
     }
   });
 
   async function loadDevices() {
-    devices = await airplay.getDevices();
+    devices = await getDevices();
   }
 
   async function loadStatus() {
-    status = await airplay.getStatus();
+    status = await getStatus();
   }
 
   async function startDiscovery() {
     discovering = true;
-    const result = await airplay.discoverDevices();
+    const result = await discoverDevices();
     if (result.kind === 'ok') {
       await loadDevices();
     }
@@ -55,7 +64,7 @@
   async function handleConnect(deviceId: string) {
     connecting = true;
     selectedDeviceId = deviceId;
-    const result = await airplay.connect(deviceId);
+    const result = await connect(deviceId);
     connecting = false;
     if (result.kind === 'ok') {
       await loadStatus();
@@ -67,7 +76,7 @@
 
   async function handleDisconnect() {
     connecting = true;
-    const result = await airplay.disconnect();
+    const result = await disconnect();
     connecting = false;
     if (result.kind === 'ok') {
       await loadStatus();
@@ -78,7 +87,7 @@
   async function handleVolumeChange(e: Event) {
     const target = e.target as HTMLInputElement;
     const volume = parseFloat(target.value);
-    await airplay.setVolume(volume);
+    await setVolume(volume);
   }
 
   function getDeviceKindLabel(kind: string): string {
@@ -217,7 +226,10 @@
     background: rgb(71 85 105 / 0.5);
     border-radius: 3px;
   }
-  .airplay-panel ::-webkit-scrollbar-thumb:hover {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .airplay-panel ::-webkit-scrollbar-thumb:hover {
     background: rgb(71 85 105 / 0.7);
+  }
   }
 </style>

@@ -31,16 +31,22 @@ fn magic_bytes() {
     assert_eq!(ffi::AMLK_MAGIC, [0x41, 0x4D, 0x4C, 0x4B]);
 }
 
-#[test]
-fn size_limits_are_reasonable() {
+/// The published limits are part of the ABI contract, and they are `const`s — so this is
+/// checked **at compile time**, not by a runtime test. A runtime `assert!` on a constant
+/// can never fail (that is exactly what `clippy::assertions_on_constants` is about: it
+/// reads as a test while testing nothing), whereas this form also fails the build for every
+/// consumer of the crate. Measured 2026-09-17 (REQ-A388): this block was one of the things
+/// keeping `cargo clippy --all-targets -- -D warnings` red for `amos-link-cc`.
+const _: () = {
     assert!(ffi::AMLK_MAX_FRAME_BYTES > 0);
     assert!(ffi::AMLK_MAX_PAYLOAD_BYTES > 0);
     assert!(ffi::AMLK_MAX_PEER_ID_LEN > 0);
     assert!(ffi::AMLK_MAX_TOPIC_LEN > 0);
     assert!(ffi::AMLK_MAX_ENDPOINT_LEN > 0);
     assert!(ffi::AMLK_QOS_MAX_DEPTH > 0);
+    // A frame must be able to carry the header *and* a full payload.
     assert!(ffi::AMLK_MAX_FRAME_BYTES >= ffi::AMLK_MAX_PAYLOAD_BYTES);
-}
+};
 
 // ---------------------------------------------------------------------------
 // Topic / keyexpr
@@ -65,7 +71,9 @@ fn topic_validate_accepts_valid_topics() {
 
 #[test]
 fn topic_validate_rejects_invalid_topics() {
-    let topics = &["", "foo//bar", "foo/bar/", "/foo/bar", "foo BAR", "foo\nbar"];
+    let topics = &[
+        "", "foo//bar", "foo/bar/", "/foo/bar", "foo BAR", "foo\nbar",
+    ];
     for topic in topics {
         let c_str = std::ffi::CString::new(*topic).unwrap();
         let result = unsafe { ffi::amos_link_topic_validate(c_str.as_ptr()) };
@@ -75,7 +83,13 @@ fn topic_validate_rejects_invalid_topics() {
 
 #[test]
 fn topic_validate_pattern_accepts_wildcards() {
-    let patterns = &["amos/*/sensor/*", "amos/robot-1/**", "amos/**/imu", "amos/*", "amos/**"];
+    let patterns = &[
+        "amos/*/sensor/*",
+        "amos/robot-1/**",
+        "amos/**/imu",
+        "amos/*",
+        "amos/**",
+    ];
     for pattern in patterns {
         let c_str = std::ffi::CString::new(*pattern).unwrap();
         let result = unsafe { ffi::amos_link_topic_validate_pattern(c_str.as_ptr()) };
@@ -141,32 +155,50 @@ fn peer_id_new_with_small_buffer_succeeds() {
 
 #[test]
 fn qos_sensor_has_expected_values() {
-    let qos = unsafe { ffi::amos_link_qos_sensor() };
-    assert_eq!(qos.reliability, ffi::amos_link_reliability::ReliabilityBestEffort);
+    let qos = ffi::amos_link_qos_sensor();
+    assert_eq!(
+        qos.reliability,
+        ffi::amos_link_reliability::ReliabilityBestEffort
+    );
     assert_eq!(qos.depth, 1);
-    assert_eq!(qos.drop_policy, ffi::amos_link_drop_policy::DropPolicyDropOldest);
+    assert_eq!(
+        qos.drop_policy,
+        ffi::amos_link_drop_policy::DropPolicyDropOldest
+    );
 }
 
 #[test]
 fn qos_control_has_expected_values() {
-    let qos = unsafe { ffi::amos_link_qos_control() };
-    assert_eq!(qos.reliability, ffi::amos_link_reliability::ReliabilityReliable);
+    let qos = ffi::amos_link_qos_control();
+    assert_eq!(
+        qos.reliability,
+        ffi::amos_link_reliability::ReliabilityReliable
+    );
     assert_eq!(qos.depth, 64);
-    assert_eq!(qos.drop_policy, ffi::amos_link_drop_policy::DropPolicyDropNewest);
+    assert_eq!(
+        qos.drop_policy,
+        ffi::amos_link_drop_policy::DropPolicyDropNewest
+    );
 }
 
 #[test]
 fn qos_state_has_expected_values() {
-    let qos = unsafe { ffi::amos_link_qos_state() };
-    assert_eq!(qos.reliability, ffi::amos_link_reliability::ReliabilityBestEffort);
+    let qos = ffi::amos_link_qos_state();
+    assert_eq!(
+        qos.reliability,
+        ffi::amos_link_reliability::ReliabilityBestEffort
+    );
     assert_eq!(qos.depth, 8);
-    assert_eq!(qos.drop_policy, ffi::amos_link_drop_policy::DropPolicyDropNewest);
+    assert_eq!(
+        qos.drop_policy,
+        ffi::amos_link_drop_policy::DropPolicyDropNewest
+    );
 }
 
 #[test]
 fn qos_default_equals_state() {
-    let qos = unsafe { ffi::amos_link_qos_default() };
-    let state = unsafe { ffi::amos_link_qos_state() };
+    let qos = ffi::amos_link_qos_default();
+    let state = ffi::amos_link_qos_state();
     assert_eq!(qos.reliability, state.reliability);
     assert_eq!(qos.depth, state.depth);
     assert_eq!(qos.drop_policy, state.drop_policy);
@@ -174,41 +206,63 @@ fn qos_default_equals_state() {
 
 #[test]
 fn qos_new_constructs_correctly() {
-    let qos = unsafe {
-        ffi::amos_link_qos_new(ffi::amos_link_reliability::ReliabilityReliable, 128, ffi::amos_link_drop_policy::DropPolicyDropOldest)
-    };
-    assert_eq!(qos.reliability, ffi::amos_link_reliability::ReliabilityReliable);
+    let qos = ffi::amos_link_qos_new(
+        ffi::amos_link_reliability::ReliabilityReliable,
+        128,
+        ffi::amos_link_drop_policy::DropPolicyDropOldest,
+    );
+    assert_eq!(
+        qos.reliability,
+        ffi::amos_link_reliability::ReliabilityReliable
+    );
     assert_eq!(qos.depth, 128);
-    assert_eq!(qos.drop_policy, ffi::amos_link_drop_policy::DropPolicyDropOldest);
+    assert_eq!(
+        qos.drop_policy,
+        ffi::amos_link_drop_policy::DropPolicyDropOldest
+    );
 }
 
 #[test]
 fn qos_for_channel_sensor() {
-    let qos = unsafe { ffi::amos_link_qos_for_channel(ffi::amos_link_channel::ChannelSensor) };
-    assert_eq!(qos.reliability, ffi::amos_link_reliability::ReliabilityBestEffort);
-    assert_eq!(qos.drop_policy, ffi::amos_link_drop_policy::DropPolicyDropOldest);
+    let qos = ffi::amos_link_qos_for_channel(ffi::amos_link_channel::ChannelSensor);
+    assert_eq!(
+        qos.reliability,
+        ffi::amos_link_reliability::ReliabilityBestEffort
+    );
+    assert_eq!(
+        qos.drop_policy,
+        ffi::amos_link_drop_policy::DropPolicyDropOldest
+    );
 }
 
 #[test]
 fn qos_for_channel_control() {
-    let qos = unsafe { ffi::amos_link_qos_for_channel(ffi::amos_link_channel::ChannelControl) };
-    assert_eq!(qos.reliability, ffi::amos_link_reliability::ReliabilityReliable);
-    assert_eq!(qos.drop_policy, ffi::amos_link_drop_policy::DropPolicyDropNewest);
+    let qos = ffi::amos_link_qos_for_channel(ffi::amos_link_channel::ChannelControl);
+    assert_eq!(
+        qos.reliability,
+        ffi::amos_link_reliability::ReliabilityReliable
+    );
+    assert_eq!(
+        qos.drop_policy,
+        ffi::amos_link_drop_policy::DropPolicyDropNewest
+    );
 }
 
 #[test]
 fn qos_validate_accepts_valid_qos() {
-    let qos = unsafe { ffi::amos_link_qos_sensor() };
-    let result = unsafe { ffi::amos_link_qos_validate(qos) };
+    let qos = ffi::amos_link_qos_sensor();
+    let result = ffi::amos_link_qos_validate(qos);
     assert_eq!(result, 0);
 }
 
 #[test]
 fn qos_validate_rejects_depth_zero() {
-    let qos = unsafe {
-        ffi::amos_link_qos_new(ffi::amos_link_reliability::ReliabilityBestEffort, 0, ffi::amos_link_drop_policy::DropPolicyDropOldest)
-    };
-    let result = unsafe { ffi::amos_link_qos_validate(qos) };
+    let qos = ffi::amos_link_qos_new(
+        ffi::amos_link_reliability::ReliabilityBestEffort,
+        0,
+        ffi::amos_link_drop_policy::DropPolicyDropOldest,
+    );
+    let result = ffi::amos_link_qos_validate(qos);
     assert_ne!(result, 0);
 }
 
@@ -218,35 +272,35 @@ fn qos_validate_rejects_depth_zero() {
 
 #[test]
 fn timestamp_now_is_valid() {
-    let stamp = unsafe { ffi::amos_link_timestamp_now() };
-    assert!(unsafe { ffi::amos_link_timestamp_is_valid(stamp) });
+    let stamp = ffi::amos_link_timestamp_now();
+    assert!(ffi::amos_link_timestamp_is_valid(stamp));
 }
 
 #[test]
 fn timestamp_new_accepts_valid_values() {
-    let stamp = unsafe { ffi::amos_link_timestamp_new(1_700_000_000, 500_000_000) };
-    assert!(unsafe { ffi::amos_link_timestamp_is_valid(stamp) });
+    let stamp = ffi::amos_link_timestamp_new(1_700_000_000, 500_000_000);
+    assert!(ffi::amos_link_timestamp_is_valid(stamp));
 }
 
 #[test]
 fn timestamp_as_nanos() {
-    let stamp = unsafe { ffi::amos_link_timestamp_new(10, 500_000_000) };
-    let nanos = unsafe { ffi::amos_link_timestamp_as_nanos(stamp) };
+    let stamp = ffi::amos_link_timestamp_new(10, 500_000_000);
+    let nanos = ffi::amos_link_timestamp_as_nanos(stamp);
     assert_eq!(nanos, 10_000_000_000 + 500_000_000);
 }
 
 #[test]
 fn timestamp_unix_ms() {
-    let stamp = unsafe { ffi::amos_link_timestamp_new(1700, 500_000) };
-    let ms = unsafe { ffi::amos_link_timestamp_unix_ms(stamp) };
+    let stamp = ffi::amos_link_timestamp_new(1700, 500_000);
+    let ms = ffi::amos_link_timestamp_unix_ms(stamp);
     assert_eq!(ms, 1_700_000);
 }
 
 #[test]
 fn timestamp_since_secs() {
-    let earlier = unsafe { ffi::amos_link_timestamp_new(10, 0) };
-    let later = unsafe { ffi::amos_link_timestamp_new(12, 500_000_000) };
-    let diff = unsafe { ffi::amos_link_timestamp_since_secs(earlier, later) };
+    let earlier = ffi::amos_link_timestamp_new(10, 0);
+    let later = ffi::amos_link_timestamp_new(12, 500_000_000);
+    let diff = ffi::amos_link_timestamp_since_secs(earlier, later);
     assert!((diff - 2.5).abs() < 0.001);
 }
 
@@ -259,12 +313,18 @@ fn frame_encode_produces_non_empty_bytes() {
     let topic = std::ffi::CString::new("amos/robot-1/sensor/imu").unwrap();
     let peer = std::ffi::CString::new("robot-1").unwrap();
     let payload: &[u8] = &[1, 2, 3, 4];
-    let stamp = unsafe { ffi::amos_link_timestamp_now() };
+    let stamp = ffi::amos_link_timestamp_now();
     let mut frame = [0u8; 4096];
     let n = unsafe {
         ffi::amos_link_frame_encode(
-            topic.as_ptr(), peer.as_ptr(), 42, stamp,
-            payload.as_ptr(), payload.len(), frame.as_mut_ptr(), frame.len(),
+            topic.as_ptr(),
+            peer.as_ptr(),
+            42,
+            stamp,
+            payload.as_ptr(),
+            payload.len(),
+            frame.as_mut_ptr(),
+            frame.len(),
         )
     };
     assert!(n > 0, "encoded frame should have non-zero size");
@@ -280,18 +340,29 @@ fn frame_decode_header_extracts_fields() {
     let topic = std::ffi::CString::new("amos/robot-1/sensor/imu").unwrap();
     let peer = std::ffi::CString::new("robot-1").unwrap();
     let payload: &[u8] = &[1, 2, 3, 4];
-    let stamp = unsafe { ffi::amos_link_timestamp_now() };
+    let stamp = ffi::amos_link_timestamp_now();
     let mut frame = [0u8; 4096];
     let n = unsafe {
         ffi::amos_link_frame_encode(
-            topic.as_ptr(), peer.as_ptr(), 7, stamp,
-            payload.as_ptr(), payload.len(), frame.as_mut_ptr(), frame.len(),
+            topic.as_ptr(),
+            peer.as_ptr(),
+            7,
+            stamp,
+            payload.as_ptr(),
+            payload.len(),
+            frame.as_mut_ptr(),
+            frame.len(),
         )
     };
     assert!(n > 0);
     let mut h = ffi::amos_link_frame_header {
-        topic: [0; 1024], topic_len: 0, peer_id: [0; 64],
-        seq: 0, stamp_secs: 0, stamp_nanos: 0, payload_len: 0,
+        topic: [0; 1024],
+        topic_len: 0,
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        payload_len: 0,
     };
     let result = unsafe { ffi::amos_link_frame_decode_header(frame.as_ptr(), n, &mut h) };
     assert_eq!(result, 0, "decode_header should succeed");
@@ -305,20 +376,32 @@ fn frame_decode_payload_extracts_data() {
     let topic = std::ffi::CString::new("amos/r1/sensor/imu").unwrap();
     let peer = std::ffi::CString::new("r1").unwrap();
     let payload: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
-    let stamp = unsafe { ffi::amos_link_timestamp_now() };
+    let stamp = ffi::amos_link_timestamp_now();
     let mut frame = [0u8; 4096];
     let n = unsafe {
         ffi::amos_link_frame_encode(
-            topic.as_ptr(), peer.as_ptr(), 1, stamp,
-            payload.as_ptr(), payload.len(), frame.as_mut_ptr(), frame.len(),
+            topic.as_ptr(),
+            peer.as_ptr(),
+            1,
+            stamp,
+            payload.as_ptr(),
+            payload.len(),
+            frame.as_mut_ptr(),
+            frame.len(),
         )
     };
     let mut out = [0u8; 64];
     let result = unsafe {
         ffi::amos_link_frame_decode_payload(frame.as_ptr(), n, out.as_mut_ptr(), out.len())
     };
-    assert!(result > 0, "decode_payload should return positive byte count");
-    assert!(out.iter().any(|&b| b != 0), "decoded payload should be non-zero");
+    assert!(
+        result > 0,
+        "decode_payload should return positive byte count"
+    );
+    assert!(
+        out.iter().any(|&b| b != 0),
+        "decoded payload should be non-zero"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +422,12 @@ fn crc32_combine_is_nonzero() {
     let header: &[u8] = b"HEAD";
     let payload: &[u8] = b"PAYLOAD";
     let combined = unsafe {
-        ffi::amos_link_crc32_combine(header.as_ptr(), header.len(), payload.as_ptr(), payload.len())
+        ffi::amos_link_crc32_combine(
+            header.as_ptr(),
+            header.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
     };
     assert_ne!(combined, 0);
 }
@@ -360,7 +448,8 @@ fn node_new_creates_valid_node() {
 #[test]
 fn node_peer_id_round_trip() {
     let peer = std::ffi::CString::new("test-robot-99").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let mut buf = [0i8; 128];
     let result = unsafe { ffi::amos_link_node_peer_id(node, buf.as_mut_ptr(), buf.len()) };
@@ -373,7 +462,8 @@ fn node_peer_id_round_trip() {
 #[test]
 fn node_kind_is_correct() {
     let peer = std::ffi::CString::new("sensor-1").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
     assert!(!node.is_null());
     let kind = unsafe { ffi::amos_link_node_get_kind(node) };
     assert_eq!(kind, ffi::amos_link_node_kind::NodeSensor);
@@ -383,7 +473,8 @@ fn node_kind_is_correct() {
 #[test]
 fn node_uptime_is_monotonic() {
     let peer = std::ffi::CString::new("uptime-test").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeTool) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeTool) };
     assert!(!node.is_null());
     std::thread::sleep(std::time::Duration::from_millis(50));
     let t1 = unsafe { ffi::amos_link_node_uptime_ms(node) };
@@ -396,7 +487,8 @@ fn node_uptime_is_monotonic() {
 #[test]
 fn node_clone_increments_refcount() {
     let peer = std::ffi::CString::new("clone-test").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let clone1 = unsafe { ffi::amos_link_node_clone(node) };
     assert!(!clone1.is_null());
@@ -407,10 +499,16 @@ fn node_clone_increments_refcount() {
 #[test]
 fn node_metrics_initially_zeros() {
     let peer = std::ffi::CString::new("metrics-test").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeBrain) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeBrain) };
     assert!(!node.is_null());
     let mut m = ffi::amos_link_metrics {
-        published: 0, delivered: 0, dropped: 0, blocked: 0, decode_errors: 0, encode_errors: 0,
+        published: 0,
+        delivered: 0,
+        dropped: 0,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
     };
     let result = unsafe { ffi::amos_link_node_metrics(node, &mut m) };
     assert_eq!(result, 0);
@@ -420,16 +518,20 @@ fn node_metrics_initially_zeros() {
 
 #[test]
 fn last_error_is_clearable() {
-    let node = unsafe { ffi::amos_link_node_new(std::ptr::null(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(std::ptr::null(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(node.is_null());
-    let err = unsafe { ffi::amos_link_last_error() };
+    let err = ffi::amos_link_last_error();
     assert!(!err.is_null());
     let err_str = unsafe { CStr::from_ptr(err) };
     assert!(!err_str.to_string_lossy().is_empty());
-    unsafe { ffi::amos_link_error_clear() };
-    let err2 = unsafe { ffi::amos_link_last_error() };
+    ffi::amos_link_error_clear();
+    let err2 = ffi::amos_link_last_error();
     let err_str2 = unsafe { CStr::from_ptr(err2) };
-    assert!(err_str2.to_bytes().is_empty(), "after clear, error string should be empty");
+    assert!(
+        err_str2.to_bytes().is_empty(),
+        "after clear, error string should be empty"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +541,8 @@ fn last_error_is_clearable() {
 #[test]
 fn publisher_new_creates_valid_publisher() {
     let peer = std::ffi::CString::new("pub-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let topic = std::ffi::CString::new("amos/pub-peer/sensor/test").unwrap();
     let pubr = unsafe { ffi::amos_link_publisher_new(node, topic.as_ptr()) };
@@ -456,7 +559,8 @@ fn publisher_new_creates_valid_publisher() {
 #[test]
 fn publisher_publish_encodes_frame() {
     let peer = std::ffi::CString::new("pub-test").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let topic = std::ffi::CString::new("amos/pub-test/control/cmd").unwrap();
     let pubr = unsafe { ffi::amos_link_publisher_new(node, topic.as_ptr()) };
@@ -467,6 +571,71 @@ fn publisher_publish_encodes_frame() {
     unsafe { ffi::amos_link_publisher_drop(pubr) };
     unsafe { ffi::amos_link_node_drop(node) };
 }
+// --- Publisher: an empty payload from C ------------------------------------------------
+//
+// C spells "no payload" as `NULL, 0`, and `amos_link_publisher_publish` used to hand that
+// straight to `slice::from_raw_parts` — which requires a non-null aligned pointer **even
+// for length 0**, so publishing an empty payload was undefined behaviour until REQ-A388.
+// `NULL, n>0` is a caller bug: refused with the same sentence `frame_encode` uses.
+#[test]
+fn publisher_publish_accepts_null_payload_with_zero_length() {
+    let peer = std::ffi::CString::new("pub-empty").unwrap();
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    assert!(!node.is_null());
+    let topic = std::ffi::CString::new("amos/pub-empty/sensor/x").unwrap();
+    let pubr = unsafe { ffi::amos_link_publisher_new(node, topic.as_ptr()) };
+    assert!(!pubr.is_null());
+
+    let empty = unsafe { ffi::amos_link_publisher_publish(pubr, std::ptr::null(), 0) };
+    assert_eq!(empty, 0, "an empty payload must publish, not crash");
+
+    let bad = unsafe { ffi::amos_link_publisher_publish(pubr, std::ptr::null(), 4) };
+    assert!(
+        bad < 0,
+        "NULL with a non-zero length must be refused, got {bad}"
+    );
+
+    unsafe { ffi::amos_link_publisher_drop(pubr) };
+    unsafe { ffi::amos_link_node_drop(node) };
+}
+
+// --- Heartbeat: a null out-buffer must be refused, not written through -------------------
+#[test]
+fn heartbeat_encode_rejects_null_output_buffer() {
+    let peer = std::ffi::CString::new("beat-null-out").unwrap();
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    assert!(!node.is_null());
+    let beat = unsafe { ffi::amos_link_node_heartbeat(node) };
+    assert!(!beat.is_null());
+
+    let r = unsafe { ffi::amos_link_heartbeat_encode(beat, std::ptr::null_mut()) };
+    assert!(r < 0, "a null frame buffer must be refused, got {r}");
+
+    unsafe { ffi::amos_link_heartbeat_drop(beat) };
+    unsafe { ffi::amos_link_node_drop(node) };
+}
+
+// --- `last_error` must not allocate per call --------------------------------------------
+//
+// `amos_link_last_error` is called by C after *every* failed call, so it has to be free of
+// per-call allocations it never frees. It used to `Box::leak` a fresh string per call
+// (REQ-A388): a C error loop leaked every byte it read. The pointer is now backed by a
+// thread-local `CString`, i.e. the ordinary `strerror` contract (valid until the next call
+// on this thread). A leak is not observable from a test process, so this pins the
+// *implementation shape* that caused it — the same technique the repo's scan gates use.
+#[test]
+fn last_error_does_not_leak_per_call() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+    // Match the **call**, not the word: this file's own prose mentions the old `Box::leak`
+    // when explaining why it is gone, and a ratchet that trips on its own comment would be
+    // turned off by the next person.
+    assert!(
+        !src.contains("Box::leak("),
+        "a leaking per-call allocation came back to amos_link_last_error"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Subscriber lifecycle
@@ -475,19 +644,30 @@ fn publisher_publish_encodes_frame() {
 #[test]
 fn subscriber_new_creates_valid_subscriber() {
     let peer = std::ffi::CString::new("sub-test").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
     assert!(!node.is_null());
     let pattern = std::ffi::CString::new("amos/sub-test/sensor/*").unwrap();
-    let qos = unsafe { ffi::amos_link_qos_sensor() };
+    let qos = ffi::amos_link_qos_sensor();
     let sub = unsafe { ffi::amos_link_subscriber_new(node, pattern.as_ptr(), qos) };
     assert!(!sub.is_null());
     let mut received = ffi::amos_link_received {
-        topic: [0; 1024], peer_id: [0; 64], seq: 0,
-        stamp_secs: 0, stamp_nanos: 0, frame_len: 0, payload_len: 0,
+        topic: [0; 1024],
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        frame_len: 0,
+        payload_len: 0,
     };
     let mut payload_buf = [0u8; 256];
     let poll_result = unsafe {
-        ffi::amos_link_subscriber_poll(sub, &mut received, payload_buf.as_mut_ptr(), payload_buf.len())
+        ffi::amos_link_subscriber_poll(
+            sub,
+            &mut received,
+            payload_buf.as_mut_ptr(),
+            payload_buf.len(),
+        )
     };
     // Pending is expected (no publisher yet)
     assert_eq!(poll_result, ffi::amos_link_poll::Pending);
@@ -498,12 +678,22 @@ fn subscriber_new_creates_valid_subscriber() {
 #[test]
 fn subscriber_poll_returns_closed_for_null() {
     let mut received = ffi::amos_link_received {
-        topic: [0; 1024], peer_id: [0; 64], seq: 0,
-        stamp_secs: 0, stamp_nanos: 0, frame_len: 0, payload_len: 0,
+        topic: [0; 1024],
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        frame_len: 0,
+        payload_len: 0,
     };
     let mut payload_buf = [0u8; 256];
     let result = unsafe {
-        ffi::amos_link_subscriber_poll(std::ptr::null(), &mut received, payload_buf.as_mut_ptr(), payload_buf.len())
+        ffi::amos_link_subscriber_poll(
+            std::ptr::null(),
+            &mut received,
+            payload_buf.as_mut_ptr(),
+            payload_buf.len(),
+        )
     };
     assert_eq!(result, ffi::amos_link_poll::Closed);
 }
@@ -515,7 +705,8 @@ fn subscriber_poll_returns_closed_for_null() {
 #[test]
 fn heartbeat_encode_produces_frame() {
     let peer = std::ffi::CString::new("beat-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let beat = unsafe { ffi::amos_link_node_heartbeat(node) };
     assert!(!beat.is_null());
@@ -523,9 +714,14 @@ fn heartbeat_encode_produces_frame() {
     let n = unsafe { ffi::amos_link_heartbeat_encode(beat, frame.as_mut_ptr()) };
     assert!(n > 0);
     let mut fields = ffi::amos_link_heartbeat_fields {
-        peer_id: [0; 64], seq: 0, stamp_secs: 0, stamp_nanos: 0, uptime_ms: 0,
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        uptime_ms: 0,
     };
-    let decode_result = unsafe { ffi::amos_link_heartbeat_decode(frame.as_ptr(), n as usize, &mut fields) };
+    let decode_result =
+        unsafe { ffi::amos_link_heartbeat_decode(frame.as_ptr(), n as usize, &mut fields) };
     assert_eq!(decode_result, 0);
     unsafe { ffi::amos_link_heartbeat_drop(beat) };
     unsafe { ffi::amos_link_node_drop(node) };
@@ -538,7 +734,12 @@ fn heartbeat_encode_produces_frame() {
 #[test]
 fn health_evaluate_unknown_with_no_peers() {
     let metrics = ffi::amos_link_metrics {
-        published: 0, delivered: 0, dropped: 0, blocked: 0, decode_errors: 0, encode_errors: 0,
+        published: 0,
+        delivered: 0,
+        dropped: 0,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
     };
     let health = unsafe { ffi::amos_link_evaluate_health(&metrics, std::ptr::null(), 0, false) };
     assert_eq!(health.state, ffi::amos_link_health_state::Unknown);
@@ -547,18 +748,31 @@ fn health_evaluate_unknown_with_no_peers() {
 #[test]
 fn health_evaluate_healthy_with_good_ratio() {
     let metrics = ffi::amos_link_metrics {
-        published: 100, delivered: 95, dropped: 5, blocked: 0, decode_errors: 0, encode_errors: 0,
+        published: 100,
+        delivered: 95,
+        dropped: 5,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
     };
     // With clock synced, no peers is still degraded (NoPeers reason).
     // This tests that the function is callable and returns a known state.
     let health = unsafe { ffi::amos_link_evaluate_health(&metrics, std::ptr::null(), 0, true) };
-    assert!(matches!(health.state, ffi::amos_link_health_state::Healthy | ffi::amos_link_health_state::Degraded));
+    assert!(matches!(
+        health.state,
+        ffi::amos_link_health_state::Healthy | ffi::amos_link_health_state::Degraded
+    ));
 }
 
 #[test]
 fn health_evaluate_degraded_with_bad_ratio() {
     let metrics = ffi::amos_link_metrics {
-        published: 100, delivered: 30, dropped: 70, blocked: 0, decode_errors: 0, encode_errors: 0,
+        published: 100,
+        delivered: 30,
+        dropped: 70,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
     };
     let health = unsafe { ffi::amos_link_evaluate_health(&metrics, std::ptr::null(), 0, true) };
     assert_eq!(health.state, ffi::amos_link_health_state::Degraded);
@@ -572,13 +786,18 @@ fn health_evaluate_degraded_with_bad_ratio() {
 #[test]
 fn node_heartbeat_topic_returns_valid_path() {
     let peer = std::ffi::CString::new("beat-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let mut buf = [0i8; 256];
     let result = unsafe { ffi::amos_link_node_heartbeat_topic(node, buf.as_mut_ptr()) };
     assert_eq!(result, 0);
     let s = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
-    assert!(s.starts_with("amos/"), "heartbeat topic should start with 'amos/', got: {}", s);
+    assert!(
+        s.starts_with("amos/"),
+        "heartbeat topic should start with 'amos/', got: {}",
+        s
+    );
     unsafe { ffi::amos_link_node_drop(node) };
 }
 
@@ -586,11 +805,16 @@ fn node_heartbeat_topic_returns_valid_path() {
 #[test]
 fn node_metrics_initially_all_zeros() {
     let peer = std::ffi::CString::new("metrics-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
     assert!(!node.is_null());
     let mut m = ffi::amos_link_metrics {
-        published: !0u64, delivered: !0u64, dropped: !0u64,
-        blocked: !0u64, decode_errors: !0u64, encode_errors: !0u64,
+        published: !0u64,
+        delivered: !0u64,
+        dropped: !0u64,
+        blocked: !0u64,
+        decode_errors: !0u64,
+        encode_errors: !0u64,
     };
     let r = unsafe { ffi::amos_link_node_metrics(node, &mut m) };
     assert_eq!(r, 0);
@@ -604,16 +828,18 @@ fn node_metrics_initially_all_zeros() {
 #[test]
 fn node_peers_returns_zero_when_no_peers() {
     let peer = std::ffi::CString::new("peers-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     // Use std::array::from_fn for non-Copy types with explicit type annotation
-    let mut peers: [ffi::amos_link_peer_view; 8] = std::array::from_fn(|_| ffi::amos_link_peer_view {
-        id: [0; 64],
-        kind: ffi::amos_link_node_kind::NodeRobot,
-        endpoint: [0; 128],
-        last_seen_ms: !0u64,
-        beacons: !0u64,
-    });
+    let mut peers: [ffi::amos_link_peer_view; 8] =
+        std::array::from_fn(|_| ffi::amos_link_peer_view {
+            id: [0; 64],
+            kind: ffi::amos_link_node_kind::NodeRobot,
+            endpoint: [0; 128],
+            last_seen_ms: !0u64,
+            beacons: !0u64,
+        });
     let n = unsafe { ffi::amos_link_node_peers(node, peers.as_mut_ptr(), peers.len()) };
     assert_eq!(n, 0, "should have no peers at startup");
     unsafe { ffi::amos_link_node_drop(node) };
@@ -623,9 +849,11 @@ fn node_peers_returns_zero_when_no_peers() {
 #[test]
 fn node_topics_returns_zero_when_no_topics() {
     let peer = std::ffi::CString::new("topics-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
-    let mut entries: [ffi::amos_link_topic_entry; 4] = std::array::from_fn(|_| ffi::amos_link_topic_entry { topic: [0; 1024] });
+    let mut entries: [ffi::amos_link_topic_entry; 4] =
+        std::array::from_fn(|_| ffi::amos_link_topic_entry { topic: [0; 1024] });
     let n = unsafe { ffi::amos_link_node_topics(node, entries.as_mut_ptr(), entries.len()) };
     assert_eq!(n, 0, "should have no topics at startup");
     unsafe { ffi::amos_link_node_drop(node) };
@@ -635,7 +863,8 @@ fn node_topics_returns_zero_when_no_topics() {
 #[test]
 fn subscriber_stats_returns_zeros() {
     let peer = std::ffi::CString::new("stats-sub").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let pattern = std::ffi::CString::new("amos/stats-sub/*").unwrap();
     let sub = unsafe {
@@ -657,10 +886,18 @@ fn subscriber_stats_returns_zeros() {
 }
 
 // --- Subscriber has_pending ---
+//
+// `amos_link_subscriber_has_pending` answers `true` for any live subscriber: an mpsc
+// receiver cannot be asked "is it empty" without consuming, so the C ABI promises "there
+// may be data" rather than lying with a `false` (see the function's own comment in
+// `src/lib.rs`). This test used to assert `matches!(r, true | false)` — always true, i.e.
+// it could never fail (REQ-A388). Assert the contract that actually holds instead, so a
+// future change to "never claims pending" is caught.
 #[test]
-fn subscriber_has_pending_is_bool() {
+fn subscriber_has_pending_is_conservatively_true() {
     let peer = std::ffi::CString::new("pending-sub").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let pattern = std::ffi::CString::new("amos/pending-sub/**").unwrap();
     let sub = unsafe {
@@ -668,8 +905,10 @@ fn subscriber_has_pending_is_bool() {
     };
     assert!(!sub.is_null());
     let r = unsafe { ffi::amos_link_subscriber_has_pending(sub) };
-    // Just verify it's a valid bool (always true conservatively since no data yet)
-    assert!(matches!(r, true | false));
+    assert!(
+        r,
+        "a live subscriber must report 'maybe pending' (conservative true), not 'empty'"
+    );
     unsafe { ffi::amos_link_subscriber_drop(sub) };
     unsafe { ffi::amos_link_node_drop(node) };
 }
@@ -678,13 +917,20 @@ fn subscriber_has_pending_is_bool() {
 #[test]
 fn subscriber_has_pending_null_returns_false() {
     let r = unsafe { ffi::amos_link_subscriber_has_pending(std::ptr::null()) };
-    assert_eq!(r, false);
+    assert!(
+        !r,
+        "a null subscriber must answer false, not 'maybe pending'"
+    );
 }
 
 // --- Subscriber stats null ---
 #[test]
 fn subscriber_stats_null_returns_neg2() {
-    let mut s = ffi::amos_link_sub_stats { received: 0, dropped: 0, decode_errors: 0 };
+    let mut s = ffi::amos_link_sub_stats {
+        received: 0,
+        dropped: 0,
+        decode_errors: 0,
+    };
     let r = unsafe { ffi::amos_link_subscriber_stats(std::ptr::null(), &mut s) };
     assert_eq!(r, -2);
 }
@@ -712,7 +958,9 @@ fn federation_spawn_null_node_returns_null() {
 
 #[test]
 fn federation_spawn_advertising_null_node_returns_null() {
-    let r = unsafe { ffi::amos_link_node_spawn_federation_advertising(std::ptr::null(), 1000, std::ptr::null()) };
+    let r = unsafe {
+        ffi::amos_link_node_spawn_federation_advertising(std::ptr::null(), 1000, std::ptr::null())
+    };
     assert!(r.is_null());
 }
 
@@ -720,7 +968,8 @@ fn federation_spawn_advertising_null_node_returns_null() {
 #[test]
 fn federation_spawn_and_stop_succeeds() {
     let peer = std::ffi::CString::new("fed-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let task = unsafe { ffi::amos_link_node_spawn_federation(node, 500) };
     assert!(!task.is_null());
@@ -731,10 +980,12 @@ fn federation_spawn_and_stop_succeeds() {
 #[test]
 fn federation_spawn_advertising_and_stop_succeeds() {
     let peer = std::ffi::CString::new("fed-adv-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeSensor) };
     assert!(!node.is_null());
     let endpoint = std::ffi::CString::new("tcp://192.168.1.100:7550").unwrap();
-    let task = unsafe { ffi::amos_link_node_spawn_federation_advertising(node, 500, endpoint.as_ptr()) };
+    let task =
+        unsafe { ffi::amos_link_node_spawn_federation_advertising(node, 500, endpoint.as_ptr()) };
     assert!(!task.is_null());
     unsafe { ffi::amos_link_federation_stop(task) };
     unsafe { ffi::amos_link_node_drop(node) };
@@ -751,14 +1002,19 @@ fn federation_stop_null_is_safe() {
 #[test]
 fn heartbeat_encode_decode_round_trip() {
     let peer = std::ffi::CString::new("beat-pub").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let beat_ptr = unsafe { ffi::amos_link_node_heartbeat(node) };
     assert!(!beat_ptr.is_null());
 
     let mut frame = [0u8; 512];
     let enc_len = unsafe { ffi::amos_link_heartbeat_encode(beat_ptr, frame.as_mut_ptr()) };
-    assert!(enc_len > 0, "encoded heartbeat should be non-empty, got {}", enc_len);
+    assert!(
+        enc_len > 0,
+        "encoded heartbeat should be non-empty, got {}",
+        enc_len
+    );
 
     let mut fields = ffi::amos_link_heartbeat_fields {
         peer_id: [0; 64],
@@ -767,9 +1023,12 @@ fn heartbeat_encode_decode_round_trip() {
         stamp_nanos: !0u32,
         uptime_ms: !0u64,
     };
-    let dec_r = unsafe { ffi::amos_link_heartbeat_decode(frame.as_ptr(), enc_len as usize, &mut fields) };
+    let dec_r =
+        unsafe { ffi::amos_link_heartbeat_decode(frame.as_ptr(), enc_len as usize, &mut fields) };
     assert_eq!(dec_r, 0, "heartbeat decode should succeed");
-    let decoded_peer = unsafe { CStr::from_ptr(fields.peer_id.as_ptr()) }.to_str().unwrap();
+    let decoded_peer = unsafe { CStr::from_ptr(fields.peer_id.as_ptr()) }
+        .to_str()
+        .unwrap();
     assert_eq!(decoded_peer, "beat-pub");
     assert_ne!(fields.seq, !0u64);
     assert_ne!(fields.uptime_ms, !0u64);
@@ -789,7 +1048,8 @@ fn heartbeat_decode_null_fields_returns_neg2() {
 // --- Frame decode header null ---
 #[test]
 fn frame_decode_header_null_returns_neg2() {
-    let r = unsafe { ffi::amos_link_frame_decode_header(std::ptr::null(), 0, std::ptr::null_mut()) };
+    let r =
+        unsafe { ffi::amos_link_frame_decode_header(std::ptr::null(), 0, std::ptr::null_mut()) };
     assert_eq!(r, -2);
 }
 
@@ -797,7 +1057,8 @@ fn frame_decode_header_null_returns_neg2() {
 #[test]
 fn frame_decode_payload_null_returns_neg2() {
     let mut buf = [0u8; 64];
-    let r = unsafe { ffi::amos_link_frame_decode_payload(std::ptr::null(), 0, buf.as_mut_ptr(), 64) };
+    let r =
+        unsafe { ffi::amos_link_frame_decode_payload(std::ptr::null(), 0, buf.as_mut_ptr(), 64) };
     assert_eq!(r, -2);
 }
 
@@ -815,12 +1076,8 @@ fn crc32_of_empty_is_zero() {
 fn crc32_combine_with_empty_is_simple_crc() {
     let data = b"hello world";
     let simple = unsafe { ffi::amos_link_crc32(data.as_ptr(), data.len()) };
-    let combined = unsafe {
-        ffi::amos_link_crc32_combine(
-            data.as_ptr(), data.len(),
-            std::ptr::null(), 0,
-        )
-    };
+    let combined =
+        unsafe { ffi::amos_link_crc32_combine(data.as_ptr(), data.len(), std::ptr::null(), 0) };
     assert_eq!(combined, simple);
 }
 
@@ -828,7 +1085,7 @@ fn crc32_combine_with_empty_is_simple_crc() {
 #[test]
 fn last_error_starts_empty() {
     // After a fresh start, last_error should return an empty string
-    let err_ptr = unsafe { ffi::amos_link_last_error() };
+    let err_ptr = ffi::amos_link_last_error();
     let err_s = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap();
     assert_eq!(err_s, "", "last_error should be empty initially");
 }
@@ -838,10 +1095,11 @@ fn last_error_starts_empty() {
 fn error_clear_then_last_error_is_empty() {
     // Trigger an error first
     let peer = std::ffi::CString::new("").unwrap();
-    let _node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let _node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     // Then clear it
-    unsafe { ffi::amos_link_error_clear() };
-    let err_ptr = unsafe { ffi::amos_link_last_error() };
+    ffi::amos_link_error_clear();
+    let err_ptr = ffi::amos_link_last_error();
     let err_s = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap();
     assert_eq!(err_s, "");
 }
@@ -849,19 +1107,31 @@ fn error_clear_then_last_error_is_empty() {
 // --- QoS new from fields ---
 #[test]
 fn qos_new_from_fields() {
-    let qos = unsafe {
-        ffi::amos_link_qos_new(ffi::amos_link_reliability::ReliabilityReliable, 50, ffi::amos_link_drop_policy::DropPolicyDropNewest)
-    };
-    assert_eq!(qos.reliability, ffi::amos_link_reliability::ReliabilityReliable);
+    let qos = ffi::amos_link_qos_new(
+        ffi::amos_link_reliability::ReliabilityReliable,
+        50,
+        ffi::amos_link_drop_policy::DropPolicyDropNewest,
+    );
+    assert_eq!(
+        qos.reliability,
+        ffi::amos_link_reliability::ReliabilityReliable
+    );
     assert_eq!(qos.depth, 50);
-    assert_eq!(qos.drop_policy, ffi::amos_link_drop_policy::DropPolicyDropNewest);
+    assert_eq!(
+        qos.drop_policy,
+        ffi::amos_link_drop_policy::DropPolicyDropNewest
+    );
 }
 
 // --- QoS validate invalid reliability ---
 #[test]
 fn qos_validate_rejects_depth_exceeds_max() {
-    let qos = unsafe { ffi::amos_link_qos_new(ffi::amos_link_reliability::ReliabilityBestEffort, u32::MAX, ffi::amos_link_drop_policy::DropPolicyDropOldest) };
-    let r = unsafe { ffi::amos_link_qos_validate(qos) };
+    let qos = ffi::amos_link_qos_new(
+        ffi::amos_link_reliability::ReliabilityBestEffort,
+        u32::MAX,
+        ffi::amos_link_drop_policy::DropPolicyDropOldest,
+    );
+    let r = ffi::amos_link_qos_validate(qos);
     assert_ne!(r, 0, "qos_validate should reject depth that overflows u32");
 }
 
@@ -871,11 +1141,14 @@ fn topic_matches_null_handles() {
     // topic_matches with null should return false
     // (already tested in the main suite, but let's add null-pattern variant here)
     let peer = std::ffi::CString::new("match-peer").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
 
     let pattern = std::ffi::CString::new("amos/match-peer/sensor/*").unwrap();
-    let sub = unsafe { ffi::amos_link_subscriber_new(node, pattern.as_ptr(), ffi::amos_link_qos_default()) };
+    let sub = unsafe {
+        ffi::amos_link_subscriber_new(node, pattern.as_ptr(), ffi::amos_link_qos_default())
+    };
     assert!(!sub.is_null());
 
     // pattern is null → false
@@ -891,7 +1164,12 @@ fn topic_matches_null_handles() {
 #[test]
 fn metrics_delivery_ratio() {
     let m = ffi::amos_link_metrics {
-        published: 100, delivered: 75, dropped: 25, blocked: 0, decode_errors: 0, encode_errors: 0,
+        published: 100,
+        delivered: 75,
+        dropped: 25,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
     };
     let ratio = unsafe { ffi::amos_link_metrics_delivery_ratio(&m) };
     // 75/100 = 75%
@@ -901,7 +1179,12 @@ fn metrics_delivery_ratio() {
 #[test]
 fn metrics_delivery_ratio_zero_published() {
     let m = ffi::amos_link_metrics {
-        published: 0, delivered: 0, dropped: 0, blocked: 0, decode_errors: 0, encode_errors: 0,
+        published: 0,
+        delivered: 0,
+        dropped: 0,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
     };
     let ratio = unsafe { ffi::amos_link_metrics_delivery_ratio(&m) };
     assert_eq!(ratio, 0, "delivery ratio with 0 published should be 0");
@@ -911,8 +1194,11 @@ fn metrics_delivery_ratio_zero_published() {
 #[test]
 fn node_peers_null_node_returns_zero() {
     let mut peers = [ffi::amos_link_peer_view {
-        id: [0; 64], kind: ffi::amos_link_node_kind::NodeRobot,
-        last_seen_ms: 0, beacons: 0, endpoint: [0; 128],
+        id: [0; 64],
+        kind: ffi::amos_link_node_kind::NodeRobot,
+        last_seen_ms: 0,
+        beacons: 0,
+        endpoint: [0; 128],
     }; 1];
     let n = unsafe { ffi::amos_link_node_peers(std::ptr::null(), peers.as_mut_ptr(), 1) };
     assert_eq!(n, 0);
@@ -921,7 +1207,8 @@ fn node_peers_null_node_returns_zero() {
 #[test]
 fn node_peers_null_out_returns_zero() {
     let peer = std::ffi::CString::new("p").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let n = unsafe { ffi::amos_link_node_peers(node, std::ptr::null_mut(), 0) };
     assert_eq!(n, 0);
@@ -939,7 +1226,8 @@ fn node_topics_null_node_returns_zero() {
 #[test]
 fn node_topics_null_out_returns_zero() {
     let peer = std::ffi::CString::new("t").unwrap();
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
     let n = unsafe { ffi::amos_link_node_topics(node, std::ptr::null_mut(), 0) };
     assert_eq!(n, 0);
@@ -949,7 +1237,14 @@ fn node_topics_null_out_returns_zero() {
 // --- Node metrics null ---
 #[test]
 fn node_metrics_null_returns_neg2() {
-    let mut m = ffi::amos_link_metrics { published: 0, delivered: 0, dropped: 0, blocked: 0, decode_errors: 0, encode_errors: 0 };
+    let mut m = ffi::amos_link_metrics {
+        published: 0,
+        delivered: 0,
+        dropped: 0,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
+    };
     let r = unsafe { ffi::amos_link_node_metrics(std::ptr::null(), &mut m) };
     assert_eq!(r, -2);
 }
@@ -958,7 +1253,8 @@ fn node_metrics_null_returns_neg2() {
 #[test]
 fn publisher_topic_null_pub_returns_neg2() {
     let mut buf = [0i8; 64];
-    let r = unsafe { ffi::amos_link_publisher_topic(std::ptr::null(), buf.as_mut_ptr(), buf.len()) };
+    let r =
+        unsafe { ffi::amos_link_publisher_topic(std::ptr::null(), buf.as_mut_ptr(), buf.len()) };
     assert_eq!(r, -2);
 }
 
@@ -966,7 +1262,8 @@ fn publisher_topic_null_pub_returns_neg2() {
 #[test]
 fn publisher_publish_null_pub_returns_neg2() {
     let data = [0u8; 4];
-    let r = unsafe { ffi::amos_link_publisher_publish(std::ptr::null(), data.as_ptr(), data.len()) };
+    let r =
+        unsafe { ffi::amos_link_publisher_publish(std::ptr::null(), data.as_ptr(), data.len()) };
     assert_eq!(r, -2);
 }
 
@@ -974,11 +1271,18 @@ fn publisher_publish_null_pub_returns_neg2() {
 #[test]
 fn subscriber_poll_null_returns_closed() {
     let mut received = ffi::amos_link_received {
-        topic: [0; 1024], peer_id: [0; 64], seq: 0,
-        stamp_secs: 0, stamp_nanos: 0, frame_len: 0, payload_len: 0,
+        topic: [0; 1024],
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        frame_len: 0,
+        payload_len: 0,
     };
     let mut buf = [0u8; 64];
-    let r = unsafe { ffi::amos_link_subscriber_poll(std::ptr::null(), &mut received, buf.as_mut_ptr(), buf.len()) };
+    let r = unsafe {
+        ffi::amos_link_subscriber_poll(std::ptr::null(), &mut received, buf.as_mut_ptr(), buf.len())
+    };
     assert_eq!(r, ffi::amos_link_poll::Closed);
 }
 
@@ -986,31 +1290,41 @@ fn subscriber_poll_null_returns_closed() {
 #[test]
 fn subscriber_recv_null_returns_closed() {
     let mut received = ffi::amos_link_received {
-        topic: [0; 1024], peer_id: [0; 64], seq: 0,
-        stamp_secs: 0, stamp_nanos: 0, frame_len: 0, payload_len: 0,
+        topic: [0; 1024],
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        frame_len: 0,
+        payload_len: 0,
     };
     let mut buf = [0u8; 64];
-    let r = unsafe { ffi::amos_link_subscriber_recv(std::ptr::null(), &mut received, buf.as_mut_ptr(), buf.len()) };
+    let r = unsafe {
+        ffi::amos_link_subscriber_recv(std::ptr::null(), &mut received, buf.as_mut_ptr(), buf.len())
+    };
     assert_eq!(r, ffi::amos_link_poll::Closed);
 }
 
 // --- Frame encode null ---
 #[test]
 fn frame_encode_null_topic_returns_neg2() {
-    let stamp = ffi::Timestamp { secs: 1000, nanos: 0 };
+    let stamp = ffi::Timestamp {
+        secs: 1000,
+        nanos: 0,
+    };
     let mut out = [0u8; 4096];
     let peer = std::ffi::CString::new("robot").unwrap();
-    let r = unsafe { 
+    let r = unsafe {
         ffi::amos_link_frame_encode(
-            std::ptr::null(), 
-            peer.as_ptr(), 
-            1, 
-            stamp, 
-            std::ptr::null(), 
-            0, 
+            std::ptr::null(),
+            peer.as_ptr(),
+            1,
+            stamp,
+            std::ptr::null(),
+            0,
             out.as_mut_ptr(),
-            out.len()
-        ) 
+            out.len(),
+        )
     };
     // Should return 0 (error case)
     assert_eq!(r, 0);
@@ -1021,20 +1335,23 @@ fn frame_encode_null_topic_returns_neg2() {
 fn frame_encode_truncates_to_buffer_size() {
     let peer = std::ffi::CString::new("enc-peer").unwrap();
     let topic = std::ffi::CString::new("amos/enc-peer/data").unwrap();
-    let stamp = ffi::Timestamp { secs: 1000, nanos: 500000 };
+    let stamp = ffi::Timestamp {
+        secs: 1000,
+        nanos: 500000,
+    };
     let payload = b"test";
     let mut out = [0u8; 32]; // Very small buffer
-    let r = unsafe { 
+    let r = unsafe {
         ffi::amos_link_frame_encode(
-            topic.as_ptr(), 
-            peer.as_ptr(), 
-            1, 
-            stamp, 
-            payload.as_ptr(), 
-            payload.len(), 
+            topic.as_ptr(),
+            peer.as_ptr(),
+            1,
+            stamp,
+            payload.as_ptr(),
+            payload.len(),
             out.as_mut_ptr(),
-            out.len()
-        ) 
+            out.len(),
+        )
     };
     assert!(r > 0, "should encode something");
     assert!((r as usize) <= out.len(), "should not exceed buffer");
@@ -1049,11 +1366,21 @@ fn crc32_combine_order_dependent() {
     let _crc_a = unsafe { ffi::amos_link_crc32(a.as_ptr(), a.len()) };
     let _crc_b = unsafe { ffi::amos_link_crc32(b_bytes.as_ptr(), b_bytes.len()) };
     let crc_ab = unsafe { ffi::amos_link_crc32(ab.as_ptr(), ab.len()) };
-    let combined = unsafe { ffi::amos_link_crc32_combine(a.as_ptr(), a.len(), b_bytes.as_ptr(), b_bytes.len()) };
-    assert_eq!(combined, crc_ab, "crc32_combine(A,B) should equal crc32(A||B)");
+    let combined = unsafe {
+        ffi::amos_link_crc32_combine(a.as_ptr(), a.len(), b_bytes.as_ptr(), b_bytes.len())
+    };
+    assert_eq!(
+        combined, crc_ab,
+        "crc32_combine(A,B) should equal crc32(A||B)"
+    );
     // order reversal should differ
-    let combined_rev = unsafe { ffi::amos_link_crc32_combine(b_bytes.as_ptr(), b_bytes.len(), a.as_ptr(), a.len()) };
-    assert_ne!(combined_rev, crc_ab, "reversed order should produce different CRC");
+    let combined_rev = unsafe {
+        ffi::amos_link_crc32_combine(b_bytes.as_ptr(), b_bytes.len(), a.as_ptr(), a.len())
+    };
+    assert_ne!(
+        combined_rev, crc_ab,
+        "reversed order should produce different CRC"
+    );
 }
 
 // --- Frame decode header extracts topic_len ---
@@ -1061,23 +1388,26 @@ fn crc32_combine_order_dependent() {
 fn frame_decode_header_reports_correct_topic_len() {
     let peer = std::ffi::CString::new("hdr-peer").unwrap();
     let topic = std::ffi::CString::new("amos/hdr-peer/control/cmd").unwrap();
-    let stamp = ffi::Timestamp { secs: 1000, nanos: 0 };
+    let stamp = ffi::Timestamp {
+        secs: 1000,
+        nanos: 0,
+    };
     let payload: &[u8] = &[1, 2, 3, 4];
     let mut frame = [0u8; 4096];
-    let frame_len = unsafe { 
+    let frame_len = unsafe {
         ffi::amos_link_frame_encode(
-            topic.as_ptr(), 
-            peer.as_ptr(), 
-            1, 
-            stamp, 
-            payload.as_ptr(), 
-            payload.len(), 
+            topic.as_ptr(),
+            peer.as_ptr(),
+            1,
+            stamp,
+            payload.as_ptr(),
+            payload.len(),
             frame.as_mut_ptr(),
-            frame.len()
-        ) 
+            frame.len(),
+        )
     };
     if frame_len == 0 {
-        let err_ptr = unsafe { ffi::amos_link_last_error() };
+        let err_ptr = ffi::amos_link_last_error();
         if !err_ptr.is_null() {
             let err_str = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
                 .to_string_lossy()
@@ -1102,7 +1432,7 @@ fn frame_decode_header_reports_correct_topic_len() {
     let r = unsafe { ffi::amos_link_frame_decode_header(frame.as_ptr(), frame_len, &mut h) };
     println!("Decode result r: {}", r);
     if r != 0 {
-        let err_ptr = unsafe { ffi::amos_link_last_error() };
+        let err_ptr = ffi::amos_link_last_error();
         if !err_ptr.is_null() {
             let err_str = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
                 .to_string_lossy()
@@ -1111,7 +1441,10 @@ fn frame_decode_header_reports_correct_topic_len() {
         }
     }
     assert_eq!(r, 0, "frame decode header should succeed");
-    assert_eq!(h.topic_len, 25, "topic_len should match 'amos/hdr-peer/control/cmd'.len()");
+    assert_eq!(
+        h.topic_len, 25,
+        "topic_len should match 'amos/hdr-peer/control/cmd'.len()"
+    );
     assert_eq!(h.payload_len, payload.len() as u32);
 }
 
@@ -1120,27 +1453,40 @@ fn frame_decode_header_reports_correct_topic_len() {
 fn frame_decode_payload_extracts_correct_bytes() {
     let peer = std::ffi::CString::new("pld-peer").unwrap();
     let topic = std::ffi::CString::new("amos/pld-peer/data/raw").unwrap();
-    let stamp = ffi::Timestamp { secs: 1000, nanos: 0 };
+    let stamp = ffi::Timestamp {
+        secs: 1000,
+        nanos: 0,
+    };
     let original = b"\xDE\xAD\xBE\xEF\x12\x34\x56\x78";
     let mut frame = [0u8; 4096];
-    let frame_len = unsafe { 
+    let frame_len = unsafe {
         ffi::amos_link_frame_encode(
-            topic.as_ptr(), 
-            peer.as_ptr(), 
-            1, 
-            stamp, 
-            original.as_ptr(), 
-            original.len(), 
+            topic.as_ptr(),
+            peer.as_ptr(),
+            1,
+            stamp,
+            original.as_ptr(),
+            original.len(),
             frame.as_mut_ptr(),
-            frame.len()
-        ) 
+            frame.len(),
+        )
     };
     assert!(frame_len > 0);
 
     let mut buf = [0u8; 256];
-    let n = unsafe { ffi::amos_link_frame_decode_payload(frame.as_ptr(), frame_len, buf.as_mut_ptr(), buf.len()) };
-    assert_eq!(n as usize, original.len(), "decoded payload length should match original");
-    assert_eq!(&buf[..original.len()], original, "decoded payload bytes should match original");
+    let n = unsafe {
+        ffi::amos_link_frame_decode_payload(frame.as_ptr(), frame_len, buf.as_mut_ptr(), buf.len())
+    };
+    assert_eq!(
+        n as usize,
+        original.len(),
+        "decoded payload length should match original"
+    );
+    assert_eq!(
+        &buf[..original.len()],
+        original,
+        "decoded payload bytes should match original"
+    );
 }
 
 // --- Frame decode payload buffer too small ---
@@ -1148,27 +1494,37 @@ fn frame_decode_payload_extracts_correct_bytes() {
 fn frame_decode_payload_buffer_too_small_sets_error() {
     let peer = std::ffi::CString::new("small-buf").unwrap();
     let topic = std::ffi::CString::new("amos/small-buf/data").unwrap();
-    let stamp = ffi::Timestamp { secs: 1000, nanos: 0 };
+    let stamp = ffi::Timestamp {
+        secs: 1000,
+        nanos: 0,
+    };
     let payload = b"LARGE_PAYLOAD_DATA_GOES_HERE_1234567890";
     let mut frame = [0u8; 4096];
-    let frame_len = unsafe { 
+    let frame_len = unsafe {
         ffi::amos_link_frame_encode(
-            topic.as_ptr(), 
-            peer.as_ptr(), 
-            1, 
-            stamp, 
-            payload.as_ptr(), 
-            payload.len(), 
+            topic.as_ptr(),
+            peer.as_ptr(),
+            1,
+            stamp,
+            payload.as_ptr(),
+            payload.len(),
             frame.as_mut_ptr(),
-            frame.len()
-        ) 
+            frame.len(),
+        )
     };
     assert!(frame_len > 0);
 
     let mut tiny = [0u8; 4];
-    let r = unsafe { ffi::amos_link_frame_decode_payload(frame.as_ptr(), frame_len, tiny.as_mut_ptr(), tiny.len()) };
+    let r = unsafe {
+        ffi::amos_link_frame_decode_payload(
+            frame.as_ptr(),
+            frame_len,
+            tiny.as_mut_ptr(),
+            tiny.len(),
+        )
+    };
     assert!(r < 0, "should return error when buffer is too small");
-    let err_ptr = unsafe { ffi::amos_link_last_error() };
+    let err_ptr = ffi::amos_link_last_error();
     let err_s = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap();
     assert!(!err_s.is_empty(), "error message should be set");
 }
@@ -1177,7 +1533,12 @@ fn frame_decode_payload_buffer_too_small_sets_error() {
 #[test]
 fn health_evaluate_null_peers_is_unknown() {
     let metrics = ffi::amos_link_metrics {
-        published: 0, delivered: 0, dropped: 0, blocked: 0, decode_errors: 0, encode_errors: 0,
+        published: 0,
+        delivered: 0,
+        dropped: 0,
+        blocked: 0,
+        decode_errors: 0,
+        encode_errors: 0,
     };
     let health = unsafe { ffi::amos_link_evaluate_health(&metrics, std::ptr::null(), 0, false) };
     assert_eq!(health.state, ffi::amos_link_health_state::Unknown);
@@ -1188,13 +1549,16 @@ fn health_evaluate_null_peers_is_unknown() {
 fn pub_sub_roundtrip_single_message() {
     let peer = std::ffi::CString::new("round-test").unwrap();
 
-    let node = unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
+    let node =
+        unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
 
     let topic = std::ffi::CString::new("amos/round-test/sensor/imu").unwrap();
     let pubr = unsafe { ffi::amos_link_publisher_new(node, topic.as_ptr()) };
     let pattern = std::ffi::CString::new("amos/round-test/sensor/*").unwrap();
-    let sub = unsafe { ffi::amos_link_subscriber_new(node, pattern.as_ptr(), ffi::amos_link_qos_default()) };
+    let sub = unsafe {
+        ffi::amos_link_subscriber_new(node, pattern.as_ptr(), ffi::amos_link_qos_default())
+    };
     assert!(!pubr.is_null());
     assert!(!sub.is_null());
 
@@ -1209,13 +1573,20 @@ fn pub_sub_roundtrip_single_message() {
 
     // Poll for the message
     let mut received = ffi::amos_link_received {
-        topic: [0; 1024], peer_id: [0; 64], seq: 0,
-        stamp_secs: 0, stamp_nanos: 0, frame_len: 0, payload_len: 0,
+        topic: [0; 1024],
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        frame_len: 0,
+        payload_len: 0,
     };
     let mut buf = [0u8; 256];
     let mut found = false;
     for i in 0..20 {
-        let poll_r = unsafe { ffi::amos_link_subscriber_poll(sub, &mut received, buf.as_mut_ptr(), buf.len()) };
+        let poll_r = unsafe {
+            ffi::amos_link_subscriber_poll(sub, &mut received, buf.as_mut_ptr(), buf.len())
+        };
         println!("Poll attempt {}: result = {:?}", i, poll_r);
         if poll_r == ffi::amos_link_poll::Ready {
             found = true;
@@ -1223,7 +1594,10 @@ fn pub_sub_roundtrip_single_message() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(found, "subscriber should eventually receive the published message");
+    assert!(
+        found,
+        "subscriber should eventually receive the published message"
+    );
 
     // Cleanup
     unsafe { ffi::amos_link_publisher_drop(pubr) };

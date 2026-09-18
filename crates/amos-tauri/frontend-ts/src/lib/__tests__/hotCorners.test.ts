@@ -104,7 +104,11 @@ describe("hotCorners.ts", () => {
       const result = normalizeHotCorners(input);
       expect(result).toHaveLength(4);
       expect(result[0]?.corner).toBe("top-left");
-      expect(result[0]?.action).toBe("launchpad");
+      // 输入里 top-left 的 action 是 `mission-control`、top-right 才是 `launchpad`
+      // （`normalizeHotCorners` 保持输入顺序）。原来这里断言的是 `launchpad`，
+      // 与同一段输入的上一行自相矛盾 —— 它测的不是代码，是自己写错的一行期望。
+      expect(result[0]?.action).toBe("mission-control");
+      expect(result[1]?.action).toBe("launchpad");
     });
 
     test("malformed input returns defaults", () => {

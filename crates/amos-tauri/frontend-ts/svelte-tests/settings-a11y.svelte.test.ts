@@ -34,6 +34,8 @@ import CellularPage from "../src/svelte/settings/CellularPage.svelte";
 import ChoiceRow from "../src/svelte/settings/ChoiceRow.svelte";
 import DisplayPage from "../src/svelte/settings/DisplayPage.svelte";
 import FocusPage from "../src/svelte/settings/FocusPage.svelte";
+import DockPage from "../src/svelte/settings/DockPage.svelte";
+import HotCornersPage from "../src/svelte/settings/HotCornersPage.svelte";
 import HotspotPage from "../src/svelte/settings/HotspotPage.svelte";
 import ImePage from "../src/svelte/settings/ImePage.svelte";
 import LanguagePage from "../src/svelte/settings/LanguagePage.svelte";
@@ -174,6 +176,35 @@ describe("every flagged Settings surface names its controls (REQ-A283)", () => {
     expect(host.getByRole("switch", { name: t("settings.focusWork") })).toBeTruthy();
     expect(host.getByRole("switch", { name: t("settings.focusSleep") })).toBeTruthy();
     expectEveryControlNamed(host, "FocusPage");
+  });
+
+  test("DockPage — 位置/开关/滑块各自有可见名（REQ-A386）", () => {
+    const host = render(DockPage);
+    // 位置是一**组**按钮 ⇒ 由 `role="group"` + `aria-labelledby` 命名整组。
+    const group = host.container.querySelector('[role="group"]');
+    expect(group).toBeTruthy();
+    expect(group?.getAttribute("aria-labelledby")).toBeTruthy();
+    // 自动隐藏开关由**可见标题**命名（不是 aria-label 抄一遍）。
+    expect(host.getByRole("switch", { name: t("settings.dock.autoHide") })).toBeTruthy();
+    // 两个滑块由各自的可见标签命名。
+    expect(host.getByRole("slider", { name: t("settings.dock.magnification") })).toBeTruthy();
+    expect(host.getByRole("slider", { name: t("settings.dock.iconSize") })).toBeTruthy();
+    expectEveryControlNamed(host, "DockPage");
+  });
+
+  test("HotCornersPage — 每个角落的三处控件都有自己的可见名（REQ-A386）", () => {
+    const host = render(HotCornersPage);
+    // 四个角落各有一个动作选择器；它们的名字就是该角落的可见标题。
+    const selects = host.container.querySelectorAll("select");
+    expect(selects.length).toBeGreaterThanOrEqual(4);
+    // 每一个 select 都能被它的 `label[for]` 命名（id 与 for 真的对上了）。
+    for (const sel of selects) {
+      const id = sel.getAttribute("id");
+      expect(id, "HotCornersPage: a select without an id cannot be named").toBeTruthy();
+      const label = host.container.querySelector(`label[for="${id}"]`);
+      expect(label?.textContent?.trim()).toBeTruthy();
+    }
+    expectEveryControlNamed(host, "HotCornersPage");
   });
 
   test("NotificationsPage — the 勿扰 switch", () => {

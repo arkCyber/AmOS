@@ -290,6 +290,13 @@ query(options: AuditLogQuery = {}): AuditLog[] {
 - 类型定义和逻辑略有不同
 - 应该统一到一个文件
 
+> **已解决（REQ-A393，2026-09-18）**：这条发现是**对的**，已按它的建议统一到一个文件 ——
+> 删掉 `api.ts` 的副本（`WebhookManager` / `WebhookConfig` / `WebhookEvent`，−268 行），
+> 保留 `enterprise/webhooks.ts`（`enterprise/index.ts` 一直只把后者接进生产 ——
+> `APISettings.svelte` 调的是只有它才有的 `testWebhook`）。
+> 附带证实了"副本会漂移"：P1-6 给 `webhooks.ts` 加的**队列上限**没有加进副本（`eventQueue` 无上限），
+> 副本的 `retryCount` 字段也从未被使用。
+
 #### 10. **MDM 同步逻辑未实现** (mdm.ts:352)
 ```typescript
 async syncWithServer(): Promise<MDMSyncResponse> {

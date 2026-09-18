@@ -229,7 +229,16 @@ pub fn on_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
             }
             ids::HIDE_AMOS => {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                    // Hiding can fail (the window may already be gone). A menu action that
+                    // silently does nothing is worse than a log line — same rule as
+                    // `dock_badge.rs`'s event mirror (REQ-A387: this was a `let _ =`).
+                    if let Err(e) = window.hide() {
+                        tracing::warn!(
+                            target: "amos::menu",
+                            error = %e,
+                            "Hiding the main window failed"
+                        );
+                    }
                 }
             }
             _ => unreachable!("all RUST_HANDLED ids must be matched above"),
@@ -265,7 +274,16 @@ fn show_about_dialog<R: Runtime>(app: &AppHandle<R>) {
         version,
         "About dialog requested from menu"
     );
-    let _ = app.emit("show-about-dialog", version);
+    // The frontend has no consumer for this yet (no About surface exists), so the
+    // emission routinely finds no listener — record *that* instead of dropping it on
+    // the floor with `let _ =` (REQ-A387; `dock_badge.rs` does the same for its event).
+    if let Err(e) = app.emit("show-about-dialog", version) {
+        tracing::debug!(
+            target: "amos::menu",
+            error = %e,
+            "show-about-dialog event could not be delivered (no listener)"
+        );
+    }
 }
 
 #[cfg(test)]

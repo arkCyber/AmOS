@@ -394,8 +394,11 @@ pub async fn appstore_install(
 ) -> AppStoreResult<InstalledApp> {
     validate_appstore_id(&id)?;
     let app = state.store.install(&id).await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::AppStoreInstallFailed,
-            format!("install failed for {id}: {e}"), e)
+        AmosError::with_cause(
+            ErrorCode::AppStoreInstallFailed,
+            format!("install failed for {id}: {e}"),
+            e,
+        )
     })?;
     state.persist_best_effort();
     Ok(app)
@@ -409,8 +412,11 @@ pub async fn appstore_upgrade(
 ) -> AppStoreResult<InstalledApp> {
     validate_appstore_id(&id)?;
     let app = state.store.upgrade(&id).await.map_err(|e| {
-        AmosError::with_cause(ErrorCode::AppStoreUpgradeFailed,
-            format!("upgrade failed for {id}: {e}"), e)
+        AmosError::with_cause(
+            ErrorCode::AppStoreUpgradeFailed,
+            format!("upgrade failed for {id}: {e}"),
+            e,
+        )
     })?;
     state.persist_best_effort();
     Ok(app)
@@ -421,8 +427,11 @@ pub async fn appstore_upgrade(
 pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> AppStoreResult<()> {
     validate_appstore_id(&id)?;
     state.store.uninstall(&id).map_err(|e| {
-        AmosError::with_cause(ErrorCode::AppStoreUninstallFailed,
-            format!("uninstall failed for {id}: {e}"), e)
+        AmosError::with_cause(
+            ErrorCode::AppStoreUninstallFailed,
+            format!("uninstall failed for {id}: {e}"),
+            e,
+        )
     })?;
     state.persist_best_effort();
     Ok(())
@@ -438,13 +447,20 @@ pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> Ap
 /// use `?` without wrapping.
 fn validate_appstore_id(id: &str) -> AppStoreResult<()> {
     if id.is_empty() {
-        return Err(AmosError::new(ErrorCode::AppStoreIdEmpty,
-            "appstore id is empty"));
+        return Err(AmosError::new(
+            ErrorCode::AppStoreIdEmpty,
+            "appstore id is empty",
+        ));
     }
     if id.len() > MAX_APPSTORE_ID_BYTES {
-        return Err(AmosError::new(ErrorCode::AppStoreIdTooLong,
-            format!("appstore id too long: {} bytes (max {})",
-                id.len(), MAX_APPSTORE_ID_BYTES)));
+        return Err(AmosError::new(
+            ErrorCode::AppStoreIdTooLong,
+            format!(
+                "appstore id too long: {} bytes (max {})",
+                id.len(),
+                MAX_APPSTORE_ID_BYTES
+            ),
+        ));
     }
     if id.contains('/')
         || id.contains('\\')
@@ -455,8 +471,10 @@ fn validate_appstore_id(id: &str) -> AppStoreResult<()> {
         || id.contains("/../")
         || id.ends_with("/..")
     {
-        return Err(AmosError::new(ErrorCode::AppStoreIdInvalid,
-            format!("appstore id is not a valid id: {id:?}")));
+        return Err(AmosError::new(
+            ErrorCode::AppStoreIdInvalid,
+            format!("appstore id is not a valid id: {id:?}"),
+        ));
     }
     Ok(())
 }
@@ -1082,7 +1100,7 @@ mod tests {
     /// id may proceed to the on-disk `dir_for(id)` join. The unit tests below
     /// pin down what is (and is not) acceptable, so a future relaxation is a
     /// conscious change rather than a silent drift toward "anything goes".
-    /// conscious change rather than a silent drift toward "anything goes".
+    #[test]
     fn validate_appstore_id_accepts_well_formed_ids() {
         for ok in [
             "org.amos.pomodoro",
@@ -1123,7 +1141,10 @@ mod tests {
 
     #[test]
     fn validate_appstore_id_rejects_empty_and_oversized() {
-        assert!(validate_appstore_id("").is_err(), "empty id must be refused");
+        assert!(
+            validate_appstore_id("").is_err(),
+            "empty id must be refused"
+        );
         let huge = "x".repeat(MAX_APPSTORE_ID_BYTES + 1);
         assert!(
             validate_appstore_id(&huge).is_err(),

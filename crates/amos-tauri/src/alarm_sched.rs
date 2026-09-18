@@ -107,6 +107,12 @@ impl AlarmSchedState {
         self.lock().len()
     }
 
+    /// Whether the ledger is empty (the companion `len` needs, and what "no alarms armed"
+    /// reads as at the call sites).
+    pub fn is_empty(&self) -> bool {
+        self.lock().len() == 0
+    }
+
     /// Whether this id is already registered (re-registration must be allowed at capacity).
     pub fn contains(&self, id: &str) -> bool {
         self.lock().contains(&JobId::new(id.to_string()))

@@ -49,6 +49,9 @@ pub mod devcare;
 #[cfg(feature = "android")]
 pub mod devcare_device;
 pub mod display;
+// The macOS Dock badge + attention request. Written ahead of its consumer: nothing
+// paints a badge yet, but the host API is registered (REQ-A389).
+pub mod dock_badge;
 /// Typed error envelope shared across the System UI Rust core. See
 /// [`error::ErrorCode`] for the wire vocabulary and [`error::AmosError`] for the
 /// serializable failure shape returned by every `#[tauri::command]`.
@@ -75,7 +78,11 @@ pub mod rag_client;
 pub mod real_dial;
 pub mod sensor_host;
 pub mod sensors;
+// Spaces (virtual desktops): the manager plus its Tauri commands. The shell mounts
+// `SpacesPanel`, so these have to be compiled and registered (REQ-A389).
 pub mod sms;
+pub mod spaces;
+pub mod spaces_commands;
 pub mod store;
 pub mod system;
 pub mod taskmgr;
@@ -151,6 +158,13 @@ pub fn run() {
         .manage(SystemContext::new())
         .manage(alarm_sched::AlarmSchedState::new())
         .manage(clipboard.clone())
+        // The Space ledger is persisted through the same store the rest of the shell
+        // uses, so a restart restores the spaces (and the default space when there is
+        // nothing saved yet).
+        .manage(std::sync::Mutex::new(spaces::SpaceManager::load(
+            &shared_store,
+        )))
+        .manage(dock_badge::DockBadgeState::new())
         .manage(shared_store)
         .manage(radio_bridge)
         .manage(flashlight_bridge)
@@ -196,6 +210,15 @@ pub fn run() {
             }));
         })
         .invoke_handler(tauri::generate_handler![
+            dock_badge::dock_badge_set,
+            dock_badge::dock_request_attention,
+            spaces_commands::spaces_list,
+            spaces_commands::spaces_active,
+            spaces_commands::spaces_switch,
+            spaces_commands::spaces_create,
+            spaces_commands::spaces_delete,
+            spaces_commands::spaces_rename,
+            spaces_commands::spaces_move_window,
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
             ai_bridge::cancel_ai_session,

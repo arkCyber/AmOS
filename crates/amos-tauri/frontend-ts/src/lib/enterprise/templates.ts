@@ -17,6 +17,7 @@ import { readStoreValue, writeStoreValueChecked } from "../amosStore";
 import { logger } from "./logger";
 import type { Shortcut } from "../shortcuts";
 import { mdmManager } from "./mdm";
+import { localId } from "../localId";
 
 // ============================================================================
 // 类型定义
@@ -121,10 +122,14 @@ export interface TemplateCategory {
 // 常量
 // ============================================================================
 
+export const TEMPLATES_KEY = "amos.shortcuts.enterprise.templates";
+export const TEMPLATE_INSTALLATIONS_KEY = "amos.shortcuts.enterprise.installations";
+export const TEMPLATE_CATEGORIES_KEY = "amos.shortcuts.enterprise.categories";
+
 const STORE_KEYS = {
-  TEMPLATES: "amos.shortcuts.enterprise.templates",
-  INSTALLATIONS: "amos.shortcuts.enterprise.installations",
-  CATEGORIES: "amos.shortcuts.enterprise.categories",
+  TEMPLATES: TEMPLATES_KEY,
+  INSTALLATIONS: TEMPLATE_INSTALLATIONS_KEY,
+  CATEGORIES: TEMPLATE_CATEGORIES_KEY,
 };
 
 const DEFAULT_CATEGORIES: TemplateCategory[] = [
@@ -198,7 +203,10 @@ export class TemplateManager {
   private saveTemplates(): void {
     const data = Array.from(this.templates.values());
     const serialized = JSON.stringify(data);
-    writeStoreValueChecked(STORE_KEYS.TEMPLATES, serialized);
+    // 模板是用户/管理员的内容：写不进去就是内容丢失，必须报（write-scan 判据）。
+    if (!writeStoreValueChecked(STORE_KEYS.TEMPLATES, serialized)) {
+      logger.error("templates", `模板写入被存储拒绝 —— ${data.length} 个模板重启后会丢失`);
+    }
   }
 
   /**
@@ -226,7 +234,10 @@ export class TemplateManager {
   private saveInstallations(): void {
     const data = Array.from(this.installations.values());
     const serialized = JSON.stringify(data);
-    writeStoreValueChecked(STORE_KEYS.INSTALLATIONS, serialized);
+    // 安装记录丢失 = 已安装的模板在重启后被当成"没装过"，必须报。
+    if (!writeStoreValueChecked(STORE_KEYS.INSTALLATIONS, serialized)) {
+      logger.error("templates", `安装记录写入被存储拒绝 —— ${data.length} 条重启后会丢失`);
+    }
   }
 
   /**
@@ -253,7 +264,9 @@ export class TemplateManager {
    */
   private saveCategories(): void {
     const serialized = JSON.stringify(this.categories);
-    writeStoreValueChecked(STORE_KEYS.CATEGORIES, serialized);
+    if (!writeStoreValueChecked(STORE_KEYS.CATEGORIES, serialized)) {
+      logger.error("templates", "模板分类写入被存储拒绝 —— 重启后会回落到内置分类");
+    }
   }
 
   /**
@@ -371,7 +384,7 @@ export class TemplateManager {
       const shortcut = this.applyParameters(template.shortcutData, parameterValues);
       
       // 生成新的 ID
-      shortcut.id = `shortcut-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      shortcut.id = localId("shortcut");
       shortcut.createdAt = Date.now();
       shortcut.updatedAt = Date.now();
 
@@ -497,7 +510,7 @@ export class TemplateManager {
   createTemplate(template: Omit<EnterpriseTemplate, "id" | "version" | "createdAt" | "updatedAt">): EnterpriseTemplate {
     const newTemplate: EnterpriseTemplate = {
       ...template,
-      id: `tpl-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: localId("tpl"),
       version: "1.0.0",
       createdAt: Date.now(),
       updatedAt: Date.now(),

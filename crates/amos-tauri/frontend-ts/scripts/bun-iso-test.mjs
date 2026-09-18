@@ -16,7 +16,7 @@
  *   node scripts/bun-iso-test.mjs coverage      # pure-batch coverage + P2-1 gate
  */
 import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, renameSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -95,10 +95,31 @@ if (mode === "test") {
     ok = run(["test", rel(f)], { env: { ...process.env, TZ: tzOf(f) } }) && ok;
   }
 } else if (mode === "coverage") {
-  // P2-1 gate measures src/lib only; pure files carry that coverage. DOM files
-  // are run isolated (correctness) and need not contribute to the lib gate.
+  // P2-1 gate measures src/lib only. It used to be fed by the **pure batch alone**, which
+  // silently dropped the coverage of the DOM-registered lib tests (enterprise, webman,
+  // desktopView, dockConfig, focusTrap): measured 2026-09-17 (REQ-A390), merging them in
+  // moves the gate from 77.18% to 82.91% — 1,122 covered lines that were being thrown away
+  // (their *correctness* was always checked; only their contribution to the number was lost).
+  //
+  // Isolation is preserved: every DOM/zoned file still runs in its own process, it just
+  // leaves its lcov behind as a part file for the gate to merge (max hit per line).
   if (existsSync(join(root, "coverage"))) spawnSync("rm", ["-rf", join(root, "coverage")]);
   ok = run(["test", "--coverage", "--coverage-reporter=lcov", ...pure.map(rel)]) && ok;
+  // Bun always writes `coverage/lcov.info`, so the pure batch has to be moved aside before
+  // the first isolated run overwrites it (measured: forgetting this made the gate read the
+  // *last* DOM file's report instead of everything).
+  {
+    const lcov = join(root, "coverage", "lcov.info");
+    if (existsSync(lcov)) renameSync(lcov, join(root, "coverage", "lcov.part-000.info"));
+  }
+  [...dom, ...zoned].forEach((f, i) => {
+    const tz = tzOf(f);
+    ok = run(["test", "--coverage", "--coverage-reporter=lcov", rel(f)], tz ? { env: { ...process.env, TZ: tz } } : {}) && ok;
+    const lcov = join(root, "coverage", "lcov.info");
+    if (existsSync(lcov)) {
+      renameSync(lcov, join(root, "coverage", `lcov.part-${String(i + 1).padStart(3, "0")}.info`));
+    }
+  });
   ok = run(["scripts/lib-coverage-gate.mjs"]) && ok;
 } else {
   console.error(`unknown mode: ${mode}`);

@@ -50,11 +50,19 @@ export function workspaceMembers(manifest) {
   const open = manifest.indexOf("[", start);
   const close = manifest.indexOf("]", open);
   if (start < 0 || open < 0 || close < 0) return [];
-  return manifest
+  // A commented-out member is **not** a member: strip `#`-comments before splitting, or
+  // `# "crates/amos-link-py",  # PyO3 extension - build with maturin, not cargo` turns into
+  // three phantom crate names and the README gate asks for READMEs that cannot exist
+  // (REQ-A388).
+  const body = manifest
     .slice(open + 1, close)
+    .split("\n")
+    .map((line) => line.replace(/#.*$/, ""))
+    .join("\n");
+  return body
     .split(",")
     .map((m) => m.trim().replace(/^"|"$/g, ""))
-    .filter((m) => m !== "" && m !== "#");
+    .filter((m) => m !== "");
 }
 
 /** The crate name a README's H1 claims (`# amos-x — …`), or null. */
@@ -188,6 +196,15 @@ function runSelfTest() {
   const cases = [];
   const members = workspaceMembers('members = [\n  "crates/a",\n  "crates/b",\n]');
   cases.push(["members", members.length === 2 && members[1] === "crates/b"]);
+  // REQ-A388: a commented-out member is not a member — it used to yield three phantom
+  // crate names (one from the quote, two from the prose after the second `#`).
+  const commented = workspaceMembers(
+    'members = [\n  "crates/a",\n  # "crates/pyo3",  # build with maturin, not cargo\n  "crates/b",\n]',
+  );
+  cases.push([
+    "commented-out members are skipped",
+    commented.length === 2 && commented.join(",") === "crates/a,crates/b",
+  ]);
   cases.push(["title", titleCrate("# amos-a — x\n") === "amos-a"]);
   cases.push(["title missing", titleCrate("## not a title\n") === null]);
   cases.push(["headings", headings("# t\n## What it is\n## Layout\n").includes("## Layout")]);

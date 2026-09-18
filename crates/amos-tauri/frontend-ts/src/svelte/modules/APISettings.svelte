@@ -10,9 +10,10 @@
    */
 
   import { apiClient, webhookManager } from "../../lib/enterprise";
+  import { t } from "../locale.svelte";
   import type { APIConfig } from "../../lib/enterprise/api";
   import type { WebhookConfig } from "../../lib/enterprise/webhooks";
-
+  import { attachFocusTrap } from "../../lib/focusTrap";
   // ============================================================================
   // 状态管理
   // ============================================================================
@@ -27,6 +28,15 @@
 
   // Webhook 编辑状态
   let showWebhookModal = $state(false);
+  /** 模态根元素（焦点陷阱 + Escape 关闭）；`$effect` 在它出现时挂上。 */
+  let modalEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!showWebhookModal || !modalEl) return;
+    return attachFocusTrap(modalEl, closeWebhookModal);
+  });
+
+  /** 订阅事件那组复选框的组名 id（可见标签命名整组，而不是单个控件）。 */
+  const eventsLabelId = "api-events-label";
   let editingWebhook = $state<WebhookConfig | null>(null);
   let webhookForm = $state<Partial<WebhookConfig>>({
     name: "",
@@ -90,10 +100,10 @@
         skipRateLimit: true,
       });
       connectionStatus = "success";
-      connectionMessage = "连接成功";
+      connectionMessage = t("api.connectOk");
     } catch (error) {
       connectionStatus = "error";
-      connectionMessage = error instanceof Error ? error.message : "连接失败";
+      connectionMessage = error instanceof Error ? error.message : t("api.connectFailed");
     } finally {
       testingConnection = false;
       setTimeout(() => { connectionStatus = null; }, 3000);
@@ -105,11 +115,11 @@
     try {
       apiClient.configure(apiConfig);
       connectionStatus = "success";
-      connectionMessage = "配置已保存";
+      connectionMessage = t("api.configSaved");
       setTimeout(() => { connectionStatus = null; }, 2000);
     } catch (error) {
       connectionStatus = "error";
-      connectionMessage = error instanceof Error ? error.message : "保存失败";
+      connectionMessage = error instanceof Error ? error.message : t("api.saveFailed");
     } finally {
       savingConfig = false;
     }
@@ -166,12 +176,12 @@
 
   function saveWebhook() {
     if (!webhookForm.name || !webhookForm.url) {
-      alert("请填写名称和 URL");
+      alert(t("api.needNameAndUrl"));
       return;
     }
 
     if (!webhookForm.events || webhookForm.events.length === 0) {
-      alert("请至少选择一个订阅事件");
+      alert(t("api.needOneEvent"));
       return;
     }
 
@@ -195,12 +205,16 @@
       webhooks = webhookManager.getWebhooks();
       closeWebhookModal();
     } catch (error) {
-      alert(`保存失败: ${error instanceof Error ? error.message : "未知错误"}`);
+      alert(
+        t("api.saveFailedReason", {
+          reason: error instanceof Error ? error.message : t("api.unknownError"),
+        }),
+      );
     }
   }
 
   function deleteWebhook(webhookId: string) {
-    if (confirm("确定要删除这个 Webhook 吗？")) {
+    if (confirm(t("api.confirmDeleteWebhook"))) {
       webhookManager.deleteWebhook(webhookId);
       webhooks = webhookManager.getWebhooks();
     }
@@ -211,12 +225,16 @@
     try {
       const result = await webhookManager.testWebhook(webhookId);
       if (result.success) {
-        alert(`测试成功！响应时间: ${result.duration}ms`);
+        alert(t("api.testOk", { ms: result.duration }));
       } else {
-        alert(`测试失败: ${result.error || "未知错误"}`);
+        alert(t("api.testFailed", { reason: result.error || t("api.unknownError") }));
       }
     } catch (error) {
-      alert(`测试失败: ${error instanceof Error ? error.message : "未知错误"}`);
+      alert(
+        t("api.testFailed", {
+          reason: error instanceof Error ? error.message : t("api.unknownError"),
+        }),
+      );
     } finally {
       testingWebhook = false;
     }
@@ -234,14 +252,16 @@
   // 辅助函数
   // ============================================================================
 
+  // 事件标签存**键**，渲染时再 t()：这个数组在模块初始化时就建好了，把 t() 放进去
+  // 会把当时的语言**冻**在数组里（切语言不会再变）。
   const availableEvents = [
-    { id: "shortcut_create", label: "快捷指令创建" },
-    { id: "shortcut_run", label: "快捷指令执行" },
-    { id: "shortcut_update", label: "快捷指令更新" },
-    { id: "shortcut_delete", label: "快捷指令删除" },
-    { id: "shortcut_share", label: "快捷指令分享" },
-    { id: "template_install", label: "模板安装" },
-    { id: "mdm_policy_change", label: "MDM 策略变更" },
+    { id: "shortcut_create", labelKey: "api.event.shortcut_create" },
+    { id: "shortcut_run", labelKey: "api.event.shortcut_run" },
+    { id: "shortcut_update", labelKey: "api.event.shortcut_update" },
+    { id: "shortcut_delete", labelKey: "api.event.shortcut_delete" },
+    { id: "shortcut_share", labelKey: "api.event.shortcut_share" },
+    { id: "template_install", labelKey: "api.event.template_install" },
+    { id: "mdm_policy_change", labelKey: "api.event.mdm_policy_change" },
   ];
 
   function getSuccessRate(webhook: WebhookConfig): number {
@@ -252,34 +272,41 @@
 
 <div class="api-settings">
   <header class="settings-header">
-    <h2>🔌 API 集成</h2>
-    <p class="subtitle">配置外部 API 和 Webhook 集成</p>
+    <h2>🔌 {t("api.title")}</h2>
+    <p class="subtitle">{t("api.subtitle")}</p>
   </header>
 
   <!-- API 配置 -->
   <section class="card">
     <div class="card-header-row">
-      <h3 class="section-title">API 配置</h3>
+      <h3 class="section-title">{t("api.configSection")}</h3>
       <label class="toggle-switch">
         <input
           type="checkbox"
           checked={apiConfig.enabled}
           onchange={toggleAPI}
           role="switch"
-          aria-label="启用 API 集成"
+          aria-label={t("api.enable")}
         />
         <span class="slider"></span>
       </label>
     </div>
 
     {#if connectionStatus}
-      <div class="status-message" class:success={connectionStatus === "success"} class:error={connectionStatus === "error"}>
+      <!-- 这是一条**用户动作之后**才出现的瞬时结果（测试连接/保存），而焦点还在按钮上，
+           所以它必须是 live region —— 否则屏幕阅读器用户点了按钮、什么都没听到（REQ-A386）。 -->
+      <div
+        class="status-message"
+        role="status"
+        class:success={connectionStatus === "success"}
+        class:error={connectionStatus === "error"}
+      >
         {connectionStatus === "success" ? "✓" : "✗"} {connectionMessage}
       </div>
     {/if}
 
     <div class="form-group">
-      <label for="baseUrl" class="form-label">基础 URL</label>
+      <label for="baseUrl" class="form-label">{t("api.baseUrl")}</label>
       <input
         id="baseUrl"
         type="url"
@@ -292,11 +319,11 @@
     </div>
 
     <div class="form-group">
-      <label for="authMethod" class="form-label">认证方式</label>
+      <label for="authMethod" class="form-label">{t("api.authMethod")}</label>
       <select id="authMethod" class="form-input" disabled>
         <option>Bearer Token</option>
       </select>
-      <p class="help-text">当前仅支持 Bearer Token 认证</p>
+      <p class="help-text">{t("api.authHint")}</p>
     </div>
 
     <div class="form-group">
@@ -308,14 +335,14 @@
           class="form-input"
           value={apiConfig.apiKey || ""}
           oninput={updateToken}
-          placeholder="输入 API Key"
+          placeholder={t("api.apiKeyPlaceholder")}
           disabled={!apiConfig.enabled}
         />
         <button
           class="toggle-visibility-btn"
           onclick={toggleTokenVisibility}
           disabled={!apiConfig.enabled}
-          aria-label={showTokenPlaintext ? "隐藏 Token" : "显示 Token"}
+          aria-label={showTokenPlaintext ? t("api.hideToken") : t("api.showToken")}
         >
           {showTokenPlaintext ? "🙈" : "👁️"}
         </button>
@@ -324,7 +351,7 @@
 
     <div class="form-row">
       <div class="form-group">
-        <label for="timeout" class="form-label">超时时间（毫秒）</label>
+        <label for="timeout" class="form-label">{t("api.timeoutMs")}</label>
         <input
           id="timeout"
           type="number"
@@ -339,7 +366,7 @@
       </div>
 
       <div class="form-group">
-        <label for="retryCount" class="form-label">重试次数</label>
+        <label for="retryCount" class="form-label">{t("api.retryCount")}</label>
         <input
           id="retryCount"
           type="number"
@@ -353,7 +380,7 @@
       </div>
 
       <div class="form-group">
-        <label for="retryDelay" class="form-label">重试延迟（毫秒）</label>
+        <label for="retryDelay" class="form-label">{t("api.retryDelayMs")}</label>
         <input
           id="retryDelay"
           type="number"
@@ -374,14 +401,14 @@
         onclick={testConnection}
         disabled={!apiConfig.enabled || testingConnection}
       >
-        {testingConnection ? "测试中..." : "测试连接"}
+        {testingConnection ? t("api.testing") : t("api.testConnection")}
       </button>
       <button
         class="btn-primary"
         onclick={saveAPIConfig}
         disabled={!apiConfig.enabled || savingConfig}
       >
-        {savingConfig ? "保存中..." : "保存配置"}
+        {savingConfig ? t("api.saving") : t("api.saveConfig")}
       </button>
     </div>
   </section>
@@ -389,9 +416,9 @@
   <!-- Webhook 管理 -->
   <section class="card">
     <div class="card-header-row">
-      <h3 class="section-title">Webhook 管理</h3>
+      <h3 class="section-title">{t("api.webhooksSection")}</h3>
       <button class="btn-add" onclick={() => openWebhookModal()}>
-        + 添加 Webhook
+        + {t("api.addWebhook")}
       </button>
     </div>
 
@@ -399,8 +426,8 @@
       {#if webhooks.length === 0}
         <div class="empty-state">
           <div class="empty-icon">🔗</div>
-          <p class="empty-title">暂无 Webhook</p>
-          <p class="empty-text">点击"添加 Webhook"创建第一个</p>
+          <p class="empty-title">{t("api.noWebhooks")}</p>
+          <p class="empty-text">{t("api.noWebhooksHint")}</p>
         </div>
       {:else}
         {#each webhooks as webhook}
@@ -414,7 +441,7 @@
                     checked={webhook.enabled}
                     onchange={() => webhook.id && toggleWebhook(webhook.id)}
                   />
-                  <span>{webhook.enabled ? "启用" : "禁用"}</span>
+                  <span>{webhook.enabled ? t("api.enabled") : t("api.disabled")}</span>
                 </label>
               </div>
               <div class="webhook-url">{webhook.url}</div>
@@ -422,31 +449,31 @@
 
             <div class="webhook-info">
               <div class="webhook-events">
-                <span class="info-label">事件:</span>
+                <span class="info-label">{t("api.eventLabel")}</span>
                 <span class="info-value">{webhook.events.join(", ")}</span>
               </div>
               <div class="webhook-stats">
-                <span class="info-label">触发:</span>
-                <span class="info-value">{webhook.triggerCount || 0} 次</span>
+                <span class="info-label">{t("api.triggerLabel")}</span>
+                <span class="info-value">{t("api.timesCount", { count: webhook.triggerCount || 0 })}</span>
                 <span class="info-separator">|</span>
-                <span class="info-label">成功:</span>
+                <span class="info-label">{t("api.successLabel")}</span>
                 <span class="info-value">{webhook.successCount || 0} ({getSuccessRate(webhook)}%)</span>
               </div>
             </div>
 
             <div class="webhook-actions">
               <button class="btn-small" onclick={() => openWebhookModal(webhook)}>
-                编辑
+                {t("api.edit")}
               </button>
               <button
                 class="btn-small"
                 onclick={() => webhook.id && testWebhook(webhook.id)}
                 disabled={!webhook.enabled || testingWebhook}
               >
-                测试
+                {t("api.test")}
               </button>
               <button class="btn-small btn-danger" onclick={() => webhook.id && deleteWebhook(webhook.id)}>
-                删除
+                {t("api.delete")}
               </button>
             </div>
           </div>
@@ -458,24 +485,38 @@
 
 <!-- Webhook 编辑模态框 -->
 {#if showWebhookModal}
-  <div class="modal-overlay" onclick={closeWebhookModal}>
-    <div class="modal-content" onclick={(e) => e.stopPropagation()}>
+  <!-- 遮罩 = 内容后面的一枚真按钮（点它关闭）；内容因此不再需要 stopPropagation，
+       Escape + 焦点陷阱走仓库共享的 `attachFocusTrap`（REQ-A386）。 -->
+  <div class="modal-overlay">
+    <button
+      class="modal-backdrop"
+      aria-label={t("api.close")}
+      onclick={closeWebhookModal}
+    ></button>
+    <div
+      class="modal-content"
+      bind:this={modalEl}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="api-modal-title"
+      tabindex="-1"
+    >
       <header class="modal-header">
-        <h3 class="modal-title">
-          {editingWebhook ? "编辑 Webhook" : "添加 Webhook"}
+        <h3 id="api-modal-title" class="modal-title">
+          {editingWebhook ? t("api.editWebhookTitle") : t("api.addWebhookTitle")}
         </h3>
-        <button class="close-btn" onclick={closeWebhookModal} aria-label="关闭">×</button>
+        <button class="close-btn" onclick={closeWebhookModal} aria-label={t("api.close")}>×</button>
       </header>
 
       <div class="modal-body">
         <div class="form-group">
-          <label for="webhookName" class="form-label">名称 *</label>
+          <label for="webhookName" class="form-label">{t("api.nameLabel")}</label>
           <input
             id="webhookName"
             type="text"
             class="form-input"
             bind:value={webhookForm.name}
-            placeholder="例如: Slack 通知"
+            placeholder={t("api.namePlaceholder")}
           />
         </div>
 
@@ -491,7 +532,7 @@
         </div>
 
         <div class="form-group">
-          <label for="webhookMethod" class="form-label">方法</label>
+          <label for="webhookMethod" class="form-label">{t("api.methodLabel")}</label>
           <select
             id="webhookMethod"
             class="form-input"
@@ -503,8 +544,10 @@
         </div>
 
         <div class="form-group">
-          <label class="form-label">订阅事件（多选） *</label>
-          <div class="events-checkboxes">
+          <!-- 这个标签命名的是一**组**复选框 ⇒ `role="group"` + `aria-labelledby`，
+               而不是一个指向不存在的控件的 `<label>`（REQ-A386）。 -->
+          <span id={eventsLabelId} class="form-label">{t("api.eventsLabel")}</span>
+          <div class="events-checkboxes" role="group" aria-labelledby={eventsLabelId}>
             {#each availableEvents as event}
               <label class="checkbox-label">
                 <input
@@ -512,27 +555,27 @@
                   checked={webhookForm.events?.includes(event.id)}
                   onchange={() => toggleWebhookEvent(event.id)}
                 />
-                <span>{event.label}</span>
+                <span>{t(event.labelKey)}</span>
               </label>
             {/each}
           </div>
         </div>
 
         <div class="form-group">
-          <label for="webhookSecret" class="form-label">Secret（可选）</label>
+          <label for="webhookSecret" class="form-label">{t("api.secretLabel")}</label>
           <input
             id="webhookSecret"
             type="password"
             class="form-input"
             bind:value={webhookForm.secret}
-            placeholder="用于签名验证"
+            placeholder={t("api.secretPlaceholder")}
           />
-          <p class="help-text">用于 HMAC 签名，增强安全性</p>
+          <p class="help-text">{t("api.secretHint")}</p>
         </div>
 
         <div class="form-row">
           <div class="form-group">
-            <label for="webhookTimeout" class="form-label">超时（毫秒）</label>
+            <label for="webhookTimeout" class="form-label">{t("api.webhookTimeoutMs")}</label>
             <input
               id="webhookTimeout"
               type="number"
@@ -545,7 +588,7 @@
           </div>
 
           <div class="form-group">
-            <label for="webhookRetry" class="form-label">重试次数</label>
+            <label for="webhookRetry" class="form-label">{t("api.retryCount")}</label>
             <input
               id="webhookRetry"
               type="number"
@@ -560,10 +603,10 @@
 
       <footer class="modal-footer">
         <button class="btn-secondary" onclick={closeWebhookModal}>
-          取消
+          {t("api.cancel")}
         </button>
         <button class="btn-primary" onclick={saveWebhook}>
-          {editingWebhook ? "更新" : "添加"}
+          {editingWebhook ? t("api.update") : t("api.add")}
         </button>
       </footer>
     </div>
@@ -774,8 +817,11 @@
     color: white;
   }
 
-  .btn-primary:hover:not(:disabled) {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-primary:hover:not(:disabled) {
     opacity: 0.8;
+  }
   }
 
   .btn-secondary {
@@ -784,8 +830,11 @@
     color: #007AFF;
   }
 
-  .btn-secondary:hover:not(:disabled) {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-secondary:hover:not(:disabled) {
     background: #E5E5EA;
+  }
   }
 
   .btn-add {
@@ -795,8 +844,11 @@
     font-size: 14px;
   }
 
-  .btn-add:hover {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-add:hover {
     opacity: 0.8;
+  }
   }
 
   button:disabled {
@@ -903,8 +955,11 @@
     cursor: pointer;
   }
 
-  .btn-small:hover:not(:disabled) {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-small:hover:not(:disabled) {
     background: #E5E5EA;
+  }
   }
 
   .btn-small.btn-danger {
@@ -947,7 +1002,6 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.5);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -955,7 +1009,18 @@
     padding: 20px;
   }
 
+  /* 遮罩层：铺满的真按钮（背景在它身上，不在 overlay 上）。 */
+  .modal-backdrop {
+    position: absolute;
+    inset: 0;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    background: rgba(0, 0, 0, 0.5);
+  }
+
   .modal-content {
+    position: relative; /* 盖在遮罩之上 */
     background: #fff;
     border-radius: 16px;
     max-width: 600px;
@@ -996,8 +1061,11 @@
     justify-content: center;
   }
 
-  .close-btn:hover {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .close-btn:hover {
     background: #E5E5EA;
+  }
   }
 
   .modal-body {

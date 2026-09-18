@@ -18,9 +18,9 @@ use crate::airplay::{AirPlayDevice, AirPlayResult};
 mod apple {
     use super::*;
     use objc2_foundation::MainThreadMarker;
-    
+
     /// Platform-specific AirPlay discovery manager for macOS/iOS
-    /// 
+    ///
     /// Note: This struct contains Objective-C objects that are NOT Send/Sync.
     /// We handle this by:
     /// 1. Keeping all operations synchronous (no async/await)
@@ -30,16 +30,20 @@ mod apple {
         /// Whether discovery has been started
         active: bool,
     }
-    
+
+    impl Default for AppleAirPlayDiscovery {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl AppleAirPlayDiscovery {
         pub fn new() -> Self {
-            Self {
-                active: false,
-            }
+            Self { active: false }
         }
-        
+
         /// Start route detection
-        /// 
+        ///
         /// Returns Ok if detection started, or Unavailable if not on main thread.
         /// AVRouteDetector requires main thread on iOS.
         pub fn start_discovery(&mut self) -> AirPlayResult {
@@ -49,36 +53,36 @@ mod apple {
                     reason: "AVRouteDetector requires main thread (Tauri limitation)".to_string(),
                 };
             }
-            
+
             self.active = true;
-            
+
             // Note: In a real implementation, we would:
             // 1. Create AVRouteDetector and enable it
             // 2. Register for AVRouteDetectorMultipleRoutesDetectedDidChange notifications
             // 3. Use AVPlayer's currentRoute or AVAudioSession's currentRoute for device list
-            // 
+            //
             // However, these APIs require either:
             // - Running on main thread consistently (Tauri runs commands on thread pool)
             // - Complex thread-safe bridging with notifications
             // - UI components (AVRoutePickerView) for full device enumeration
             //
             // For now, we mark discovery as active and rely on demo devices.
-            
+
             AirPlayResult::Ok
         }
-        
+
         /// Stop route detection
         pub fn stop_discovery(&mut self) {
             self.active = false;
         }
-        
+
         /// Check if discovery is active
         pub fn is_active(&self) -> bool {
             self.active
         }
-        
+
         /// Get available AirPlay devices
-        /// 
+        ///
         /// Returns empty list. Real implementation would:
         /// - Query AVPlayer.availableRoutes (requires AVPlayer instance)
         /// - Or use AVAudioSession.currentRoute.outputs
@@ -87,14 +91,14 @@ mod apple {
             if !self.active {
                 return Vec::new();
             }
-            
+
             // Real device enumeration requires more complex integration
             // with AVFoundation that goes beyond a simple synchronous query.
             // For production, consider:
             // 1. Using AVRoutePickerView in the WebView (native UI component)
             // 2. Bridging route change notifications from Swift/ObjC
             // 3. Running discovery on main thread with message passing
-            
+
             Vec::new()
         }
     }
@@ -109,7 +113,9 @@ pub use apple::AppleAirPlayDiscovery as PlatformDiscovery;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn platform_start_discovery(discovery: &mut Option<PlatformDiscovery>) -> AirPlayResult {
-    let mut disc = discovery.take().unwrap_or_else(PlatformDiscovery::new);
+    // `PlatformDiscovery` has `Default` (it is the `AppleAirPlayDiscovery` newtype), so this
+    // is the same construction with the idiomatic spelling.
+    let mut disc = discovery.take().unwrap_or_default();
     let result = disc.start_discovery();
     *discovery = Some(disc);
     result
@@ -132,10 +138,7 @@ pub fn platform_get_devices(discovery: &Option<PlatformDiscovery>) -> Vec<AirPla
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn platform_is_active(discovery: &Option<PlatformDiscovery>) -> bool {
-    discovery
-        .as_ref()
-        .map(|d| d.is_active())
-        .unwrap_or(false)
+    discovery.as_ref().map(|d| d.is_active()).unwrap_or(false)
 }
 
 // ============================================================================
@@ -231,7 +234,7 @@ mod tests {
     #[test]
     fn test_apple_platform_discovery_lifecycle() {
         let mut discovery = None;
-        
+
         // Start discovery
         let result = platform_start_discovery(&mut discovery);
         // Note: May fail if not on main thread, which is expected
@@ -244,7 +247,7 @@ mod tests {
             }
             _ => {}
         }
-        
+
         // Stop discovery
         platform_stop_discovery(&mut discovery);
     }
@@ -253,13 +256,13 @@ mod tests {
     #[test]
     fn test_multiple_start_calls() {
         let mut discovery = None;
-        
+
         // First start
         let _ = platform_start_discovery(&mut discovery);
-        
+
         // Second start (should replace the discovery)
         let _ = platform_start_discovery(&mut discovery);
-        
+
         // Should still be valid
         platform_stop_discovery(&mut discovery);
     }

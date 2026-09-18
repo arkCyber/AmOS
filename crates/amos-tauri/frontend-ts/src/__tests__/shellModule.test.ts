@@ -17,11 +17,10 @@
  */
 import { describe, expect, test } from "vitest";
 import {
+  bindingHint,
   formatShortcut,
-  moduleForShortcut,
   modulesFor,
   normalizeKey,
-  overlayShortcutHint,
   shortcutAria,
   shortcutMatches,
   type ShellModule,
@@ -195,39 +194,39 @@ describe("the shortcut table (the overlay rows are the list)", () => {
     }
   });
 
-  test("F4 opens the Launchpad, ⌘Space the Spotlight, F3 and ⌘Tab Mission Control", () => {
-    const at = (e: Parameters<typeof moduleForShortcut>[2]) =>
-      moduleForShortcut("overlay", SHELL_MODULES, e)?.id;
-    expect(at({ key: "F4" })).toBe("launchpad");
-    expect(at({ key: "F3" })).toBe("mission-control");
-    expect(at({ key: " ", metaKey: true })).toBe("spotlight");
-    expect(at({ key: "Tab", metaKey: true })).toBe("mission-control");
-    // Ctrl counts as ⌘ (the shell already treated them as one) …
-    expect(at({ key: " ", ctrlKey: true })).toBe("spotlight");
-    // … and a modifier the binding does not list must not fire it: F4 with ⌘ is free
-    // for something else, and a bare Space must not open Spotlight while typing.
-    expect(at({ key: "F4", metaKey: true })).toBeUndefined();
-    expect(at({ key: " ", shiftKey: true, metaKey: true })).toBeUndefined();
-    expect(at({ key: " " })).toBeUndefined();
-    expect(at({ key: "F5" })).toBeUndefined();
-  });
+  // 这里曾有一条 `moduleForShortcut("overlay", SHELL_MODULES, e)` 的矩阵（F4 / ⌘Space /
+  // F3 / ⌘Tab、Ctrl 视作 ⌘、未列出的修饰符不得触发）。REQ-A394 之后，桌面壳与触摸壳都
+  // 从**合并后的绑定**里找匹配（`keyboardConfigHook.findMatchingBinding`），`moduleForShortcut`
+  // 因此零生产调用点、已删除；同一套语义由两处**真路径**钉住，不在这里重写一遍匹配器
+  // （那会变成"测自己写的 lambda"）：
+  //   • `src/lib/__tests__/keyboardConfigHook.bindings.test.ts` —— 合成矩阵（含 Ctrl→⌘、
+  //     严格修饰符、先声明先命中、空表）；
+  //   • `svelte-tests/desktop-shell.svelte.test.ts` —— 端到端：F4/F3 真的开、再按真的关、
+  //     ⌘F3 不开、用户改键/禁用后以合并结果为准。
 
   test("the label a widget shows comes from the same row the matcher reads", () => {
-    expect(overlayShortcutHint(SHELL_MODULES, "spotlight")).toEqual({
+    // 提示从**行**里折叠（`bindingHint`），行本身可以来自注册表，也可以来自合并后的绑定
+    // （桌面壳读的是后者 —— 用户改过的键因此显示的就是他自己那把）。
+    const row = (id: string) =>
+      modulesFor("overlay", SHELL_MODULES).find((m) => m.id === id)?.shortcuts;
+
+    expect(bindingHint(row("spotlight"))).toEqual({
       label: "⌘Space",
       aria: "Meta+Space",
     });
-    expect(overlayShortcutHint(SHELL_MODULES, "launchpad")).toEqual({ label: "F4", aria: "F4" });
+    expect(bindingHint(row("launchpad"))).toEqual({ label: "F4", aria: "F4" });
     // The *first* binding is the displayed one; both are bound.
-    expect(overlayShortcutHint(SHELL_MODULES, "mission-control")).toEqual({
+    expect(bindingHint(row("mission-control"))).toEqual({
       label: "F3",
       aria: "F3",
     });
     // An overlay with no binding, and one that does not exist: both `null`, never a guess.
     // (`control-center-panel` is the real row without `shortcuts` — macOS has no default
     // key for Control Center, so the panel is opened from its item.)
-    expect(overlayShortcutHint(SHELL_MODULES, "control-center-panel")).toBeNull();
-    expect(overlayShortcutHint(SHELL_MODULES, "nope")).toBeNull();
+    expect(bindingHint(row("control-center-panel"))).toBeNull();
+    expect(bindingHint(row("nope"))).toBeNull();
+    // 合并后的覆盖行（用户在键盘设置里改成 F9）同样只显示第一个绑定
+    expect(bindingHint([{ key: "F9" }])).toEqual({ label: "F9", aria: "F9" });
   });
 
   test("formatting/parsing agree on the shapes the shell binds", () => {

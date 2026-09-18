@@ -42,6 +42,7 @@
   import { startTimerWatcher } from "./osTimerWatcher";
   import { startAlarmWatcher } from "./osAlarmWatcher";
   import { startReminderWatcher } from "./osReminderWatcher";
+  import { startPushWatcher } from "./osPushWatcher";
   import { startCalendarWatcher } from "./osCalendarWatcher";
   import { startOsAutoOff } from "./osAutoOff";
   import { startOsTelephonyHold } from "./osTelephonyHold";
@@ -336,6 +337,9 @@
       startAlarmWatcher(getActive),
       startReminderWatcher(getActive),
       startCalendarWatcher(getActive),
+      // Remote push deliveries land in the same notification store the NC/banner
+      // already render (the mapping is pure: `lib/pushNotifBridge`).
+      startPushWatcher(),
       startOsAutoOff({ onSleep: lock }),
       startOsTelephonyHold(),
       startOsWakeHome({ onHome: goHome }),

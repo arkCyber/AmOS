@@ -17,6 +17,7 @@
 import { readStoreValue, writeStoreValueChecked } from "../amosStore";
 import { logger } from "./logger";
 import { mdmManager } from "./mdm";
+import { localId } from "../localId";
 
 // ============================================================================
 // 类型定义
@@ -245,10 +246,14 @@ export interface AuditConfig {
 // 常量
 // ============================================================================
 
+export const AUDIT_LOGS_KEY = "amos.shortcuts.audit.logs";
+export const AUDIT_CONFIG_KEY = "amos.shortcuts.audit.config";
+export const AUDIT_SYNC_QUEUE_KEY = "amos.shortcuts.audit.sync_queue";
+
 const STORE_KEYS = {
-  AUDIT_LOGS: "amos.shortcuts.audit.logs",
-  AUDIT_CONFIG: "amos.shortcuts.audit.config",
-  AUDIT_SYNC_QUEUE: "amos.shortcuts.audit.sync_queue",
+  AUDIT_LOGS: AUDIT_LOGS_KEY,
+  AUDIT_CONFIG: AUDIT_CONFIG_KEY,
+  AUDIT_SYNC_QUEUE: AUDIT_SYNC_QUEUE_KEY,
 };
 
 const DEFAULT_CONFIG: AuditConfig = {
@@ -847,7 +852,7 @@ export class AuditLogger {
    * 生成日志 ID
    */
   private generateLogId(): string {
-    return `audit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    return localId("audit");
   }
 
   /**
@@ -935,10 +940,16 @@ export class AuditLogger {
 
   /**
    * 保存配置
+   *
+   * 写盘被拒就是**数据丢失**：内存里的 `config` 是本会话的权威，但重启后它
+   * 会回到默认值。所以这里不能把 `writeStoreValueChecked` 的答案丢掉
+   * （write-scan 的判据），要把损失说出来。
    */
   private saveConfig(): void {
     const serialized = JSON.stringify(this.config);
-    writeStoreValueChecked(STORE_KEYS.AUDIT_CONFIG, serialized);
+    if (!writeStoreValueChecked(STORE_KEYS.AUDIT_CONFIG, serialized)) {
+      logger.error("audit", "审计配置写入被存储拒绝 —— 重启后将回落到默认配置");
+    }
   }
 
   /**
@@ -961,10 +972,14 @@ export class AuditLogger {
 
   /**
    * 保存日志
+   *
+   * 审计日志"写不进去"本身就是一条该被看见的事实：内存 ring 还在，重启后会丢。
    */
   private saveLogs(): void {
     const serialized = JSON.stringify(this.logs);
-    writeStoreValueChecked(STORE_KEYS.AUDIT_LOGS, serialized);
+    if (!writeStoreValueChecked(STORE_KEYS.AUDIT_LOGS, serialized)) {
+      logger.error("audit", `审计日志写入被存储拒绝 —— ${this.logs.length} 条重启后会丢失`);
+    }
   }
 
   /**
@@ -987,10 +1002,14 @@ export class AuditLogger {
 
   /**
    * 保存同步队列
+   *
+   * 队列丢失 = 待同步的审计条目再也不会到达服务器，必须报出来。
    */
   private saveSyncQueue(): void {
     const serialized = JSON.stringify(this.syncQueue);
-    writeStoreValueChecked(STORE_KEYS.AUDIT_SYNC_QUEUE, serialized);
+    if (!writeStoreValueChecked(STORE_KEYS.AUDIT_SYNC_QUEUE, serialized)) {
+      logger.error("audit", `审计同步队列写入被存储拒绝 —— ${this.syncQueue.length} 条将不再同步`);
+    }
   }
 
   /**

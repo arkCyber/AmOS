@@ -582,7 +582,10 @@
   </div>
 
   {#if status}
-    <p class="mt-1 text-xs text-accent">{status}</p>
+    <!-- 这条状态是**用户动作之后**才出现的（改头像主题、导入了多少联系人…），
+         而焦点还在原来的控件上 ⇒ 播报它；否则屏幕阅读器用户点了之后什么都听不到
+         （REQ-A387）。 -->
+    <p class="mt-1 text-xs text-accent" role="status">{status}</p>
   {/if}
 
   {#if importOpen}
@@ -820,7 +823,7 @@
           <button
             onclick={closeAvatarPreview}
             aria-label={t("contacts.close")}
-            class="absolute -right-3 -top-3 grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-900 shadow-lg transition active:scale-90 dark:bg-neutral-800 dark:text-white"
+            class="absolute -right-3 -top-3 grid h-11 w-11 place-items-center rounded-full bg-white text-neutral-900 shadow-lg transition active:scale-90 dark:bg-neutral-800 dark:text-white"
           >
             {@html iconSvg("x", "h-5 w-5")}
           </button>

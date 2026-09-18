@@ -10,7 +10,7 @@ mod tests {
             DeviceKind::Audio,
             DeviceKind::Generic,
         ];
-        
+
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
             let deserialized: DeviceKind = serde_json::from_str(&json).unwrap();
@@ -20,12 +20,8 @@ mod tests {
 
     #[test]
     fn test_stream_kind_serialization() {
-        let kinds = vec![
-            StreamKind::Audio,
-            StreamKind::Video,
-            StreamKind::Mirroring,
-        ];
-        
+        let kinds = vec![StreamKind::Audio, StreamKind::Video, StreamKind::Mirroring];
+
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
             let deserialized: StreamKind = serde_json::from_str(&json).unwrap();
@@ -99,7 +95,10 @@ mod tests {
             match (&result, &deserialized) {
                 (AirPlayResult::Ok, AirPlayResult::Ok) => (),
                 (AirPlayResult::Unavailable { .. }, AirPlayResult::Unavailable { .. }) => (),
-                (AirPlayResult::PermissionDenied { .. }, AirPlayResult::PermissionDenied { .. }) => (),
+                (
+                    AirPlayResult::PermissionDenied { .. },
+                    AirPlayResult::PermissionDenied { .. },
+                ) => (),
                 (AirPlayResult::DeviceNotFound, AirPlayResult::DeviceNotFound) => (),
                 (AirPlayResult::Failed { .. }, AirPlayResult::Failed { .. }) => (),
                 _ => panic!("Mismatched AirPlayResult variants"),
@@ -138,18 +137,18 @@ mod tests {
     fn test_manager_get_devices() {
         let mut manager = AirPlayManager::new();
         let result = manager.start_discovery();
-        
+
         // Only check devices if discovery succeeded
         match result {
             AirPlayResult::Ok => {
                 let devices = manager.get_devices();
-                
+
                 #[cfg(debug_assertions)]
                 {
                     // In debug mode, should return demo devices
                     assert_eq!(devices.len(), 3);
                 }
-                
+
                 #[cfg(not(debug_assertions))]
                 {
                     // In release mode, may be empty or contain real devices
@@ -171,7 +170,7 @@ mod tests {
     fn test_manager_connect_device_not_found() {
         let mut manager = AirPlayManager::new();
         let result = manager.connect("nonexistent-device");
-        
+
         match result {
             AirPlayResult::DeviceNotFound => (),
             AirPlayResult::Unavailable { .. } => {
@@ -185,7 +184,7 @@ mod tests {
     fn test_manager_disconnect_not_connected() {
         let mut manager = AirPlayManager::new();
         let result = manager.disconnect();
-        
+
         match result {
             AirPlayResult::Ok => {
                 // Disconnect succeeded even when not connected (idempotent)
@@ -200,21 +199,36 @@ mod tests {
     #[test]
     fn test_manager_volume_bounds() {
         let mut manager = AirPlayManager::new();
-        
+
         // Test valid volumes
-        assert!(matches!(manager.set_volume(0.0), AirPlayResult::Ok | AirPlayResult::Unavailable { .. }));
-        assert!(matches!(manager.set_volume(0.5), AirPlayResult::Ok | AirPlayResult::Unavailable { .. }));
-        assert!(matches!(manager.set_volume(1.0), AirPlayResult::Ok | AirPlayResult::Unavailable { .. }));
-        
+        assert!(matches!(
+            manager.set_volume(0.0),
+            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
+        ));
+        assert!(matches!(
+            manager.set_volume(0.5),
+            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
+        ));
+        assert!(matches!(
+            manager.set_volume(1.0),
+            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
+        ));
+
         // Test out-of-range volumes (should be clamped, not fail)
         let result = manager.set_volume(-0.1);
-        assert!(matches!(result, AirPlayResult::Ok | AirPlayResult::Unavailable { .. }));
+        assert!(matches!(
+            result,
+            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
+        ));
         if manager.is_available() {
             assert_eq!(manager.get_status().volume, 0.0); // Should be clamped to 0.0
         }
-        
+
         let result = manager.set_volume(1.5);
-        assert!(matches!(result, AirPlayResult::Ok | AirPlayResult::Unavailable { .. }));
+        assert!(matches!(
+            result,
+            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
+        ));
         if manager.is_available() {
             assert_eq!(manager.get_status().volume, 1.0); // Should be clamped to 1.0
         }
@@ -232,10 +246,10 @@ mod tests {
     fn test_platform_availability() {
         let manager = AirPlayManager::new();
         let available = manager.is_available();
-        
+
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         assert!(available);
-        
+
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             // On other platforms, it may or may not be available
@@ -248,7 +262,7 @@ mod tests {
     fn test_get_status() {
         let manager = AirPlayManager::new();
         let status = manager.get_status();
-        
+
         assert!(!status.active);
         assert_eq!(status.volume, 0.7);
         assert!(status.device.is_none());
@@ -259,7 +273,7 @@ mod tests {
     fn test_start_stream_no_connection() {
         let mut manager = AirPlayManager::new();
         let result = manager.start_stream(StreamKind::Audio, None);
-        
+
         // Should fail because no device is connected
         match result {
             AirPlayResult::Failed { .. } => (),
@@ -272,7 +286,7 @@ mod tests {
     fn test_stop_stream_no_active_stream() {
         let mut manager = AirPlayManager::new();
         let result = manager.stop_stream();
-        
+
         // Should succeed (idempotent)
         match result {
             AirPlayResult::Ok => (),

@@ -447,7 +447,11 @@
           <p class="mb-6 text-sm text-slate-400">{t("measure.calibrateDesc")}</p>
 
           {#if calibrationMessage}
+            <!-- 校准结果是**用户选完参考物之后**才出现的（焦点还在那个按钮上），
+                 所以必须是 live region；失败用 `alert`（assertive），成功用 `status`（polite）
+                 —— 失败是用户必须知道的事，等待播报会被后面的话挤掉（REQ-A387）。 -->
             <div
+              role={calibrationMessage.type === "error" ? "alert" : "status"}
               class="mb-4 rounded-lg border p-4 transition-all"
               class:bg-green-900={calibrationMessage.type === "success"}
               class:bg-opacity-20={calibrationMessage.type === "success"}

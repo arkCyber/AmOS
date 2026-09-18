@@ -4,6 +4,15 @@
 *.pdb
 Cargo.lock
 
+# Compiled shared objects — never source. The one that had been committed was the pyo3
+# extension `crates/amos-link-py/python/amos_link/_native.so`, built in place by
+# `maturin develop` (see that crate's README): platform-specific, unreviewable, and wrong
+# on every other OS. Removed 2026-09-17 (REQ-A389); build it locally before running the
+# Python tests.
+*.so
+*.dylib
+*.dll
+
 # Frontend / Node
 node_modules/
 **/node_modules/

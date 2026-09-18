@@ -110,5 +110,129 @@
   {
     "key": "wm.whyNoCandidates",
     "reason": "Window manager no-candidates message — the window manager UI was stubbed and this message was reserved for future spaces UX; the wm module is not yet wired to any UI surface."
+  },
+  {
+    "key": "airplay.connect",
+    "reason": "AirPlay **streaming surface** (REQ-A384): `AirPlayPanel.svelte` today discovers, connects/disconnects and sets volume, but renders no device-list header, no connect/volume labels and no failure/permission-denied states. The library side already implements the streaming calls (`startStream`/`stopStream` are in `scripts/unwired-baseline.json`), so the surface is planned rather than imagined — the strings are kept for it."
+  },
+  {
+    "key": "airplay.connecting",
+    "reason": "AirPlay streaming surface — the in-flight connect state the panel does not show (REQ-A384)."
+  },
+  {
+    "key": "airplay.deviceNotFound",
+    "reason": "AirPlay streaming surface — the 'device disappeared' state the panel does not render (REQ-A384)."
+  },
+  {
+    "key": "airplay.devices",
+    "reason": "AirPlay streaming surface — the device-list header; the panel renders the list without a heading (REQ-A384)."
+  },
+  {
+    "key": "airplay.failed",
+    "reason": "AirPlay streaming surface — the generic failure state (the panel shows per-command results only) (REQ-A384)."
+  },
+  {
+    "key": "airplay.permissionDenied",
+    "reason": "AirPlay streaming surface — the local-network permission state (Rust reports it; no panel row renders it yet) (REQ-A384)."
+  },
+  {
+    "key": "airplay.startStream",
+    "reason": "AirPlay streaming surface — the start/stop-stream controls; `lib/airplay.ts::startStream`/`stopStream` exist and are baselined as unwired (REQ-A384)."
+  },
+  {
+    "key": "airplay.stopStream",
+    "reason": "AirPlay streaming surface — the stop control of the same pair (REQ-A384)."
+  },
+  {
+    "key": "airplay.volume",
+    "reason": "AirPlay streaming surface — the volume control's label; the panel calls `setVolume` from a slider without a label of its own (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.categoryAll",
+    "reason": "Shortcut **gallery** surface (REQ-A384): `ShortcutsApp.svelte` today creates/lists/runs shortcuts; the category tabs, gallery header, drag-to-sort, preview/confirm dialogs and the 'completed' state belong to the gallery that is not built yet. Reserved with a reason so the strings are not silently deleted."
+  },
+  {
+    "key": "shortcuts.categoryApps",
+    "reason": "Shortcut gallery surface — category tab (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.categoryDate",
+    "reason": "Shortcut gallery surface — category tab (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.categoryDevice",
+    "reason": "Shortcut gallery surface — category tab (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.categoryMath",
+    "reason": "Shortcut gallery surface — category tab (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.categoryScripting",
+    "reason": "Shortcut gallery surface — category tab (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.categoryText",
+    "reason": "Shortcut gallery surface — category tab (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.categoryWeb",
+    "reason": "Shortcut gallery surface — category tab (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.completed",
+    "reason": "Shortcut gallery surface — the completion badge while a shortcut runs (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.confirmDelete",
+    "reason": "Shortcut gallery surface — the delete confirmation dialog; today's delete asks via a plain confirm string (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.dragToSort",
+    "reason": "Shortcut gallery surface — the reorder hint of the gallery grid (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.enterName",
+    "reason": "Shortcut gallery surface — the create-dialog placeholder; the live key is `shortcuts.alerts.enterName` (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.enterNameWithKey",
+    "reason": "Shortcut gallery surface — the create-dialog label naming the shortcut's key (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.error",
+    "reason": "Shortcut gallery surface — the gallery's load-error line (the app surfaces run errors instead) (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.failed",
+    "reason": "Shortcut gallery surface — the failed-run badge in the gallery grid (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.galleryComingSoon",
+    "reason": "Shortcut gallery surface — its own 'coming soon' notice: this key is the written evidence that the gallery is a planned surface, not a mistake (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.galleryTitle",
+    "reason": "Shortcut gallery surface — the gallery screen title (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.newShortcut",
+    "reason": "Shortcut gallery surface — the create button of the gallery; the live button uses `shortcuts.newButton`/`newShortcutWithKey` (REQ-A384)."
+  },
+  {
+    "key": "shortcuts.previewCompleted",
+    "reason": "Shortcut gallery surface — the preview panel's completion line (REQ-A384)."
+  },
+  {
+    "key": "webman.downloadContent",
+    "reason": "Browser **download sheet** (REQ-A384): `WebManApp.svelte` renders tabs/bookmarks/history, but no download panel — the download helpers (`addDownload`/`updateDownload`/`removeDownload`/`clearCompletedDownloads`/`formatFileSize`) are baselined as unwired in `scripts/unwired-baseline.json`. This string is reserved for that panel."
+  },
+  {
+    "key": "webman.newTabButton",
+    "reason": "Browser download sheet / tab-strip affordance — the labelled new-tab button; today's tab strip adds a tab with an icon-only control (REQ-A384)."
+  },
+  {
+    "key": "webman.openInExternalBrowser",
+    "reason": "Browser download sheet / external-open affordance — opening the current page in the system browser is not offered yet (REQ-A384)."
   }
 ]

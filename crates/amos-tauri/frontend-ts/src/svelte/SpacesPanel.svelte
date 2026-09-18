@@ -244,15 +244,21 @@
                 if (e.key === "Escape") cancelEdit();
               }}
             />
-            <div class="flex gap-2" onclick={(e) => e.stopPropagation()}>
+            <div class="flex gap-2">
               <button
-                onclick={() => saveEdit(space.id)}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  saveEdit(space.id);
+                }}
                 class="flex-1 px-2 py-1 bg-green-600 text-white rounded text-sm"
               >
                 {t("spaces.save")}
               </button>
               <button
-                onclick={cancelEdit}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  cancelEdit();
+                }}
                 class="flex-1 px-2 py-1 bg-neutral-600 text-white rounded text-sm"
               >
                 {t("spaces.cancel")}
@@ -281,21 +287,27 @@
             </div>
 
             <!-- 操作按钮 -->
-            <div class="flex gap-2" onclick={(e) => e.stopPropagation()}>
+            <div class="flex gap-2">
               {#if currentIndex === index}
                 <div class="flex-1 px-2 py-1 bg-blue-600 text-white text-center rounded text-sm">
                   {t("spaces.currentDesktop")}
                 </div>
               {:else}
                 <button
-                  onclick={() => handleSwitch(index)}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    handleSwitch(index);
+                  }}
                   class="flex-1 px-2 py-1 bg-neutral-600 hover:bg-neutral-700 text-white rounded text-sm"
                 >
                   {t("spaces.switch")}
                 </button>
               {/if}
               <button
-                onclick={() => handleDelete(space.id)}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  handleDelete(space.id);
+                }}
                 class="px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm disabled:opacity-50"
                 disabled={spaces.length <= 1}
                 title={spaces.length <= 1 ? t("spaces.cannotDeleteLast") : t("spaces.delete")}

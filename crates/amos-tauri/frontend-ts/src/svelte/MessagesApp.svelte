@@ -716,7 +716,7 @@
     <div class="flex items-center justify-between pb-2">
       <div class="flex min-w-0 items-center gap-2">
         <span class="text-sm font-semibold">{activeRealName}</span>
-        <span data-testid="real-sms-badge" class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-[10px] text-accent">📡 {t("message.realSms")}</span>
+        <span data-testid="real-sms-badge" class="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] text-accent">📡 {t("message.realSms")}</span>
       </div>
       {#if activeReal}
         <button onclick={() => void blockSender()} disabled={blockBusy} aria-label={`block-sender-${activeReal.address}`} title={t("message.blockSender")}
@@ -767,7 +767,7 @@
       <div class="flex min-w-0 items-center gap-2">
         <span class="text-sm font-semibold">{active.name}</span>
         {#if unreadCount(msgs) > 0}
-          <button onclick={() => setMsgs(markAllRead(msgs))} title={t("message.markRead")} class="shrink-0 rounded-full bg-accent/15 px-2 py-0.5 text-xs text-accent">{unreadCount(msgs)} {t("message.unread")}</button>
+          <button onclick={() => setMsgs(markAllRead(msgs))} title={t("message.markRead")} class="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-xs text-accent">{unreadCount(msgs)} {t("message.unread")}</button>
         {/if}
       </div>
       <div class="flex items-center gap-1.5">

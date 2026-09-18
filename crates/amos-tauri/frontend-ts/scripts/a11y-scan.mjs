@@ -157,18 +157,58 @@ function r1_labelFieldAssoc(file, content) {
  *   - 必须**不是**键盘监听覆盖层(`onkeydown` 在 div 上是 WAI-ARIA
  *     允许的:例如 radiogroup / tablist,只要它有 role)。
  */
+/**
+ * Index of the `>` that closes the tag starting at `from`, skipping `>` that is inside a
+ * quoted attribute value or a `{…}` expression.
+ *
+ * A naive `indexOf(">")` truncates the tag at the `>` of an arrow function
+ * (`onclick={() => …}`) — which made `role=` / `aria-hidden` written *after* that
+ * attribute invisible to R2 (REQ-A387: ContactsApp's `role="dialog"` avatar overlay was
+ * reported as "clickable <div> without role" for exactly this reason).
+ */
+function tagEndIndex(content, from) {
+  let quote = null;
+  let braces = 0;
+  for (let i = from; i < content.length; i++) {
+    const ch = content[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      braces += 1;
+      continue;
+    }
+    if (ch === "}") {
+      if (braces > 0) braces -= 1;
+      continue;
+    }
+    if (ch === ">" && braces === 0) return i;
+  }
+  return -1;
+}
+
 function r2_customControlRole(file, content) {
   const re = /<(div|span)\b[^>]*?\bon(?:click|:click)=/g;
   const findings = [];
   let m;
   while ((m = re.exec(content)) !== null) {
-    // Look at a wider window around the match — role= can be 100s of chars before onclick
-    const start = Math.max(0, m.index - 400);
-    const snippet = content.slice(start, m.index + 80).replace(/\s+/g, " ");
-    if (/role=/.test(snippet)) continue;
+    // **整条开始标签**（`<div` 到它的 `>`）才是"这个元素有哪些属性"的答案。
+    // 这里原来只看标签起始后 80 个字符 ⇒ 本仓库里 `class="…"` 动辄一两百字符，
+    // 写在 class **之后**的 `role=` / `aria-hidden` 全都落在窗口外，于是
+    // `role="button"` 的卡片、`role="dialog"`+键盘路径的浮层都被报成"没有 role"
+    // （REQ-A387：SpacesPanel / ContactsApp 四条假阳性就是这么来的）。
+    const end = tagEndIndex(content, m.index);
+    const tag = end === -1 ? content.slice(m.index) : content.slice(m.index, end + 1);
+    const pre = content.slice(Math.max(0, m.index - 400), m.index);
+    if (/\brole=/.test(tag)) continue;
     // Skip click-outside-to-close overlay: aria-hidden + pointer-events-auto absolute inset-0
-    if (/aria-hidden|pointer-events-(none|auto)\s+(absolute|fixed)\s+inset-0/.test(snippet)) continue;
-    findings.push(snippet.slice(-90));
+    if (/aria-hidden|pointer-events-(none|auto)\s+(absolute|fixed)\s+inset-0/.test(tag + pre)) continue;
+    findings.push((pre + tag).replace(/\s+/g, " ").slice(-90));
   }
   if (findings.length === 0) return null;
   return {
@@ -282,6 +322,10 @@ function r5_liveRegion(file, content) {
   // alternative to aria-live that we adopted for REQ-A284's clock files (ClockWidget /
   // StageClock / LockScreen / StatusBar / HomeDock).
   if (/aria-live=|role=["'](status|alert|timer)["']/.test(content)) return null;
+  // **动态绑定也算答案**：`role={cond ? "alert" : "status"}` 是合法的 live region
+  // 选择（MeasureApp 校准失败要 assertive、成功要 polite），只认静态字符串会把
+  // 已经修好的文件重新报成缺口（REQ-A387）。
+  if (/role=\{[^}]*["'](status|alert|timer)["']/.test(content)) return null;
   // Files where the setInterval/setTimeout is **not** carrying user-perceivable state —
   // it is a visual re-render trigger (Dock refreshes the running-dot set, MonitorApp polls
   // for the progressbar values, CalendarApp re-derives the agenda, …). Screen readers do
@@ -303,6 +347,8 @@ function r5_liveRegion(file, content) {
     "crates/amos-tauri/frontend-ts/src/svelte/TaskManager.svelte",       // same shape as SystemPanel
     "crates/amos-tauri/frontend-ts/src/svelte/TerminalApp.svelte",       // setInterval for ANSI cursor blink (visual only)
     "crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte",     // 250 ms tick drives the recording pulse animation; the recording state itself is a toggle, not a polling value
+    "crates/amos-tauri/frontend-ts/src/svelte/MissionControl.svelte",     // the 200 ms timeout is a close-animation delay after switching space; no readout changes
+    "crates/amos-tauri/frontend-ts/src/svelte/Shell.svelte",              // the setTimeout(…,0) defers the back-key action by a tick so an inner consumer can claim it; no readout changes
   ]);
   if (KNOWN_FALSE_POSITIVES.has(file)) return null;
   // Allow repo-relative form too (when ROOT is set, file paths come absolute; the
@@ -928,6 +974,47 @@ function selftest() {
   fs.unlinkSync(tmp2);
   if (!f2.some(x => x.rule.includes("clickable <div>"))) {
     console.error("[a11y-scan selftest] FAIL: did not catch the <div onclick>");
+    process.exit(1);
+  }
+  // sample 2b (REQ-A387): the SAME `<div onclick>` but with a role that comes **after** a
+  // long class and an arrow function. Both traps that used to hide `role=` from R2:
+  //   • the old 80-char window stopped before `role=` (a class attr is usually longer);
+  //   • a naive `indexOf(">")` stopped at the `>` of `=>`.
+  // A regression here means the scanner goes back to reporting real controls as role-less.
+  const good2b = [
+    `<div`,
+    `  onclick={() => handle()}`,
+    `  onkeydown={(e) => { if (e.key === "Enter") handle(); }}`,
+    `  class="space-card p-4 rounded-lg border-2 transition-all cursor-pointer border-neutral-300 dark:border-neutral-700"`,
+    `  role="button"`,
+    `  tabindex="0"`,
+    `>card</div>`,
+  ].join("\n");
+  const tmp2b = path.join("/tmp", `a11y-scan-selftest-2b-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp2b, good2b);
+  const f2b = scan(tmp2b);
+  fs.unlinkSync(tmp2b);
+  if (f2b.some(x => x.rule.includes("clickable <div>"))) {
+    console.error(
+      "[a11y-scan selftest] FAIL: a role= written after a long class / an arrow fn must NOT be flagged",
+    );
+    console.error("  findings:", JSON.stringify(f2b, null, 2));
+    process.exit(1);
+  }
+  // sample 2c (REQ-A387): the class hint alone is not enough — an element with NO role and
+  // no keydown is still a finding even when it looks like the card above.
+  const bad2c = [
+    `<div`,
+    `  onclick={() => handle()}`,
+    `  class="space-card p-4 rounded-lg border-2 transition-all cursor-pointer border-neutral-300"`,
+    `>card</div>`,
+  ].join("\n");
+  const tmp2c = path.join("/tmp", `a11y-scan-selftest-2c-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp2c, bad2c);
+  const f2c = scan(tmp2c);
+  fs.unlinkSync(tmp2c);
+  if (!f2c.some(x => x.rule.includes("clickable <div>"))) {
+    console.error("[a11y-scan selftest] FAIL: a role-less clickable <div> must still be reported");
     process.exit(1);
   }
   // sample 3: tabindex=1 — should be flagged

@@ -8,7 +8,7 @@
  * - 完整的错误处理
  * - 并发安全
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "./amosStore";
 
 // ==================== 常量定义 ====================
 
@@ -332,6 +332,19 @@ export function throttle<T extends (...args: any[]) => any>(
   };
 }
 
+/**
+ * `hostname` 是否**就是** `domain`，或它的一个子域。
+ *
+ * 为什么不用 `hostname.includes(domain)`（原实现）：`notgoogle.com` 与
+ * `google.com.evil.example` 都**包含** `google.com` 子串，于是 safe-search 会被加到
+ * 根本不是该搜索引擎的站点上；反过来，一个真域名若只是恰好包含子串也会被误认。
+ * 边界必须是**点分边界**：等于，或以 `"." + domain` 结尾。
+ */
+function hostMatches(hostname: string, domain: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === domain || h.endsWith("." + domain);
+}
+
 /** 安全搜索过滤器 */
 export function applySafeSearch(url: string, enabled: boolean): string {
   if (!enabled) return url;
@@ -340,15 +353,15 @@ export function applySafeSearch(url: string, enabled: boolean): string {
     const parsed = new URL(url);
     
     // Google
-    if (parsed.hostname.includes('google.com')) {
+    if (hostMatches(parsed.hostname, 'google.com')) {
       parsed.searchParams.set('safe', 'active');
     }
     // Bing
-    else if (parsed.hostname.includes('bing.com')) {
+    else if (hostMatches(parsed.hostname, 'bing.com')) {
       parsed.searchParams.set('adlt', 'strict');
     }
     // DuckDuckGo
-    else if (parsed.hostname.includes('duckduckgo.com')) {
+    else if (hostMatches(parsed.hostname, 'duckduckgo.com')) {
       parsed.searchParams.set('kp', '1');
     }
     
@@ -467,7 +480,12 @@ function saveBookmarkStore(bookmarks: Bookmark[], expectedVersion: number): bool
       data: bookmarks.slice(0, LIMITS.BOOKMARK_MAX_COUNT),
     };
 
-    writeStoreValue(BOOKMARKS_KEY, newStore);
+    // 书签是**用户内容**（在 `cloud.ts` 的 SYNC_STORES 里）：写盘被拒必须让调用方
+    // 看到，不能在这里 `return true` —— 那等于告诉用户"书签存好了"，而它没存下。
+    if (!writeStoreValueChecked(BOOKMARKS_KEY, newStore)) {
+      logger.error('Failed to save bookmarks (the store rejected the write)');
+      return false;
+    }
     return true;
   } catch (error) {
     logger.error('Failed to save bookmarks', error);
@@ -712,15 +730,24 @@ export function clearHistory(): void {
   }
 }
 
-/** 搜索历史记录 (防抖建议配合使用) */
+/**
+ * 搜索历史记录 (防抖建议配合使用)。
+ *
+ * 「没有查询」= 去掉首尾空白后为空 ⇒ 给最近的 20 条。原实现里守卫写的是
+ * `if (!query || …) return []`，于是**空串**直接回空，而下面那支 `if (!q) …`
+ * 只有**纯空白**（`"   "`）可达 —— 同一件事的两条路径给出不同答案，而那支代码
+ * 看上去像是在承诺"空查询给最近记录"。现在按"trim 后再判空"统一到一支。
+ * （唯一调用方 `WebManApp` 自己在 `query` 为空时给最近 20 条，故这不是行为扩张。）
+ * 非字符串入参仍回空数组：那是"没给查询"，不是"查询为空"。
+ */
 export function searchHistory(query: string): HistoryEntry[] {
-  if (!query || typeof query !== 'string') {
+  if (typeof query !== 'string') {
     return [];
   }
 
   const history = loadHistory();
   const q = query.toLowerCase().trim();
-  
+
   if (!q) return history.slice(0, 20);
 
   return history.filter(
@@ -788,7 +815,11 @@ function saveDownloadStore(downloads: Download[], expectedVersion: number): bool
       data: downloads.slice(0, LIMITS.DOWNLOAD_MAX_COUNT),
     };
 
-    writeStoreValue(DOWNLOADS_KEY, newStore);
+    // 下载列表同样是用户内容：被拒的写入必须回报，而不是假装已保存。
+    if (!writeStoreValueChecked(DOWNLOADS_KEY, newStore)) {
+      logger.error('Failed to save downloads (the store rejected the write)');
+      return false;
+    }
     return true;
   } catch (error) {
     logger.error('Failed to save downloads', error);
@@ -945,7 +976,10 @@ export function loadSettings(): WebManSettings {
     const stored = readStoreValue<Partial<WebManSettings>>(SETTINGS_KEY, {});
     
     if (!stored || typeof stored !== 'object') {
-      return DEFAULT_SETTINGS;
+      // 返回**副本**，不是 `DEFAULT_SETTINGS` 本身：那是一个导出常量，把它直接交出去
+      // 等于把模块状态借给调用方 —— 谁改一下 `settings.safeSearch`，之后**每一次**
+      // `loadSettings()` 都会"读到"那个改动，而它从未落盘（设置"看起来被保存了"）。
+      return { ...DEFAULT_SETTINGS };
     }
 
     // 合并默认设置
@@ -961,7 +995,8 @@ export function loadSettings(): WebManSettings {
     };
   } catch (error) {
     logger.error('Failed to load settings', error);
-    return DEFAULT_SETTINGS;
+    // 同上：catch 分支也必须给副本，否则一次读失败就把模块常量泄给调用方。
+    return { ...DEFAULT_SETTINGS };
   }
 }
 

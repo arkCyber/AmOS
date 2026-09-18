@@ -9,6 +9,7 @@
  * - 错误恢复
  */
 import { describe, expect, test } from "vitest";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
   isValidUrl,
   parseInput,
@@ -45,6 +46,17 @@ import {
   LIMITS,
   DEFAULT_SETTINGS,
 } from "../webman";
+
+// 书签/下载/标签都写 `amos.webman.*` 共享存储（localStorage）。没有 DOM 时
+// `writeStoreValueChecked` 一律返回 false ⇒ 保存函数**如实地**回报失败，而这 8
+// 条断言此前之所以"通过"，是因为保存函数把被拒的写入当成成功说出口了 ——
+// 测试断言的是那句谎话。与其他 lib 测试同样注册 happy-dom。
+try {
+  GlobalRegistrator.register();
+} catch {
+  /* already registered */
+}
+
 
 // Types and beforeEach available if needed
 
@@ -403,10 +415,15 @@ describe("并发安全测试 - 书签管理", () => {
     expect(bookmark).toBeNull();
   });
 
-  test("addBookmark 拒绝重复 URL (跳过，因为存储不可用)", () => {
-    // 注意: 由于测试环境存储不可用，重复检测依赖持久化，跳过此测试
-    // 在实际环境中，loadBookmarks 会返回已存在的书签，addBookmark 会检测重复
-    expect(true).toBe(true);
+  // 这里原来有一条 `expect(true).toBe(true)` 的“占位”用例，注释写着“因为存储不可用，
+  // 跳过”。**那句注释是假的**：本文件已注册 happy-dom，存储一直是可用的，而它测的
+  // 只是自己写下的 `true`。重复检测（以及下面整片历史/下载/设置的落盘契约）现在由
+  // `webman-persistence.test.ts` 用真断言覆盖（书签去重、上限、坏档过滤、写入被拒、
+  // 隐私模式、去重与最近在前、设置合并、标签页兜底）。
+  test("addBookmark 拒绝重复 URL", () => {
+    const url = `https://dup-${generateId()}.example/`;
+    expect(addBookmark(url)).not.toBeNull();
+    expect(addBookmark(url)).toBeNull();
   });
 
   test("addBookmark 自动生成标题", () => {
@@ -437,52 +454,30 @@ describe("并发安全测试 - 书签管理", () => {
 });
 
 describe("并发安全测试 - 历史记录管理", () => {
-  test("addToHistory 记录有效访问", () => {
-    addToHistory("https://test-history-1.com", "Test History 1");
-    // 由于存储不可用，我们只测试函数不抛出异常
-    expect(true).toBe(true);
+  // 这一片原来是 5 条 `expect(true).toBe(true)`（“存储不可用”）。存储是可用的，
+  // 所以它们既没测到行为、又给出了错误的解释。真实契约见 `webman-persistence.test.ts`；
+  // 这里只留一条与持久化无关的“不抛异常”烟雾 + 三条纯函数边界（它们不依赖存储）。
+  test("addToHistory 对任意输入都不抛异常（含非法 URL 与隐私模式）", () => {
+    expect(() => addToHistory("https://smoke.example/", "smoke")).not.toThrow();
+    expect(() => addToHistory("javascript:alert(1)")).not.toThrow();
+    expect(() => addToHistory("https://private.example/", "Private", true)).not.toThrow();
   });
 
-  test("addToHistory 忽略无效 URL", () => {
-    addToHistory("javascript:alert(1)");
-    // 应该不抛出异常，只是忽略
-    expect(true).toBe(true);
-  });
-
-  test("addToHistory 隐私模式不记录", () => {
-    addToHistory("https://private.com", "Private", true);
-    // 隐私模式应该直接返回，不抛出异常
-    expect(true).toBe(true);
-  });
-
-  test("addToHistory 自动生成标题", () => {
-    addToHistory("https://github.com/user/repo");
-    expect(true).toBe(true);
-  });
-
-  test("clearHistory 清除所有历史", () => {
-    clearHistory();
-    expect(true).toBe(true);
-  });
-
-  test("searchHistory 空查询返回结果", () => {
-    const results = searchHistory("");
-    expect(Array.isArray(results)).toBe(true);
-  });
-
-  test("searchHistory 处理查询", () => {
-    const results = searchHistory("test");
-    expect(Array.isArray(results)).toBe(true);
-  });
-
-  test("searchHistory 处理空字符串", () => {
-    const results = searchHistory(null as any);
-    expect(Array.isArray(results)).toBe(true);
+  test("searchHistory 空查询返回最近记录、null 返回空、正常查询有结果", () => {
+    expect(searchHistory("")).toEqual(loadHistory().slice(0, 20));
+    expect(searchHistory(null as any)).toEqual([]);
+    expect(Array.isArray(searchHistory("test"))).toBe(true);
   });
 
   test("loadHistory 返回数组", () => {
-    const history = loadHistory();
-    expect(Array.isArray(history)).toBe(true);
+    expect(Array.isArray(loadHistory())).toBe(true);
+  });
+
+  test("clearHistory 清空历史", () => {
+    addToHistory(`https://clear-${generateId()}.example/`);
+    expect(loadHistory().length).toBeGreaterThan(0);
+    clearHistory();
+    expect(loadHistory()).toEqual([]);
   });
 });
 
@@ -539,9 +534,14 @@ describe("并发安全测试 - 下载管理", () => {
     expect(removeDownload(null as any)).toBe(false);
   });
 
-  test("clearCompletedDownloads 不抛出异常", () => {
+  test("clearCompletedDownloads 只清已完成的", () => {
+    const done = addDownload(`https://example.com/done-${generateId()}`)!;
+    const pending = addDownload(`https://example.com/pending-${generateId()}`)!;
+    updateDownload(done.id, 100, "completed");
     clearCompletedDownloads();
-    expect(true).toBe(true);
+    const ids = loadDownloads().map((d) => d.id);
+    expect(ids).toContain(pending.id);
+    expect(ids).not.toContain(done.id);
   });
 
   test("loadDownloads 返回数组", () => {
@@ -613,16 +613,10 @@ describe("边界测试 - 设置管理", () => {
     expect(settings.blockPopups).toBe(true);
   });
 
-  test("saveSettings 部分更新 (跳过，因为存储不可用)", () => {
-    // 注意: 由于测试环境存储不可用，设置无法持久化
+  test("saveSettings 部分更新且保留未指定字段", () => {
     saveSettings({ searchEngine: "bing" });
-    expect(true).toBe(true);
-  });
-
-  test("saveSettings 保留未指定的字段 (跳过，因为存储不可用)", () => {
-    // 注意: 由于测试环境存储不可用，设置无法持久化
     saveSettings({ privateMode: true });
-    expect(true).toBe(true);
+    expect(loadSettings()).toMatchObject({ searchEngine: "bing", privateMode: true });
   });
 });
 

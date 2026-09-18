@@ -1,3 +1,16 @@
+<script module lang="ts">
+  /**
+   * 可见标签与它的控件共用一枚 id（REQ-A283/A386）。**模块级**计数器：同一份
+   * 文档里可能挂载多份 ShortcutsApp（多窗口、测试），写死字符串会在第二份实例上
+   * 撞车，而每次渲染重取又会让 `for` 关联失效 —— 与 `settings/kit.nextFieldId` 同一思路。
+   */
+  let fieldSeq = 0;
+  function nextFieldId(): string {
+    fieldSeq += 1;
+    return `shortcut-field-${fieldSeq}`;
+  }
+</script>
+
 <script lang="ts">
   /**
    * ShortcutsApp.svelte — iOS-style Shortcuts automation app (Phase 2)
@@ -19,6 +32,7 @@
   
   import { onMount, onDestroy } from "svelte";
   import { t } from "./locale.svelte";
+  import { attachFocusTrap } from "../lib/focusTrap";
   import {
     loadShortcuts,
     createShortcut,
@@ -49,6 +63,27 @@
   let selectedCategory = $state<ActionCategory | "all">("all");
   
   // 新建快捷指令表单
+  // 编辑器/新建模态里每一对「可见标签 ↔ 控件」的 id（一次挂载取一次）。
+  const nameId = nextFieldId();
+  const descriptionId = nextFieldId();
+  const iconId = nextFieldId();
+  const colorId = nextFieldId();
+  const newNameId = nextFieldId();
+  const newIconId = nextFieldId();
+  const newColorId = nextFieldId();
+
+  /** 两个模态的根元素：Escape 关闭 + 焦点陷阱（也负责开模态时把焦点交给首个字段）。 */
+  let newModalEl: HTMLDivElement | undefined = $state();
+  let pickerEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!showNewModal || !newModalEl) return;
+    return attachFocusTrap(newModalEl, () => (showNewModal = false));
+  });
+  $effect(() => {
+    if (!showActionPicker || !pickerEl) return;
+    return attachFocusTrap(pickerEl, () => (showActionPicker = false));
+  });
+
   let newName = $state("");
   let newIcon = $state(SHORTCUT_ICONS[0]);
   let newColor = $state(SHORTCUT_COLORS[0]);
@@ -666,7 +701,7 @@
                   </div>
                   
                   <!-- 操作按钮 -->
-                  <div class="flex flex-shrink-0 gap-2 opacity-0 transition-opacity group-hover:opacity-100">
+                  <div class="row-actions">
                     <button
                       onclick={() => handleRun(shortcut.id)}
                       disabled={executing}
@@ -717,8 +752,9 @@
             <h3 class="mb-3 text-sm font-semibold text-neutral-700 dark:text-neutral-300">{t("shortcuts.basicInfo")}</h3>
             <div class="space-y-3">
               <div>
-                <label class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.name")}</label>
+                <label for={nameId} class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.name")}</label>
                 <input
+                  id={nameId}
                   type="text"
                   value={selectedShortcut.name}
                   oninput={(e) => updateShortcut(selectedShortcut!.id, { name: e.currentTarget.value })}
@@ -726,8 +762,9 @@
                 />
               </div>
               <div>
-                <label class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.description")}</label>
+                <label for={descriptionId} class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.description")}</label>
                 <textarea
+                  id={descriptionId}
                   value={selectedShortcut.description}
                   oninput={(e) => updateShortcut(selectedShortcut!.id, { description: e.currentTarget.value })}
                   rows="2"
@@ -736,8 +773,9 @@
               </div>
               <div class="flex gap-3">
                 <div class="flex-1">
-                  <label class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.icon")}</label>
+                  <label for={iconId} class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.icon")}</label>
                   <select
+                    id={iconId}
                     value={selectedShortcut.icon}
                     onchange={(e) => updateShortcut(selectedShortcut!.id, { icon: e.currentTarget.value })}
                     class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
@@ -748,8 +786,9 @@
                   </select>
                 </div>
                 <div class="flex-1">
-                  <label class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.color")}</label>
+                  <label for={colorId} class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.color")}</label>
                   <select
+                    id={colorId}
                     value={selectedShortcut.color}
                     onchange={(e) => updateShortcut(selectedShortcut!.id, { color: e.currentTarget.value })}
                     class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
@@ -778,11 +817,12 @@
                 </p>
               </div>
             {:else}
-              <div class="space-y-2">
+              <div class="space-y-2" role="list">
                 {#each selectedShortcut.actions as action, index (action.id)}
                   {@const actionType = BUILTIN_ACTIONS.find(a => a.id === action.actionTypeId)}
                   {#if actionType}
                     <div
+                      role="listitem"
                       draggable="true"
                       ondragstart={(e) => handleDragStart(action.id, e)}
                       ondragover={(e) => handleDragOver(action.id, e)}
@@ -809,7 +849,7 @@
                             <span class="text-sm font-medium text-neutral-900 dark:text-neutral-100">
                               {index + 1}. {actionType.name}
                             </span>
-                            <div class="flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                            <div class="action-actions">
                               {#if index > 0}
                                 <button
                                   onclick={() => handleMoveAction(action.id, "up")}
@@ -846,7 +886,10 @@
                             <div class="space-y-2">
                               {#each actionType.parameters as param}
                                 <div>
-                                  <label class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">
+                                  <label
+                                    for={`shortcut-param-${action.id}-${param.id}`}
+                                    class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400"
+                                  >
                                     {param.name}
                                     {#if param.required}
                                       <span class="text-red-500">*</span>
@@ -858,6 +901,7 @@
                                       value={action.parameters[param.id] ?? ""}
                                       oninput={(e) => handleUpdateActionParam(action.id, param.id, e.currentTarget.value)}
                                       placeholder={param.placeholder}
+                                      id={`shortcut-param-${action.id}-${param.id}`}
                                       class="w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
                                     />
                                   {:else if param.type === "number"}
@@ -865,12 +909,14 @@
                                       type="number"
                                       value={action.parameters[param.id] ?? ""}
                                       oninput={(e) => handleUpdateActionParam(action.id, param.id, Number(e.currentTarget.value))}
+                                      id={`shortcut-param-${action.id}-${param.id}`}
                                       class="w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
                                     />
                                   {:else if param.type === "select" && param.options}
                                     <select
                                       value={action.parameters[param.id] ?? param.defaultValue}
                                       onchange={(e) => handleUpdateActionParam(action.id, param.id, e.currentTarget.value)}
+                                      id={`shortcut-param-${action.id}-${param.id}`}
                                       class="w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
                                     >
                                       {#each param.options as option}
@@ -999,30 +1045,42 @@
 
 <!-- 新建快捷指令模态框 -->
 {#if showNewModal}
-  <div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-    onclick={(e) => { if (e.target === e.currentTarget) showNewModal = false; }}
-  >
-    <div class="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl dark:bg-neutral-900">
-      <h2 class="mb-4 text-xl font-bold text-neutral-900 dark:text-neutral-100">{t("shortcuts.createNew")}</h2>
+  <!-- 遮罩 = 内容后面的一枚真按钮；Escape/焦点陷阱走 `attachFocusTrap`，
+       它同时把焦点交给第一个可聚焦元素 ⇒ 不再需要 `autofocus`（REQ-A386）。 -->
+  <div class="fixed inset-0 z-50 flex items-center justify-center">
+    <button
+      class="modal-backdrop"
+      aria-label={t("shortcuts.close")}
+      onclick={() => (showNewModal = false)}
+    ></button>
+    <div
+      class="relative w-full max-w-md rounded-2xl bg-white p-6 shadow-xl dark:bg-neutral-900"
+      bind:this={newModalEl}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="shortcut-new-title"
+      tabindex="-1"
+    >
+      <h2 id="shortcut-new-title" class="mb-4 text-xl font-bold text-neutral-900 dark:text-neutral-100">{t("shortcuts.createNew")}</h2>
       
       <div class="space-y-4">
         <div>
-          <label class="mb-1 block text-sm font-medium text-neutral-700 dark:text-neutral-300">{t("shortcuts.name")}</label>
+          <label for={newNameId} class="mb-1 block text-sm font-medium text-neutral-700 dark:text-neutral-300">{t("shortcuts.name")}</label>
           <input
+            id={newNameId}
             type="text"
             bind:value={newName}
             placeholder={t("shortcuts.createNamePlaceholder")}
             class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
             onkeydown={(e) => { if (e.key === "Enter") handleCreate(); }}
-            autofocus
           />
         </div>
         
         <div class="flex gap-3">
           <div class="flex-1">
-            <label class="mb-1 block text-sm font-medium text-neutral-700 dark:text-neutral-300">{t("shortcuts.icon")}</label>
+            <label for={newIconId} class="mb-1 block text-sm font-medium text-neutral-700 dark:text-neutral-300">{t("shortcuts.icon")}</label>
             <select
+              id={newIconId}
               bind:value={newIcon}
               class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
             >
@@ -1033,8 +1091,9 @@
           </div>
           
           <div class="flex-1">
-            <label class="mb-1 block text-sm font-medium text-neutral-700 dark:text-neutral-300">{t("shortcuts.color")}</label>
+            <label for={newColorId} class="mb-1 block text-sm font-medium text-neutral-700 dark:text-neutral-300">{t("shortcuts.color")}</label>
             <select
+              id={newColorId}
               bind:value={newColor}
               class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
             >
@@ -1066,15 +1125,24 @@
 
 <!-- 操作选择器模态框 -->
 {#if showActionPicker}
-  <div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-    onclick={(e) => { if (e.target === e.currentTarget) showActionPicker = false; }}
-  >
-    <div class="h-[80vh] w-full max-w-2xl rounded-2xl bg-white shadow-xl dark:bg-neutral-900">
+  <div class="fixed inset-0 z-50 flex items-center justify-center">
+    <button
+      class="modal-backdrop"
+      aria-label={t("shortcuts.close")}
+      onclick={() => (showActionPicker = false)}
+    ></button>
+    <div
+      class="relative h-[80vh] w-full max-w-2xl rounded-2xl bg-white shadow-xl dark:bg-neutral-900"
+      bind:this={pickerEl}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="shortcut-picker-title"
+      tabindex="-1"
+    >
       <div class="flex h-full flex-col">
         <!-- 标题 -->
         <div class="flex items-center justify-between border-b border-neutral-200 p-4 dark:border-neutral-800">
-          <h2 class="text-xl font-bold text-neutral-900 dark:text-neutral-100">{t("shortcuts.selectAction")}</h2>
+          <h2 id="shortcut-picker-title" class="text-xl font-bold text-neutral-900 dark:text-neutral-100">{t("shortcuts.selectAction")}</h2>
           <button
             onclick={() => { showActionPicker = false; }}
             class="rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
@@ -1121,9 +1189,59 @@
 
 <!-- 执行结果 Toast -->
 {#if executionResult}
-  <div class="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-[fadeIn_0.3s_ease-in-out]">
+  <!-- 运行结果是**用户按了按钮之后**才出现的，而焦点还在那个按钮上 ⇒ 必须是 live region
+       （`role="status"` = polite），否则屏幕阅读器用户不会知道跑完没有、成功了没有。 -->
+  <div
+    class="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-[fadeIn_0.3s_ease-in-out]"
+    role="status"
+  >
     <div class="rounded-full bg-neutral-800 px-6 py-3 text-sm text-white shadow-lg dark:bg-neutral-700">
       {executionResult}
     </div>
   </div>
 {/if}
+
+<style>
+  /* 模态遮罩：铺满的真按钮（背景在它身上，不在定位容器上）。点它 = 关闭；
+     它是 `<button>` ⇒ 键盘可达、有名字，不需要"带 click 的 div"（REQ-A386）。 */
+  .modal-backdrop {
+    position: absolute;
+    inset: 0;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    background: rgba(0, 0, 0, 0.5);
+  }
+
+  /* 指针契约（REQ-A385）：这两个操作行原来只在 hover 时出现（`opacity-0
+     group-hover:opacity-100`），而 opacity-0 **既不挡绘制也不挡命中** ⇒ 手机上
+     既看不见、又在原位置留着可点区域，而且触屏根本没有 hover 能把它唤出来。
+
+     现在的规则：指针设备上隐到 hover / 键盘聚焦才出现，且**隐藏时不可命中**
+     （`visibility: hidden` 会脱离命中测试，`opacity: 0` 不会）；触屏设备
+     （`(hover: hover)` 为假）则**一直显示可点** —— 它没有 hover 可用。 */
+  .row-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: 0.5rem;
+  }
+  .action-actions {
+    display: flex;
+    gap: 0.25rem;
+  }
+  @media (hover: hover) {
+    .row-actions,
+    .action-actions {
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 150ms ease, visibility 150ms ease;
+    }
+    .group:hover .row-actions,
+    .group:focus-within .row-actions,
+    .group:hover .action-actions,
+    .group:focus-within .action-actions {
+      opacity: 1;
+      visibility: visible;
+    }
+  }
+</style>

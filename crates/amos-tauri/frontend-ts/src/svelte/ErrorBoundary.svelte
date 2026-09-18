@@ -1,5 +1,7 @@
 <!-- ErrorBoundary.svelte — 错误边界组件 (航空航天级) -->
 <script lang="ts">
+  import { t } from './locale.svelte';
+
   interface Props extends Record<string, unknown> {
     children: import('svelte').Snippet;
   }
@@ -11,7 +13,7 @@
   
   function handleError(event: ErrorEvent) {
     error = event.error;
-    errorInfo = event.error?.stack || event.message || "未知错误";
+    errorInfo = event.error?.stack || event.message || t("webman.error.unknown");
     console.error('[WebMan ErrorBoundary]', event.error);
     
     // 阻止错误继续传播
@@ -19,8 +21,8 @@
   }
   
   function handleUnhandledRejection(event: PromiseRejectionEvent) {
-    error = new Error(event.reason?.message || "Promise 未处理的拒绝");
-    errorInfo = event.reason?.stack || String(event.reason) || "未知 Promise 错误";
+    error = new Error(event.reason?.message || t("webman.error.unhandledRejection"));
+    errorInfo = event.reason?.stack || String(event.reason) || t("webman.error.unknownPromise");
     console.error('[WebMan ErrorBoundary] Unhandled Rejection:', event.reason);
     
     event.preventDefault();
@@ -45,9 +47,14 @@
   }
   
   function copyError() {
-    const text = `WebMan 错误报告\n\n错误: ${error?.message}\n\n堆栈:\n${errorInfo}`;
+    // 报告正文走 t()：它是**用户可见的文案**（两个参数：错误信息与堆栈），
+    // 不是日志格式 —— 扫描器看不见它（`<script>` 里的模板串），用户看得见。
+    const text = t("webman.error.report", {
+      message: error?.message ?? "",
+      stack: errorInfo,
+    });
     navigator.clipboard.writeText(text).then(() => {
-      alert('错误信息已复制到剪贴板');
+      alert(t("webman.error.copied"));
     });
   }
 </script>
@@ -61,12 +68,12 @@
     
     <!-- 错误标题 -->
     <h1 class="mb-2 text-2xl font-bold text-neutral-900 dark:text-neutral-100">
-      浏览器遇到错误
+      {t("webman.error.title")}
     </h1>
     
     <!-- 错误描述 -->
     <p class="mb-6 max-w-md text-center text-sm text-neutral-600 dark:text-neutral-400">
-      WebMan 遇到了一个意外错误。您可以尝试重新加载，或者复制错误信息报告给开发者。
+      {t("webman.error.description")}
     </p>
     
     <!-- 错误消息 -->
@@ -86,7 +93,7 @@
         class="flex items-center gap-2 rounded-full bg-accent px-6 py-3 font-medium text-white transition-opacity hover:opacity-90"
       >
         <span>🔄</span>
-        <span>重新加载</span>
+        <span>{t("webman.error.reload")}</span>
       </button>
       
       {#if import.meta.env?.DEV}
@@ -95,14 +102,14 @@
           class="flex items-center gap-2 rounded-full border border-neutral-300 bg-white px-6 py-3 font-medium transition-colors hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-800 dark:hover:bg-neutral-700"
         >
           <span>📋</span>
-          <span>复制错误</span>
+          <span>{t("webman.error.copy")}</span>
         </button>
       {/if}
     </div>
     
     <!-- 技术信息 -->
     <div class="mt-8 text-xs text-neutral-500">
-      <p>如果问题持续存在，请尝试清除浏览器数据或联系支持</p>
+      <p>{t("webman.error.hint")}</p>
     </div>
   </div>
 {:else}

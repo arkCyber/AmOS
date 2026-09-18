@@ -107,11 +107,21 @@ describe("云同步系统 - 航空航天级审计", () => {
         "amos.alarms",
         "amos.calllog", // CALLLOG_KEY
         "amos.interp.log", // INTERP_LOG_KEY
+        // REQ-A384：这些是**用户自己创建的内容**，此前不在集合里（store-scan 逐条点名）
+        "amos.shortcuts", // SHORTCUTS_KEY
+        "amos.shortcuts.folders", // SHORTCUT_FOLDERS_KEY
+        "amos.webman.bookmarks", // BOOKMARKS_KEY
+        "amos.webman.downloads", // DOWNLOADS_KEY
+        "amos.shortcuts.enterprise.templates", // TEMPLATES_KEY
+        "amos.shortcuts.audit.logs", // AUDIT_LOGS_KEY
       ];
       for (const key of requiredStores) {
         expect(SYNC_STORES.some(s => s === key)).toBe(true);
       }
-      expect(SYNC_STORES.length).toBe(17);
+      // 判据是"**恰好**这一批"：用清单自己的长度而不是写死的数字 —— 少一个会
+      // 被上面的循环抓住，多一个（往备份里悄悄塞东西）会被这一行抓住，
+      // 而清单本身就是这次改动的说明书。
+      expect(SYNC_STORES.length as number).toBe(requiredStores.length);
     });
 
     test("空存储返回空 stores 对象但保留元数据", () => {

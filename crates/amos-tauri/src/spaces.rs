@@ -17,11 +17,11 @@
 //! Planned implementation: Q1 2027 → **Now in progress**
 //! See: docs/SPACES_IMPLEMENTATION_PLAN.md
 
-use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 
-use crate::store::SharedStore;
 use crate::error::{AmosError, AmosResult, ErrorCode};
+use crate::store::SharedStore;
 
 /// Storage key for Spaces configuration in SharedStore
 const SPACES_KEY: &str = "amos.desktop.spaces";
@@ -31,10 +31,10 @@ const SPACES_KEY: &str = "amos.desktop.spaces";
 pub struct Space {
     /// Unique identifier for this Space
     pub id: String,
-    
+
     /// User-visible name (editable)
     pub name: String,
-    
+
     /// Window labels belonging to this Space
     pub windows: Vec<String>,
 }
@@ -73,10 +73,10 @@ impl From<&Space> for SpaceInfo {
 pub struct SpaceManager {
     /// All Spaces, indexed by ID
     spaces: Vec<Space>,
-    
+
     /// Index of the currently active Space (0-based)
     active_index: usize,
-    
+
     /// Next auto-increment ID for new Spaces
     next_id: usize,
 }
@@ -85,14 +85,14 @@ impl SpaceManager {
     /// Create a new SpaceManager with a single default Space
     pub fn new() -> Self {
         let default_space = Space::new("space-0".to_string(), "桌面 1".to_string());
-        
+
         Self {
             spaces: vec![default_space],
             active_index: 0,
             next_id: 1,
         }
     }
-    
+
     /// Load SpaceManager from SharedStore, or create default if not found
     pub fn load(store: &SharedStore) -> Self {
         match store.get(SPACES_KEY) {
@@ -106,24 +106,28 @@ impl SpaceManager {
             None => Self::new(),
         }
     }
-    
-/// Save SpaceManager to SharedStore
+
+    /// Save SpaceManager to SharedStore
     pub fn save(&self, store: &SharedStore) -> AmosResult<()> {
         let json = serde_json::to_string(self).map_err(|e| {
-            AmosError::new(ErrorCode::SpacesSerializationFailed, format!("Spaces serialization failed: {}", e))
+            AmosError::new(
+                ErrorCode::SpacesSerializationFailed,
+                format!("Spaces serialization failed: {}", e),
+            )
         })?;
         store.insert(SPACES_KEY, json);
         Ok(())
-    }    /// Get all Spaces
+    }
+    /// Get all Spaces
     pub fn list_spaces(&self) -> Vec<SpaceInfo> {
         self.spaces.iter().map(SpaceInfo::from).collect()
     }
-    
+
     /// Get the currently active Space index
     pub fn active_space(&self) -> usize {
         self.active_index
     }
-    
+
     /// Switch to the Space at the given index
     ///
     /// Returns `Err` if the index is out of bounds
@@ -131,27 +135,31 @@ impl SpaceManager {
         if index >= self.spaces.len() {
             return Err(AmosError::new(
                 ErrorCode::SpacesIndexOutOfBounds,
-                format!("Space index {} out of bounds (have {} spaces)", index, self.spaces.len())
+                format!(
+                    "Space index {} out of bounds (have {} spaces)",
+                    index,
+                    self.spaces.len()
+                ),
             ));
         }
 
         self.active_index = index;
         Ok(())
     }
-    
+
     /// Create a new Space with the given name
     ///
     /// Returns the ID of the newly created Space
     pub fn create_space(&mut self, name: String) -> String {
         let id = format!("space-{}", self.next_id);
         self.next_id += 1;
-        
+
         let space = Space::new(id.clone(), name);
         self.spaces.push(space);
-        
+
         id
     }
-    
+
     /// Delete the Space with the given ID
     ///
     /// Returns `Err` if:
@@ -161,68 +169,83 @@ impl SpaceManager {
         if self.spaces.len() <= 1 {
             return Err(AmosError::new(
                 ErrorCode::SpacesDeleteLast,
-                "Cannot delete the last Space"
+                "Cannot delete the last Space",
             ));
         }
 
-        let index = self.spaces.iter().position(|s| s.id == id)
-            .ok_or_else(|| AmosError::new(ErrorCode::SpacesNotFound, format!("Space {} not found", id)))?;
-        
+        let index = self.spaces.iter().position(|s| s.id == id).ok_or_else(|| {
+            AmosError::new(ErrorCode::SpacesNotFound, format!("Space {} not found", id))
+        })?;
+
         // Remove the Space
         self.spaces.remove(index);
-        
+
         // Adjust active_index if necessary
         if self.active_index >= self.spaces.len() {
             self.active_index = self.spaces.len() - 1;
         } else if self.active_index > index {
             self.active_index -= 1;
         }
-        
+
         Ok(())
     }
-    
+
     /// Move a window to a different Space
     ///
     /// Removes the window from its current Space (if any) and adds it to the target Space
     pub fn move_window_to_space(&mut self, window_label: &str, space_id: &str) -> AmosResult<()> {
         // Find the target Space
-        let target_index = self.spaces.iter().position(|s| s.id == space_id)
-            .ok_or_else(|| AmosError::new(ErrorCode::SpacesNotFound, format!("Space {} not found", space_id)))?;
-        
+        let target_index = self
+            .spaces
+            .iter()
+            .position(|s| s.id == space_id)
+            .ok_or_else(|| {
+                AmosError::new(
+                    ErrorCode::SpacesNotFound,
+                    format!("Space {} not found", space_id),
+                )
+            })?;
+
         // Remove window from all Spaces
         for space in &mut self.spaces {
             space.windows.retain(|w| w != window_label);
         }
-        
+
         // Add to target Space
-        self.spaces[target_index].windows.push(window_label.to_string());
-        
+        self.spaces[target_index]
+            .windows
+            .push(window_label.to_string());
+
         Ok(())
     }
-    
+
     /// Rename a Space
     pub fn rename_space(&mut self, id: &str, name: String) -> AmosResult<()> {
-        let space = self.spaces.iter_mut()
-            .find(|s| s.id == id)
-            .ok_or_else(|| AmosError::new(ErrorCode::SpacesNotFound, format!("Space {} not found", id)))?;
-        
+        let space = self.spaces.iter_mut().find(|s| s.id == id).ok_or_else(|| {
+            AmosError::new(ErrorCode::SpacesNotFound, format!("Space {} not found", id))
+        })?;
+
         space.name = name;
         Ok(())
     }
-    
+
     /// Get the Space that contains the given window
     pub fn space_for_window(&self, window_label: &str) -> Option<&Space> {
-        self.spaces.iter().find(|s| s.windows.contains(&window_label.to_string()))
+        self.spaces
+            .iter()
+            .find(|s| s.windows.contains(&window_label.to_string()))
     }
-    
+
     /// Get windows in the currently active Space
     pub fn active_space_windows(&self) -> &[String] {
         &self.spaces[self.active_index].windows
     }
-    
+
     /// Check if a window belongs to the active Space
     pub fn is_window_in_active_space(&self, window_label: &str) -> bool {
-        self.spaces[self.active_index].windows.contains(&window_label.to_string())
+        self.spaces[self.active_index]
+            .windows
+            .contains(&window_label.to_string())
     }
 }
 
@@ -258,19 +281,21 @@ impl<'de> Deserialize<'de> for SpaceManager {
             active_index: usize,
             next_id: usize,
         }
-        
+
         let data = SpaceManagerData::deserialize(deserializer)?;
-        
+
         // Validate: must have at least one Space
         if data.spaces.is_empty() {
-            return Err(serde::de::Error::custom("SpaceManager must have at least one Space"));
+            return Err(serde::de::Error::custom(
+                "SpaceManager must have at least one Space",
+            ));
         }
-        
+
         // Validate: active_index must be valid
         if data.active_index >= data.spaces.len() {
             return Err(serde::de::Error::custom("Invalid active_index"));
         }
-        
+
         Ok(Self {
             spaces: data.spaces,
             active_index: data.active_index,
@@ -285,7 +310,7 @@ pub type SpaceManagerState = Mutex<SpaceManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn new_manager_has_default_space() {
         let mgr = SpaceManager::new();
@@ -294,72 +319,72 @@ mod tests {
         assert_eq!(mgr.spaces[0].name, "桌面 1");
         assert_eq!(mgr.active_index, 0);
     }
-    
+
     #[test]
     fn create_space_increments_id() {
         let mut mgr = SpaceManager::new();
         let id1 = mgr.create_space("工作".to_string());
         let id2 = mgr.create_space("个人".to_string());
-        
+
         assert_eq!(id1, "space-1");
         assert_eq!(id2, "space-2");
         assert_eq!(mgr.spaces.len(), 3);
     }
-    
+
     #[test]
     fn switch_space_changes_active() {
         let mut mgr = SpaceManager::new();
         mgr.create_space("Space 2".to_string());
-        
+
         assert_eq!(mgr.active_space(), 0);
         mgr.switch_space(1).unwrap();
         assert_eq!(mgr.active_space(), 1);
     }
-    
+
     #[test]
     fn switch_space_out_of_bounds_fails() {
         let mut mgr = SpaceManager::new();
         let result = mgr.switch_space(5);
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn cannot_delete_last_space() {
         let mut mgr = SpaceManager::new();
         let result = mgr.delete_space("space-0");
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn delete_space_adjusts_active_index() {
         let mut mgr = SpaceManager::new();
         mgr.create_space("Space 2".to_string());
         mgr.create_space("Space 3".to_string());
         mgr.switch_space(2).unwrap();
-        
+
         // Delete the middle Space
         mgr.delete_space("space-1").unwrap();
-        
+
         // Active index should be adjusted
         assert_eq!(mgr.spaces.len(), 2);
         assert_eq!(mgr.active_index, 1);
     }
-    
+
     #[test]
     fn move_window_removes_from_old_space() {
         let mut mgr = SpaceManager::new();
         mgr.create_space("Space 2".to_string());
-        
+
         // Add window to first Space
         mgr.spaces[0].windows.push("settings".to_string());
-        
+
         // Move to second Space
         mgr.move_window_to_space("settings", "space-1").unwrap();
-        
+
         assert!(!mgr.spaces[0].windows.contains(&"settings".to_string()));
         assert!(mgr.spaces[1].windows.contains(&"settings".to_string()));
     }
-    
+
     #[test]
     fn serialize_deserialize_roundtrip() {
         let mut mgr = SpaceManager::new();
@@ -387,21 +412,23 @@ mod tests {
         assert_eq!(e.code(), "amos.spaces.index_out_of_bounds", "switch OOB");
 
         // Delete-last refusal (current manager has 1 space, so any delete → refuse)
-    let e = mgr.delete_space("space-0").unwrap_err();
-    assert_eq!(e.code(), "amos.spaces.delete_last");
+        let e = mgr.delete_space("space-0").unwrap_err();
+        assert_eq!(e.code(), "amos.spaces.delete_last");
 
-    // Unknown id on delete / move_window / rename needs a populated manager
-    // (so the delete-last guard doesn't shadow the not-found path).
-    mgr.create_space("工作".into());
+        // Unknown id on delete / move_window / rename needs a populated manager
+        // (so the delete-last guard doesn't shadow the not-found path).
+        mgr.create_space("工作".into());
 
-    let e = mgr.delete_space("space-bogus").unwrap_err();
-    assert_eq!(e.code(), "amos.spaces.not_found");
+        let e = mgr.delete_space("space-bogus").unwrap_err();
+        assert_eq!(e.code(), "amos.spaces.not_found");
 
-    let e = mgr.move_window_to_space("settings", "space-bogus").unwrap_err();
-    assert_eq!(e.code(), "amos.spaces.not_found");
+        let e = mgr
+            .move_window_to_space("settings", "space-bogus")
+            .unwrap_err();
+        assert_eq!(e.code(), "amos.spaces.not_found");
 
-    let e = mgr.rename_space("space-bogus", "x".into()).unwrap_err();
-    assert_eq!(e.code(), "amos.spaces.not_found");
+        let e = mgr.rename_space("space-bogus", "x".into()).unwrap_err();
+        assert_eq!(e.code(), "amos.spaces.not_found");
 
         // Group collapses — every Spaces variant must map to "spaces" so a single
         // tracing filter scopes the entire surface.

@@ -25,6 +25,12 @@ export interface FlashlightStore {
  * pathologically large/bogus store being rendered in full on every open. */
 export const NOTIF_CAP = 100;
 
+/** Where a notification came from. The shell's own producers (alarm / timer /
+ * reminder / telemetry-spy …) are `"system"`; a remote push delivery is `"push"`.
+ * Absent means `"system"`, so every value written before this field existed keeps
+ * its old meaning. */
+export type NotifSource = "system" | "push";
+
 export interface Notif {
   id: string;
   app?: string;
@@ -32,6 +38,14 @@ export interface Notif {
   body?: string;
   icon?: string;
   time: number;
+  /** Producer. Omitted = the shell made it (`"system"`). */
+  source?: NotifSource;
+  /** Read state. Only a **push** record carries the device's own flag; shell-made
+   * notifications have none (they are *removed* when opened — see
+   * `removeAppNotifs`), so "no flag" is not the same as "unread". */
+  read?: boolean;
+  /** App-icon badge count carried by a push payload (absolute value). */
+  badge?: number;
 }
 
 /** Pure: flip one quick-toggle boolean (immutable). */
@@ -159,7 +173,8 @@ export function normalizeQuick(v: unknown): QuickSettings {
 }
 
 /** Corruption guard for the notifications store: keeps entries with a usable id +
- * numeric time, preserves valid optional string fields, and de-duplicates ids. */
+ * numeric time, preserves valid optional fields (including the push-only
+ * `source`/`read`/`badge`), and de-duplicates ids. */
 export function normalizeNotifs(v: unknown): Notif[] {
   if (!Array.isArray(v)) return [];
   const out: Notif[] = [];
@@ -175,7 +190,28 @@ export function normalizeNotifs(v: unknown): Notif[] {
     for (const f of ["app", "title", "body", "icon"] as const) {
       if (typeof o[f] === "string") n[f] = o[f] as string;
     }
+    // Push-only fields. Each is validated on its own so a bogus one cannot take
+    // the rest of a legitimate notification down with it.
+    if (o.source === "push" || o.source === "system") n.source = o.source;
+    if (typeof o.read === "boolean") n.read = o.read;
+    if (typeof o.badge === "number" && Number.isFinite(o.badge)) n.badge = o.badge;
     out.push(n);
   }
   return out.length > NOTIF_CAP ? out.slice(out.length - NOTIF_CAP) : out;
 }
+
+/** Pure: mark one notification read (immutable). Absent id / already-read is a
+ * no-op returning a **new** array, so callers can always treat it as a value. */
+export function markNotifRead(list: Notif[], id: string): Notif[] {
+  return list.map((n) => (n.id === id && n.read !== true ? { ...n, read: true } : n));
+}
+
+/** Pure: how many notifications carry an explicit **unread** push flag. Shell-made
+ * notifications have no flag and are *not* counted (they are removed when opened,
+ * so counting them would show a badge that never clears). */
+export function unreadCount(list: Notif[]): number {
+  let n = 0;
+  for (const item of list) if (item.read === false) n++;
+  return n;
+}
+

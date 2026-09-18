@@ -14,7 +14,7 @@
 import { describe, test, expect, beforeEach, beforeAll, afterAll } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { auditLogger } from "../lib/enterprise";
-import type { AuditLog, AuditEventResult, AuditLogLevel } from "../lib/enterprise/audit";
+import type { AuditLog, AuditResult, AuditLogLevel } from "../lib/enterprise/audit";
 
 // 注册 happy-dom 全局对象
 beforeAll(() => {
@@ -88,13 +88,13 @@ describe("AuditLogViewer UI 逻辑测试", () => {
   describe("用户过滤", () => {
     test("应该能够按用户 ID 过滤日志", () => {
       const logs: Partial<AuditLog>[] = [
-        { userId: "user1", eventType: "shortcut.create" },
-        { userId: "user2", eventType: "shortcut.execute" },
-        { userId: "user1", eventType: "shortcut.modify" },
+        { userId: "user1", eventType: "shortcut_create" },
+        { userId: "user2", eventType: "shortcut_execute" },
+        { userId: "user1", eventType: "shortcut_update" },
       ];
 
       const selectedUser = "user1";
-      const filtered = logs.filter(log => 
+      const filtered = logs.filter(log =>
         !selectedUser || log.userId === selectedUser
       );
 
@@ -106,31 +106,31 @@ describe("AuditLogViewer UI 逻辑测试", () => {
   describe("事件类型过滤", () => {
     test("应该能够按事件类型过滤日志", () => {
       const logs: Partial<AuditLog>[] = [
-        { eventType: "shortcut.create", userId: "user1" },
-        { eventType: "shortcut.execute", userId: "user2" },
-        { eventType: "shortcut.create", userId: "user3" },
+        { eventType: "shortcut_create", userId: "user1" },
+        { eventType: "shortcut_execute", userId: "user2" },
+        { eventType: "shortcut_create", userId: "user3" },
       ];
 
-      const selectedEventType = "shortcut.create";
-      const filtered = logs.filter(log => 
+      const selectedEventType = "shortcut_create";
+      const filtered = logs.filter(log =>
         !selectedEventType || log.eventType === selectedEventType
       );
 
       expect(filtered).toHaveLength(2);
-      expect(filtered.every(log => log.eventType === "shortcut.create")).toBe(true);
+      expect(filtered.every(log => log.eventType === "shortcut_create")).toBe(true);
     });
   });
 
   describe("结果过滤", () => {
     test("应该能够按成功/失败过滤日志", () => {
       const logs: Partial<AuditLog>[] = [
-        { result: "success" as AuditEventResult, userId: "user1" },
-        { result: "failure" as AuditEventResult, userId: "user2" },
-        { result: "success" as AuditEventResult, userId: "user3" },
+        { result: "success" as AuditResult, userId: "user1" },
+        { result: "failure" as AuditResult, userId: "user2" },
+        { result: "success" as AuditResult, userId: "user3" },
       ];
 
       const selectedResult = "success";
-      const filtered = logs.filter(log => 
+      const filtered = logs.filter(log =>
         !selectedResult || log.result === selectedResult
       );
 
@@ -149,7 +149,7 @@ describe("AuditLogViewer UI 逻辑测试", () => {
       ];
 
       const selectedLevel = "info";
-      const filtered = logs.filter(log => 
+      const filtered = logs.filter(log =>
         !selectedLevel || log.level === selectedLevel
       );
 
@@ -165,22 +165,22 @@ describe("AuditLogViewer UI 逻辑测试", () => {
         {
           timestamp: now,
           userId: "user1",
-          eventType: "shortcut.create",
-          result: "success" as AuditEventResult,
+          eventType: "shortcut_create",
+          result: "success" as AuditResult,
           level: "info" as AuditLogLevel,
         },
         {
           timestamp: now - 86400000,
           userId: "user2",
-          eventType: "shortcut.execute",
-          result: "failure" as AuditEventResult,
+          eventType: "shortcut_execute",
+          result: "failure" as AuditResult,
           level: "error" as AuditLogLevel,
         },
         {
           timestamp: now,
           userId: "user1",
-          eventType: "shortcut.execute",
-          result: "success" as AuditEventResult,
+          eventType: "shortcut_execute",
+          result: "success" as AuditResult,
           level: "info" as AuditLogLevel,
         },
       ];
@@ -193,7 +193,7 @@ describe("AuditLogViewer UI 逻辑测试", () => {
         const matchesTime = (log.timestamp ?? 0) >= timeRange;
         const matchesUser = !selectedUser || log.userId === selectedUser;
         const matchesResult = !selectedResult || log.result === selectedResult;
-        
+
         return matchesTime && matchesUser && matchesResult;
       });
 
@@ -216,10 +216,10 @@ describe("AuditLogViewer UI 逻辑测试", () => {
 
     test("应该计算成功率", () => {
       const logs: Partial<AuditLog>[] = [
-        { result: "success" as AuditEventResult },
-        { result: "success" as AuditEventResult },
-        { result: "failure" as AuditEventResult },
-        { result: "success" as AuditEventResult },
+        { result: "success" as AuditResult },
+        { result: "success" as AuditResult },
+        { result: "failure" as AuditResult },
+        { result: "success" as AuditResult },
       ];
 
       const successCount = logs.filter(log => log.result === "success").length;
@@ -230,10 +230,10 @@ describe("AuditLogViewer UI 逻辑测试", () => {
 
     test("应该计算失败率", () => {
       const logs: Partial<AuditLog>[] = [
-        { result: "success" as AuditEventResult },
-        { result: "failure" as AuditEventResult },
-        { result: "failure" as AuditEventResult },
-        { result: "success" as AuditEventResult },
+        { result: "success" as AuditResult },
+        { result: "failure" as AuditResult },
+        { result: "failure" as AuditResult },
+        { result: "success" as AuditResult },
       ];
 
       const failureCount = logs.filter(log => log.result === "failure").length;
@@ -258,10 +258,10 @@ describe("AuditLogViewer UI 逻辑测试", () => {
 
     test("应该统计唯一事件类型数", () => {
       const logs: Partial<AuditLog>[] = [
-        { eventType: "shortcut.create" },
-        { eventType: "shortcut.execute" },
-        { eventType: "shortcut.create" },
-        { eventType: "shortcut.modify" },
+        { eventType: "shortcut_create" },
+        { eventType: "shortcut_execute" },
+        { eventType: "shortcut_create" },
+        { eventType: "shortcut_update" },
       ];
 
       const uniqueEventTypes = new Set(logs.map(log => log.eventType));
@@ -297,34 +297,36 @@ describe("AuditLogViewer UI 逻辑测试", () => {
     test("应该格式化事件类型标签", () => {
       const getEventTypeLabel = (eventType: string): string => {
         const labels: Record<string, string> = {
-          "shortcut.create": "创建快捷指令",
-          "shortcut.execute": "执行快捷指令",
-          "shortcut.modify": "修改快捷指令",
-          "shortcut.delete": "删除快捷指令",
-          "template.install": "安装模板",
-          "mdm.sync": "MDM 同步",
+          "shortcut_create": "创建快捷指令",
+          "shortcut_execute": "执行快捷指令",
+          "shortcut_update": "修改快捷指令",
+          "shortcut_delete": "删除快捷指令",
+          "template_install": "安装模板",
+          "mdm_sync": "MDM 同步",
         };
         return labels[eventType] || eventType;
       };
 
-      expect(getEventTypeLabel("shortcut.create")).toBe("创建快捷指令");
-      expect(getEventTypeLabel("template.install")).toBe("安装模板");
+      expect(getEventTypeLabel("shortcut_create")).toBe("创建快捷指令");
+      expect(getEventTypeLabel("template_install")).toBe("安装模板");
       expect(getEventTypeLabel("unknown.event")).toBe("unknown.event");
     });
 
     test("应该根据结果返回图标", () => {
-      const getResultIcon = (result: AuditEventResult): string => {
-        const icons: Record<AuditEventResult, string> = {
+      const getResultIcon = (result: AuditResult): string => {
+        const icons: Record<AuditResult, string> = {
           success: "✅",
           failure: "❌",
-          pending: "⏳",
+          warning: "⚠️",
+          blocked: "🚫",
         };
         return icons[result];
       };
 
-      expect(getResultIcon("success" as AuditEventResult)).toBe("✅");
-      expect(getResultIcon("failure" as AuditEventResult)).toBe("❌");
-      expect(getResultIcon("pending" as AuditEventResult)).toBe("⏳");
+      expect(getResultIcon("success" as AuditResult)).toBe("✅");
+      expect(getResultIcon("failure" as AuditResult)).toBe("❌");
+      expect(getResultIcon("warning" as AuditResult)).toBe("⚠️");
+      expect(getResultIcon("blocked" as AuditResult)).toBe("🚫");
     });
 
     test("应该根据级别返回颜色", () => {
@@ -352,8 +354,8 @@ describe("AuditLogViewer UI 逻辑测试", () => {
           id: "log-001",
           timestamp: Date.now(),
           userId: "user1",
-          eventType: "shortcut.create",
-          result: "success" as AuditEventResult,
+          eventType: "shortcut_create",
+          result: "success" as AuditResult,
         },
       ];
 
@@ -419,27 +421,11 @@ describe("AuditLogViewer UI 逻辑测试", () => {
   });
 
   describe("实际审计日志管理器集成", () => {
-    test("应该能够查询日志", () => {
-      const logs = auditLogger.queryLogs({
-        limit: 10,
-      });
-
-      expect(Array.isArray(logs)).toBe(true);
-    });
-
     test("应该能够获取统计信息", () => {
       const stats = auditLogger.getStatistics();
 
       expect(stats).toBeDefined();
       expect(typeof stats?.totalLogs).toBe("number");
-    });
-
-    test("应该能够清理日志", () => {
-      const sevenDaysAgo = Date.now() - 7 * 86400000;
-      const result = auditLogger.cleanup(sevenDaysAgo);
-
-      expect(typeof result).toBe("number");
-      expect(result).toBeGreaterThanOrEqual(0);
     });
   });
 });

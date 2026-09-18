@@ -6,9 +6,9 @@
 
 use tauri::State;
 
+use crate::error::{AmosError, AmosResult, ErrorCode};
 use crate::spaces::{SpaceInfo, SpaceManagerState};
 use crate::store::SharedStore;
-use crate::error::{AmosError, AmosResult, ErrorCode};
 
 // One shape used at every Mutex::lock() site — keeps the `code` consistent
 // across all 7 commands and lets a future `clippy::else_if_without_else` rule
@@ -28,17 +28,13 @@ fn lock_manager<'a>(
 
 /// List all Spaces
 #[tauri::command]
-pub fn spaces_list(
-    spaces: State<SpaceManagerState>,
-) -> AmosResult<Vec<SpaceInfo>> {
+pub fn spaces_list(spaces: State<SpaceManagerState>) -> AmosResult<Vec<SpaceInfo>> {
     Ok(lock_manager(&spaces)?.list_spaces())
 }
 
 /// Get the index of the currently active Space
 #[tauri::command]
-pub fn spaces_active(
-    spaces: State<SpaceManagerState>,
-) -> AmosResult<usize> {
+pub fn spaces_active(spaces: State<SpaceManagerState>) -> AmosResult<usize> {
     Ok(lock_manager(&spaces)?.active_space())
 }
 

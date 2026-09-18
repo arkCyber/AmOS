@@ -66,7 +66,7 @@
     <button
       aria-label={t("clipboard.announceDismiss")}
       onclick={dismiss}
-      class="grid h-8 w-8 shrink-0 place-items-center rounded-full text-neutral-500 transition active:bg-black/5 dark:text-neutral-400 dark:active:bg-white/10"
+      class="grid h-11 w-11 -my-2 shrink-0 place-items-center rounded-full text-neutral-500 transition active:bg-black/5 dark:text-neutral-400 dark:active:bg-white/10"
     >
       <span aria-hidden="true">✕</span>
     </button>

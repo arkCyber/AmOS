@@ -3,7 +3,9 @@
     "configuration": "User-set preferences and UI state: toggles, home layout, theme/locale, per-app settings, the permission ledger, chosen cities/clock. Losing them costs a re-setup, not content — and they are device-local by design (a restored backup must not silently re-grant capabilities or move the user's theme across devices).",
     "derived": "State the app recomputes, or that is only meaningful for the current run: fired-notification flags, the RAG index id list, recent/recently-used lists, in-app history caches, the AI session pointer, a running countdown, the notification-centre history, debug counters.",
     "device-state": "Mirrors of OS/device state (wifi, bluetooth, cellular, flashlight, the personal hotspot's AP configuration). The device itself is the source of truth and re-reports on the next boot; restoring a stale copy could contradict the hardware.",
-    "meta": "The backup blob itself — snapshotting a backup would copy it into itself."
+    "meta": "The backup blob itself — snapshotting a backup would copy it into itself.",
+    "enterprise-admin": "Enterprise/MDM state an administrator configured (API + webhook config, the audit trail's own config and sync queue, MDM policy config and the daily execution counters, the enterprise template catalogue and its installation bookkeeping, the shortcuts webhook list). It is device-local **administrative** state, not user content: restoring it from an end user's backup could silently re-apply a policy the admin has since changed or revoked, so losing it costs the admin a re-sync with the MDM server — which is the authoritative side anyway.",
+    "device-expectation": "Keys the app **reads but nothing in this build writes** (`amos.app.version`, `amos.user.id/name/email` — read by the enterprise audit trail to stamp each entry, written by no component). Losing them costs nothing today because they are always empty; they are listed so the gap is documented (the audit entries carry empty identity/version) instead of looking like a configured value that quietly failed to load."
   },
   "keys": [
     { "key": "amos-ui.locale", "kind": "configuration" },
@@ -58,6 +60,29 @@
     { "key": "amos.cellular", "kind": "device-state" },
     { "key": "amos.hotspot", "kind": "device-state" },
     { "key": "amos.flashlight", "kind": "device-state" },
-    { "key": "amos.cloud.backup", "kind": "meta" }
+    { "key": "amos.cloud.backup", "kind": "meta" },
+    { "key": "amos.compass.settings", "kind": "configuration" },
+    { "key": "amos.measure.settings", "kind": "configuration" },
+    { "key": "amos.hotcorners", "kind": "configuration" },
+    { "key": "amos.cloud.sync.config", "kind": "configuration" },
+    { "key": "amos.webman.settings", "kind": "configuration" },
+    { "key": "amos.measure.history", "kind": "derived" },
+    { "key": "amos.cloud.sync.metrics", "kind": "derived" },
+    { "key": "amos.webman.history", "kind": "derived" },
+    { "key": "amos.webman.tabs", "kind": "derived" },
+    { "key": "amos.shortcuts.execLog", "kind": "derived" },
+    { "key": "amos.shortcuts.api.config", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.api.rate_limits", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.audit.config", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.audit.sync_queue", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.mdm.config", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.mdm.execution_count", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.enterprise.categories", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.enterprise.installations", "kind": "enterprise-admin" },
+    { "key": "amos.shortcuts.webhooks", "kind": "enterprise-admin" },
+    { "key": "amos.app.version", "kind": "device-expectation" },
+    { "key": "amos.user.id", "kind": "device-expectation" },
+    { "key": "amos.user.name", "kind": "device-expectation" },
+    { "key": "amos.user.email", "kind": "device-expectation" }
   ]
 }

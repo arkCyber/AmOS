@@ -44,6 +44,8 @@ members = [
     "crates/amos-ime",
     "crates/amos-link",
     "crates/amos-link-cli",
+    "crates/amos-link-cc",
+    # "crates/amos-link-py",  # PyO3 extension - build with maturin, not cargo
 ]
 
 [workspace.package]
@@ -96,6 +98,8 @@ amos-identity = { path = "crates/amos-identity" }
 amos-ime = { path = "crates/amos-ime" }
 # AmOS-Link: the robot middleware (pub/sub + framing + LAN discovery + robot HAL).
 amos-link = { path = "crates/amos-link" }
+# C ABI for amos-link (loadable from C, C++, or any POSIX toolchain).
+amos-link-cc = { path = "crates/amos-link-cc" }
 # Wire codecs shared by the link layer (see crates/amos-link/src/codec.rs).
 bincode = "1.3"
 crc32fast = "1"

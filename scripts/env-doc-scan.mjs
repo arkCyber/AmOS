@@ -35,6 +35,16 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SKIP = new Set(["node_modules", "target", ".git", "dist"]);
 
+/** Frozen snapshots are out of scope — same rule (and same reason) as `docs-link-scan.mjs`
+ *  and `make-target-doc-scan.mjs`: an archived document describes the tree **as it was when
+ *  it was written**, so the knobs it names are history, not the promised interface today.
+ *  Measured 2026-09-17: `docs/archive/2026-09/zh/CHANGELOG.md` still names `AMOS_ENERGY_`
+ *  and `AMOS_OS_NAME`, which were removed from the code long ago and are never coming back —
+ *  nothing to wire, and allow-listing them would turn history into a permanent exemption.
+ *  The root `CHANGELOG.md` is already excluded for the same reason; this closes the gap for
+ *  its archived copies. */
+const SKIP_PATHS = ["docs/archive/"];
+
 export const ENV_RE = /\bAMOS_[A-Z0-9_]+\b/g;
 
 export function envNames(text) {
@@ -63,6 +73,9 @@ export function isHonored(name, codeText) {
 // --- corpora ----------------------------------------------------------------
 function walk(dir, filter, acc = []) {
   if (!existsSync(dir)) return acc;
+  // `docs/archive` and everything under it — see the note above SKIP_PATHS.
+  const rel = relative(root, dir).split("\\").join("/") + "/";
+  if (SKIP_PATHS.some((p) => rel.startsWith(p))) return acc;
   for (const ent of readdirSync(dir, { withFileTypes: true })) {
     if (SKIP.has(ent.name)) continue;
     const p = join(dir, ent.name);
@@ -102,7 +115,6 @@ const codeFiles = [
   .filter((f) => f !== fileURLToPath(import.meta.url));
 
 const codeText = codeFiles.map((f) => readFileSync(f, "utf8")).join("\n");
-
 // --- selftest ---------------------------------------------------------------
 export function runSelftest() {
   const checks = [];

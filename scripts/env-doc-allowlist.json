@@ -18,5 +18,9 @@
   {
     "name": "AMOS_ACCELERATION",
     "reason": "Legacy boolean on the removed dead `Config` struct (CLAIMS table in CODE_COMPLETION_SUMMARY.md). The accelerator strategy is configured by `AMOS_ACCEL` (accel.rs) and reported via `AccelProfile::from_env`; `AMOS_ACCELERATION` is honoured nowhere."
+  },
+  {
+    "name": "AMOS_THEME_CHANGED_EVENT",
+    "reason": "Not a knob at all: it is the TypeScript event-name constant quoted out of source in docs/FINAL_CODE_AUDIT_2026_SEP17.md (a code block showing `new CustomEvent(AMOS_THEME_CHANGED_EVENT, …)`). The constant lives in crates/amos-tauri/frontend-ts/src/svelte/ui-events.ts and is imported by theme.svelte.ts; the scanner is right that it is never read as configuration (a bare identifier, not a quoted env lookup), so the doc's quote is the only reason it looks like one."
   }
 ]

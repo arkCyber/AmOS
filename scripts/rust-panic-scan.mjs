@@ -47,11 +47,19 @@ export function workspaceMembers(manifest) {
   const open = manifest.indexOf("[", start);
   const close = manifest.indexOf("]", open);
   if (start < 0 || open < 0 || close < 0) return [];
-  return manifest
+  // A commented-out member is **not** a member: strip `#`-comments before splitting, or
+  // `# "crates/amos-link-py",  # PyO3 extension - build with maturin, not cargo` turns into
+  // three phantom crate names and the README gate asks for READMEs that cannot exist
+  // (REQ-A388).
+  const body = manifest
     .slice(open + 1, close)
+    .split("\n")
+    .map((line) => line.replace(/#.*$/, ""))
+    .join("\n");
+  return body
     .split(",")
     .map((m) => m.trim().replace(/^"|"$/g, ""))
-    .filter((m) => m !== "" && m !== "#");
+    .filter((m) => m !== "");
 }
 
 /** True when `src` carries the whole P0-1 gate (all three lints, not just one). */
@@ -155,6 +163,16 @@ export function runSelftest() {
   ok("reads the workspace member list", members.length === 2 && members[0] === "crates/a");
   ok("stops at the closing bracket", !members.includes("workspace.package"));
   ok("a missing members list yields none", workspaceMembers("[package]\nname = 'x'\n").length === 0);
+  // REQ-A388: a commented-out member is not a member. Splitting the raw text used to turn
+  // `# "crates/pyo3",  # build with maturin, not cargo` into three phantom crate names (the
+  // same fix, and the same parse, as crate-readme-scan).
+  const commented = workspaceMembers(
+    '[workspace]\nmembers = [\n  "crates/a",\n  # "crates/pyo3",  # build with maturin, not cargo\n  "crates/b",\n]\n',
+  );
+  ok(
+    "commented-out members are skipped",
+    commented.length === 2 && commented.join(",") === "crates/a,crates/b",
+  );
 
   ok(
     "the full gate is recognised",

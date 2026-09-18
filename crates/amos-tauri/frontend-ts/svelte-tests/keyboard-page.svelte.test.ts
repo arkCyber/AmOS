@@ -14,9 +14,28 @@ import { describe, expect, test } from "vitest";
 import { render } from "@testing-library/svelte";
 import KeyboardPage from "../src/svelte/settings/KeyboardPage.svelte";
 import { SHELL_MODULES } from "../src/svelte/shellModules";
-import { modulesFor } from "../src/lib/shellModule";
+import { formatShortcut, modulesFor } from "../src/lib/shellModule";
+import {
+  SYSTEM_DEFAULTS,
+  SPACES_DEFAULTS,
+  TOUCH_DEFAULTS,
+} from "../src/lib/keyboardConfigHook.svelte";
 
 describe("KeyboardPage", () => {
+  test("shows the engine's defaults — one source, not a second copy", () => {
+    // 这个页面曾经把三张默认表逐字再抄一遍（同一个键、同一个修饰符，只是包成数组）。
+    // 现在它读 `keyboardConfigHook` 导出的那一份；这条断言把"显示的就是引擎的默认值"
+    // 钉住 —— 一旦有人再抄一份，改引擎默认值就不会反映到这里，测试会红。
+    const { container } = render(KeyboardPage);
+    const text = container.textContent || "";
+
+    for (const table of [SYSTEM_DEFAULTS, SPACES_DEFAULTS, TOUCH_DEFAULTS]) {
+      for (const shortcut of Object.values(table)) {
+        expect(text).toContain(formatShortcut(shortcut));
+      }
+    }
+  });
+
   test("renders all shortcut sections", () => {
     const { container } = render(KeyboardPage);
     

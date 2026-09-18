@@ -51,6 +51,13 @@ const ASSIGN: Record<string, CategoryId> = {
   pwa: "system",
   nativeapps: "system",
   terminal: "utilities",
+  // 后加的内置应用也必须在这里归类，否则它们会悄悄落进 "other" —— App Library
+  // 会因此多出一个"其他"文件夹（app-groups 测试的 5 个文件夹断言就是这么红的）。
+  // 归类依据与上面的邻居一致：浏览器/指南针/测距仪/终端是工具，快捷指令是生产力。
+  webman: "utilities",
+  compass: "utilities",
+  measure: "utilities",
+  shortcuts: "productivity",
 };
 
 export function categoryOf(id: string): CategoryId {

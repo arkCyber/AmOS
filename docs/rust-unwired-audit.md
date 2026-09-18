@@ -40,7 +40,8 @@ One **real defect**, now fixed: `SessionManager::get_or_create` is wired into
 conversation now share one session whose token total accumulates, instead of three
 throwaway sessions for three turns (the negative control).
 
-The remaining **19** entries are baselined as **library API surface**, by kind —
+The remaining **25** entries are baselined, by kind — 19 as **library API surface** and 6 as
+**planned-feature surface** —
 they are decisions, not unknowns (Round 43 wired `tauri::media::android_backend` and
 dropped `ai::config::log_summary`, whose `config.rs` was deleted — see that round
 below):
@@ -56,6 +57,23 @@ in-workspace callers build the struct directly (or via `Default`), so these are
 unused **today**; deleting them would shrink the public API for no defect fixed.
 `life_guard::with_path` is additionally a documented **injection point** ("tests
 inject a tempdir").
+
+### Spaces: the window half of the feature (REQ-A389)
+
+`tauri::spaces::active_space_windows`, `tauri::spaces::is_window_in_active_space`,
+`tauri::spaces::space_for_window`.
+
+The Spaces ledger is **wired** now (REQ-A389): `mod spaces;` / `mod spaces_commands;` are
+declared, `Mutex<SpaceManager>` is managed (loaded from the shared store, so a restart
+restores the spaces), the eight `spaces_*` commands are registered, and the shell's
+`SpacesPanel` — which was already mounted and calling them — works. The three helpers above
+are the part that is **not** wired: they answer "which windows belong to the active space",
+and nothing calls them, because switching a space moves the *ledger*, not the windows. That
+is the gap `docs/SPACES_IMPLEMENTATION_PLAN.md` still owes (its §一 promises "each desktop
+has its own window set"); it is baselined here so the gap stays visible instead of reading as
+"done". Wiring it means the shell hiding/showing windows on switch — device-visible behaviour
+that needs a real run, not a test.
+
 
 ### Inspection / maintenance API on public services
 

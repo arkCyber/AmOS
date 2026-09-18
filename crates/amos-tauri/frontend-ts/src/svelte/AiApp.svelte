@@ -406,7 +406,7 @@
               onclick={() => void delSess(s.session_id)}
               title={t("ai.removeSession")}
               data-icon="x"
-              class="grid h-7 w-7 place-items-center rounded-full bg-danger/15 text-danger dark:bg-danger/25"
+              class="grid h-7 w-7 place-items-center rounded-full bg-danger/8 text-danger dark:bg-danger/20"
             >{@html iconSvg("x", "h-3 w-3")}</button>
           </div>
         {/each}

@@ -65,17 +65,18 @@ async function getDeviceFingerprint(): Promise<string> {
     platform: typeof navigator !== "undefined" ? navigator.platform : "test-platform",
   };
 
-  // 尝试获取 Tauri 设备 ID（如果可用）
-  try {
-    // @ts-ignore - Tauri 特有 API
-    if (typeof window !== "undefined" && window.__TAURI__) {
-      const { invoke } = await import("@tauri-apps/api/tauri");
-      components.deviceId = await invoke<string>("get_device_id").catch(() => "unknown");
-    }
-  } catch {
-    // Web 环境或 Tauri API 不可用
-    components.deviceId = "web-fallback";
-  }
+  // 设备标识：这里**曾经**想调 Tauri 的 `get_device_id`，但
+  // `crates/amos-tauri` 里**没有这个命令**（全仓 grep 为零）⇒ 每次都落进
+  // catch，指纹里永远是 "web-fallback"：一个不会生效的调用披着"设备绑定"的外衣。
+  // 现在把这条边界写出来，而不是继续假装：
+  //   * 本指纹是**尽力而为的环境指纹**（userAgent / 语言 / 屏幕 / 时区 / 平台），
+  //     **不是**硬件身份；
+  //   * 它绑定的是"这台设备的这套环境"，同一套环境的另一台设备会得到同一个
+  //     指纹（PBKDF2 的盐也是源码里的固定值），所以它能挡的是"随手拷走配置
+  //     到另一台不同环境的设备"，挡不住"伪造同样环境"。
+  //   * 要做到真正的硬件绑定，需要先在 Rust 侧提供一个**真实存在**的设备标识
+  //     命令，再由这里调用（届时记得同步改这条注释）。
+  components.deviceId = "environment-only";
 
   // 序列化并哈希
   const raw = JSON.stringify(components);
@@ -229,13 +230,19 @@ export async function decryptMDMData(encrypted: string): Promise<string> {
 }
 
 /**
- * ArrayBuffer 转 Base64
+ * 字节视图转 Base64。
+ *
+ * 入参收 `ArrayBuffer | Uint8Array`：调用方手里常常是 `crypto.getRandomValues`
+ * 的 `Uint8Array` 视图，而 `arrayBufferToBase64(iv)` 原来只收 `ArrayBuffer` ——
+ * 类型上不成立（TS2345）。这里只读字节，两种形状都可以。
  */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
+function arrayBufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  // 用 for..of 而不是 `bytes[i]`：`noUncheckedIndexedAccess` 下索引可能为
+  // undefined，逐元素迭代没有这个问题，也更省一次下标运算。
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
   }
   return btoa(binary);
 }

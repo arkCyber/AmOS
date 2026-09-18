@@ -359,7 +359,7 @@
                 e.stopPropagation();
                 removeTab(tab.id);
               }}
-              class="opacity-0 transition-opacity group-hover:opacity-100"
+              class="tab-close"
               aria-label={t("webman.closeTab")}
             >
               <span class="text-neutral-500 hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200">✕</span>
@@ -395,20 +395,20 @@
       <button
         onclick={() => (canGoBack = !canGoBack)}
         disabled={!canGoBack}
-        class="flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 disabled:opacity-30 dark:hover:bg-neutral-800"
+        class="flex h-11 w-11 -my-1 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 disabled:opacity-30 dark:hover:bg-neutral-800"
       >
         ←
       </button>
       <button
         onclick={() => (canGoForward = !canGoForward)}
         disabled={!canGoForward}
-        class="flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 disabled:opacity-30 dark:hover:bg-neutral-800"
+        class="flex h-11 w-11 -my-1 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 disabled:opacity-30 dark:hover:bg-neutral-800"
       >
         →
       </button>
       <button
         onclick={() => navigate()}
-        class="flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 dark:hover:bg-neutral-800"
+        class="flex h-11 w-11 -my-1 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 dark:hover:bg-neutral-800"
       >
         ↻
       </button>
@@ -439,7 +439,7 @@
       <!-- 书签 -->
       <button
         onclick={toggleBookmark}
-        class="flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 dark:hover:bg-neutral-800"
+        class="flex h-11 w-11 -my-1 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 dark:hover:bg-neutral-800"
       >
         {activeTab && isBookmarked(activeTab.url ?? "") ? "★" : "☆"}
       </button>
@@ -447,7 +447,7 @@
       <!-- 菜单 -->
       <button
         onclick={() => (showMenu = !showMenu)}
-        class="flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 dark:hover:bg-neutral-800"
+        class="flex h-11 w-11 -my-1 items-center justify-center rounded-lg text-lg transition-colors hover:bg-neutral-200 dark:hover:bg-neutral-800"
       >
         ⋮
       </button>
@@ -839,7 +839,12 @@
   
   <!-- Toast 通知 -->
   {#if toastVisible}
-    <div class="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 animate-[fadeIn_0.3s_ease-in-out]">
+    <!-- Toast 是**用户动作之后**才出现的反馈（加书签、加载失败…），而焦点还在原处 ⇒
+         必须播报，否则屏幕阅读器用户不知道刚才那一下成没成（REQ-A387）。 -->
+    <div
+      class="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 animate-[fadeIn_0.3s_ease-in-out]"
+      role="status"
+    >
       <div class="rounded-full bg-neutral-800 px-6 py-3 text-sm text-white shadow-lg dark:bg-neutral-700">
         {toastMessage}
       </div>
@@ -847,3 +852,26 @@
   {/if}
 </div>
 </ErrorBoundary>
+
+<style>
+  /* 指针契约（REQ-A385）：关标签按钮原来只在 hover 时出现，而 opacity-0
+     **不挡命中** ⇒ 触屏上它既看不见又留着可点区域，而且没有 hover 能唤出它；
+     顺带一提，误触一个看不见的"关闭"正是最该避免的那种误触。
+
+     现在的规则：指针设备上隐到 hover / 键盘聚焦才出现，且隐藏时**不可命中**
+     （`visibility: hidden` 脱离命中测试）；触屏设备一直显示 —— 它没有 hover。 */
+  .tab-close {
+    transition: opacity 150ms ease, visibility 150ms ease;
+  }
+  @media (hover: hover) {
+    .tab-close {
+      opacity: 0;
+      visibility: hidden;
+    }
+    .group:hover .tab-close,
+    .group:focus-within .tab-close {
+      opacity: 1;
+      visibility: visible;
+    }
+  }
+</style>

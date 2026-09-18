@@ -11,6 +11,7 @@
    */
 
   import { mdmManager } from "../../lib/enterprise";
+  import { t } from "../locale.svelte";
   import type { MDMConfig, MDMRestrictions } from "../../lib/enterprise/mdm";
 
   // ============================================================================
@@ -66,11 +67,11 @@
       restrictions = mdmManager.getRestrictions();
       lastSyncTime = Date.now();
       connectionStatus = "success";
-      connectionMessage = "配置同步成功";
+      connectionMessage = t("mdm.syncOk");
       setTimeout(() => { connectionStatus = null; }, 3000);
     } catch (error) {
       connectionStatus = "error";
-      connectionMessage = error instanceof Error ? error.message : "同步失败";
+      connectionMessage = error instanceof Error ? error.message : t("mdm.syncFailed");
     } finally {
       syncing = false;
     }
@@ -85,13 +86,13 @@
       await new Promise(resolve => setTimeout(resolve, 1000));
       if (config.serverUrl && config.serverUrl.startsWith("https://")) {
         connectionStatus = "success";
-        connectionMessage = "连接成功";
+        connectionMessage = t("mdm.connectOk");
       } else {
-        throw new Error("无效的服务器 URL");
+        throw new Error(t("mdm.invalidServerUrl"));
       }
     } catch (error) {
       connectionStatus = "error";
-      connectionMessage = error instanceof Error ? error.message : "连接失败";
+      connectionMessage = error instanceof Error ? error.message : t("mdm.connectFailed");
     } finally {
       testingConnection = false;
       setTimeout(() => { connectionStatus = null; }, 3000);
@@ -100,7 +101,7 @@
 
   function resetToDefault() {
     if (!config) return;
-    if (confirm("确定要重置为默认配置吗？这将清除所有自定义设置。")) {
+    if (confirm(t("mdm.confirmReset"))) {
       mdmManager.configure({
         enabled: false,
         serverUrl: "",
@@ -131,7 +132,7 @@
   }
 
   function formatDate(timestamp: number | null): string {
-    if (!timestamp) return "从未同步";
+    if (!timestamp) return t("mdm.neverSynced");
     const date = new Date(timestamp);
     return date.toLocaleString("zh-CN", {
       year: "numeric",
@@ -145,16 +146,16 @@
 
 <div class="mdm-panel">
   <header class="panel-header">
-    <h2>📱 MDM 移动设备管理</h2>
-    <p class="subtitle">集中管理快捷指令策略和使用限制</p>
+    <h2>📱 {t("mdm.title")}</h2>
+    <p class="subtitle">{t("mdm.subtitle")}</p>
   </header>
 
   <!-- 主开关 -->
   <section class="card">
     <div class="toggle-row">
       <div>
-        <div class="label">启用 MDM</div>
-        <div class="caption">启用后将应用企业策略和使用限制</div>
+        <div class="label">{t("mdm.enable")}</div>
+        <div class="caption">{t("mdm.enableHint")}</div>
       </div>
       <label class="toggle-switch">
         <input
@@ -162,7 +163,7 @@
           checked={config?.enabled}
           onchange={toggleMDM}
           role="switch"
-          aria-label="启用 MDM"
+          aria-label={t("mdm.enable")}
         />
         <span class="slider"></span>
       </label>
@@ -171,9 +172,9 @@
 
   <!-- 服务器配置 -->
   <section class="card">
-    <h3 class="section-title">服务器配置</h3>
+    <h3 class="section-title">{t("mdm.serverSection")}</h3>
     <div class="form-group">
-      <label for="serverUrl" class="form-label">服务器 URL</label>
+      <label for="serverUrl" class="form-label">{t("mdm.serverUrl")}</label>
       <input
         id="serverUrl"
         type="url"
@@ -185,7 +186,7 @@
       />
     </div>
     <div class="form-group">
-      <label for="organizationId" class="form-label">组织 ID</label>
+      <label for="organizationId" class="form-label">{t("mdm.organizationId")}</label>
       <input
         id="organizationId"
         type="text"
@@ -197,7 +198,7 @@
       />
     </div>
     <div class="form-group">
-      <label for="deviceId" class="form-label">设备 ID</label>
+      <label for="deviceId" class="form-label">{t("mdm.deviceId")}</label>
       <input
         id="deviceId"
         type="text"
@@ -206,20 +207,20 @@
         disabled
         readonly
       />
-      <p class="help-text">自动生成，只读</p>
+      <p class="help-text">{t("mdm.deviceIdHint")}</p>
     </div>
     <button
       class="btn-secondary"
       onclick={testConnection}
       disabled={!config?.enabled || testingConnection}
     >
-      {testingConnection ? "测试中..." : "测试连接"}
+      {testingConnection ? t("mdm.testing") : t("mdm.testConnection")}
     </button>
   </section>
 
   <!-- 权限策略 -->
   <section class="card">
-    <h3 class="section-title">权限策略</h3>
+    <h3 class="section-title">{t("mdm.permissionsSection")}</h3>
     <div class="permission-list">
       <label class="permission-item">
         <input
@@ -228,7 +229,7 @@
           onchange={() => updateRestriction("allowUserCreate", !restrictions.allowUserCreate)}
           disabled={!config?.enabled}
         />
-        <span>允许用户创建快捷指令</span>
+        <span>{t("mdm.allowCreate")}</span>
       </label>
       <label class="permission-item">
         <input
@@ -237,7 +238,7 @@
           onchange={() => updateRestriction("allowUserModify", !restrictions.allowUserModify)}
           disabled={!config?.enabled}
         />
-        <span>允许用户编辑快捷指令</span>
+        <span>{t("mdm.allowModify")}</span>
       </label>
       <label class="permission-item">
         <input
@@ -246,7 +247,7 @@
           onchange={() => updateRestriction("allowUserDelete", !restrictions.allowUserDelete)}
           disabled={!config?.enabled}
         />
-        <span>允许用户删除快捷指令</span>
+        <span>{t("mdm.allowDelete")}</span>
       </label>
       <label class="permission-item">
         <input
@@ -255,7 +256,7 @@
           onchange={() => updateRestriction("allowSharing", !restrictions.allowSharing)}
           disabled={!config?.enabled}
         />
-        <span>允许用户分享快捷指令</span>
+        <span>{t("mdm.allowSharing")}</span>
       </label>
       <label class="permission-item">
         <input
@@ -264,7 +265,7 @@
           onchange={() => updateRestriction("allowImport", !restrictions.allowImport)}
           disabled={!config?.enabled}
         />
-        <span>允许用户导入快捷指令</span>
+        <span>{t("mdm.allowImport")}</span>
       </label>
       <label class="permission-item">
         <input
@@ -273,18 +274,18 @@
           onchange={() => updateRestriction("allowExport", !restrictions.allowExport)}
           disabled={!config?.enabled}
         />
-        <span>允许用户导出快捷指令</span>
+        <span>{t("mdm.allowExport")}</span>
       </label>
     </div>
   </section>
 
   <!-- 使用限制 -->
   <section class="card">
-    <h3 class="section-title">使用限制</h3>
+    <h3 class="section-title">{t("mdm.limitsSection")}</h3>
     <div class="limit-list">
       <div class="limit-item">
         <label for="maxShortcutsPerUser" class="limit-label">
-          每用户快捷指令数
+          {t("mdm.maxShortcutsPerUser")}
         </label>
         <div class="number-input-group">
           <input
@@ -297,12 +298,12 @@
             max="1000"
             disabled={!config?.enabled}
           />
-          <span class="unit">个</span>
+          <span class="unit">{t("mdm.unitCount")}</span>
         </div>
       </div>
       <div class="limit-item">
         <label for="maxActionsPerShortcut" class="limit-label">
-          每快捷指令动作数
+          {t("mdm.maxActionsPerShortcut")}
         </label>
         <div class="number-input-group">
           <input
@@ -315,12 +316,12 @@
             max="200"
             disabled={!config?.enabled}
           />
-          <span class="unit">个</span>
+          <span class="unit">{t("mdm.unitCount")}</span>
         </div>
       </div>
       <div class="limit-item">
         <label for="maxExecutionsPerDay" class="limit-label">
-          每日执行次数
+          {t("mdm.maxExecutionsPerDay")}
         </label>
         <div class="number-input-group">
           <input
@@ -333,7 +334,7 @@
             max="10000"
             disabled={!config?.enabled}
           />
-          <span class="unit">次</span>
+          <span class="unit">{t("mdm.unitTimes")}</span>
         </div>
       </div>
     </div>
@@ -348,7 +349,7 @@
     {/if}
     
     <div class="sync-info">
-      <span class="sync-label">最后同步:</span>
+      <span class="sync-label">{t("mdm.lastSync")}</span>
       <span class="sync-time">{formatDate(lastSyncTime || config?.enrolledAt || 0)}</span>
     </div>
     
@@ -358,14 +359,14 @@
         onclick={syncConfig}
         disabled={!config?.enabled || syncing}
       >
-        {syncing ? "同步中..." : "同步配置"}
+        {syncing ? t("mdm.syncing") : t("mdm.syncConfig")}
       </button>
       <button
         class="btn-secondary"
         onclick={resetToDefault}
         disabled={syncing}
       >
-        重置为默认
+        {t("mdm.resetToDefault")}
       </button>
     </div>
   </section>
@@ -668,8 +669,11 @@
     color: white;
   }
 
-  .btn-primary:hover:not(:disabled) {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-primary:hover:not(:disabled) {
     opacity: 0.8;
+  }
   }
 
   .btn-secondary {
@@ -677,8 +681,11 @@
     color: #007AFF;
   }
 
-  .btn-secondary:hover:not(:disabled) {
+  /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
+  @media (hover: hover) {
+    .btn-secondary:hover:not(:disabled) {
     opacity: 0.8;
+  }
   }
 
   button:disabled {

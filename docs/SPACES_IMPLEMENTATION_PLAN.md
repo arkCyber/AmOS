@@ -4,6 +4,14 @@
 > 工作量：3 周
 > 计划时间：Q1 2027
 > 依赖：当前 wm (窗口管理) 系统
+>
+> **状态（2026-09-17，REQ-A389）**：**账本那一半已经上线** —— `mod spaces;` /
+> `mod spaces_commands;` 已声明、`SpaceManager` 已托管（从共享 store 恢复，重启保留）、8 条
+> `spaces_*` 命令已注册、面板 `SpacesPanel` 在 shell 注册表里可用。
+> **还欠的是窗口那一半**：切桌面只改 `active_index`，没有任何代码把窗口在桌面间搬动 ——
+> `active_space_windows` / `is_window_in_active_space` / `space_for_window` 三个 helper 无人调用
+> （记在 `docs/rust-unwired-audit.md`），面板文案若暗示“窗口会跟着走”就是不准确的。
+> 下面这份计划因此仍然有效，只是它的“第一步”已经落地了。
 
 ---
 

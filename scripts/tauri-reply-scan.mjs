@@ -129,6 +129,14 @@ export function parseRustShapes(src) {
     if (close < 0) continue;
     const body = clean.slice(brace + 1, close);
     const renameAll = /rename_all\s*=\s*"([A-Za-z_]+)"/.exec(attrs)?.[1] ?? "";
+    // **Internally tagged** enums (`#[serde(tag = "kind")]`) do not use serde's default
+    // external tagging at all: the tag becomes a field of the payload and each variant's
+    // own fields sit beside it. Without this, a consumer that declares `{ kind, reason }`
+    // — which is exactly what the wire carries — is reported as declaring a field "absent
+    // from the reply" (REQ-A387: `push_notifications.rs::PushResult` +
+    // `pushNotifications.ts::PushResult`; measured 2 false positives).
+    const tagName = /(?:^|[(,])\s*tag\s*=\s*"([^"]+)"/.exec(attrs)?.[1] ?? "";
+    const renameAllFields = /rename_all_fields\s*=\s*"([A-Za-z_]+)"/.exec(attrs)?.[1] ?? "";
     let opaque = /flatten|skip_serializing|serde\(into|with\s*=|serialize_with/.test(attrs + body);
     const fields = [];
     const renameOf = (field) => {
@@ -138,11 +146,48 @@ export function parseRustShapes(src) {
       }
       return field; // snake_case / lowercase: the Rust spelling
     };
+    const renameFieldOf = (field) => {
+      if (renameAllFields !== "camelCase") return field;
+      return field.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+    };
     if (kind === "struct") {
       for (const part of splitTopLevel(body)) {
         const fm = /^\s*(?:pub\s+)?([a-z_]\w*)\s*:/.exec(part);
         if (fm) fields.push(renameOf(fm[1]));
         else if (part.trim().startsWith("//") === false && part.includes(":")) opaque = true;
+      }
+    } else if (tagName) {
+      // Tagged enum: `{"<tag>": "<variant>", <this variant's fields…>}` per variant, so the
+      // union of what the wire can carry is the tag plus every variant's own field names.
+      fields.push(tagName);
+      for (const part of splitTopLevel(body)) {
+        const vm = /^\s*([A-Z]\w*)\s*([({]?)/.exec(part);
+        if (!vm) {
+          if (part.trim() !== "") opaque = true;
+          continue;
+        }
+        if (vm[2] === "(") {
+          // A tagged newtype/tuple variant is not representable on the wire (serde rejects
+          // it at runtime) — do not guess a field name for it.
+          opaque = true;
+          continue;
+        }
+        if (vm[2] !== "{") continue; // unit variant: the tag is the whole payload
+        const open = part.indexOf("{");
+        const close = part.lastIndexOf("}");
+        if (open < 0 || close < open) {
+          opaque = true;
+          continue;
+        }
+        for (const inner of splitTopLevel(part.slice(open + 1, close))) {
+          const fm = /^\s*(?:pub\s+)?([a-z_]\w*)\s*:/.exec(inner);
+          if (fm) {
+            const renamed = renameFieldOf(fm[1]);
+            if (!fields.includes(renamed)) fields.push(renamed);
+          } else if (inner.trim() !== "" && !inner.trim().startsWith("//")) {
+            opaque = true;
+          }
+        }
       }
     } else {
       // Enum variants: serde's default external tagging serializes a unit variant as
@@ -364,11 +409,23 @@ export function runSelftest() {
       "#[derive(Serialize)]",
       "#[serde(flatten)]",
       "pub struct Flattened { pub a: String }",
+      "#[derive(Serialize)]",
+      '#[serde(tag = "kind", rename_all = "lowercase")]',
+      "pub enum Tagged { Ok, Failed { reason: String } }",
+      "#[derive(Serialize)]",
+      "pub enum External { Ok, Gone { id: u32 } }",
     ].join("\n"),
   );
   ok("parses snake_case struct fields", shapes.get("TrashOut").fields.join(",") === "thread_id,message_id,ts_ms,trashed_ms");
   ok("honours serde rename_all = camelCase", shapes.get("Camel").fields[0] === "displayName");
   ok("a flattened struct is opaque, never compared", shapes.get("Flattened").opaque === true);
+  // REQ-A387: an internally tagged enum's payload is the tag **plus** the variant's fields
+  // (`{"kind":"failed","reason":"…"}`), so a TS type declaring `{kind, reason}` is right.
+  ok(
+    "internally tagged enum = tag + variant fields",
+    shapes.get("Tagged").fields.join(",") === "kind,reason",
+  );
+  ok("externally tagged enum still yields variant names", shapes.get("External").fields.join(",") === "Ok,Gone");
 
   const returns = parseReturns(
     [

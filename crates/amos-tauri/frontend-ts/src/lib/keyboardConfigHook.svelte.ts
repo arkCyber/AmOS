@@ -13,9 +13,10 @@
  *   // bindings.spaces - 合并后的 Spaces 快捷键
  */
 import { SHELL_MODULES } from "../svelte/shellModules";
-import { modulesFor, formatShortcut, type ShellShortcut } from "./shellModule";
+import { modulesFor, formatShortcut, shortcutMatches, type ShellShortcut } from "./shellModule";
 import {
   readKeyboardConfig,
+  mergeOverlayBindings,
   type KeyboardConfig,
 } from "./keyboardConfig";
 
@@ -65,64 +66,11 @@ let globalRefresh: (() => void) | null = null;
 export function createKeyboardBindings() {
   let bindings = $state<ResolvedBindings>(resolveBindings(readKeyboardConfig()));
 
-  function resolveBindings(config: KeyboardConfig): ResolvedBindings {
-    // ─── 浮层快捷键 ─────────────────────────────────────────────────────
-    const overlays = new Map<string, ShellShortcut[]>();
-    for (const m of modulesFor("overlay", SHELL_MODULES)) {
-      if (!m.shortcuts) continue;
-      const custom = config.overlays[m.id];
-      if (custom === undefined) {
-        // 使用默认值
-        overlays.set(m.id, [...m.shortcuts]);
-      } else if (custom === null) {
-        // 被禁用，不添加到绑定
-      } else {
-        // 使用自定义
-        overlays.set(m.id, custom);
-      }
-    }
-
-    // ─── 系统快捷键 ─────────────────────────────────────────────────────
-    const system = new Map<string, ShellShortcut>();
-    for (const [id, defaultShortcut] of Object.entries(SYSTEM_DEFAULTS)) {
-      const custom = config.system[id];
-      if (custom === undefined) {
-        system.set(id, defaultShortcut);
-      } else if (custom === null) {
-        // 被禁用
-      } else {
-        system.set(id, custom);
-      }
-    }
-
-    // ─── Spaces 快捷键 ─────────────────────────────────────────────────
-    const spaces = new Map<string, ShellShortcut>();
-    for (const [id, defaultShortcut] of Object.entries(SPACES_DEFAULTS)) {
-      const custom = config.spaces[id];
-      if (custom === undefined) {
-        spaces.set(id, defaultShortcut);
-      } else if (custom === null) {
-        // 被禁用
-      } else {
-        spaces.set(id, custom);
-      }
-    }
-
-    // ─── 触屏快捷键 ────────────────────────────────────────────────────
-    const touch = new Map<string, ShellShortcut>();
-    for (const [id, defaultShortcut] of Object.entries(TOUCH_DEFAULTS)) {
-      const custom = config.touch[id];
-      if (custom === undefined) {
-        touch.set(id, defaultShortcut);
-      } else if (custom === null) {
-        // 被禁用
-      } else {
-        touch.set(id, custom);
-      }
-    }
-
-    return { overlays, system, spaces, touch };
-  }
+  // 这里曾经**再抄一份** `resolveBindings`（与下面的模块级同名函数逐字重复，
+  // 只有 if/else 的写法略有不同）。两份合并在同一个文件里漂移是必然的 ——
+  // 浮层那一份就没跟上 `keyboardConfig.mergeOverlayBindings` 这条共用规则书，
+  // 而 `systemKeys.ts` 的注释却写着"两个调用方共用一本规则书"。现在只有一份：
+  // 模块级 `resolveBindings`（浮层域直接调 `mergeOverlayBindings`）。
 
   function refreshBindings() {
     bindings = resolveBindings(readKeyboardConfig());
@@ -208,16 +156,10 @@ export function getGlobalBindings(): ResolvedBindings {
 
 function resolveBindings(config: KeyboardConfig): ResolvedBindings {
   // ─── 浮层快捷键 ─────────────────────────────────────────────────────
-  const overlays = new Map<string, ShellShortcut[]>();
-  for (const m of modulesFor("overlay", SHELL_MODULES)) {
-    if (!m.shortcuts) continue;
-    const custom = config.overlays[m.id];
-    if (custom === undefined) {
-      overlays.set(m.id, [...m.shortcuts]);
-    } else if (custom !== null) {
-      overlays.set(m.id, custom);
-    }
-  }
+  // 三态合并（默认 / 自定义 / `null` 禁用）**只在这里与 `mergeOverlayBindings` 一处**：
+  // 触摸壳的键盘准入（`systemKeys.ts`）读的是同一个函数，所以桌面壳、触摸壳与
+  // ⌘-hold 面板不可能再各写一份规则。
+  const overlays = mergeOverlayBindings(modulesFor("overlay", SHELL_MODULES), config);
 
   // ─── 系统快捷键 ─────────────────────────────────────────────────────
   const system = new Map<string, ShellShortcut>();
@@ -268,20 +210,19 @@ export function findMatchingBinding(
   bindings: Map<string, ShellShortcut[]>,
   e: KeyboardEvent,
 ): ShortcutMatch | null {
-  const normalizeKey = (key: string) => 
-    key === " " || key === "Spacebar" ? "Space" : key;
-
+  // 判据**委托给 `shellModule.shortcutMatches`**（两处匹配逻辑必须是一份真相）。这里原来
+  // 自己写了一组比较：
+  //
+  //     if (s.shift !== e.shiftKey) continue;
+  //     if (s.alt !== e.altKey) continue;
+  //
+  // 而 `ShellShortcut.shift` / `alt` 是**可选**的（`SHELL_MODULES` / `SYSTEM_DEFAULTS` 里
+  // 一条都没写）。于是 `undefined !== false` 恒真 ⇒ **每一个默认绑定都会被 `continue` 掉**，
+  // 这个函数对当前所有绑定都只会回 `null`。当时它没有生产调用点（浮层键走注册表那条
+  // `moduleForShortcut`，REQ-A394 已把后者删掉），所以是**潜伏**缺陷而不是线上故障；
+  // 但它正是桌面壳浮层键的入口 —— 委托之后两处判据同源，不会再各自漂移。
   for (const [id, shortcuts] of bindings) {
-    for (const s of shortcuts) {
-      // 检查修饰符
-      if (s.meta && !e.metaKey && !e.ctrlKey) continue;
-      if (s.ctrl && !e.ctrlKey) continue;
-      if (s.shift !== e.shiftKey) continue;
-      if (s.alt !== e.altKey) continue;
-
-      // 检查键
-      if (normalizeKey(e.key) !== normalizeKey(s.key)) continue;
-
+    if (shortcuts.some((s) => shortcutMatches(e, s))) {
       return { id, shortcuts };
     }
   }

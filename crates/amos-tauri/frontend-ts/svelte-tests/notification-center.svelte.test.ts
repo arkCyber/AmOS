@@ -117,6 +117,93 @@ describe("NotificationCenter.svelte (controlled via propsBus 'nc')", () => {
     const module = c.querySelector('[data-testid="nc-cellular"]');
     expect(module?.textContent ?? "").toContain(zh["settings.cellularDataOff"]);
   });
+
+describe("NotificationCenter — push deliveries in the one list (REQ-A383)", () => {
+  /** A host that records push commands; `push_get_history` is not used here (the
+   *  watcher is a separate unit) — the NC renders whatever the store holds. */
+  function installPushBridge() {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "push_mark_read") return true;
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    return calls;
+  }
+
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  test("a delivery is labelled as push and counted as unread, beside the shell's own", async () => {
+    writeStoreValue(NOTIF_KEY, [
+      { id: "p1", app: "Mail", title: "Deploy", body: "ready", icon: "📩", time: 20, source: "push", read: false, badge: 3 },
+      { id: "s1", app: "时钟", title: "计时结束", icon: "⏱️", time: 10 },
+    ]);
+    const c = await renderOpen();
+    await tick();
+
+    const badges = c.querySelectorAll('[data-testid="nc-push-badge"]');
+    expect(badges).toHaveLength(1);
+    expect(badges[0]?.textContent).toContain(zh["nc.pushBadge"]);
+    // Only the push delivery is unread; the shell-made one has no read flag at all.
+    expect(c.textContent ?? "").toContain(zh["nc.unread"].replace("{count}", "1"));
+    expect(c.querySelectorAll(`button[aria-label="${zh["nc.markRead"]}"]`)).toHaveLength(1);
+  });
+
+  test("marking a delivery read updates the store and asks the device", async () => {
+    writeStoreValue(NOTIF_KEY, [
+      { id: "p1", app: "Mail", title: "Deploy", icon: "📩", time: 20, source: "push", read: false },
+    ]);
+    const calls = installPushBridge();
+    const c = await renderOpen();
+    await tick();
+
+    await fireEvent.click(c.querySelector(`button[aria-label="${zh["nc.markRead"]}"]`) as HTMLButtonElement);
+    await tick();
+
+    const stored = readStoreValue<Array<{ id: string; read?: boolean; source?: string }>>(NOTIF_KEY, []);
+    expect(stored[0]?.read).toBe(true);
+    expect(stored[0]?.source).toBe("push");
+    // The device's own flag is updated too, so a re-poll does not resurrect it as unread.
+    await vi.waitFor(() => expect(calls.some((x) => x.cmd === "push_mark_read")).toBe(true));
+    expect(calls.find((x) => x.cmd === "push_mark_read")?.args).toEqual({ id: "p1" });
+    // Read → the row stays (the user can still read it) but is no longer offered for marking.
+    expect(c.querySelectorAll(`button[aria-label="${zh["nc.markRead"]}"]`)).toHaveLength(0);
+    expect(c.textContent ?? "").not.toContain(zh["nc.unread"].replace("{count}", "1"));
+  });
+
+  test("dismissing a delivery removes it from the one store, like any other", async () => {
+    writeStoreValue(NOTIF_KEY, [
+      { id: "p1", app: "Mail", title: "Deploy", icon: "📩", time: 20, source: "push", read: false },
+    ]);
+    const c = await renderOpen();
+    await tick();
+
+    // Dismiss *this* row (the store may also hold the shell's own demo rows).
+    const row = c.querySelector('[data-testid="nc-notif-p1"]');
+    expect(row).not.toBeNull();
+    await fireEvent.click(row?.querySelector(`button[aria-label="${zh["a11y.dismiss"]}"]`) as HTMLButtonElement);
+    await tick();
+    const stored = readStoreValue<Array<{ id: string }>>(NOTIF_KEY, []);
+    expect(stored.some((n) => n.id === "p1")).toBe(false);
+  });
+
+  test("a delivery that landed before the sheet opened is not overwritten by the demo seed", async () => {
+    // The store already holds a delivery (the watcher can write it at any time).
+    writeStoreValue(NOTIF_KEY, [
+      { id: "p1", app: "Mail", title: "Deploy", icon: "📩", time: 20, source: "push", read: false },
+    ]);
+    await renderOpen();
+    await tick();
+    const stored = readStoreValue<Array<{ id: string }>>(NOTIF_KEY, []);
+    expect(stored.map((n) => n.id)).toContain("p1");
+  });
+});
+
 });
 
 

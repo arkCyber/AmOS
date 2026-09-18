@@ -507,7 +507,7 @@
                         data-testid="app-library-member-up"
                         onclick={() => shiftMember(index, -1)}
                         disabled={index === 0}
-                        class="grid h-9 w-9 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
+                        class="grid h-11 w-11 -my-1 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
                       >▲</button>
                       <button
                         type="button"
@@ -515,7 +515,7 @@
                         data-testid="app-library-member-down"
                         onclick={() => shiftMember(index, 1)}
                         disabled={index === memberApps.length - 1}
-                        class="grid h-9 w-9 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
+                        class="grid h-11 w-11 -my-1 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
                       >▼</button>
                     </span>
                   </div>
@@ -587,7 +587,7 @@
               type="button"
               aria-label={t("a11y.clearSearch")}
               onclick={clearSearch}
-              class="grid h-9 w-9 shrink-0 cursor-pointer place-items-center rounded-full bg-neutral-300 text-sm text-neutral-700 transition active:scale-90 dark:bg-neutral-600 dark:text-neutral-200"
+              class="grid h-11 w-11 -my-1 shrink-0 cursor-pointer place-items-center rounded-full bg-neutral-300 text-sm text-neutral-700 transition active:scale-90 dark:bg-neutral-600 dark:text-neutral-200"
             >✕</button>
           {/if}
         </div>

@@ -41,9 +41,9 @@
   import { stageRect, DEFAULT_SCREEN } from "../lib/desktopLayout";
   import {
     SHELL_CHROME_API,
-    moduleForShortcut,
+    bindingHint,
     modulesFor,
-    overlayShortcutHint,
+    shortcutMatches,
     type ShellChromeApi,
   } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
@@ -51,6 +51,7 @@
   import { isDesktopFeatureEnabled, loadDesktopFeatures } from "../lib/desktopFeatures";
   import {
     createKeyboardBindings,
+    findMatchingBinding,
     matchesShortcut,
   } from "../lib/keyboardConfigHook.svelte";
   import TopBar from "./TopBar.svelte";
@@ -105,17 +106,23 @@
 
   // ─── 自定义快捷键绑定（Phase 3）────────────────────────────────────────────
   // 从 localStorage 读取用户配置，与系统默认值合并。注意：浮层快捷键的真源仍是
-  // `SHELL_MODULES.shortcuts`（见 `onKeyDown`）。`keyboardBindings` 目前只在
-  // 浮层提示与 system 区域里少量读取——浮层 tooltip 仍然读 SHELL_MODULES，所以
-  // tooltip 与按下结果永远来自同一份声明。
+  // ─── 自定义快捷键绑定（Phase 3）────────────────────────────────────────────
+  // 从 localStorage 读取用户配置，与系统默认值合并；**浮层的按键与提示都读这一份**
+  // （见 `onKeyDown` 的浮层分支与下面的 `overlayShortcut`），所以"按钮说会开什么"与
+  // "按下去开什么"永远同源 —— 这是 REQ-A394 补上的那一半（此前提示读合并结果、
+  // 按键读注册表默认值，两者会在用户改过键之后互相矛盾）。
   const keyboardBindings = createKeyboardBindings();
   keyboardBindings.startListening();
   const customSystemBindings = $derived(keyboardBindings.bindings.system);
 
   // ─── 系统快捷键（macOS 作用于焦点窗口的那一组）────────────────────────
   // 故意与「浮层快捷键」分两层处理：
-  //   1) 浮层快捷键走 `findMatchingBinding(overlays, …)`，支持用户自定义
-  //   2) 系统快捷键（⌘W / ⌘M / ⌘H / ⌘,）是固定的"作用于焦点窗口"动作
+  //   1) 浮层快捷键走**合并后的** `bindings.overlays`（注册表默认 + 用户覆盖 + `null` 禁用）
+  //   2) 系统快捷键（⌘W / ⌘M / ⌘H / ⌘,）走**合并后的** `customSystemBindings`
+  //
+  // 浮层域的规则书是 `keyboardConfig.mergeOverlayBindings`（触摸壳的准入
+  // `systemKeys.ts` 与 ⌘-hold 面板读的也是它）；system / spaces / touch 三个域由
+  // `keyboardConfigHook` 的 `resolveBindings` 一处合并（本文件不再自己写一套）。
   //
   // 这些键**仍然**在捕获阶段消费：浮层内若有表单元素拿到焦点，浏览器默认会拦下 ⌘W，
   // 但 Tauri WebView 不一定，而用户的肌肉记忆是"按了 = 关窗"，所以壳直接消费。
@@ -155,13 +162,16 @@
     openLaunchpad: () => openOverlay("launchpad"),
     openSpotlight: () => openOverlay("spotlight"),
     lockScreen: () => lock(),
-    overlayShortcut: (overlayId) => overlayShortcutHint(SHELL_MODULES, overlayId),
+    // 提示与按键同源：`bindings.overlays` 就是 `onKeyDown` 里 `findMatchingBinding` 读的那一份
+    // （注册表默认 + 用户覆盖 + `null` 禁用），所以改过键的人看到的正是自己那把键。
+    overlayShortcut: (overlayId) => bindingHint(keyboardBindings.bindings.overlays.get(overlayId)),
     toggleOverlay: (overlayId) => toggleOverlay(overlayId),
     isOverlayOpen: (overlayId) => openOverlays.includes(overlayId),
   });
 
   // ─── 快捷键：**使用自定义绑定** ─────────────────────────────────────────────
-  // `findMatchingBinding` 从合并后的绑定中查找匹配，所以用户自定义的快捷键会生效。
+  // `customSystemBindings`（`keyboardBindings.bindings.system`）是默认值 + 用户覆盖 +
+  // `null` 禁用合并后的结果，所以系统域的用户自定义会生效；浮层域见上面的诚实边界。
   // 监听在**捕获阶段**，并且消费掉的键 `stopPropagation()`：浮层自己是可独立挂载的
   // 组件，各自也听 Esc（`Launchpad` / `MissionControl`），而键事件是同一个——
   // 不拦截的话一次 Esc 会把叠在一起的两层一起关掉。
@@ -169,76 +179,92 @@
     // 系统快捷键（⌘W 关窗 / ⌘M 最小化 / ⌘H 隐藏 / ⌘, 偏好）先于浮层快捷键
     if (handleSystemShortcut(e)) return;
 
-    // Spaces 快捷键（使用自定义绑定）
-    // Ctrl+1-9: 直接跳转到桌面
-    if (e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
-      const key = e.key;
-      if (/^[1-9]$/.test(key)) {
-        e.preventDefault();
-        e.stopPropagation();
-        const index = parseInt(key, 10) - 1;
-        void (async () => {
-          const ok = await invoke<unknown>("spaces_switch", { index });
-          if (ok === null) {
-            const diag = bridgeDiag("spaces_switch");
-            if (!diag.ok) {
-              const code =
-                diag.kind === "command-failed" &&
-                diag.detail &&
-                typeof diag.detail === "object"
-                  ? (diag.detail as { code?: string }).code
-                  : undefined;
-              console.warn(
-                `🛟 [DesktopShell] spaces_switch(${index}) refused`,
-                code ?? diag.kind,
-              );
-            }
-          }
-        })();
-        return;
-      }
+    // ─── Spaces 快捷键（**合并后的绑定**）────────────────────────────────────
+    // 与浮层 / 系统两域同源：`bindings.spaces` = `SPACES_DEFAULTS` + 用户覆盖 + `null` 禁用，
+    // 判据用 `shortcutMatches`（触摸壳的准入与 ⌘-hold 面板读的是同一个匹配器）。
+    //
+    // 这里原来是**硬编码**（`e.ctrlKey && /^[1-9]$/`、`Ctrl+←/→`、`Ctrl+↑`），后果有三：
+    //   • 键盘设置里改过的 Spaces 键在桌面上不生效（浮层域同族缺口，REQ-A394 已修）；
+    //   • `Ctrl+↑`（`spacesPanel`）被 `preventDefault + stopPropagation` **吃掉却什么都不做**
+    //     —— 注释写着"可以扩展为显示 Spaces 面板"，而注册表那边的注释更进一步，声称它
+    //     "由 `DesktopShell` 在面板挂载时派发"。两句都不成立：这一支只有 `return`。
+    // 现在按配置派发，`null` 即是"这个键不归壳管"（**不消费**，交给别处）。
+    const spacesBindings = keyboardBindings.bindings.spaces;
 
-      // Ctrl+Left/Right: 切换到上/下一个桌面
-      if (key === "ArrowLeft" || key === "ArrowRight") {
-        e.preventDefault();
-        e.stopPropagation();
-        void (async () => {
-          const spaces = await listSpaces();
-          const current = await activeSpace();
-          if (!spaces || current === null) return;
-
-          const newIndex =
-            key === "ArrowLeft"
-              ? prevSpaceIndex(current, spaces.length)
-              : nextSpaceIndex(current, spaces.length);
-          if (newIndex === null || newIndex === current) return;
-
-          const ok = await switchSpace(newIndex);
-          if (!ok) {
-            console.warn(`[DesktopShell] Failed to switch to space ${newIndex}`);
-          }
-        })();
-        return;
-      }
-
-      // Ctrl+Up: 显示 Spaces 面板（通过触屏快捷键机制）
-      if (key === "ArrowUp") {
-        e.preventDefault();
-        e.stopPropagation();
-        // 触发 Spaces 面板显示
-        // 注意：这里可以扩展为显示 Spaces 面板
-        return;
-      }
-    }
-
-    // 浮层快捷键（注册表即清单）：⌘Space/F4/F3/⌘Tab 的真源是 `SHELL_MODULES` 的
-    // `shortcuts` 字段。`moduleForShortcut` 按声明顺序找第一个匹配的绑定，浮层
-    // tooltip 也从同一个注册表读，所以"按下会开什么"和"按钮说会开什么"是一份代码。
-    const target = moduleForShortcut("overlay", SHELL_MODULES, e);
-    if (target) {
+    // Ctrl+1…9 是**一族**键：这一行给的是修饰符与代表键（`{ key: "1", ctrl: true }`），
+    // 数字本身由事件提供 —— 用规范匹配器把代表键换成事件里的那个数字再比一次，
+    // 于是用户把修饰符改成 ⌘⇧ 也只改一处，而不是在这里另写一套判断。
+    const spacesDirect = spacesBindings.get("spacesDirect");
+    if (spacesDirect && /^[1-9]$/.test(e.key) && shortcutMatches(e, { ...spacesDirect, key: e.key })) {
       e.preventDefault();
       e.stopPropagation();
-      toggleOverlay(target.id);
+      const index = parseInt(e.key, 10) - 1;
+      void (async () => {
+        const ok = await invoke<unknown>("spaces_switch", { index });
+        if (ok === null) {
+          const diag = bridgeDiag("spaces_switch");
+          if (!diag.ok) {
+            const code =
+              diag.kind === "command-failed" &&
+              diag.detail &&
+              typeof diag.detail === "object"
+                ? (diag.detail as { code?: string }).code
+                : undefined;
+            console.warn(
+              `🛟 [DesktopShell] spaces_switch(${index}) refused`,
+              code ?? diag.kind,
+            );
+          }
+        }
+      })();
+      return;
+    }
+
+    // 上一个 / 下一个桌面
+    const spacesPrev = spacesBindings.get("spacesPrev");
+    const spacesNext = spacesBindings.get("spacesNext");
+    const step = spacesPrev && shortcutMatches(e, spacesPrev) ? -1 : spacesNext && shortcutMatches(e, spacesNext) ? 1 : 0;
+    if (step !== 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      void (async () => {
+        const spaces = await listSpaces();
+        const current = await activeSpace();
+        if (!spaces || current === null) return;
+
+        const newIndex =
+          step < 0 ? prevSpaceIndex(current, spaces.length) : nextSpaceIndex(current, spaces.length);
+        if (newIndex === null || newIndex === current) return;
+
+        const ok = await switchSpace(newIndex);
+        if (!ok) {
+          console.warn(`[DesktopShell] Failed to switch to space ${newIndex}`);
+        }
+      })();
+      return;
+    }
+
+    // 打开 / 关闭 Spaces 面板（默认 ⌃↑）。注册表**故意**不给这一行 `shortcuts`
+    // （见 `shellModules.ts` 的 SpacesPanel 块注释：四个浮层启动键的清单是文档化的不变量），
+    // 所以这个键来自键盘配置的 `spaces` 域，而不是注册表。
+    const spacesPanel = spacesBindings.get("spacesPanel");
+    if (spacesPanel && shortcutMatches(e, spacesPanel)) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleOverlay("spaces-panel");
+      return;
+    }
+
+    // 浮层快捷键（**合并后的绑定**）：⌘Space/F4/F3/⌘Tab 的默认值来自注册表
+    // （`SHELL_MODULES.shortcuts`），用户覆盖与 `null` 禁用来自键盘设置。这里读
+    // `keyboardBindings.bindings.overlays` —— 与触摸壳的准入（`systemKeys.ts`）、
+    // ⌘-hold 面板都走 `mergeOverlayBindings` 这一本规则书；提示也读同一份
+    // （见下面的 `overlayShortcut`），所以"按下会开什么"与"按钮说会开什么"同源。
+    const overlayHit = findMatchingBinding(keyboardBindings.bindings.overlays, e);
+    if (overlayHit) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleOverlay(overlayHit.id);
       return;
     }
 

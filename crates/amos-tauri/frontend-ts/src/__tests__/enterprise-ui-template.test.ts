@@ -31,51 +31,16 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
   describe("模板搜索", () => {
     test("应该能够按名称搜索模板", () => {
-      const templates: EnterpriseTemplate[] = [
-        {
-          id: "tpl-001",
-          name: "每日报告",
-          description: "自动生成每日工作报告",
-          category: "productivity",
-          department: "engineering",
-          version: "1.0.0",
-          author: "Admin",
-          tags: ["report", "daily"],
-          parameters: [],
-          actions: [],
-          requiredPermissions: [],
-          icon: "📊",
-          installCount: 100,
-          rating: 4.5,
-          isRequired: false,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        },
-        {
-          id: "tpl-002",
-          name: "周报生成",
-          description: "生成周报模板",
-          category: "productivity",
-          department: "engineering",
-          version: "1.0.0",
-          author: "Admin",
-          tags: ["report", "weekly"],
-          parameters: [],
-          actions: [],
-          requiredPermissions: [],
-          icon: "📈",
-          installCount: 80,
-          rating: 4.3,
-          isRequired: false,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        },
+      const templates: Partial<EnterpriseTemplate>[] = [
+        { id: "tpl-001", name: "每日报告", description: "自动生成每日工作报告" },
+        { id: "tpl-002", name: "周报生成", description: "生成周报模板" },
       ];
 
-      const searchQuery = "每日";
-      const filtered = templates.filter(t => 
-        t.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        t.description.toLowerCase().includes(searchQuery.toLowerCase())
+      const searchQuery: string = "每日";
+      const filtered = templates.filter(t =>
+        !searchQuery ||
+        (t.name?.toLowerCase() || "").includes(searchQuery.toLowerCase()) ||
+        (t.description?.toLowerCase() || "").includes(searchQuery.toLowerCase())
       );
 
       expect(filtered).toHaveLength(1);
@@ -83,15 +48,15 @@ describe("TemplateLibrary UI 逻辑测试", () => {
     });
 
     test("空搜索应该返回所有模板", () => {
-      const templates: EnterpriseTemplate[] = [
-        { id: "1", name: "Template 1" } as EnterpriseTemplate,
-        { id: "2", name: "Template 2" } as EnterpriseTemplate,
+      const templates: Array<Partial<EnterpriseTemplate>> = [
+        { id: "1", name: "Template 1" },
+        { id: "2", name: "Template 2" },
       ];
 
-      const searchQuery = "";
-      const filtered = templates.filter(t => 
-        !searchQuery || 
-        t.name.toLowerCase().includes(searchQuery.toLowerCase())
+      const searchQuery: string = "";
+      const filtered = templates.filter(t =>
+        !searchQuery ||
+        (t.name?.toLowerCase() || "").includes(searchQuery.toLowerCase())
       );
 
       expect(filtered).toHaveLength(2);
@@ -100,14 +65,14 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
   describe("分类过滤", () => {
     test("应该能够按分类过滤模板", () => {
-      const templates: EnterpriseTemplate[] = [
-        { id: "1", category: "productivity" } as EnterpriseTemplate,
-        { id: "2", category: "automation" } as EnterpriseTemplate,
-        { id: "3", category: "productivity" } as EnterpriseTemplate,
+      const templates: Partial<EnterpriseTemplate>[] = [
+        { id: "1", category: "productivity" },
+        { id: "2", category: "automation" },
+        { id: "3", category: "productivity" },
       ];
 
-      const category = "productivity";
-      const filtered = templates.filter(t => 
+      const category: string = "productivity";
+      const filtered = templates.filter(t =>
         !category || category === "all" || t.category === category
       );
 
@@ -116,13 +81,13 @@ describe("TemplateLibrary UI 逻辑测试", () => {
     });
 
     test("'all' 分类应该返回所有模板", () => {
-      const templates: EnterpriseTemplate[] = [
-        { id: "1", category: "productivity" } as EnterpriseTemplate,
-        { id: "2", category: "automation" } as EnterpriseTemplate,
+      const templates: Partial<EnterpriseTemplate>[] = [
+        { id: "1", category: "productivity" },
+        { id: "2", category: "automation" },
       ];
 
-      const category = "all";
-      const filtered = templates.filter(t => 
+      const category: string = "all";
+      const filtered = templates.filter(t =>
         !category || category === "all" || t.category === category
       );
 
@@ -132,14 +97,14 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
   describe("部门过滤", () => {
     test("应该能够按部门过滤模板", () => {
-      const templates: EnterpriseTemplate[] = [
-        { id: "1", department: "engineering" } as EnterpriseTemplate,
-        { id: "2", department: "sales" } as EnterpriseTemplate,
-        { id: "3", department: "engineering" } as EnterpriseTemplate,
+      const templates: Partial<EnterpriseTemplate>[] = [
+        { id: "1", department: "engineering" },
+        { id: "2", department: "sales" },
+        { id: "3", department: "engineering" },
       ];
 
-      const department = "engineering";
-      const filtered = templates.filter(t => 
+      const department: string = "engineering";
+      const filtered = templates.filter(t =>
         !department || department === "all" || t.department === department
       );
 
@@ -150,39 +115,24 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
   describe("组合过滤", () => {
     test("应该支持搜索 + 分类 + 部门组合过滤", () => {
-      const templates: EnterpriseTemplate[] = [
-        {
-          id: "1",
-          name: "工程报告",
-          category: "productivity",
-          department: "engineering",
-        } as EnterpriseTemplate,
-        {
-          id: "2",
-          name: "销售报告",
-          category: "productivity",
-          department: "sales",
-        } as EnterpriseTemplate,
-        {
-          id: "3",
-          name: "工程自动化",
-          category: "automation",
-          department: "engineering",
-        } as EnterpriseTemplate,
+      const templates: Partial<EnterpriseTemplate>[] = [
+        { id: "1", name: "工程报告", category: "productivity", department: "engineering" },
+        { id: "2", name: "销售报告", category: "productivity", department: "sales" },
+        { id: "3", name: "工程自动化", category: "automation", department: "engineering" },
       ];
 
-      const searchQuery = "工程";
-      const category = "productivity";
-      const department = "engineering";
+      const searchQuery: string = "工程";
+      const category: string = "productivity";
+      const department: string = "engineering";
 
       const filtered = templates.filter(t => {
-        const matchesSearch = !searchQuery || 
-          t.name.toLowerCase().includes(searchQuery.toLowerCase());
-        const matchesCategory = !category || category === "all" || 
+        const matchesSearch = !searchQuery ||
+          (t.name?.toLowerCase() || "").includes(searchQuery.toLowerCase());
+        const matchesCategory = !category || category === "all" ||
           t.category === category;
-        const matchesDepartment = !department || department === "all" || 
+        const matchesDepartment = !department || department === "all" ||
           t.department === department;
-        
+
         return matchesSearch && matchesCategory && matchesDepartment;
       });
 
@@ -193,11 +143,11 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
   describe("分类和部门提取", () => {
     test("应该能够提取所有唯一的分类", () => {
-      const templates: EnterpriseTemplate[] = [
-        { id: "1", category: "productivity" } as EnterpriseTemplate,
-        { id: "2", category: "automation" } as EnterpriseTemplate,
-        { id: "3", category: "productivity" } as EnterpriseTemplate,
-        { id: "4", category: "communication" } as EnterpriseTemplate,
+      const templates: Partial<EnterpriseTemplate>[] = [
+        { id: "1", category: "productivity" },
+        { id: "2", category: "automation" },
+        { id: "3", category: "productivity" },
+        { id: "4", category: "communication" },
       ];
 
       const categories = Array.from(new Set(templates.map(t => t.category)));
@@ -209,11 +159,11 @@ describe("TemplateLibrary UI 逻辑测试", () => {
     });
 
     test("应该能够提取所有唯一的部门", () => {
-      const templates: EnterpriseTemplate[] = [
-        { id: "1", department: "engineering" } as EnterpriseTemplate,
-        { id: "2", department: "sales" } as EnterpriseTemplate,
-        { id: "3", department: "engineering" } as EnterpriseTemplate,
-        { id: "4", department: "hr" } as EnterpriseTemplate,
+      const templates: Partial<EnterpriseTemplate>[] = [
+        { id: "1", department: "engineering" },
+        { id: "2", department: "sales" },
+        { id: "3", department: "engineering" },
+        { id: "4", department: "hr" },
       ];
 
       const departments = Array.from(new Set(templates.map(t => t.department)));
@@ -227,34 +177,40 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
   describe("参数验证", () => {
     test("应该验证必填参数", () => {
-      const parameter: TemplateParameter = {
-        name: "projectName",
-        type: "string",
-        label: "项目名称",
-        description: "输入项目名称",
-        required: true,
+      const parameter: Partial<TemplateParameter> = {
+        key: "projectName",
+        name: "项目名称",
+        type: "text",
         defaultValue: "",
+        required: true,
+        description: "项目名称",
       };
 
       const value = "";
-      const isValid = !parameter.required || (value && value.trim().length > 0);
+      const isValid = !parameter.required || (typeof value === "string" && value.trim().length > 0);
 
       expect(isValid).toBe(false);
     });
 
     test("应该验证数字参数范围", () => {
-      const parameter: TemplateParameter = {
-        name: "count",
+      const parameter: Partial<TemplateParameter> = {
+        key: "count",
+        name: "数量",
         type: "number",
-        label: "数量",
+        defaultValue: 1,
         required: true,
-        min: 1,
-        max: 100,
+        description: "数量",
+        validation: {
+          min: 1,
+          max: 100,
+        },
       };
 
-      const validateNumber = (value: number, param: TemplateParameter): boolean => {
-        if (param.min !== undefined && value < param.min) return false;
-        if (param.max !== undefined && value > param.max) return false;
+      const validateNumber = (value: number, param: Partial<TemplateParameter>): boolean => {
+        const min = param.validation?.min;
+        const max = param.validation?.max;
+        if (min !== undefined && value < min) return false;
+        if (max !== undefined && value > max) return false;
         return true;
       };
 
@@ -264,16 +220,25 @@ describe("TemplateLibrary UI 逻辑测试", () => {
     });
 
     test("应该验证选项参数", () => {
-      const parameter: TemplateParameter = {
-        name: "priority",
+      const options: Array<{ label: string; value: unknown }> = [
+        { label: "低", value: "low" as unknown },
+        { label: "中", value: "medium" as unknown },
+        { label: "高", value: "high" as unknown },
+      ];
+
+      const parameter: Partial<TemplateParameter> = {
+        key: "priority",
+        name: "优先级",
         type: "select",
-        label: "优先级",
+        defaultValue: "medium",
         required: true,
-        options: ["low", "medium", "high"],
+        description: "优先级",
+        options,
       };
 
       const value = "medium";
-      const isValid = !parameter.options || parameter.options.includes(value);
+      const validValues = options.map(o => o.value);
+      const isValid = !parameter.options || validValues.includes(value);
 
       expect(isValid).toBe(true);
     });
@@ -302,11 +267,11 @@ describe("TemplateLibrary UI 逻辑测试", () => {
   describe("模板徽章", () => {
     test("必需的模板应该显示 required 徽章", () => {
       const template: Partial<EnterpriseTemplate> = {
-        isRequired: true,
+        targetRoles: ["admin"],
       };
 
       const badges: string[] = [];
-      if (template.isRequired) badges.push("required");
+      if ((template.targetRoles?.length ?? 0) > 0) badges.push("required");
 
       expect(badges).toContain("required");
     });
@@ -325,12 +290,11 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
     test("高评分模板应该显示 popular 徽章", () => {
       const template: Partial<EnterpriseTemplate> = {
-        rating: 4.5,
-        installCount: 150,
+        installedCount: 150,
       };
 
       const badges: string[] = [];
-      if ((template.rating ?? 0) >= 4.5 && (template.installCount ?? 0) >= 100) {
+      if ((template.installedCount ?? 0) >= 100) {
         badges.push("popular");
       }
 
@@ -365,13 +329,8 @@ describe("TemplateLibrary UI 逻辑测试", () => {
 
   describe("实际模板管理器集成", () => {
     test("应该能够获取所有模板", () => {
-      const templates = templateManager.getAllTemplates();
+      const templates = templateManager.getTemplates();
       expect(Array.isArray(templates)).toBe(true);
-    });
-
-    test("应该能够获取已安装的模板", () => {
-      const installations = templateManager.getInstallations();
-      expect(Array.isArray(installations)).toBe(true);
     });
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { flipQuick, flipRadio, flipLocation, locationEnabled, dndActive, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, NOTIF_CAP, flipFlashlight, torchOn, normalizeFlashlight, type Notif, type FlashlightStore } from "../lib/settings";
+import { flipQuick, flipRadio, flipLocation, locationEnabled, dndActive, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, markNotifRead, unreadCount, NOTIF_CAP, flipFlashlight, torchOn, normalizeFlashlight, type Notif, type FlashlightStore } from "../lib/settings";
 import {
   BACKUP_VERSION,
   SETTINGS_KEY,
@@ -450,6 +450,43 @@ describe("settings / NC helpers", () => {
     expect(out[0]!.id).toBe("id40"); // oldest id0..id39 evicted
     expect(out[out.length - 1]!.id).toBe(`id${NOTIF_CAP + 39}`); // newest tail intact
   });
+  test("normalizeNotifs preserves the push-only fields, and drops a bogus one alone", () => {
+    const out = normalizeNotifs([
+      { id: "p1", time: 5, source: "push", read: false, badge: 2 },
+      { id: "p2", time: 6, source: "system" },
+      // A bad badge must not take the rest of a legitimate row down with it.
+      { id: "p3", time: 7, source: "carrier-pigeon", read: "yes", badge: Number.NaN },
+    ]);
+    expect(out[0]).toEqual({ id: "p1", time: 5, source: "push", read: false, badge: 2 });
+    expect(out[1]).toEqual({ id: "p2", time: 6, source: "system" });
+    expect(out[2]).toEqual({ id: "p3", time: 7 });
+  });
+
+  test("markNotifRead flips exactly one id, is immutable, and ignores unknown ids", () => {
+    const before: Notif[] = [
+      { id: "a", time: 1, source: "push", read: false },
+      { id: "b", time: 2, source: "push", read: false },
+    ];
+    const after = markNotifRead(before, "a");
+    expect(after[0]?.read).toBe(true);
+    expect(after[1]?.read).toBe(false);
+    expect(before[0]?.read).toBe(false); // input untouched
+    expect(markNotifRead(after, "a")[0]?.read).toBe(true); // idempotent
+    expect(markNotifRead(before, "nope")).toEqual(before);
+  });
+
+  test("unreadCount counts only notifications carrying an explicit unread flag", () => {
+    expect(
+      unreadCount([
+        { id: "a", time: 1, source: "push", read: false },
+        { id: "b", time: 2, source: "push", read: true },
+        { id: "c", time: 3 }, // shell-made: no flag, and opening it removes it
+      ]),
+    ).toBe(1);
+    expect(unreadCount([])).toBe(0);
+  });
+
+
 
   test("flashlight helpers flip/torch/guard are consistent and immutable", () => {
     const off: FlashlightStore = { on: false, torch_present: true };

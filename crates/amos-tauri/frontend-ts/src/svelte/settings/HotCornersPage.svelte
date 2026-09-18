@@ -15,8 +15,20 @@
     type HotCornerConfig,
   } from "../../lib/hotCorners";
   import { t } from "../locale.svelte";
-  import { GROUP, HINT } from "./kit";
+  import { GROUP, HINT, nextFieldId } from "./kit";
   import StoreErrorBar from "../StoreErrorBar.svelte";
+
+  // 每个角落的三处可见标签与它们的控件共用**一枚 id**（REQ-A283）：控件必须由
+  // 看得见的标签命名，而手写 id 正是这两半最容易漂移的地方 —— 一次挂载取一次，
+  // 稳定且不重复（`{#each}` 里每次渲染重取会换 id，关联就断了）。
+  const ACTION_IDS: Record<string, string> = {};
+  const MODIFIER_IDS: Record<string, string> = {};
+  const DELAY_IDS: Record<string, string> = {};
+  for (const c of ["top-left", "top-right", "bottom-left", "bottom-right"] as const) {
+    ACTION_IDS[c] = nextFieldId();
+    MODIFIER_IDS[c] = nextFieldId();
+    DELAY_IDS[c] = nextFieldId();
+  }
 
   let configs = $state<HotCornerConfig[]>(
     normalizeHotCorners(readStoreValue(HOT_CORNER_KEY, DEFAULT_HOT_CORNERS))
@@ -81,12 +93,13 @@
       {@const config = getConfig(corner as Corner)}
       <div class={GROUP}>
         <div class="px-4 py-3">
-          <label class="block text-sm font-medium mb-2">
+          <label for={ACTION_IDS[corner]} class="block text-sm font-medium mb-2">
             {cornerLabels[corner as Corner]}
           </label>
 
           <!-- Action selector -->
           <select
+            id={ACTION_IDS[corner]}
             value={config.action}
             onchange={(e) =>
               updateCorner(corner as Corner, {
@@ -101,10 +114,11 @@
 
           {#if config.action !== "disabled"}
             <!-- Modifier key selector -->
-            <label class="block text-xs opacity-60 mt-3 mb-1">
+            <label for={MODIFIER_IDS[corner]} class="block text-xs opacity-60 mt-3 mb-1">
               {t("settings.hotCorner.modifier")}
             </label>
             <select
+              id={MODIFIER_IDS[corner]}
               value={config.modifier || ""}
               onchange={(e) => {
                 const val = e.currentTarget.value;
@@ -120,10 +134,11 @@
             </select>
 
             <!-- Delay slider -->
-            <label class="block text-xs opacity-60 mt-3 mb-1">
+            <label for={DELAY_IDS[corner]} class="block text-xs opacity-60 mt-3 mb-1">
               {t("settings.hotCorner.delay")}: {config.delay}ms
             </label>
             <input
+              id={DELAY_IDS[corner]}
               type="range"
               min="0"
               max="2000"

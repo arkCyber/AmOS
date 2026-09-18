@@ -338,11 +338,25 @@ function calleesOf(masked, fn, index) {
       push(resolveMethod(index, fn.selfType, m[2]));
     }
   }
-  // `Type::name(…)` — an explicit path to any type implemented in this file.
+  // `Type::name(…)` — an explicit path to a type implemented in this file. **Only a path
+  // that can actually name a local type**: one segment (`Timestamp::now()`), or two with a
+  // relative-crate prefix (`crate::Timestamp::now()`). Anything longer belongs to another
+  // crate/module — `amos_link::codec::Timestamp::now()` resolves *there*, not here — and
+  // matching only its last two segments made every C-ABI bridge method in
+  // `crates/amos-link-cc/src/lib.rs` look self-recursive (REQ-A387, 4 false positives; see
+  // the selftest case "a qualified path to another crate's same-named method").
+  const LOCAL_PREFIXES = new Set(["crate", "self", "super"]);
   for (const m of body.matchAll(
-    /([A-Za-z_][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>)?\s*\(/g,
+    /([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>)?\s*\(/g,
   )) {
-    push(resolveMethod(index, m[1], m[2]));
+    const path = m[1].split(/\s*::\s*/);
+    if (path.length === 1) {
+      push(resolveMethod(index, path[0], m[2]));
+      continue;
+    }
+    if (path.length === 2 && LOCAL_PREFIXES.has(path[0])) {
+      push(resolveMethod(index, path[1], m[2]));
+    }
   }
   // A bare `name(…)` — a free function (never this method), unless it is a definition.
   for (const m of body.matchAll(
@@ -500,6 +514,34 @@ function runSelftest() {
       src: `fn value() -> u8 { 1 }
     fn caller() -> u8 { other::value() }`,
       expect: [],
+    },
+    {
+      // REQ-A387: the C-ABI mirror in `crates/amos-link-cc/src/lib.rs` delegates to the
+      // **upstream** type's method of the same name. Resolving by the last two path
+      // segments made every one of those bridges look self-recursive (4 false positives:
+      // Qos::for_channel, Qos::validate, Timestamp::now, Timestamp::new).
+      name: "a qualified path to another crate's same-named method is not recursion",
+      src: `impl Timestamp {
+        pub fn now() -> Self {
+            let inner = amos_link::codec::Timestamp::now();
+            Self { secs: inner.secs, nanos: inner.nanos }
+        }
+        pub fn new(secs: u64) -> Self {
+            amos_link::codec::Timestamp::new(secs, 0).unwrap();
+            Self { secs, nanos: 0 }
+        }
+    }`,
+      expect: [],
+    },
+    {
+      // …while the same type reached through `crate::` **is** this file's type.
+      name: "crate::Type::method is still the local type",
+      src: `impl Counter {
+        fn count(&self, n: u32) -> u32 {
+            if n == 0 { 0 } else { crate::Counter::count(self, n - 1) }
+        }
+    }`,
+      expect: ["Counter::count"],
     },
     {
       name: "mentions inside strings and comments are not calls",

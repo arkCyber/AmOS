@@ -7,7 +7,7 @@
   // list is reactive over the shared amos.notifications store.
   import { t } from "./locale.svelte";
   import { themeDark, toggleTheme } from "./theme.svelte";
-  import { writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import {
     bridged,
     flashlightSet,
@@ -20,6 +20,7 @@
   import { attachFocusTrap } from "../lib/focusTrap";
   import { iconSvg, quickIcon } from "../lib/sysIcons";
   import { propsChannel } from "./propsBus";
+  import { markNotificationRead } from "../lib/pushNotifications";
   import { createStoreValue } from "./store";
   import { cellularRadio } from "./cellularRadio";
   import { CELLULAR_KEY, defaultCellular, normalizeCellular, type CellularPrefs } from "../lib/cellular";
@@ -38,11 +39,13 @@
     flipLocation,
     flipQuick,
     locationEnabled,
+    markNotifRead,
     normalizeFlashlight,
     normalizeNotifs,
     normalizeQuick,
     removeNotif,
     seedNotifs,
+    unreadCount,
     type FlashlightStore,
     type Notif,
     type QuickKey,
@@ -149,12 +152,16 @@
     return un;
   });
 
-  // Seed demo notifications once when the store is empty (mirrors React's mount
-  // seed). A later manual clear reaches the true empty state.
+  // Seed demo notifications once, and only when the **store** is empty. Reading the
+  // store (rather than the in-memory `notifs`, which lags the first subscription by a
+  // flush) matters now that a background poller can write this store on its own: the
+  // old `notifs.length === 0` test raced the subscribe effect and could overwrite a
+  // delivery that had already landed with three demo rows (REQ-A383).
   let seeded = false;
   $effect(() => {
-    if (!seeded && notifs.length === 0) {
-      seeded = true;
+    if (seeded) return;
+    seeded = true;
+    if (normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, [])).length === 0) {
       writeStoreValue(NOTIF_KEY, seedNotifs(Date.now()));
     }
   });
@@ -242,6 +249,20 @@
 
   const clear = () => writeStoreValue(NOTIF_KEY, []);
   const dismiss = (id: string) => writeStoreValue(NOTIF_KEY, removeNotif(notifs, id));
+
+  /** Unread **push** deliveries. Shell-made notifications carry no read flag (they
+   * are removed when opened), so this counts only what the device told us is unread. */
+  const unread = $derived(unreadCount(notifs));
+
+  /**
+   * Mark one delivery read: locally first — a screen must show the change the user
+   * just made — then on the device, best-effort. `markNotificationRead` is a no-op
+   * without a host bridge, and a device that refuses cannot un-read the list.
+   */
+  const markRead = (id: string) => {
+    writeStoreValue(NOTIF_KEY, markNotifRead(notifs, id));
+    void markNotificationRead(id);
+  };
 
   const close = () => bus.emit("close");
   const act = (name: string) => {
@@ -386,7 +407,7 @@
             {t("nc.dnd")}
           </span>
         {:else}
-          {notifs.length} ·
+          {notifs.length} ·{#if unread > 0} {t("nc.unread", { count: unread })}{/if}
         {/if}
       </span>
       <button onclick={clear} aria-label={t("nc.clear")} class="text-xs font-medium text-accent hover:underline">{t("nc.clear")}</button>
@@ -397,20 +418,44 @@
         <p class="py-12 text-center text-sm opacity-50">{t("nc.empty")}</p>
       {:else}
         {#each notifs as n (n.id)}
+          {@const unreadPush = n.source === "push" && n.read === false}
           <div
+            data-testid={`nc-notif-${n.id}`}
             class={
               "rounded-3xl p-3.5 shadow-sm ring-1 ring-black/5 dark:ring-white/10 " +
-              (quiet ? "bg-white/30 opacity-60 saturate-50 dark:bg-white/5" : "bg-white/60 dark:bg-white/10")
+              (quiet || (n.source === "push" && n.read === true)
+                ? "bg-white/30 opacity-60 saturate-50 dark:bg-white/5"
+                : "bg-white/60 dark:bg-white/10")
             }
           >
             <div class="flex items-center justify-between text-xs">
-              <span class="font-semibold">{n.icon} {n.app ?? n.title}</span>
-              <button
-                onclick={() => dismiss(n.id)}
-                aria-label={t("a11y.dismiss")}
-                data-icon="x"
-                class="grid h-6 w-6 place-items-center rounded-full opacity-60 transition hover:opacity-100"
-              >{@html iconSvg("x", "h-3 w-3")}</button>
+              <span class="flex min-w-0 items-center gap-1.5">
+                <span class="truncate font-semibold">{n.icon} {n.app ?? n.title}</span>
+                <!-- A delivery from the push backend says so, instead of blending into the
+                     shell's own notifications (REQ-A383). -->
+                {#if n.source === "push"}
+                  <span
+                    data-testid="nc-push-badge"
+                    class="shrink-0 rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] font-semibold text-accent"
+                  >{t("nc.pushBadge")}</span>
+                {/if}
+              </span>
+              <span class="flex shrink-0 items-center gap-0.5">
+                {#if unreadPush}
+                  <button
+                    onclick={() => markRead(n.id)}
+                    aria-label={t("nc.markRead")}
+                    data-icon="check"
+                    class="grid h-6 w-6 place-items-center rounded-full opacity-60 transition hover:opacity-100"
+                  >{@html iconSvg("check", "h-3 w-3")}</button>
+                {/if}
+                <button
+                  onclick={() => dismiss(n.id)}
+                  aria-label={t("a11y.dismiss")}
+                  data-icon="x"
+                  class="grid h-6 w-6 place-items-center rounded-full opacity-60 transition hover:opacity-100"
+                >{@html iconSvg("x", "h-3 w-3")}</button>
+              </span>
             </div>
             {#if n.title}<div class="mt-1 text-sm font-medium">{n.title}</div>{/if}
             {#if n.body}<div class="text-xs opacity-70">{n.body}</div>{/if}
