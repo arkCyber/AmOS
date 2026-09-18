@@ -6,7 +6,7 @@
  * current_date / format_date / 通知类透传）、变量引用（$input / $var）、
  * runCount 计数、执行异常落盘为失败结果，以及 MDM 限制（操作数上限）拦截。
  */
-import { describe, test as it, expect, beforeEach } from "bun:test";
+import { describe, test as it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import {
   createShortcut,
   executeShortcut,
@@ -20,7 +20,10 @@ import type { ActionInstance } from "../shortcuts";
 import { mdmManager } from "../enterprise/mdm";
 import type { MDMConfig, MDMRestrictions } from "../enterprise/mdm";
 
-// 与 shortcuts.test.ts 相同的存储缝：注入 window.localStorage 假体（纯 bun 环境无宿主存储）
+// 与 shortcuts.test.ts 相同的存储缝：注入 window.localStorage 假体（纯 bun 环境无宿主存储）。
+// pure 批次是一个进程跑所有文件，所以桩只在本文件生命周期内存在（beforeAll 装 / afterAll 还原）：
+// 装在模块顶层会泄漏给后面的文件，让它们凭空多出一个可用的存储（实测会让
+// enterprise-audit.test.ts 的用例走另一条分支）。
 const storageMap = new Map<string, string>();
 const mockStorage: Storage = {
   getItem: (key) => storageMap.get(key) ?? null,
@@ -32,14 +35,21 @@ const mockStorage: Storage = {
     return storageMap.size;
   },
 };
-if (typeof window === "undefined") {
-  (globalThis as { window?: unknown }).window = {
-    localStorage: mockStorage,
-    dispatchEvent: () => true,
-  };
-} else {
-  (window as unknown as { localStorage: Storage }).localStorage = mockStorage;
-}
+const globals = globalThis as Record<string, unknown>;
+const prevWindow = globals.window;
+const prevLocalStorage = globals.localStorage;
+
+beforeAll(() => {
+  globals.window = { localStorage: mockStorage, dispatchEvent: () => true };
+  globals.localStorage = mockStorage;
+});
+
+afterAll(() => {
+  if (prevWindow === undefined) delete globals.window;
+  else globals.window = prevWindow;
+  if (prevLocalStorage === undefined) delete globals.localStorage;
+  else globals.localStorage = prevLocalStorage;
+});
 
 let seq = 0;
 const action = (actionTypeId: string, parameters: Record<string, unknown> = {}): ActionInstance => ({

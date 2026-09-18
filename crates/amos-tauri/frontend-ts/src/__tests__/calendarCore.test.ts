@@ -5,7 +5,7 @@
  * Map-backed localStorage (same trick as core.test.ts) and assert both the
  * notifications and the idempotency markers it writes.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   ALERT_GRACE_MS,
   CALENDAR_FIRED_KEY,
@@ -53,6 +53,21 @@ function withStorage(store: Map<string, string>) {
     dispatchEvent: () => true,
   };
 }
+
+/**
+ * `withStorage` 把 `window` 指向一个内存 localStorage。**pure 批次是一个进程跑所有文件**
+ * (`scripts/bun-iso-test.mjs`)，所以这个桩必须在每个用例后还原：漏出去的可用存储会让
+ * 同批次后面的文件走另一条分支。实测（2026-09-18）——不还原时
+ * `enterprise-audit.test.ts` 的「并发安全 > 应该处理并发日志记录」变红：那边 `beforeEach`
+ * 只在存储不可用时才回落默认配置，可用的存储把 `minLevel: "warning"` 持久化了下来。
+ */
+let realWindow: unknown;
+beforeEach(() => {
+  realWindow = (globalThis as unknown as { window?: unknown }).window;
+});
+afterEach(() => {
+  (globalThis as unknown as { window?: unknown }).window = realWindow;
+});
 
 describe("calendarCore — fired markers", () => {
   test("normalizeFired keeps finite numeric entries only", () => {

@@ -8,7 +8,7 @@
  * - 实时预览功能
  */
 
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import {
   loadShortcuts,
   createShortcut,
@@ -33,15 +33,24 @@ const mockStorage: Storage = {
   },
 };
 
-if (typeof window === 'undefined') {
-  (global as any).window = {
-    localStorage: mockStorage,
-    dispatchEvent: () => true,
-  };
-} else {
-  (window as any).localStorage = mockStorage;
-}
-global.localStorage = mockStorage;
+// `window` / `global.localStorage` 桩：pure 批次是一个进程跑所有文件，所以只在
+// 本文件的生命周期内存在（`beforeAll` 装 / `afterAll` 还原）。装在模块顶层会泄漏给
+// 后面的文件 —— 实测那样会让 `enterprise-audit.test.ts` 的用例走另一条分支。
+const globals = globalThis as Record<string, unknown>;
+const prevWindow = globals.window;
+const prevLocalStorage = globals.localStorage;
+
+beforeAll(() => {
+  globals.window = { localStorage: mockStorage, dispatchEvent: () => true };
+  globals.localStorage = mockStorage;
+});
+
+afterAll(() => {
+  if (prevWindow === undefined) delete globals.window;
+  else globals.window = prevWindow;
+  if (prevLocalStorage === undefined) delete globals.localStorage;
+  else globals.localStorage = prevLocalStorage;
+});
 
 beforeEach(() => {
   storageMap.clear();

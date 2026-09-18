@@ -194,14 +194,14 @@ describe("backend 事件订阅与会话持久化", () => {
 
   it("onTelephonyEvent：只把带 string id 的通话转发给回调，退订后不再转发", async () => {
     installInternals();
-    const got: Array<{ id: string }> = [];
+    const got: Array<{ id: string; state?: string }> = [];
     const unsub = backend.onTelephonyEvent((c) => got.push(c));
     await flush();
     const ch = backend.TELEPHONY_EVENT;
     listeners.get(ch)!({ payload: { id: "call-1", state: "ringing" } });
     listeners.get(ch)!({ payload: { state: "ignored-no-id" } });
     listeners.get(ch)!({ payload: null });
-    expect(got).toEqual([{ id: "call-1" }]);
+    expect(got).toEqual([{ id: "call-1", state: "ringing" }]);
     unsub();
     expect(listeners.has(ch)).toBe(false);
   });

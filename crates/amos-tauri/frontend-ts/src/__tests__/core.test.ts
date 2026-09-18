@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   defaultLayout,
   getLayout,
@@ -22,6 +22,18 @@ function withStorage(store: Map<string, string>) {
     },
   };
 }
+
+/**
+ * pure 批次是一个进程跑所有文件，所以 `window` 桩必须逐用例还原 —— 否则后面的文件
+ * （例如 `enterprise-audit.test.ts`）会凭空多出一个可用的 localStorage，走另一条分支。
+ */
+let realWindow: unknown;
+beforeEach(() => {
+  realWindow = (globalThis as unknown as { window?: unknown }).window;
+});
+afterEach(() => {
+  (globalThis as unknown as { window?: unknown }).window = realWindow;
+});
 
 describe("core shell", () => {
   test("default layout puts known dock apps on the dock, the rest on a page", () => {

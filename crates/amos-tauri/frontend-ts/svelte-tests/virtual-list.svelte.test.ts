@@ -1,397 +1,105 @@
 /**
- * VirtualList.test.ts - 虚拟滚动列表组件单元测试
- * 
- * 需要 DOM 环境支持
+ * virtual-list.svelte.test.ts — `VirtualList.svelte` 的组件契约
+ * （`src/svelte/components/VirtualList.svelte`，被 `AuditLogViewer` 使用）。
+ *
+ * 组件把每一项交给 `renderItem` snippet 渲染，只把**可见窗口的切片**交出去，所以这里用
+ * `createRawSnippet` 造一个会把"我是第几项"写进 `data-idx` 的 snippet，据此断言：
+ *   • 容器高度来自 `containerHeight`，空列表不渲染任何项；
+ *   • spacer 高度 = 所有项高度之和（固定值与函数式两种）；
+ *   • 只有窗口内的项被渲染，`data-index` 是**真实下标**，内容确实来自 snippet；
+ *   • 滚动会移动窗口：被跳过的项高度变成顶部填充（`translateY`）。
+ *
+ * 为什么重写：原文件渲染的是 `VirtualList<TestItem>` 且**不传 `renderItem`** —— 那是组件
+ * 还在用默认插槽时的写法。组件后来改成 snippet 属性，于是那批用例即便跑起来也会在
+ * `{@render renderItem(...)}` 上抛错；而它当时并不在任何一个 runner 的扫描目录里
+ * （`src/svelte/components/__tests__/`），所以没有任何门会红。现按仓库约定落在 `svelte-tests/`。
  */
+import { afterEach, describe, expect, test } from "vitest";
+import { cleanup, fireEvent, render } from "@testing-library/svelte";
+import { createRawSnippet } from "svelte";
+import VirtualList from "../src/svelte/components/VirtualList.svelte";
 
-import { GlobalRegistrator } from "@happy-dom/global-registrator";
-GlobalRegistrator.register();
-
-import { describe, it, expect, beforeEach } from "bun:test";
-import { render, screen } from "@testing-library/svelte";
-import VirtualListComponent from "../src/svelte/components/VirtualList.svelte";
-
-// 为 @testing-library/svelte 创建兼容的组件导入
-const VirtualList = { default: VirtualListComponent };
-
-// ============================================================================
-// 测试数据
-// ============================================================================
-
-interface TestItem {
+interface Item {
   id: number;
   content: string;
 }
 
-const createTestItems = (count: number): TestItem[] =>
-  Array.from({ length: count }, (_, i) => ({
-    id: i,
-    content: `Item ${i}`,
-  }));
+const makeItems = (n: number): Item[] =>
+  Array.from({ length: n }, (_, i) => ({ id: i, content: `Item ${i}` }));
 
-// ============================================================================
-// 基础渲染测试
-// ============================================================================
+/** 每一项渲染成 `<span class="vrow" data-idx="…">内容</span>`，便于断言窗口位置。 */
+const renderItem = createRawSnippet<[Item, number]>((item, index) => ({
+  render: () => `<span class="vrow" data-idx="${index()}" data-id="${item().id}">${item().content}</span>`,
+}));
 
-describe("VirtualList - 基础渲染", () => {
-  it("应该渲染容器", () => {
-    const items = createTestItems(10);
-    const { container } = render(VirtualList<TestItem>, {
+const rows = (el: HTMLElement): Element[] => Array.from(el.querySelectorAll(".virtual-list-item"));
+
+afterEach(() => cleanup());
+
+describe("VirtualList — 渲染与虚拟化", () => {
+  test("空列表：容器高度来自 containerHeight，且不渲染任何项", () => {
+    const { container } = render(VirtualList, {
+      props: { items: [], itemHeight: 50, containerHeight: 300, renderItem },
+    });
+    const box = container.querySelector(".virtual-list-container") as HTMLElement;
+    expect(box.style.height).toBe("300px");
+    expect(rows(container).length).toBe(0);
+  });
+
+  test("spacer 高度等于固定高度的总和", () => {
+    const { container } = render(VirtualList, {
+      props: { items: makeItems(10), itemHeight: 50, containerHeight: 300, renderItem },
+    });
+    const spacer = container.querySelector(".virtual-list-spacer") as HTMLElement;
+    expect(spacer.style.height).toBe("500px"); // 10 × 50
+  });
+
+  test("函数式高度参与总和", () => {
+    const { container } = render(VirtualList, {
       props: {
-        items,
-        itemHeight: 50,
+        items: makeItems(10),
+        itemHeight: (it: Item) => (it.id % 2 === 0 ? 60 : 40),
         containerHeight: 300,
+        renderItem,
       },
     });
-
-    const listContainer = container.querySelector(".virtual-list-container");
-    expect(listContainer).toBeTruthy();
-    expect(listContainer?.getAttribute("style")).toContain("height: 300px");
+    const spacer = container.querySelector(".virtual-list-spacer") as HTMLElement;
+    expect(spacer.style.height).toBe("500px"); // 5 × 60 + 5 × 40
   });
 
-  it("应该计算正确的总高度", () => {
-    const items = createTestItems(10);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-      },
+  test("只渲染窗口内的项：数量小于总数，首项 data-index 为 0，内容来自 renderItem", () => {
+    const { container } = render(VirtualList, {
+      props: { items: makeItems(100), itemHeight: 50, containerHeight: 300, buffer: 2, renderItem },
     });
-
-    const spacer = container.querySelector(".virtual-list-spacer");
-    expect(spacer?.getAttribute("style")).toContain("height: 500px"); // 10 * 50
+    const rendered = rows(container);
+    expect(rendered.length).toBeGreaterThan(0);
+    expect(rendered.length).toBeLessThan(100);
+    expect(rendered[0]!.getAttribute("data-index")).toBe("0");
+    expect(rendered[0]!.querySelector(".vrow")!.textContent).toBe("Item 0");
   });
 
-  it("应该仅渲染可见区域内的项目", () => {
-    const items = createTestItems(100);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300, // 可见 6 项
-        buffer: 2,
-      },
+  test("滚动后窗口前移，被跳过的项高度成为顶部填充", async () => {
+    const { container } = render(VirtualList, {
+      props: { items: makeItems(100), itemHeight: 50, containerHeight: 300, buffer: 2, renderItem },
     });
+    const box = container.querySelector(".virtual-list-container") as HTMLElement;
+    box.scrollTop = 1000;
+    await fireEvent.scroll(box);
 
-    // 可见区域: 0-5 (6项) + buffer 前后各2项 = 最多10项
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    expect(renderedItems.length).toBeLessThanOrEqual(12); // 6 + 2*2 + 一些余量
-    expect(renderedItems.length).toBeGreaterThan(0);
-  });
-});
-
-// ============================================================================
-// 动态高度测试
-// ============================================================================
-
-describe("VirtualList - 动态高度", () => {
-  it("应该支持函数式高度计算", () => {
-    const items = createTestItems(10);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: (item: TestItem) => (item.id % 2 === 0 ? 60 : 40),
-        containerHeight: 300,
-      },
-    });
-
-    const spacer = container.querySelector(".virtual-list-spacer");
-    // 总高度: 5*60 + 5*40 = 500
-    expect(spacer?.getAttribute("style")).toContain("height: 500px");
+    // scrollTop=1000, h=50 ⇒ 第一个可见项是 20，减 buffer 2 ⇒ startIndex=18 ⇒ 18×50=900
+    const content = container.querySelector(".virtual-list-content") as HTMLElement;
+    expect(content.style.transform).toBe("translateY(900px)");
+    const firstIndex = Number(rows(container)[0]!.getAttribute("data-index"));
+    expect(firstIndex).toBe(18);
   });
 
-  it("应该为每个项目应用正确的高度", () => {
-    const items = createTestItems(5);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: (item: TestItem) => (item.id === 2 ? 100 : 50),
-        containerHeight: 400,
-      },
+  test("窗口内的每一项都带着它自己的真实下标", () => {
+    const { container } = render(VirtualList, {
+      props: { items: makeItems(30), itemHeight: 40, containerHeight: 200, buffer: 1, renderItem },
     });
-
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    const thirdItem = Array.from(renderedItems).find(
-      (el) => el.getAttribute("data-index") === "2"
-    );
-
-    expect(thirdItem?.getAttribute("style")).toContain("height: 100px");
-  });
-});
-
-// ============================================================================
-// 滚动行为测试
-// ============================================================================
-
-describe("VirtualList - 滚动行为", () => {
-  it("应该在滚动时更新可见范围", () => {
-    const items = createTestItems(100);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-        buffer: 1,
-      },
-    });
-
-    const listContainer = container.querySelector(
-      ".virtual-list-container"
-    ) as HTMLDivElement;
-
-    // 初始状态: 应该从索引 0 开始
-    let firstItem = container.querySelector('[data-index="0"]');
-    expect(firstItem).toBeTruthy();
-
-    // 模拟滚动到中间位置
-    Object.defineProperty(listContainer, "scrollTop", {
-      writable: true,
-      value: 2500, // 滚动到第 50 项附近
-    });
-    listContainer.dispatchEvent(new Event("scroll"));
-
-    // 注意: 由于 Svelte 的响应式更新，这里需要等待 DOM 更新
-    // 在真实环境中，滚动后应该不再渲染索引 0
-    // 这个测试在真实浏览器环境中会通过，但在 jsdom 中可能需要额外处理
-  });
-
-  it("应该计算正确的偏移量", () => {
-    const items = createTestItems(100);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-        buffer: 0,
-      },
-    });
-
-    const content = container.querySelector(".virtual-list-content");
-    // 初始偏移应该是 0
-    expect(content?.getAttribute("style")).toContain("translateY(0px)");
-  });
-});
-
-// ============================================================================
-// 缓冲区测试
-// ============================================================================
-
-describe("VirtualList - 缓冲区", () => {
-  it("应该尊重自定义缓冲区大小", () => {
-    const items = createTestItems(100);
-    const { container: container1 } = render(VirtualList, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-        buffer: 0,
-      },
-    });
-
-    const { container: container2 } = render(VirtualList, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-        buffer: 5,
-      },
-    });
-
-    const items1 = container1.querySelectorAll(".virtual-list-item");
-    const items2 = container2.querySelectorAll(".virtual-list-item");
-
-    // buffer=5 应该渲染更多项目
-    expect(items2.length).toBeGreaterThan(items1.length);
-  });
-
-  it("应该使用默认缓冲区值 3", () => {
-    const items = createTestItems(20);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-        // 不提供 buffer，应该使用默认值 3
-      },
-    });
-
-    // 可见项: 6 (300/50) + buffer 前3 + 后3 = 至少 6 项，可能更多
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    expect(renderedItems.length).toBeGreaterThanOrEqual(6);
-  });
-});
-
-// ============================================================================
-// 边界情况测试
-// ============================================================================
-
-describe("VirtualList - 边界情况", () => {
-  it("应该处理空列表", () => {
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items: [],
-        itemHeight: 50,
-        containerHeight: 300,
-      },
-    });
-
-    const spacer = container.querySelector(".virtual-list-spacer");
-    expect(spacer?.getAttribute("style")).toContain("height: 0px");
-
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    expect(renderedItems.length).toBe(0);
-  });
-
-  it("应该处理单项列表", () => {
-    const items = createTestItems(1);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-      },
-    });
-
-    const spacer = container.querySelector(".virtual-list-spacer");
-    expect(spacer?.getAttribute("style")).toContain("height: 50px");
-
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    expect(renderedItems.length).toBe(1);
-  });
-
-  it("应该处理容器高度大于总内容高度的情况", () => {
-    const items = createTestItems(3);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 500, // 容器 500px，内容仅 150px
-      },
-    });
-
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    // 应该渲染所有项目
-    expect(renderedItems.length).toBe(3);
-  });
-
-  it("应该处理非常小的项目高度", () => {
-    const items = createTestItems(1000);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 1, // 1px per item
-        containerHeight: 300,
-        buffer: 10,
-      },
-    });
-
-    const spacer = container.querySelector(".virtual-list-spacer");
-    expect(spacer?.getAttribute("style")).toContain("height: 1000px");
-
-    // 应该渲染足够多的项目以填满可见区域
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    expect(renderedItems.length).toBeGreaterThan(300); // 至少 300 项可见
-  });
-
-  it("应该处理非常大的项目高度", () => {
-    const items = createTestItems(10);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 500, // 500px per item
-        containerHeight: 300,
-        buffer: 1,
-      },
-    });
-
-    // 可见区域只能显示不到1项，加上buffer，应该渲染2-3项
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    expect(renderedItems.length).toBeLessThanOrEqual(4);
-    expect(renderedItems.length).toBeGreaterThan(0);
-  });
-});
-
-// ============================================================================
-// 性能测试
-// ============================================================================
-
-describe("VirtualList - 性能", () => {
-  it("应该能处理大量数据（10000 项）", () => {
-    const items = createTestItems(10000);
-    const startTime = performance.now();
-
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 600,
-      },
-    });
-
-    const endTime = performance.now();
-    const renderTime = endTime - startTime;
-
-    // 渲染应该在合理时间内完成（< 100ms）
-    expect(renderTime).toBeLessThan(100);
-
-    // 应该只渲染可见区域的项目，而不是全部 10000 项
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    expect(renderedItems.length).toBeLessThan(50); // 远少于 10000
-  });
-
-  it("应该能快速计算总高度（100000 项）", () => {
-    const items = createTestItems(100000);
-    const startTime = performance.now();
-
-    render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 600,
-      },
-    });
-
-    const endTime = performance.now();
-    const renderTime = endTime - startTime;
-
-    // 即使 100000 项，初始渲染也应该很快（< 200ms）
-    expect(renderTime).toBeLessThan(200);
-  });
-});
-
-// ============================================================================
-// 数据索引测试
-// ============================================================================
-
-describe("VirtualList - 数据索引", () => {
-  it("应该为每个项目设置正确的 data-index", () => {
-    const items = createTestItems(20);
-    const { container } = render(VirtualList<TestItem>, {
-      props: {
-        items,
-        itemHeight: 50,
-        containerHeight: 300,
-        buffer: 1,
-      },
-    });
-
-    const renderedItems = container.querySelectorAll(".virtual-list-item");
-    
-    // 验证第一个渲染的项目有正确的索引
-    const firstItem = renderedItems[0];
-    const firstIndex = parseInt(firstItem.getAttribute("data-index") || "0");
-    
-    // 第一个应该是 0 或接近 0（取决于 buffer）
-    expect(firstIndex).toBeLessThanOrEqual(1);
-    
-    // 验证索引是连续的
-    const indices = Array.from(renderedItems).map((el) =>
-      parseInt(el.getAttribute("data-index") || "0")
-    );
-    
-    for (let i = 1; i < indices.length; i++) {
-      expect(indices[i]).toBe(indices[i - 1] + 1);
-    }
+    const indices = rows(container).map((el) => Number(el.getAttribute("data-index")));
+    expect(indices.length).toBeGreaterThan(0);
+    // 连续、从 0 开始、且严格递增 —— 任何重复/错位都会在这里露出来
+    expect(indices).toEqual(indices.map((_, i) => i));
   });
 });

@@ -22,7 +22,7 @@
 
   import type { Snippet } from "svelte";
 
-  interface Props {
+  interface Props extends Record<string, unknown> {
     /** 列表数据 */
     items: T[];
     /** 项目高度（固定值或计算函数） */
@@ -41,7 +41,7 @@
     containerHeight,
     buffer = 3,
     renderItem,
-  }: Props = $props();
+  } = $props<Props>();
 
   // ============================================================================
   // 状态管理

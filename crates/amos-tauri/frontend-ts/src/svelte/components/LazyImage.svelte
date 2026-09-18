@@ -16,7 +16,10 @@
    * ```
    */
 
-  interface Props {
+  // `extends Record<string, unknown>` + `$props<Props>()` 是本仓既有的写法
+  // （见 FileErrorBanner.svelte）：直接 `: Props = $props()` 时 svelte-check 会报
+  // 「Type 'Record<string, unknown>' is missing the following properties from type 'Props'」。
+  interface Props extends Record<string, unknown> {
     /** 图片 URL */
     src: string;
     /** 替代文本 */
@@ -44,7 +47,7 @@
     rootMargin = "50px",
     onload,
     onerror,
-  }: Props = $props();
+  } = $props<Props>();
 
   // ============================================================================
   // 状态管理
