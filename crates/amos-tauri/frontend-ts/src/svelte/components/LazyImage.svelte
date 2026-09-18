@@ -31,8 +31,8 @@
     rootMargin?: string;
     /** 图片加载回调 */
     onload?: () => void;
-    /** 图片错误回调 */
-    onerror?: (error: Event) => void;
+    /** 图片错误回调（`HTMLImageElement.onerror` 的入参是 `Event | string`，照实转发） */
+    onerror?: (error: Event | string) => void;
   }
 
   let {

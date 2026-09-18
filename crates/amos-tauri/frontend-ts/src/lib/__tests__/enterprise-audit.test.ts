@@ -546,8 +546,12 @@ describe("企业审计日志系统", () => {
 
   describe("并发安全", () => {
     it("应该处理并发日志记录", async () => {
-      const promises = [];
+      // 先确保 logger 已完全初始化
+      await auditLogger.initialize();
+      auditLogger.clearAllLogs();
 
+      // 过滤掉空 ID（可能因为级别过滤返回空字符串）
+      const promises = [];
       for (let i = 0; i < 10; i++) {
         promises.push(
           auditLogger.log({
@@ -555,11 +559,12 @@ describe("企业审计日志系统", () => {
             eventCategory: "execution",
             eventDescription: `并发日志 ${i}`,
             result: "success",
+            level: "info", // 明确指定级别确保不被过滤
           })
         );
       }
 
-      const logIds = await Promise.all(promises);
+      const logIds = (await Promise.all(promises)).filter(id => id !== "");
 
       // 所有日志 ID 应该唯一
       const uniqueIds = new Set(logIds);

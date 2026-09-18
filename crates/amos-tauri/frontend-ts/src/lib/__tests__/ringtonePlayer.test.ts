@@ -16,7 +16,6 @@ import {
   stopAlarmRing,
   previewAlarmTone,
 } from "../ringtonePlayer";
-import { ringtoneIdFor } from "../ringtone";
 
 // ---------------------------------------------------------------------------
 // 假音频栈

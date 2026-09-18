@@ -14,13 +14,13 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
-import APISettings from "../APISettings.svelte";
-import { apiClient, webhookManager } from "../../../lib/enterprise";
-import type { APIConfig } from "../../../lib/enterprise/api";
-import type { WebhookConfig } from "../../../lib/enterprise/webhooks";
+import APISettings from "../src/svelte/modules/APISettings.svelte";
+import { apiClient, webhookManager } from "../src/lib/enterprise";
+import type { APIConfig } from "../src/lib/enterprise/api";
+import type { WebhookConfig } from "../src/lib/enterprise/webhooks";
 
 // Mock 企业模块
-vi.mock("../../../lib/enterprise", () => ({
+vi.mock("../src/lib/enterprise", () => ({
   apiClient: {
     getConfig: vi.fn(),
     configure: vi.fn(),
@@ -36,7 +36,7 @@ vi.mock("../../../lib/enterprise", () => ({
 }));
 
 // Mock 国际化
-vi.mock("../../locale.svelte", () => ({
+vi.mock("../src/svelte/locale.svelte", () => ({
   t: vi.fn((key: string, params?: Record<string, any>) => {
     const translations: Record<string, string> = {
       "api.title": "API 集成",
@@ -107,7 +107,7 @@ vi.mock("../../locale.svelte", () => ({
 }));
 
 // Mock 焦点陷阱
-vi.mock("../../../lib/focusTrap", () => ({
+vi.mock("../src/lib/focusTrap", () => ({
   attachFocusTrap: vi.fn(() => () => {}),
 }));
 
@@ -173,20 +173,20 @@ describe("APISettings", () => {
     it("应该渲染标题和副标题", () => {
       render(APISettings);
       
-      expect(screen.getByText("API 集成")).toBeInTheDocument();
-      expect(screen.getByText("配置企业 API 和 Webhook 集成")).toBeInTheDocument();
+      expect(screen.getByText("API 集成")).toBeTruthy();
+      expect(screen.getByText("配置企业 API 和 Webhook 集成")).toBeTruthy();
     });
 
     it("应该渲染 API 配置区域", () => {
       render(APISettings);
       
-      expect(screen.getByText("API 配置")).toBeInTheDocument();
+      expect(screen.getByText("API 配置")).toBeTruthy();
     });
 
     it("应该渲染 Webhook 管理区域", () => {
       render(APISettings);
       
-      expect(screen.getByText("Webhook 管理")).toBeInTheDocument();
+      expect(screen.getByText("Webhook 管理")).toBeTruthy();
     });
   });
 
@@ -296,7 +296,7 @@ describe("APISettings", () => {
     it("应该显示测试连接按钮", () => {
       render(APISettings);
       
-      expect(screen.getByText("测试连接")).toBeInTheDocument();
+      expect(screen.getByText("测试连接")).toBeTruthy();
     });
 
     it("成功测试连接应该显示成功消息", async () => {
@@ -308,7 +308,7 @@ describe("APISettings", () => {
       await fireEvent.click(testBtn);
       
       await waitFor(() => {
-        expect(screen.getByText(/连接成功/)).toBeInTheDocument();
+        expect(screen.getByText(/连接成功/)).toBeTruthy();
         expect(screen.getByRole("status")).toHaveClass("success");
       });
     });
@@ -322,7 +322,7 @@ describe("APISettings", () => {
       await fireEvent.click(testBtn);
       
       await waitFor(() => {
-        expect(screen.getByText(/网络错误/)).toBeInTheDocument();
+        expect(screen.getByText(/网络错误/)).toBeTruthy();
         expect(screen.getByRole("status")).toHaveClass("error");
       });
     });
@@ -357,7 +357,7 @@ describe("APISettings", () => {
     it("应该显示保存按钮", () => {
       render(APISettings);
       
-      expect(screen.getByText("保存配置")).toBeInTheDocument();
+      expect(screen.getByText("保存配置")).toBeTruthy();
     });
 
     it("成功保存应该显示成功消息", async () => {
@@ -367,7 +367,7 @@ describe("APISettings", () => {
       await fireEvent.click(saveBtn);
       
       await waitFor(() => {
-        expect(screen.getByText(/配置已保存/)).toBeInTheDocument();
+        expect(screen.getByText(/配置已保存/)).toBeTruthy();
       });
       
       expect(apiClient.configure).toHaveBeenCalled();
@@ -384,7 +384,7 @@ describe("APISettings", () => {
       await fireEvent.click(saveBtn);
       
       await waitFor(() => {
-        expect(screen.getByText(/保存失败/)).toBeInTheDocument();
+        expect(screen.getByText(/保存失败/)).toBeTruthy();
       });
     });
 
@@ -405,35 +405,35 @@ describe("APISettings", () => {
     it("应该显示所有 Webhook", () => {
       render(APISettings);
       
-      expect(screen.getByText("Slack 通知")).toBeInTheDocument();
-      expect(screen.getByText("钉钉机器人")).toBeInTheDocument();
+      expect(screen.getByText("Slack 通知")).toBeTruthy();
+      expect(screen.getByText("钉钉机器人")).toBeTruthy();
     });
 
     it("应该显示 Webhook URL", () => {
       render(APISettings);
       
-      expect(screen.getByText("https://hooks.slack.com/services/xxx")).toBeInTheDocument();
-      expect(screen.getByText("https://oapi.dingtalk.com/robot/send")).toBeInTheDocument();
+      expect(screen.getByText("https://hooks.slack.com/services/xxx")).toBeTruthy();
+      expect(screen.getByText("https://oapi.dingtalk.com/robot/send")).toBeTruthy();
     });
 
     it("应该显示订阅的事件", () => {
       render(APISettings);
       
-      expect(screen.getByText(/shortcut_run, shortcut_create/)).toBeInTheDocument();
+      expect(screen.getByText(/shortcut_run, shortcut_create/)).toBeTruthy();
     });
 
     it("应该显示触发统计", () => {
       render(APISettings);
       
-      expect(screen.getByText("100 次")).toBeInTheDocument();
-      expect(screen.getByText(/95 \(95%\)/)).toBeInTheDocument();
+      expect(screen.getByText("100 次")).toBeTruthy();
+      expect(screen.getByText(/95 \(95%\)/)).toBeTruthy();
     });
 
     it("应该显示启用状态", () => {
       render(APISettings);
       
-      expect(screen.getByText("已启用")).toBeInTheDocument();
-      expect(screen.getByText("已禁用")).toBeInTheDocument();
+      expect(screen.getByText("已启用")).toBeTruthy();
+      expect(screen.getByText("已禁用")).toBeTruthy();
     });
 
     it("禁用的 Webhook 应该有视觉标记", () => {
@@ -448,8 +448,8 @@ describe("APISettings", () => {
       
       render(APISettings);
       
-      expect(screen.getByText("暂无 Webhook")).toBeInTheDocument();
-      expect(screen.getByText("点击右上角添加按钮创建第一个 Webhook")).toBeInTheDocument();
+      expect(screen.getByText("暂无 Webhook")).toBeTruthy();
+      expect(screen.getByText("点击右上角添加按钮创建第一个 Webhook")).toBeTruthy();
     });
   });
 
@@ -470,8 +470,8 @@ describe("APISettings", () => {
       await fireEvent.click(editBtns[0]);
       
       await waitFor(() => {
-        expect(screen.getByText("编辑 Webhook")).toBeInTheDocument();
-        expect(screen.getByRole("dialog")).toBeInTheDocument();
+        expect(screen.getByText("编辑 Webhook")).toBeTruthy();
+        expect(screen.getByRole("dialog")).toBeTruthy();
       });
     });
 
@@ -549,8 +549,8 @@ describe("APISettings", () => {
       await fireEvent.click(addBtn);
       
       await waitFor(() => {
-        expect(screen.getByText("添加 Webhook")).toBeInTheDocument();
-        expect(screen.getByRole("dialog")).toBeInTheDocument();
+        expect(screen.getByText("添加 Webhook")).toBeTruthy();
+        expect(screen.getByRole("dialog")).toBeTruthy();
       });
     });
 
@@ -589,9 +589,9 @@ describe("APISettings", () => {
       await fireEvent.click(screen.getByText("添加 Webhook"));
       
       await waitFor(() => {
-        expect(screen.getByText("快捷指令创建")).toBeInTheDocument();
-        expect(screen.getByText("快捷指令运行")).toBeInTheDocument();
-        expect(screen.getByText("模板安装")).toBeInTheDocument();
+        expect(screen.getByText("快捷指令创建")).toBeTruthy();
+        expect(screen.getByText("快捷指令运行")).toBeTruthy();
+        expect(screen.getByText("模板安装")).toBeTruthy();
       });
     });
 
@@ -668,7 +668,7 @@ describe("APISettings", () => {
       });
       
       await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(screen.queryByRole("dialog")).not.toBeTruthy();
       });
       
       expect(webhookManager.addWebhook).toHaveBeenCalled();
@@ -685,7 +685,7 @@ describe("APISettings", () => {
       });
       
       await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(screen.queryByRole("dialog")).not.toBeTruthy();
       });
     });
 
@@ -700,7 +700,7 @@ describe("APISettings", () => {
       });
       
       await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(screen.queryByRole("dialog")).not.toBeTruthy();
       });
     });
   });
@@ -730,10 +730,10 @@ describe("APISettings", () => {
       render(APISettings);
       
       // Webhook 1: 95/100 = 95%
-      expect(screen.getByText(/95 \(95%\)/)).toBeInTheDocument();
+      expect(screen.getByText(/95 \(95%\)/)).toBeTruthy();
       
       // Webhook 2: 48/50 = 96%
-      expect(screen.getByText(/48 \(96%\)/)).toBeInTheDocument();
+      expect(screen.getByText(/48 \(96%\)/)).toBeTruthy();
     });
 
     it("触发次数为 0 时成功率应该是 0%", () => {
@@ -746,7 +746,7 @@ describe("APISettings", () => {
       
       render(APISettings);
       
-      expect(screen.getByText(/0 \(0%\)/)).toBeInTheDocument();
+      expect(screen.getByText(/0 \(0%\)/)).toBeTruthy();
     });
 
     it("保存 Webhook 失败应该显示错误", async () => {
@@ -784,8 +784,8 @@ describe("APISettings", () => {
       render(APISettings);
       
       // 通过渲染的统计信息验证计算正确
-      expect(screen.getByText(/95 \(95%\)/)).toBeInTheDocument();
-      expect(screen.getByText(/48 \(96%\)/)).toBeInTheDocument();
+      expect(screen.getByText(/95 \(95%\)/)).toBeTruthy();
+      expect(screen.getByText(/48 \(96%\)/)).toBeTruthy();
     });
   });
 });

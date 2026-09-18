@@ -10,7 +10,7 @@
  * - 参考物体选择
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   MEASURE_SETTINGS_KEY,
   MEASURE_HISTORY_KEY,
@@ -26,7 +26,7 @@ import {
   REFERENCE_OBJECTS,
   getReferenceObject,
 } from "../lib/measure";
-import type { MeasurePoint, Measurement, MeasureSettings } from "../lib/measure";
+import type { MeasurePoint, Measurement } from "../lib/measure";
 
 describe("MeasureApp - 设置和持久化", () => {
   describe("defaultMeasureSettings", () => {

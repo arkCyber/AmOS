@@ -22,7 +22,7 @@
 
   import type { Snippet } from "svelte";
 
-  interface Props<T> {
+  interface Props {
     /** 列表数据 */
     items: T[];
     /** 项目高度（固定值或计算函数） */
@@ -33,8 +33,6 @@
     buffer?: number;
     /** 渲染单个项目的插槽 */
     renderItem: Snippet<[T, number]>;
-    /** 子内容 */
-    children?: Snippet;
   }
 
   let {
@@ -43,15 +41,13 @@
     containerHeight,
     buffer = 3,
     renderItem,
-    children,
-  }: Props<T> = $props();
+  }: Props = $props();
 
   // ============================================================================
   // 状态管理
   // ============================================================================
 
   let scrollTop = $state(0);
-  let containerEl: HTMLDivElement | undefined = $state();
 
   // ============================================================================
   // 计算属性
@@ -76,7 +72,7 @@
     
     // 找到第一个可见项
     for (let i = 0; i < items.length; i++) {
-      const height = getItemHeight(items[i], i);
+      const height = getItemHeight(items[i]!, i);
       if (currentOffset + height > scrollTop) {
         startIndex = Math.max(0, i - buffer);
         break;
@@ -88,7 +84,7 @@
     let endIndex = startIndex;
     let visibleHeight = 0;
     for (let i = startIndex; i < items.length; i++) {
-      visibleHeight += getItemHeight(items[i], i);
+      visibleHeight += getItemHeight(items[i]!, i);
       endIndex = i;
       if (visibleHeight >= containerHeight + buffer * 50) {
         break;
@@ -109,7 +105,7 @@
   const offsetY = $derived(() => {
     let offset = 0;
     for (let i = 0; i < visibleRange().startIndex; i++) {
-      offset += getItemHeight(items[i], i);
+      offset += getItemHeight(items[i]!, i);
     }
     return offset;
   });
@@ -125,7 +121,6 @@
 </script>
 
 <div
-  bind:this={containerEl}
   class="virtual-list-container"
   style="height: {containerHeight}px; overflow-y: auto;"
   onscroll={handleScroll}

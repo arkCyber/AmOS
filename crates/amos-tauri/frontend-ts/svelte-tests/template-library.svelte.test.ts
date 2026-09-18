@@ -12,12 +12,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
-import TemplateLibrary from "../TemplateLibrary.svelte";
-import { templateManager } from "../../../lib/enterprise";
-import type { EnterpriseTemplate } from "../../../lib/enterprise/templates";
+import TemplateLibrary from "../src/svelte/modules/TemplateLibrary.svelte";
+import { templateManager } from "../src/lib/enterprise";
+import type { EnterpriseTemplate } from "../src/lib/enterprise/templates";
 
 // Mock 企业模板管理器
-vi.mock("../../../lib/enterprise", () => ({
+vi.mock("../src/lib/enterprise", () => ({
   templateManager: {
     getTemplates: vi.fn(),
     installTemplate: vi.fn(),
@@ -25,12 +25,12 @@ vi.mock("../../../lib/enterprise", () => ({
 }));
 
 // Mock 快捷指令加载
-vi.mock("../../../lib/shortcuts", () => ({
+vi.mock("../src/lib/shortcuts", () => ({
   loadShortcuts: vi.fn(() => []),
 }));
 
 // Mock 国际化
-vi.mock("../../locale.svelte", () => ({
+vi.mock("../src/svelte/locale.svelte", () => ({
   t: vi.fn((key: string, params?: Record<string, any>) => {
     const translations: Record<string, string> = {
       "templates.title": "企业模板库",
@@ -67,7 +67,7 @@ vi.mock("../../locale.svelte", () => ({
 }));
 
 // Mock 焦点陷阱
-vi.mock("../../../lib/focusTrap", () => ({
+vi.mock("../src/lib/focusTrap", () => ({
   attachFocusTrap: vi.fn(() => () => {}),
 }));
 
@@ -179,36 +179,36 @@ describe("TemplateLibrary", () => {
     it("应该渲染标题和副标题", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("企业模板库")).toBeInTheDocument();
-      expect(screen.getByText("浏览和安装企业提供的标准化快捷指令模板")).toBeInTheDocument();
+      expect(screen.getByText("企业模板库")).toBeTruthy();
+      expect(screen.getByText("浏览和安装企业提供的标准化快捷指令模板")).toBeTruthy();
     });
 
     it("应该渲染搜索框", () => {
       render(TemplateLibrary);
       
       const searchInput = screen.getByPlaceholderText("搜索模板...");
-      expect(searchInput).toBeInTheDocument();
+      expect(searchInput).toBeTruthy();
     });
 
     it("应该渲染类别和部门筛选器", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("全部类别")).toBeInTheDocument();
-      expect(screen.getByText("全部部门")).toBeInTheDocument();
+      expect(screen.getByText("全部类别")).toBeTruthy();
+      expect(screen.getByText("全部部门")).toBeTruthy();
     });
 
     it("应该渲染所有模板卡片", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("销售报告生成器")).toBeInTheDocument();
-      expect(screen.getByText("会议纪要助手")).toBeInTheDocument();
-      expect(screen.getByText("客户反馈收集")).toBeInTheDocument();
+      expect(screen.getByText("销售报告生成器")).toBeTruthy();
+      expect(screen.getByText("会议纪要助手")).toBeTruthy();
+      expect(screen.getByText("客户反馈收集")).toBeTruthy();
     });
 
     it("应该显示模板数量", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("找到 3 个模板")).toBeInTheDocument();
+      expect(screen.getByText("找到 3 个模板")).toBeTruthy();
     });
   });
 
@@ -227,8 +227,8 @@ describe("TemplateLibrary", () => {
       await fireEvent.input(searchInput, { target: { value: "销售" } });
       
       await waitFor(() => {
-        expect(screen.getByText("销售报告生成器")).toBeInTheDocument();
-        expect(screen.queryByText("会议纪要助手")).not.toBeInTheDocument();
+        expect(screen.getByText("销售报告生成器")).toBeTruthy();
+        expect(screen.queryByText("会议纪要助手")).not.toBeTruthy();
       });
     });
 
@@ -244,8 +244,8 @@ describe("TemplateLibrary", () => {
       await fireEvent.input(searchInput, { target: { value: "不存在的模板" } });
       
       await waitFor(() => {
-        expect(screen.getByText("暂无模板")).toBeInTheDocument();
-        expect(screen.getByText("请尝试调整筛选条件")).toBeInTheDocument();
+        expect(screen.getByText("暂无模板")).toBeTruthy();
+        expect(screen.getByText("请尝试调整筛选条件")).toBeTruthy();
       });
     });
 
@@ -257,7 +257,7 @@ describe("TemplateLibrary", () => {
       
       await waitFor(() => {
         const clearBtn = screen.getByText("×");
-        expect(clearBtn).toBeInTheDocument();
+        expect(clearBtn).toBeTruthy();
       });
     });
 
@@ -287,8 +287,8 @@ describe("TemplateLibrary", () => {
       await fireEvent.change(categorySelect, { target: { value: "销售" } });
       
       await waitFor(() => {
-        expect(screen.getByText("销售报告生成器")).toBeInTheDocument();
-        expect(screen.queryByText("会议纪要助手")).not.toBeInTheDocument();
+        expect(screen.getByText("销售报告生成器")).toBeTruthy();
+        expect(screen.queryByText("会议纪要助手")).not.toBeTruthy();
       });
     });
 
@@ -304,8 +304,8 @@ describe("TemplateLibrary", () => {
       await fireEvent.change(departmentSelect, { target: { value: "销售部" } });
       
       await waitFor(() => {
-        expect(screen.getByText("销售报告生成器")).toBeInTheDocument();
-        expect(screen.queryByText("会议纪要助手")).not.toBeInTheDocument();
+        expect(screen.getByText("销售报告生成器")).toBeTruthy();
+        expect(screen.queryByText("会议纪要助手")).not.toBeTruthy();
       });
     });
 
@@ -329,8 +329,8 @@ describe("TemplateLibrary", () => {
       await fireEvent.change(categorySelect, { target: { value: "销售" } });
       
       await waitFor(() => {
-        expect(screen.getByText("销售报告生成器")).toBeInTheDocument();
-        expect(screen.getByText("找到 1 个模板")).toBeInTheDocument();
+        expect(screen.getByText("销售报告生成器")).toBeTruthy();
+        expect(screen.getByText("找到 1 个模板")).toBeTruthy();
       });
     });
 
@@ -341,7 +341,7 @@ describe("TemplateLibrary", () => {
       await fireEvent.input(searchInput, { target: { value: "测试" } });
       
       await waitFor(() => {
-        expect(screen.getByText("重置筛选")).toBeInTheDocument();
+        expect(screen.getByText("重置筛选")).toBeTruthy();
       });
     });
 
@@ -365,36 +365,36 @@ describe("TemplateLibrary", () => {
     it("应该显示模板图标和名称", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("销售报告生成器")).toBeInTheDocument();
+      expect(screen.getByText("销售报告生成器")).toBeTruthy();
       // 图标通过 getCategoryIcon 显示
     });
 
     it("应该显示必装徽章", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("必装")).toBeInTheDocument();
+      expect(screen.getByText("必装")).toBeTruthy();
     });
 
     it("应该显示模板描述", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("自动生成每日销售报告")).toBeInTheDocument();
-      expect(screen.getByText("快速创建会议纪要")).toBeInTheDocument();
+      expect(screen.getByText("自动生成每日销售报告")).toBeTruthy();
+      expect(screen.getByText("快速创建会议纪要")).toBeTruthy();
     });
 
     it("应该显示版本信息", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("版本 1.0.0")).toBeInTheDocument();
-      expect(screen.getByText("版本 2.1.0")).toBeInTheDocument();
+      expect(screen.getByText("版本 1.0.0")).toBeTruthy();
+      expect(screen.getByText("版本 2.1.0")).toBeTruthy();
     });
 
     it("应该显示类别和部门标签", () => {
       render(TemplateLibrary);
       
-      expect(screen.getByText("销售")).toBeInTheDocument();
-      expect(screen.getByText("办公")).toBeInTheDocument();
-      expect(screen.getByText("销售部")).toBeInTheDocument();
+      expect(screen.getByText("销售")).toBeTruthy();
+      expect(screen.getByText("办公")).toBeTruthy();
+      expect(screen.getByText("销售部")).toBeTruthy();
     });
   });
 
@@ -406,8 +406,8 @@ describe("TemplateLibrary", () => {
       await fireEvent.click(templateCard!);
       
       await waitFor(() => {
-        expect(screen.getAllByText("销售报告生成器")[1]).toBeInTheDocument(); // 模态框中的标题
-        expect(screen.getByText("自动生成每日销售报告")).toBeInTheDocument();
+        expect(screen.getAllByText("销售报告生成器")[1]).toBeTruthy(); // 模态框中的标题
+        expect(screen.getByText("自动生成每日销售报告")).toBeTruthy();
       });
     });
 
@@ -418,10 +418,10 @@ describe("TemplateLibrary", () => {
       await fireEvent.click(templateCard!);
       
       await waitFor(() => {
-        expect(screen.getByText("版本")).toBeInTheDocument();
-        expect(screen.getByText("类别")).toBeInTheDocument();
-        expect(screen.getByText("部门")).toBeInTheDocument();
-        expect(screen.getByText("描述")).toBeInTheDocument();
+        expect(screen.getByText("版本")).toBeTruthy();
+        expect(screen.getByText("类别")).toBeTruthy();
+        expect(screen.getByText("部门")).toBeTruthy();
+        expect(screen.getByText("描述")).toBeTruthy();
       });
     });
 
@@ -432,8 +432,8 @@ describe("TemplateLibrary", () => {
       await fireEvent.click(templateCard!);
       
       await waitFor(() => {
-        expect(screen.getByText("参数配置")).toBeInTheDocument();
-        expect(screen.getByText("接收邮箱")).toBeInTheDocument();
+        expect(screen.getByText("参数配置")).toBeTruthy();
+        expect(screen.getByText("接收邮箱")).toBeTruthy();
       });
     });
 
@@ -444,7 +444,7 @@ describe("TemplateLibrary", () => {
       await fireEvent.click(templateCard!);
       
       await waitFor(() => {
-        expect(screen.getByText(/包含 3 个动作/)).toBeInTheDocument();
+        expect(screen.getByText(/包含 3 个动作/)).toBeTruthy();
       });
     });
 
@@ -460,7 +460,7 @@ describe("TemplateLibrary", () => {
       });
       
       await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(screen.queryByRole("dialog")).not.toBeTruthy();
       });
     });
 
@@ -476,7 +476,7 @@ describe("TemplateLibrary", () => {
       });
       
       await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(screen.queryByRole("dialog")).not.toBeTruthy();
       });
     });
   });
@@ -490,7 +490,7 @@ describe("TemplateLibrary", () => {
       
       await waitFor(() => {
         const input = screen.getByPlaceholderText("报告发送目标邮箱") as HTMLInputElement;
-        expect(input).toBeInTheDocument();
+        expect(input).toBeTruthy();
         expect(input.type).toBe("text");
       });
     });
@@ -503,7 +503,7 @@ describe("TemplateLibrary", () => {
       
       await waitFor(() => {
         const input = screen.getByPlaceholderText("客户反馈问卷的 URL") as HTMLInputElement;
-        expect(input).toBeInTheDocument();
+        expect(input).toBeTruthy();
         expect(input.type).toBe("url");
       });
     });
@@ -516,7 +516,7 @@ describe("TemplateLibrary", () => {
       
       await waitFor(() => {
         const checkbox = screen.getByText("是否自动发送提醒").previousElementSibling as HTMLInputElement;
-        expect(checkbox).toBeInTheDocument();
+        expect(checkbox).toBeTruthy();
         expect(checkbox.type).toBe("checkbox");
       });
     });
@@ -528,7 +528,7 @@ describe("TemplateLibrary", () => {
       await fireEvent.click(templateCard!);
       
       await waitFor(() => {
-        expect(screen.getByText("*")).toBeInTheDocument(); // 必填标记
+        expect(screen.getByText("*")).toBeTruthy(); // 必填标记
       });
     });
 
@@ -650,7 +650,7 @@ describe("TemplateLibrary", () => {
       });
       
       await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(screen.queryByRole("dialog")).not.toBeTruthy();
       });
     });
   });
@@ -661,8 +661,8 @@ describe("TemplateLibrary", () => {
       
       render(TemplateLibrary);
       
-      expect(screen.getByText("暂无模板")).toBeInTheDocument();
-      expect(screen.getByText("找到 0 个模板")).toBeInTheDocument();
+      expect(screen.getByText("暂无模板")).toBeTruthy();
+      expect(screen.getByText("找到 0 个模板")).toBeTruthy();
     });
 
     it("应该处理没有参数的模板", async () => {
@@ -672,7 +672,7 @@ describe("TemplateLibrary", () => {
       await fireEvent.click(templateCard!);
       
       await waitFor(() => {
-        expect(screen.queryByText("参数配置")).not.toBeInTheDocument();
+        expect(screen.queryByText("参数配置")).not.toBeTruthy();
       });
     });
 
@@ -681,7 +681,7 @@ describe("TemplateLibrary", () => {
       
       const marketingCard = screen.getByText("客户反馈收集").closest("button");
       // 模板 3 没有 department 字段
-      expect(marketingCard).toBeInTheDocument();
+      expect(marketingCard).toBeTruthy();
     });
 
     it("应该处理安装异常", async () => {
@@ -711,19 +711,19 @@ describe("TemplateLibrary", () => {
       render(TemplateLibrary);
       
       // 通过渲染的类别标签验证图标
-      expect(screen.getByText("销售")).toBeInTheDocument();
-      expect(screen.getByText("办公")).toBeInTheDocument();
-      expect(screen.getByText("市场")).toBeInTheDocument();
+      expect(screen.getByText("销售")).toBeTruthy();
+      expect(screen.getByText("办公")).toBeTruthy();
+      expect(screen.getByText("市场")).toBeTruthy();
     });
 
     it("isInstalled 应该正确判断安装状态", () => {
-      const { loadShortcuts } = require("../../../lib/shortcuts");
+      const { loadShortcuts } = require("../src/lib/shortcuts");
       loadShortcuts.mockReturnValue([{ templateId: "tpl-1" }]);
       
       render(TemplateLibrary);
       
       // 模板 1 应该显示"已安装"徽章
-      expect(screen.getByText("已安装")).toBeInTheDocument();
+      expect(screen.getByText("已安装")).toBeTruthy();
     });
   });
 });

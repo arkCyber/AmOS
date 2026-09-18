@@ -9,7 +9,7 @@ GlobalRegistrator.register();
 
 import { describe, it, expect, beforeEach } from "bun:test";
 import { render, screen } from "@testing-library/svelte";
-import VirtualListComponent from "../VirtualList.svelte";
+import VirtualListComponent from "../src/svelte/components/VirtualList.svelte";
 
 // 为 @testing-library/svelte 创建兼容的组件导入
 const VirtualList = { default: VirtualListComponent };

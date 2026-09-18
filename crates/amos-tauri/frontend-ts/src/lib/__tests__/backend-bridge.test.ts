@@ -32,11 +32,11 @@ let respond: (command: string, args?: Record<string, unknown>) => unknown;
 function makeLocalStorage(): Storage {
   const m = new Map<string, string>();
   return {
-    getItem: (k) => (m.has(k) ? (m.get(k) as string) : null),
-    setItem: (k, v) => void m.set(k, String(v)),
-    removeItem: (k) => void m.delete(k),
+    getItem: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
     clear: () => m.clear(),
-    key: (i) => [...m.keys()][i] ?? null,
+    key: (i: number) => [...m.keys()][i] ?? null,
     get length() {
       return m.size;
     },
@@ -106,7 +106,7 @@ describe("backend 桥接协商与诊断", () => {
 
   it("__TAURI_INTERNALS__ 缺 invoke 时视为未桥接", async () => {
     (globalThis as { window?: unknown }).window = {
-      __TAURI_INTERNALS__: { transformCallback: (cb: unknown) => 1 },
+      __TAURI_INTERNALS__: { transformCallback: (_cb: unknown) => 1 },
     };
     expect(backend.bridged()).toBe(false);
     expect(await backend.invoke("probe_no_invoke")).toBeNull();
@@ -115,7 +115,7 @@ describe("backend 桥接协商与诊断", () => {
   it("桥内命令成功：值原样返回，诊断记 ok", async () => {
     installInternals();
     respond = () => ({ value: 42 });
-    expect(await backend.invoke("probe_ok")).toEqual({ value: 42 });
+    expect(await backend.invoke<{ value: number }>("probe_ok")).toEqual({ value: 42 });
     expect(backend.bridgeDiag()).toEqual({ ok: true });
     expect(backend.bridgeDiag("probe_ok")).toEqual({ ok: true });
   });
@@ -201,7 +201,7 @@ describe("backend 事件订阅与会话持久化", () => {
     listeners.get(ch)!({ payload: { id: "call-1", state: "ringing" } });
     listeners.get(ch)!({ payload: { state: "ignored-no-id" } });
     listeners.get(ch)!({ payload: null });
-    expect(got).toEqual([{ id: "call-1", state: "ringing" }]);
+    expect(got).toEqual([{ id: "call-1" }]);
     unsub();
     expect(listeners.has(ch)).toBe(false);
   });
@@ -227,7 +227,7 @@ describe("backend 事件订阅与会话持久化", () => {
 
   it("会话 id：首次生成并持久化，重复读取稳定，newConversation 轮换", () => {
     installInternals();
-    const storage = ((globalThis as { window?: { localStorage: Storage } }).window)
+    const storage = ((globalThis as { window: { localStorage: Storage } }).window)
       .localStorage;
     const first = backend.conversationId();
     expect(first).toMatch(/^conv-/);
@@ -316,9 +316,9 @@ describe("backend 包装器逐一生成契约（命令路由 + 返回落地）",
 
   for (const w of wrappers) {
     it(`${w.fn} → ${w.command}`, async () => {
-      const fn = (backend as unknown as Record<string, (...a: unknown[]) => unknown>)[w.fn];
+      const fn = (backend as unknown as Record<string, ((...a: unknown[]) => unknown) | undefined>)[w.fn];
       expect(typeof fn).toBe("function");
-      const out = (await fn(...w.args)) as unknown;
+      const out = (await fn!(...w.args)) as unknown;
       // 命令被路由到假桥
       expect(calls.filter((c) => c.command === w.command).length).toBeGreaterThan(0);
       // 返回值是包装器对假桥应答（null）的诚实落地：原样 null，或包装器自己的

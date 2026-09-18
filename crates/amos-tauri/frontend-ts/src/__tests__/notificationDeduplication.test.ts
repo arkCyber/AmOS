@@ -5,7 +5,7 @@
  * 真正调用 pushNotifBridge 中的函数，而不是 mock
  */
 
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect } from "bun:test";
 import {
   mergePushHistory,
   pushRecordToNotif,

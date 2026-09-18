@@ -6,36 +6,19 @@
  * 但测试的是真实的业务逻辑而非自定义 mock。
  */
 
-import { describe, test, expect, mock, beforeEach } from "bun:test";
-import type {
-  PushPayload,
-  RustNotificationRecord,
-} from "../lib/pushNotifications";
+import { describe, test, expect } from "bun:test";
+import type { PushPayload } from "../lib/pushNotifications";
 import {
   isSilentPush,
   hasMutableContent,
   extractBadge,
   extractAlertText,
   parsePushPayload,
-  setBadgeCount,
-  getBadgeCount,
-  playNotificationSound, // 如果存在
 } from "../lib/pushNotifications";
 
 // ============================================================================
 // 测试辅助
 // ============================================================================
-
-const mockInvoke = mock((command: string, args?: any) => {
-  switch (command) {
-    case "push_set_badge":
-      return Promise.resolve({ kind: "ok" });
-    case "push_get_badge":
-      return Promise.resolve(0);
-    default:
-      return Promise.resolve(null);
-  }
-});
 
 // ============================================================================
 // 徽章测试
