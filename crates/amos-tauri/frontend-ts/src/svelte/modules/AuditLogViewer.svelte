@@ -14,6 +14,7 @@
   import { t } from "../locale.svelte";
   import { attachFocusTrap } from "../../lib/focusTrap";
   import type { AuditLog, AuditLogQuery, AuditLogLevel, AuditResult, AuditEventType } from "../../lib/enterprise/audit";
+  import VirtualList from "../components/VirtualList.svelte";
 
   // ============================================================================
   // 状态管理
@@ -407,38 +408,45 @@
           <p class="empty-text">{t("audit.emptyHint")}</p>
         </div>
       {:else}
-        {#each logs as log}
-          <button
-            class="log-item"
-            onclick={() => openLogDetail(log)}
-            style="border-left: 4px solid {getResultColor(log.result)}"
-          >
-            <div class="log-header-row">
-              <span class="log-result-icon" style="color: {getResultColor(log.result)}">
-                {getResultIcon(log.result)}
-              </span>
-              <span class="log-timestamp">{formatTimestamp(log.timestamp)}</span>
-              <span class="log-level" style="color: {getLevelColor(log.level)}">
-                {log.level}
-              </span>
-            </div>
-            
-            <div class="log-info-row">
-              <span class="log-user">👤 {log.userId}</span>
-              <span class="log-event">{getEventTypeLabel(log.eventType)}</span>
-            </div>
-            
-            <div class="log-description">{log.eventDescription}</div>
-            
-            {#if log.errorMessage}
-              <div class="log-error">{t("audit.errorLine", { message: log.errorMessage ?? "" })}</div>
-            {/if}
-            
-            {#if log.duration}
-              <div class="log-duration">⏱️ {log.duration} ms</div>
-            {/if}
-          </button>
-        {/each}
+        <VirtualList
+          items={logs}
+          itemHeight={120}
+          containerHeight={600}
+          buffer={3}
+        >
+          {#snippet renderItem(log: AuditLog)}
+            <button
+              class="log-item"
+              onclick={() => openLogDetail(log)}
+              style="border-left: 4px solid {getResultColor(log.result)}"
+            >
+              <div class="log-header-row">
+                <span class="log-result-icon" style="color: {getResultColor(log.result)}">
+                  {getResultIcon(log.result)}
+                </span>
+                <span class="log-timestamp">{formatTimestamp(log.timestamp)}</span>
+                <span class="log-level" style="color: {getLevelColor(log.level)}">
+                  {log.level}
+                </span>
+              </div>
+              
+              <div class="log-info-row">
+                <span class="log-user">👤 {log.userId}</span>
+                <span class="log-event">{getEventTypeLabel(log.eventType)}</span>
+              </div>
+              
+              <div class="log-description">{log.eventDescription}</div>
+              
+              {#if log.errorMessage}
+                <div class="log-error">{t("audit.errorLine", { message: log.errorMessage ?? "" })}</div>
+              {/if}
+              
+              {#if log.duration}
+                <div class="log-duration">⏱️ {log.duration} ms</div>
+              {/if}
+            </button>
+          {/snippet}
+        </VirtualList>
       {/if}
     </div>
   </section>

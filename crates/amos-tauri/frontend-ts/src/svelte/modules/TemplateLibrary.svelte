@@ -16,6 +16,7 @@
   import { loadShortcuts } from "../../lib/shortcuts";
   import { t } from "../locale.svelte";
   import { attachFocusTrap } from "../../lib/focusTrap";
+  import { debounce } from "../../lib/utils/debounce";
 
   // ============================================================================
   // 状态管理
@@ -23,6 +24,8 @@
 
   let templates = $state<EnterpriseTemplate[]>(templateManager.getTemplates());
   let searchQuery = $state("");
+  let debouncedSearchQuery = $state("");
+  let searching = $state(false);
   let selectedCategory = $state<string | undefined>(undefined);
   let selectedDepartment = $state<string | undefined>(undefined);
   let showDetailModal = $state(false);
@@ -38,12 +41,29 @@
   });
 
   // ============================================================================
+  // 防抖搜索
+  // ============================================================================
+
+  const debouncedSearch = debounce((query: string) => {
+    debouncedSearchQuery = query;
+    searching = false;
+  }, 300);
+
+  // 监听搜索查询变化
+  $effect(() => {
+    if (searchQuery !== debouncedSearchQuery) {
+      searching = true;
+    }
+    debouncedSearch(searchQuery);
+  });
+
+  // ============================================================================
   // 计算属性
   // ============================================================================
 
   const filteredTemplates = $derived(
     templateManager.getTemplates({
-      search: searchQuery.trim() || undefined,
+      search: debouncedSearchQuery.trim() || undefined,
       category: selectedCategory,
       department: selectedDepartment,
       status: "published",
@@ -211,7 +231,11 @@
     </div>
 
     <div class="results-count">
-      {t("templates.foundCount", { count: filteredTemplates.length })}
+      {#if searching}
+        <span class="searching-indicator">🔍 {t("templates.searching")}</span>
+      {:else}
+        {t("templates.foundCount", { count: filteredTemplates.length })}
+      {/if}
     </div>
   </section>
 
@@ -548,6 +572,11 @@
   .results-count {
     font-size: 13px;
     color: #8E8E93;
+  }
+
+  .searching-indicator {
+    color: #007AFF;
+    font-weight: 500;
   }
 
   /* 模板网格 */

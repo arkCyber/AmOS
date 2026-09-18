@@ -105,7 +105,7 @@
         : t("pushPermission.description"),
   );
   const stats = $derived(
-    pushStatus === null
+    pushStatus === null || pushStatus.statistics === null
       ? []
       : [
           { label: t("pushSettings.totalReceived"), value: pushStatus.statistics.total_received },
@@ -196,7 +196,7 @@
       <div class="border-t border-black/5 px-4 py-3 dark:border-white/10">
         <p class={LABEL}>{t("pushSettings.lastReceived")}</p>
         <p class="mt-1 text-xs opacity-70">
-          {pushStatus.statistics.last_received ?? t("pushSettings.never")}
+          {pushStatus.statistics?.last_received ?? t("pushSettings.never")}
         </p>
       </div>
 

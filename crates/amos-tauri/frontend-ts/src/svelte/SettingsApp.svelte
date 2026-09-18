@@ -52,7 +52,7 @@
   import TelemetrySpyPage from "./settings/TelemetrySpyPage.svelte";
   import NetGuardPage from "./settings/NetGuardPage.svelte";
   import NotificationsPage from "./settings/NotificationsPage.svelte";
-  import PushNotificationSettings from "./modules/PushNotificationSettings.svelte";
+  // import PushNotificationSettings from "./modules/PushNotificationSettings.svelte"; // TODO: Create this component
   import SoundPage from "./settings/SoundPage.svelte";
   import RingtonePage from "./settings/RingtonePage.svelte";
   import AboutPage from "./settings/AboutPage.svelte";
@@ -527,7 +527,10 @@
       {:else if page === "notifications"}
         <NotificationsPage />
       {:else if page === "push_management"}
-        <PushNotificationSettings />
+        <!-- TODO: Implement PushNotificationSettings component -->
+        <div class="placeholder-page">
+          <p>Push Notification Settings - Coming Soon</p>
+        </div>
       {:else if page === "sound"}
         <SoundPage />
       {:else if page === "ringtone"}

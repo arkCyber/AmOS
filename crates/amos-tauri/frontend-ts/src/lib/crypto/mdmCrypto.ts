@@ -239,9 +239,11 @@ export async function decryptMDMData(encrypted: string): Promise<string> {
 function arrayBufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   let binary = "";
-  // 用 for..of 而不是 `bytes[i]`：`noUncheckedIndexedAccess` 下索引可能为
+  // 用 Array.from(...) 而不是 `bytes[i]`：`noUncheckedIndexedAccess` 下索引可能为
   // undefined，逐元素迭代没有这个问题，也更省一次下标运算。
-  for (const b of bytes) {
+  // `Array.from` 把 `Uint8Array` 转成普通数组从而绕开 `TS2802`（`for..of`
+  // 直接迭代 `Uint8Array` 在某些 `lib` 配置下被禁止）；语义上仍是逐字节。
+  for (const b of Array.from(bytes)) {
     binary += String.fromCharCode(b);
   }
   return btoa(binary);
