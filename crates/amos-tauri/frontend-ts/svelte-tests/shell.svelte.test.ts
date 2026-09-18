@@ -28,10 +28,11 @@ import {
   pulseId,
   unlock,
 } from "../src/svelte/shellState.svelte";
-import { moveBefore, readStoreValue, writeStoreValue, RECENTS_KEY } from "../src/lib/amosStore";
+import { moveBefore, readStoreValue, writeStoreValue, RECENTS_KEY, LAYOUT_KEY } from "../src/lib/amosStore";
 import { CONTACTS_KEY } from "../src/lib/contacts";
 import { NOTIF_KEY } from "../src/lib/settings";
 import { LAYOUT_CHANGED_EVENT, type LayoutSnapshot } from "../src/lib/wm";
+import { WAKE_HOME_MIN_MS } from "../src/lib/display";
 import { setFormFactor } from "../src/lib/desktopApps";
 import { zh } from "../src/i18n/locales/zh";
 
@@ -223,15 +224,14 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
   });
 
-  test("a macOS window renders DesktopShell (TopBar + Dock + Stage) instead of the iOS surface (PC_DESKTOP_ARCHITECTURE.md)", async () => {
-    // The PC desktop form factor (Phase 3 alignment) renders an entirely different
-    // shell — a TopBar / Dock / Stage layout that mirrors macOS Aqua. The iOS
-    // shape's app-surface element no longer exists in this shell: app windows are
-    // independent WebviewWindow instances that the host opens via `wm_open("<id>")`
-    // rather than a single SPA surface. The host is the only authority on the form
-    // factor; the shell never guesses from the viewport.
+  test("the launcher window renders DesktopShell (TopBar + Dock + Stage), never an app surface", async () => {
+    // The PC desktop form factor (Phase 3 alignment) renders its own chrome for the
+    // **launcher** window — the one shell-entry.ts leaves at surface `home` (a launcher
+    // window carries no `#window=` fragment). REQ-A416 narrowed this rule: an app window
+    // renders its own app (see the test below), so this case pins the launcher's half.
+    // The host is the only authority on the form factor; the shell never guesses from
+    // the viewport.
     installHost(() => snap({ form: "desktop" }));
-    await open("phone");
     const { container } = render(Shell);
     await tick();
     // Wait for `wm_layout_snapshot()` round-trip + onLayoutChanged push to settle.
@@ -251,6 +251,88 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(topbar).toBeTruthy();
     const dock = container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]');
     expect(dock).toBeTruthy();
+  });
+
+  test("a desktop APP window renders the app it addresses, not a second desktop (REQ-A416)", async () => {
+    // `wm_open(label)` builds a real `WebviewWindow` at `index.html#window=<label>`
+    // (crates/amos-tauri/src/wm.rs) and `shell-entry.ts` turns that fragment into
+    // `open(label)`. Before this round the desktop branch rendered `DesktopShell` for
+    // **every** window, so on a PC every "app window" was another copy of the desktop
+    // and no window ever drew an app — while `docs/PC_DESKTOP_ARCHITECTURE.md` §2.2
+    // documented `app — 聚焦 app 窗口`.
+    installHost(() => snap({ form: "desktop" }));
+    await open("settings");
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const surface = container.querySelector('[data-testid="app-surface"]');
+    expect(surface, "an app window must show its app").toBeTruthy();
+    expect(surface?.getAttribute("data-window-app")).toBe("settings");
+    // The desktop chrome belongs to the launcher window: an app window has none.
+    expect(container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]')).toBeNull();
+    expect(
+      container.querySelector('[aria-label="顶部菜单栏"], [aria-label="Top Menu Bar"]'),
+    ).toBeNull();
+    // The app itself really mounted (Settings has a screen in this build), so this is
+    // not merely "a wrapper div appeared".
+    await vi.waitFor(() => {
+      expect(container.textContent ?? "").toContain(zh["settings.dock.title"]);
+    });
+  });
+
+  test("a desktop APP window does not navigate itself home on a wake (REQ-A429)", async () => {
+    // Measured on this machine (2026-09-18): with the Settings window open, a plain
+    // **focus change** (⌘M hid a sibling window) made that app window call `goHome()` —
+    // it re-rendered the desktop shell *inside* an app window (the REQ-A416 defect, this
+    // time reached through a watcher) and its title bar flipped back to the label-derived
+    // English name. `Shell.svelte` mounts the shell-level navigation watchers in *every*
+    // window, but on a desktop a window that **is** one app (REQ-A416) must not navigate
+    // itself: wake-home / auto-off lock / hardware nav belong to the window that is the
+    // shell. (On a phone there is one window and surfaces are its modes — see the control
+    // test below, which stays green.)
+    installHost(() => snap({ form: "desktop" }));
+    await open("settings");
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(container.querySelector('[data-window-app="settings"]')).toBeTruthy();
+
+    // A real wake: away for longer than the gate's minimum, then back.
+    fireEvent(window, new Event("blur"));
+    await new Promise((r) => setTimeout(r, WAKE_HOME_MIN_MS + 150));
+    fireEvent(window, new Event("focus"));
+    await tick();
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Still that app — not the desktop, not the home screen.
+    expect(
+      container.querySelector('[data-window-app="settings"]'),
+      "an app window must not turn itself into the desktop on a wake",
+    ).toBeTruthy();
+    expect(container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]')).toBeNull();
+  });
+
+  test("a touch class STILL returns home on a wake (the guard is not global) (REQ-A429)", async () => {
+    // The control: on a phone the shell has one window and surfaces are its modes, so a
+    // real wake must keep returning to the dock exactly as before.
+    installHost(() => snap({ form: "phone", screen_w: 480, screen_h: 820 }));
+    await open("settings");
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+
+    fireEvent(window, new Event("blur"));
+    await new Promise((r) => setTimeout(r, WAKE_HOME_MIN_MS + 150));
+    fireEvent(window, new Event("focus"));
+    await tick();
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(
+      container.querySelector('[data-testid="app-surface"]'),
+      "a phone surface must still be sent home by a wake",
+    ).toBeNull();
   });
 
   test("a touch class keeps both, and a layout push flips them live (REQ-A249)", async () => {
@@ -311,21 +393,28 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(bridgeCalls.filter((c) => c.cmd === "wm_set_shell_title")).toEqual([]);
   });
 
-  test("a desktop shell hides the phone dialer (REQ-A251: desktop cannot dial)", async () => {
-    // Desktop form factor + the user clicks the phone tile (it is not in the dock on
-    // desktop, but the surface could still try to mount it via `open("phone")`).
-    // The shell must NOT mount `PhoneApp` — desktop has no SIM.
+  test("a desktop app window for a phone-only app says so instead of drawing a dialer (REQ-A251 + REQ-A416)", async () => {
+    // Desktop form factor + a window addressing the phone app (it is not in the dock on
+    // desktop, but a stray link or an old window could still address it).
+    // REQ-A416: the window now shows its own app surface — and because `phone` has no
+    // SIM on desktop, `svelteAppLoader` returns undefined, so the surface states that
+    // instead of mounting `PhoneApp` (and instead of drawing a second desktop, which is
+    // what every desktop window did before this round).
     installHost(() => snap({ form: "desktop" }));
     await open("phone");
     const { container } = render(Shell);
     await tick();
     await new Promise((r) => setTimeout(r, 80));
-    // The phone app must be unavailable — the loader returns undefined on desktop,
-    // so Shell's app loader effect can never produce a real `<AppComp>` for it.
-    expect(container.querySelector('[data-testid="app-surface"]')).toBeNull();
-    // The desktop shell renders instead (TopBar + Dock signature, plus our new stage).
-    expect(container.querySelector('[aria-label="顶部菜单栏"], [aria-label="Top Menu Bar"]')).toBeTruthy();
-    expect(container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]')).toBeTruthy();
+    const surface = container.querySelector('[data-testid="app-surface"]');
+    expect(surface?.getAttribute("data-window-app")).toBe("phone");
+    expect(
+      container.textContent ?? "",
+      "the window must explain why there is no dialer",
+    ).toContain(zh["app.screenMissing"].replace("{id}", "phone"));
+    // The sentence above can only be rendered by the `{:else}` branch of the app
+    // surface, i.e. when no app component was mounted — so it *is* the negative control
+    // for "PhoneApp never started" (a `[data-testid]` on PhoneApp would be a weaker,
+    // copy-pasted assertion).
   });
 
 
@@ -518,6 +607,200 @@ describe("Shell.svelte (surface decision tree)", () => {
     const expected = moveBefore({ page: [], dock: ["phone", "messages"], hidden: [] }, "phone", "messages");
     expect(layout()).toEqual(expected);
   });
+
+/**
+ * Launcher → desktop wiring (REQ-A417 follow-up). Before this round the home /
+ * App-Library "open" handlers always reached `open(id)`, a **touch**-shell surface
+ * switch that `Shell.svelte` never translates on the desktop form. The Mac launcher
+ * therefore sat at `surface=home` no matter what the user tapped, and every doc/
+ * audit claimed "the home launcher can open apps on the desktop" while the
+ * implementation said otherwise.
+ *
+ * The fix: a `launchApp(id)` helper that picks `wm_open` on the desktop and the
+ * legacy surface switch everywhere else. The cases below pin both halves — the
+ * decision (which command reaches the host) and the visible outcome (what
+ * `surface` ends up being).
+ *
+ * Why the desktop cases render `DesktopShell` and the phone case renders `Shell`:
+ * REQ-A416 split the desktop form into two windows — the **launcher** carries
+ * `DesktopShell` (top bar, dock, stage, overlays); an app window carries
+ * `DesktopAppWindow`. The launcher is what users tap on, so "tapping a desktop
+ * tile reaches `wm_open`" is an assertion about the launcher window's own chrome.
+ * The phone form keeps using `Shell` + `HomeDock`, so its control lives there.
+ */
+import DesktopShell from "../src/svelte/DesktopShell.svelte";
+import { resetDesktopFeaturesForTest } from "../src/lib/desktopFeatures";
+import { setFormFactor as setFormFactorLib } from "../src/lib/desktopApps";
+
+const DESKTOP_SNAPSHOT = {
+  screen_w: 1496,
+  screen_h: 882,
+  split: null,
+  candidates: [],
+  form: "desktop" as const,
+  columns: 4,
+  multi_window: true,
+  free_resize: true,
+  divider_gap: 8,
+};
+
+/** Recorder host for DesktopShell: returns the desktop snapshot and records every
+ * `wm_open(label)` call. Boot reads (`wm_windows`, `wm_layout_snapshot`,
+ * `desktop_features_disabled`) are not user gestures and are filtered out. */
+function installRecorderHost() {
+  const opens: string[] = [];
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+    invoke: async (cmd: string, args?: unknown) => {
+      if (cmd === "wm_layout_snapshot") return DESKTOP_SNAPSHOT;
+      if (cmd === "wm_windows") return { windows: [] };
+      if (cmd === "desktop_features_disabled") return [];
+      if (cmd === "wm_open") {
+        const label = (args as { label?: string } | undefined)?.label;
+        if (typeof label === "string") opens.push(label);
+        return { windows: [] };
+      }
+      return null;
+    },
+    listen: async () => () => {},
+  };
+  return opens;
+}
+
+const press = (key: string, mods: Record<string, boolean> = {}): KeyboardEvent => {
+  const ev = new KeyboardEvent("keydown", { key, cancelable: true, ...mods });
+  window.dispatchEvent(ev);
+  return ev;
+};
+
+describe("DesktopShell — launcher routes to wm_open on the desktop form", () => {
+  beforeEach(() => {
+    resetDesktopFeaturesForTest();
+    setFormFactorLib("desktop");
+  });
+  const settle = () => new Promise((r) => setTimeout(r, 40));
+
+  test("desktop form: tapping a Dock app tile reaches the host as wm_open(id)", async () => {
+    const opens = installRecorderHost();
+    // `notes` is not a phone app, so the Dock renders it on the desktop form factor
+    // (`Dock.svelte` runs every user dock id through `withoutPhone`; phone apps
+    // are mobile-only and do not appear on a desktop Dock).
+    writeStoreValue(LAYOUT_KEY, { page: [], dock: ["notes"], hidden: [] });
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+    // The Dock uses `<DockAppItem>` (`data-testid="dock-app-{id}"`). The touch shell's
+    // HomeDock selector (`button[aria-label="${zh["app.phone"]}"]`) would never
+    // resolve here: a desktop shell does not mount HomeDock.
+    const tile = container.querySelector<HTMLButtonElement>(
+      '[data-testid="dock-app-notes"]',
+    );
+    expect(tile, "the Dock has rendered the user-pinned notes tile").toBeTruthy();
+    await fireEvent.click(tile!);
+    await tick();
+    await settle();
+    expect(opens).toEqual(["notes"]);
+  });
+
+  test("desktop form: a Launchpad tile tap also reaches wm_open (not open)", async () => {
+    // The Launchpad is the desktop shell's second entry point (F4 / 🚀 in the bar /
+    // 🚀 in the dock). Whatever widget owns the click, `launchApp` must route to the
+    // host — not fall back to the touch shell's surface switch.
+    const opens = installRecorderHost();
+    writeStoreValue(LAYOUT_KEY, { page: [], dock: [], hidden: [] });
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+    press("F4"); // open Launchpad
+    await tick();
+    await settle();
+    const overlay = container.querySelector<HTMLElement>(
+      '[data-testid="launchpad-overlay"]',
+    );
+    expect(overlay, "F4 summoned the Launchpad overlay").toBeTruthy();
+    // The same `app.notes` aria-label may also live in the Stage icon grid; pick
+    // the one inside the overlay container.
+    const tile = overlay!.querySelector<HTMLButtonElement>(
+      `button[aria-label="${zh["app.notes"]}"]`,
+    );
+    expect(tile, "the Launchpad overlay shows a Notes tile").toBeTruthy();
+    await fireEvent.click(tile!);
+    await tick();
+    await settle();
+    expect(opens).toEqual(["notes"]);
+  });
+
+  test("desktop form: a refused wm_open leaves the launcher at home (no surface flip, no fake app)", async () => {
+    // REQ-A297 phase-2 §4: a `wm_open` that returns `null` is the "host refused"
+    // signal. The launcher must NOT compensate by flipping its own surface to
+    // `app(id)` — that would render an app it never opened. The case asserts the
+    // visible half: a refused Dock click does not put the launcher window into an
+    // app surface (which is what `DesktopAppWindow` would mount in an *app* window).
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "wm_layout_snapshot") return DESKTOP_SNAPSHOT;
+        if (cmd === "wm_windows") return { windows: [] };
+        if (cmd === "desktop_features_disabled") return [];
+        // wm_open returns null ⇒ refused.
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    writeStoreValue(LAYOUT_KEY, { page: [], dock: ["notes"], hidden: [] });
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+    const tile = container.querySelector<HTMLButtonElement>(
+      '[data-testid="dock-app-notes"]',
+    );
+    expect(tile).toBeTruthy();
+    await fireEvent.click(tile!);
+    await tick();
+    await settle();
+    // DesktopShell never renders `[data-testid="app-surface"]` — that belongs to
+    // DesktopAppWindow, which is what Shell mounts in an *app* window. The launcher
+    // window, on a refused click, stays a launcher.
+    expect(container.querySelector('[data-testid="app-surface"]')).toBeNull();
+    // The dock, the top bar and the stage are still there (the launcher's chrome).
+    expect(container.querySelector('[data-testid="dock-panel"]')).toBeTruthy();
+    expect(container.querySelector(`[aria-label="${zh["desktop.dock"]}"]`)).toBeTruthy();
+  });
+});
+
+describe("Shell.svelte — phone form keeps the touch surface switch", () => {
+  // The control: on the touch form the launcher is `HomeDock`, the tap calls
+  // `open()`, and the shell surface flips to `app(id)`. No `wm_open` reaches the
+  // bridge — the host has no real windows to open on a phone.
+  beforeEach(() => setFormFactorLib("phone"));
+  const settle = () => new Promise((r) => setTimeout(r, 40));
+
+  test("phone form: the same tap goes through open() and reaches the app surface (no wm_open)", async () => {
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        if (cmd === "wm_set_shell_title") return (args?.title as string | null) ?? "Amos";
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    applyLayout({ page: [], dock: ["phone"], hidden: [] });
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+    const tile = container.querySelector<HTMLButtonElement>(
+      `button[aria-label="${zh["app.phone"]}"]`,
+    );
+    expect(tile).toBeTruthy();
+    const callsBefore = calls.length;
+    await fireEvent.click(tile!);
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="app-surface"]')).toBeTruthy();
+    });
+    // No `wm_open` was sent. We slice from `callsBefore` so the only entries are
+    // user-driven calls; mount-time reads were excluded by the pre-click guard.
+    expect(calls.slice(callsBefore).filter((c) => c.cmd === "wm_open")).toEqual([]);
+  });
+});
 
 describe("Shell.svelte (edge gestures)", () => {
   const rootOf = (container: HTMLElement) => container.firstElementChild as HTMLElement;

@@ -13,9 +13,10 @@
   import { moveBefore, addAppsToDock, readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { amosWarn } from "../lib/debugLog";
   import { homeGrid, homeTile, deviceChrome, PHONE_GRID, type HomeGrid, type HomeTile } from "../lib/formLayout";
-  import { onLayoutChanged, wmLayoutSnapshot, wmSetShellTitle, type LayoutSnapshot, type FormFactor } from "../lib/wm";
+  import { onLayoutChanged, wmLayoutSnapshot, wmOpen, wmSetShellTitle, type LayoutSnapshot, type FormFactor } from "../lib/wm";
+  import { windowOwnsShellNav } from "../lib/shellNav";
   import { CONTACTS_KEY, seedContacts } from "../lib/contacts";
-  import { setFormFactor } from "../lib/desktopApps";
+  import { desktopFormActive, setFormFactor } from "../lib/desktopApps";
   import {
     applyLayout,
     enterEdit,
@@ -39,14 +40,17 @@
   } from "./shellState.svelte";
   import LockScreen from "./LockScreen.svelte";
   import DesktopShell from "./DesktopShell.svelte";
+  import DesktopAppWindow from "./DesktopAppWindow.svelte";
   import { startTimerWatcher } from "./osTimerWatcher";
   import { startAlarmWatcher } from "./osAlarmWatcher";
   import { startReminderWatcher } from "./osReminderWatcher";
   import { startPushWatcher } from "./osPushWatcher";
+  import { startShortcutTriggers } from "./osShortcutTriggers";
   import { startCalendarWatcher } from "./osCalendarWatcher";
   import { startOsAutoOff } from "./osAutoOff";
   import { startOsTelephonyHold } from "./osTelephonyHold";
   import { startOsWakeHome } from "./osWakeHome";
+  import { ensureDefaultCapabilitiesSeeded } from "./osCapabilities";
   import { reassertScreenOnUnlocked, reportScreenOff, reportScreenOn } from "./osScreenState";
   import { edgeAtY, pastEdgeThreshold, type Edge } from "../lib/edgeSwipe";
   import { startOsInputBridge, startOsHardwarePoll } from "./osInputBridge";
@@ -118,6 +122,37 @@
   // Tile size for the launcher: a Mac window's Launcher wants Launchpad-class tiles
   // (a 56 px tile in a 183 px cell reads as a phone screenshot pasted onto a desktop).
   const homeTilePlan = $derived(homeTile(shellForm));
+
+  /**
+   * Run a shell-level **navigation** action only when this window owns navigation
+   * (`lib/shellNav.ts`, REQ-A429). On a phone the shell has one window and its surfaces are
+   * that window's modes, so a wake / idle-lock / nav key moves it. On a desktop an app
+   * window **is** one app (REQ-A416): navigating it would render the desktop inside an app
+   * window (measured — a focus change did exactly that), so those actions are skipped there.
+   *
+   * Read at **call** time on purpose: the layout snapshot that decides `shellForm` arrives
+   * after the watcher list is built, so deciding once at mount would answer "phone" for
+   * every window and this guard would never fire in a real launch.
+   */
+  function navigateSelf(action: () => void): void {
+    if (windowOwnsShellNav(shellForm, surface().kind === "app")) action();
+  }
+  /**
+   * Open an app by id. On the desktop shell a launcher / App-Library tap is **the**
+   * place to drive `wm_open`: each app lives in its own real `WebviewWindow`
+   * (`docs/PC_DESKTOP_AUDIT.md` §3.2 + REQ-A416/REQ-A419), and the SPA fallback
+   * would render the *desktop* inside the launcher, not the app. Every other form
+   * factor keeps the legacy surface switch — phones/tablets/robots run a single
+   * window and the launcher is that window's mode.
+   *
+   * Read at call time on purpose: `shellForm` is `$derived` from the host snapshot,
+   * which arrives a tick after mount. A captured-at-mount answer would say "phone"
+   * for every real launch and the desktop branch would never run.
+   */
+  function launchApp(id: string): void {
+    if (desktopFormActive()) void wmOpen(id);
+    else open(id);
+  }
 
   // The window's own name (REQ-A250). On a class with an OS title bar, the bar answers
   // "what am I looking at": the app that is on screen, or — via `null` — the title the
@@ -197,7 +232,7 @@
   // Listen for one-shot actions the Svelte screens emit back.
   $effect(() => {
     return propsChannel<HomeProps>("home").on((e, d) => {
-      if (e === "open" && typeof d === "string") open(d);
+      if (e === "open" && typeof d === "string") launchApp(d);
       else if (e === "move") {
         const m = d as { drag: string; over: string };
         applyLayout(moveBefore(layout(), m.drag, m.over));
@@ -213,7 +248,7 @@
   });
   $effect(() => {
     return propsChannel<{ layout: HomeLayout; ext: StoreTile[] }>("appLibrary").on((e, d) => {
-      if (e === "open" && typeof d === "string") open(d);
+      if (e === "open" && typeof d === "string") launchApp(d);
       else if (e === "back") goHome();
       else if (e === "dockAdd" && Array.isArray(d)) {
         applyLayout(addAppsToDock(layout(), d.filter((x) => typeof x === "string")));
@@ -291,6 +326,11 @@
     // Seed the address book before any app surface can read it (Contacts / Phone /
     // IncomingCall all hydrate `amos.contacts` at component init).
     seedContactsOnce();
+    // Seed default-on capabilities (REQ-A380): camera + microphone for the
+    // built-in apps so the Camera / Voice Memos screens open straight into a
+    // usable viewfinder without an in-app "allow?" prompt. The seed writes
+    // only when a key is missing — explicit Privacy revokes are kept.
+    ensureDefaultCapabilitiesSeeded();
     // Form-factor authority for the home grid: read the host's snapshot once, then
     // follow its `layout-changed` pushes (the host emits only on a real change, so
     // this is not a poll). A `null` answer (no bridge, or a failed command — recorded
@@ -340,14 +380,30 @@
       // Remote push deliveries land in the same notification store the NC/banner
       // already render (the mapping is pure: `lib/pushNotifBridge`).
       startPushWatcher(),
-      startOsAutoOff({ onSleep: lock }),
+      // User automations (shortcut triggers): the Rust ledger owns *when* they fire
+      // (so a time trigger survives "no window open"), this watcher owns the signals
+      // the WebView can see (connectivity / battery / app-open) and runs the actions.
+      //
+      // `isLocked` is a **proxy** (REQ-A412): AmOS's own lock screen, not the device
+      // keyguard (that is not visible from the WebView until a host command exists).
+      // See `ShortcutTriggerHostOptions.isLocked` for which direction the proxy can
+      // under-refuse, so nobody reads this line as "the phone is locked".
+      startShortcutTriggers({ isLocked: () => surface().kind === "lock" }),
+      // REQ-A429: the four navigation actions below move **this window**, which is the
+      // shell's job — but on a desktop an app window *is* one app (REQ-A416) and must not
+      // navigate itself (measured: a focus change sent the Settings window home, i.e. it
+      // rendered the desktop inside an app window). The predicate is read at **fire** time,
+      // not at mount: the host's layout snapshot (which decides `shellForm`) arrives a beat
+      // after this list is built, so a start-time decision would answer "phone" for every
+      // window and the guard would be dead code on a real launch.
+      startOsAutoOff({ onSleep: () => navigateSelf(lock) }),
       startOsTelephonyHold(),
-      startOsWakeHome({ onHome: goHome }),
+      startOsWakeHome({ onHome: () => navigateSelf(goHome) }),
       startOsHardwarePoll({
-        onNav: (a) => (a === "home" ? goHome() : open("ai")),
+        onNav: (a) => navigateSelf(a === "home" ? goHome : () => void open("ai")),
       }),
       startOsInputBridge({
-        onNav: (a) => (a === "home" ? goHome() : open("ai")),
+        onNav: (a) => navigateSelf(a === "home" ? goHome : () => void open("ai")),
       }),
       // Store tiles: load once, then re-load whenever the Store page pokes
       // (install / uninstall / upgrade). In the watcher list so unmount unsubscribes.
@@ -626,8 +682,20 @@
       <LockScreen />
     {:else if layoutSnap?.form === "desktop"}
       <!-- 桌面形态（PC / macOS）：UI 拓扑走 DesktopShell，顶栏 + Dock + 舞台 + 浮层。
-           手机/平板形态保持原 shell 不变。 -->
-      <DesktopShell />
+           手机/平板形态保持原 shell 不变。
+
+           REQ-A416：**只有启动器窗口**画那套 chrome。宿主为每个 app 建的窗口都带
+           `index.html#window=<label>`，`shell-entry.ts` 把它变成 `surface = app(id)`
+           —— 此前桌面分支无条件渲染 `DesktopShell`，于是 PC 上每一个"应用窗口"都是
+           另一份桌面（舞台 + Dock + 菜单栏），**没有任何窗口画出过 app 本身**
+           （`docs/PC_DESKTOP_ARCHITECTURE.md` §2.2 写的却是 `app — 聚焦 app 窗口`）。
+           现在：`s.kind === "app"` ⇒ 这个窗口画它自己那个应用，其余（启动器 / 锁屏 /
+           片段无法解析成 app 的窗口）仍是桌面壳。 -->
+      {#if s.kind === "app"}
+        <DesktopAppWindow id={s.id} />
+      {:else}
+        <DesktopShell />
+      {/if}
     {:else}
       {#if s.kind === "edit"}
         <EditHome />
