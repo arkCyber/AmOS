@@ -2045,6 +2045,7 @@ export const en: Record<MessageKey, string> = {
   // Enterprise template library (TemplateLibrary.svelte)
   "templates.title": "Enterprise templates",
   "templates.subtitle": "Standardised shortcuts, ready to install",
+  "templates.searching": "Searching…",
   "templates.searchPlaceholder": "Search template name or description…",
   "templates.allCategories": "All categories",
   "templates.allDepartments": "All departments",

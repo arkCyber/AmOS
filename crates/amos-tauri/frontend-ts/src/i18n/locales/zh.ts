@@ -2048,6 +2048,7 @@ export const zh = {
   // 企业模板库（TemplateLibrary.svelte）
   "templates.title": "企业模板库",
   "templates.subtitle": "使用预制模板快速创建标准化快捷指令",
+  "templates.searching": "搜索中...",
   "templates.searchPlaceholder": "搜索模板名称或描述...",
   "templates.allCategories": "全部类别",
   "templates.allDepartments": "全部部门",
