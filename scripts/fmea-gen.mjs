@@ -55,7 +55,7 @@ const KNOWN_FAILURES = [
   { id: 'F-AI-011', module: 'amos-ai', files: ['crates/amos-ai/src/tcp_auth.rs'], markers: ['tcp_auth', 'AMOS_TCP_TOKEN'], severity: 5 },
   { id: 'F-AI-012', module: 'amos-ai', files: ['crates/amos-ai/src/alerts.rs'], markers: ['derive', 'rank', 'BreakerOpen'], severity: 3 },
   { id: 'F-AI-013', module: 'amos-ai', files: ['crates/amos-ai/src/security.rs'], markers: ['RateLimiter', 'validate_probe'], severity: 3 },
-  { id: 'F-AI-014', module: 'amos-ai', files: ['crates/amos-ai/src/notifier_bridge.rs', 'crates/amos-ai/src/notifier_sink.rs'], markers: ['AlertBridge', 'observe', 'transition', 'paging'], severity: 3 },
+  { id: 'F-AI-014', module: 'amos-ai', files: ['crates/amos-ai/src/notifier_bridge.rs', 'crates/amos-ai/src/notifier_sink.rs', 'crates/amos-ai/src/main.rs', 'crates/amos-ai/src/server.rs', 'crates/amos-ai/tests/notifier_alerts_e2e_v2.rs'], markers: ['AlertBridge', 'observe', 'transition', 'paging', 'AMOS_NOTIFIER', 'notifier_sink_from_env', 'serve_with_sinks_full', 'wire'], severity: 3 },
   { id: 'F-AI-015', module: 'amos-ai', files: ['crates/amos-ai/src/alerts.rs'], markers: ['RULES', 'governor', 'privacy', 'netguard'], severity: 3 },
   { id: 'F-NOT-001', module: 'amos-notifier', files: ['crates/amos-notifier/src/webhook.rs', 'crates/amos-notifier/tests/webhook_e2e.rs'], markers: ['POST', 'Content-Type', 'Content-Length', 'Sent', 'Dropped', 'Failed'], severity: 3 },
 
@@ -214,6 +214,9 @@ const KNOWN_FAILURES = [
   // since REQ-A447 that partial count renders as **stale baseline entries**, i.e. as work nobody
   // did, pointing at files nobody touched (observed: four files after a concurrent crate broke).
   { id: 'F-DEV-041', module: 'process', files: ['scripts/rust-discard-scan.mjs'], markers: ['firstCompilerError', 'could not measure', 'REQ-A452'], severity: 3 },
+  { id: 'F-DEV-042', module: 'process', files: ['scripts/blocking-async-allowlist.json', 'crates/amos-ai/src/server.rs'], markers: ['serve_with_sinks_full', 'One cause can produce two lines of output', 'REQ-A454'], severity: 3 },
+  { id: 'F-DEV-043', module: 'process', files: ['Makefile', 'scripts/feature-surface-scan.mjs'], markers: ['--features notifier', 'never enabled', 'REQ-A454'], severity: 3 },
+  { id: 'F-DEV-044', module: 'process', files: ['Makefile', 'scripts/diagnose-android-usb.sh', 'docs/device-bringup-checklist.md'], markers: ['android-usb', 'diagnose-android-usb', 'REQ-A454'], severity: 2 },
   // REQ-A409: BLE GATT 写后 read 缓存被读成"已写入"，但实际是前一次应答。
   // `ble::install_glue` 一次性注入 `JavaVM` + `Context`；读写命令走严格 `JValue` 类型；
   // `pending_read` 仅由 Kotlin `onCharacteristicReadResult` 写入并 `take` 后即清空。
@@ -264,7 +267,9 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-026', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/svelte-tests/app-registry.svelte.test.ts', 'crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts'], markers: ['missingLoaders', 'unreachableScreens', 'the comparison itself can fail'], severity: 2 },
   // REQ-A410: voice memo playback progress, edit/trim (edit-keep), and ASR transcription were missing.
   { id: 'F-SH-027', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/voiceMemos.ts', 'crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte'], markers: ['progressPercent', 'clampTrimRange', 'trimMemo', 'classifyTranscribe', 'REQ-A410'], severity: 3 },
-  { id: 'F-SH-028', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopAppWindow.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/desktop-app-window.svelte.test.ts'], markers: ['loadDesktopFeatures', 'REQ-A453', 'desktop_features_disabled'], severity: 2 },
+  { id: 'F-SH-028', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopAppWindow.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/desktop-app-window.svelte.test.ts', 'crates/amos-tauri/src/menu.rs'], markers: ['loadDesktopFeatures', 'REQ-A453', 'desktop_features_disabled', 'menu item activated'], severity: 2 },
+  { id: 'F-SH-029', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/files.ts', 'crates/amos-tauri/frontend-ts/src/svelte/FilesApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/files.svelte.test.ts'], markers: ['moveToTrash', 'commitTrash', 'REQ-A455', 'amos.files.trash'], severity: 3 },
+  { id: 'F-SH-030', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/Dock.svelte', 'crates/amos-tauri/frontend-ts/src/lib/amosStore.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/dock-reorder.svelte.test.ts'], markers: ['reorderVisibleDock', 'dockReorderIds', 'REQ-A456', 'data-dock-drop-target'], severity: 2 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },

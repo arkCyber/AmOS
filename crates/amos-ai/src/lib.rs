@@ -50,7 +50,7 @@ pub mod notifier_bridge;
 mod notifier_sink;
 
 #[cfg(feature = "notifier")]
-pub use notifier_sink::{notifier_sink, NotifierSink};
+pub use notifier_sink::{notifier_sink, notifier_sink_from_env, NotifierSink};
 
 // Peer-credential check for the daemon's unix socket (gap #28 / REQ-A141): the 0700
 // mode keeps other users out, but that is a filesystem property — this asks the

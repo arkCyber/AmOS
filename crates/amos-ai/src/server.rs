@@ -1781,7 +1781,7 @@ pub async fn serve_with_log_sink(
     path: std::path::PathBuf,
     log_sink: Option<crate::logfile::LogSinkHandle>,
 ) -> anyhow::Result<()> {
-    serve_with_sinks(path, log_sink, None).await
+    serve_with_sinks_full(path, log_sink, None, None).await
 }
 
 /// Same as [`serve_with_log_sink`], but also attaches the daemon's structured
@@ -1793,6 +1793,23 @@ pub async fn serve_with_sinks(
     path: std::path::PathBuf,
     log_sink: Option<crate::logfile::LogSinkHandle>,
     json_sink: Option<crate::jsonlog::JsonSinkHandle>,
+) -> anyhow::Result<()> {
+    serve_with_sinks_full(path, log_sink, json_sink, None).await
+}
+
+/// Same as [`serve_with_sinks`], but ALSO attaches a notifier sink
+/// (REQ-A449 / F-AI-014 (a) step). When `notifier_sink` is `Some`, every
+/// state transition in the threshold alerts (`appear` / `clear`) is
+/// delivered to that sink; when `None`, the bridge runs but no fire ever
+/// happens (the default build keeps the daemon quiet). The wiring is
+/// explicit so a test can attach its own `Capture` sink; the production
+/// binary builds the env-driven sink with
+/// `amos_ai::notifier_sink_from_env` and passes the result here.
+pub async fn serve_with_sinks_full(
+    path: std::path::PathBuf,
+    log_sink: Option<crate::logfile::LogSinkHandle>,
+    json_sink: Option<crate::jsonlog::JsonSinkHandle>,
+    notifier_sink: Option<std::sync::Arc<dyn crate::notifier_bridge::AlertSink>>,
 ) -> anyhow::Result<()> {
     let tcp_addr = resolve_tcp_addr()?;
     // TCP has neither the socket's 0700 mode nor the kernel peer check, and loopback TCP
@@ -1880,6 +1897,20 @@ pub async fn serve_with_sinks(
     }
     if let Some(handle) = json_sink {
         ai_service = ai_service.with_json_sink(handle);
+    }
+    // Notifier sink (REQ-A449 / F-AI-014 (a) step): when the env told us
+    // to arm it, attach the bridge the dispatcher drives. With the bridge
+    // attached, every state transition in the threshold alerts is delivered
+    // through the dispatcher (webhook + stderr fallback); without it the
+    // daemon only logs new alerts at warn/error level — same behavior as
+    // the build before this round. The constructor defaults
+    // `notifier_bridge: None`; this is the **only** call site that arms
+    // it, mirroring `amos-supervisor`'s `with_alert_sink` line.
+    if let Some(sink) = notifier_sink {
+        let bridge = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::notifier_bridge::AlertBridge::new().with_sink(sink),
+        ));
+        ai_service = ai_service.with_notifier_bridge(bridge);
     }
     // monitor counts requests to the *AiAgent* gRPC service (the AI daemon's own
     // RPCs); the Android-compat service sharing the same socket is separate.
@@ -2251,9 +2282,28 @@ pub async fn serve_with_sinks(
         }
     }
 
-    // Remove the socket file so a stale one never blocks the next bind.
-    let _ = std::fs::remove_file(&path);
+    // Remove the socket file so a stale one never blocks the next bind — **and report a failure**
+    // (REQ-A451): if this fails, the file stays, and the *next* `serve_with_sinks` binds the same
+    // path and gets `EADDRINUSE`. The comment above already stated the stake; a discarded result
+    // meant the stake could be lost with nothing written down, and the symptom would appear in a
+    // later process as a failure about this one.
+    remove_socket(&path);
     Ok(())
+}
+
+/// Remove the daemon's socket file, reporting a failure instead of discarding it (REQ-A451).
+///
+/// Pulled out of `serve_with_sinks` so the two halves that matter are testable without a running
+/// server: this really removes a real socket, and a socket that survives really does block the
+/// next bind (see `a_socket_that_survives_its_cleanup_blocks_the_next_bind`).
+fn remove_socket(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to remove the socket file at shutdown; a stale socket makes the next bind fail"
+        );
+    }
 }
 
 /// Resolve the periodic health-metrics interval: `AMOS_METRICS_INTERVAL_SECS`
@@ -2616,10 +2666,7 @@ mod tests {
                 .await
                 .expect("status");
             assert_eq!(capture.fired.lock().unwrap().len(), 1);
-            assert_eq!(
-                capture.fired.lock().unwrap()[0].id,
-                "amos-ai.breaker_open"
-            );
+            assert_eq!(capture.fired.lock().unwrap()[0].id, "amos-ai.breaker_open");
 
             // 4. Subsequent polls with the breaker still open produce NO
             //    new fires (the suppression is the bridge's, not the
@@ -2645,8 +2692,7 @@ mod tests {
             //    `decide` + the legal transitions. We pin `HalfOpen`
             //    because it reports "not an alert" in `alerts.rs`, so the
             //    bridge fires its `.cleared` on the first non-Open read.
-            crate::breaker::lock(&br)
-                .force_state_for_test(crate::breaker::BreakerState::HalfOpen);
+            crate::breaker::lock(&br).force_state_for_test(crate::breaker::BreakerState::HalfOpen);
             let _ = svc
                 .get_status(Request::new(StatusRequest {}))
                 .await
@@ -3794,5 +3840,51 @@ mod tests {
             parse_node_paths(" , , ").is_empty(),
             "only blanks → no nodes"
         );
+    }
+
+    /// REQ-A451 — the shutdown cleanup is **not** cosmetic, and the discard hid that.
+    ///
+    /// `serve_with_sinks` binds this exact path (line ~1831) and `UnixListener::bind` refuses a
+    /// path that still exists, so a cleanup that failed quietly makes the **next** start fail with
+    /// a message about the *previous* one. The old line's comment already said "so a stale one
+    /// never blocks the next bind" — i.e. the stake was understood and then not reportable.
+    ///
+    /// Pinned here are the two halves that are observable without a running server or a log
+    /// subscriber: the cleanup really removes a real socket, and a socket that survives really does
+    /// block the next bind. The `warn!` on the failing path is not asserted (this crate has no
+    /// capturing-subscriber harness); what it adds is that the failure is no longer silent.
+    #[tokio::test]
+    async fn a_socket_that_survives_its_cleanup_blocks_the_next_bind() {
+        let dir = std::env::temp_dir().join(format!("amos-ai-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("daemon.sock");
+
+        // A UDS path outlives its listener: dropping the socket does **not** unlink the file.
+        let listener = tokio::net::UnixListener::bind(&path).expect("first bind");
+        drop(listener);
+        assert!(
+            path.exists(),
+            "the path is still on disk after the listener is gone"
+        );
+
+        // A clean exit leaves nothing behind …
+        remove_socket(&path);
+        assert!(!path.exists(), "the cleanup removed the socket");
+        let listener = tokio::net::UnixListener::bind(&path).expect("re-bind after a clean exit");
+        drop(listener);
+
+        // … and the consequence of a cleanup that did not happen, measured rather than asserted:
+        let err = tokio::net::UnixListener::bind(&path).expect_err("a stale path blocks the bind");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the next start fails with the platform's own word for it: {err}"
+        );
+
+        // A cleanup that cannot do its job must not panic — it reports.
+        remove_socket(&dir.join("never-existed.sock"));
+        remove_socket(&path);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }
