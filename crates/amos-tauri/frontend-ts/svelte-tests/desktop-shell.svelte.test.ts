@@ -1446,5 +1446,32 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     }
   });
 
-
+  /**
+   * REQ-A415 + REQ-A431: the Finder tile (`DockFinderItem`) is the **entry point**
+   * the user taps most — Dock apps run in their own window (`wm_open("files")`), so a
+   * SPA fallback would render the desktop inside the launcher and never reach the host.
+   * The dock app tile already had this contract pinned; the **Finder system tile** did
+   * not. This case pins it: click `data-testid="dock-finder"` ⇒ the host receives
+   * exactly one `wm_open({ label: "files" })` call, with no menu detour. The negative
+   * control restores the SPA fallback in `DockFinderItem` and the assertion goes red.
+   */
+  test("the Finder system tile opens the host as wm_open('files'), not a surface flip", async () => {
+    installHostWithRecorder();
+    seedDock(["notes"]);
+    setWindowWidth(2000);
+    const { container } = render(Dock);
+    await tick();
+    await settle();
+    const finder = container.querySelector<HTMLButtonElement>(
+      '[data-testid="dock-finder"]',
+    );
+    expect(finder, "the Finder tile is in the registry, so it must render").toBeTruthy();
+    expect(finder!.disabled).toBe(false);
+    await fireEvent.click(finder!);
+    await tick();
+    await settle();
+    const opens = (window as unknown as { __wmOpens: string[] }).__wmOpens;
+    expect(opens).toEqual(["files"]);
+  });
 });
+
