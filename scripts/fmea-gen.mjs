@@ -57,6 +57,7 @@ const KNOWN_FAILURES = [
   { id: 'F-AI-013', module: 'amos-ai', files: ['crates/amos-ai/src/security.rs'], markers: ['RateLimiter', 'validate_probe'], severity: 3 },
   { id: 'F-AI-014', module: 'amos-ai', files: ['crates/amos-ai/src/notifier_bridge.rs', 'crates/amos-ai/src/notifier_sink.rs'], markers: ['AlertBridge', 'observe', 'transition', 'paging'], severity: 3 },
   { id: 'F-AI-015', module: 'amos-ai', files: ['crates/amos-ai/src/alerts.rs'], markers: ['RULES', 'governor', 'privacy', 'netguard'], severity: 3 },
+  { id: 'F-NOT-001', module: 'amos-notifier', files: ['crates/amos-notifier/src/webhook.rs', 'crates/amos-notifier/tests/webhook_e2e.rs'], markers: ['POST', 'Content-Type', 'Content-Length', 'Sent', 'Dropped', 'Failed'], severity: 3 },
 
   // 窗口管理 (形态策略强制到真实窗口: G5 / REQ-A256 主体, REQ-A257 复核收口)
   { id: 'F-WM-014', module: 'amos-tauri', files: ['crates/amos-tauri/src/wm.rs', 'crates/amos-wm/src/form.rs'], markers: ['check_new_app_window', 'check_app_window'], severity: 3 },
@@ -193,6 +194,26 @@ const KNOWN_FAILURES = [
   // Tauri's template), was written down nowhere, and was checked by nothing — so a template change
   // would have silently turned 17 deliberate discards into bridges driving a dead Kotlin instance.
   { id: 'F-DEV-037', module: 'process', files: ['scripts/android-glue-mirror.sh', 'crates/amos-tauri/src/mic_permission.rs', 'crates/amos-tauri/src/clipboard_glue.rs'], markers: ['configChanges', 'Activity is not recreated under us', 'REQ-A448'], severity: 3 },
+  // REQ-A449: a feature whose last half had **no UI at all**. `spaces_move_window` was on the
+  // bridge (exported, typed, unit-tested, command registered) and nothing called it — the frontend
+  // unwired baseline listed it as an excuse — so only a window filed by hand from a shell could
+  // ever follow a desktop switch, and the panel offered no way to file one.
+  { id: 'F-DEV-038', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/SpacesPanel.svelte', 'crates/amos-tauri/frontend-ts/src/lib/spaces.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/spaces.svelte.test.ts'], markers: ['handleAssignWindow', 'fileableWindows', 'REQ-A449'], severity: 3 },
+  // REQ-A450: a feature's **initial state was a one-way door**. `move_window_to_space` only moves a
+  // window *between* Spaces, so a window filed by mistake could never return to "filed by nobody"
+  // (visible on every desktop) — the state every window starts in, and the state the panel could
+  // only draw as a placeholder it refused to accept. The inverse operation was simply missing.
+  { id: 'F-DEV-039', module: 'frontend', files: ['crates/amos-tauri/src/spaces.rs', 'crates/amos-tauri/src/spaces_commands.rs', 'crates/amos-tauri/frontend-ts/src/svelte/SpacesPanel.svelte'], markers: ['unfile_window', 'spaces_unfile_window', 'REQ-A450'], severity: 2 },
+  // REQ-A451: the same defect twice, in two sibling daemons. `amos-translate`'s socket cleanup was
+  // fixed to report (REQ-A443); `amos-ai`'s identical line — under a comment that already named the
+  // stake ("so a stale one never blocks the next bind") — kept discarding. A fix applied where it
+  // was found is not a fix applied where it also holds.
+  { id: 'F-DEV-040', module: 'process', files: ['crates/amos-ai/src/server.rs', 'crates/amos-translate/src/lib.rs'], markers: ['remove_socket', 'a stale socket makes the next bind fail', 'REQ-A451'], severity: 3 },
+  // REQ-A452: the discard gate could **under-measure itself**. `clippyPass` accepted any output that
+  // contained a `compiler-message`, so a pass that failed to *build* returned a partial count — and
+  // since REQ-A447 that partial count renders as **stale baseline entries**, i.e. as work nobody
+  // did, pointing at files nobody touched (observed: four files after a concurrent crate broke).
+  { id: 'F-DEV-041', module: 'process', files: ['scripts/rust-discard-scan.mjs'], markers: ['firstCompilerError', 'could not measure', 'REQ-A452'], severity: 3 },
   // REQ-A409: BLE GATT 写后 read 缓存被读成"已写入"，但实际是前一次应答。
   // `ble::install_glue` 一次性注入 `JavaVM` + `Context`；读写命令走严格 `JValue` 类型；
   // `pending_read` 仅由 Kotlin `onCharacteristicReadResult` 写入并 `take` 后即清空。
@@ -243,6 +264,7 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-026', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/svelte-tests/app-registry.svelte.test.ts', 'crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts'], markers: ['missingLoaders', 'unreachableScreens', 'the comparison itself can fail'], severity: 2 },
   // REQ-A410: voice memo playback progress, edit/trim (edit-keep), and ASR transcription were missing.
   { id: 'F-SH-027', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/voiceMemos.ts', 'crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte'], markers: ['progressPercent', 'clampTrimRange', 'trimMemo', 'classifyTranscribe', 'REQ-A410'], severity: 3 },
+  { id: 'F-SH-028', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopAppWindow.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/desktop-app-window.svelte.test.ts'], markers: ['loadDesktopFeatures', 'REQ-A453', 'desktop_features_disabled'], severity: 2 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
