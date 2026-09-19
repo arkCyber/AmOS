@@ -13,7 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 # Real Android power backend (BatteryManager via JNI, hosted in the System UI APK
 # which owns the Context). Optional: only pulled in with the `android` feature.
-jni = { version = "0.21", optional = true }
+jni = { version = "0.22", optional = true }
 # Shared JNI rules (clean exception state + class resolution through the app
 # loader): see crates/amos-jni/src/lib.rs and REQ-A186.
 amos-jni = { path = "../amos-jni", optional = true }
