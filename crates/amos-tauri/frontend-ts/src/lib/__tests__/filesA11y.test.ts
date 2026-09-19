@@ -2,7 +2,13 @@
  * Tests for filesA11y.ts — keyboard navigation and accessibility helpers.
  */
 import { describe, test, expect } from "vitest";
-import { navNext, createKeyboardHandler, entryAriaLabel, type A11yNavState } from "../filesA11y";
+import {
+  navNext,
+  createKeyboardHandler,
+  entryAriaLabel,
+  scrollIntoViewIfNeeded,
+  type A11yNavState,
+} from "../filesA11y";
 
 describe("filesA11y.ts", () => {
   describe("navNext", () => {
@@ -212,3 +218,72 @@ describe("filesA11y.ts", () => {
     });
   });
 });
+
+/**
+ * REQ-A407 — `scrollIntoViewIfNeeded`（此前 0 覆盖：17 行，全仓第 5 大的一块）。
+ *
+ * 它只碰元素的三件事：`parentElement`、双方的 `getBoundingClientRect()`、`scrollIntoView()`。
+ * 所以**不需要 DOM**：给一个假元素即可把"什么时候该滚、什么时候不该滚"逐条钉住 —— 键盘导航
+ * 每按一次方向键都会调它，滚错方向的代价是列表"看着卡住"。
+ */
+describe("scrollIntoViewIfNeeded", () => {
+  type Rect = { top: number; bottom: number; left: number; right: number };
+  const rect = (top: number, bottom: number, left = 0, right = 100): DOMRect =>
+    ({ top, bottom, left, right, width: right - left, height: bottom - top, x: left, y: top }) as DOMRect;
+
+  /** 一个假元素：记录 scrollIntoView 的调用次数与参数。 */
+  function fakeElement(options: { parent?: unknown; rect?: Rect } = {}) {
+    const scrolls: unknown[] = [];
+    const element = {
+      parentElement: options.parent ?? null,
+      getBoundingClientRect: () => rect(options.rect?.top ?? 0, options.rect?.bottom ?? 10, options.rect?.left ?? 0, options.rect?.right ?? 100),
+      scrollIntoView: (arg?: unknown) => {
+        scrolls.push(arg);
+      },
+    };
+    return { element: element as unknown as HTMLElement, scrolls };
+  }
+
+  test("null 元素：什么都不做（不抛）", () => {
+    expect(() => scrollIntoViewIfNeeded(null)).not.toThrow();
+  });
+
+  test("没有父元素：直接滚（无从判断可见性）", () => {
+    const { element, scrolls } = fakeElement();
+    scrollIntoViewIfNeeded(element);
+    expect(scrolls).toEqual([{ block: "nearest", behavior: "smooth" }]);
+  });
+
+  test("完全可见（含四条边正好贴合）：一次都不滚", () => {
+    const parent = fakeElement({ rect: rect(0, 200) }).element;
+    const inside = fakeElement({ parent, rect: rect(10, 100, 10, 90) }).element;
+    scrollIntoViewIfNeeded(inside);
+    expect((inside as unknown as { scrollIntoView: unknown }).scrollIntoView).toBeDefined();
+
+    // 逐边贴合也必须算"可见"（`>=` / `<=`，不是 `>` / `<`）
+    for (const touching of [rect(0, 100), rect(100, 200), rect(0, 200, 0, 100), rect(0, 200, 0, 100)]) {
+      const { element, scrolls } = fakeElement({ parent, rect: touching });
+      scrollIntoViewIfNeeded(element);
+      expect(scrolls).toEqual([]);
+    }
+  });
+
+  test("上/下/左/右任一边越界都要滚（用 nearest，不是整页跳）", () => {
+    const parent = fakeElement({ rect: rect(100, 200, 100, 200) }).element;
+    const outOfView = [
+      rect(99, 150, 120, 180), // 顶边越界
+      rect(150, 201, 120, 180), // 底边越界
+      rect(120, 180, 99, 150), // 左边越界
+      rect(120, 180, 150, 201), // 右边越界
+    ];
+    for (const r of outOfView) {
+      const { element, scrolls } = fakeElement({ parent, rect: r });
+      scrollIntoViewIfNeeded(element);
+      expect([JSON.stringify(r), scrolls]).toEqual([
+        JSON.stringify(r),
+        [{ block: "nearest", behavior: "smooth" }],
+      ]);
+    }
+  });
+});
+

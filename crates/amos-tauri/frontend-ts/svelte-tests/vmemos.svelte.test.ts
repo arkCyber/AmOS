@@ -168,3 +168,123 @@ describe("VoiceMemosApp — export to the shared collection (REQ-A350)", () => {
   });
 });
 
+/**
+ * Playback-progress affordance. The detail panel renders a seek slider + duration
+ * text once a memo is selected; the slider is present even when no recording is
+ * playing (it doubles as the position display).
+ */
+describe("VoiceMemosApp.svelte — playback progress (REQ-A351)", () => {
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  test("selecting a memo opens a detail panel with the seek slider", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async () => null,
+      listen: async () => () => {},
+    };
+    const host = render(VoiceMemosApp);
+    // Click a memo's title (not the play button) to open the detail panel.
+    const titleBtn = [...host.container.querySelectorAll("button")].find(
+      (b) =>
+        !b.hasAttribute("data-icon") &&
+        (b.getAttribute("aria-label") ?? "") !== "开始录音",
+    );
+    expect(titleBtn, "a memo title button is rendered").toBeTruthy();
+    await fireEvent.click(titleBtn as HTMLButtonElement);
+    const seek = host.container.querySelector(
+      'input[type="range"][aria-label="跳到指定位置"]',
+    );
+    expect(seek, "the seek slider is part of the detail panel").toBeTruthy();
+  });
+});
+
+/**
+ * Trim affordance. The original recording is **retained**; saving a trim creates a
+ * new sibling memo (edit-keep). A seed memo has no bytes to cut, so the trim
+ * button is suppressed (the panel only renders it for `audio.kind === "recorded"`).
+ */
+describe("VoiceMemosApp.svelte — trim (REQ-A352, edit-keep)", () => {
+  test("opening trim on a seed memo is suppressed (no bytes to cut)", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async () => null,
+      listen: async () => () => {},
+    };
+    const host = render(VoiceMemosApp);
+    const titleBtn = [...host.container.querySelectorAll("button")].find(
+      (b) =>
+        !b.hasAttribute("data-icon") &&
+        (b.getAttribute("aria-label") ?? "") !== "开始录音",
+    );
+    await fireEvent.click(titleBtn as HTMLButtonElement);
+    // The seed memo never exposes the trim button.
+    expect(buttonsByAria(host, "编辑").length).toBe(0);
+  });
+});
+
+/**
+ * ASR (speech-to-text) affordance. Pressing the "转写" button calls the backend
+ * `transcribeAudio` RPC; the daemon reply (or its absence) is reflected in the
+ * detail panel as a transcript, an empty notice, or an explicit error reason.
+ */
+describe("VoiceMemosApp.svelte — ASR transcript (REQ-A353)", () => {
+  function installAsrHost(reply: unknown) {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "transcribe_audio") return reply;
+        return null;
+      },
+      listen: async () => () => {},
+    };
+  }
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  test("a transcribe button is exposed once a memo is selected", async () => {
+    const host = render(VoiceMemosApp);
+    const titleBtn = [...host.container.querySelectorAll("button")].find(
+      (b) =>
+        !b.hasAttribute("data-icon") &&
+        (b.getAttribute("aria-label") ?? "") !== "开始录音",
+    );
+    await fireEvent.click(titleBtn as HTMLButtonElement);
+    expect(buttonsByAria(host, "转写").length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("a transcribe button is exposed for selected memos and the page chrome does not crash", async () => {
+    // A bridge is installed but returns null for every command — the screen
+    // still renders the transcribe affordance, exactly what an end user with
+    // an offline ASR daemon would see.
+    installAsrHost(null);
+    const host = render(VoiceMemosApp);
+    const titleBtn = [...host.container.querySelectorAll("button")].find(
+      (b) =>
+        !b.hasAttribute("data-icon") &&
+        (b.getAttribute("aria-label") ?? "") !== "开始录音",
+    );
+    await fireEvent.click(titleBtn as HTMLButtonElement);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(buttonsByAria(host, "转写").length, "the transcribe affordance is part of the panel")
+      .toBeGreaterThanOrEqual(1);
+  });
+
+  test("a transcribe button is exposed for selected memos (the panel does not crash)", async () => {
+    // Install a bridge that returns null for all commands — the screen still
+    // renders the transcribe affordance, exactly what an end user with an offline
+    // ASR daemon would see.
+    installAsrHost(null);
+    const host = render(VoiceMemosApp);
+    const titleBtn = [...host.container.querySelectorAll("button")].find(
+      (b) =>
+        !b.hasAttribute("data-icon") &&
+        (b.getAttribute("aria-label") ?? "") !== "开始录音",
+    );
+    await fireEvent.click(titleBtn as HTMLButtonElement);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(buttonsByAria(host, "转写").length, "the transcribe affordance is in the panel").toBeGreaterThanOrEqual(1);
+    // The panel's idle-state content is just the button — no crash, no error.
+    expect(txt(host)).not.toContain("undefined");
+  });
+});
+

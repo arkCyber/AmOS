@@ -43,7 +43,7 @@
 
 | # | 规则（要旨） | 证据 / 判定 | 违规点与整改 |
 |---|---|---|---|
-| 1 | 限制控制流：无 goto、无递归 | Rust 无 goto；**递归已有全仓静态门**（`scripts/rust-recursion-scan.mjs`，跑在 `make lint`，REQ-A215）——门上线即查出 3 处：2 处真递归改为迭代（`amos-link` 的键表达式匹配器、`amos-web3` 的 EIP-712 依赖遍历），1 处深度硬性有界（`amos-devocare` 的 `MAX_SCAN_DEPTH = 12`，基线化并写明理由）；当前 304 个生产 `.rs` **0 新增**。TS/React 无深度递归。**符合**。 | 已落地（REQ-A215）：零依赖扫描器 + 棘轮基线 + `--selftest` **11** 用例 + **负控实测**（临时探针文件 ⇒ `exit=1` 并指名 `file:line`，删除后恢复 OK）。 |
+| 1 | 限制控制流：无 goto、无递归 | Rust 无 goto；**递归已有全仓静态门**（`scripts/rust-recursion-scan.mjs`，跑在 `make lint`，REQ-A215）——门上线即查出 3 处：2 处真递归改为迭代（`amos-link` 的键表达式匹配器、`amos-web3` 的 EIP-712 依赖遍历），1 处深度硬性有界（`amos-devocare` 的 `MAX_SCAN_DEPTH = 12`，基线化并写明理由）；当前生产 `.rs` 数量由门**每次运行打印**（2026-09-19 实测 **412** 个；旧文写死的 304 早已烂掉）**0 新增**；且门已从"文件内"扩到 **workspace 级**（跨文件/跨 crate 的环,REQ-A443）。TS/React 无深度递归。**符合**。 | 已落地（REQ-A215，边界 REQ-A443）：零依赖扫描器 + 棘轮基线 + `--selftest` **23** 用例 + **负控实测**（临时探针文件 ⇒ `exit=1` 并指名 `file:line`，删除后恢复 OK；REQ-A443 又用**两个真实 crate** 各插一个互调探针做了跨 crate 负控）。 |
 | 2 | 所有循环静态有界；**不得用循环计数器当数组下标** | TS/React 列表以固定长度渲染；Rust 生产代码 **94 处**顶层 `loop {}`（多为 supervisor/WM 事件循环 + 守护进程采样 + 看门狗重连）。**部分符合/有风险**。 | (a) 事件循环必须由外部信号显式中止并文档化终止条件（见 §9 + `scripts/hot-loop-scan.mjs` 门禁）；(b) TS 已开 `noUncheckedIndexedAccess`（P1-5 闭环）。 |
 | 3 | 初始化后禁止动态内存分配 | Rust 编译期管理，无手动动态分配。**符合（Rust 语义内）**。 | 监控前端长会话是否累积（AiMsg/音频流无上限），见 P1-4。 |
 | 4 | 禁止函数指针 | Rust 用 trait/dyn（受控）；TS 用一等函数（React 模式）。按语言语义**适配性符合**。 | React 回调需保持引用稳定（多用 `useCallback`/ref 模式，已大量采用）。 |

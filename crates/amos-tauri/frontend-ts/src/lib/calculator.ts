@@ -237,6 +237,33 @@ export function calcRun(presses: string[]): string {
   return presses.reduce((s, k) => calcPress(s, k), calcInit()).cur;
 }
 
+/**
+ * Evaluate an arithmetic **query** the way the Calculator app would type it (REQ-A458), or
+ * `null` when the query is not a calculation at all.
+ *
+ * The engine is the app's own (`calcRun`), so Spotlight's answer and the Calculator's answer
+ * cannot disagree — **including the semantics**: this is left-to-right with no operator
+ * precedence (`2+3*4` = 20, exactly as the app computes it) and no parentheses (they are not
+ * in the app's key set, so `((1+2))*3` is `ERR`, not a silently different answer).
+ *
+ * Two deliberate refusals:
+ *   * a bare number is **not** a calculation (a row that echoes the query is noise);
+ *   * `ERR` — division by zero, an unbalanced expression, an unknown token — is `null`, so the
+ *     caller shows no row instead of a row that says nothing useful.
+ *
+ * The accepted alphabet is the app's own key set: digits, `.`, `+ - * /` and the display glyphs
+ * the reducer also understands (`× ÷ −`). `%` is a **key** in the app (it applies to the current
+ * entry) but not an infix operator, so it is refused here rather than guessed at.
+ */
+export function calcQuery(raw: string): string | null {
+  const q = raw.trim().replace(/\s+/g, "");
+  if (!q || !/[0-9]/.test(q)) return null;
+  if (!/[+\-*/×÷−]/.test(q)) return null;
+  if (!/^[0-9+\-*/×÷−.]+$/.test(q)) return null;
+  const out = calcRun([...q, "="]);
+  return out === "" || out === "ERR" ? null : out;
+}
+
 export interface CalcEntry {
   expr: string; // e.g. "9 − 3"
   result: string; // e.g. "6" (plain ASCII result, ERR if not solvable)

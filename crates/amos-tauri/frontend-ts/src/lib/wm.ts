@@ -18,7 +18,8 @@
  * (plus the form-factor capability fields: class, content columns, multi-window,
  * free resize, divider width).
  */
-import { invoke, subscribe } from "./backend";
+import { bridgeDiag, invoke, subscribe } from "./backend";
+import type { BridgeDiag } from "./backend";
 
 export type SplitAxis = "vertical" | "horizontal" | string;
 
@@ -67,13 +68,21 @@ export function wmLayoutSnapshot(): Promise<LayoutSnapshot | null> {
 }
 
 /**
- * Name the shell window — on macOS, what its **title bar** shows.
+ * Name the window this runs in — on macOS, what **its** title bar shows.
  *
- * `title` is the localized name of the app that is on screen, or `null` for the
- * surfaces that are the shell itself (launcher / lock / edit / library). `null` does
- * **not** mean "empty": the host restores the title it was configured with, so the
- * product name lives in exactly one place (`tauri.conf.json`) instead of a second copy
- * here — the same rule REQ-A234 applied to the launcher label.
+ * The target is the **calling** window (the host injects it, REQ-A428): an app window
+ * names itself, the launcher window names itself. That distinction matters because
+ * `Shell.svelte`'s title effect runs in every window, and before REQ-A428 the host named
+ * the launcher no matter which window asked — so an app window's localized name landed on
+ * the desktop window while the app window kept its label-derived English name (measured on
+ * a live launch: `Settings | 236,69` and `设置 | 0,29` for the launcher).
+ *
+ * `title` is the localized name of the app that is on screen, or `null` for the surfaces
+ * that are the shell itself (launcher / lock / edit / library). `null` does **not** mean
+ * "empty": the host restores the name that window was created with — the configured
+ * product title for the launcher, the app's own name for an app window — so the product
+ * name lives in exactly one place (`tauri.conf.json`) instead of a second copy here (the
+ * rule REQ-A234 applied to the launcher label).
  *
  * Resolves to the title the host actually applied (a long third-party display name is
  * truncated host-side, with a visible `…`), or `null` when there is no host / the call
@@ -86,6 +95,17 @@ export function wmSetShellTitle(title: string | null): Promise<string | null> {
 /** Set the full window area the split layout sub-divides. */
 export function wmLayoutSetScreen(width: number, height: number): Promise<LayoutSnapshot | null> {
   return invoke<LayoutSnapshot>("wm_layout_set_screen", { width, height });
+}
+
+/**
+ * Draw the **native menu bar** in the shell's language (REQ-A437).
+ *
+ * The menu bar is rendered by the host (AppKit), so a UI language change has to reach it: the
+ * host rebuilds its tree and answers with the locale it applied, or `null` when there is no
+ * host (a browser preview) — never silently pretending.
+ */
+export function menuSetLocale(locale: string): Promise<string | null> {
+  return invoke<string>("menu_set_locale", { locale });
 }
 
 /** Enter a split between two windows along an axis (`vertical`|`horizontal`). */
@@ -117,6 +137,111 @@ export function wmSplitSwap(): Promise<LayoutSnapshot | null> {
 /** End the active split (windows return to fullscreen). */
 export function wmSplitExit(): Promise<LayoutSnapshot | null> {
   return invoke<LayoutSnapshot>("wm_split_exit");
+}
+
+// ---- Individual window commands ----
+//
+// REQ-A415 — these four return `Promise<boolean>`, and the promise now really resolves
+// to a boolean. The old bodies were `(await invoke<boolean>(cmd, { label })) ?? false`:
+// the *host* answers `wm_open`/`wm_focus`/`wm_hide`/`wm_close` with a `WmSnapshot`
+// (`Result<WmSnapshot, String>` in `crates/amos-tauri/src/wm.rs`), so on success the
+// value was a **snapshot object**, not `true` — the declared type was a lie that only
+// stayed hidden because every caller happened to write `void wmX(...)`. The honest
+// derivation is the null check: `lib/backend`'s `invoke` resolves `null` for "no bridge
+// / the command failed" and never for success, so `!== null` is exactly "did it land".
+
+/** Open (show) a named app window. `false` = no bridge, or the host refused. */
+export async function wmOpen(label: string): Promise<boolean> {
+  return (await invoke<unknown>("wm_open", { label })) !== null;
+}
+
+/** Close a named app window. `false` = no bridge, or the host refused. */
+export async function wmClose(label: string): Promise<boolean> {
+  return (await invoke<unknown>("wm_close", { label })) !== null;
+}
+
+/** Hide a named app window (minimize off-screen). `false` = no bridge, or refused. */
+export async function wmHide(label: string): Promise<boolean> {
+  return (await invoke<unknown>("wm_hide", { label })) !== null;
+}
+
+/** Bring a named app window to the front and focus it. `false` = no bridge, or refused. */
+export async function wmFocus(label: string): Promise<boolean> {
+  return (await invoke<unknown>("wm_focus", { label })) !== null;
+}
+
+/**
+ * Zoom a named app window — the Window menu's **Zoom** (maximize ⇄ restore).
+ *
+ * REQ-A415: the host had no such command, so the shell's `menu.zoom` branch was an
+ * explicit no-op. `false` = no bridge, the window is gone, or the host refused (a split
+ * pane's rectangle belongs to the split — see `crates/amos-tauri/src/wm.rs::wm_zoom`).
+ */
+export async function wmZoom(label: string): Promise<boolean> {
+  return (await invoke<unknown>("wm_zoom", { label })) !== null;
+}
+
+/** Toggle full screen on a named app window. `false` = no bridge, or refused. */
+export async function wmFullscreen(label: string): Promise<boolean> {
+  return (await invoke<unknown>("wm_fullscreen", { label })) !== null;
+}
+
+/**
+ * Toggle maximize ⇄ restore on a named app window — the **title bar's double-click**.
+ *
+ * G-α: macOS users double-click a window's title bar to toggle maximize; with
+ * `title_bar_style(Overlay)` the host already accepts the underlying Tauri call, but
+ * the shell never wired the gesture. The host refuses for split panes (their
+ * rectangle belongs to the split) and for windows that have been closed since the
+ * 5 s `wm_windows` poll — a refused call is recorded in `bridgeDiag("wm_maximize")`,
+ * not swallowed (the REQ-A297 phase-2 §4 typed-error discipline).
+ *
+ * `false` = no bridge, the window is gone, or the host refused.
+ */
+export async function wmMaximize(label: string): Promise<boolean> {
+  return (await invoke<unknown>("wm_maximize", { label })) !== null;
+}
+
+// ---- Diagnostic-aware variants (for callers that need bridgeDiag on failure) ----
+// These return `null` on failure so callers can distinguish "host refused" from
+// "offline". The plain `wmOpen`/`wmClose`/`wmHide`/`wmFocus` variants above are
+// for fire-and-forget calls that don't need diagnostics.
+
+/** Open + get the diagnostics record on failure. Returns `null` when the bridge
+ * is unavailable or the command failed (use `bridgeDiag("wm_open")` for the reason). */
+export async function wmOpenWithDiag(
+  label: string,
+): Promise<{ ok: true } | { ok: false; diag: BridgeDiag }> {
+  const result = await invoke<unknown>("wm_open", { label });
+  if (result !== null) return { ok: true };
+  return { ok: false, diag: bridgeDiag("wm_open") };
+}
+
+/** Close + get the diagnostics record on failure. */
+export async function wmCloseWithDiag(
+  label: string,
+): Promise<{ ok: true } | { ok: false; diag: BridgeDiag }> {
+  const result = await invoke<unknown>("wm_close", { label });
+  if (result !== null) return { ok: true };
+  return { ok: false, diag: bridgeDiag("wm_close") };
+}
+
+/** Hide + get the diagnostics record on failure. */
+export async function wmHideWithDiag(
+  label: string,
+): Promise<{ ok: true } | { ok: false; diag: BridgeDiag }> {
+  const result = await invoke<unknown>("wm_hide", { label });
+  if (result !== null) return { ok: true };
+  return { ok: false, diag: bridgeDiag("wm_hide") };
+}
+
+/** Focus + get the diagnostics record on failure. */
+export async function wmFocusWithDiag(
+  label: string,
+): Promise<{ ok: true } | { ok: false; diag: BridgeDiag }> {
+  const result = await invoke<unknown>("wm_focus", { label });
+  if (result !== null) return { ok: true };
+  return { ok: false, diag: bridgeDiag("wm_focus") };
 }
 
 /** The window labels the host can offer for entering a split: the front two shown

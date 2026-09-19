@@ -152,7 +152,11 @@ describe("measure", () => {
       
       const m = createMeasurement(start, end, 1000, 800, 500, "Test");
       
-      expect(m.id).toMatch(/^m-\d+-[a-z0-9]+$/);
+      // The prefix is the contract (`m-`); the rest is opaque. This used to read
+      // `/^m-\d+-[a-z0-9]+$/`, which pinned the *implementation* (`Date.now()` in
+      // decimal + a random tail) rather than anything a consumer needs — and it is the
+      // shape REQ-A401 replaced with `localId` (uniqueness by counter, not by luck).
+      expect(m.id).toMatch(/^m-/);
       expect(m.start).toEqual(start);
       expect(m.end).toEqual(end);
       expect(m.distance).toBeGreaterThan(0);

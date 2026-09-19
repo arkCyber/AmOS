@@ -2,6 +2,7 @@
   "_comment": "scripts/crate-readme-scan.mjs: crates that cannot ship an examples/ directory need a reason here. A crate that later gains examples/ is reported [stale] so this list cannot rot.",
   "no_examples": {
     "amos-jni": "JNI plumbing: every entry point needs a live JVM/JNIEnv (attached thread + app class loader). A host example cannot run one, and a fake that prints class names would demonstrate the opposite of the crate's point (the exception-clearing rules at docs/android-glue.md). The crate is exercised on device through the Android providers that use it.",
+  "amos-mdm": "A daemon, not a library API. What demonstrates it is a real SQLite file + an HTTP client + an admin token — a `cargo run --example` would either re-run `main.rs`'s startup path or use a fake client to assert against a fake server (which would demonstrate the opposite of the crate's point). Its end-to-end behaviour is covered by `cargo test -p amos-mdm` and the frontend's `enterprise-mdm-*` suites.",
     "amos-link-cc": "The examples that belong to this crate are C and C++ programs (`examples/*.c`, `examples/federation`, `examples/request_response`) built by `examples/Makefile` against `amos_link.h` and the built shared library. A cargo `examples/*.rs` cannot show anything about a C ABI — the Rust side already has the upstream crate's examples, and the point here is the boundary C callers cross."
   }
 }

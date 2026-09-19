@@ -14,7 +14,7 @@
  * - API simulation (success, error, timeout, invalid response)
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import {
   normalizeCompassSettings,
   defaultCompassSettings,
@@ -31,6 +31,52 @@ import {
 } from "../compass";
 
 // vi is available from vitest if needed for mocking
+
+// ---------------------------------------------------------------------------
+// `fetch` 缝：这一套用例**不能碰真网络**。
+//
+// `fetchDeclination` 会真的去请求 NOAA 的 HTTPS 接口，并带 `AbortSignal.timeout(5000)`。
+// 那带来两个问题，都是实测过的：(a) 测试依赖网络与外部服务 —— 离线/半离线时走的是另一条
+// 分支，"绿"不再说明被测代码对；(b) 那个 5s 中止与 bun 的 **5s 单测默认超时撞在一起**，
+// 于是慢网/负载高时用例会以 `Test "…" timed out after 5009ms` 失败（本轮就是先看到这条
+// 红才顺着查到这里）。下面把 `fetch` 换成确定性应答：`beforeAll` 装、`afterAll` 还原
+// （pure 批次是一个进程跑所有文件，桩漏出去会改别的文件的行为），`beforeEach` 重置计划。
+// 顺带把一直**没有被测到**的成功路径（`result[0].declination`）钉住 —— 原注释写着
+// "Real API tests would require mocking fetch"，这里就是那个 mock。
+// ---------------------------------------------------------------------------
+
+/** The slice of `Response` that `fetchDeclination` actually reads. */
+interface StubbedResponse {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  json: () => Promise<unknown>;
+}
+
+const realFetch = globalThis.fetch;
+let respondWith: (url: string) => StubbedResponse;
+let fetchedUrls: string[];
+
+beforeAll(() => {
+  (globalThis as { fetch: unknown }).fetch = (input: unknown) => {
+    fetchedUrls.push(String(input));
+    return Promise.resolve(respondWith(String(input)));
+  };
+});
+
+afterAll(() => {
+  (globalThis as { fetch: unknown }).fetch = realFetch;
+});
+
+beforeEach(() => {
+  fetchedUrls = [];
+  respondWith = () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    json: async () => ({ result: [{ declination: 12.5 }] }),
+  });
+});
 
 describe("compass", () => {
   describe("normalizeCompassSettings", () => {
@@ -430,8 +476,36 @@ describe("compass", () => {
       await expect(fetchDeclination(0, -181)).rejects.toThrow();
     });
 
-    // Note: Real API tests would require mocking fetch
-    // These tests verify input validation works
+    // 现在 API 路径**是被测的**（见上面的 `fetch` 缝），不再只是输入校验。
+    it("returns the API's declination on 200 — and asks for exactly the right query", async () => {
+      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBeCloseTo(12.5, 5);
+      expect(fetchedUrls).toHaveLength(1);
+      expect(fetchedUrls[0]).toContain("lat1=40.7128");
+      expect(fetchedUrls[0]).toContain("lon1=-74.0060");
+      expect(fetchedUrls[0]).toContain("resultFormat=json");
+    });
+
+    it("a non-2xx answer degrades to 0 instead of throwing", async () => {
+      respondWith = () => ({ ok: false, status: 503, statusText: "Service Unavailable", json: async () => ({}) });
+      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBe(0);
+    });
+
+    it("a non-numeric declination in the body degrades to 0", async () => {
+      respondWith = () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ result: [{ declination: "east" }] }),
+      });
+      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBe(0);
+    });
+
+    it("a thrown network error degrades to 0 (offline is not a crash)", async () => {
+      respondWith = () => {
+        throw new TypeError("Failed to fetch");
+      };
+      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBe(0);
+    });
   });
 
   describe("fetchDeclinationWithCache", () => {
@@ -456,6 +530,9 @@ describe("compass", () => {
       const result = await fetchDeclinationWithCache(40.7128, -74.0060, -13.5, cached);
       expect(result.fromCache).toBe(false);
       expect(result.cachedLocation.timestamp).toBeGreaterThan(cached.timestamp);
+      // 值确实来自 API（而不是把旧值原样发回来）——这是 stub 之后才能断言的。
+      expect(result.declination).toBeCloseTo(12.5, 5);
+      expect(fetchedUrls).toHaveLength(1);
     });
 
     it("fetches new value when location changed", async () => {
@@ -507,13 +584,13 @@ describe("compass", () => {
       expect(elapsed).toBeLessThan(5);
     });
 
-    it("levelPercentage completes in < 1ms for 1000 iterations", () => {
-      const start = performance.now();
-      for (let i = 0; i < 1000; i++) {
-        levelPercentage(Math.random() * 90, Math.random() * 90);
-      }
-      const elapsed = performance.now() - start;
-      expect(elapsed).toBeLessThan(1);
+    it("levelPercentage stays within budget for 1000 iterations", () => {
+      // 与上面三条同一判据。这条是本轮发现的**漏网**：上面那段注释已经写明"墙钟亚毫秒
+      // 刀锋"换成了"热身 + 5 倍余量预算"，但这一条仍是裸的 `performance.now()` `< 1ms`、
+      // 也没有热身 —— 负载一高就红（实测 1.27ms/1000 次）。它想抓的"慢了 5 倍"用 5ms
+      // 预算同样抓得到，且输入改成确定性序列（原来是 `Math.random()`）。
+      const elapsed = measure(1000, (i) => levelPercentage(i % 90, (i * 7) % 90));
+      expect(elapsed).toBeLessThan(5);
     });
   });
 

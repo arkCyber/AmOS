@@ -601,4 +601,21 @@ placeholder 一输入就消失。这就是为什么 `LockPage` 的密码框与 `
 |---|---|---|
 | AEROSPACE_SOFTWARE_AUDIT.md | 全栈需求审计 | a11y 是其中一维度("11/106 文件声明 ARIA")——本次给出**结构化诊断 + 可重复扫描** |
 | FMEA.md | 失效模式 | 新增 FMEA 行可在下一轮补(类比 F-SH-010 / F-SH-011,见 TRACEABILITY_MATRIX 中 REQ-A280 的格式)。**本轮未加** FMEA 行 —— 刀 1 的缺陷(名字为英文 slug / 字段无名字)属于"可用性降级"而非危险源,且 `FMEA.md` 的 severity 表以数据完整性/安全为主;诚实登记为**已知未登账项** |
+
+### 9.1 回填(REQ-A438,2026-09-18):扫描器报的 3 条已归零(其中 1 条是扫描器自身的假阳性)
+
+刀 8 之后扫描器的新数据表已经到 **0**,但本节要如实登记**下一轮又冒出来的 3 条**——它们是
+REQ-A417(通知中心)/ 更早的文件应用改动带来的**回归**,不是旧账:
+
+| 位置 | 规则 | 处置 |
+|---|---|---|
+| `DesktopNotificationCenter.svelte` `nc-push-badge` | 对比度 `text-accent on bg-accent/15` = **4.46:1**(AA 小字需 4.5) | 改成 `bg-neutral-900/60 text-white`——通知中心是**两种主题都存在的深色毛玻璃**面板(`text-white/70` / `bg-white/12`),原来那个"浅底蓝字"的配对在真实渲染里根本不存在,但**扫描器 (a)(b) 两种合成都不利**(浅色变体把 15% accent 合成到白底),修成中性深底白字后**两种合成各自 ≥10:1**,且更贴合 macOS 玻璃面板里的 chip 外观 |
+| `FilesApp.svelte` 两个删除 chip(行内 + 云端) | 对比度 `text-danger on bg-neutral-300` = 3.63:1 / `on dark:bg-neutral-700` = 3.04:1 | 改成 `bg-neutral-100`(浅色 4.94:1)/ `dark:bg-neutral-900/70`(深色 5.26:1):**保留红色文字**而把底色推离文字,而不是把红改成黑(破坏"危险操作"语义) |
+| `DesktopShell.svelte` | live-region 启发式命中(5 s 轮询) | **假阳性,登记进 `KNOWN_FALSE_POSITIVES`**:该轮询读的是"系统快捷键的目标窗口"(`focusedWindowLabel`),**从不被渲染**,加 `aria-live` 反而会每 5 s 念一次窗口标题——与同类条目(`Dock.svelte` 的"运行中小白点")同一判据 |
+
+证据:`node scripts/a11y-scan.mjs --selftest` 全绿;`node scripts/a11y-scan.mjs` → **136 文件 / 0 缺口**;
+`vitest`(通知中心与文件应用两套件在内)**102 文件 / 1217 例全绿**。**仍未做**:颜色对比度只覆盖
+`text-*` 与 `bg-*` 能在同一 class 串里配对的形状——**跨元素**对比(例如 chip 落在动态卡片底色上)、
+渐变/图片背景、`opacity` 叠加仍不在静态扫描器视野内(§4.2 的已知盲区不变)。
+
 | TRACEABILITY_MATRIX.md | 需求-测试-失效模式追踪 | 扫描/审计 = REQ-A282(首扫,该次提交未登记本行);**修补 = REQ-A283**(本文件 §3.1.5) |

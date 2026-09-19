@@ -24,9 +24,20 @@
  *     (`self.path` in a getter) are not calls; a call on some other value (`other.run()`)
  *     cannot be resolved by name and contributes no edge.
  *
+ * Workspace-wide (REQ-A443). The scan also builds a **whole-workspace call graph**, so a cycle
+ * spanning two files or two crates is caught, not only one inside a single file. The global pass
+ * adds an edge only where the target is **unambiguous**: a call the file itself cannot resolve
+ * contributes an edge *iff* exactly one production definition of that key (`Type::name`, or a
+ * bare free-function name) exists in the whole workspace. Two crates with a same-named method
+ * therefore contribute **no** edge — a false cycle is worse than a missed one, the contract every
+ * resolver here keeps — and only cycles whose members live in ≥2 files are reported by it, so the
+ * per-file findings keep their stable shape.
+ *
  * What it does **not** claim (honest boundaries, spelled out rather than implied):
- *   • a cycle spanning **two files** (a whole-workspace call graph would need module
- *     resolution and `use` tracking; this scan only links functions defined in one file);
+ *   • a target key that is **ambiguous** workspace-wide (two same-named types, or two free
+ *     functions): the global pass drops the edge rather than guessing which one it means;
+ *   • a call the resolver cannot name at all: a method call on some other value
+ *     (`other.run()`), or a qualified path deeper than `crate::Type::name` (see `calleesOf`);
  *   • dynamic recursion through a trait object, a function pointer or a closure;
  *   • macro-generated code (`macro_rules!` bodies, `include!`d files) — this workspace uses
  *     neither for control flow;
@@ -35,10 +46,12 @@
  *
  * Gated as a **ratchet** (`scripts/rust-recursion-baseline.json`): the existing backlog is
  * frozen with a reason per entry, a **new** recursion finding fails the scan, and a baseline
- * entry that no longer matches is reported `[stale]` so the ratchet cannot rot. The baseline
- * is **empty** today (337 production files in which the two recursive functions that existed
- * were rewritten as a dynamic program and a work list, REQ-A214/A215), so any finding at all
- * is a regression.
+ * entry that no longer matches **fails too** (REQ-A447 — the ratchet must shrink, not rot;
+ * printing a note was not enough). The baseline
+ * is **empty** today (the two recursive functions that ever existed in the production tree were
+ * rewritten as a dynamic program and a work list, REQ-A214/A215), so any finding at all is a
+ * regression. The scanned-file count is *printed* by every run rather than written down here,
+ * because a number in a comment is a claim nobody re-measures — the lesson of F-DEV-031.
  *
  * The scanner is dependency-free (regex + fs) and never executes or imports the Rust it
  * inspects.
@@ -56,6 +69,22 @@ import { fileURLToPath } from "node:url";
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cratesDir = join(repoRoot, "crates");
 const baselinePath = join(repoRoot, "scripts", "rust-recursion-baseline.json");
+
+// An unrecognised flag is a **failure**, not a no-op. `docs/POWER_OF_10.md`'s verification block
+// spelled this script's selftest as `--self-test`, which it does not implement — so the documented
+// command silently ran the *gate* and printed a clean line (the F-DEV-005 shape: an instrument
+// answering a different question). Measured on 2026-09-19 across all five `-scan` gates; the flag
+// is rejected here so the mistake cannot silently pass again.
+const KNOWN_FLAGS = new Set(["--selftest", "--json", "--update-baseline"]);
+const unknownFlags = process.argv
+  .slice(2)
+  .filter((f) => f.startsWith("-") && !KNOWN_FLAGS.has(f));
+if (unknownFlags.length > 0) {
+  console.error(
+    `[recursion-scan] unknown flag(s): ${unknownFlags.join(", ")} — known: ${[...KNOWN_FLAGS].join(", ")}`,
+  );
+  process.exit(2);
+}
 
 const SKIP_DIRS = new Set(["node_modules", "target", ".git", "gen"]);
 
@@ -322,11 +351,16 @@ function traitOf(header) {
  * some other value, `other.run()`, cannot be resolved by name alone), so the analysis can
  * miss a cycle but never invent one — the same contract as the direct-recursion check.
  */
-function calleesOf(masked, fn, index) {
-  const out = new Set();
+function calleesOfDetailed(masked, fn, index) {
+  const resolved = new Set(); // keys *this file* defines — the per-file graph's edges
+  const unresolved = new Set(); // candidate keys only the workspace pass can resolve
   const body = bodyOf(masked, fn.bodyOpen);
-  const push = (key) => {
-    if (key !== undefined) out.add(key);
+  // A call this file resolves becomes an edge here; one it cannot carries its *candidate* key
+  // (`Type::name`, or a bare name) so `scanWorkspace` can still use it when the whole workspace
+  // defines that key exactly once.
+  const push = (local, candidate) => {
+    if (local !== undefined) resolved.add(local);
+    else if (candidate !== undefined) unresolved.add(candidate);
   };
   // `self.name(…)` / `Self::name(…)` — this type's own methods. The trailing `(` matters:
   // `self.path` in a getter is a *field* access, and counting those as calls made every
@@ -335,7 +369,7 @@ function calleesOf(masked, fn, index) {
     for (const m of body.matchAll(
       /\b(self\s*\.\s*|Self\s*::\s*)([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^>]*>)?\s*\(/g,
     )) {
-      push(resolveMethod(index, fn.selfType, m[2]));
+      push(resolveMethod(index, fn.selfType, m[2]), `${fn.selfType}::${m[2]}`);
     }
   }
   // `Type::name(…)` — an explicit path to a type implemented in this file. **Only a path
@@ -351,11 +385,11 @@ function calleesOf(masked, fn, index) {
   )) {
     const path = m[1].split(/\s*::\s*/);
     if (path.length === 1) {
-      push(resolveMethod(index, path[0], m[2]));
+      push(resolveMethod(index, path[0], m[2]), `${path[0]}::${m[2]}`);
       continue;
     }
     if (path.length === 2 && LOCAL_PREFIXES.has(path[0])) {
-      push(resolveMethod(index, path[1], m[2]));
+      push(resolveMethod(index, path[1], m[2]), `${path[1]}::${m[2]}`);
     }
   }
   // A bare `name(…)` — a free function (never this method), unless it is a definition.
@@ -365,9 +399,18 @@ function calleesOf(masked, fn, index) {
     const nameStart = m.index + m[1].length;
     const before = body.slice(Math.max(0, nameStart - 4), nameStart).trimEnd();
     if (before.endsWith("fn")) continue; // a nested definition, not a call
-    if (index.all.has(m[2])) push(m[2]);
+    push(index.all.has(m[2]) ? m[2] : undefined, m[2]);
   }
-  return [...out];
+  return { resolved: [...resolved], unresolved: [...unresolved] };
+}
+
+/**
+ * Edges the **per-file** graph uses: the calls this file resolves by itself. Kept as a wrapper
+ * so `scanMasked` reads exactly as before; the workspace pass (`scanWorkspace`) uses the
+ * detailed form, which also carries the candidates only a whole-workspace index can resolve.
+ */
+function calleesOf(masked, fn, index) {
+  return calleesOfDetailed(masked, fn, index).resolved;
 }
 
 /** Every function in one masked source, keyed as the graph needs it. */
@@ -424,9 +467,10 @@ function resolveMethod(index, type, name) {
  * black colouring — no recursion in the scanner either) reports every back edge. Members are
  * sorted so a cycle has one stable name (`a+b`), which is what the baseline keys on.
  *
- * Honest scope: edges exist only between functions **defined in the same file** and resolved
- * by name (see `calleesOf`), so a cycle that spans two files, a bare method call on another
- * value, or dynamic dispatch through a trait object is not seen — the header states it too.
+ * Honest scope: the per-file graph's edges exist only between functions **defined in the same
+ * file** and resolved by name (see `calleesOf`), so a cycle that spans two files, a bare method
+ * call on another value, or dynamic dispatch through a trait object is not seen here — the first
+ * of those is what `scanWorkspace` (REQ-A443) adds, and the header states the rest.
  */
 function scanMasked(masked) {
   const fns = functionsOf(masked);
@@ -475,6 +519,113 @@ function scanMasked(masked) {
     }
   }
   return [...cycles.values()];
+}
+
+/**
+ * The **workspace-wide** pass (REQ-A443). The per-file pass cannot see a cycle split across two
+ * files or two crates, and `docs/POWER_OF_10.md`'s residual-risk table registered exactly that
+ * ("跨 crate 间接递归(扫描器只看 crate 内) → 扩展为 workspace-wide call graph"). This pass builds
+ * one graph over every production file and adds an edge for a call the file could not resolve
+ * **iff the whole workspace defines that key exactly once**.
+ *
+ * Why uniqueness rather than "the first definition with that name": a false cycle is worse than a
+ * missed one — the REQ-A387 lesson, where matching a name without knowing *which* definition it
+ * named produced four false positives. Two same-named types, or two free functions, make the
+ * target ambiguous and the edge is dropped (unremarked; the header states the boundary).
+ *
+ * Only cycles whose members live in **≥2 files** are returned: a cycle inside one file is already
+ * the per-file pass's finding, and reporting it twice would double every baseline entry.
+ *
+ * @param {{path: string, masked: string}[]} parsed every production file, masked and test-stripped
+ */
+function scanWorkspace(parsed) {
+  const files = parsed.map(({ path, masked }) => {
+    const fns = functionsOf(masked);
+    const index = indexFunctions(fns);
+    const node = (key) => `${path}::${key}`;
+    const localNode = new Map();
+    for (const f of fns) if (!localNode.has(f.key)) localNode.set(f.key, node(f.key));
+    return { path, masked, fns, index, node, localNode };
+  });
+
+  // Every definition of each key, workspace-wide. `length > 1` ⇒ the key is ambiguous.
+  const owners = new Map();
+  for (const pf of files) {
+    for (const f of pf.fns) {
+      if (!owners.has(f.key)) owners.set(f.key, []);
+      owners.get(f.key).push(pf.node(f.key));
+    }
+  }
+
+  const graph = new Map();
+  const nodeInfo = new Map(); // node id -> { path, key, line }
+  for (const pf of files) {
+    for (const f of pf.fns) {
+      const id = pf.node(f.key);
+      nodeInfo.set(id, { path: pf.path, key: f.key, line: f.line });
+      const { resolved, unresolved } = calleesOfDetailed(pf.masked, f, pf.index);
+      const edges = new Set();
+      for (const k of resolved) {
+        const target = pf.localNode.get(k);
+        if (target && target !== id) edges.add(target);
+      }
+      for (const k of unresolved) {
+        const os = owners.get(k);
+        if (os && os.length === 1 && os[0] !== id) edges.add(os[0]);
+      }
+      graph.set(id, edges);
+    }
+  }
+
+  // The same iterative white/grey/black DFS as `scanMasked`, now over the workspace nodes.
+  const WHITE = 0;
+  const GREY = 1;
+  const BLACK = 2;
+  const colour = new Map([...graph.keys()].map((k) => [k, WHITE]));
+  const cycles = new Map();
+  for (const start of graph.keys()) {
+    if (colour.get(start) !== WHITE) continue;
+    const path = [start];
+    const stack = [[start, 0]];
+    colour.set(start, GREY);
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      const [key, index] = frame;
+      const callees = [...(graph.get(key) ?? [])];
+      if (index >= callees.length) {
+        colour.set(key, BLACK);
+        stack.pop();
+        path.pop();
+        continue;
+      }
+      frame[1] = index + 1;
+      const next = callees[index];
+      if (colour.get(next) === GREY) {
+        const members = path.slice(path.indexOf(next)).sort();
+        const label = members.join("+");
+        if (!cycles.has(label)) cycles.set(label, { members });
+      } else if (colour.get(next) === WHITE) {
+        colour.set(next, GREY);
+        path.push(next);
+        stack.push([next, 0]);
+      }
+    }
+  }
+
+  // Report only the cycles the per-file pass cannot produce: `members` are rendered as
+  // `path::key` so a baseline key is unique without a second field.
+  const out = [];
+  for (const c of cycles.values()) {
+    const infos = c.members.map((m) => nodeInfo.get(m));
+    const paths = [...new Set(infos.map((i) => i.path))];
+    if (paths.length < 2) continue;
+    out.push({
+      entry: infos[0],
+      files: paths,
+      members: infos.map((i) => `${i.path}::${i.key}`),
+    });
+  }
+  return out;
 }
 
 // --- selftest ---------------------------------------------------------------
@@ -637,6 +788,67 @@ function runSelftest() {
       );
     }
   }
+  // --- the workspace pass (REQ-A443): the shapes it must catch and must not invent -----------
+  const crossCases = [
+    {
+      name: "a cycle spanning two files is a finding (the per-file pass cannot see it)",
+      files: [
+        { path: "crates/a/src/x.rs", src: "fn a() -> u8 { b() }\n" },
+        { path: "crates/b/src/y.rs", src: "fn b() -> u8 { a() }\n" },
+      ],
+      expect: 1,
+    },
+    {
+      name: "a cycle inside one file is left to the per-file pass (no double report)",
+      files: [{ path: "crates/a/src/x.rs", src: "fn a() -> u8 { b() }\nfn b() -> u8 { a() }\n" }],
+      expect: 0,
+    },
+    {
+      // The REQ-A387 lesson one level up: `helper` is defined in two files, so the target is
+      // ambiguous — an implementation that "picks one" would report a cycle here. Not guessing is
+      // the whole contract, so the expected count is zero.
+      name: "an ambiguous key contributes no edge",
+      files: [
+        { path: "crates/a/src/x.rs", src: "fn a() -> u8 { helper() }\n" },
+        { path: "crates/b/src/y.rs", src: "fn helper() -> u8 { a() }\n" },
+        { path: "crates/c/src/z.rs", src: "fn helper() -> u8 { 0 }\n" },
+      ],
+      expect: 0,
+    },
+    {
+      name: "a cycle of methods split across two files is a finding",
+      files: [
+        { path: "crates/a/src/x.rs", src: "impl A { fn x(&self) -> u8 { self.y() } }\n" },
+        { path: "crates/b/src/y.rs", src: "impl A { fn y(&self) -> u8 { self.x() } }\n" },
+      ],
+      expect: 1,
+    },
+    {
+      name: "a same-named method on two types contributes no edge",
+      files: [
+        {
+          path: "crates/a/src/x.rs",
+          src: "impl A { fn run(&self) -> u8 { self.help() } fn help(&self) -> u8 { 0 } }\n",
+        },
+        {
+          path: "crates/b/src/y.rs",
+          src: "impl B { fn help(&self) -> u8 { self.run() } fn run(&self) -> u8 { 0 } }\n",
+        },
+      ],
+      expect: 0,
+    },
+  ];
+  for (const c of crossCases) {
+    const got = scanWorkspace(
+      c.files.map((f) => ({ path: f.path, masked: maskNonCode(f.src) })),
+    ).length;
+    if (got !== c.expect) {
+      failures++;
+      console.error(
+        `[recursion-scan:selftest] FAIL ${c.name}: expected ${c.expect} finding(s), got ${got}`,
+      );
+    }
+  }
   // The test-module stripper is part of the contract too.
   const withTest = `fn helper() -> u8 { 0 }
 #[cfg(test)]
@@ -654,7 +866,9 @@ mod tests { fn helper() -> u8 { helper() } }`;
     console.error(`[recursion-scan:selftest] ${failures} case(s) failed`);
     process.exit(1);
   }
-  console.log(`[recursion-scan:selftest] OK — ${cases.length + 1} pinned case(s)`);
+  console.log(
+    `[recursion-scan:selftest] OK — ${cases.length + crossCases.length + 1} pinned case(s)`,
+  );
 }
 if (process.argv.includes("--selftest")) {
   runSelftest();
@@ -666,19 +880,36 @@ const rel = (f) => relative(repoRoot, f);
 const files = rustFiles.map((f) => [f, readFileSync(f, "utf8")]);
 
 const findings = [];
-for (const [file, src] of files) {
-  const production = stripTestModules(src);
-  for (const hit of scanMasked(maskNonCode(production))) {
-    findings.push({ path: rel(file), members: hit.members, line: hit.line });
+const parsed = files.map(([file, src]) => ({
+  path: rel(file),
+  masked: maskNonCode(stripTestModules(src)),
+}));
+for (const { path, masked } of parsed) {
+  for (const hit of scanMasked(masked)) {
+    findings.push({ path, members: hit.members, line: hit.line });
   }
+}
+// The workspace pass (REQ-A443): only the cycles the per-file pass above cannot see — ones whose
+// members live in **two or more** files. Its member names are already `path::key`, so the baseline
+// key (`path::members`) stays unique without a second field.
+for (const hit of scanWorkspace(parsed)) {
+  findings.push({
+    path: hit.entry.path,
+    members: hit.members,
+    line: hit.entry.line,
+    crossFile: true,
+    files: hit.files,
+  });
 }
 findings.sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
 /** `path::a+b` — a cycle has one stable name, whether it has one member or three. */
 const keyOf = (f) => `${f.path}::${f.members.join("+")}`;
 const describe = (f) =>
-  f.members.length === 1
-    ? `fn ${f.members[0]}`
-    : `cycle ${f.members.join(" → ")} → ${f.members[0]}`;
+  f.crossFile
+    ? `cross-file cycle ${f.members.join(" → ")} → ${f.members[0]}`
+    : f.members.length === 1
+      ? `fn ${f.members[0]}`
+      : `cycle ${f.members.join(" → ")} → ${f.members[0]}`;
 
 // --- baseline (ratchet) -----------------------------------------------------
 function loadBaseline() {
@@ -697,7 +928,7 @@ function writeBaseline(current) {
     policy:
       "Known production recursion (NASA Power of 10 rule 1), frozen per `path::fn` with a reason. " +
       "A **new** recursive function fails `make lint` until it is either rewritten or acknowledged here; " +
-      "an entry that no longer matches is reported `[stale]` so this ratchet cannot rot. " +
+      "an entry that no longer matches **fails the scan** (REQ-A447), so this ratchet must shrink rather than rot. " +
       "The intended steady state for a safety-critical crate is **zero** entries: prefer the iterative " +
       "form (a bounded loop or a dynamic program) over a recursive one, and if recursion is genuinely " +
       "unavoidable, write down why its depth is bounded.",
@@ -733,7 +964,7 @@ if (process.argv.includes("--json")) {
       2,
     ),
   );
-  process.exit(fresh.length > 0 ? 1 : 0);
+  process.exit(fresh.length > 0 || stale.length > 0 ? 1 : 0);
 }
 
 console.log(
@@ -761,6 +992,12 @@ if (fresh.length > 0) {
   );
   process.exit(1);
 }
-console.log(
-  `[recursion-scan] OK — no new recursion${stale.length > 0 ? " (baseline has stale entries)" : ""}.`,
-);
+if (stale.length > 0) {
+  // A note was not enough (REQ-A447): the ratchet must **shrink**. A baseline entry that no longer
+  // matches any finding is a claim about code that has changed — it fails until it is removed.
+  console.error(
+    `[recursion-scan] FAIL — ${stale.length} stale baseline entr(ies); remove them (the ratchet must shrink, not rot).`,
+  );
+  process.exit(1);
+}
+console.log("[recursion-scan] OK — no new recursion, no stale baseline entries.");

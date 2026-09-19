@@ -55,4 +55,39 @@ describe("locale.svelte — reactive i18n persistence", () => {
     window.dispatchEvent(new CustomEvent(SVELTE_LOCALE_EVENT, { detail: null }));
     expect(locale()).toBe("en");
   });
+
+  test("setLocale tells the HOST to draw the native menu bar in that language (REQ-A437)", async () => {
+    // The menu bar is AppKit's, not ours: a UI language the host never hears about leaves a
+    // Chinese shell with an English File / Edit / View (measured on this machine).
+    const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        return args?.locale ?? null; // the host echoes the locale it applied
+      },
+      listen: async () => () => {},
+    };
+    setLocale("en");
+    await Promise.resolve();
+    await Promise.resolve();
+    const menu = calls.find((c) => c.cmd === "menu_set_locale");
+    expect(menu, "setLocale must ask the host to re-draw the menu bar").toBeTruthy();
+    expect(menu?.args).toEqual({ locale: "en" });
+
+    // …and it survives a host that draws something else (the caller reports the difference
+    // instead of believing its own request landed).
+    calls.length = 0;
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push({ cmd, args });
+        return "zh";
+      },
+      listen: async () => () => {},
+    };
+    expect(() => setLocale("en")).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls.some((c) => c.cmd === "menu_set_locale")).toBe(true);
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
 });

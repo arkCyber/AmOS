@@ -11,9 +11,9 @@
  *
  * Three checks:
  *
- *   1. **emitted ⇒ consumed** — every event name the host emits (a literal or a
- *      `pub const …_EVENT`) must appear in a production `subscribe(...)` /
- *      `listen(...)` call, or be allow-listed in
+ *   1. **emitted ⇒ consumed** — every event name the host emits (a literal, a
+ *      `pub const …_EVENT`, or a free `emit("…", payload)` helper call) must appear
+ *      in a production `subscribe(...)` / `listen(...)` call, or be allow-listed in
  *      `scripts/tauri-event-allowlist.json` **with a reason**;
  *   2. **consumed ⇒ emitted** — a screen subscribing to an event no Rust code emits
  *      can never fire (the mirror defect);
@@ -157,6 +157,15 @@ export function parseEmitters(src, consts = new Map()) {
     if (table.has(last)) out.push({ name: table.get(last), unresolved: false });
     else out.push({ name: raw, unresolved: true });
   }
+  // A **free** `emit("name", payload)` call — `jni_glue.rs` emits through a module-local helper
+  // (REQ-A412). The receiver form above only sees `x.emit(…)`, so an event emitted through such a
+  // helper was reported as "no Rust code emits it" even though the emit is real: the *shape* was
+  // unrecognised, not the event absent. Deliberately **literals only** — a bare `emit(NAME, …)`
+  // that the table cannot resolve would add noise to the informational `unresolved` list for every
+  // unrelated function named `emit`, and the one shape that exists in this workspace is quoted.
+  for (const m of prod.matchAll(/(?<![\w.])emit\s*\(\s*"([^"]+)"\s*,/g)) {
+    out.push({ name: m[1], unresolved: false });
+  }
   return out;
 }
 
@@ -254,6 +263,32 @@ export function runSelftest() {
   ok("reads a literal subscription", subNames.includes("store-updated") && subNames.includes("sensor-data"));
   ok("a DOM listener is marked as DOM", subNames.includes("dom:hardware-button"));
   ok("an unresolvable subscription is flagged", subs.some((s) => s.unresolved && s.name === "computed"));
+
+  // REQ-A412: a *free* `emit("…", payload)` helper (jni_glue.rs's local `emit`) is an emitter too;
+  // without this shape the scan called two live Android events dead. Narrow by design: a free
+  // `emit(NAME, …)` whose first argument is not a literal is left alone.
+  const freeEmits = parseEmitters(
+    [
+      'fn emit(name: &str, payload: serde_json::Value) { /* … */ }',
+      'fn f() {',
+      '    emit("ble-value-changed", payload);',
+      '    emit(NFC_TAG_EVENT, payload);',
+      '    self.emit("sensor-data", ev);',
+      '}',
+    ].join("\n"),
+  );
+  ok(
+    "a free `emit(\"…\")` call counts as an emitter (jni_glue.rs's helper)",
+    freeEmits.some((e) => e.name === "ble-value-changed" && !e.unresolved),
+  );
+  ok(
+    "the receiver form still works alongside it (no double-counting)",
+    freeEmits.filter((e) => e.name === "sensor-data").length === 1,
+  );
+  ok(
+    "a free emit whose first argument is not a literal is left alone",
+    !freeEmits.some((e) => e.name === "NFC_TAG_EVENT"),
+  );
 
   ok(
     "the payload table only names plain-struct shapes",

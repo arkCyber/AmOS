@@ -119,14 +119,51 @@ describe("TopBar as a chrome container", () => {
       expect(panel, `the ${id} menu must open`).toBeTruthy();
       const rows = [...panel!.querySelectorAll<HTMLButtonElement>("[role=menuitem]")];
       expect(rows.length).toBeGreaterThan(0);
-      const disabledRows = rows.filter((r) => r.disabled);
-      expect(disabledRows.length, `${id} must have at least one F-SH-001 honest row`)
-        .toBeGreaterThan(0);
-      const first = disabledRows[0]!;
-      expect(first.getAttribute("aria-disabled")).toBe("true");
-      expect(first.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+      // The **rule** for a row the shell cannot do (F-SH-001): it stays visible, it is
+      // disabled, and it names its reason. Checked wherever such a row exists — see the
+      // list below for which menus still have one and why.
+      for (const dead of rows.filter((r) => r.disabled)) {
+        expect(dead.getAttribute("aria-disabled"), `${id}: a disabled row must say so`).toBe("true");
+        expect(dead.textContent?.trim().length ?? 0, `${id}: a disabled row must be named`).toBeGreaterThan(0);
+      }
       await fireEvent.click(trigger);
       await tick();
     }
+  });
+
+  /**
+   * Which menus still carry an unavailable row — **and why View does not** (REQ-A457).
+   *
+   * This case used to assert `disabledRows.length > 0` for **every** group, as a proxy for
+   * "the F-SH-001 rendering path is exercised". That proxy turned into the defect's bodyguard:
+   * the moment the View menu's last greyed row (`View ▸ 进入全屏幕`) became real — the command
+   * had existed all along, and on a platform with no native menu bar this bar *is* the menu —
+   * the assertion demanded View keep a dead row. A menu whose rows all work is not a loss of
+   * honesty; a test that requires one to stay dead is.
+   *
+   * So the list is explicit now: the menus that still have rows the shell cannot do, and the
+   * reason each. `view` is asserted to have **none**, so a future edit that greys one there
+   * again is the thing that fails.
+   */
+  test("the menus with an honest greyed row are exactly these (View is fully wired since REQ-A457)", async () => {
+    const host = render(TopBar);
+    await tick();
+    const dead: Record<string, number> = {};
+    for (const id of ["file", "edit", "view", "window", "help"] as const) {
+      await fireEvent.click(host.container.querySelector<HTMLElement>(`[data-testid="menu-${id}-trigger"]`)!);
+      await tick();
+      const panel = host.container.querySelector(`[data-testid="menu-${id}-panel"]`)!;
+      dead[id] = [...panel.querySelectorAll<HTMLButtonElement>("[role=menuitem]")].filter((r) => r.disabled).length;
+      await fireEvent.click(host.container.querySelector<HTMLElement>(`[data-testid="menu-${id}-trigger"]`)!);
+      await tick();
+    }
+    // file: 打印…（宿主没有打印管线）· edit: 撤销（唯一路径是 execCommand，未验证 ⇒ 不假装）
+    // window: 前置全部窗口（宿主没有该命令）· help: 搜索 / 应用帮助（没有 per-app 帮助内容）
+    expect(dead.file).toBeGreaterThan(0);
+    expect(dead.edit).toBeGreaterThan(0);
+    expect(dead.window).toBeGreaterThan(0);
+    expect(dead.help).toBeGreaterThan(0);
+    // View had exactly one (`进入全屏幕`) and it is now live — see `docs/mac-menu.md` §5.1.
+    expect(dead.view).toBe(0);
   });
 });

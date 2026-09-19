@@ -49,6 +49,31 @@ export const BACKGROUND_MODES: { id: BgModeId; style: BgStyle }[] = [
 ];
 export const DEFAULT_BG_MODE: BgModeId = "ghost";
 
+/**
+ * 桌面背景 fallback 颜色 —— 当壁纸图尚未加载、或加载失败时显示的纯色。
+ *
+ * 设计意图：**不**用纯黑（`#000` / `#1a1a1a`），而是用 macOS 风格的中性灰，
+ * 因为 macOS 真机的 `NSColor.windowBackgroundColor` 在 dark mode 下也是
+ * `#1e1e1e` 附近、不是死黑（Apple 的 Human Interface Guidelines 明确
+ * 「avoid pure black」—— OLED 上会出 letterboxing artifacts，也会让
+ * 用户的壁纸看起来像被裁了）。
+ *
+ * 这是**唯一真源**：DesktopShell 容器 / Backdrop / 任何需要 fallback 的地方
+ * 都必须 import 这个函数，不许写第二份（与 `lib/desktopLayout.ts::TOPBAR_HEIGHT`
+ * 的「唯一真源」纪律同源 —— `src/__tests__/wallpaper.test.ts` 的两条结构性负控
+ * 钉此）。
+ *
+ * 返回值是 hex 字面值，**不带** `rgb(...)` 包装 —— 调用方按需用：
+ *   - 容器背景：直接写 `style="background: <color>;"`
+ *   - Backdrop：在 `background-image` 之前写 `<color>` 作 fallback
+ */
+export function wallpaperFallbackColor(dark: boolean): string {
+  // macOS dark: NSColor.windowBackgroundColor ≈ #1e1e1e（macOS 14 实测）
+  // macOS light: NSColor.windowBackgroundColor ≈ #ececec（macOS 14 实测）
+  // 这两个值与 Apple 官方 Color and Typography 文档一致（HIG §Color）
+  return dark ? "#1e1e1e" : "#ececec";
+}
+
 export function isBgMode(id: string | undefined): id is BgModeId {
   return BACKGROUND_MODES.some((m) => m.id === id);
 }

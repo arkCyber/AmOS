@@ -306,7 +306,9 @@ mod device {
         if let Ok(provider) =
             amos_flashlight::AndroidFlashlightProvider::new(vm, &env, ctx, camera, torch_present)
         {
-            // Exactly-once; a redundant re-attach simply keeps the first provider.
+            // Exactly-once; a redundant re-attach simply keeps the first provider. Safe because
+            // the Activity is not recreated under us — the generated manifest's `configChanges`
+            // is what makes that true, and `scripts/android-glue-mirror.sh` gates it (REQ-A448).
             let _ = DEVICE.set(Arc::new(provider));
         }
     }

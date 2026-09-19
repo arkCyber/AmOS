@@ -25,8 +25,16 @@ fi
 echo "==> ensuring amos-ai is running (resumes persisted local/cloud choice)"
 "$ROOT/scripts/ai-backend.sh"
 
-echo "==> building release amos-tauri (embedded UI)…"
-cargo build --release -p amos-tauri
+# `--features custom-protocol` is **load-bearing**, not decoration (REQ-A421,
+# measured on this machine 2026-09-18): without it `tauri` is compiled in *dev*
+# mode (`tauri::is_dev() == !cfg!(feature = "custom-protocol")`), so this binary
+# would ignore the embedded `frontend-ts/dist` above and point its WebView at
+# `build.devUrl` — `http://localhost:1420`, which nothing serves on this path. The
+# result was a white window (main-frame -1004, 1 176 colours, no `[csp-probe]`
+# boot line) while every gate stayed green. `make app-open` never hit this because
+# the Tauri CLI adds `tauri/custom-protocol` itself.
+echo "==> building release amos-tauri (embedded UI, custom-protocol)…"
+cargo build --release -p amos-tauri --features custom-protocol
 
 echo "==> launching embedded UI (no port; AMOS_SOCKET=$SOCK)"
 exec env -u ALL_PROXY -u all_proxy \

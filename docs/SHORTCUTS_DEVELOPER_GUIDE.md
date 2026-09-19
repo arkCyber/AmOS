@@ -42,32 +42,44 @@ export {
   // 数据模型
   type Shortcut,
   type ActionType,
-  type ActionInstance,
+  type ActionInstance,   // children / elseChildren = 控制流子操作
   type Trigger,
+  type TriggerEvent,     // 触发器的一次信号（宿主翻译后喂给运行时）
   type ExecutionResult,
-  
+  type ExecutionLogEntry,
+
   // CRUD 操作
   createShortcut,
   updateShortcut,
   deleteShortcut,
   duplicateShortcut,
   loadShortcuts,
-  
+  saveShortcuts,
+
   // 执行引擎
-  executeShortcut,
-  executeAction,
-  
+  executeShortcut,       // 唯一入口（confirmed / locked 门禁都在这里）
+  evaluateCondition,     // `if` 的条件求值（纯）
+  resolveValue,          // 变量解析（纯；含行内插值）
+
   // 操作库
   getActionType,
   getActionsByCategory,
   BUILTIN_ACTIONS,
-  
+
+  // 触发器（纯判定 + 运行时；"在哪个绝对时刻唤醒"在 Rust）
+  triggerMatches,
+  timeTriggerMatches,
+  haversineMeters,
+  isoWeekday,
+  minuteKey,
+  ShortcutTriggerRuntime,
+  TRIGGER_TICK_MS,
+
   // 常量
   SHORTCUT_COLORS,
   SHORTCUT_ICONS,
   LIMITS,
 };
-```
 
 ---
 
@@ -344,23 +356,27 @@ interface ExecutionContext {
 
 ### 变量解析
 
-`resolveValue` 函数处理动态变量：
+`resolveValue` 处理两种写法，**语义故意不同**（`lib/shortcuts.ts`）：
 
-```typescript
-function resolveValue(value: unknown, context: ExecutionContext): unknown {
-  if (typeof value === "string") {
-    return value
-      .replace(/{input}/g, String(context.input ?? ""))
-      .replace(/{output}/g, String(context.output ?? ""))
-      .replace(/{date}/g, new Date().toLocaleDateString())
-      .replace(/{time}/g, new Date().toLocaleTimeString())
-      .replace(/{var:(\w+)}/g, (_, name) => {
-        return String(context.variables.get(name) ?? "");
-      });
-  }
-  return value;
-}
-```
+| 写法 | 含义 | 例 |
+| --- | --- | --- |
+| 整串 `"$name"` / `"${name}"` | 取变量**原值**（数字还是数字、列表还是列表）；未定义时 `"$name"` 回落成字面量 | `"$total"` → `42` |
+| 嵌入 `"总计 ${total} 元"` / `"{total} 元"` | 把变量**转成文本**填进去 | `"总计 42 元"` |
+| 内建（同名变量不覆盖） | `{input}` 上一步输入、`{output}` 上一步输出、`{date}` / `{time}` | `"${output}"` |
+
+数组 / 对象会**递归**解析；普通文本里的 `$5` 不会被当成变量（嵌入形式必须带花括号）。
+
+### 控制流
+
+`if` / `repeat` / `for_each` 的子操作放在 `ActionInstance.children`（`if` 的 else 分支放
+`elseChildren`），执行器递归求值：
+
+- `repeat` 暴露 `${repeatIndex}`（1 起），上限 `LIMITS.MAX_REPEAT_ITERATIONS`；
+- `for_each` 默认暴露 `${item}` / `${index}`（可用 `itemName` / `indexName` 改名），输出每轮结果组成的列表；
+- 嵌套深度上限 `LIMITS.MAX_CONTROL_DEPTH`（手改/导入的 JSON 可以自引用，这是拒它的地方）；
+- `stop_shortcut` 立刻结束整条指令，**记为成功**，输出是当时管道值；
+- `actionsTotal` 按整棵树递归计数（不走的 else 分支也在树上）。
+
 
 ### 错误处理
 
@@ -380,6 +396,32 @@ try {
 ---
 
 ## 🎯 触发器系统
+
+### 触发器系统（Rust 负责"何时"，WebView 负责"做什么"）
+
+自动化触发器**不能**靠 WebView 的 `setInterval`：它在后台被节流，窗口关掉就不存在了。
+所以时间触发器的"在哪个绝对时刻唤醒"住在 Rust：
+
+| 层 | 文件 | 职责 |
+| --- | --- | --- |
+| Rust 计划 + 唤醒 | `crates/amos-tauri/src/shortcut_triggers.rs` | `shortcuts_trigger_sync`（幂等替换整份计划）/ `shortcuts_trigger_poll`（到点 + 自动重挂下一次）；账本用 `amos-scheduler::ExactAlarmClock`，Android 走 `alarm_sched` 的同一个 JNI 绑定（`AlarmManager#setExactAndAllowWhileIdle`） |
+| 桥 | `src/lib/shortcutSchedule.ts` | 把存储里的快捷指令翻译成计划、轮询到点、解析 key |
+| 判定（纯函数） | `src/lib/shortcuts.ts` | `triggerMatches` / `timeTriggerMatches` / `haversineMeters`：时区、星期、电量阈值、半径都在纯 bun 里钉死 |
+| 运行时 + 信号 | `src/svelte/osShortcutTriggers.ts`（`Shell.svelte` 启动） | 心跳兜底、连接变化、电池、app 打开事件、执行 |
+
+要点：
+
+- **时间触发器是复现（recurrence）**：`poll` 命中的那一条会立刻按**同一规则**重挂下一次；
+  睡过 3 天醒来只触发 **1 次**（不是 3 次）。
+- **去重到分钟**：Rust 的 `atMs` 与 WebView 心跳用同一份分钟账本，所以两边都报同一时刻
+  时只会跑一次。
+- **读不懂的规则按名字拒绝**：`time` 不是 `HH:mm` / 星期不在 1..7 → `rejected[{key, reason}]`，
+  不静默丢弃（静默丢掉的触发器是没人看得见的坏自动化）。
+- **`requiresConfirmation` 在自动化里跳过**：没人可问，所以不跑也不假装成功（手动运行由
+  `ShortcutsApp` 先确认再传 `confirmed: true`）。
+- **锁屏**：`runOnLockScreen === false` 的指令在锁屏下由 `executeShortcut` 拒绝。
+- 尚未有信号源的触发器类型（`email` / `message` / `location` 的真实定位等）判定返回
+  `false` —— 不猜、不假装。
 
 ### 触发器配置示例
 
@@ -421,57 +463,25 @@ try {
 }
 ```
 
-### 实现触发器监听器
+### 加一个触发器类型（照现有信号源抄）
+
+1. 在 `TriggerType` 里加类型（`lib/shortcuts.ts`）。
+2. 在 `triggerMatches` 的同名 `case` 里写**纯判定**：缺条件的类型返回 `false`，不要猜。
+   带阈值的要像 `battery` 一样"一个条件都没给 = 不匹配"，否则"任意变化都触发"会变成默认行为。
+3. 找一个能产生该信号的**宿主**（WebView 事件 / 存储键变化 / Tauri 事件），在
+   `svelte/osShortcutTriggers.ts` 里把它翻译成 `TriggerEvent` 交给 `runtime.fire(...)`。
+4. 判定与运行时都能在纯 bun 里单测（见 `lib/__tests__/shortcuts-automation.test.ts`）。
 
 ```typescript
-// 在应用启动时注册触发器
-function registerTriggers() {
-  const shortcuts = loadShortcuts();
-  
-  shortcuts.forEach((shortcut) => {
-    shortcut.triggers.forEach((trigger) => {
-      if (!trigger.enabled) return;
-      
-      switch (trigger.type) {
-        case "time":
-          registerTimeTrigger(shortcut.id, trigger);
-          break;
-        case "location":
-          registerLocationTrigger(shortcut.id, trigger);
-          break;
-        case "app":
-          registerAppTrigger(shortcut.id, trigger);
-          break;
-        // ... 其他触发器类型
-      }
-    });
-  });
-}
-
-function registerTimeTrigger(shortcutId: string, trigger: Trigger) {
-  const config = trigger.config as {
-    time: string;
-    days?: number[];
-    repeat: boolean;
-  };
-  
-  // 实现定时检查逻辑
-  setInterval(() => {
-    const now = new Date();
-    const [hour, minute] = config.time.split(":").map(Number);
-    
-    if (now.getHours() === hour && now.getMinutes() === minute) {
-      const dayOfWeek = now.getDay() || 7; // 转换为 1-7
-      
-      if (!config.days || config.days.includes(dayOfWeek)) {
-        executeShortcut(shortcutId, undefined, {
-          triggerId: trigger.id,
-        });
-      }
-    }
-  }, 60000); // 每分钟检查一次
-}
+// svelte/osShortcutTriggers.ts 里每个非时间信号源都是这几行
+window.addEventListener("online", () => {
+  void runtime.fire({ type: "wifi", at: Date.now(), data: { ssid, connected: true } });
+});
 ```
+
+时间触发器**不走** `fire`，而是 Rust 的 `shortcuts_trigger_poll`（见上一节）—— 那是唯一在
+"没有窗口 / 设备 Doze"时仍然作数的路径。
+
 
 ---
 

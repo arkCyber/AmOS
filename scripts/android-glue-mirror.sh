@@ -131,6 +131,52 @@ if ! grep -rqF --include='*.rs' --exclude-dir=target "\"$jni_prefix" crates; the
 fi
 echo "[glue] package identity agrees: identifier=$IDENT, glue package=$glue_pkg, JNI prefix=\"$jni_prefix\""
 
+# --- verify the Activity is never recreated under the glue ----------------------
+#
+# Nine files in `crates/amos-tauri/src` install a process-global handle **exactly once** —
+# `APP` / `VM` / `GLUE` / `SINK` / `DEVICE` / `PUSHER` — and the comment at each says "a
+# redundant attach simply keeps the first". That is only true while the first handle is
+# still the *live* one: an Activity that is **recreated** (rotation, resize, locale or
+# UI-mode change) hands the JNI attach a NEW Kotlin object, which `OnceLock::set` then
+# drops — leaving the mic / clipboard / media bridges driving a dead instance.
+#
+# What makes "keep the first" true is not in this repository's Kotlin: it is the generated
+# Activity's `android:configChanges` list, which comes from Tauri's template. Measured
+# 2026-09-19: orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|
+# screenLayout|uiMode. Nothing checked it, so a template change would silently turn those
+# deliberate discards into a scheduled failure on device.
+#
+# Honest boundary: `density` and `fontScale` are NOT in that list, so changing display size
+# or font scale DOES recreate the Activity — on that path the first-handle-wins rule is a
+# registered gap, not something this script can assert away.
+CONFIG_CHANGES_REQUIRED=(orientation keyboardHidden keyboard screenSize locale smallestScreenSize screenLayout uiMode)
+if ! grep -q 'android:configChanges' "$GEN_MANIFEST"; then
+  echo "error: $GEN_MANIFEST declares no android:configChanges on the Activity." >&2
+  echo "  The exactly-once glue handles (APP/VM/GLUE/SINK/DEVICE/PUSHER) keep the FIRST" >&2
+  echo "  handle on purpose; without configChanges the Activity is recreated and those" >&2
+  echo "  handles go stale. Re-generate with 'cargo tauri android init' (or restore the" >&2
+  echo "  attribute) before building." >&2
+  exit 1
+fi
+cc_value=$(sed -n 's/.*android:configChanges="\([^"]*\)".*/\1/p' "$GEN_MANIFEST" | head -1)
+IFS='|' read -r -a cc_tokens <<<"$cc_value"
+missing_cc=""
+for want in "${CONFIG_CHANGES_REQUIRED[@]}"; do
+  found=0
+  for tok in "${cc_tokens[@]}"; do
+    [[ "$tok" == "$want" ]] && found=1
+  done
+  [[ "$found" == "1" ]] || missing_cc="$missing_cc $want"
+done
+if [[ -n "$missing_cc" ]]; then
+  echo "error: the generated Activity's configChanges is missing:$missing_cc" >&2
+  echo "  Found: android:configChanges=\"$cc_value\"" >&2
+  echo "  Those values are what stop the Activity being recreated; the exactly-once glue" >&2
+  echo "  handles rely on it (see the comment in this script)." >&2
+  exit 1
+fi
+echo "[glue] Activity not recreated for orientation/size/locale/uiMode — the exactly-once handles rely on it (configChanges=\"$cc_value\")"
+
 # The generated Activity is the only place the glue is actually *invoked*, and that
 # wiring is hand-copied from `MainActivity.Wiring.kt`. Verify it too, for the same
 # reason: a fresh `tauri android init` Activity binds nothing (the APK would ship a

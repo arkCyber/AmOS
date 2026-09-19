@@ -5,13 +5,13 @@
  */
 import { describe, test, expect } from "vitest";
 import {
-  deleteEntries,
   folderTree,
   hasName,
   isInside,
   makeEntry,
   makeId,
   moveEntries,
+  moveToTrash,
   normalizeFiles,
   pathOf,
   recentFiles,
@@ -226,7 +226,7 @@ describe("files.ts — pure functions", () => {
     });
   });
 
-  describe("batch operations — deleteEntries", () => {
+  describe("batch operations — moveToTrash", () => {
     test("removes subtree union", () => {
       const list: FEntry[] = [
         { id: "a", type: "folder", name: "A", ts: 0 },
@@ -234,16 +234,19 @@ describe("files.ts — pure functions", () => {
         { id: "c", type: "file", name: "C", parent: "b", ts: 0 },
         { id: "d", type: "file", name: "D", ts: 0 },
       ];
-      const result = deleteEntries(list, new Set(["a", "d"]));
-      expect(result).toHaveLength(0);
+      const result = moveToTrash(list, [], new Set(["a", "d"]), 0);
+      expect(result.list).toHaveLength(0);
+      // Both selected entries become ledger rows, folder first (root-first members).
+      expect(result.moved.map((m) => m.id)).toEqual(["a", "d"]);
+      expect(result.moved[0]!.members.map((m) => m.id)).toEqual(["a", "b", "c"]);
     });
 
     test("empty set is no-op", () => {
       const list: FEntry[] = [
         { id: "a", type: "folder", name: "A", ts: 0 },
       ];
-      const result = deleteEntries(list, new Set());
-      expect(result).toBe(list);
+      const result = moveToTrash(list, [], new Set(), 0);
+      expect(result.list).toBe(list);
     });
   });
 

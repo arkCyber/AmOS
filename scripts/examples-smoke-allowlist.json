@@ -1,0 +1,81 @@
+{
+  "_comment": "scripts/examples-smoke.mjs: examples that cannot run to a zero exit in this tree. Each entry is a **decision** — a reason is mandatory (a placeholder fails), and an entry whose example no longer exists is reported stale, because a suppression that outlives its cause hides the next regression. Measured on 2026-09-19: 68 examples in `crates/*/examples/`, 49 of them run clean, the 19 below need something this machine does not have.",
+  "entries": [
+    {
+      "example": "amos-ai/chat_once",
+      "why": "Takes a daemon socket and a prompt (`usage: chat_once <socket> <prompt>`), so it needs a running `amos-ai` daemon; there is no in-tree harness that starts one for an example."
+    },
+    {
+      "example": "amos-ai/profile_once",
+      "why": "Takes a daemon socket (`usage: profile_once <socket> [prompt]`) — same requirement as `chat_once`: a live daemon on the other end of the UDS."
+    },
+    {
+      "example": "amos-ai/rag_once",
+      "why": "Takes a daemon socket or an HTTP endpoint (`usage: rag_once <socket-path | http://host:port>`); without a live RAG service it cannot answer, and the example exists to show a real round trip."
+    },
+    {
+      "example": "amos-ai/sensor_once",
+      "why": "Takes a daemon socket (`usage: sensor_once <socket>`) and prints the daemon's sensor snapshot, so it needs a live daemon to have anything true to print."
+    },
+    {
+      "example": "amos-ai/status_once",
+      "why": "Takes a daemon socket (`usage: status_once <socket>`) and prints the daemon's status; with no daemon it must not invent one."
+    },
+    {
+      "example": "amos-ai/tcp_status_once",
+      "why": "Dials the daemon's TCP status port (measured: `daemon not reachable at tcp 127.0.0.1:8787`). It is the TCP-transport counterpart of `status_once` and needs a daemon listening there."
+    },
+    {
+      "example": "amos-asr/sherpa_asr",
+      "why": "`required-features = [\"sherpa\"]` (declared): cargo refuses without it, and with it the example still needs the on-device sherpa-onnx shared library plus a model. `make lint` compiles it with the feature; the run is a device bring-up item (see docs/aaudio-sherpa-bringup.md)."
+    },
+    {
+      "example": "amos-asr/sherpa_session",
+      "why": "`required-features = [\"sherpa\"]`, same as `sherpa_asr`: the session example needs the sherpa-onnx library and a model, neither of which is in this tree."
+    },
+    {
+      "example": "amos-audio/aaudio_callback_probe",
+      "why": "`required-features = [\"aaudio\"]`: the data-callback capture path only exists in the Android build, and running it needs a device with an audio HAL. `make lint` compiles it with the feature."
+    },
+    {
+      "example": "amos-audio/aaudio_link_smoke",
+      "why": "`required-features = [\"aaudio\"]`: it is a link check against the NDK's `libaaudio.so` (see scripts/android-audio-check.sh), not a host-runnable probe."
+    },
+    {
+      "example": "amos-media/probe_media",
+      "why": "Takes a media root (`usage: probe_media <ROOT>`); on this host there is no device media tree to point it at, and inventing one would make the probe print something nobody measured."
+    },
+    {
+      "example": "amos-media/scan_dir",
+      "why": "Takes a media root (`usage: scan_dir <ROOT> [tags…]`) and exits 2 without one — correct behaviour, not a defect, but non-zero. It is the device bring-up probe for raw `read_dir` over `/storage/emulated/0` (docs/android-storage-unify.md §6 E)."
+    },
+    {
+      "example": "amos-monitor/sample_health",
+      "why": "`required-features = [\"linux\"]` (added by REQ-A463 — before that it did not declare the requirement, which made `cargo build -p amos-monitor --all-targets` fail with E0432 while the workspace build hid it through feature unification). Reading real /proc needs Linux/Android."
+    },
+    {
+      "example": "amos-tauri/term_shell",
+      "why": "Drives a real PTY shell and reads commands from **stdin** (its own doc shows `printf 'echo HI\\nexit\\n' | cargo run …`), so with no input it waits for one. Also the heaviest example build in the tree."
+    },
+    {
+      "example": "amos-telemetry-spy/live_spy",
+      "why": "`required-features = [\"audit\"]`: the live capture path needs libpcap/pnet plus privileges to open a capture handle."
+    },
+    {
+      "example": "amos-timesync/ntp_probe",
+      "why": "`required-features = [\"ntp\"]` and it queries real NTP servers, so it is a network test rather than an offline smoke (the offline half is `cargo test -p amos-timesync --features amos-timesync/ntp`)."
+    },
+    {
+      "example": "amos-translate/status_once",
+      "why": "Takes a daemon socket (`usage: status_once <socket>`): the translate daemon's status, which needs that daemon to be running."
+    },
+    {
+      "example": "amos-translate/translate_once",
+      "why": "Takes a socket and text (`usage: translate_once <socket> <text> [source] [target]`) — a real translation round trip against the running daemon."
+    },
+    {
+      "example": "amos-tts/piper_tts",
+      "why": "`required-features = [\"piper\"]` plus a downloaded Piper voice model (`make fetch-models`), neither of which is in this tree by default."
+    }
+  ]
+}

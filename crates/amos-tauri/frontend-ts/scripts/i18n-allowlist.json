@@ -1,9 +1,5 @@
 [
   {
-    "key": "common.close",
-    "reason": "Used by the shared kit.ts Close button token; Svelte components import kit.ts but the t() call is dynamic (kit.ts exports raw label strings, not t() calls), so the scanner cannot see the usage statically."
-  },
-  {
     "key": "contacts.avatarHint",
     "reason": "Avatar interaction hint bar — the hint bar was removed in the avatar UX refactor; the key remains for future reference and is listed in the avatar section documentation."
   },
@@ -22,22 +18,6 @@
   {
     "key": "edit.remove",
     "reason": "Home screen edit mode: remove item from home — the remove UX was not yet wired in the home grid; reserved for future implementation."
-  },
-  {
-    "key": "files.preview",
-    "reason": "File preview button label — the file preview feature was stubbed but not yet wired to a UI surface; reserved for future Files UX."
-  },
-  {
-    "key": "files.previewOpen",
-    "reason": "File preview open action — same as files.preview; reserved for future implementation."
-  },
-  {
-    "key": "files.previewClose",
-    "reason": "File preview close action — same as files.preview; reserved for future implementation."
-  },
-  {
-    "key": "files.previewFailed",
-    "reason": "File preview error message — same as files.preview; reserved for future implementation."
   },
   {
     "key": "interp.endSentence",

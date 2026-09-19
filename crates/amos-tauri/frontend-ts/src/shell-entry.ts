@@ -12,6 +12,8 @@ import { hydrateFromSystemStore } from "./lib/amosStore";
 import { installUiFailureObserver } from "./lib/uiFailures";
 import { invoke } from "./lib/backend";
 import { appIdFromHash } from "./lib/windowRoute";
+import { installEarlySystemKeys } from "./lib/earlySystemKeys";
+import { trackEditableFocus } from "./lib/editKeys";
 import {
   enterEdit,
   lock,
@@ -35,6 +37,9 @@ function mountShell() {
   })();
   root.innerHTML = "";
   resetShellState();
+  // The app this window addresses — the host's `#window=<label>` fragment. Read here so the
+  // early key listener below and the surface decision cannot disagree about it.
+  const ownApp = appIdFromHash(location.hash);
   try {
     const p = new URLSearchParams(location.search);
     const surface = p.get("surface");
@@ -44,13 +49,13 @@ function mountShell() {
     // An app window the host opened for a specific app (`#window=<label>`) — the
     // `?surface=` overrides above win, because they are the headless-acceptance
     // path and a real window never carries both.
-    else {
-      const win = appIdFromHash(location.hash);
-      if (win) open(win);
-    }
+    else if (ownApp) open(ownApp);
   } catch {
     /* ignore; default home */
   }
+  // REQ-A431: the listener is installed at the top of `boot()` — before the hydration await,
+  // which is the part of startup that can take seconds under load. Nothing else is needed
+  // here: the same instance stands down when the mounted shell takes the chords over.
   mount(Shell, { target: root });
 }
 
@@ -77,6 +82,18 @@ async function boot() {
     );
   });
   cspProbe("boot-reached");
+
+  // REQ-A431: own the system chords from the **first statement** — before the store
+  // hydration RPC below, which is an await and can take seconds under load (measured: with a
+  // busy machine, a ⌘W pressed 3 s after opening a window still landed before the shell was
+  // up). The listener needs nothing but the URL fragment and localStorage, and it stands down
+  // the moment a component that owns the chords mounts (`handOverSystemKeys`).
+  installEarlySystemKeys(appIdFromHash(location.hash));
+
+  // REQ-A439: remember the field the user is editing. AppKit's first responder survives a menu
+  // being opened; the DOM's `activeElement` does not — so without this, Edit ▸ Select All (a menu
+  // activation by definition) finds nothing to select. One listener for the whole page.
+  trackEditableFocus();
 
   // Install the failure observer **first**: everything below runs through async callbacks
   // (the store hydration, the app watchers), and a throw in one of them used to leave no

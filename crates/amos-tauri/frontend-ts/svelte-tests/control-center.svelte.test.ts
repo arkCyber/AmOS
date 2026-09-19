@@ -227,3 +227,67 @@ describe("ControlCenter — the panel the bar's ⚙️ item was waiting for", ()
     expect(panel.getAttribute("aria-label")).toBe(zh["desktop.controlCenter"]);
   });
 });
+
+describe("G-β-1 · Control Center 屏幕亮度滑杆（仅桌面 WebView 内容）", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  test("slider 存在、默认值 = 100（不降亮）", async () => {
+    const { container } = render(ControlCenter);
+    await tick();
+    await settle();
+    const slider = container.querySelector(
+      '[data-testid="cc-brightness"]',
+    ) as HTMLInputElement | null;
+    expect(slider).toBeTruthy();
+    expect(slider!.type).toBe("range");
+    expect(Number(slider!.value)).toBe(100);
+    // 滑杆必须有 a11y label —— 屏幕阅读器要能播报
+    expect(slider!.getAttribute("aria-label")).toBe(zh["cc.brightness"]);
+  });
+
+  test("slider 上方有「仅桌面」诚实标注", async () => {
+    const { container } = render(ControlCenter);
+    await tick();
+    await settle();
+    const block = container.querySelector('[data-testid="cc-brightness-block"]');
+    expect(block).toBeTruthy();
+    // 「仅桌面」标签 —— 这是诚实边界的关键（不控制系统亮度）
+    expect(block!.textContent ?? "").toContain(zh["cc.brightnessScope"]);
+    // 详尽 hint（WebView 内降亮）—— 避免用户误读
+    expect(block!.textContent ?? "").toContain(zh["cc.brightnessHint"]);
+  });
+
+  test("拖动 slider 写入 amos.brightness store（{pct} 形状）", async () => {
+    const { container } = render(ControlCenter);
+    await tick();
+    await settle();
+    const slider = container.querySelector(
+      '[data-testid="cc-brightness"]',
+    ) as HTMLInputElement | null;
+    slider!.value = "50";
+    await fireEvent.input(slider!);
+    await tick();
+    await settle();
+    const stored = JSON.parse(
+      window.localStorage.getItem("amos.brightness") ?? "null",
+    );
+    expect(stored).toEqual({ pct: 50 });
+    // readout 显示「50% · 仅桌面」
+    const readout = container.querySelector(
+      '[data-testid="cc-brightness-readout"]',
+    );
+    expect(readout?.textContent ?? "").toContain("50%");
+    expect(readout?.textContent ?? "").toContain(zh["cc.brightnessScope"]);
+  });
+
+  test("slider 在 store 已经有值时读出来（refresh 后保留用户偏好）", async () => {
+    writeStoreValue("amos.brightness", { pct: 30 });
+    const { container } = render(ControlCenter);
+    await tick();
+    await settle();
+    const slider = container.querySelector(
+      '[data-testid="cc-brightness"]',
+    ) as HTMLInputElement | null;
+    expect(Number(slider!.value)).toBe(30);
+  });
+});

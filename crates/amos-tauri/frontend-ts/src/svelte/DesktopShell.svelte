@@ -27,6 +27,10 @@
   import { bridgeDiag, invoke, onMenuEvent } from "../lib/backend";
   import {
     wmLayoutSnapshot,
+    wmOpen,
+    wmHide,
+    wmZoom,
+    wmFullscreen,
     onLayoutChanged,
     wmWindows,
     type LayoutSnapshot,
@@ -39,16 +43,35 @@
     nextSpaceIndex,
   } from "../lib/spaces";
   import { stageRect, DEFAULT_SCREEN } from "../lib/desktopLayout";
+  import { wallpaperFallbackColor } from "../lib/wallpaper";
+  import {
+    BRIGHTNESS_KEY,
+    brightnessToAlpha,
+    normalizeBrightness,
+  } from "../lib/brightness";
+  import {
+    actionableLabelOf,
+    deadChordMessage,
+    refusedChordMessage,
+    runSystemIntent,
+    systemIntentFor,
+    type DesktopSystemIntent,
+  } from "./desktopSystemKeys";
+  import { amosWarn } from "../lib/debugLog";
+  import { handOverSystemKeys } from "../lib/earlySystemKeys";
   import {
     SHELL_CHROME_API,
     bindingHint,
     modulesFor,
     shortcutMatches,
+    topOverlay,
     type ShellChromeApi,
+    type ShellWindowAction,
   } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
   import { lock } from "./shellState.svelte";
   import { isDesktopFeatureEnabled, loadDesktopFeatures } from "../lib/desktopFeatures";
+  import { isSelectAllChord, selectAllInFocus } from "../lib/editKeys";
   import {
     createKeyboardBindings,
     findMatchingBinding,
@@ -57,7 +80,9 @@
   import TopBar from "./TopBar.svelte";
   import Dock from "./Dock.svelte";
   import DesktopStage from "./DesktopStage.svelte";
+  import DesktopNotificationBanner from "./DesktopNotificationBanner.svelte";
   import HotCornersListener from "./modules/HotCornersListener.svelte";
+  import { createStoreValue } from "./store";
   import { t } from "./locale.svelte";
 
   // ─── 布局状态 ───────────────────────────────────────────────────────────────
@@ -74,6 +99,8 @@
 
   // ─── 浮层：注册表即清单 ─────────────────────────────────────────────────────
   const overlayModules = modulesFor("overlay", SHELL_MODULES);
+  /** The registered overlay ids — what `topOverlay` filters the open stack by (REQ-A415). */
+  const overlayIds = overlayModules.map((m) => m.id);
   /** 打开的浮层 id，**按打开顺序**——最后一个在最上面，Esc 关的也是它（macOS 语义）。 */
   let openOverlays = $state<string[]>([]);
 
@@ -104,6 +131,22 @@
     }
   }
 
+  // ─── G-β-1 · 屏幕降亮（WebView 内）────────────────────────────────────────
+  // 仓内**唯一**真源是 `lib/brightness.ts::brightnessToAlpha(pct)`：slider 写到
+  // `amos.brightness` store，shell 订阅同一个 store 然后渲染一个黑色遮罩。
+  // 遮罩是 `pointer-events: none` 不抢事件；z=80 在 stage / banner (90) / 浮层 (100+)
+  // 之间 —— Mission Control / Spotlight / 控制中心 **不会**被暗化（用户开浮层时
+  // 要看清内容，不该被压一层黑）。
+  const brightnessStore = createStoreValue<unknown>(BRIGHTNESS_KEY, {});
+  let brightnessPct = $state<number>(100);
+  $effect(() => {
+    const un = brightnessStore.subscribe((v) => {
+      brightnessPct = normalizeBrightness(v).pct;
+    });
+    return un;
+  });
+  const brightnessAlpha = $derived(brightnessToAlpha(brightnessPct));
+
   // ─── 自定义快捷键绑定（Phase 3）────────────────────────────────────────────
   // 从 localStorage 读取用户配置，与系统默认值合并。注意：浮层快捷键的真源仍是
   // ─── 自定义快捷键绑定（Phase 3）────────────────────────────────────────────
@@ -126,33 +169,127 @@
   //
   // 这些键**仍然**在捕获阶段消费：浮层内若有表单元素拿到焦点，浏览器默认会拦下 ⌘W，
   // 但 Tauri WebView 不一定，而用户的肌肉记忆是"按了 = 关窗"，所以壳直接消费。
+  /**
+   * Re-ask the host for the focused window, then act — the fallback for a chord whose
+   * target the 5 s poll did not know yet (REQ-A424).
+   *
+   * Measured on this machine, 2026-09-18: with the launcher focused, ⌘N opened the Files
+   * window and ⌘W pressed a few seconds later closed **nothing** — the polled label was
+   * read before that window existed. Invoking File ▸ Close Window by hand, a second later,
+   * closed it immediately (same host code: `menu.rs::close_key_window`), which is what
+   * proved the target was there to be found and the staleness was the whole defect. The
+   * key's own path stays synchronous (the poll answer is used when it is actionable, so a
+   * normal press never waits on IPC); only the empty answer pays for a fresh read.
+   */
+  async function resolveFocusedThen(intent: DesktopSystemIntent): Promise<void> {
+    await refreshFocused();
+    const outcome = await runSystemIntent(intent, actionableLabelOf(focusedWindowLabel));
+    if (outcome.reason) {
+      // Nothing to act on even after asking — or the host refused. Say which, instead of
+      // leaving the user pressing a key that is silently a no-op (REQ-A424/REQ-A430).
+      amosWarn(
+        "shell",
+        outcome.reason === "host-refused"
+          ? refusedChordMessage(intent, actionableLabelOf(focusedWindowLabel))
+          : deadChordMessage(intent),
+        { reason: outcome.reason },
+      );
+    }
+  }
+
+  /**
+   * Run a system intent for a target the poll already knew, and report a **refusal**
+   * (`host-refused`) — the other way a chord can die (REQ-A430). The caller's key path stays
+   * synchronous; only the reporting waits for the host's answer.
+   */
+  async function reportIntentOutcome(intent: DesktopSystemIntent, label: string): Promise<void> {
+    const outcome = await runSystemIntent(intent, label);
+    if (outcome.reason === "host-refused") {
+      amosWarn("shell", refusedChordMessage(intent, label), { reason: outcome.reason });
+    }
+  }
+
   function handleSystemShortcut(e: KeyboardEvent): boolean {
     // 关掉这个能力 ⇒ 与浮层快捷键无关,我们只放行(让 OS / WebView 接管)。这是
     // macOS 真机上 `⌘H` 的场景:用户希望系统"隐藏应用",而不是前端消费。
     if (!isDesktopFeatureEnabled("shortcuts")) return false;
 
-    // 检查自定义绑定的系统快捷键
+    // 检查自定义绑定的系统快捷键。**意图表与派发**住在 `svelte/desktopSystemKeys.ts`
+    // ——应用窗口的 `DesktopWindowKeys` 读的是同一张表（REQ-A419：应用窗口在 A416 之后
+    // 不再挂载本组件，⌘W 在它自己身上失效过）。
     for (const [id, shortcut] of customSystemBindings) {
+      const intent = systemIntentFor(id);
+      if (!intent) continue; // 不是"作用于焦点窗口"的键 ⇒ 不归这一层管
       if (matchesShortcut(shortcut, e)) {
         e.preventDefault();
         e.stopPropagation();
-        const label = focusedWindowLabel;
-        switch (id) {
-          case "closeWindow":
-            if (label && label !== "main") void invoke("wm_close", { label });
-            return true;
-          case "minimizeWindow":
-          case "hideApp":
-            if (label && label !== "main") void invoke("wm_hide", { label });
-            return true;
-          case "preferences":
-            void invoke("wm_open", { label: "settings" });
-            return true;
-        }
+        // `main`（启动器）永远不是目标：关掉它等于关掉整个桌面（F-SH-008）。
+        const target = actionableLabelOf(focusedWindowLabel);
+        // The key's own path stays synchronous (a normal press never waits on IPC): the
+        // polled answer is used when it is actionable, and only the **empty** answer pays for
+        // a fresh read (REQ-A424). Both paths report a host refusal (REQ-A430).
+        if (target) void reportIntentOutcome(intent, target);
+        else void resolveFocusedThen(intent);
+        return true;
       }
     }
 
     return false;
+  }
+
+  /**
+   * Run a "acts on the focused window" menu action and **say so when the host refuses**.
+   *
+   * REQ-A415: `menu.zoom` / `menu.enter-fullscreen` used to be explicit no-ops (macOS
+   * users press Zoom and nothing happened). Now they act — and a refusal is reported with
+   * the host's own typed code instead of silence: the window may have been closed since
+   * the 5 s `wm_windows` poll (a stale label is the normal case), and a split pane is
+   * refused on purpose because its rectangle belongs to the split. A menu that closes
+   * with nothing changing is exactly the shape the typed-error discipline removes.
+   */
+  async function windowMenuAction(
+    run: () => Promise<boolean>,
+    command: string,
+    label: string,
+  ): Promise<void> {
+    if (await run()) return;
+    const diag = bridgeDiag(command);
+    if (diag.ok) {
+      // The command reported a failure but the ledger's last word on it is "fine" — say
+      // what is actually known instead of inventing a code we did not observe.
+      console.warn(`🛟 [DesktopShell] ${command}(${label}) did not land`, diag);
+      return;
+    }
+    const code =
+      diag.kind === "command-failed" && diag.detail && typeof diag.detail === "object"
+        ? (diag.detail as { code?: string }).code
+        : undefined;
+    console.warn(`🛟 [DesktopShell] ${command}(${label}) refused`, code ?? diag.kind);
+  }
+
+  /**
+   * Zoom / Enter Full Screen on the **focused app window** — one implementation (REQ-A457).
+   *
+   * Both menu surfaces call this: the native macOS menu arrives as a `menu-event` from the host
+   * (`menu.zoom` / `menu.enter-fullscreen`, REQ-A415) and the in-app topbar menu asks through
+   * `SHELL_CHROME_API.windowAction`. They used to hold two copies of this decision — the same
+   * command, two places to keep in step — which is exactly how the in-app menu ended up still
+   * painting 缩放 / 进入全屏幕 as *unavailable* while the host command and the native item were
+   * both live (and on a platform with no native menu bar, the in-app rows are the **only** menu,
+   * so those commands were unreachable from any menu there).
+   *
+   * The target comes from the shell's own poll, and neither the launcher (`main` — it *is* the
+   * desktop, F-SH-008) nor "nothing focused" is a target: nothing is sent, and no window is
+   * resized as a guess.
+   */
+  function applyWindowAction(action: ShellWindowAction): void {
+    const label = focusedWindowLabel;
+    if (!label || label === "main") return;
+    if (action === "zoom") {
+      void windowMenuAction(() => wmZoom(label), "wm_zoom", label);
+    } else {
+      void windowMenuAction(() => wmFullscreen(label), "wm_fullscreen", label);
+    }
   }
 
   // ─── 壳注入的把手（一次，给所有槽位）────────────────────────────────────────
@@ -167,6 +304,7 @@
     overlayShortcut: (overlayId) => bindingHint(keyboardBindings.bindings.overlays.get(overlayId)),
     toggleOverlay: (overlayId) => toggleOverlay(overlayId),
     isOverlayOpen: (overlayId) => openOverlays.includes(overlayId),
+    windowAction: (action) => applyWindowAction(action),
   });
 
   // ─── 快捷键：**使用自定义绑定** ─────────────────────────────────────────────
@@ -176,6 +314,15 @@
   // 组件，各自也听 Esc（`Launchpad` / `MissionControl`），而键事件是同一个——
   // 不拦截的话一次 Esc 会把叠在一起的两层一起关掉。
   function onKeyDown(e: KeyboardEvent) {
+    // ⌘A first, and **outside** the shortcuts switch: this is a text-editing gesture the OS
+    // never delivers here (see `lib/editKeys.ts` for the measurements), not one of our desktop
+    // shortcuts — with `AMOS_DESKTOP_SHORTCUTS=disabled` a field must still be selectable.
+    if (isSelectAllChord(e) && selectAllInFocus()) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     // 系统快捷键（⌘W 关窗 / ⌘M 最小化 / ⌘H 隐藏 / ⌘, 偏好）先于浮层快捷键
     if (handleSystemShortcut(e)) return;
 
@@ -270,7 +417,11 @@
 
     // Esc → 关最上面那一层
     if (e.key === "Escape") {
-      const top = openOverlays[openOverlays.length - 1];
+      // REQ-A415: ask the registry which layer is really on top. `openOverlays` can hold
+      // an id no row declares (a typo — the structural gate in `shellModule.test.ts` is
+      // what stops new ones); such a layer draws nothing, so closing the raw last entry
+      // would swallow the press and leave the *visible* panel up.
+      const top = topOverlay(openOverlays, overlayIds);
       if (top) {
         e.preventDefault();
         e.stopPropagation();
@@ -288,6 +439,10 @@
 
   onMount(() => {
     window.addEventListener("keydown", onKeyDown, KEY_LISTENER);
+    // REQ-A431: the shell owns the system chords from here on — the boot-time listener that
+    // `shell-entry.ts` installed (covering the seconds before this component mounted) stands
+    // down, so a chord is never double-handled.
+    handOverSystemKeys();
 
     // The two documented shells capability switches (`AMOS_DESKTOP_SHORTCUTS` /
     // `AMOS_DOCK_CONTEXT_MENU`) are read by the **host** at startup — a WebView has no
@@ -316,57 +471,42 @@
     // Native macOS menu bar (Apple / File / Edit / View / Window / Help).
     // The Rust host installs the global menu at boot and forwards every item
     // activation to the WebView as a `menu-event`.  We map a small subset here
-    // (Preferences / New Window / Close Window / Enter Full Screen) so the menu
-    // actually does something — items the host handles directly (About, Quit,
-    // Hide Amos) only need to refresh the WebView's own UI.
+    // (Preferences / New Window / Close Window / Zoom / Enter Full Screen) so the menu
+    // actually does something — the items the **host** owns (About, Quit, Hide Amos,
+    // Hide Others, Show All) never arrive here: they are terminal in `menu.rs`, so a
+    // second implementation of them in the shell cannot drift from the native one
+    // (REQ-A423 moved `show-all` there, which is also where macOS defines it).
     const stopMenu = onMenuEvent((id) => {
       // Best-effort: log unknown ids but do not throw — a host-only id (e.g.
       // `menu.about`) arrives here too and is meant to be ignored.
       switch (id) {
         case "menu.preferences":
-          // ⌘, opens the Settings window (same as the existing ⌘, shortcut).
-          void invoke("wm_open", { label: "settings" });
+          void wmOpen("settings");
           break;
         case "menu.new-window":
-          // New Window on macOS opens a fresh "Finder-like" surface.  We open
-          // the Files app as a reasonable default (it's our closest analog).
-          void invoke("wm_open", { label: "files" });
-          break;
-        case "menu.close-window":
-          // Close Window closes the **focused** non-shell window.
-          const label = focusedWindowLabel;
-          if (label && label !== "main") void invoke("wm_close", { label });
+          // The **Files** window, and the native item's label says exactly that ("New Files
+          // Window", REQ-A434) — the two must not drift: a shell has no "current app" window
+          // to duplicate (the host keeps one window per label), so "New Window" was a promise
+          // the item could not keep.
+          void wmOpen("files");
           break;
         case "menu.minimize":
-          // ⌘M hides the focused window (mirrors ⌘M on the focused window).
           const mlabel = focusedWindowLabel;
-          if (mlabel && mlabel !== "main") void invoke("wm_hide", { label: mlabel });
+          if (mlabel && mlabel !== "main") void wmHide(mlabel);
           break;
         case "menu.zoom":
-          // Tauri windows don't expose a "zoom" (toggle max size) call here;
-          // fall back to maximize which is the closest platform-neutral analog.
-          const zlabel = focusedWindowLabel;
-          // No `wm_zoom` — leave as a no-op for now.
-          if (zlabel) { /* intentional */ }
+          // REQ-A415 wired this branch (it used to be an explicit no-op: "No `wm_zoom` —
+          // leave as a no-op for now"). REQ-A457 moved the body into `applyWindowAction`,
+          // which the in-app menu rows now call too — one implementation, so the two menu
+          // surfaces cannot describe the same command differently.
+          applyWindowAction("zoom");
           break;
         case "menu.enter-fullscreen":
-          // Toggle fullscreen on the focused window (the platform toggles).
-          // Tauri's per-window toggle is `is_fullscreen` → not exposed as a
-          // command yet; the user can still use macOS's native green button.
-          break;
-        case "menu.show-all":
-          // "Show All" mirrors "unhide all" — unhide every hidden window.
-          // `WmWindowInfo.state` is one of "Hidden" | "Shown" | "Focused"
-          // (the host's own spelling — see lib/wm.ts).
-          void wmWindows().then((snap) => {
-            if (!snap) return;
-            for (const w of snap.windows) {
-              if (w.state === "Hidden") void invoke("wm_focus", { label: w.label });
-            }
-          });
+          applyWindowAction("full-screen");
           break;
         default:
-          // Host-handled (about / quit / hide-amos) — nothing to do here.
+          // Host-owned and terminal in `menu.rs` (about / quit / hide-amos / hide-others
+          // / show-all): it forwards them for symmetry, and there is nothing to do here.
           break;
       }
     });
@@ -409,12 +549,26 @@
   {t("a11y.skipToMain")}
 </a>
 
+<!--
+  G-DesktopShell · 桌面背景 fallback 不再是死黑（`#1a1a1a` → macOS 中性灰）。
+
+  颜色字面值的**唯一**真源是 lib/wallpaper.ts::wallpaperFallbackColor（被
+  src/__tests__/wallpaper.test.ts 的两条结构性负控钉住）—— 不允许这里写第二份。
+  Svelte 把 `{wallpaperFallbackColor(true)}` 渲染为 `background: #1e1e1e`
+  （dark 默认 —— 仓内默认是 dark 主题，与 `lib/wallpaper.ts::resolveWallpaper`
+  的默认分支一致）；light 值在下面的 `<style>` 块用 CSS 媒体查询覆盖 —— 跟随 OS
+  的 prefers-color-scheme（与 Backdrop 用 `themeDark()` 跟随用户主题偏好同源
+  语义：Backdrop 跟「用户的选择」，根容器跟「OS 级偏好」，二者产生同一 dark 值的
+  判据，不重复计算同一件事）。这样**任何**时机整个屏幕都不会出死黑，包括：
+    (1) Backdrop 还没挂载（首帧 / 切回桌面）
+    (2) 壁纸图加载失败（离线 / 路径错）
+    (3) stage 之外（理论上不存在 —— 但若 host 答 screen_w < 实际宽度时
+        stage 之外也会出 fallback）
+-->
 <div
   class="relative h-full w-full overflow-hidden font-system"
-  style="
-    background: #1a1a1a;
-    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif;
-  "
+  style="background: {wallpaperFallbackColor(true)}; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif;"
+  data-testid="desktop-shell-root"
 >
   <!-- 桌面舞台（壁纸 + 桌面图标 + stage 槽位 + 右键菜单） -->
   <div
@@ -457,6 +611,31 @@
       </div>
     {/if}
   {/each}
+
+  <!-- G-γ · 桌面通知 banner（macOS 右上角 toast）
+       z=90：高于 stage / topbar / dock（≤30），低于注册表浮层（=100+），且**不**进
+       `{#each openOverlays}` —— banner 是 ambient 的（用户没主动叫起），浮层是
+       modal 的（用户主动叫起），混进同一容器会让 "Esc 关最上" 的规则把 banner 也关掉。
+
+       与 phone 形态的 `NotificationBanner` **完全同源**（同一份 `lib/settings.ts`
+       纯函数），所以两条路径不会有「同一个通知在 PC 上停留 4.2s，在手机上停留别
+       的时长」的 UX 分裂。详见 `docs/DESKTOP_NOTIFICATION_BANNER_G_GAMMA.md`。 -->
+  <DesktopNotificationBanner />
+
+  <!-- G-β-1 · 屏幕降亮遮罩（仅 WebView 内容；不控制系统亮度）
+       z=80：高于 stage / topbar / dock（≤30），**低于** 通知 banner（=90）与
+       注册表浮层（=100+）—— 用户开 Mission Control / Spotlight / 控制中心时**不**
+       被压一层黑（浮层自己有自己的 backdrop 与深色玻璃，遮罩叠上去反而看不清）。
+       `pointer-events: none` 不抢事件；alpha=0 时**不渲染**（避免无意义的额外层）。 -->
+  {#if brightnessAlpha > 0}
+    <div
+      class="pointer-events-none fixed inset-0 z-[80] bg-black"
+      style="opacity: {brightnessAlpha}"
+      data-testid="brightness-overlay"
+      data-brightness-pct={brightnessPct}
+      aria-hidden="true"
+    ></div>
+  {/if}
 
   <!-- Hot Corners Listener (global mousemove handler) -->
   <HotCornersListener />

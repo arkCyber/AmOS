@@ -47,25 +47,25 @@
     }
   }
 
-  /** Which state token to show for a victim. The daemon's `outcome` is authoritative
-   *  (REQ-A299): `killed: false` alone cannot tell "frozen to Cached" from "the
-   *  container refused", and showing the latter as frozen is a claim that did not
-   *  happen. */
+  /** Which state token to show for a victim. The wire gives us exactly one signal —
+   *  `killed` — and `proto/android_compat.proto` defines it: `true = killed (surface
+   *  torn down)`, `false = frozen`. The server agrees (`trigger_lmk_low_freezes_not_kills`
+   *  moves the task to Cached and leaves it tracked), so a `false` row says "frozen":
+   *  that is what the host reported. A round the container refused produces **no victim
+   *  row at all** (`service.rs::trigger_lmk` ignores the `am force-stop` result), and a
+   *  payload whose `killed` is missing stays "unknown" rather than being claimed as a freeze.
+   *  (This panel used to read a per-victim `outcome`, which the wire never carried — so
+   *  "frozen" was unreachable and every freeze rendered as "unknown".) */
   const VICTIM_KEY: Record<LmkVictimState, string> = {
     reclaimed: "lmk.killed",
     frozen: "lmk.frozen",
-    refused: "lmk.refused",
     unknown: "lmk.unknown",
   };
   const VICTIM_CLASS: Record<LmkVictimState, string> = {
     reclaimed: "text-red-500",
     frozen: "opacity-60",
-    // A refusal is not a failure — nothing happened — so it is a warning, not danger.
-    refused: "text-amber-600 dark:text-amber-500",
     unknown: "opacity-40",
   };
-  /** The container's own reason, appended only when it refused the action. */
-  const reasonSuffix = (v: LmkVictim) => (v.refusal_reason ? ` (${v.refusal_reason})` : "");
 
   let busy = $state(false);
   let note = $state<string | null>(null);
@@ -227,7 +227,7 @@
               {@const st = victimState(v)}
               <span class="mr-2">
                 {v.package_name}
-                <span class={VICTIM_CLASS[st]}>{t(VICTIM_KEY[st])}{reasonSuffix(v)}</span>
+                <span class={VICTIM_CLASS[st]}>{t(VICTIM_KEY[st])}</span>
               </span>
             {/each}
           </li>

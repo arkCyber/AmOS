@@ -25,3 +25,20 @@ linux = []
 # (real Android SystemStatus reads remain device bring-up). Validated with
 # `cargo check -p amos-monitor --features android`.
 android = []
+
+# `examples/sample_health.rs` uses `amos_monitor::linux::LinuxSystemSampler`, which only
+# exists with the `linux` feature — so it must declare that requirement (REQ-A463).
+#
+# Without this the package is broken **in isolation** and only a workspace build hides it:
+# `cargo build -p amos-monitor --all-targets` fails with E0432 (unresolved import), while
+# `cargo clippy --workspace --all-targets` passes because `amos-ai` depends on this crate
+# with `features = ["linux"]` and cargo unifies features across the workspace. The defect
+# was found by *running* the example (`cargo run -p amos-monitor --example sample_health`),
+# not by any gate — `make lint` is green either way. With the declaration, cargo skips the
+# target when the feature is off (like `amos-asr`'s `sherpa_asr`, `amos-tts`'s `piper_tts`,
+# `amos-timesync`'s `ntp_probe`) and prints "requires the features: `linux`" instead of an
+# unresolved-import error.
+[[example]]
+name = "sample_health"
+required-features = ["linux"]
+

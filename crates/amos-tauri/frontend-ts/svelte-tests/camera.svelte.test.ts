@@ -120,8 +120,12 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     expect(JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]").length).toBe(0);
     await fireEvent.click(shot as HTMLButtonElement);
     await settle();
-    const stored = JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]") as unknown[];
+    const stored = JSON.parse(window.localStorage.getItem(PHOTOS_KEY) ?? "[]") as Array<{ id: string }>;
     expect(stored.length).toBe(1);
+    // REQ-A402: the shot's id comes from `localId`. It used to be `c${now}-${shotSeq++}` —
+    // the clock plus a **per-process** counter (no entropy: two windows agreeing on a
+    // millisecond mint the same string), while the album renders a keyed `{#each … (p.id)}`.
+    expect(stored[0]!.id).toMatch(/^shot-[0-9a-z]+-[0-9a-z]+-[0-9a-z]{7}$/);
     expect(txt(host)).toContain("已保存到相册"); // camera.saved
   });
 

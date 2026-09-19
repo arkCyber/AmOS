@@ -33,7 +33,11 @@
 
   // Plain const seed is unnecessary — appId is read only in reactive contexts.
   let status = $state<VoiceStatus>("idle");
-  // OS microphone permission gate (persisted ledger for `appId`).
+  // OS microphone permission gate (persisted ledger for `appId`). REQ-A380: the
+  // AI app's resident voice mic is in the boot-time default-on set, so opening
+  // the button must NOT throw a chip in front of the user; the gate still
+  // exists so an explicit Privacy revoke (and a "deny" answer from the OS
+  // record-audio dialog) keeps it off.
   let micGranted = $state(false);
   let seeded = false;
   $effect(() => {
@@ -104,9 +108,17 @@
 
   async function start(): Promise<void> {
     if (!online) return;
+    // REQ-A380: the AI app is in the boot-time default-on set, so the ledger
+    // already holds `microphone` on first boot. The “chip” (a tiny "允许使用
+    // 麦克风？") path stays for *rare* cases — the user explicitly revoked from
+    // the Privacy dashboard, or the OS report denied the runtime grant — and is
+    // reached only through `allowMic()` / `denyMic()`, never auto on mount.
     if (!micGranted) {
-      ask = true; // prompt before touching the microphone
-      return;
+      micGranted = capSet(loadLedger(), appId, MIC);
+      if (!micGranted) {
+        ask = true; // explicit revoke from Privacy → surface the chip
+        return;
+      }
     }
     const media = navigator.mediaDevices;
     if (!media?.getUserMedia) return;
@@ -167,7 +179,7 @@
   }
 
   const allowMic = () => {
-    grantCapability(appId, MIC);
+    grantCapability(appId, MIC); // mirrors to daemon for the audit trail
     micGranted = true;
     ask = false;
     void start();

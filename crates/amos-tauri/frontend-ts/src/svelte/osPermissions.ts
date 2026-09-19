@@ -27,9 +27,20 @@ import {
 } from "../lib/permissions";
 import { daemonAuthorize, daemonGrant, daemonRevoke } from "../lib/privacyBackend";
 
-/** Grant `cap` to `appId`: persist locally, then mirror to the daemon. */
+/**
+ * Grant `cap` to `appId`: persist locally, then mirror to the daemon.
+ *
+ * Idempotent — a cap that is already held returns the unchanged ledger and
+ * **does not** call the daemon. Repeated default-on seeds during a single boot
+ * therefore fire exactly one mirror per newly-added pair, and a re-boot of an
+ * already-default-on install fires none.
+ */
 export function grantCapability(appId: string, cap: Capability): PermissionLedger {
-  const next = grantCap(loadLedger(), appId, cap);
+  const prev = loadLedger();
+  const next = grantCap(prev, appId, cap);
+  // Same reference ⇒ no work done (idempotent grantCap). Skip both write and
+  // daemon mirror so the audit log stays honest about which boot wrote what.
+  if (next === prev) return next;
   saveLedger(next);
   void daemonGrant(appId, cap);
   return next;

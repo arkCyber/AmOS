@@ -110,7 +110,9 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_ClipboardGlue_attach(
                 .map(|vm| Arc::new(AndroidClipboardSink { vm, bridge }))
         });
         if let Some(sink) = registered {
-            // Exactly-once; a redundant re-attach simply keeps the first sink.
+            // Exactly-once; a redundant re-attach simply keeps the first sink. Safe because the
+            // Activity is not recreated under us — the generated manifest's `configChanges` is
+            // what makes that true, and `scripts/android-glue-mirror.sh` now gates it (REQ-A448).
             let _ = SINK.set(sink.clone());
             let _ = clipboard::set_native_sink(sink);
         }

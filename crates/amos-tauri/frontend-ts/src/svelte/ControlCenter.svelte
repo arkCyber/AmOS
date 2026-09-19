@@ -33,6 +33,10 @@
     type QuickSettings,
     type RadioKey,
   } from "../lib/settings";
+  import {
+    BRIGHTNESS_KEY,
+    normalizeBrightness,
+  } from "../lib/brightness";
   import { writeStoreValue } from "../lib/amosStore";
   import { themeDark, toggleTheme } from "./theme.svelte";
   import { createStoreValue } from "./store";
@@ -57,6 +61,32 @@
   });
 
   const persist = (next: QuickSettings) => writeStoreValue(SETTINGS_KEY, next);
+
+  /** G-β-1 · 屏幕降亮（WebView 内）—— 同源自 lib/brightness.ts。
+   *
+   * 为什么不放在 quickRadio 那一套：brightness 是连续值（0..100 百分比），不是布尔。
+   * 走独立 store key（`amos.brightness`），由 DesktopShell 订阅同一个 key 渲染
+   * `<div class="brightness-overlay">`（详见 docs/DESKTOP_BRIGHTNESS_SLIDER_G_BETA_1.md）。
+   * 默认 100 = 不降亮；持久化即"用户的偏好"，覆盖系统默认值。
+   *
+   * 诚实边界：本仓做不到 macOS 系统亮度 —— slider 上方/下方会**显式**标注
+   * "仅桌面" / "Desktop only"，避免用户把它误读为系统级亮度（这是
+   * docs/DESKTOP_ECOSYSTEM_GAP_AUDIT.md G6 钉住的纪律——「不摆装饰性滑杆」，
+   * 我们不是摆了一个装饰性的滑杆，而是摆了一个**真实生效**的 WebView 降亮）。 */
+  const brightnessStore = createStoreValue<unknown>(BRIGHTNESS_KEY, {});
+  let brightnessPct = $state<number>(100);
+  $effect(() => {
+    const un = brightnessStore.subscribe((v) => {
+      brightnessPct = normalizeBrightness(v).pct;
+    });
+    return un;
+  });
+  const setBrightnessPct = (next: number) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(next)));
+    if (clamped === brightnessPct) return; // 减少没必要的写盘
+    brightnessPct = clamped;
+    writeStoreValue(BRIGHTNESS_KEY, { pct: clamped });
+  };
 
   /**
    * What the platform said about each of **this panel's** switches (REQ-A202); `null` =
@@ -217,6 +247,37 @@
         </span>
         <span class="text-[12px] font-medium">{t("q.dnd")}</span>
       </button>
+    </div>
+
+    <!-- G-β-1 · 屏幕亮度滑杆（WebView 内降亮；显式标注「仅桌面」避免误读为系统亮度） -->
+    <div class="mt-2 space-y-1" data-testid="cc-brightness-block">
+      <div class="flex items-center justify-between px-1">
+        <span class="flex items-center gap-2 text-[12px] font-medium text-white/80">
+          <span data-icon="brightness" class="grid h-5 w-5 place-items-center" aria-hidden="true">
+            {@html iconSvg(quickIcon("brightness"), "h-5 w-5")}
+          </span>
+          {t("cc.brightness")}
+        </span>
+        <span class="text-[10px] tabular-nums text-white/50" data-testid="cc-brightness-readout">
+          {brightnessPct}%  ·  {t("cc.brightnessScope")}
+        </span>
+      </div>
+      <input
+        type="range"
+        min="0"
+        max="100"
+        step="1"
+        value={brightnessPct}
+        aria-label={t("cc.brightness")}
+        title={`${t("cc.brightness")} — ${t("cc.brightnessHint")}`}
+        data-testid="cc-brightness"
+        oninput={(e) => setBrightnessPct(Number((e.target as HTMLInputElement).value))}
+        class="h-1 w-full appearance-none rounded-full bg-white/30 accent-white"
+      />
+      <!-- 诚实标注：slider 控件可被屏幕阅读器读出，但视觉用户需要看这行小字 -->
+      <p class="px-1 text-[10px] leading-tight text-white/40">
+        {t("cc.brightnessHint")}
+      </p>
     </div>
 
     <!-- AirPlay tile -->

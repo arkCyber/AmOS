@@ -24,6 +24,7 @@
     type HotCornerConfig,
   } from "../../lib/hotCorners";
   import { SHELL_CHROME_API, type ShellChromeApi } from "../../lib/shellModule";
+  import { wmFocus, wmHide, wmWindows } from "../../lib/wm";
 
   const api = getContext<ShellChromeApi>(SHELL_CHROME_API);
 
@@ -89,7 +90,48 @@
     }
   }
 
+  // ─── Show Desktop（「显示桌面」）──────────────────────────────────────────────
+  //
+  // REQ-A415: this action used to be a single `console.log("🖥️ Show Desktop (not yet
+  // implemented)")` — an entry the Settings page offers, enabled in the default
+  // configuration, that did nothing (FMEA F-SH-001: a control that looks usable).
+  //
+  // Semantics (macOS): move every *visible* app window out of the way so the desktop
+  // shows through; the same gesture brings them back. What it remembers is exactly the
+  // windows **it** hid, so a window the user opens while the desktop is showing is not
+  // swept away by the second trigger (that is the difference between "restore" and
+  // "hide everything again").
+  //
+  // Failure is not faked: a missing bridge (`wm_windows` ⇒ `null`) leaves the set empty
+  // and nothing changes, and a per-window `wm_hide` that the host refused is simply not
+  // remembered — so the restore cannot claim to bring back a window that never left.
+  let deskHidden: string[] = [];
+
+  async function toggleShowDesktop(): Promise<void> {
+    if (deskHidden.length > 0) {
+      const back = deskHidden;
+      deskHidden = [];
+      // `wm_focus` is show + focus, so the loop leaves the last window focused — macOS
+      // also hands the focus to exactly one window.
+      for (const label of back) await wmFocus(label);
+      return;
+    }
+    const snap = await wmWindows();
+    if (!snap) return;
+    for (const w of snap.windows) {
+      if (w.kind !== "App" || w.state === "Hidden") continue;
+      if (await wmHide(w.label)) deskHidden.push(w.label);
+    }
+  }
+
   function triggerAction(action: HotCornerAction) {
+    if (action === "disabled") return; // the caller filters these out; belt and braces
+    // Show Desktop drives the host's window manager directly and needs no chrome handle
+    // (locking the screen, by contrast, is `shellState`'s).
+    if (action === "desktop") {
+      void toggleShowDesktop();
+      return;
+    }
     if (!api) {
       console.warn("ShellChromeApi not available");
       return;
@@ -97,24 +139,20 @@
 
     switch (action) {
       case "mission-control":
-        api.toggleOverlay("spaces");
+        // REQ-A414: this used to toggle `"spaces"` — an id no overlay row has
+        // (`shellModules.ts` declares `mission-control` / `spaces-panel`). The call was
+        // accepted, entered `openOverlays`, rendered nothing, and then swallowed the
+        // first `Escape`. The default top-left hot corner therefore did nothing at all.
+        api.toggleOverlay("mission-control");
         break;
       case "launchpad":
         api.openLaunchpad();
-        break;
-      case "desktop":
-        // TODO: Minimize all windows (show desktop)
-        // This requires wm integration to minimize all open windows
-        console.log("🖥️ Show Desktop (not yet implemented)");
         break;
       case "lock-screen":
         api.lockScreen();
         break;
       case "notification-center":
         api.toggleOverlay("control-center-panel");
-        break;
-      case "disabled":
-        // Should never reach here
         break;
     }
   }

@@ -16,8 +16,8 @@
    *   • 键盘导航（Arrow keys, Home/End）
    *   • Escape 关闭（由 Dock.svelte 处理）
    */
-  import { onMount } from "svelte";
   import { t } from "../locale.svelte";
+  import { installMenuKeyboard } from "../../lib/menuKeys";
   import {
     CHROME_MENU_ITEM,
     CHROME_MENU_PANEL,
@@ -49,49 +49,16 @@
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
-  let menuItems: HTMLButtonElement[] = $state([]);
-  let currentFocusIndex = $state(0);
 
-  onMount(() => {
-    // 收集所有可聚焦的菜单项（排除禁用的）
+  // REQ-A436: the keyboard rules live in `lib/menuKeys.ts` — one owner for every pop-up menu.
+  // This component used to carry its own copy (a `menuItems` array + `currentFocusIndex` +
+  // a switch over the four keys) while the other Dock menus had none at all: the same rule in
+  // one place and missing in two others (the F-SH-005 shape). The shared layer also skips
+  // `aria-disabled` rows and claims Escape for *this* menu's closer.
+  $effect(() => {
     if (!menuEl) return;
-    
-    menuItems = Array.from(
-      menuEl.querySelectorAll('button[role^="menuitem"]:not([disabled])')
-    ) as HTMLButtonElement[];
-    
-    // 自动聚焦第一个菜单项
-    if (menuItems.length > 0) {
-      menuItems[0]?.focus();
-    }
+    return installMenuKeyboard(menuEl, { onClose: () => onclose?.() });
   });
-
-  function handleKeyDown(e: KeyboardEvent) {
-    if (!menuItems || menuItems.length === 0) return;
-
-    switch (e.key) {
-      case "ArrowDown":
-        e.preventDefault();
-        currentFocusIndex = (currentFocusIndex + 1) % menuItems.length;
-        menuItems[currentFocusIndex]?.focus();
-        break;
-      case "ArrowUp":
-        e.preventDefault();
-        currentFocusIndex = (currentFocusIndex - 1 + menuItems.length) % menuItems.length;
-        menuItems[currentFocusIndex]?.focus();
-        break;
-      case "Home":
-        e.preventDefault();
-        currentFocusIndex = 0;
-        menuItems[0]?.focus();
-        break;
-      case "End":
-        e.preventDefault();
-        currentFocusIndex = menuItems.length - 1;
-        menuItems[menuItems.length - 1]?.focus();
-        break;
-    }
-  }
 
   function handlePositionChange(position: DockPosition) {
     onclose?.();
@@ -148,7 +115,6 @@
   tabindex="-1"
   aria-label={t("desktop.dockGlobalCtxDockPrefs")}
   data-testid="dock-global-context-menu"
-  onkeydown={handleKeyDown}
 >
   <!-- 位置 -->
   <div class="px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-neutral-500 dark:text-neutral-400">

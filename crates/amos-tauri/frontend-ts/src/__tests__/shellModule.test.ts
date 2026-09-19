@@ -16,10 +16,12 @@
  *    is a red test rather than a silent gap.
  */
 import { describe, expect, test } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   bindingHint,
   formatShortcut,
   modulesFor,
+  topOverlay,
   normalizeKey,
   shortcutAria,
   shortcutMatches,
@@ -151,6 +153,10 @@ describe("the shipped chrome registry", () => {
       // (`F3 / F4 / ⌘Space / ⌘Tab`) keeps holding and Ctrl+ArrowLeft/Right stays
       // free for editor caret motion.
       "spaces-panel",
+      // REQ-A417: the desktop notification panel (macOS's right-hand surface, opened from
+      // the clock). It carries no `shortcuts` row on purpose, so the documented shortcut
+      // set above is unchanged by its arrival.
+      "notifications",
     ]);
   });
 
@@ -287,3 +293,88 @@ describe("the shortcut table (the overlay rows are the list)", () => {
     expect(shortcutMatches({ key: "L", metaKey: true }, { key: "l", meta: true })).toBe(true);
   });
 });
+
+/**
+ * Structural gate: an overlay id only exists if the registry declares it.
+ *
+ * REQ-A414 — the Hot Corners listener's default "Mission Control" action called
+ * `api.toggleOverlay("spaces")`, but no overlay row has that id (the rows are
+ * `launchpad` / `spotlight` / `mission-control` / `control-center-panel` /
+ * `spaces-panel`). The call was *accepted*: the id entered `openOverlays`, rendered
+ * nothing, and then the shell's `Escape` handler closed that phantom instead of the
+ * real top layer — the documented default hot corner did nothing, twice over
+ * (silently, and it ate one Escape). Nothing in the suite looked at the call sites.
+ *
+ * This test reads every `toggleOverlay("…")` / `openOverlay("…")` /
+ * `isOverlayOpen("…")` literal in `src/` and holds it to the registry, so the next
+ * id typo fails here instead of on a user's desktop.
+ */
+describe("overlay-id call sites (structural)", () => {
+  test("every literal overlay id passed to the chrome API exists in the registry", () => {
+    const known = new Set(modulesFor("overlay", SHELL_MODULES).map((m) => m.id));
+    expect(known.size).toBeGreaterThan(0);
+
+    const srcRoot = new URL("../", import.meta.url).pathname; // …/frontend-ts/src
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const ent of readdirSync(dir, { withFileTypes: true })) {
+        if (ent.name === "node_modules" || ent.name === "__tests__") continue;
+        const p = `${dir}/${ent.name}`;
+        if (ent.isDirectory()) walk(p);
+        else if (/\.(ts|svelte)$/.test(ent.name)) files.push(p);
+      }
+    };
+    walk(srcRoot);
+
+    const re = /\b(?:toggleOverlay|openOverlay|isOverlayOpen|overlayShortcut)\(\s*["']([A-Za-z0-9-]+)["']/g;
+    const seen = new Set<string>();
+    const bad: string[] = [];
+    for (const f of files) {
+      // **Prose is not a call site.** The defect this gate exists for is *documented* in
+      // comments (the literal `toggleOverlay("spaces")` appears in the history notes for
+      // REQ-A414/A415), and a naive regex read those as evidence of a live call — the same
+      // "the gate read the narrative as a contract" failure `scripts/make-target-doc-scan.mjs`
+      // records for `docs/archive/`. So whole-line `//` comments and block comments are
+      // stripped first. Only whole-line `//` (never a trailing one) so a URL inside a
+      // string literal cannot truncate a real call site.
+      const text = readFileSync(f, "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^[ \t]*\/\/.*$/gm, "");
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        const id = m[1];
+        if (!id) continue;
+        seen.add(id);
+        if (!known.has(id)) bad.push(`${f.slice(srcRoot.length)}: "${id}"`);
+      }
+    }
+    // Sanity: the scan really found the call sites (a broken regex would otherwise pass).
+    expect(seen.size).toBeGreaterThan(0);
+    expect(bad).toEqual([]);
+  });
+
+  test("topOverlay closes the last layer the registry really declares", () => {
+    const ids = modulesFor("overlay", SHELL_MODULES).map((m) => m.id);
+
+    // Nothing open ⇒ nothing to close (and `Escape` must not be consumed).
+    expect(topOverlay([], ids)).toBeNull();
+
+    // The normal case: the top of the stack.
+    expect(topOverlay(["launchpad", "spotlight"], ids)).toBe("spotlight");
+
+    // REQ-A415: an id no row declares draws nothing. The old code closed the raw last
+    // entry, so one such entry swallowed an `Escape` and left the *visible* panel up —
+    // the "the panel is sticky" symptom the hot-corner defect produced.
+    expect(topOverlay(["launchpad", "spaces"], ids)).toBe("launchpad");
+    expect(topOverlay(["launchpad", "nope", "also-nope"], ids)).toBe("launchpad");
+
+    // A stack with nothing registered in it is "nothing to close", not a guess.
+    expect(topOverlay(["nope", "also-nope"], ids)).toBeNull();
+
+    // Pure: the stack is not modified.
+    const stack = ["launchpad", "spaces"];
+    topOverlay(stack, ids);
+    expect(stack).toEqual(["launchpad", "spaces"]);
+  });
+});
+

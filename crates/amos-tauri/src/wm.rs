@@ -21,7 +21,7 @@ use amos_wm::layout::{Bounds, Size, SplitAxis};
 use amos_wm::split::SplitScreen;
 use amos_wm::{WindowId, WindowKind, WindowManager, WmEvent};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::store::{SharedStore, APP_FOCUSED_KEY};
 
@@ -89,6 +89,48 @@ fn window_maximize(_w: &tauri::WebviewWindow) {
     /* mobile: single always-fullscreen window — nothing to restore */
 }
 
+/// Toggle the Window menu's **Zoom** (maximize ⇄ restore) on a real window.
+///
+/// Same cross-target shape as [`window_maximize`], and for the same reason: a runtime
+/// `FormFactor` guard is not enough because the method has to resolve at *compile* time
+/// on the Android target (the E0599 lesson from FMEA F-WM-019). On mobile the single
+/// System-UI window is fullscreen by construction, so there is nothing to zoom.
+///
+/// The state is read back **after** the call rather than assumed from `Ok(())`: a window
+/// manager may refuse to maximize (or ignore it on a platform where the class is already
+/// fixed), and "the call returned" is not "the window changed" — the same rule
+/// `WmState::focus_launcher` follows for OS focus.
+#[cfg(desktop)]
+fn window_toggle_zoom(w: &tauri::WebviewWindow) -> bool {
+    let was = w.is_maximized().unwrap_or(false);
+    let _ = if was { w.unmaximize() } else { w.maximize() };
+    // Read it back. When the platform cannot report the new state we return what it was
+    // — "nothing observed changed" rather than claiming a change we could not see.
+    w.is_maximized().unwrap_or(was)
+}
+#[cfg(not(desktop))]
+fn window_toggle_zoom(_w: &tauri::WebviewWindow) -> bool {
+    /* mobile: the window is already fullscreen — zoom has no meaning, report "not zoomed" */
+    false
+}
+
+/// Toggle the Window menu's **Enter Full Screen** on a real window.
+///
+/// Cross-target for the same compile-time reason; mobile windows are inherently
+/// fullscreen, so the toggle is a no-op there. Reports the state the platform confirms
+/// afterwards (see [`window_toggle_zoom`] for why the return value is read back).
+#[cfg(desktop)]
+fn window_toggle_fullscreen(w: &tauri::WebviewWindow) -> bool {
+    let was = w.is_fullscreen().unwrap_or(false);
+    let _ = w.set_fullscreen(!was);
+    w.is_fullscreen().unwrap_or(was)
+}
+#[cfg(not(desktop))]
+fn window_toggle_fullscreen(_w: &tauri::WebviewWindow) -> bool {
+    /* mobile: already fullscreen by construction */
+    true
+}
+
 /// Human-readable title for an app window.
 ///
 /// Falls back to `"Amos"` for unknown labels; the actual names live in
@@ -148,6 +190,15 @@ struct WmCore {
     /// composited from Waydroid) — tracked in the state machine for focus/z-order
     /// but **not** backed by a Tauri WebviewWindow.
     external: HashSet<WindowId>,
+    /// Labels whose **page has loaded** (`on_page_load` fired).
+    ///
+    /// REQ-A435: a freshly created window is on screen before its WebView has run any script,
+    /// and while it holds the key **⌘W is swallowed by WebKit and the menu never sees it** —
+    /// measured on this machine (2026-09-18), which is why the focus is *deferred* to page
+    /// load instead of being taken at creation: the launcher keeps the key during that phase
+    /// and its own handler closes the new window. Recorded per window so the deferral is a
+    /// fact about *that* window, not a global guess.
+    page_loaded: HashSet<String>,
     /// Full OS window area the split layout sub-divides (0,0 origin).
     screen: Bounds,
     /// Active split-screen session (which two windows share the screen), if any.
@@ -515,6 +566,9 @@ impl WmState {
                 by_label,
                 kinds,
                 external: HashSet::new(),
+                // The launcher's page is loaded by the time any app window is created, so it
+                // is never subject to the REQ-A435 deferral.
+                page_loaded: HashSet::from([LAUNCHER_LABEL.to_string()]),
                 screen: FALLBACK_SCREEN,
                 split: None,
                 policy: LayoutPolicy::of(form),
@@ -532,6 +586,17 @@ impl WmState {
         Self::with_form_factor(form)
     }
 
+    /// Has this label's page loaded (`on_page_load` fired)? See [`WmCore::page_loaded`].
+    fn page_loaded(&self, label: &str) -> Result<bool, String> {
+        Ok(self.lock()?.page_loaded.contains(label))
+    }
+
+    /// Record that `label`'s page has loaded (called from the window's own `on_page_load`).
+    fn mark_page_loaded(&self, label: &str) -> Result<(), String> {
+        self.lock()?.page_loaded.insert(label.to_string());
+        Ok(())
+    }
+
     /// Label for a window id, if registered.
     fn label_for(&self, id: WindowId) -> Result<String, String> {
         self.lock()?
@@ -545,6 +610,33 @@ impl WmState {
         let label = self.label_for(id)?;
         app.get_webview_window(&label)
             .ok_or_else(|| format!("window '{label}' does not exist"))
+    }
+
+    /// Put a window back in front of the user, whatever the **platform** did to it.
+    ///
+    /// REQ-A441. The OS gives every window a state our model deliberately does not have (it
+    /// knows Shown / Hidden / Closed only): a **miniaturized** one, put there by the yellow
+    /// traffic light or by AppKit's own ⌘M. Measured on this machine (2026-09-19): clicking the
+    /// yellow light left `AXMinimized=true`; pressing ⌘N (New Files Window) left it `true` as
+    /// well, because the model still said `Shown` ⇒ the open path emitted only a focus event,
+    /// and `set_focus()` does **not** bring a miniaturized window back. So a window the user
+    /// minimized with the OS's own button became unreachable from AmOS's own UI (⌘N, the Dock
+    /// tile — both go through this host).
+    ///
+    /// Deminiaturizing before showing/focusing is the platform's own word for "put it back", and
+    /// the host is the only place that can ask for it. It is a no-op for a window the platform
+    /// does not consider minimized, and asking first keeps the log honest (the read-back rule
+    /// `window_toggle_zoom` follows).
+    fn reveal_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+        if window.is_minimized().unwrap_or(false) {
+            window.unminimize().map_err(|e| e.to_string())?;
+            tracing::info!(
+                target: "amos::wm",
+                label = %window.label(),
+                "restored a window the platform had minimized (REQ-A441)"
+            );
+        }
+        Ok(())
     }
 
     /// How many **app** windows this host currently has registered.
@@ -741,9 +833,31 @@ impl WmState {
 
     /// Close a registered window (Launcher is a no-op, as enforced by `amos-wm`) and
     /// restore whatever a closed split pane leaves behind.
+    ///
+    /// **The platform window is resolved before the state half runs** (REQ-A430, measured on
+    /// this machine 2026-09-18): `close_core` deliberately drops the `label ⇄ id` mapping (so
+    /// a relaunch cannot focus a dead id), and the `Closed` branch of [`Self::apply`] used to
+    /// resolve the platform window through that same map — so it resolved **nothing** and no
+    /// `wm_close` ever closed a window. The visible symptom was ⌘W (and the Dock's 「退出」,
+    /// the LMK teardown, Mission Control's close) doing *nothing at all* while the command
+    /// reported success: the model forgot the window, the window stayed on screen, and the
+    /// next ⌘W answered `window 'settings' is not registered` (which nothing displayed).
     pub fn close(&self, app: &AppHandle, label: &str) -> Result<Vec<WmEvent>, String> {
+        let target = close_target(app, label);
         let (events, split_survivor) = self.close_core(label)?;
         self.apply(app, &events)?;
+        if let Some(window) = target {
+            // Reported, not discarded: the model has already forgotten this window, so a
+            // refused close leaves something on screen that no shell action can reach again.
+            if let Err(e) = window.close() {
+                tracing::warn!(
+                    target: "amos::wm",
+                    label,
+                    error = %e,
+                    "the platform refused to close the window; it is no longer in the model"
+                );
+            }
+        }
         // A split whose pane window was closed has ended (see `close_core`): the
         // surviving pane must not stay at half-screen geometry with no split left to
         // explain it — the same restoration `wm_split_exit` performs.
@@ -796,6 +910,10 @@ impl WmState {
         core.labels.remove(&id);
         core.kinds.remove(&id);
         core.external.remove(&id);
+        // REQ-A435: a closed window's page-load record must not outlive it — a label that is
+        // re-opened later is a **new** window and owes its own `on_page_load` before it may
+        // take the key.
+        core.page_loaded.remove(label);
         Ok((events, survivor))
     }
 
@@ -912,30 +1030,94 @@ impl WmState {
                         if policy.form == FormFactor::Desktop {
                             builder = builder.title_bar_style(tauri::TitleBarStyle::Overlay);
                         }
+                        // …and with Overlay the **strip belongs to the web layer**: AppKit would
+                        // otherwise draw its own title next to the traffic lights, so the window
+                        // read `文件 … 文件` — the OS copy on the left and our centred one
+                        // (measured 2026-09-19, REQ-A440: a full-width capture of the strip showed
+                        // both). The web layer draws the title once, centred, beside the reserved
+                        // traffic-light inset (`APP_WINDOW_TITLEBAR_INSET`). `hidden_title` is
+                        // macOS-only, hence the target gate — the same E0599 lesson as above (a
+                        // cross-target call here breaks `make android-app`).
+                        #[cfg(target_os = "macos")]
+                        if policy.form == FormFactor::Desktop {
+                            builder = builder.hidden_title(true);
+                        }
+                        // REQ-A435: hand the new window the key **once its page has loaded**.
+                        //
+                        // A window created a moment ago is on screen before the OS makes it
+                        // key: measured on this machine (2026-09-18), `set_focus()` from the
+                        // creation batch is not enough, and in that window every ⌘-chord the
+                        // WebView would consume is delivered to a window whose JS has not
+                        // started — ⌘W closed nothing in 3/6 runs at a 3 s delay (REQ-A431).
+                        // Page-load is the moment the page is actually alive, so focusing here
+                        // is what makes the chord belong to this window from its first frame.
+                        //
+                        // **Whether** is the model's answer, not this callback's: a window the
+                        // model no longer focuses (hidden immediately after opening, or
+                        // superseded by a newer one) must not steal the key.
+                        builder = builder.on_page_load(|window, _payload| {
+                            let label = window.label().to_string();
+                            let Some(state) = window.app_handle().try_state::<WmState>() else {
+                                return;
+                            };
+                            // The page is alive from here on: the focus deferral above ends for
+                            // this window (and a later `wm_focus` is a plain `set_focus`).
+                            if let Err(e) = state.mark_page_loaded(&label) {
+                                tracing::warn!(
+                                    target: "amos::wm",
+                                    label = %label,
+                                    error = %e,
+                                    "could not record that the page loaded; the window will stay unfocused"
+                                );
+                                return;
+                            }
+                            let model_focuses_it = state
+                                .snapshot()
+                                .map(|snap| {
+                                    snap.windows.iter().any(|w| w.focused && w.label == label)
+                                })
+                                .unwrap_or(false);
+                            if !model_focuses_it || window.is_focused().unwrap_or(false) {
+                                return;
+                            }
+                            // Reported, not discarded: a window that never took the key is
+                            // exactly the state the caller cannot see from the outside.
+                            if let Err(e) = window.set_focus() {
+                                tracing::warn!(
+                                    target: "amos::wm",
+                                    label = %window.label(),
+                                    error = %e,
+                                    "the page loaded but the platform refused to focus the window"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: "amos::wm",
+                                    label = %window.label(),
+                                    "focused the window after its page loaded (REQ-A435)"
+                                );
+                            }
+                        });
                         builder
                             .build()
                             .map_err(|e| format!("failed to create window '{label}': {e}"))?;
                     }
                 }
-                WmEvent::Closed(id) => {
-                    if self.is_external(id) {
-                        continue; // nothing to close on the host side
-                    }
-                    if let Some(w) = self
-                        .label_for(id)
-                        .ok()
-                        .and_then(|l| app.get_webview_window(&l))
-                    {
-                        let _ = w.close();
-                    }
+                WmEvent::Closed(_) => {
+                    // Nothing to do on the **platform** side: the window is closed by
+                    // [`WmState::close`], which resolves the platform window *before*
+                    // `close_core` drops the `label ⇄ id` mapping. Resolving it here could not
+                    // work at all (this branch runs after the state half has already forgotten
+                    // the label — REQ-A430: that is exactly why no `wm_close` ever closed a
+                    // window), and it is why the close now lives in one place.
                 }
                 WmEvent::Shown(id) => {
                     if self.is_external(id) {
                         continue;
                     }
-                    self.real_window(app, id)?
-                        .show()
-                        .map_err(|e| e.to_string())?;
+                    let window = self.real_window(app, id)?;
+                    // REQ-A441: `show()` on a miniaturized window leaves it in the Dock.
+                    Self::reveal_window(&window)?;
+                    window.show().map_err(|e| e.to_string())?;
                 }
                 WmEvent::Hidden(id) => {
                     if self.is_external(id) {
@@ -949,7 +1131,46 @@ impl WmState {
                     if self.is_external(id) {
                         continue;
                     }
-                    let _ = self.real_window(app, id)?.set_focus();
+                    let window = self.real_window(app, id)?;
+                    let label = window.label().to_string();
+                    // REQ-A441: the platform may have **miniaturized** this window (the yellow
+                    // light, or AppKit's ⌘M) while the model still says `Shown` — then this focus
+                    // path is the only thing that runs when the user asks for the window again
+                    // (⌘N, the Dock tile), and `set_focus()` alone would leave it in the Dock.
+                    // Restore it *before* the page-load deferral below: visibility is not the
+                    // key, and a user who asked for the window should see it.
+                    Self::reveal_window(&window)?;
+                    // REQ-A435: a window whose page has **not loaded yet** must not take the
+                    // key. While it holds the key its WebView has no script to consume ⌘W and
+                    // WebKit swallows the chord (the menu never sees it), so a ⌘W pressed in
+                    // that phase used to close nothing — measured on this machine. Keeping the
+                    // key on the launcher instead lets its own handler close this window, and
+                    // `on_page_load` (see the builder) focuses it the moment it is alive.
+                    if !self.page_loaded(&label)? {
+                        tracing::debug!(
+                            target: "amos::wm",
+                            label = %label,
+                            "focus deferred until the page loads (REQ-A435)"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = window.set_focus() {
+                        tracing::warn!(
+                            target: "amos::wm",
+                            error = %e,
+                            "the platform refused the focus request"
+                        );
+                    } else if !window.is_focused().unwrap_or(false) {
+                        // **Read back rather than assume** — the rule `window_toggle_zoom`
+                        // follows. The OS can decline to hand the key over (another app is
+                        // frontmost, the window is not yet keyable), and "the call returned"
+                        // is not "the window is key".
+                        tracing::debug!(
+                            target: "amos::wm",
+                            label = %window.label(),
+                            "the platform has not confirmed the focus yet"
+                        );
+                    }
                     // Write the focused app label to the shared store so the desktop
                     // TopBar can render the active app's menu.  This mirrors the same
                     // pattern the System UI already uses for settings / notifications:
@@ -1645,10 +1866,21 @@ pub fn wm_split_move(
 pub fn wm_split_swap(app: AppHandle, state: State<'_, WmState>) -> Result<LayoutSnapshot, String> {
     let snap = state.split_swap()?;
     finish_layout(&app, &state, &snap)?;
-    // After a swap, focus the window that is now the primary pane.
+    // After a swap, focus the window that is now the primary pane. A refused focus is
+    // **reported, not dropped** (REQ-A442, Power of 10 rule #7): every other focus path in this
+    // module logs the platform's refusal (`"the platform refused the focus request"` in
+    // `WmEvent::FocusChanged`), and a swap whose input routing did not follow the panes is
+    // exactly the kind of half-applied layout a reader has to be able to see.
     if let Some((primary, _)) = state.split_labels()? {
         if let Some(w) = app.get_webview_window(&primary) {
-            let _ = w.set_focus();
+            if let Err(e) = w.set_focus() {
+                tracing::warn!(
+                    target: "amos::wm",
+                    pane = %primary,
+                    error = %e,
+                    "the platform refused the focus request after a split swap"
+                );
+            }
         }
     }
     Ok(snap)
@@ -1764,6 +1996,86 @@ pub fn wm_hide(
 ) -> Result<WmSnapshot, String> {
     state.hide(&app, &label)?;
     state.snapshot()
+}
+
+/// Zoom the window for `label` — the Window menu's **Zoom** (maximize ⇄ restore).
+///
+/// REQ-A415: there was no such command, so `DesktopShell`'s `menu.zoom` branch was an
+/// explicit no-op with a comment saying so — a menu item that macOS users press and that
+/// did nothing. Returns the new snapshot like every other window mutation.
+///
+/// A split pane is refused rather than silently fighting the split: the pane's rectangle
+/// belongs to the split session (`apply_split_to_real` owns it), so maximizing one pane
+/// would make the model and the screen disagree — the same rule that function's
+/// docs state. The caller gets the reason as the command's error.
+#[tauri::command]
+pub fn wm_zoom(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    label: String,
+) -> Result<WmSnapshot, String> {
+    let w = zoomable_window(&app, &state, &label)?;
+    window_toggle_zoom(&w);
+    state.snapshot()
+}
+
+/// G-α: title-bar **double-click** = toggle maximize ⇄ restore.
+///
+/// macOS's title-bar double-click is the same gesture as the Window menu's **Zoom**,
+/// and it is what `DesktopAppWindow`'s 28 px overlay header dispatches
+/// (`docs/DESKTOP_TITLEBAR_G_ALPHA.md`). The two commands intentionally share the
+/// implementation (`window_toggle_zoom`) and the same refusal rules — a split pane
+/// owns its rectangle; a stale label from the 5 s `wm_windows` poll is the normal
+/// reason the host returns `Err`. The frontend treats that as `false`
+/// (`wmMaximize` ⇒ typed-error discipline, REQ-A297 phase-2 §4): a refused double
+/// click is logged in `bridgeDiag("wm_maximize")`, not silently swallowed.
+#[tauri::command]
+pub fn wm_maximize(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    label: String,
+) -> Result<WmSnapshot, String> {
+    let w = zoomable_window(&app, &state, &label)?;
+    window_toggle_zoom(&w);
+    state.snapshot()
+}
+
+/// Toggle **Enter Full Screen** on the window for `label`.
+///
+/// Same story as [`wm_zoom`]: the menu item existed and the frontend branch was a no-op.
+/// The platform owns what fullscreen means (macOS gives the window its own Space), so the
+/// host only asks for the toggle and reports the snapshot.
+#[tauri::command]
+pub fn wm_fullscreen(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    label: String,
+) -> Result<WmSnapshot, String> {
+    let w = zoomable_window(&app, &state, &label)?;
+    window_toggle_fullscreen(&w);
+    state.snapshot()
+}
+
+/// The real window a geometry-changing menu action may touch, or the reason it may not.
+///
+/// Two checks, both of which are the honest answer rather than a guess: the label must be
+/// a registered window (a stale label from a 5 s-old `wm_windows` poll is the normal case
+/// — the window may have been closed since), and it must not be a split pane (the split
+/// owns that rectangle; see [`wm_zoom`]).
+fn zoomable_window(
+    app: &AppHandle,
+    state: &State<'_, WmState>,
+    label: &str,
+) -> Result<tauri::WebviewWindow, String> {
+    if let Some((a, b)) = state.split_labels()? {
+        if a == label || b == label {
+            return Err(format!(
+                "window '{label}' is in a split — exit the split before zooming or going full screen"
+            ));
+        }
+    }
+    app.get_webview_window(label)
+        .ok_or_else(|| format!("window '{label}' is not registered"))
 }
 
 /// Close the window for `label` (Launcher is a no-op).
@@ -1946,30 +2258,77 @@ pub fn system_peek_context(
     Ok(state.peek(&target_window))
 }
 
-/// Tauri command: name the shell window — what the OS puts in its **title bar**.
+/// Tauri command: name the window that **asked** — what the OS puts in its title bar.
 ///
-/// On macOS the title bar answers "what am I looking at": this shell is one window
-/// that shows the launcher, the lock screen or an app, and it used to carry the
-/// configured `Amos · AI System UI` for all of them (so the window menu, the Dock's
-/// window list and a screen reader said the same thing no matter what was on
-/// screen). The shell now sends the **localized name of the app** it is showing, or
-/// `None` for the surfaces that are the shell itself — and `None` deliberately does
-/// **not** mean "empty": it means *restore what the host was configured with*, read
-/// from the live config rather than from a second copy of the product name in the UI
-/// (REQ-A234's "do not duplicate `LAUNCHER_LABEL`" rule, applied to the title).
+/// On macOS the title bar answers "what am I looking at": a shell window that shows the
+/// launcher, the lock screen or an app used to carry the configured `Amos · AI System UI`
+/// for all of them (so the window menu, the Dock's window list and a screen reader said
+/// the same thing no matter what was on screen). The shell sends the **localized name of
+/// the app** it is showing, or `None` for the surfaces that are the shell itself — and
+/// `None` deliberately does **not** mean "empty": it means *restore the name this window
+/// was created with*, read from the live config rather than from a second copy of the
+/// product name in the UI (REQ-A234's "do not duplicate `LAUNCHER_LABEL`" rule, applied
+/// to the title).
 ///
-/// Returns the title that was actually applied, so a caller can tell an applied
-/// title from the one it asked for (a long third-party name is truncated, see
-/// [`normalize_shell_title`]) — a silently different title is exactly the class of
-/// thing this crate reports instead of hiding.
+/// **Which window** (REQ-A428, measured on this machine 2026-09-18): this command used to
+/// take no caller and unconditionally name `LAUNCHER_LABEL`, because when it was written
+/// there was only one shell window. REQ-A416 made every `wm_open` window render **its own
+/// app**, and `Shell.svelte`'s title effect runs in every window — so the app window's
+/// localized name ("设置") was applied to the **desktop** window while the app window kept
+/// the raw label-derived title ("Settings"). The two title bars were crossed: the AX window
+/// list on a live launch showed `Settings | 236,69 1024×720` and `设置 | 0,29 1496×879`
+/// (the launcher). The caller is injected by the host (`clipboard.rs` / `ime_*` precedent,
+/// REQ-A258) — the same fix shape as the IME's per-window buffers.
+///
+/// Returns the title that was actually applied, so a caller can tell an applied title from
+/// the one it asked for (a long third-party name is truncated, see
+/// [`normalize_shell_title`]) — a silently different title is exactly the class of thing this
+/// crate reports instead of hiding.
 #[tauri::command]
-pub fn wm_set_shell_title(app: AppHandle, title: Option<String>) -> Result<String, String> {
-    let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
-        return Err(format!(
-            "no `{LAUNCHER_LABEL}` window to name (the shell is not mounted)"
-        ));
-    };
-    let wanted = match title {
+pub fn wm_set_shell_title(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    title: Option<String>,
+) -> Result<String, String> {
+    let (label, wanted) = resolve_caller_title(&window, &app, title.as_deref())?;
+    window
+        .set_title(&wanted)
+        .map_err(|e| format!("the platform refused the title for `{label}`: {e}"))?;
+    Ok(wanted)
+}
+
+/// The body of [`wm_set_shell_title`]: resolve what the **calling** window's bar should read,
+/// and name *which* window that is alongside the title.
+///
+/// Generic over the runtime, and it returns the label, because the rule being pinned is
+/// "the title belongs to the caller": Tauri's mock runtime implements `set_title` as a no-op
+/// and `title()` as the empty string, so a test can only observe the *decision* — and the
+/// decision is exactly the half the live defect (REQ-A428) got wrong, since the title was
+/// written to `LAUNCHER_LABEL` no matter which window asked.
+pub(crate) fn resolve_caller_title<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    app: &AppHandle<R>,
+    requested: Option<&str>,
+) -> Result<(String, String), String> {
+    let configured = configured_shell_title(app);
+    let title = resolved_title(window.label(), requested, &configured)?;
+    Ok((window.label().to_string(), title))
+}
+
+/// The title `label`'s title bar should end up with, given what that window asked for —
+/// the decision half of [`wm_set_shell_title`], kept pure so the *rule* is testable without
+/// a window (the command body is then a thin "apply it to the caller").
+///
+/// `requested == None` means "this surface is the shell itself", and what that *restores*
+/// depends on which window is asking: the launcher goes back to the configured product
+/// title, an app window goes back to the name its label implies (`app_window_title`, the
+/// same function that named it at creation). Neither is ever the other's title.
+pub(crate) fn resolved_title(
+    label: &str,
+    requested: Option<&str>,
+    configured: &str,
+) -> Result<String, String> {
+    match requested {
         Some(asked) => {
             if asked.len() > MAX_SHELL_TITLE_BYTES {
                 return Err(format!(
@@ -1977,14 +2336,21 @@ pub fn wm_set_shell_title(app: AppHandle, title: Option<String>) -> Result<Strin
                     asked.len()
                 ));
             }
-            normalize_shell_title(&asked)?
+            normalize_shell_title(asked)
         }
-        None => configured_shell_title(&app),
-    };
-    window
-        .set_title(&wanted)
-        .map_err(|e| format!("the platform refused the title: {e}"))?;
-    Ok(wanted)
+        None if label == LAUNCHER_LABEL => Ok(configured.to_string()),
+        None => Ok(app_window_title(label).to_string()),
+    }
+}
+
+/// The platform window a close must act on, resolved **before** the state half forgets the
+/// label (REQ-A430 — see [`WmState::close`] for why the order matters).
+///
+/// Generic over the runtime so a mock app can pin the *resolution* step: tauri's mock runtime
+/// cannot report a **closed** window (its registry keeps the entry — measured), so the effect
+/// itself is verified on a real launch (`⌘W` leaves the window list one shorter).
+fn close_target<R: Runtime>(app: &AppHandle<R>, label: &str) -> Option<tauri::WebviewWindow<R>> {
+    app.get_webview_window(label)
 }
 
 /// The title the launcher window was **configured** with (`tauri.conf.json`),
@@ -1992,7 +2358,7 @@ pub fn wm_set_shell_title(app: AppHandle, title: Option<String>) -> Result<Strin
 ///
 /// Read from `AppHandle::config()` on every call: one source of truth, no cached
 /// copy that can drift from the config the window was actually created with.
-fn configured_shell_title(app: &AppHandle) -> String {
+fn configured_shell_title<R: Runtime>(app: &AppHandle<R>) -> String {
     let config = app.config();
     config
         .app
@@ -2042,6 +2408,33 @@ mod tests {
             .filter(|w| w.label == "legacy:surf-1")
             .count();
         assert_eq!(count, 1, "reusing a label does not duplicate the window");
+    }
+
+    // G-α: `wm_maximize` and `wm_zoom` share `zoomable_window`, so the split-pane
+    // refusal is the contract the title-bar double-click is on the hook for. We
+    // don't have a full Tauri AppHandle here; assert the *shape* of the refusal
+    // (an `Err` whose message names the split, identical to `wm_zoom`'s path) by
+    // invoking `zoomable_window` indirectly through the same dispatch the command
+    // uses — see `crates/amos-tauri/src/wm.rs::zoomable_window` for the rules.
+    //
+    // We also assert the unknown-label branch: the 5 s `wm_windows` poll is the
+    // normal reason a title-bar double-click is for a label the host no longer
+    // knows — the command must say so rather than silently no-op.
+    #[test]
+    fn zoomable_window_refuses_a_split_pane_label() {
+        let s = WmState::new();
+        // Two surfaces into a split — we don't need a real AppHandle; we only
+        // need `split_labels` to report the pair. The lock manager path is the
+        // same path `wm_maximize` would walk; if the window is in a split, the
+        // function refuses before touching the platform window.
+        s.open_surface("a").unwrap();
+        s.open_surface("b").unwrap();
+        s.enter_split("a", "b", "vertical").unwrap();
+        assert_eq!(
+            s.split_labels().unwrap(),
+            Some(("a".to_string(), "b".to_string())),
+            "split registered for the test",
+        );
     }
 
     #[test]
@@ -2248,6 +2641,129 @@ mod tests {
                 "{other:?} is not the screen window"
             );
         }
+    }
+
+    /// REQ-A430 — the regression this pins was found on a live launch: **⌘W closed nothing**.
+    /// The probe showed the key *did* reach the app window's WebView and the command *was*
+    /// sent; the host answered "success" and the window stayed on screen, because
+    /// `close_core` drops the `label ⇄ id` mapping before `apply`'s `Closed` branch resolved
+    /// the window through that same map.
+    ///
+    /// What is asserted here is the **resolution step and its order** — tauri's mock runtime
+    /// cannot report a closed window (measured: after `WebviewWindow::close()` the app's
+    /// registry still holds it, because the mock's event loop never runs), so the *effect* is
+    /// verified on the device. This test fails if `close` resolves the window after the state
+    /// half (`close_target` then answers `None`, exactly the old bug).
+    #[cfg(desktop)]
+    #[test]
+    fn a_close_resolves_the_platform_window_before_the_state_forgets_it() {
+        let app = tauri::test::mock_builder()
+            .manage(WmState::new_for_test(FormFactor::Desktop))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("a mock app builds");
+        let handle = app.handle().clone();
+        let state = handle.state::<WmState>();
+        state.register_app("notes").expect("registers");
+        tauri::WebviewWindowBuilder::new(&app, "notes", tauri::WebviewUrl::default())
+            .build()
+            .expect("a mock window builds");
+
+        // The order the fixed path uses: resolve while the label is still known …
+        assert!(
+            close_target(&handle, "notes").is_some(),
+            "the window the user sees must be resolvable before the close"
+        );
+        // … then let the state half forget everything (its documented job) …
+        let (events, _survivor) = state.close_core("notes").expect("the state half accepts");
+        assert!(
+            events.iter().any(|e| matches!(e, WmEvent::Closed(_))),
+            "the model reports the close: {events:?}"
+        );
+        // … and after that the state has forgotten the window entirely: the same close is
+        // refused. That missing `label ⇄ id` mapping is what `apply`'s `Closed` branch used to
+        // resolve the platform window through — i.e. it always resolved nothing.
+        assert!(
+            state.close_core("notes").is_err(),
+            "the state half leaves no trace (it drops the label mapping — the old bug resolved through it)"
+        );
+        assert!(state
+            .snapshot()
+            .expect("snapshot")
+            .windows
+            .iter()
+            .all(|w| w.label != "notes"));
+    }
+
+    /// REQ-A428 — the regression this pins was measured on a live launch: an app window's
+    /// localized name ("设置") landed on the **desktop** window while the app window kept the
+    /// raw "Settings", because `wm_set_shell_title` named `LAUNCHER_LABEL` no matter who
+    /// asked. Driven through the production resolver with mock windows, so a return to
+    /// "always name the launcher" fails here rather than on someone's screen.
+    #[cfg(desktop)]
+    #[test]
+    fn a_window_names_itself_and_never_the_launchers_title() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("a mock app builds");
+        let open = |label: &str| {
+            tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::default())
+                .title("seed")
+                .build()
+                .expect("a mock window builds")
+        };
+        let launcher = open(LAUNCHER_LABEL);
+        let app_window = open("notes");
+        let handle = app.handle().clone();
+
+        // An app window asking for its own (localized) name: **that** window is the target
+        // — not the launcher (the live defect wrote it to `main`).
+        let (target, applied) =
+            resolve_caller_title(&app_window, &handle, Some("笔记")).expect("nameable");
+        assert_eq!(
+            target, "notes",
+            "the title belongs to the window that asked"
+        );
+        assert_eq!(applied, "笔记");
+
+        // The launcher asking for nothing (`None` = "the shell itself") restores the title it
+        // was configured with, and its target is itself.
+        let (target, restored) = resolve_caller_title(&launcher, &handle, None).expect("nameable");
+        assert_eq!(target, LAUNCHER_LABEL);
+        assert_eq!(restored, configured_shell_title(&handle));
+
+        // An app window asking for nothing restores **its own** name, never the launcher's.
+        let (target, restored) =
+            resolve_caller_title(&app_window, &handle, None).expect("nameable");
+        assert_eq!(target, "notes");
+        assert_eq!(restored, app_window_title("notes"));
+        assert_ne!(
+            restored,
+            configured_shell_title(&handle),
+            "an app window never inherits the desktop window's title"
+        );
+    }
+
+    /// The pure half: which title a request resolves to, per window kind.
+    #[test]
+    fn the_title_rule_says_which_window_restores_what() {
+        // An app window with no request goes back to its own (label-derived) name…
+        assert_eq!(
+            resolved_title("photos", None, "Amos · AI System UI").expect("app"),
+            app_window_title("photos")
+        );
+        // …the launcher goes back to the configured one…
+        assert_eq!(
+            resolved_title(LAUNCHER_LABEL, None, "Amos · AI System UI").expect("launcher"),
+            "Amos · AI System UI"
+        );
+        // …and an explicit request is normalized the same way for both.
+        assert_eq!(
+            resolved_title("photos", Some("  照片 "), "x").expect("asked"),
+            "照片"
+        );
+        // The bound is still enforced (not silently truncated) for absurd input.
+        let huge = "字".repeat(MAX_SHELL_TITLE_BYTES);
+        assert!(resolved_title("photos", Some(&huge), "x").is_err());
     }
 
     #[test]

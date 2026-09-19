@@ -224,7 +224,25 @@ export interface ShellChromeApi {
    * (`docs/FMEA.md` F-SH-001).
    */
   isOverlayOpen: (overlayId: string) => boolean;
+  /**
+   * Act on the **focused app window**, the way the OS menu's window items do (REQ-A457).
+   *
+   * A **request, not a label**: the shell owns "which window is focused" (it polls
+   * `wm_windows`), so a widget that resolved the label itself would be a second
+   * implementation of the focus model (F-SH-005) — and the two would disagree the moment one
+   * of them stopped polling. The shell then runs the *same* code path the native macOS menu's
+   * `menu.zoom` / `menu.enter-fullscreen` items run (`DesktopShell::applyWindowAction`), so
+   * the two menu surfaces cannot drift.
+   *
+   * "No app window is focused" (the launcher, or none open) means **nothing is sent**: the
+   * launcher *is* the desktop, and zooming or full-screening it is not what the user asked for
+   * (F-SH-008).
+   */
+  windowAction: (action: ShellWindowAction) => void;
 }
+
+/** The focused-window actions the in-app menu can request (see [`ShellChromeApi.windowAction`]). */
+export type ShellWindowAction = "zoom" | "full-screen";
 
 /**
  * The context key the shell provides and widgets read (`getContext`).
@@ -289,6 +307,26 @@ export function modulesFor<T extends ShellModule>(slot: ShellSlot, modules: read
     .filter(({ m }) => m.slot === slot)
     .sort((a, b) => a.m.order - b.m.order || a.index - b.index)
     .map(({ m }) => m);
+}
+
+/**
+ * The overlay id `Escape` should close: the **last registered** layer in the stack.
+ *
+ * `openOverlays` is a list of ids the shell was asked to open — nothing more. A layer
+ * whose id no registry row declares renders **nothing** (the renderer skips it), so
+ * closing `openOverlays[openOverlays.length - 1]` blindly consumes one `Escape` press per
+ * such entry and leaves the visible top layer open — exactly the "the panel is sticky"
+ * symptom REQ-A414's hot-corner defect produced (`toggleOverlay("spaces")`, an id that
+ * does not exist). Filtering by the registry makes the key act on something the user can
+ * see, whatever ends up in the stack. Pure; the stack is not modified.
+ */
+export function topOverlay(stack: readonly string[], knownIds: readonly string[]): string | null {
+  const known = new Set(knownIds);
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    const id = stack[i];
+    if (id !== undefined && known.has(id)) return id;
+  }
+  return null;
 }
 
 /**

@@ -24,7 +24,7 @@
   import { CALLLOG_KEY, callDateStamp, callHistory, callWhenLabel, clearCallHistory, filterHistory, flushPendingCalls, fmtCallClock, frequentNumbers, logNameFor, missedCalls, normalizeCallLog, pendingCallCount, recordCall } from "../lib/calllog";
   import type { CallFilter, CallRecord } from "../lib/calllog";
   import { composeSmsTo } from "./appLinks";
-  import { NOTIF_KEY, addNotif } from "../lib/settings";
+  import { NOTIF_KEY, addNotif, newNotifId } from "../lib/settings";
   import type { Notif } from "../lib/settings";
   import { zh } from "../i18n/locales/zh";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
@@ -422,7 +422,7 @@
     storeErr = callLogStore.save(next) ? "" : t("common.storeWriteFailed");
     const label = name && name.trim() !== "" ? name.trim() : number;
     const entry: Notif = {
-      id: `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      id: newNotifId(),
       app: zh["app.phone"],
       title: label,
       body,

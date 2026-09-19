@@ -483,7 +483,10 @@ describe("calendar — CRUD", () => {
   });
 
   test("makeId is unique within the same millisecond", () => {
-    expect(new Set([makeId(5), makeId(5), makeId(5)]).size).toBe(3);
+    // REQ-A402: `makeId` no longer takes the clock — it delegates to `localId`, whose
+    // per-process counter + crypto tail make `new Set([...]).size` deterministic. The
+    // old signature took `now` and only a per-process counter kept the three apart.
+    expect(new Set([makeId(), makeId(), makeId()]).size).toBe(3);
   });
 
   test("newEventDraft is a 09:00–10:00 one-hour slot on the given day", () => {

@@ -2,8 +2,13 @@
  * uses (amos.home.layout / amos.recents / …), so both UIs interoperate and, in the
  * Tauri shell, the value is mirrored to the Rust `SharedStore` — the durable copy
  * and cross-window bus (`store_set` / `store_snapshot`). */
-import { bridged, systemStoreSet, systemStoreSnapshot } from "./backend";
+import { bridged, systemStoreSet as _systemStoreSet, systemStoreSnapshot } from "./backend";
 import { amosError } from "./debugLog";
+
+/** Write-through helper: update `localStorage` AND the Rust `SharedStore` mirror.
+ *  Re-exported so callers that already depend on `amosStore` don't have to reach
+ *  into `backend.ts` for a single function. */
+export const systemStoreSet = _systemStoreSet;
 export interface HomeLayout {
   page: string[];
   dock: string[];
@@ -228,10 +233,70 @@ export function moveBefore(layout: HomeLayout, dragId: string, targetId: string)
 }
 
 /**
+ * The new **dock order** for a drag that ends on `hoveredId` (REQ-A456). Pure; returns its
+ * input (same reference) when nothing moves.
+ *
+ * Why this is not `moveBefore`: that one is a *cross-list* move ("take this out, drop it in
+ * front of that"), and it always inserts **before** the target. In a dock that is wrong
+ * half the time — dragging an icon to the right and dropping it on a neighbour would put it
+ * *on the left of* that neighbour, i.e. one slot short of where the user pointed. macOS's
+ * rule is positional: the dragged icon lands **in the hovered icon's slot**, and the others
+ * close ranks around it. That is what `from < to ? anchor + 1 : anchor` expresses: moving
+ * right inserts *after* the hovered item, moving left inserts *before* it.
+ */
+export function dockReorderIds(dock: string[], dragId: string, hoveredId: string): string[] {
+  const from = dock.indexOf(dragId);
+  const to = dock.indexOf(hoveredId);
+  if (from < 0 || to < 0 || from === to) return dock;
+  const rest = dock.filter((id) => id !== dragId);
+  const anchor = rest.indexOf(hoveredId);
+  const at = from < to ? anchor + 1 : anchor;
+  const next = [...rest];
+  next.splice(at, 0, dragId);
+  return next;
+}
+
+/**
+ * Apply a dock reorder to the **layout**, moving only the entries the surface actually
+ * shows (REQ-A456).
+ *
+ * The dock's displayed list is a **subsequence** of `layout.dock`: the desktop filters out
+ * phone-only apps (`withoutPhone`) and ids with no screen (`appTitleKey === null`). Writing
+ * a reorder of the displayed list straight back would therefore **delete the hidden
+ * entries** — and the worst case is the default layout itself: `DEFAULT_DOCK` contains
+ * `phone`, which the desktop never draws, so the first drag on a fresh install would have
+ * silently dropped it from the phone form's dock. `visible` is passed in (rather than
+ * recomputed here) because the filter belongs to the surface; this function keeps every
+ * non-displayed id in the slot it occupies and permutes only the visible ones.
+ *
+ * Returns `layout` unchanged (same reference) when the reorder is a no-op.
+ */
+export function reorderVisibleDock(
+  layout: HomeLayout,
+  visible: readonly string[],
+  dragId: string,
+  hoveredId: string,
+): HomeLayout {
+  const shown = new Set(visible);
+  const visibleNow = layout.dock.filter((id) => shown.has(id));
+  const ordered = dockReorderIds(visibleNow, dragId, hoveredId);
+  if (ordered === visibleNow) return layout;
+  let i = 0;
+  return { ...layout, dock: layout.dock.map((id) => (shown.has(id) ? ordered[i++]! : id)) };
+}
+
+/**
  * Pin `ids` to the home DOCK (used when the user asks to send a custom group's
  * apps to the main screen). An app is shown once: it is moved out of the page
  * grid and out of `hidden` into the dock (dedup). Ids already docked are left in
- * place; unknown ids are ignored.
+ * place.
+ *
+ * REQ-A406: this function takes no `available` list, so it **cannot** tell a
+ * known id from a stale one — an id it has never seen is appended like any other.
+ * (The comment here used to claim "unknown ids are ignored", which the signature
+ * makes impossible; the caller is what filters.) `Shell.svelte` passes a custom
+ * group's members, and the App Library has already dropped uninstalled members
+ * when the group was opened, so the list it hands over is known-ids-only.
  */
 export function addAppsToDock(layout: HomeLayout, ids: readonly string[]): HomeLayout {
   const page = [...layout.page];
@@ -266,6 +331,29 @@ export function readStoreValue<T>(key: string, fallback: T): T {
 }
 export function writeStoreValue(key: string, value: unknown): void {
   writeJson(key, value);
+}
+
+/**
+ * Remove a key from **both** stores (localStorage and the Rust mirror) and report success.
+ *
+ * The mirror receives the JSON literal `null` rather than an empty string, for two reasons: an
+ * empty string is not JSON, so a reader that parses the mirrored value would *throw* instead of
+ * seeing "absent"; and `null` is this store's own "no value" (a reader's fallback fires either
+ * way). The local removal happens after the mirror write so the visible state changes even when
+ * the bridge is gone — the bridge call is fire-and-forget here exactly as it is in [`writeJson`].
+ *
+ * Added in REQ-A412 because `filesCloud.deleteSnapshot` had hand-rolled both halves and got the
+ * mirror wrong; passing every removal through one function is what keeps them from drifting.
+ */
+export function removeStoreValue(key: string): boolean {
+  void systemStoreSet(key, "null");
+  try {
+    window.localStorage.removeItem(key);
+    return true;
+  } catch {
+    amosError("store", `remove failed for "${key}" (storage unavailable)`);
+    return false;
+  }
 }
 
 /**

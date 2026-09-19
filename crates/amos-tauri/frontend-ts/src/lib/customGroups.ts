@@ -7,6 +7,7 @@
  * to a 📁 icon when empty).
  */
 import { readStoreValue, writeStoreValue } from "./amosStore";
+import { localId } from "./localId";
 
 export interface CustomGroup {
   id: string;
@@ -33,7 +34,11 @@ export function getCustomGroups(): CustomGroup[] {
   ).map((g) => ({
     id: g.id,
     name: g.name,
-    apps: Array.isArray(g.apps) ? g.apps : [],
+    // REQ-A406: `apps` 也要**逐元素**校验。读侧对 `id`/`name` 是严格的（认不出就丢整行），
+    // 却把 `apps` 原样透传 —— 于是 `apps: [1, "notes"]` 会变成"分组里有一个 id=1 的成员"：
+    // 一个用户可编辑的 localStorage 就能让 App Library 渲染出不存在的瓦片。成员本来就只有
+    // 一个含义（应用 id），所以非字符串元素直接丢掉，与 `id`/`name` 的判据一致。
+    apps: Array.isArray(g.apps) ? g.apps.filter((a): a is string => typeof a === "string") : [],
     icon: typeof (g as CustomGroup).icon === "string" ? (g as CustomGroup).icon : undefined,
   }));
 }
@@ -49,7 +54,11 @@ export function addCustomGroup(
 ): { groups: CustomGroup[]; created: CustomGroup } {
   const trimmed = name.trim();
   const created: CustomGroup = {
-    id: uid(),
+    // A group id is identity: `renameCustomGroup` / `setGroupApps` / `removeCustomGroup`
+    // all match on it. Prefer the platform UUID when the WebView has it, else the shared
+    // `localId` (REQ-A401) — never the old `Date.now() + 6 random digits` fallback, which
+    // collides in a tight loop under a frozen clock.
+    id: newGroupId(),
     name: trimmed || "未命名分组",
     apps: [],
   };
@@ -104,8 +113,12 @@ export function removeCustomGroup(current: CustomGroup[], id: string): CustomGro
   return groups;
 }
 
-/** A short, collision-resistant local id (works without crypto.randomUUID). */
-function uid(): string {
+/**
+ * A new group id: the platform UUID when the WebView exposes one, else the shared
+ * `localId` (REQ-A401). Both are counter/entropy-backed; neither is
+ * `Date.now()` + a handful of random digits, which is what this used to be.
+ */
+function newGroupId(): string {
   try {
     if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
       return crypto.randomUUID();
@@ -113,6 +126,6 @@ function uid(): string {
   } catch {
     /* fall through */
   }
-  return `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return localId("g");
 }
 

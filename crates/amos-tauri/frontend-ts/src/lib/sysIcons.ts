@@ -57,7 +57,10 @@ export type SysIconName =
   | "volumeX"
   | "maximize"
   | "film"
-  | "plus";
+  | "scissors"
+  | "alertCircle"
+  | "plus"
+  | "brightness";
 
 /** Radio quick-setting kind → status icon (mirrors `lib/settings` RadioKind). */
 const RADIO_TO_ICON: Record<string, SysIconName> = {
@@ -91,6 +94,8 @@ export function quickIcon(key: string): SysIconName {
       return "moon";
     case "location":
       return "location";
+    case "brightness":
+      return "brightness";
     default:
       return "wifi";
   }
@@ -230,12 +235,37 @@ const INNER: Record<SysIconName, string> = {
   film:
     '<rect x="2" y="3" width="20" height="18" rx="2"/>' +
     '<path d="M7 3v18M17 3v18M2 9h5M2 15h5M17 9h5M17 15h5"/>',
+  // Lucide "scissors" — the trim affordance (Voice Memos). Added with its first
+  // consumer rather than substituted with a nearby glyph, so the button reads right.
+  scissors:
+    '<circle cx="6" cy="6" r="3"/>' +
+    '<path d="M8.12 8.12 12 12"/>' +
+    '<path d="M20 4 8.12 15.88"/>' +
+    '<circle cx="6" cy="18" r="3"/>' +
+    '<path d="M14.8 14.8 20 20"/>',
+  // Lucide "alert-circle" — an explicit error/notice glyph (Voice Memos transcription
+  // failure). `x` reads as "close" and `moon`/`mutedBell` mean something else entirely.
+  alertCircle:
+    '<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  // Lucide "sun" — G-β-1 屏幕亮度 slider 的图标。太阳比"灯泡"（`flashlight`）语义
+  // 更接近 macOS Control Center 的 "Display"（屏幕亮度），灯泡读作"手电筒"。
+  // 24-viewBox，stroke=1.9，圆心 (12,12)，主圆半径 4 + 8 道光芒。
+  brightness:
+    '<circle cx="12" cy="12" r="4"/>' +
+    '<path d="M12 2v2"/><path d="M12 20v2"/><path d="M4.93 4.93l1.41 1.41"/>' +
+    '<path d="M17.66 17.66l1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/>' +
+    '<path d="M4.93 19.07l1.41-1.41"/><path d="M17.66 6.34l1.41-1.41"/>',
 };
 
-/** Render a named icon as an SVG markup string. */
+/** Render a named icon as an SVG markup string.
+ *
+ *  REQ-A405: `INNER[name]` is `undefined` for a name outside the table, and
+ *  `${undefined}` renders the visible text **"undefined"** into the status bar /
+ *  control centre. The table is hand-written and the name can come from data at
+ *  runtime, so the miss degrades to an *empty* glyph (invisible) instead of garbage. */
 export function iconSvg(name: SysIconName, cls = "h-3.5 w-3.5"): string {
-  return svgStroke(INNER[name], cls);
+  return svgStroke(INNER[name] ?? "", cls);
 }
 
 /**

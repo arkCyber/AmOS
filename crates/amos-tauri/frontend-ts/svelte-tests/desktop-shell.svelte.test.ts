@@ -1234,7 +1234,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
 
     expect(byAria(container, zh["desktop.launchpad"])).toBeTruthy();
     expect(byAria(container, zh["desktop.finder"])).toBeTruthy();
-    expect(byAria(container, zh["desktop.trashUnavailable"])).toBeTruthy();
+    expect(byAria(container, zh["desktop.trashInFiles"])).toBeTruthy();
     // The old code put `appTitleKey(id)` (e.g. `app.clock.title`) straight into
     // aria-label: a screen reader read the key out loud.
     const labels = [...container.querySelectorAll("button[aria-label]")].map((b) =>
@@ -1269,7 +1269,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     await tick();
     await settle();
     const sep = container.querySelector('[data-testid="dock-separator"]') as Element;
-    const trash = byAria(container, zh["desktop.trashUnavailable"]) as Element;
+    const trash = byAria(container, zh["desktop.trashInFiles"]) as Element;
     expect(sep && trash).toBeTruthy();
     const rel = sep.compareDocumentPosition(trash);
     expect(Boolean(rel & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
@@ -1320,7 +1320,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     expect(chip).toBeTruthy();
     expect(byAria(narrow.container, zh["desktop.dockOverflow"].replace("{n}", "5"))).toBeTruthy();
     // …and the system items survive the squeeze (macOS never drops the trash).
-    expect(byAria(narrow.container, zh["desktop.trashUnavailable"])).toBeTruthy();
+    expect(byAria(narrow.container, zh["desktop.trashInFiles"])).toBeTruthy();
     expect(byAria(narrow.container, zh["desktop.finder"])).toBeTruthy();
   });
 

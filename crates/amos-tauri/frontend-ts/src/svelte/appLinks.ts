@@ -11,6 +11,8 @@
 import { propsChannel } from "./propsBus";
 import { open } from "./shellState.svelte";
 import { systemSetContext } from "../lib/backend";
+import { FILES_REVEAL_KEY } from "../lib/files";
+import { writeStoreValueChecked } from "../lib/amosStore";
 
 /**
  * A "show me this item" link (Files / Contacts): the shell switches to the app and
@@ -218,6 +220,24 @@ export function openFile(fileId: string): void {
   if (id === "") return;
   filesChannel().set({ id, nonce: Date.now() });
   open("files");
+}
+
+/**
+ * Ask the Files screen to show one entry **from another window** (REQ-A458).
+ *
+ * `openFile` above is the same-window route (`propsBus`); on the desktop the Spotlight runs in the
+ * launcher window while Files runs in its own `WebviewWindow`, so the bus reaches nobody. This
+ * writes the shared store instead — the one channel that crosses windows — and the caller opens the
+ * window itself (`wmOpen("files")`, create-or-focus).
+ *
+ * The write is **checked**: a refused store write would leave the user in a Files window at the
+ * root, i.e. the app opened but not on the thing they picked, and that must not pass silently.
+ * Returns whether the intent was recorded — the caller decides what to say.
+ */
+export function revealFileAcrossWindows(fileId: string): boolean {
+  const id = fileId.trim();
+  if (id === "") return false;
+  return writeStoreValueChecked(FILES_REVEAL_KEY, { id, nonce: Date.now() });
 }
 
 /** Props-channel name of the Contacts screen (shared contract with ContactsApp). */

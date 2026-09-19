@@ -127,6 +127,17 @@ pub enum ErrorCode {
     /// The caller asked to delete the last remaining Space — refused so the
     /// manager always has at least one usable desktop.
     SpacesDeleteLast,
+    // --- BLE / NFC / Biometric (REQ-A382 follow-up: device glue wire surface) ---
+    /// `ble_connect` was called before the Android glue binding was attached
+    /// (no foreground Activity has called `bind`). The UI should not retry; the
+    /// boot path must install the binding first.
+    BleConnectFailed,
+    /// `nfc_status` / `nfc_write_message` / etc. was called before the NFC glue
+    /// was initialized (no Activity has run `onStart` to hand up the Context).
+    NfcNotInitialized,
+    /// `biometric_authenticate` was called without an Activity-bound prompt
+    /// (the Kotlin glue requires a `FragmentActivity` to host `BiometricPrompt`).
+    BiometricNoActivity,
 }
 
 impl ErrorCode {
@@ -184,6 +195,9 @@ impl ErrorCode {
             Self::SpacesNotFound => "amos.spaces.not_found",
             Self::SpacesIndexOutOfBounds => "amos.spaces.index_out_of_bounds",
             Self::SpacesDeleteLast => "amos.spaces.delete_last",
+            Self::BleConnectFailed => "amos.ble.connect_failed",
+            Self::NfcNotInitialized => "amos.nfc.not_initialized",
+            Self::BiometricNoActivity => "amos.biometric.no_activity",
         }
     }
 
@@ -334,6 +348,9 @@ mod tests {
             ErrorCode::SpacesNotFound,
             ErrorCode::SpacesIndexOutOfBounds,
             ErrorCode::SpacesDeleteLast,
+            ErrorCode::BleConnectFailed,
+            ErrorCode::NfcNotInitialized,
+            ErrorCode::BiometricNoActivity,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in codes {

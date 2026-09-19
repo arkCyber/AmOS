@@ -29,7 +29,8 @@
   //   - 桌面图标：`SharedStore.home.layout.page`（与手机主屏共用）
   //   - 选区：**只在本组件内**（DesktopStage 选区不该跨"主屏"——主屏是手机形态）
   import { getContext, onMount, tick } from "svelte";
-  import { bridgeDiag, invoke } from "../lib/backend";
+  import { bridgeDiag } from "../lib/backend";
+  import { wmOpen, wmOpenWithDiag } from "../lib/wm";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import {
     LAYOUT_KEY,
@@ -52,6 +53,7 @@
     desktopGridWidth,
     desktopIconCapacity,
   } from "../lib/desktopLayout";
+  import { installMenuKeyboard } from "../lib/menuKeys";
   import {
     CHROME_MENU_ITEM,
     CHROME_MENU_PANEL,
@@ -208,7 +210,7 @@
       ? [...selectedIds]
       : [id];
     for (const t of targets) {
-      void invoke("wm_open", { label: t });
+      void wmOpen(t);
     }
     selectedIds = new Set();
   }
@@ -451,7 +453,7 @@
         }
         if (selectedIds.size > 0) {
           for (const id of selectedIds) {
-            void invoke("wm_open", { label: id });
+            void wmOpen(id);
           }
           selectedIds = new Set();
           anchorId = null;
@@ -594,9 +596,9 @@
 
   /** 壁纸与显示设置都住在设置应用里——打开它，不假装这里能改。 */
   async function openSettings() {
-    const result = await invoke<unknown>("wm_open", { label: "settings" });
+    const r = await wmOpenWithDiag("settings");
     closeContextMenu();
-    if (result === null) noteOpenFailure("wm_open", "settings", "openSettings");
+    if (!r.ok) noteOpenFailure("wm_open", "settings", "openSettings");
   }
 
   /** Multi-open: walk the selection and invoke `wm_open` for each (the host opens a
@@ -611,8 +613,8 @@
     const ids = [...selectedIds];
     closeContextMenu();
     for (const id of ids) {
-      const result = await invoke<unknown>("wm_open", { label: id });
-      if (result === null) noteOpenFailure("wm_open", id, "openSelectedApps");
+      const r = await wmOpenWithDiag(id);
+      if (!r.ok) noteOpenFailure("wm_open", id, "openSelectedApps");
     }
   }
 
@@ -637,6 +639,13 @@
   }
 
   let menuEl = $state<HTMLDivElement | null>(null);
+
+  // REQ-A436: the desktop context menu answers the keyboard too (arrows / Home / End walk its
+  // rows, Escape closes this menu and nobody else's) — the shared `lib/menuKeys` layer.
+  $effect(() => {
+    if (!menuEl) return;
+    return installMenuKeyboard(menuEl, { onClose: closeContextMenu });
+  });
 
   $effect(() => {
     document.addEventListener("click", onDocumentClick);

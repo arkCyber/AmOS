@@ -1,0 +1,35 @@
+[package]
+name = "amos-robot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AmOS autonomy stack: IMU attitude (Mahony 6-DOF + 9-DOF magnetometer ref + Allan-variance health), EKF-SLAM 2D (prediction / observation / JCBB data association / loop closure / log-odds grid), sparse visual odometry (FAST corners + LK flow + 5-point essential-matrix RANSAC), grid planning (A* + line-of-sight smoothing + DWA local planner + pure pursuit), real motor drivers (Serial/CAN/UDP behind the RobotHal trait), cadence-measured control loop with PID/MRAC adaptive layer and safety monitor. Design: docs/robot-autonomy.md."
+
+[lib]
+    name = "amos_robot"
+path = "src/lib.rs"
+
+[dependencies]
+# The frame contract, the profile table (travel/units/actions) and the safety core
+# (e-stop latch + deadman + refusal) all live in the middleware; this crate is the
+# layer *above* it and produces set points rather than a second wire format.
+amos-link.workspace = true
+# `DriveCommand::to_agent_json` is the single place a plan becomes an action string,
+# and it is generated (not hand-printed) so it cannot drift from the payload it means.
+serde_json = "1"
+# The loop's timer (`tokio::time::interval` + `MissedTickBehavior::Delay`) and the `Instant`
+# its lateness is measured against. A **regular** dependency, not a dev one: the pacing is
+# production code — only the tests wish they could skip it.
+tokio.workspace = true
+# `#[instrument]`-free tracing only: the loop reports its cadence as a measurement.
+tracing.workspace = true
+# Fixed-size, deterministic RNG for Monte-Carlo SLAM/Vision tests. `rand` is the
+# workspace-friendly choice (no_std friendly, `SmallRng` is a tiny PCG); we never
+# read the system clock inside the algorithms — every random decision is reproducible
+# from a seed a test can pin.
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+# The `RobotHal` trait in amos-link uses #[async_trait]; the driver implementations here
+# do the same so the trait-object dispatch stays a single shape across the workspace.
+async-trait = { workspace = true }
+

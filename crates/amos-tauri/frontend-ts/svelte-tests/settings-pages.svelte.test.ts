@@ -10,10 +10,13 @@
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
+import { tick } from "svelte";
 import SettingsApp from "../src/svelte/SettingsApp.svelte";
 import RadioPage from "../src/svelte/settings/RadioPage.svelte";
 import AiPage from "../src/svelte/settings/AiPage.svelte";
 import NotificationsPage from "../src/svelte/settings/NotificationsPage.svelte";
+import DockPage from "../src/svelte/settings/DockPage.svelte";
+import { DOCK_PREFS_KEY } from "../src/lib/dockPrefs";
 import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
 import { readQuarantine } from "../src/lib/amosStore";
 import { NOTIF_KEY, SETTINGS_KEY, type QuickSettings } from "../src/lib/settings";
@@ -132,6 +135,24 @@ describe("Settings real sub pages (interactions)", () => {
       '[data-testid="sound-volume"]',
     ) as HTMLInputElement;
     expect(slider2.value).toBe("50");
+  });
+
+  test("程序坞(Dock)设置页: a refused write is reported in the user's language, not hard-coded English", async () => {
+    // REQ-A414: `DockPage.persist()` wrote `"Failed to save dock preferences"` as a
+    // literal while every other Settings page routes the same failure through
+    // `t("common.storeWriteFailed")`.
+    const restore = failWritesFor(DOCK_PREFS_KEY);
+    try {
+      const host = render(DockPage);
+      await tick();
+      // Toggling auto-hide is a real write of the whole prefs object.
+      await fireEvent.click(switchByLabel(host, zh["settings.dock.autoHide"]) as HTMLButtonElement);
+      expect(
+        host.container.querySelector('[data-testid="store-write-error"]')?.textContent,
+      ).toBe(zh["common.storeWriteFailed"]);
+    } finally {
+      restore();
+    }
   });
 
   test("隐私与安全性: revoking a granted capability removes it from the ledger", async () => {

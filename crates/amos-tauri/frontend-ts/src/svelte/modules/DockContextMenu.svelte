@@ -25,8 +25,10 @@
    * 把 `label` 立刻读到局部 `targetLabel` 再调用 `onclose()`——这是闭包捕获，不是
    * "复制一个字符串"。这一处缺陷本轮才出现：先前的 stage 右键菜单没有跨过 await。
    */
-  import { bridgeDiag, invoke } from "../../lib/backend";
+  import { bridgeDiag } from "../../lib/backend";
+  import { wmCloseWithDiag, wmHideWithDiag, wmFocusWithDiag, wmOpenWithDiag } from "../../lib/wm";
   import { t } from "../locale.svelte";
+  import { installMenuKeyboard } from "../../lib/menuKeys";
   import {
     CHROME_MENU_ITEM,
     CHROME_MENU_PANEL,
@@ -57,8 +59,7 @@
   // diagnostic via `bridgeDiag(command)` plus a `console.warn` so the
   // failure is visible in the launcher log.
   const WARN_ICON = "🛟";
-  function noteFailure(command: string, targetLabel: string, context: string) {
-    const diag = bridgeDiag(command);
+  function noteFailure(command: string, targetLabel: string, context: string, diag: ReturnType<typeof bridgeDiag>) {
     if (diag.ok) return; // invariant: null result implies diag is not ok
     const code =
       diag.kind === "command-failed" &&
@@ -72,12 +73,34 @@
     );
   }
 
+  /** REQ-A436: the shared keyboard layer (arrows / Home / End / Escape) — see `lib/menuKeys`. */
+  let menuEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!menuEl) return;
+    return installMenuKeyboard(menuEl, { onClose: () => onclose?.() });
+  });
+
+  /**
+   * 「打开」：**未运行**时把窗口开出来。
+   *
+   * macOS 对**未运行**的 Dock 图标右键，第一项就是「打开」（`wm_open`）。此前没有这一项，
+   * 而其余三行都因为 `running === false` 灰着 —— 也就是**整张菜单没有任何一行能做任何事**：
+   * 用户右键一个没在跑的 app，得到的是一张纯灰的菜单（F-SH-001 家族：看起来是菜单）。
+   */
+  async function open() {
+    const targetLabel = label;
+    onclose?.();
+    if (running) return;
+    const r = await wmOpenWithDiag(targetLabel);
+    if (!r.ok) noteFailure("wm_open", targetLabel, "open", r.diag);
+  }
+
   /** 「退出」需要真的把窗口关掉。`wm_close` 在 `main`（Launcher）上是 no-op。 */
   async function quit() {
     const targetLabel = label;
     onclose?.();
-    const result = await invoke<unknown>("wm_close", { label: targetLabel });
-    if (result === null) noteFailure("wm_close", targetLabel, "quit");
+    const r = await wmCloseWithDiag(targetLabel);
+    if (!r.ok) noteFailure("wm_close", targetLabel, "quit", r.diag);
   }
 
   /** 「隐藏」对应 macOS 的 "Hide"（⌘H）。非运行中项上没有意义，灰掉。 */
@@ -85,8 +108,8 @@
     const targetLabel = label;
     onclose?.();
     if (!running) return;
-    const result = await invoke<unknown>("wm_hide", { label: targetLabel });
-    if (result === null) noteFailure("wm_hide", targetLabel, "hide");
+    const r = await wmHideWithDiag(targetLabel);
+    if (!r.ok) noteFailure("wm_hide", targetLabel, "hide", r.diag);
   }
 
   /** 「显示」对应 macOS 的"再次点按运行中的图标 → 切回焦点"。 */
@@ -94,8 +117,8 @@
     const targetLabel = label;
     onclose?.();
     if (!running) return;
-    const result = await invoke<unknown>("wm_focus", { label: targetLabel });
-    if (result === null) noteFailure("wm_focus", targetLabel, "show");
+    const r = await wmFocusWithDiag(targetLabel);
+    if (!r.ok) noteFailure("wm_focus", targetLabel, "show", r.diag);
   }
 </script>
 
@@ -105,6 +128,7 @@
   - 菜单项 disabled 时仍渲染（macOS 把"做不到"那一项也列出来，灰字而不是消失）
 -->
 <div
+  bind:this={menuEl}
   class="fixed z-[200] {CHROME_MENU_PANEL}"
   style="
     left:{x}px;
@@ -116,6 +140,23 @@
   data-testid="dock-context-menu"
   data-label={label}
 >
+  <!--
+    「打开」：只有**未运行**时才出现（运行中时 macOS 的第一项是「显示」，也就是下面的焦点切换，
+    两项不可能同时有意义）。它是这张菜单在 `running === false` 时**唯一**可用的行 —— 没有它，
+    右键一个没在跑的 app 只会得到一张全灰的菜单。
+  -->
+  {#if !running}
+    <button
+      type="button"
+      role="menuitem"
+      class={CHROME_MENU_ITEM}
+      data-testid="dock-ctx-open"
+      onclick={() => void open()}>{t("desktop.dockCtxOpen")}</button
+    >
+
+    <div class={CHROME_MENU_SEPARATOR} role="presentation"></div>
+  {/if}
+
   <!-- 「显示」：仅当窗口已开 -->
   <button
     type="button"
@@ -124,6 +165,7 @@
     data-testid="dock-ctx-show"
     disabled={!running}
     aria-disabled={running ? undefined : "true"}
+    title={running ? undefined : t("desktop.dockCtxNotRunning")}
     onclick={() => void show()}>{t("desktop.dockCtxShow")}</button
   >
 
@@ -135,6 +177,7 @@
     data-testid="dock-ctx-hide"
     disabled={!running}
     aria-disabled={running ? undefined : "true"}
+    title={running ? undefined : t("desktop.dockCtxNotRunning")}
     onclick={() => void hide()}>{t("desktop.dockCtxHide")}</button
   >
 
@@ -163,6 +206,7 @@
     data-testid="dock-ctx-quit"
     disabled={!running}
     aria-disabled={running ? undefined : "true"}
+    title={running ? undefined : t("desktop.dockCtxNotRunning")}
     onclick={() => void quit()}>{t("desktop.dockCtxQuit")}</button
   >
 </div>

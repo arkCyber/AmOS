@@ -12,6 +12,10 @@ import {
   hideFromHome,
   restoreToHome,
   moveBefore,
+  dockReorderIds,
+  reorderVisibleDock,
+  type HomeLayout,
+  addAppsToDock,
   pushRecent,
   getRecents,
   hydrateFromSystemStore,
@@ -363,3 +367,161 @@ describe("a rejected store write is reported, never swallowed", () => {
     }
   });
 });
+
+/**
+ * REQ-A406 — `addAppsToDock`（自定义分组"发送到主屏"）与此前三处**从未进入**的
+ * "存储不可用" 分支。判定标准同样是从外部可观察的结果：布局内容 + 是否留下半条数据。
+ */
+describe("addAppsToDock (REQ-A406)", () => {
+  const layout = (page: string[], dock: string[], hidden: string[] = []) => ({ page, dock, hidden });
+
+  test("把应用从页面移进 dock（顺序：先来的先入，留在原 dock 项之后）", () => {
+    expect(addAppsToDock(layout(["a", "b", "c"], ["d"]), ["a", "b"])).toEqual(
+      layout(["c"], ["d", "a", "b"]),
+    );
+  });
+
+  test("隐藏中的应用重新出现（hidden 与 page 一样是「不显示」的状态）", () => {
+    expect(addAppsToDock(layout([], [], ["x"]), ["x"])).toEqual(layout([], ["x"], []));
+  });
+
+  test("已在 dock 里的不动、也不会重复；但必须从 hidden 里摘掉", () => {
+    expect(addAppsToDock(layout(["a"], ["d"], ["d"]), ["d"])).toEqual(layout(["a"], ["d"], []));
+  });
+
+  test("空 id 被忽略（不会往 dock 里塞一个空字符串）", () => {
+    expect(addAppsToDock(layout([], ["d"]), ["", "a"])).toEqual(layout([], ["d", "a"]));
+  });
+
+  test("同一个 id 在入参里出现两次只入一次", () => {
+    expect(addAppsToDock(layout(["a"], []), ["a", "a"])).toEqual(layout([], ["a"]));
+  });
+
+  test("认不出的 id 会**原样进 dock** —— 这个函数没有 available 列表，过滤是调用方的事", () => {
+    // 源码注释此前写着 "unknown ids are ignored"，而实现（也没有 available 参数）做不到。
+    // 事实是：调用方 `Shell.svelte` 给的 id 必须已经是可用的（App Library 打开分组时会把
+    // 已卸载的成员滤掉并回写）—— 这里把契约钉成"原样入 dock"，免得注释继续骗人。
+    expect(addAppsToDock(layout([], ["d"]), ["store:gone.away"])).toEqual(
+      layout([], ["d", "store:gone.away"]),
+    );
+  });
+
+  test("不改入参（返回新对象，三个数组都是副本）", () => {
+    const before = layout(["a"], ["d"], ["h"]);
+    const after = addAppsToDock(before, ["a"]);
+    expect(before).toEqual(layout(["a"], ["d"], ["h"]));
+    expect(after).not.toBe(before);
+    expect(after.dock).not.toBe(before.dock);
+  });
+});
+
+describe("存储不可用时既不崩、也不假装写成功 (REQ-A406)", () => {
+  /** 换一个"读就抛"的 localStorage（描述符可配置 ⇒ 能还原）。 */
+  function withDeadStorage<T>(fn: () => T): T {
+    const desc = Object.getOwnPropertyDescriptor(window, "localStorage")!;
+    const dead = {
+      getItem() {
+        throw new Error("storage unavailable");
+      },
+      setItem() {
+        throw new Error("storage unavailable");
+      },
+      removeItem() {
+        throw new Error("storage unavailable");
+      },
+      key() {
+        throw new Error("storage unavailable");
+      },
+      get length(): number {
+        throw new Error("storage unavailable");
+      },
+    };
+    try {
+      Object.defineProperty(window, "localStorage", { value: dead, configurable: true, writable: true });
+      return fn();
+    } finally {
+      Object.defineProperty(window, "localStorage", desc);
+    }
+  }
+
+  test("listQuarantined 回空表（不编造条目）；readQuarantine 回 null", () => {
+    expect(withDeadStorage(() => listQuarantined())).toEqual([]);
+    expect(withDeadStorage(() => readQuarantine(KEY))).toBeNull();
+    expect(withDeadStorage(() => readStoreValue<number[]>(KEY, [7]))).toEqual([7]);
+  });
+
+  test("坏档**备份**不进去时，错误里说清「备份也失败了」（用户数据仍然丢，但不静默）", () => {
+    installWarnSpy();
+    const real = window.localStorage;
+    const noWrite = {
+      getItem: (k: string) => real.getItem(k),
+      setItem() {
+        throw new Error("QuotaExceededError");
+      },
+      removeItem: (k: string) => real.removeItem(k),
+      key: (i: number) => real.key(i),
+      get length() {
+        return real.length;
+      },
+    };
+    const desc = Object.getOwnPropertyDescriptor(window, "localStorage")!;
+    try {
+      real.setItem(KEY, "{ corrupt but i can still read it");
+      Object.defineProperty(window, "localStorage", { value: noWrite, configurable: true, writable: true });
+      expect(readStoreValue<number[]>(KEY, [])).toEqual([]); // 回落到默认值
+      expect(warns.some((w) => w.includes("could not be backed up"))).toBe(true);
+    } finally {
+      Object.defineProperty(window, "localStorage", desc);
+      real.removeItem(KEY);
+    }
+  });
+});
+
+
+/**
+ * REQ-A456 — the dock's own reorder. `moveBefore` (above) is the **cross-list** move the
+ * home screen uses; a dock drag is a different rule (the icon lands in the hovered icon's
+ * slot, direction-aware), and the layout write-back has to leave the entries the desktop
+ * does not draw exactly where they were.
+ */
+describe("dock reorder (REQ-A456)", () => {
+  test("a drag lands IN the hovered slot, from either side", () => {
+    const dock = ["a", "b", "c", "d"];
+    // Moving right: `b` dropped on `d` takes `d`'s slot (d closes up to the left).
+    expect(dockReorderIds(dock, "b", "d")).toEqual(["a", "c", "d", "b"]);
+    // Moving left: `d` dropped on `b` takes `b`'s slot (b shifts right).
+    expect(dockReorderIds(dock, "d", "b")).toEqual(["a", "d", "b", "c"]);
+    // One step each way — the case a "always insert before" rule gets wrong on the way right.
+    expect(dockReorderIds(dock, "c", "b")).toEqual(["a", "c", "b", "d"]);
+    expect(dockReorderIds(dock, "b", "c")).toEqual(["a", "c", "b", "d"]);
+  });
+
+  test("no-ops keep the same array (identical drag, unknown ids)", () => {
+    const dock = ["a", "b", "c"];
+    expect(dockReorderIds(dock, "b", "b")).toBe(dock);
+    expect(dockReorderIds(dock, "ghost", "b")).toBe(dock);
+    expect(dockReorderIds(dock, "b", "ghost")).toBe(dock);
+  });
+
+  test("the reorder permutes ONLY what the surface shows", () => {
+    // The default dock is exactly this shape: `phone` is in `layout.dock` and the desktop
+    // never draws it (`withoutPhone`), so a naive write-back would delete it on the first
+    // drag — and `phone` is the phone form's dock entry.
+    const base: HomeLayout = { page: ["notes"], dock: ["phone", "ai", "interpreter", "files"], hidden: [] };
+    const visible = ["ai", "interpreter", "files"];
+    const next = reorderVisibleDock(base, visible, "files", "ai");
+    expect(next.dock).toEqual(["phone", "files", "ai", "interpreter"]);
+    // `phone` kept its slot (index 0) and the page/hidden lists are untouched.
+    expect(next.page).toEqual(base.page);
+    expect(next.hidden).toEqual(base.hidden);
+  });
+
+  test("a no-op reorder returns the very same layout object", () => {
+    const base: HomeLayout = { page: [], dock: ["ai", "files"], hidden: [] };
+    expect(reorderVisibleDock(base, ["ai", "files"], "ai", "ai")).toBe(base);
+    expect(reorderVisibleDock(base, ["ai", "files"], "ghost", "ai")).toBe(base);
+    // A "visible" list that names nothing in the dock is not a reorder either.
+    expect(reorderVisibleDock(base, ["nope"], "ai", "files")).toBe(base);
+  });
+});
+

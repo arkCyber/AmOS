@@ -1,3 +1,5 @@
+import { localId } from "./localId";
+
 export interface Photo {
   id: string;
   ts: number;
@@ -39,12 +41,22 @@ export function seedPhotos(count: number, now: number): Photo[] {
   });
 }
 
-/** A random demo/gradient photo (fallback when no camera is available). */
-export function newPhoto(id: string, now: number): Photo {
+/**
+ * A random demo/gradient photo (fallback when no camera is available).
+ *
+ * REQ-A402: the id is minted here, not passed in. The gallery's own "add" used to build it
+ * as `` `p${Date.now()}` `` — the clock with **no counter and no entropy** — so two adds in
+ * one millisecond produced one id, and the gallery renders a **keyed** `{#each … (p.id)}`
+ * (a repeated key is a render-time error, not a quiet duplicate row). A factory that takes
+ * the id from its caller is exactly how that shape gets in; owning it here makes the
+ * mistake unrepresentable. The camera path, which *must* share the frame's id, goes through
+ * {@link newPhotoForCapture} and hands over an id it got from `localId`.
+ */
+export function newPhoto(now: number): Photo {
   const pal = PALETTE[Math.floor(Math.random() * PALETTE.length)];
   const emoji = EMOJIS[Math.floor(Math.random() * EMOJIS.length)];
   return {
-    id,
+    id: localId("p"),
     a: pal?.[0],
     b: pal?.[1],
     emoji,
@@ -55,6 +67,18 @@ export function newPhoto(id: string, now: number): Photo {
 /** A real camera capture (video frame -> JPEG data URL). */
 export function newCapturePhoto(id: string, now: number, data: string): Photo {
   return { id, data, ts: now };
+}
+
+/**
+ * The demo/gradient fallback for a camera **capture** — the same shot, without a frame.
+ *
+ * The id is the caller's on purpose: it must be the *same* identity the frame path used
+ * (`newCapturePhoto`), so one shutter press has one id whichever branch ran (REQ-A402). The
+ * caller mints it with `localId` — that is the contract, and `idgen-scan`'s R3(c) fails a
+ * `new*` factory that is handed a clock-stamped template instead.
+ */
+export function newPhotoForCapture(id: string, now: number): Photo {
+  return { ...newPhoto(now), id };
 }
 
 /** True when the photo is a real captured image (has pixel data). */

@@ -33,6 +33,7 @@
   import { onMount, onDestroy } from "svelte";
   import { t } from "./locale.svelte";
   import { attachFocusTrap } from "../lib/focusTrap";
+  import { localId } from "../lib/localId";
   import {
     loadShortcuts,
     createShortcut,
@@ -422,11 +423,21 @@
   }
   
   async function handleRun(id: string) {
+    /**
+     * `requiresConfirmation` 是一个数据字段，而这里是它唯一能兑现的地方：引擎会拒
+     * 绝未确认的运行（`executeShortcut` 的 confirmed 门禁），所以 UI 必须先问。
+     * 自动化触发（触发器）没人可问，运行时按约定**跳过**这类指令。
+     */
+    const target = shortcuts.find((s) => s.id === id);
+    if (target?.requiresConfirmation && !confirm(t("shortcuts.confirmRun", { name: target.name }))) {
+      return;
+    }
+
     executing = true;
     executionResult = null;
     
     try {
-      const result = await executeShortcut(id);
+      const result = await executeShortcut(id, undefined, { confirmed: true });
       if (result.success) {
         executionResult = t("shortcuts.executionSuccess", {
           completed: result.actionsCompleted,
@@ -455,7 +466,9 @@
     if (!selectedShortcut) return;
     
     const action: ActionInstance = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      // The shared `localId` (REQ-A401): an action id is identity within the shortcut,
+      // and the editor keys its rows by it.
+      id: localId("act"),
       actionTypeId: actionType.id,
       parameters: {},
       position: selectedShortcut.actions.length,

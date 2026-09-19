@@ -23,6 +23,7 @@ pub mod android_glue;
 pub mod android_lmk;
 pub mod appstore;
 pub mod assistant_voice;
+pub mod ble;
 /// Spam blocking (calls + SMS): rule storage, SMS filtering and the Android
 /// call-screening JNI hook.
 pub mod blocklist;
@@ -49,6 +50,7 @@ pub mod devcare;
 #[cfg(feature = "android")]
 pub mod devcare_device;
 pub mod display;
+pub mod files;
 // The macOS Dock badge + attention request. Written ahead of its consumer: nothing
 // paints a badge yet, but the host API is registered (REQ-A389).
 pub mod dock_badge;
@@ -59,12 +61,28 @@ pub mod error;
 pub mod flashlight;
 pub mod host_battery;
 pub mod host_log;
+
+/// The **embedded frontend bundle's fingerprint** — which UI this binary carries
+/// (REQ-A425).
+///
+/// Written by `build.rs` (see its module docs for the staleness this exists to stop) and
+/// `include_str!`d precisely so that a changed bundle makes this crate dirty: without it,
+/// `generate_context!`'s embedding has no tracked input and a release binary silently
+/// keeps shipping the previous `frontend-ts/dist`. It is also the honest answer to "which
+/// UI is in this build?", which the boot log states when the bundle is the thing being
+/// loaded. `"absent"` means no bundle existed at build time (a fresh checkout, or the dev
+/// server path) — a state to report, not to guess about.
+pub const EMBEDDED_FRONTEND_FINGERPRINT: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/embedded-frontend.fingerprint"));
+
 /// Input method (IME): the System UI's on-screen pinyin keyboard. `amos-ime` owns
 /// the engine; this bridge owns the session + the `amos-ime.json` profile.
 pub mod ime;
 #[cfg(feature = "android")]
 pub mod incall;
 pub mod interpret;
+#[cfg(feature = "android")]
+pub mod jni_glue;
 pub mod link;
 pub mod mail;
 pub mod media;
@@ -78,6 +96,10 @@ pub mod rag_client;
 pub mod real_dial;
 pub mod sensor_host;
 pub mod sensors;
+// Shortcut automation triggers: the wall-clock side of "run this shortcut at 08:00".
+// The WebView owns *what* runs (`lib/shortcuts.ts`); this module owns *when*, so a
+// trigger still fires with no window open (see the module header for the split).
+pub mod shortcut_triggers;
 // Spaces (virtual desktops): the manager plus its Tauri commands. The shell mounts
 // `SpacesPanel`, so these have to be compiled and registered (REQ-A389).
 pub mod sms;
@@ -157,6 +179,7 @@ pub fn run() {
         .manage(WmState::new())
         .manage(SystemContext::new())
         .manage(alarm_sched::AlarmSchedState::new())
+        .manage(shortcut_triggers::ShortcutTriggerState::new())
         .manage(clipboard.clone())
         // The Space ledger is persisted through the same store the rest of the shell
         // uses, so a restart restores the spaces (and the default space when there is
@@ -176,6 +199,7 @@ pub fn run() {
         .manage(mail::MailBridge::new())
         .manage(appstore::StoreBridge::new())
         .manage(sensor_host::SensorHost::new())
+        .manage(ble::BleState::new())
         .manage(sms::SmsBridge::boot())
         .manage(sms::trash_shared())
         .manage(blocklist::shared())
@@ -219,6 +243,7 @@ pub fn run() {
             spaces_commands::spaces_delete,
             spaces_commands::spaces_rename,
             spaces_commands::spaces_move_window,
+            spaces_commands::spaces_unfile_window,
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
             ai_bridge::cancel_ai_session,
@@ -247,6 +272,9 @@ pub fn run() {
             wm::wm_open,
             wm::wm_focus,
             wm::wm_hide,
+            wm::wm_zoom,
+            wm::wm_maximize,
+            wm::wm_fullscreen,
             wm::wm_close,
             wm::wm_home,
             wm::wm_set_shell_title,
@@ -280,6 +308,7 @@ pub fn run() {
             ime::ime_forget_last,
             store::store_get,
             store::store_set,
+            menu::menu_set_locale,
             store::store_remove,
             store::store_snapshot,
             note_export::notes_export_txt,
@@ -293,6 +322,10 @@ pub fn run() {
             media::media_save,
             media::media_load,
             media::media_read_range,
+            files::files_preview_bytes,
+            files::files_bundle_export,
+            files::files_bundle_import,
+            files::files_cloud_validate,
             translate::transcribe_audio,
             translate::translate_text,
             interpret::interpret_start,
@@ -348,6 +381,21 @@ pub fn run() {
             radio::bluetooth_pair,
             flashlight::flashlight_status,
             flashlight::flashlight_set,
+            ble::ble_connect,
+            ble::ble_disconnect,
+            ble::ble_discover_services,
+            ble::ble_read,
+            ble::ble_write,
+            ble::ble_subscribe,
+            ble::ble_unsubscribe,
+            ble::nfc_status,
+            ble::nfc_start_dispatch,
+            ble::nfc_stop_dispatch,
+            ble::nfc_format_tag,
+            ble::nfc_write_message,
+            ble::nfc_read_bytes,
+            ble::biometric_available,
+            ble::biometric_authenticate,
             sensors::sensor_snapshot,
             sensors::sensor_set_mode,
             sensors::sensor_acquire,
@@ -355,6 +403,7 @@ pub fn run() {
             sensor_host::sensor_host_set_mode,
             sensor_host::sensor_host_record_imu,
             sensor_host::sensor_host_record_frame,
+            sensor_host::sensor_host_record_video,
             sensor_host::sensor_host_acquire,
             system::system_health,
             host_battery::system_host_battery,
@@ -415,6 +464,8 @@ pub fn run() {
             alarm_sched::scheduler_alarm_cancel,
             alarm_sched::scheduler_alarm_poll,
             alarm_sched::scheduler_alarm_open_settings,
+            shortcut_triggers::shortcuts_trigger_sync,
+            shortcut_triggers::shortcuts_trigger_poll,
             real_dial::real_dial,
             #[cfg(desktop)]
             wine::wine_is_available,
@@ -452,6 +503,15 @@ pub fn run() {
             push_notifications::push_get_status,
         ])
         .on_window_event(|window, event| {
+            // REQ-A433: the window-related menu items (Close / Minimize / Zoom / Enter Full
+            // Screen) can only act on a focused app window, so the bar has to follow the
+            // platform's own focus events — that is the one signal that fires for *every*
+            // way focus can move (our `wm_focus`, a click on another window, a window that
+            // closes and hands the key over). Nothing here guesses: `sync_window_items`
+            // asks the platform and the model, in that order.
+            if matches!(event, tauri::WindowEvent::Focused(_)) {
+                menu::sync_window_items(window.app_handle());
+            }
             // Keep the layout model's screen equal to the **real** window area.
             // Only the screen window (the Launcher/main surface) defines that area:
             // every other window — including split panes, which this very handler's
@@ -534,6 +594,78 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // **Which frontend will the WebView load?** (REQ-A421) A compile-time fact
+            // (`tauri::is_dev() == !cfg!(feature = "custom-protocol")`) decides between the
+            // embedded `frontendDist` and `build.devUrl` — and it fails *silently* at
+            // runtime: the window is blank because nothing serves the dev URL, while every
+            // gate stays green (measured 2026-09-18: `scripts/run-ui-release.sh` produced a
+            // white 1 176-colour window this way). Stated once at boot so a blank window
+            // comes with the line that explains it.
+            if tauri::is_dev() {
+                tracing::warn!(
+                    target: "amos::shell",
+                    dev_url = app
+                        .config()
+                        .build
+                        .dev_url
+                        .as_ref()
+                        .map(|u| u.to_string())
+                        .as_deref()
+                        .unwrap_or("(unset)"),
+                    "the WebView loads the DEV url, not the embedded bundle (this build has \
+                     no tauri `custom-protocol` feature) — if the window is blank, nothing \
+                     is serving that url"
+                );
+            } else {
+                tracing::info!(
+                    target: "amos::shell",
+                    bundle = EMBEDDED_FRONTEND_FINGERPRINT.trim(),
+                    "the WebView loads the embedded frontend bundle (production mode)"
+                );
+            }
+            // Install the native macOS menu bar (REQ-A418). `menu::install` is
+            // documented as a no-op off macOS, but the **module** is `cfg(target_os="macos")`,
+            // so the call site MUST be gated by the same predicate — a non-macOS build
+            // (Android, iOS, Linux, Windows) would otherwise reference a missing module.
+            // Wired here, once, with a *reported* failure (a menu that silently is not
+            // there is the same defect class as a control that does nothing).
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(e) = menu::install(app.handle()) {
+                    tracing::warn!(
+                        target: "amos::menu",
+                        error = %e,
+                        "installing the native menu bar failed; the app runs without it"
+                    );
+                }
+                // Forward macOS menu events to the desktop shell's onMenuEvent handler
+                // (preferences / new-window / close-window / minimize / zoom /
+                // enter-fullscreen / show-all). Without this the native menu items render
+                // but tapping them fires into Tauri's default no-op — exactly the
+                // "Tauri default menu" boot observed 2026-09-18.
+                let menu_handle = app.handle().clone();
+                app.handle().on_menu_event(move |_app, event| {
+                    menu::on_menu_event(&menu_handle, event);
+                });
+            }
+            // Install the JNI bridge emitter so device-glue callbacks (BLE
+            // notifications, NFC tag discoveries, biometric results) reach the
+            // WebView through Tauri events. A quiet no-op before this runs.
+            #[cfg(feature = "android")]
+            {
+                jni_glue::init();
+                let handle = app.handle().clone();
+                jni_glue::set_emitter(move |event, payload| {
+                    if let Err(e) = handle.emit(event, payload) {
+                        tracing::warn!(
+                            target: "amos::jni",
+                            event,
+                            error = %e,
+                            "device glue event could not be delivered to the UI"
+                        );
+                    }
+                });
+            }
             // Desktop-shell capability switches (`AMOS_DESKTOP_SHORTCUTS` /
             // `AMOS_DOCK_CONTEXT_MENU`) are resolved **here**, where an environment
             // exists — the WebView has none, which is why these two documented
@@ -823,6 +955,9 @@ pub fn run() {
             // `telephony-event`, and so telephony answer/end can drive the real call.
             #[cfg(feature = "android")]
             incall::set_app(app.handle().clone());
+            // BLE / NFC / Biometric device glue: the JNI emitter is set up at the
+            // top of `setup`; the JavaVM + Context binding is installed by Kotlin
+            // `MainActivity.onStart`. Nothing more to do here.
             // Physical camera key → AmOS Home: hand the seam an AppHandle so the
             // MainActivity's intercepted camera key can route as Home.
             #[cfg(feature = "android")]

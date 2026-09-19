@@ -5,7 +5,7 @@
  */
 
 import { NOTES_KEY } from "./notes";
-import { FILES_KEY, FILES_FAV_KEY } from "./files";
+import { FILES_KEY, FILES_FAV_KEY, FILES_TRASH_KEY } from "./files";
 import { PHOTOS_KEY } from "./photos";
 import { CAPTURES_KEY } from "./cameraCapture";
 import { CONV_KEY } from "./messages";
@@ -54,6 +54,11 @@ export const SYNC_STORES = [
   NOTES_KEY,
   FILES_KEY,
   FILES_FAV_KEY,
+  // The trash ledger travels with the tree it belongs to (REQ-A455): a snapshot that
+  // carried `amos.files` but not its ledger would restore a tree whose deleted items
+  // silently became unrestorable — the exact "half a feature in the backup" shape the
+  // doc comment above records twice.
+  FILES_TRASH_KEY,
   PHOTOS_KEY,
   CAPTURES_KEY,
   CONV_KEY,

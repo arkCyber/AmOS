@@ -27,7 +27,7 @@
 
   function persist(): void {
     const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
-    storeError = success ? "" : "Failed to save dock preferences";
+    storeError = success ? "" : t("common.storeWriteFailed");
   }
 
   function setPosition(pos: DockPosition): void {

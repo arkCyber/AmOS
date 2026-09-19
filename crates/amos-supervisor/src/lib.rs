@@ -39,6 +39,14 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "notifier")]
+pub mod alert_sink;
+
+#[cfg(feature = "notifier")]
+pub use alert_sink::{
+    shared, AlertSeverity, AlertSink, DaemonAlert, NotifierSink, NullSink, SharedSink,
+};
+
 /// How a daemon should behave when it exits unexpectedly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartPolicy {
@@ -152,6 +160,11 @@ impl Daemon {
 pub struct Supervisor {
     daemons: Arc<RwLock<HashMap<String, Arc<Mutex<Daemon>>>>>,
     tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    /// Optional alert sink (the supervisor does not require one — when it is
+    /// `None`, the monitor loop is silent, which is the right thing for tests
+    /// and for the rare deployment that does not want external notifications).
+    #[cfg(feature = "notifier")]
+    alert_sink: Option<crate::alert_sink::SharedSink>,
 }
 
 impl Default for Supervisor {
@@ -165,7 +178,20 @@ impl Supervisor {
         Self {
             daemons: Arc::new(RwLock::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "notifier")]
+            alert_sink: None,
         }
+    }
+
+    /// Attach an alert sink. The supervisor will fire one alert on every state
+    /// transition that warrants one (see [`DaemonAlert::from_status`]). The
+    /// sink is consulted **after** the monitor loop has applied the state
+    /// change — the alert is a record of an event the supervisor already
+    /// decided to act on, never a decision input.
+    #[cfg(feature = "notifier")]
+    pub fn with_alert_sink(mut self, sink: crate::alert_sink::SharedSink) -> Self {
+        self.alert_sink = Some(sink);
+        self
     }
 
     /// Register and spawn a daemon, then begin monitoring it.
@@ -178,7 +204,12 @@ impl Supervisor {
             .await
             .insert(name.clone(), daemon.clone());
 
-        let monitor = tokio::spawn(monitor(name.clone(), daemon));
+        let monitor = tokio::spawn(monitor(
+            name.clone(),
+            daemon,
+            #[cfg(feature = "notifier")]
+            self.alert_sink.clone(),
+        ));
         self.tasks.lock().await.insert(name, monitor);
         Ok(())
     }
@@ -234,10 +265,34 @@ async fn terminate(mut child: Child) {
 /// child's whole life, so `stop()` can never race `child.take()`: it only sets the
 /// flag and wakes us, and this loop terminates the process it holds. A stop during
 /// the backoff window is also honoured (no "resurrection" after an explicit stop).
-async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
+async fn monitor(
+    name: String,
+    daemon: Arc<Mutex<Daemon>>,
+    #[cfg(feature = "notifier")] alert_sink: Option<crate::alert_sink::SharedSink>,
+) {
     let mut child = match take_child(&daemon).await {
         Some(c) => c,
         None => return, // no live child (already stopped / spawn failed)
+    };
+
+    // Fire the alert for a state transition. Best-effort: a failing sink
+    // (e.g. an unreachable webhook) must not delay the monitor loop.
+    let fire_alert = |status: &DaemonStatus| {
+        #[cfg(feature = "notifier")]
+        {
+            if let (Some(sink), Some(alert)) = (
+                alert_sink.as_ref(),
+                crate::alert_sink::DaemonAlert::from_status(&name, status),
+            ) {
+                sink.fire(alert);
+            }
+        }
+        // Without the feature the call is a no-op; the supervisor is silent,
+        // which is what a deployment without notifier integration wants.
+        #[cfg(not(feature = "notifier"))]
+        {
+            let _ = status;
+        }
     };
 
     loop {
@@ -246,6 +301,7 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
             terminate(child).await;
             let mut d = daemon.lock().await;
             d.status = DaemonStatus::Stopped;
+            fire_alert(&d.status);
             return;
         }
 
@@ -271,6 +327,7 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
                 d.status = DaemonStatus::Crashed {
                     restarts: d.restarts,
                 };
+                fire_alert(&d.status);
                 return;
             }
             match take_child(&daemon).await {
@@ -290,23 +347,36 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
         }
 
         // Child exited: apply the restart policy (or honour a stop).
-        let (restart, backoff) = {
+        let (restart, backoff, exhausted_after) = {
             let mut d = daemon.lock().await;
             if d.stop_requested {
                 d.status = DaemonStatus::Stopped;
-                (false, Duration::ZERO)
+                (false, Duration::ZERO, None)
             } else if d.restarts < d.spec.restart.max_restarts {
                 d.restarts += 1;
                 let attempt = d.restarts;
                 d.status = DaemonStatus::Restarting { attempt };
-                (true, d.spec.restart.delay_for(attempt))
+                (true, d.spec.restart.delay_for(attempt), None)
             } else {
                 d.status = DaemonStatus::Crashed {
                     restarts: d.restarts,
                 };
-                (false, Duration::ZERO)
+                (false, Duration::ZERO, Some(d.restarts))
             }
         };
+        // Giving up is the one transition an operator must never have to infer from silence. The
+        // restarting passes above are logged and the two *spawn-failure* crashes log an error, but
+        // this branch — the ordinary "the restart budget is used up" ending — had no line at all:
+        // the P0 alert was meant to be the record, and until REQ-A444 nothing ever armed a sink, so
+        // a daemon simply stopped existing with no output in either build. Log it unconditionally.
+        if let Some(restarts) = exhausted_after {
+            tracing::error!(
+                daemon = %name,
+                restarts = restarts,
+                "daemon exhausted its restart budget; the supervisor is giving up (Crashed)"
+            );
+        }
+        fire_alert(&daemon.lock().await.status);
         if !restart {
             return;
         }
@@ -347,6 +417,7 @@ async fn monitor(name: String, daemon: Arc<Mutex<Daemon>>) {
             d.status = DaemonStatus::Crashed {
                 restarts: d.restarts,
             };
+            fire_alert(&d.status);
             return;
         }
         // Take the freshly spawned child for continued polling.

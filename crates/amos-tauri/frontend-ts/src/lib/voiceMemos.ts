@@ -1,21 +1,49 @@
 /* Voice Memos (语音备忘录) domain kernel — pure + headless-friendly.
  *
- * A memo = METADATA only (title, recorded-at, duration, size). The audio is
- * stored as a BINARY Blob in a MediaStore (IndexedDB in the shell, in-memory in
- * tests) — never base64-inflated into the text KV store. The `amos.*` store
- * persists just the metadata list (small, cross-window, boot-hydrated).
+ * A memo = METADATA only (title, recorded-at, duration, size, optional
+ * transcript). The audio bytes are stored as a BINARY Blob in a MediaStore
+ * (IndexedDB in the shell, in-memory in tests) — never base64-inflated into
+ * the text KV store. The `amos.vmemos` store persists just the metadata list
+ * (small, cross-window, boot-hydrated).
  *
  * Recordings come from MediaRecorder (Opus → already compressed). Demo seeds are
  * tiny regenerable WAV clips (`audio.kind === "seed"`) — nothing is stored for
  * them, so the default store stays nearly empty. A pure WAV generator makes the
  * demos/tests deterministic without any microphone or browser APIs.
+ *
+ * Trim region (a [startMs, endMs] sub-range of a `recorded` memo's byte stream)
+ * is metadata-only too: the bytes are not re-written until the user actually
+ * saves the new memo (`trimMemo` keeps the original as-is and appends a sibling
+ * memo with a new id). A transcript attached to a memo is the small
+ * `{text, recognized, lang, at}` produced by `transcribe_audio`; it lives
+ * alongside the metadata because it is cheap and is what the screen renders.
  */
+import { localId } from "./localId";
 
 export type MemoAudio =
   /** Regenerate a short WAV on demand — no bytes persisted (demo clips). */
   | { kind: "seed"; seconds: number; toneHz: number }
   /** Audio bytes live in the binary MediaStore under the memo id. */
   | { kind: "recorded" };
+
+/** A transcript attached to a memo (from `transcribe_audio`). Cheap; kept on the
+ *  metadata row so the screen renders it without an extra fetch. Only present
+ *  when ASR ran successfully; `recognized` reflects whether the daemon actually
+ *  found speech. */
+export interface MemoTranscript {
+  text: string;
+  recognized: boolean;
+  /** BCP-47 / free-form language tag the daemon reported ("" if unknown). */
+  lang: string;
+  /** When the transcript was produced (millis). */
+  at: number;
+}
+
+/** Inclusive [startMs, endMs] range, milliseconds, used by the trimmer. */
+export interface MemoRange {
+  startMs: number;
+  endMs: number;
+}
 
 export interface VoiceMemo {
   id: string;
@@ -26,6 +54,11 @@ export interface VoiceMemo {
   /** Approx audio payload bytes (display + accounting; the bytes are binary). */
   sizeBytes: number;
   mime: string;
+  /** Optional attached transcript (ASR). */
+  transcript?: MemoTranscript;
+  /** Stable parent id when this memo was created by trimming `parentId`. The
+   *  field is optional; it does not affect playback or export. */
+  trimOf?: string;
 }
 
 function readAudio(v: unknown): MemoAudio | null {
@@ -39,6 +72,18 @@ function readAudio(v: unknown): MemoAudio | null {
     return { kind: "seed", seconds, toneHz: Number.isFinite(toneHz) ? toneHz : 440 };
   }
   return null;
+}
+
+function readTranscript(v: unknown): MemoTranscript | null {
+  if (!v || typeof v !== "object") return null;
+  const t = v as Record<string, unknown>;
+  if (typeof t.text !== "string") return null;
+  return {
+    text: t.text,
+    recognized: !!t.recognized,
+    lang: typeof t.lang === "string" ? t.lang : "",
+    at: typeof t.at === "number" && Number.isFinite(t.at) && t.at >= 0 ? t.at : 0,
+  };
 }
 
 /** Metadata for a recorded memo (its bytes live in the binary MediaStore). */
@@ -55,10 +100,18 @@ export function memoForRecording(input: {
 export const VMEMOS_KEY = "amos.vmemos";
 export const VMEMO_CAP = 24;
 
-let seq = 0;
-export function makeVoiceId(now: number): string {
-  seq += 1;
-  return `${now.toString(36)}-${seq}`;
+/**
+ * A new memo id.
+ *
+ * REQ-A402: was `${now.toString(36)}-${seq}` with a **per-process** counter — no entropy.
+ * Two contexts that agree on a millisecond mint the same string (measured: two processes
+ * with a frozen clock both produced `loyw3v28-1`), and a repeated memo id is **DROPPED**
+ * by `normalizeVoiceMemos` — the recording disappears from the library while its bytes
+ * stay behind. `localId` adds a zero-padded crypto tail, so same-millisecond mints in two
+ * windows no longer collapse.
+ */
+export function makeVoiceId(): string {
+  return localId("vm");
 }
 
 /* ---- formatting ---- */
@@ -108,7 +161,9 @@ export function removeMemo(list: VoiceMemo[], id: string): VoiceMemo[] {
 }
 
 /** Corruption guard: keeps well-formed entries (id/title/numeric ts + a src),
- *  de-dups ids and caps the list. */
+ *  de-dups ids and caps the list. Optional `transcript` is preserved when it
+ *  validates (`text` is a string); an invalid transcript is dropped, not promoted
+ *  into a "transcribing…" placeholder. */
 export function normalizeVoiceMemos(v: unknown): VoiceMemo[] {
   if (!Array.isArray(v)) return [];
   const out: VoiceMemo[] = [];
@@ -124,7 +179,7 @@ export function normalizeVoiceMemos(v: unknown): VoiceMemo[] {
     const audio = readAudio(o.audio);
     if (!audio) continue; // no playable audio → drop
     seen.add(o.id);
-    out.push({
+    const m: VoiceMemo = {
       id: o.id,
       title: o.title,
       createdAt,
@@ -132,7 +187,17 @@ export function normalizeVoiceMemos(v: unknown): VoiceMemo[] {
       audio,
       sizeBytes: typeof o.sizeBytes === "number" && Number.isFinite(o.sizeBytes) ? o.sizeBytes : 0,
       mime: typeof o.mime === "string" ? o.mime : "audio/wav",
-    });
+    };
+    if ("transcript" in o) {
+      const tx = readTranscript(o.transcript);
+      if (tx) m.transcript = tx;
+      // else: a bad transcript is **dropped**, not kept as null — the screen
+      // branches on "transcript is present" and a sentinel would silently render.
+    }
+    if (typeof o.trimOf === "string" && o.trimOf && o.trimOf !== o.id) {
+      m.trimOf = o.trimOf;
+    }
+    out.push(m);
   }
   return out.length > VMEMO_CAP ? out.slice(out.length - VMEMO_CAP) : out;
 }
@@ -184,7 +249,7 @@ export function seedVoiceMemos(now: number): VoiceMemo[] {
     buildWavBytes({ seconds, sampleRate: 8000, toneHz, amplitude: 0.3 }).length;
   return [
     {
-      id: makeVoiceId(now),
+      id: makeVoiceId(),
       title: defaultRecordingTitle(now - 60_000),
       createdAt: now - 60_000,
       durationMs: 3_000,
@@ -193,7 +258,7 @@ export function seedVoiceMemos(now: number): VoiceMemo[] {
       mime: "audio/wav",
     },
     {
-      id: makeVoiceId(now),
+      id: makeVoiceId(),
       title: defaultRecordingTitle(now - 120_000),
       createdAt: now - 120_000,
       durationMs: 1_500,
@@ -202,4 +267,175 @@ export function seedVoiceMemos(now: number): VoiceMemo[] {
       mime: "audio/wav",
     },
   ];
+}
+
+/* ---- playback progress (pure) ---- */
+
+/** Clamp `currentMs` to [0, durationMs], then return the percent [0, 100].
+ *  Zero-duration recording ⇒ 0 (never NaN); `currentMs > duration` ⇒ 100. */
+export function progressPercent(currentMs: number, durationMs: number): number {
+  const total = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 0;
+  const cur = Number.isFinite(currentMs) ? Math.max(0, currentMs) : 0;
+  if (total === 0) return 0;
+  const pct = (cur * 100) / total;
+  if (pct < 0) return 0;
+  if (pct > 100) return 100;
+  return pct;
+}
+
+/** Seek target inside the memo's own timeline (the HTMLAudioElement, not the
+ *  wall clock). `sec` is clamped to [0, durationSec]. */
+export function clampSeekSeconds(sec: number, durationSec: number): number {
+  const dur = Number.isFinite(durationSec) && durationSec > 0 ? durationSec : 0;
+  const s = Number.isFinite(sec) ? sec : 0;
+  if (dur === 0) return 0;
+  if (s < 0) return 0;
+  if (s > dur) return dur;
+  return s;
+}
+
+/* ---- trim region (pure) ---- */
+
+/** Clamp a half-open trim region to a memo's duration: `0 ≤ start ≤ end ≤
+ *  durationMs`. Negative or NaN bounds collapse to 0 / duration; `start > end`
+ *  is swapped so the tr UI can be sloppy in either handle without breaking the
+ *  invariant. Returns the same shape the screen stores (`startMs`, `endMs`)
+ *  with `endMs − startMs ≥ 0`. */
+export function clampTrimRange(
+  startMs: number,
+  endMs: number,
+  durationMs: number,
+): MemoRange {
+  const dur = Math.max(0, Number.isFinite(durationMs) ? durationMs : 0);
+  // Swap FIRST, THEN clamp — so a reversed UI drag is corrected before bounds check.
+  let s = Number.isFinite(startMs) ? startMs : 0;
+  let e = Number.isFinite(endMs) ? endMs : 0;
+  if (s > e) {
+    const tmp = s;
+    s = e;
+    e = tmp;
+  }
+  return { startMs: Math.min(Math.max(0, s), dur), endMs: Math.min(Math.max(0, e), dur) };
+}
+
+/** A no-op iff `start === 0` and `end === duration`. */
+export function isFullRange(r: MemoRange, durationMs: number): boolean {
+  return r.startMs <= 0 && r.endMs >= durationMs;
+}
+
+/** Trim a memo's audio duration down to the selected window (pure).
+ *  Returns `durationMs` clamped to `endMs − startMs`. */
+export function trimmedDurationMs(r: MemoRange): number {
+  return Math.max(0, r.endMs - r.startMs);
+}
+
+/** Build the metadata for a NEW memo (sibling row in the library) carrying the
+ *  same bytes under a fresh id + a `[startMs, endMs]` window. The trim itself —
+ *  cutting bytes — happens once the user **saves**; this only shapes metadata,
+ *  mirroring how `memoForRecording` is a metadata-only builder. The original
+ *  memo is left alone so it can be re-edited or undone. */
+export function trimMemo(
+  src: VoiceMemo,
+  range: MemoRange,
+  now: number,
+): { ok: true; memo: VoiceMemo } | { ok: false; reason: string } {
+  if (src.audio.kind !== "recorded") {
+    // Demo seeds have no bytes to cut; refusing early keeps the UI honest.
+    return { ok: false, reason: "seed" };
+  }
+  const r = clampTrimRange(range.startMs, range.endMs, src.durationMs);
+  if (r.endMs - r.startMs < 1) return { ok: false, reason: "empty" };
+  // Reuse a proportional slice of the size as an estimate. The actual re-encoded
+  // size will be set by the byte-side step (out of scope for pure helpers), so
+  // this stays an **estimate** for display only.
+  const ratio = src.durationMs > 0 ? (r.endMs - r.startMs) / src.durationMs : 0;
+  return {
+    ok: true,
+    memo: {
+      id: makeVoiceId(),
+      title: defaultRecordingTitle(now),
+      createdAt: now,
+      durationMs: r.endMs - r.startMs,
+      audio: { kind: "recorded" },
+      sizeBytes: Math.max(1, Math.round(src.sizeBytes * ratio)),
+      mime: src.mime,
+      trimOf: src.id,
+    },
+  };
+}
+
+/* ---- transcript (pure) ---- */
+
+/** ASR state machine for one memo. Used by the UI to render "transcribing…",
+ *  "recognized …", "no speech", and to disable the button while a request is
+ *  in flight. Pure: the network call lives in the UI; this just maps intents. */
+export type AsrState =
+  | { kind: "idle" }
+  | { kind: "transcribing" }
+  | { kind: "done"; transcript: MemoTranscript }
+  | { kind: "empty" }
+  | { kind: "error"; message: string };
+
+/** Parse a daemon reply (`{ text: string, recognized: boolean }` plus optional
+ *  `lang`) into a {@link MemoTranscript}. `null` when the payload is structurally
+ *  not one — never a half-built row. Mirrors `parseTranscribe`'s discipline but
+ *  is local to this module so the screen does not have to import the ASR helper
+ *  for a single row. */
+export function readTranscribeReply(
+  v: unknown,
+  at: number,
+): MemoTranscript | null {
+  if (!v || typeof v !== "object") return null;
+  const p = v as Record<string, unknown>;
+  if (typeof p.text !== "string") return null;
+  return {
+    text: p.text,
+    recognized: !!p.recognized,
+    lang: typeof p.lang === "string" ? p.lang : "",
+    at: Number.isFinite(at) && at >= 0 ? at : 0,
+  };
+}
+
+/** Attached-transcript update — returns a NEW memo (immutable) with `tx`
+ *  stamped on. `null` ⇒ strip the transcript (e.g. user cleared it). */
+export function attachTranscript(m: VoiceMemo, tx: MemoTranscript | null): VoiceMemo {
+  if (tx === null) {
+    if (!("transcript" in m)) return m;
+    const { transcript: _drop, ...rest } = m;
+    return rest as VoiceMemo;
+  }
+  return { ...m, transcript: tx };
+}
+
+/** Build the `atos` outcome line the UI should render after a transcribe call:
+ *  - shape 4 of "voice reply didn't look like a payload" → `error("shape")`
+ *  - `recognized: true` → `done(transcript)`
+ *  - `recognized: false` and empty text → `empty`
+ *  - everything else → `done(transcript)` (the daemon will surface "no speech"
+ *    via `recognized=false`; callers branch on `recognized`). */
+export function classifyTranscribe(
+  payload: unknown,
+  at: number,
+): AsrState {
+  const tx = readTranscribeReply(payload, at);
+  if (!tx) return { kind: "error", message: "shape" };
+  if (!tx.recognized && tx.text.length === 0) return { kind: "empty" };
+  return { kind: "done", transcript: tx };
+}
+
+/** Translate an arbitrary exception (from `transcribe_audio`'s catch arm) into
+ *  a typed `AsrState`. We refuse to render "transcribing…" forever — a rejected
+ *  call is `error("host")`, no host is `error("offline")`, a malformed reply is
+ *  `error("shape")`. Mirrors the `ExportOutcome` discipline used by mediaExport. */
+export function classifyTranscribeError(e: unknown): AsrState {
+  const raw = typeof e === "string"
+    ? e
+    : typeof e === "object" && e !== null
+      ? (e as Record<string, unknown>).message
+        ? String((e as Record<string, unknown>).message ?? "")
+        : "unknown"
+      : "unknown";
+  if (/no bridge|not bridged/i.test(raw)) return { kind: "error", message: "offline" };
+  if (raw === "unknown") return { kind: "error", message: "unknown" };
+  return { kind: "error", message: "host" };
 }

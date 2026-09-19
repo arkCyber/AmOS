@@ -9,8 +9,16 @@
  * 两个开关的真源(REQ-A287 改成**宿主**):
  *   1. `window.__amosDisabledFeatures` —— 测试/e2e 钩子(数组或逗号串),不需要桥;
  *   2. 宿主:`AMOS_DESKTOP_SHORTCUTS` / `AMOS_DOCK_CONTEXT_MENU` 由 Rust 宿主在启动时读
- *      (`crates/amos-tauri/src/desktop_features.rs`),UI 在 boot 时通过
- *      `desktop_features_disabled` 取一次并缓存(`loadDesktopFeatures`)。
+ *      (`crates/amos-tauri/src/desktop_features.rs`),UI 通过 `desktop_features_disabled`
+ *      取一次并缓存(`loadDesktopFeatures`)。
+ *
+ * **宿主答案住在模块状态里 ⇒ 它是 per-WebView 的**(REQ-A453,真机实测 2026-09-19):
+ * 每个窗口是独立的 WebView 与独立的 JS 模块实例,**同一个窗口不问,就永远拿不到答案**。
+ * 所以"谁来问"必须和"谁消费"一一对应:两个桌面壳面(启动器 `DesktopShell`、应用窗口
+ * `DesktopAppWindow`)各自在挂载时问一次。此前的缺陷是只有 `DesktopShell` 问 —— 而 REQ-A416
+ * 之后应用窗口不再挂载它,于是 `AMOS_DESKTOP_SHORTCUTS=disabled` 在**每一个应用窗口**里
+ * 都不生效(宿主日志照样打印 disabled,前端照样抢 ⌘W)。`loadDesktopFeatures` 是单飞的,
+ * 多问一次不产生第二次往返。
  *
  * **前端自己读不到这两个环境变量** —— 这正是 REQ-A287 修掉的缺陷:旧代码读
  * `import.meta.env.AMOS_*`(Vite 只内联 `VITE_*`,本仓没有 `envPrefix`)与 `process.env`

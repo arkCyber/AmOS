@@ -22,8 +22,9 @@
    * action. It is one file to extend.
    */
   import { getContext } from "svelte";
-  import { bridgeDiag, invoke } from "../../lib/backend";
+  import { wmOpenWithDiag } from "../../lib/wm";
   import { SHELL_CHROME_API, type ShellChromeApi } from "../../lib/shellModule";
+  import { installMenuKeyboard } from "../../lib/menuKeys";
   import { t } from "../locale.svelte";
   import {
     CHROME_MENU_BUTTON,
@@ -54,9 +55,9 @@
    *  is at least visible.
    */
   async function openSettings() {
-    const result = await invoke<unknown>("wm_open", { label: "settings" });
-    if (result === null) {
-      const diag = bridgeDiag("wm_open");
+    const r = await wmOpenWithDiag("settings");
+    if (!r.ok) {
+      const diag = r.diag;
       if (!diag.ok) {
         const code =
           diag.kind === "command-failed" &&
@@ -86,6 +87,13 @@
 
   let open = $state(false);
   let wrapEl = $state<HTMLElement | null>(null);
+  /** The open panel, for REQ-A436's keyboard layer (see `lib/menuKeys`). */
+  let panelEl = $state<HTMLElement | null>(null);
+
+  $effect(() => {
+    if (!panelEl || !open) return;
+    return installMenuKeyboard(panelEl, { onClose: () => (open = false) });
+  });
 
   async function choose(entry: AppleMenuEntry) {
     if (!entry.run) return;
@@ -130,6 +138,7 @@
     <div
       class="absolute left-0 top-full z-50 mt-1 {CHROME_MENU_PANEL}"
       style={CHROME_MENU_PANEL_STYLE}
+      bind:this={panelEl}
       role="menu"
       aria-label={t("desktop.appleMenu")}
       data-testid="apple-menu-panel"

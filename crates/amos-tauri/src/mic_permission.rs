@@ -237,7 +237,9 @@ mod jni {
                     .map(|vm| std::sync::Arc::new(MicBridge { vm, glue }))
             });
             if let Some(bridge) = registered {
-                // Exactly-once; a redundant re-bind simply keeps the first glue.
+                // Exactly-once; a redundant re-bind simply keeps the first glue. Safe because the
+                // Activity is not recreated under us — the generated manifest's `configChanges`
+                // is what makes that true, and `scripts/android-glue-mirror.sh` gates it (REQ-A448).
                 let _ = GLUE.set(bridge);
             }
         }

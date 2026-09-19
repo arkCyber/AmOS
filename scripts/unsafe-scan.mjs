@@ -19,8 +19,9 @@
  *   2. **Ratchet** — the per-file count of `unsafe` sites lives in
  *      `scripts/unsafe-baseline.json`. A file gaining a site (or a new file appearing)
  *      fails: the addition must be acknowledged in the baseline, so the `unsafe`
- *      surface can only grow deliberately. Counts going *down* are reported as
- *      `[stale]` (tighten the baseline), never silently ignored.
+ *      surface can only grow deliberately. Counts going *down* **fail** as stale entries
+ *      (REQ-A447: tighten the baseline — a note was not enough), and the file's own
+ *      `total` is checked against the sum of its entries instead of being trusted.
  *
  * Test code is out of scope: `tests/**` and everything from the first `#[cfg(test)]`
  * in a file (that is where raw-pointer helpers and `unsafe` test fixtures live).
@@ -143,6 +144,18 @@ export function scan() {
 // --- main --------------------------------------------------------------------
 const args = process.argv.slice(2);
 
+// An unrecognised flag is a failure, not a no-op (measured 2026-09-19: `docs/POWER_OF_10.md`
+// spelled this gate's selftest `--self-test`, which it does not implement, so the documented
+// "verification" line silently ran the gate instead — see `rust-recursion-scan.mjs`).
+const KNOWN_FLAGS = new Set(["--selftest", "--json"]);
+const unknownFlags = args.filter((f) => f.startsWith("-") && !KNOWN_FLAGS.has(f));
+if (unknownFlags.length > 0) {
+  console.error(
+    `[unsafe-scan] unknown flag(s): ${unknownFlags.join(", ")} — known: ${[...KNOWN_FLAGS].join(", ")}`,
+  );
+  process.exit(2);
+}
+
 function runSelfTest() {
   const cases = [];
   const src = [
@@ -226,6 +239,17 @@ function runSelfTest() {
     rmSync(tmp, { recursive: true, force: true });
   }
 
+  // REQ-A447 — the baseline's own headline number is checked, not trusted.
+  cases.push([
+    "a `total` that drifted from the sum is a problem",
+    totalProblems(233, 232).length === 1,
+  ]);
+  cases.push(["an agreeing `total` is not a problem", totalProblems(233, 233).length === 0]);
+  cases.push([
+    "a baseline without a `total` is not a problem (nothing to contradict)",
+    totalProblems(undefined, 233).length === 0,
+  ]);
+
   let failed = 0;
   for (const [name, ok] of cases) {
     if (ok) console.log(`  [ok] ${name}`);
@@ -247,9 +271,10 @@ if (args.includes("--selftest")) {
 }
 
 const { counts, undocumented } = scan();
-const baseline = existsSync(BASELINE)
-  ? JSON.parse(readFileSync(BASELINE, "utf8")).files ?? {}
+const baselineDoc = existsSync(BASELINE)
+  ? JSON.parse(readFileSync(BASELINE, "utf8"))
   : {};
+const baseline = baselineDoc.files ?? {};
 const problems = [];
 for (const [f, n] of Object.entries(counts)) {
   const b = baseline[f];
@@ -261,9 +286,37 @@ const stale = Object.entries(baseline)
   .map(([f, b]) => `${f} (baseline ${b}, now ${counts[f] ?? 0})`);
 
 const total = Object.values(counts).reduce((a, b) => a + b, 0);
+// The file's own headline number is **checked, not trusted** (REQ-A447): a `total` that has drifted
+// from the sum of `files` is a number nobody re-measures — the F-DEV-031 shape, sitting in the
+// artefact a reviewer reads first. Pulled out as a pure function so the selftest can pin it.
+export function totalProblems(declaredTotal, total) {
+  return typeof declaredTotal === "number" && declaredTotal !== total
+    ? [
+        `scripts/unsafe-baseline.json declares total ${declaredTotal}, but the per-file counts sum to ${total}`,
+      ]
+    : [];
+}
+const declaredTotal = baselineDoc.total;
+const totalProblemsFound = totalProblems(declaredTotal, total);
 if (args.includes("--json")) {
-  console.log(JSON.stringify({ total, files: counts, undocumented, problems, stale }, null, 2));
-  process.exit(problems.length === 0 && undocumented.length === 0 ? 0 : 1);
+  console.log(
+    JSON.stringify(
+      {
+        total,
+        declaredTotal,
+        files: counts,
+        undocumented,
+        problems,
+        stale,
+        totalProblems: totalProblemsFound,
+      },
+      null,
+      2,
+    ),
+  );
+  process.exit(
+    problems.length + undocumented.length + stale.length + totalProblemsFound.length === 0 ? 0 : 1,
+  );
 }
 for (const u of undocumented) console.log(`  undocumented: ${u}`);
 if (undocumented.length > 0) {
@@ -276,13 +329,20 @@ if (problems.length > 0) {
   for (const p of problems) console.log("  " + p);
 }
 if (stale.length > 0) {
-  console.log(`[unsafe-scan] note — stale baseline entries (tighten them):`);
+  // A note was not enough (REQ-A447): the ratchet must **shrink**, so an entry the measurement has
+  // fallen below fails until it is tightened — one rule, the same one `rust-macro-scan` (R2,
+  // REQ-A442), `rust-unwired-scan` (R2, REQ-A445), `unwired-script-scan` and `feature-surface-scan`
+  // already enforce.
+  console.log(`[unsafe-scan] FAIL — ${stale.length} stale baseline entr(ies); tighten them:`);
   for (const s of stale) console.log("  " + s);
 }
-if (undocumented.length === 0 && problems.length === 0) {
+for (const p of totalProblemsFound) console.log(`[unsafe-scan] FAIL — ${p}`);
+const clean =
+  undocumented.length + problems.length + stale.length + totalProblemsFound.length === 0;
+if (clean) {
   console.log(
-    `[unsafe-scan] OK — ${total} production unsafe site(s) across ${Object.keys(counts).length} file(s), all documented, none above the baseline.`,
+    `[unsafe-scan] OK — ${total} production unsafe site(s) across ${Object.keys(counts).length} file(s), all documented, none above the baseline, and \`total\` agrees with the per-file sum.`,
   );
 }
-process.exit(undocumented.length === 0 && problems.length === 0 ? 0 : 1);
+process.exit(clean ? 0 : 1);
 

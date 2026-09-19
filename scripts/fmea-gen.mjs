@@ -217,6 +217,202 @@ const KNOWN_FAILURES = [
   { id: 'F-DEV-042', module: 'process', files: ['scripts/blocking-async-allowlist.json', 'crates/amos-ai/src/server.rs'], markers: ['serve_with_sinks_full', 'One cause can produce two lines of output', 'REQ-A454'], severity: 3 },
   { id: 'F-DEV-043', module: 'process', files: ['Makefile', 'scripts/feature-surface-scan.mjs'], markers: ['--features notifier', 'never enabled', 'REQ-A454'], severity: 3 },
   { id: 'F-DEV-044', module: 'process', files: ['Makefile', 'scripts/diagnose-android-usb.sh', 'docs/device-bringup-checklist.md'], markers: ['android-usb', 'diagnose-android-usb', 'REQ-A454'], severity: 2 },
+  // REQ-A459: a crate root declared **two** of the three P0-1 lints while the comment next to the
+  // one `panic!` in that crate claimed the third was "locally silenced" — a silencing that existed
+  // nowhere: the lint had never been enabled and no `#[allow]` was written anywhere. The build
+  // enforced less than the prose asserted, and only the gate that requires all three could see it
+  // (59 crate roots; this was the only one missing the third).
+  { id: 'F-DEV-045', module: 'process', files: ['crates/amos-notifier/src/lib.rs', 'crates/amos-notifier/src/webhook.rs'], markers: ['clippy::panic', 'REQ-A459'], severity: 3 },
+  // REQ-A459: a documented default whose implementing function had **no caller anywhere** — the
+  // module header promised `~/.amos/feature-flags.json` overridable by `AMOS_FEATURE_FLAGS_FILE`,
+  // `default_file_path()` implemented exactly that promise, and nothing called it, so neither the
+  // default path nor the override existed in any code path. Two more documented capabilities in the
+  // same crate (`Resolver::feature_flags`, `Resolver::get_typed`) were zero-reference too, and one
+  // export (`env_name_for_pub`) advertised a direction whose claimed consumer used the other one.
+  { id: 'F-DEV-046', module: 'process', files: ['crates/amos-config/src/feature_flag.rs', 'crates/amos-config/src/layer.rs'], markers: ['from_local', 'default_file_path', 'REQ-A459'], severity: 3 },
+  // REQ-A459: the two halves of the key normalisation disagreed with each other AND with their own
+  // docs. `env_key_to_config_key` stripped `AMOS_` (storing `ai.port`) while its doc said the prefix
+  // was "kept"; `env_name_for("amos.ai.port")` — the key the docs and every caller use — produced
+  // `AMOS_AMOS_AI_PORT`, a name nothing sets. So Layer::Env could never answer a documented key and
+  // an operator's `AMOS_AI_PORT=9090` was silently ignored. Found by RUNNING the §4 example, not by
+  // reading: it printed `session-env AMOS_AMOS_AI_PORT: None` and `default: Number(8080)`.
+  { id: 'F-DEV-047', module: 'process', files: ['crates/amos-config/src/layer.rs', 'crates/amos-config/src/lib.rs', 'crates/amos-config/examples/layered_resolve.rs'], markers: ['env_key_to_config_key', 'env_name_for', 'REQ-A459'], severity: 4 },
+  // REQ-A459: an example nothing runs — and it had been broken since the framing changed.
+  // `crates/amos-robot/examples/serial_loopback.rs` asserted a hand-written "12 bytes" while the
+  // driver's real wire form is `body ‖ EOF` = `FRAME_LEN + 1` = 11, so it panicked the first time
+  // anyone ran it. Nothing could see that: `cargo test` does not build examples, and the README
+  // check only asks whether an example is *named* (it was not).
+  { id: 'F-DEV-048', module: 'process', files: ['crates/amos-robot/examples/serial_loopback.rs', 'crates/amos-robot/README.md'], markers: ['frame_bytes', 'REQ-A459'], severity: 2 },
+  // REQ-A460: the mirror image of `dangling-source-scan` had no gate at all, so a file
+  // that sits in `src/` while the compiler never reads it was invisible *by construction*
+  // — every other scan walks **from** a reference, and such a file has none.
+  // `crates/amos-mdm/src/error.rs.tmp_tests` (14 tests, a byte-identical copy of the
+  // module inside `error.rs`, non-`.rs` extension) and `crates/amos-ai/src/notifier_bridge/`
+  // (a stale earlier revision left behind by a move; the directory had no `mod.rs`, so
+  // `mod notifier_sink;` resolved to `src/notifier_sink.rs`) were both found the moment
+  // the gate existed. Its own first version had a false positive (the Rust 2018
+  // module-dir rule: a child of `src/live.rs` lives in `src/live/`) — 5 phantom findings,
+  // now pinned by a selftest case, because a false positive is worse than a miss.
+  { id: 'F-DEV-049', module: 'process', files: ['scripts/unreached-source-scan.mjs', 'scripts/unreached-src-allowlist.json', 'scripts/dangling-source-scan.mjs', 'Makefile'], markers: ['unreached-source-scan', 'moduleDir', 'REQ-A460'], severity: 3 },
+  // REQ-A460: a feature-gated test that **nothing runs**. `amos-ai/notifier` and
+  // `amos-supervisor/notifier` are off by default (they pull `amos-notifier` into the
+  // device build) and `make lint` only *compiled* them, so the alert bridge's unit tests
+  // and two end-to-end test targets executed in no step at all — the REQ-A188/A191 blind
+  // spot, this time on the run side rather than the compile side.
+  { id: 'F-DEV-050', module: 'process', files: ['Makefile', 'crates/amos-ai/src/notifier_sink.rs', 'crates/amos-supervisor/src/alert_sink.rs'], markers: ['amos-supervisor/notifier', 'notifier_sink', 'REQ-A460'], severity: 3 },
+  // REQ-A460: a **derived artifact** older than the tree it derives from. The embedded
+  // frontend bundle (`dist/`) was older than its sources, so the release desktop binary
+  // would have shipped a UI that does not match this tree; and `docs/ENV_VARIABLES.md`
+  // — the document that calls itself the single source of truth for configuration — was
+  // missing nine knobs the code already reads (the whole alerting/config surface).
+  // Both gates existed and both were red: the gap is not "no check" but "a check nobody
+  // had run", which is what makes it worth registering as a failure mode.
+  { id: 'F-DEV-051', module: 'process', files: ['docs/ENV_VARIABLES.md', 'scripts/dist-freshness.mjs', 'scripts/env-doc-gen.mjs', 'Makefile'], markers: ['AMOS_CONFIG_RELOAD_SECS', 'dist-freshness', 'REQ-A460'], severity: 3 },
+  // REQ-A461: the i18n gate's English-copy check read *static* attributes (`attr="…"`) and
+  // brace-less text nodes, so a label written as a Svelte expression was invisible to it —
+  // `aria-label={`remove ${id}`}` announced English *and* a raw app id in a zh+en OS while the
+  // dictionary key it should have used (`edit.remove`) sat unused and allow-listed. Ten such
+  // labels existed (two screens' accessible names, play/pause, done/undone, DND). The new rule
+  // had its own false-positive lesson: scanning *every* literal in the expression produced 94
+  // findings, 93 of them enum tokens / icon names / class lists — so the rule is "the branch the
+  // reader sees **is** the literal", and a template is only prose when it interpolates.
+  { id: 'F-DEV-052', module: 'process', files: ['crates/amos-tauri/frontend-ts/scripts/i18n-scan.mjs', 'crates/amos-tauri/frontend-ts/src/i18n/locales/zh.ts', 'Makefile'], markers: ['expressionCopy', 'wholeLiteralTexts', 'REQ-A461'], severity: 3 },
+  // REQ-A461: a control that *looked* like it did nothing — and a door with no way back.
+  // `Launchpad.svelte`'s edit-mode "−" called `hideApp` (writing `layout.hidden`), but its own
+  // displayed list never read `hidden`: the second loop re-appended every APP_META id the layout
+  // did not contain, so the icon stayed put while the **touch** home screen silently lost the app.
+  // On the desktop there was then no restore path at all (the touch form has `EditHome`'s ＋ row).
+  { id: 'F-DEV-053', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/Launchpad.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/launchpad.svelte.test.ts'], markers: ['hiddenIds', 'restoreApp', 'REQ-A461'], severity: 3 },
+  // REQ-A462: an exemption can **legitimise a false statement in the UI**. `edit.hint` told
+  // the user "tap ‹ › to reorder" from the day it was written, while neither button existed —
+  // and the two dictionary keys the buttons would use (`edit.moveEarlier` / `edit.moveLater`)
+  // were allow-listed with the reason "the reorder UX was not yet wired … reserved for future
+  // implementation". The gate was satisfied (a live allow-list entry is not a dead key), so the
+  // only place the gap showed was in front of the user. The lesson: a reason that says "not yet
+  // wired" must not also be the reason a *user-visible claim* is allowed to stand.
+  { id: 'F-DEV-054', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/EditHome.svelte', 'crates/amos-tauri/frontend-ts/src/lib/amosStore.ts', 'crates/amos-tauri/frontend-ts/scripts/i18n-allowlist.json'], markers: ['canMoveWithinHome', 'REQ-A462'], severity: 3 },
+  // REQ-A463: **feature unification hides a package that is broken on its own.**
+  // `crates/amos-monitor/examples/sample_health.rs` uses `amos_monitor::linux::LinuxSystemSampler`
+  // without declaring `required-features`, so `cargo build -p amos-monitor --all-targets` fails
+  // with E0432 while `cargo clippy --workspace --all-targets` passes — because `amos-ai` depends
+  // on `amos-monitor` with `features = ["linux"]`, so the workspace build turns the feature on for
+  // everyone. Every gate in the tree was green; the defect was found by *running* the example.
+  // It is also the reason the examples gate runs each example from the workspace root's manifest
+  // but with a scratch `cwd` — the first version wrote `sample.pdf` into the repository.
+  { id: 'F-DEV-055', module: 'process', files: ['scripts/examples-smoke.mjs', 'scripts/examples-smoke-allowlist.json', 'crates/amos-monitor/Cargo.toml'], markers: ['required-features', 'REQ-A463'], severity: 3 },
+  // REQ-A466: **总测试门是红的，而它的原因是"两个测试共用一个临时路径"**。
+  // `restart_all_e2e.rs` 的四个测试是同一个进程里的**并发线程**，而 `pidfile(name)` 只用
+  // `(process::id(), name)` 作键：`restart_all_called_twice_…` 用 `a`/`b`、
+  // `list_after_restart_all_…` 用 `a`/`b`/`c`/`d` ⇒ 两个测试共用同一批路径，而每次
+  // `sleep_daemon_with_pidfile` 开头就 `remove_file` ⇒ 一个测试把另一个测试守护进程刚写的
+  // pidfile 删掉，`read_pid` 永远读不出可解析的值。实测：默认并行 **4 例中 1 例失败**
+  // （稳定复现，5/5），单线程 **0 失败**，单独跑那一个 **通过**；`cargo test --workspace`
+  // 因此 exit 101。同一文件还留下 `cargo fmt --check` 的 3 处 diff ⇒ `make lint` 也是红的。
+  // **同一个类的第二个实例**：`amos-link-cli/tests/cli_smoke.rs` 的 `start_control_plane()`
+  // 路径用 `(process::id(), SystemTime::now().as_nanos())`，而它有**五个**调用者（同一个
+  // 进程的并发线程）⇒ 同一时钟刻度的两次调用算出**同一个**路径，先绑者胜、后绑者
+  // `AddrInUse` panic。实测：三次 `cargo test --workspace` 里**红一次**（绿/红/绿），而该
+  // 文件单独跑 **34/34 稳定通过** —— 典型的"只在整仓并行下出现"。
+  { id: 'F-DEV-056', module: 'process', files: ['crates/amos-supervisor/tests/restart_all_e2e.rs', 'crates/amos-link-cli/tests/cli_smoke.rs'], markers: ['AtomicU64', 'never became parseable', 'unique_socket_path', 'REQ-A466'], severity: 3 },
+  // REQ-A467: `Supervisor::restart_all` was only ever proven to recycle a happy-path
+  // pair of daemons (the in-lib test `restart_all_recycles_every_running_child`).
+  // The harder contracts — *which* daemons must NOT be touched (Stopped /
+  // Crashed, whose monitor has already exited), what happens to the supervisor's
+  // public view after the recycle (`list()` / `status()`), and whether two
+  // back-to-back `restart_all` calls each produce a brand-new child — were
+  // implicit. The implementation is correct, but a silent regression (e.g.
+  // someone adding a `restart_requested` flag to a crashed daemon's monitor
+  // post-hoc and resurrecting a stopped child) would have shipped green.
+  // Measured mitigation: 5/5 tests in `tests/restart_all_e2e.rs` cover the
+  // production path on real `sh -c 'echo $$ > pid; exec sleep N'` processes,
+  // including `kill -0` reaping checks across cycle boundaries.
+  { id: 'F-SUP-001', module: 'amos-supervisor', files: ['crates/amos-supervisor/src/lib.rs', 'crates/amos-supervisor/tests/restart_all_e2e.rs'], markers: ['restart_all', 'restart_all_skips_stopped_and_crashed', 'restart_all_called_twice_yields_two_distinct_new_pids', 'list_after_restart_all_reports_every_daemon_running', 'restart_all_over_mixed_states_does_not_spam_the_alert_sink', 'restart_all_on_empty_supervisor_completes', 'REQ-A467'], severity: 3 },
+  // REQ-A465: **workspace 构建也不合并输出路径** —— 两个成员的同名 `example` 都写
+  // `target/debug/examples/<name>`，cargo 只**警告**（"may become a hard error in the
+  // future"），而 `cargo build -q` 连警告都不显示 ⇒ 本仓全绿，且按路径执行那个产物
+  // (`scripts/ai-honesty-smoke.sh` 就按路径跑 `target/debug/examples/status_once`) 依赖的是
+  // "谁最后被链接"这个意外。实测两对：`status_once`（amos-ai + amos-translate）、
+  // `embed_commands`（amos-appstore-cli + amos-link-cli）。
+  { id: 'F-DEV-057', module: 'process', files: ['scripts/isolation-check.mjs', 'crates/amos-translate/examples/translate_status_once.rs'], markers: ['REQ-A465', 'outputCollisions', 'UNSHARED_KINDS'], severity: 3 },
+  // REQ-A467: **整个"控制"半场是空转的，却回 `Ok`** —— `airplay_connect` / `airplay_start_stream`
+  // / `airplay_set_volume` 三个命令的实现只有 `TODO` 注释：`connect` 把 `device.connected` /
+  // `status.active` 置位再 `Ok`；`start_stream` 置 `playing` 并把 `url` 丢掉（`let _ = url;`）；
+  // `set_volume` 把值夹紧写进 `status` 再 `Ok`。而 `is_available()` 在 macOS/iOS/Android/Linux
+  // 一律 `return true`，文件头却写着 "returns well-typed failures rather than silently pretending
+  // to work" ⇒ 面板把"已连接 / 投屏中"画出来，而没有任何设备被联系过（demo 设备让 debug 构建
+  // 里这条路真的走得到）。**同轮量到的第二个事实**：`AirPlayResult` 是 union alias，而
+  // `tauri-reply-scan` **明确跳过** union alias（"skipped, never guessed"），于是
+  // `rename_all = "lowercase"` 发出的 `"permissiondenied"` / `"devicenotfound"` 与前端声明的
+  // `permission_denied` / `device_not_found` 长期不一致而无人比较（面板只看 `kind === "ok"`）；
+  // 而当时那条"断言 Ok"的测试在 macOS 上是**空转**的（发现失败 ⇒ 设备列表为空 ⇒ 提前 return，
+  // 什么也没断言）。第三个缺口：面板把拒绝送进 `console.error`，且 discovery 失败时
+  // `discovering` 不复位 ⇒ 用户看到的是"永远在搜索"或"点了没反应"。
+  { id: 'F-DEV-058', module: 'process', files: ['crates/amos-tauri/src/airplay.rs', 'crates/amos-tauri/src/airplay_tests.rs', 'crates/amos-tauri/frontend-ts/src/lib/airplay.ts', 'crates/amos-tauri/frontend-ts/src/svelte/AirPlayPanel.svelte'], markers: ['NOT_IMPLEMENTED', 'test_airplay_result_wire_form', 'not_implemented', 'airplay.controlUnavailable'], severity: 3 },
+  // REQ-A468: **"重试"和"关闭"其实是同一个动作** —— `FilesApp.svelte` 交给 `FileErrorBanner` 的
+  // `onRetry` 是个占位实现（注释自己写着 "This is a placeholder - actual retry would need
+  // operation-specific logic"）：它只把 `currentError` 清掉，**什么都不重试**。而
+  // `FileErrorBanner` 的渲染判据是 `error.retryable && onRetry && !isStorm`，`store_locked`
+  // 恰好 `retryable: true` ⇒ 一次被存储拒绝的写操作会递给用户一个"重试"按钮，按下去**错误消失、
+  // 什么都没重试** —— 失败看起来被解决了，比"点了没反应"更坏：它把证据也抹掉了（onDismiss 的
+  // 实现与此逐字相同，两个按钮行为完全一致）。
+  { id: 'F-DEV-059', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/FilesApp.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/modules/FileErrorBanner.svelte'], markers: ['retryAction', 'REQ-A468'], severity: 3 },
+  // REQ-A469: **那道"诚实边界"其实是两处抽取器缺陷** —— REQ-A467 的 union-alias 不匹配之所以能长期
+  // 存活，是因为 `scripts/tauri-reply-scan.mjs` **根本没看到那一对**：`parseInvokeGenerics` 要求命令名
+  // 是**双引号**，而 `invoke<AirPlayResult>('airplay_connect')` 用单引号 ⇒ `lib/airplay.ts` 里 **9 个**
+  // typed invoke（整个 AirPlay 回复面）对该扫描不可见（而兄弟扫描器 `tauri-args-scan` 早就同时接受两种
+  // 引号）；且 `parseRustShapes` **从不记录 tag 的值** ⇒ 即便解析到也没有可比的东西。本轮补上
+  // `variantTag()`（对**变体名**应用 `rename_all` —— 既有的字段重命名器在这里会返回 Rust 拼写而漏报）、
+  // `parseTsTaggedUnions()`（两种引号）与单引号 invoke 抽取；报告从 `107 checked / 93 skipped` 变成
+  // `116 / 93`，负控（把 `snake_case` 换回 `lowercase`）逐条点名 6 个 airplay 命令。
+  { id: 'F-DEV-060', module: 'process', files: ['scripts/tauri-reply-scan.mjs'], markers: ['variantTag', 'parseTsTaggedUnions', 'REQ-A469'], severity: 3 },
+  // REQ-A410: **一个功能的两半各自"完成"了，中间那半没人接** —— `fail_command`（唯一写
+  // `status = 'failed'` 的人）没有任何调用者，而 ack 协议只有 `result: Option<String>`、**没有失败
+  // 信号** ⇒ 一台回报「lock 失败」的设备被记成 `acknowledged`：运维在控制台读到的是"已完成"，而设备
+  // 根本没有锁屏 —— 企业场景里这是"远程锁定"这个承诺本身失效。修法：`AckCommandRequest` 增加
+  // `ok: Option<bool>`（**加法**：设备代理不在本仓，缺失该字段必须继续按旧语义工作），handler 按
+  // `ok:false` 走 `fail_command`，并把**实际记下的**状态回给设备。
+  // **接线时又暴露一个被基线掩盖的缺陷**：`fail_command` 只按 command id 定界（`WHERE id = ?`），
+  // 任何调用者都能把**别的设备**的命令标成失败 —— 它当时没有调用者，所以这条定界缺口从未被触发；
+  // 现在加了 `device_id`，与 `ack_command`（REQ-A411）同一条纪律。
+  { id: 'F-DEV-061', module: 'amos-mdm', files: ['crates/amos-mdm/src/models.rs', 'crates/amos-mdm/src/db.rs', 'crates/amos-mdm/src/handlers.rs'], markers: ['AckCommandRequest', 'fail_command', 'REQ-A410'], severity: 4 },
+  // REQ-A470: **事件在发、界面在猜** —— `amos-int` 的会话状态机有 8 个状态，`session.rs` 在启动与**每次**
+  // 迁移时发出 `state_changed`（`payload.state = format!("{s:?}").to_lowercase()`），而
+  // `InterpApp.svelte` 的事件链里**没有这个 kind**：屏幕只按自己的动作维护 `status`（语言对 / 离线 /
+  // 权限 / 结束 / 错误），于是 daemon 正在翻译时界面可能还显示着语言对，用户读到的"当前在做什么"是**屏
+  // 幕自己的猜测**而不是引擎的事实。修法：消费 `state_changed` 并把 daemon 的**原话**渲染成一个状态
+  // 标签（`t(\`interp.state.${token}\`)`，8 个状态各有 en/zh 文案）；`ended`/`error` 两个状态**不**渲染
+  // ——它们在 `status` 行上已经带着 daemon 自己的措辞（`session_ended` / `error`），同一件事只出现一次。
+  // 没有标签的 token 会被**原样显示**（`t()` 回落到 key 本身），不是静默。
+  { id: 'F-DEV-062', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/InterpApp.svelte', 'crates/amos-int/src/state.rs'], markers: ['daemonState', 'STATUS_OWNED_STATES', 'REQ-A470'], severity: 2 },
+  // REQ-A471: **没人读的编译器警告** —— `svelte-check` 一直在 `bun run check` / `make check` / CI 里跑，
+  // 但**没有** `--fail-on-warnings`：于是 3 条 a11y 警告（`VoiceMemosApp` 两个未与控件关联的 `<label>`、
+  // `FilesApp` 预览里一个没有 captions track 的 `<video>`）长期停在输出里，而门禁是绿的。**两个仪器都
+  // 沉默**：本仓自研的 `a11y-scan`（6 个启发式维度）报 **0 缺口** —— 它看不见
+  // `a11y_label_has_associated_control` 与 `a11y_media_has_caption` 这两类。修法：①两个滑杆的
+  // `<label>` 补 `for`/`id`（输入本来就有同名 `aria-label`，可访问名不变，缺的只是"标签属于这个控件"
+  // 这层关系）；②用户自己视频的 `<video>` 用**带理由的** `svelte-ignore`（字幕只能来自文件本身，凭空
+  // 造一个 track 等于在屏幕上放一句没人做过的声明）；③`typecheck:svelte` 加 `--fail-on-warnings`
+  // ⇒ 这一类从此不能回来（负控：同一棵树带 flag 退出 1、不带 flag 退出 0）。
+  { id: 'F-DEV-063', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/package.json', 'crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/FilesApp.svelte'], markers: ['fail-on-warnings', 'vm-trim-start', 'a11y_media_has_caption', 'REQ-A471'], severity: 2 },
+  // REQ-A472: **豁免的理由没人复核，放宽的 flag 没人签名** —— REQ-A471 收口时把两件事如实记成了"开着的"：
+  // ①`--compiler-warnings`（逐条规则 ignore/error）**没有跨文件载体**，将来要放宽某条规则只能去
+  // `package.json` 改 flag，而**那里没有写理由的地方**；②`svelte-ignore` 是**局部**豁免、理由写在站点上，
+  // 而**没有任何门禁检查这条理由是否仍然成立**（本仓对 JSON allowlist 有棘轮纪律，对编译器豁免还没有）。
+  // **实测（本轮探针）**：`svelte-check` 对**拼错的/上游删掉的** code 会报 `unknown_code`（`--fail-on-warnings`
+  // 已让它致命 ✓），但对**已经不需要的**豁免**一句话都不说** —— 把 `a11y_media_has_caption` 的 ignore 挪到
+  // 一个 `<div>` 上，svelte-check 报 `0 errors and 0 warnings` ⇒ 修复前"理由是否仍然成立"**没有任何仪器**。
+  // 修法：新增 `scripts/svelte-ignore-allowlist.json`（载体：每个 file+code 一条带理由的登记 + `compilerWarnings`
+  // 的逐条放宽登记）与 `scripts/svelte-ignore-scan.mjs`：**R0** 单行可解析；**R1** 每个站点必须被登记；
+  // **R2** 登记的理由必须**逐字引用站点注释**（两个载体不许漂移）；**R3** 没有站点的登记是 finding（清单不许烂，
+  // 也不许"预先允许"一个没人写的豁免）；**R4** 站点必须保留真正的散文理由；**R5** **liveness** —— 删掉豁免、
+  // 把**那一条** code 强制成 `error`、要求它**真的再次触发**（唯一能区分"活的豁免"与"退休的豁免"的仪器；
+  // 文件在 `finally` 里按字节还原 + sha256 校验，还原失败 `exit 2`，不留下被改过的树）；**R6** `package.json`
+  // 的 `--compiler-warnings` 必须与 JSON 载体**逐条一致**，每个被放宽的 code 都要在**那一条**上写理由
+  // （今天两边都空 ⇒ 门禁断言"没有任何规则被放宽"）。合法 code 集**从安装的 svelte 编译器里读**
+  // （`warnings.js` 的 `codes[]`/`w()` + `constants.js` 的 IGNORABLE_RUNTIME_WARNINGS）：语法本身分不清
+  // "一个 code"与"一个词"（`<!-- svelte-ignore a11y_x, because … -->` 会产出 token `because`）。
+  { id: 'F-DEV-064', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/svelte-ignore-scan.mjs', 'crates/amos-tauri/frontend-ts/scripts/svelte-ignore-allowlist.json', 'crates/amos-tauri/frontend-ts/package.json'], markers: ['svelte-ignore-allowlist.json', 'REQ-A472', 'liveness', 'svelteignore:scan'], severity: 2 },
+
   // REQ-A409: BLE GATT 写后 read 缓存被读成"已写入"，但实际是前一次应答。
   // `ble::install_glue` 一次性注入 `JavaVM` + `Context`；读写命令走严格 `JValue` 类型；
   // `pending_read` 仅由 Kotlin `onCharacteristicReadResult` 写入并 `take` 后即清空。
@@ -270,6 +466,8 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-028', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopAppWindow.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/desktop-app-window.svelte.test.ts', 'crates/amos-tauri/src/menu.rs'], markers: ['loadDesktopFeatures', 'REQ-A453', 'desktop_features_disabled', 'menu item activated'], severity: 2 },
   { id: 'F-SH-029', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/files.ts', 'crates/amos-tauri/frontend-ts/src/svelte/FilesApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/files.svelte.test.ts'], markers: ['moveToTrash', 'commitTrash', 'REQ-A455', 'amos.files.trash'], severity: 3 },
   { id: 'F-SH-030', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/Dock.svelte', 'crates/amos-tauri/frontend-ts/src/lib/amosStore.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/dock-reorder.svelte.test.ts'], markers: ['reorderVisibleDock', 'dockReorderIds', 'REQ-A456', 'data-dock-drop-target'], severity: 2 },
+  { id: 'F-SH-031', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/DesktopShell.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/topbar-main-menu.svelte.test.ts'], markers: ['applyWindowAction', 'windowAction', 'REQ-A457', 'enterFullScreen'], severity: 3 },
+  { id: 'F-SH-032', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/spotlightSearch.ts', 'crates/amos-tauri/frontend-ts/src/lib/calculator.ts', 'crates/amos-tauri/frontend-ts/src/svelte/FilesApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/spotlight-search.svelte.test.ts'], markers: ['buildSpotlightResults', 'calcQuery', 'FILES_REVEAL_KEY', 'REQ-A458'], severity: 2 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },

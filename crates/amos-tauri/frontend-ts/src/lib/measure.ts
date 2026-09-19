@@ -4,6 +4,7 @@
  * Provides measurement calculations, unit conversions, and state management
  * for AR-style distance/dimension measurements using camera and reference objects.
  */
+import { localId } from "./localId";
 
 export interface MeasureSettings {
   /** Preferred unit system. */
@@ -146,6 +147,10 @@ export function estimateRealDistance(
 
 /**
  * Calculate distance between two points and return measurement.
+ *
+ * The id comes from the shared `localId` (REQ-A401): it is the row's identity in the
+ * history list and in `removeMeasurement`-style filters, so it may not rest on a random
+ * tail. The `m-` prefix is kept (the history tests key on it).
  */
 export function createMeasurement(
   start: MeasurePoint,
@@ -159,7 +164,7 @@ export function createMeasurement(
   const realDist = estimateRealDistance(pixelDist, viewportWidth, referenceDistance);
   
   return {
-    id: `m-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    id: localId("m"),
     start,
     end,
     distance: realDist,

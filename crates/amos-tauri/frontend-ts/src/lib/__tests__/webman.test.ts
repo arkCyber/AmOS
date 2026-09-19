@@ -123,15 +123,26 @@ describe("ID 生成", () => {
 });
 
 describe("书签数据模型", () => {
-  test("addBookmark 函数存在且可调用", () => {
-    // 这个测试验证函数存在，不验证持久化
-    expect(typeof createTab).toBe("function");
+  test("addBookmark 落盘一条可读回的记录（不是只验证函数存在）", () => {
+    // 这两条曾经是**假测试**：`expect(typeof createTab).toBe("function")` 与
+    // `expect(typeof extractDomain).toBe("function")` —— 断言的是**别的**函数的存在性，
+    // 与它们所命名的功能（书签/历史）毫无关系，永远为绿。真契约在
+    // `webman-persistence.test.ts` 里已逐条钉住；这里保留一条最小但真实的往返断言，
+    // 让"书签/历史"两个 describe 至少验证自己名字所指的东西。
+    localStorage.removeItem("amos.webman.bookmarks");
+    const added = addBookmark("https://example.com/bookmarked", "书签");
+    expect(added).not.toBeNull();
+    expect(loadBookmarks().map((b) => b.url)).toEqual(["https://example.com/bookmarked"]);
   });
 });
 
 describe("历史记录数据模型", () => {
-  test("addToHistory 函数存在", () => {
-    expect(typeof extractDomain).toBe("function");
+  test("addToHistory 落盘一条可读回的记录（不是只验证函数存在）", () => {
+    localStorage.removeItem("amos.webman.history");
+    addToHistory("https://example.com/visited", "访问过");
+    const rows = loadHistory();
+    expect(rows.map((h) => h.url)).toEqual(["https://example.com/visited"]);
+    expect(rows[0]!.title).toBe("访问过");
   });
 });
 

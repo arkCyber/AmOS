@@ -25,8 +25,15 @@
  *   node scripts/dangling-source-scan.mjs              # gate
  *   node scripts/dangling-source-scan.mjs --json
  *   node scripts/dangling-source-scan.mjs --selftest   # pin the parsers
+ *
+ * Importable: `unreached-source-scan.mjs` (the reverse direction — a source file
+ * present but never read by the compiler) reuses [`rustMods`] from here rather
+ * than parsing `mod` declarations a second time (one rule, one implementation).
+ * That is why the gate below is behind an `IS_MAIN` guard: this module used to
+ * run the scan **and `process.exit`** on import, so the exported parser was
+ * unusable — an export whose import kills the importer is not a reuse seam.
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,6 +111,17 @@ export function scan({ tracked = trackedSet(), exists = existsSync, read = (p) =
 }
 
 // --- main --------------------------------------------------------------------
+// Guarded so the exported `rustMods` can be imported by the reverse scan; see
+// the header. Running as a script is unchanged.
+const IS_MAIN = (() => {
+  try {
+    return !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})();
+
+if (IS_MAIN) {
 const args = process.argv.slice(2);
 
 function runSelfTest() {
@@ -191,3 +209,5 @@ console.log(
   "[dangling-source-scan] OK — every `mod`/relative import of a tracked file resolves to a tracked source.",
 );
 
+
+} // IS_MAIN

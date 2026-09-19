@@ -17,7 +17,7 @@
    * around this widget (see `Dock.svelte`), so the tile stays a plain tile and the
    * geometry the container measures cannot feed back on itself.
    */
-  import { invoke } from "../../lib/backend";
+  import { wmOpen } from "../../lib/wm";
   import DockTileButton from "./DockTileButton.svelte";
 
   let {
@@ -31,7 +31,7 @@
   } = $props();
 
   function open() {
-    void invoke("wm_open", { label: id });
+    void wmOpen(id);
   }
 </script>
 

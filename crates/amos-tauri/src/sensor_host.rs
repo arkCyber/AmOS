@@ -48,7 +48,7 @@ use amos_sensor::{
     CameraConfig, CameraFrame, CameraId, ImuSample, LiveSensorProvider, PixelFormat, Resolution,
     SensorKind, SensorManager, SensorMode, SensorProvider, StreamChange, Vec3,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 /// Serialisable one-camera capability advertised on this host.
@@ -282,6 +282,9 @@ pub struct SensorHostSnapshot {
     pub imu: Option<HostImu>,
     /// Energy-gated "would a continuous `kind`@`hz` stream be granted?" hint.
     pub stream_gate: StreamGate,
+    /// Recently completed video clips (metadata only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video_clips: Vec<HostVideoClip>,
 }
 
 /// Whether the requested continuous stream would pass the current mode's gate.
@@ -304,6 +307,8 @@ pub struct SensorHost {
     /// whose synchronous `LocationManager` GNSS read feeds the snapshot's `gnss`.
     #[cfg(feature = "android")]
     gnss: std::sync::Mutex<Option<Arc<amos_sensor::AndroidSensorProvider>>>,
+    /// Ring of recently-recorded video clips (metadata only — bytes live in MediaStore).
+    video_clips: std::sync::Mutex<Vec<HostVideoClip>>,
 }
 
 impl SensorHost {
@@ -394,6 +399,7 @@ impl SensorHost {
             bus,
             sink,
             gnss: std::sync::Mutex::new(None),
+            video_clips: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -403,7 +409,12 @@ impl SensorHost {
         bus: Arc<LiveSensorProvider>,
         sink: Arc<EventSink>,
     ) -> Self {
-        Self { manager, bus, sink }
+        Self {
+            manager,
+            bus,
+            sink,
+            video_clips: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     /// Backend label for logs / UI ("live" on this host).
@@ -497,6 +508,26 @@ impl SensorHost {
         self.bus.imu_store().latest()
     }
 
+    /// Record a completed video clip's metadata so the snapshot can surface it.
+    pub fn record_video_clip(&self, clip: HostVideoClip) {
+        if let Ok(mut guard) = self.video_clips.lock() {
+            guard.push(clip);
+            // Keep only the most recent 32 clips.
+            let len = guard.len();
+            if len > 32 {
+                guard.drain(..len - 32);
+            }
+        }
+    }
+
+    /// The most recently recorded video clips (newest last).
+    pub fn video_clips(&self) -> Vec<HostVideoClip> {
+        self.video_clips
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     /// Read the latest sample of every family + the energy mode in one go.
     pub fn snapshot(&self) -> SensorHostSnapshot {
         let cameras = self
@@ -508,6 +539,7 @@ impl SensorHost {
         let gnss = self.read_gnss();
         let imu = self.latest_imu().map(HostImu::from);
         let gate = self.acquire_gate("imu", 100);
+        let video_clips = self.video_clips();
         SensorHostSnapshot {
             backend: self.backend_label().to_string(),
             mode: self.mode().key().to_string(),
@@ -515,6 +547,7 @@ impl SensorHost {
             gnss,
             imu,
             stream_gate: gate,
+            video_clips,
         }
     }
 
@@ -632,7 +665,7 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or_else(|_| 0)
 }
 /// Tauri command: one read of the whole System-UI sensor host.
 #[tauri::command]
@@ -693,6 +726,46 @@ pub fn sensor_host_record_frame(
 #[tauri::command]
 pub fn sensor_host_acquire(host: State<'_, SensorHost>, kind: String, hz: u32) -> StreamGate {
     host.acquire_gate(&kind, hz)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Video capture accounting
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One finished video clip produced by the host (Kotlin `MediaRecorder` or
+/// WebView `MediaRecorder` fallback). Bytes are kept by the caller; the host
+/// only tracks metadata for the snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostVideoClip {
+    pub clip_id: String,
+    pub camera_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// Duration in milliseconds.
+    pub duration_ms: u64,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+    /// Bytes on disk / in `MediaStore` — informational, not the buffer itself.
+    pub size_bytes: u64,
+}
+
+/// Push a completed video clip's metadata to the host so future snapshots can
+/// surface it. Returns `false` when the clip is rejected (size cap exceeded).
+#[tauri::command]
+pub fn sensor_host_record_video(
+    host: State<'_, SensorHost>,
+    clip: HostVideoClip,
+) -> Result<bool, String> {
+    const MAX_CLIP_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB hard cap.
+    if clip.size_bytes > MAX_CLIP_BYTES {
+        return Err(format!(
+            "video clip too large: {} bytes (max {MAX_CLIP_BYTES})",
+            clip.size_bytes
+        ));
+    }
+    host.record_video_clip(clip);
+    Ok(true)
 }
 
 #[cfg(test)]

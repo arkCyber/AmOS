@@ -11,7 +11,7 @@
  * 文件 —— 这一点在 REQ-A390 里踩过）。
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
-import { mdmManager, MDMManager, type MDMConfig, type MDMRestrictions } from "../enterprise/mdm";
+import { mdmManager, MDMManager, type MDMConfig, type MDMRestrictions, type MDMPolicy } from "../enterprise/mdm";
 import { readStoreValue } from "../amosStore";
 
 const memory = new Map<string, string>();
@@ -617,6 +617,112 @@ describe("MDM syncWithServer", () => {
     expect(res.message).toBe("timeout");
     expect(m.getConfig()?.lastSyncStatus).toBe("failure");
     expect(m.getConfig()?.lastSyncError).toBe("timeout");
+  });
+});
+
+// ============================================================================
+// configure() 逐字段合并的回归（REQ-A390 之后唯一一组直接断言 configure 行为的用例）
+// ============================================================================
+
+describe("MDM configure() 字段合并（必填字段不丢、可选字段不被覆盖）", () => {
+  test("首次 configure：从空白配置起步，所有默认字段填齐", async () => {
+    const m = new MDMManager();
+    m.clearConfigForTest();
+    expect(m.getConfig()).toBeNull();
+
+    await m.configure({ organizationId: "org-init", deviceName: "Init Mac" });
+
+    const cfg = m.getConfig();
+    expect(cfg).not.toBeNull();
+    expect(cfg?.organizationId).toBe("org-init");
+    expect(cfg?.deviceName).toBe("Init Mac");
+    // 默认字段
+    expect(cfg?.deviceId).toBeTruthy();
+    expect(cfg?.deviceId.startsWith("device-")).toBe(true);
+    expect(cfg?.syncInterval).toBe(3600);
+    expect(cfg?.deviceStatus).toBe("active");
+    expect(cfg?.enabled).toBe(false);
+    expect(cfg?.restrictions.allowUserCreate).toBe(true);
+  });
+
+  test("lockMessage 不被静默丢弃（旧实现下丢失管理员的锁定说明）", async () => {
+    const m = new MDMManager();
+    m.setConfigForTest(config({}, { lockMessage: "请在 17:00 前更新" }));
+
+    // 重新 configure（模拟一次普通的 syncWithServer 后会走的路径）
+    await m.configure({ deviceName: "Renamed" });
+
+    expect(m.getConfig()?.lockMessage).toBe("请在 17:00 前更新");
+    expect(m.getConfig()?.deviceName).toBe("Renamed");
+  });
+
+  test("lastSyncError 不被静默丢弃（旧实现下同步失败原因再也查不到）", async () => {
+    const m = new MDMManager();
+    m.setConfigForTest(config({}, { lastSyncError: "组织证书已过期" }));
+
+    await m.configure({ version: "2.1.0" });
+
+    expect(m.getConfig()?.lastSyncError).toBe("组织证书已过期");
+    expect(m.getConfig()?.version).toBe("2.1.0");
+  });
+
+  test("显式传 undefined 会保留旧值（`??` 语义）", async () => {
+    const m = new MDMManager();
+    m.setConfigForTest(config({}, { deviceName: "Original", apiKey: "secret-key" }));
+
+    // 即使传入 undefined，字段不应该被覆盖为空
+    await m.configure({ deviceName: undefined });
+
+    expect(m.getConfig()?.deviceName).toBe("Original");
+    expect(m.getConfig()?.apiKey).toBe("secret-key");
+  });
+
+  test("显式传空字符串会覆盖（不算 nullish）", async () => {
+    const m = new MDMManager();
+    m.setConfigForTest(config({}, { deviceName: "Original" }));
+
+    await m.configure({ deviceName: "" });
+
+    expect(m.getConfig()?.deviceName).toBe("");
+  });
+
+  test("policies / restrictions / enforcedShortcuts 全集合替换", async () => {
+    const m = new MDMManager();
+    m.setConfigForTest(config({}, { enforcedShortcuts: ["old-a", "old-b"] }));
+
+    const newPolicies: MDMPolicy[] = [
+      {
+        id: "p-1",
+        type: "feature_disable",
+        name: "禁用脚本",
+        description: "",
+        config: {},
+        enabled: true,
+        priority: 10,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ];
+    await m.configure({ policies: newPolicies, enforcedShortcuts: ["new-x"] });
+
+    expect(m.getConfig()?.policies.length).toBe(1);
+    expect(m.getConfig()?.policies[0]?.id).toBe("p-1");
+    expect(m.getConfig()?.enforcedShortcuts).toEqual(["new-x"]);
+  });
+
+  test("configure 后必须落盘（防止'已配置'的假象，重启后字段清零）", async () => {
+    const m = new MDMManager();
+    m.clearConfigForTest();
+
+    await m.configure({ organizationId: "org-persist", deviceName: "Persist Mac" });
+
+    // 重启 → 新实例应能从存储中读回这两个字段
+    const booted = new MDMManager();
+    await booted.initialize();
+    booted.stopAutoSync();
+
+    expect(booted.getConfig()?.organizationId).toBe("org-persist");
+    expect(booted.getConfig()?.deviceName).toBe("Persist Mac");
   });
 });
 

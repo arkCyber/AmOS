@@ -9,7 +9,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import type { Space } from "../spaces";
+import { fileableWindows, type Space } from "../spaces";
 
 describe("Spaces API - 类型定义", () => {
   test("Space 接口结构完整", () => {
@@ -142,13 +142,14 @@ describe("Spaces API - 桥接契约(REQ-A296)", () => {
   });
 
   test("mutation 调用(switchSpace / deleteSpace / renameSpace)用 boolean 而不是 reject", async () => {
-    const { switchSpace, deleteSpace, renameSpace, moveWindowToSpace } = await import("../spaces");
+    const { switchSpace, deleteSpace, renameSpace, moveWindowToSpace, unfileWindow } = await import("../spaces");
     // 返回类型是 boolean(成功/失败),不是 throw — 这是 REQ-A296 把错误推回 data 后的副作用
     expect(await switchSpace(0) === true || await switchSpace(0) === false).toBe(true);
     expect(await deleteSpace("space-0") === true || await deleteSpace("space-0") === false).toBe(true);
     expect(await renameSpace("space-0", "x") === true || await renameSpace("space-0", "x") === false).toBe(true);
     expect(await moveWindowToSpace("settings", "space-0") === true ||
            await moveWindowToSpace("settings", "space-0") === false).toBe(true);
+    expect(await unfileWindow("settings") === true || await unfileWindow("settings") === false).toBe(true);
     // 关键:不会抛
     let threw = false;
     try {
@@ -159,3 +160,49 @@ describe("Spaces API - 桥接契约(REQ-A296)", () => {
     expect(threw).toBe(false);
   });
 });
+
+/**
+ * REQ-A449 — which windows a desktop may own. The rule lives here (not in the panel) so it is
+ * pinned without a renderer; each exclusion is a decision the panel would otherwise have to
+ * explain to the user.
+ */
+describe("fileableWindows - 可归档的窗口", () => {
+  const win = (label: string, kind: string, external = false) => ({
+    id: 1,
+    label,
+    kind,
+    state: "Shown",
+    focused: false,
+    external,
+  });
+
+  test("只保留 App 窗口", () => {
+    const out = fileableWindows({
+      focused: null,
+      windows: [
+        win("main", "Launcher"),
+        win("files", "App"),
+        win("notification-center", "System"),
+        win("legacy:7", "App", true),
+      ],
+    });
+    expect(out.map((w) => w.label)).toEqual(["files"]);
+  });
+
+  test("Launcher 永不出现在列表里（切换桌面不会隐藏它，所以归档它是谎）", () => {
+    const out = fileableWindows({ focused: null, windows: [win("main", "Launcher")] });
+    expect(out).toEqual([]);
+  });
+
+  test("external 合成面不可归档（没有我们的 WebviewWindow 可隐藏）", () => {
+    const out = fileableWindows({ focused: null, windows: [win("legacy:3", "App", true)] });
+    expect(out).toEqual([]);
+  });
+
+  test("空快照返回空数组，且不修改入参", () => {
+    const snapshot = { focused: null, windows: [] as ReturnType<typeof win>[] };
+    expect(fileableWindows(snapshot)).toEqual([]);
+    expect(snapshot.windows).toEqual([]);
+  });
+});
+

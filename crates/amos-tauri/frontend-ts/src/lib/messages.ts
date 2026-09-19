@@ -1,6 +1,7 @@
 // "yesterday" is a *calendar* day, not 24 hours: across a DST night a fixed 24h subtraction
 // lands two days back and the label lies. `addLocalDays` is the one DST-safe stepper.
 import { addLocalDays } from "./time";
+import { localId } from "./localId";
 export interface Msg {
   from: "me" | "them";
   text: string;
@@ -142,28 +143,49 @@ export function findConversation(convs: readonly Conversation[], id: string): Co
   return convs.find((c) => c.id === id) ?? null;
 }
 
-/** Corruption / back-compat guard for the stored conversation list. */
+/**
+ * Corruption / back-compat guard for the stored conversation list.
+ *
+ * REQ-A402: this used to hand out `c:${name}` to every row without an id **and never
+ * check for repeats** — so a stored list with two id-less rows of the same name produced
+ * two conversations sharing ONE id (measured: `ids=["c:小安","c:小安"]`), and
+ * `removeConversation(id)` then deleted **both** while a message append could land in the
+ * wrong thread. Its sibling kernels (`normalizeEvents`/`normalizeReminders`/`normalizeNotes`)
+ * all de-duplicate with `baseId` + a counter; this one now does the same.
+ */
 export function normalizeConversations(v: unknown): Conversation[] {
   if (!Array.isArray(v)) return [];
   const out: Conversation[] = [];
+  const seen = new Set<string>();
   for (const raw of v) {
     if (!raw || typeof raw !== "object") continue;
     const o = raw as Record<string, unknown>;
     const name = typeof o.name === "string" ? o.name.trim() : "";
     if (!name) continue;
-    const id = typeof o.id === "string" && o.id ? o.id : `c:${name}`;
+    const baseId = typeof o.id === "string" && o.id ? o.id : `c:${name}`;
+    let id = baseId;
+    let k = 1;
+    while (seen.has(id)) id = `${baseId}-${k++}`; // de-dup collisions on the same base
+    seen.add(id);
     out.push({ id, name, msgs: normalizeMessages(o.msgs) });
   }
   return out;
 }
 
-/** Add a conversation for `name` (blank/duplicate → unchanged). Returns a new list. */
-export function addConversation(convs: Conversation[], name: string, now: number): Conversation[] {
+/**
+ * Add a conversation for `name` (blank/duplicate → unchanged). Returns a new list.
+ *
+ * REQ-A402: the id was `c:${name}-${now}` — the *name* plus a millisecond, i.e. no
+ * entropy and no per-store uniqueness: two contexts minting the same name in the same
+ * millisecond produced the same id (and `normalizeConversations` kept both). It is now the
+ * shared `localId`.
+ */
+export function addConversation(convs: Conversation[], name: string): Conversation[] {
   const n = name.trim();
   if (!n) return convs;
   const dup = convs.some((c) => c.name.toLowerCase() === n.toLowerCase());
   if (dup) return convs;
-  return [...convs, { id: `c:${n}-${now}`, name: n, msgs: [] }];
+  return [...convs, { id: localId("chat"), name: n, msgs: [] }];
 }
 
 /** Remove the conversation with `id` (absent → unchanged). Returns a new list. */

@@ -267,9 +267,47 @@ export function statementEnd(body, from) {
 }
 
 /**
+ * The contents of every `{…}` group in `expr` — a closure/block initializer's body.
+ *
+ * String literals are skipped so a brace *inside* a signature string
+ * (`"(Ljava/lang/String;Ljava/lang/String;)Z"`) is not read as a block.
+ */
+export function blockBodies(expr) {
+  const out = [];
+  let i = 0;
+  while (i < expr.length) {
+    if (expr[i] === '"') {
+      i += 1;
+      while (i < expr.length && expr[i] !== '"') i += expr[i] === "\\" ? 2 : 1;
+      i += 1;
+      continue;
+    }
+    if (expr[i] === "{") {
+      const close = matchDelim(expr, i, "{", "}");
+      if (close < 0) break;
+      out.push(expr.slice(i + 1, close));
+      i = close + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+/**
  * `let` bindings of a fn body: the bound name and its initializer expression. `Some(x)` /
  * `Ok(x)` / `Err(x)` patterns are unwrapped (`amos-radio`'s
  * `let Some(class) = self.tethering.as_ref() else { … };`).
+ *
+ * A binding **inside** a block/closure initializer is a binding too, and this is where the
+ * BLE commands put theirs:
+ * `let _ = android_jni::with_context(|_ctx, env| { … let sig = "(…)Z"; … });`. The flat
+ * statement walk used to jump from the outer `let` straight to its `;`, so every `let sig`
+ * / `let init_sig` inside those closures was invisible: `signatureOf` answered
+ * "unresolved" and the descriptor of 8 call sites went **unchecked** — the gate printed that
+ * only under `--json`, so an unreadable signature was indistinguishable from a green one.
+ * REQ-A413 descends into the block, which immediately exposed a real arity mismatch on the
+ * BLE unsubscribe path (the defect the descriptor would have caught three rounds earlier).
  */
 export function rustBindings(body) {
   const out = [];
@@ -280,7 +318,9 @@ export function rustBindings(body) {
     if (eq < 0) continue;
     const semi = statementEnd(body, eq);
     if (semi < 0) continue;
-    out.push({ name: m[1], expr: body.slice(eq + 1, semi) });
+    const expr = body.slice(eq + 1, semi);
+    out.push({ name: m[1], expr });
+    for (const inner of blockBodies(expr)) out.push(...rustBindings(inner));
     re.lastIndex = semi;
   }
   return out;
@@ -1482,6 +1522,68 @@ export function runSelftest() {
     "a literal signature is read directly",
     signatureOf({ signature: '"()Z"', fn: null }, "").value === "()Z",
   );
+
+  // 11b. a binding *inside a closure initializer* is a binding (REQ-A413): the BLE commands
+  // build their descriptor as `let sig = "…"` inside `with_context(|_env| { … })`, and the
+  // flat statement walk used to jump from the outer `let` straight to its `;`, leaving every
+  // one of those descriptors unread — and therefore unchecked.
+  const nested = {
+    signature: "sig",
+    fn: {
+      name: "ble_read",
+      params: "",
+      body: [
+        "let _ = with_context(|_ctx, env| {",
+        "    let svc = env.new_string(&service_uuid)?;",
+        `    let sig = "(Ljava/lang/String;Ljava/lang/String;)Z";`,
+        `    env.call_static_method(C, "readCharacteristic", sig, &args)`,
+        "});",
+      ].join("\n"),
+    },
+  };
+  ok(
+    "a signature bound inside a closure is read (the shape no gate could see)",
+    signatureOf(nested, "").value === "(Ljava/lang/String;Ljava/lang/String;)Z" &&
+      signatureOf(nested, "").how.includes("binding"),
+  );
+  ok(
+    "blockBodies does not read a brace inside a signature string",
+    blockBodies(`f(|e| { let s = "(Ljava/lang/String;Z)Z"; })`).length === 1,
+  );
+  ok(
+    "bindings are still read in the flat shape",
+    rustBindings(`let a = 1;\nlet b = "x";`).map((b) => b.name).join(",") === "a,b",
+  );
+  const nestedGlue = new Map([
+    [
+      "BluetoothGattGlue",
+      {
+        file: "BluetoothGattGlue.kt",
+        members: kotlinMembers(
+          "object BluetoothGattGlue {\n    @JvmStatic\n    fun setCharacteristicNotification(serviceUuid: String, characteristicUuid: String, enable: Boolean): Boolean = true\n}",
+        ),
+      },
+    ],
+  ]);
+  const nestedCall = checkStaticCalls(
+    [
+      `const C: &str = "com/amos/ai/glue/BluetoothGattGlue";`,
+      "fn unsubscribe() {",
+      "    let _ = with_context(|_ctx, env| {",
+      `        let sig = "(Ljava/lang/String;Z)Z";`,
+      `        env.call_static_method(C, "setCharacteristicNotification", sig, &args)`,
+      "    });",
+      "}",
+    ].join("\n"),
+    "ble.rs",
+    nestedGlue,
+  );
+  ok(
+    "the BLE unsubscribe defect is now a finding, not an unreadable report",
+    nestedCall.findings.some((f) => f.kind === "signature-mismatch") &&
+      !nestedCall.reports.some((r) => r.kind === "signature-unreadable"),
+  );
+
 
   const typeGlue = new Map([
     [

@@ -7,6 +7,7 @@
  * "Smart views" mirror iOS: 全部 / 今天 / 计划 / 旗标 / 已完成. Custom lists are
  * ordinary colour-coded folders; reminders always belong to exactly one list.
  */
+import { localId } from "./localId";
 
 export type Priority = 0 | 1 | 2 | 3; // none | low | medium | high
 
@@ -59,12 +60,16 @@ export const DAY_MS = 86_400_000;
 
 export const PRIORITIES: readonly Priority[] = [0, 1, 2, 3];
 
-// Process-local monotonic counter so ids stay unique even for two reminders
-// created in the same millisecond (deterministic within a process for tests).
-let seq = 0;
-export function makeId(now: number): string {
-  seq += 1;
-  return `${now.toString(36)}-${seq}`;
+/**
+ * A new reminder (or custom-list) id.
+ *
+ * REQ-A402: was `${now.toString(36)}-${seq}` with a **per-process** counter — no entropy,
+ * so two contexts agreeing on a millisecond mint the same string (measured: two processes
+ * with a frozen clock both produced `loyw3v28-1`). The per-process counter is not a
+ * per-store guarantee, and this shell runs several windows over one store.
+ */
+export function makeId(): string {
+  return localId("rem");
 }
 
 /* ---- date helpers (local time, ms-based so they are trivial to fake) ---- */
@@ -194,7 +199,7 @@ export function seedReminders(now: number): Reminder[] {
     { title: "阅读一篇论文", listId: DEFAULT_LIST_ID, priority: 0, flagged: false, createdAt: now + 4 },
     { title: "买牛奶", listId: "life", priority: 1, flagged: false, createdAt: now - DAY_MS, completed: true, completedAt: now - 3_600_000 },
   ];
-  return base.map((r) => ({ ...r, id: makeId(now) }));
+  return base.map((r) => ({ ...r, id: makeId() }));
 }
 
 /* ---- CRUD (immutable array helpers) ---- */
@@ -209,7 +214,7 @@ function patchById(list: Reminder[], id: string, fn: (r: Reminder) => Reminder):
 export function addReminder(list: Reminder[], draft: Omit<Reminder, "id" | "createdAt" | "completed" | "completedAt">, now: number): Reminder[] {
   const title = draft.title.trim();
   if (!title) return list;
-  const r: Reminder = { ...draft, title, id: makeId(now), createdAt: now };
+  const r: Reminder = { ...draft, title, id: makeId(), createdAt: now };
   return [...list, r];
 }
 
@@ -235,7 +240,7 @@ export function removeReminder(list: Reminder[], id: string): Reminder[] {
 export function addList(lists: ReminderList[], draft: { name: string; color: ColorName }, now: number): ReminderList[] {
   const name = draft.name.trim();
   if (!name) return lists;
-  return [...lists, { id: makeId(now), custom: true, name, color: draft.color, createdAt: now }];
+  return [...lists, { id: makeId(), custom: true, name, color: draft.color, createdAt: now }];
 }
 export function removeList(lists: ReminderList[], id: string): ReminderList[] {
   return lists.filter((l) => l.id !== id);

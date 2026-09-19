@@ -8,12 +8,20 @@
    * and named with the reason.
    */
   import { bridgeDiag, invoke } from "../../lib/backend";
+  import { getContext } from "svelte";
+  import {
+    SHELL_CHROME_API,
+    type ShellChromeApi,
+    type ShellWindowAction,
+  } from "../../lib/shellModule";
   // 表派生的键帽（REQ-A342）：菜单不再自持一份"快捷键字符串"，行里的 `shortcut` 要么来自
   // 这张表（壳真正绑定的键），要么是平台自己的编辑键（⌘C/⌘V/⌘A）——后者不可改、也不可翻译。
   import { desktopShortcutLabel } from "../../lib/desktopKeys";
   import { clipboardRead, clipboardWrite } from "../../lib/clipboard";
   import { t } from "../locale.svelte";
   import { toggleDesktopView } from "../../lib/desktopView";
+  import { installMenuKeyboard } from "../../lib/menuKeys";
+  import { selectAllFromMenu } from "../../lib/editKeys";
   import {
     CHROME_MENU_BUTTON,
     CHROME_MENU_ITEM,
@@ -97,6 +105,23 @@
     if (result === null) noteFailure(command, label, context);
   }
 
+  /**
+   * The shell's handle (REQ-A457), or `undefined` when the bar is mounted standalone (a test,
+   * a story): the two window rows below then do nothing — "there is no window to act on" is the
+   * honest outcome, not a guess, and it is what a bar with no shell can actually know.
+   */
+  const api = getContext<ShellChromeApi | undefined>(SHELL_CHROME_API);
+
+  /**
+   * Ask the shell to act on the **focused app window**. The bar does not resolve the window
+   * itself: "which window is focused" lives in the shell (one poll, one owner), and a second
+   * copy here is how the two surfaces started disagreeing in the first place (the rows below
+   * still said *unavailable* long after the native menu and the host command were live).
+   */
+  function windowAction(action: ShellWindowAction): void {
+    api?.windowAction(action);
+  }
+
   // ─── File ────────────────────────────────────────────────────────────────────
   const fileRows: MenuRow[] = [
     {
@@ -169,10 +194,12 @@
       id: "edit.select-all",
       labelKey: "desktop.menu.edit.selectAll",
       shortcut: "⌘A",
+      // This row used to dispatch a synthetic `KeyboardEvent("keydown", {key:"a", metaKey:true})`
+      // — which selects nothing, because no consumer exists and a synthetic event has no default
+      // action (measured 2026-09-19; the OS does not deliver ⌘A to the WebView at all, REQ-A439).
+      // It now performs the gesture through the same rule the shell's key path uses.
       run: () => {
-        window.dispatchEvent(
-          new KeyboardEvent("keydown", { key: "a", metaKey: true }),
-        );
+        selectAllFromMenu();
       },
     },
     { id: "edit.undo", labelKey: "desktop.menu.edit.undoUnavailable" },
@@ -201,7 +228,7 @@
         toggleDesktopView("stageWidgets");
       },
     },
-    { id: "view.fullscreen", labelKey: "desktop.menu.view.toggleUnavailable" },
+    { id: "view.fullscreen", labelKey: "desktop.menu.view.enterFullScreen", run: () => windowAction("full-screen") },
   ];
 
   // ─── Window ──────────────────────────────────────────────────────────────────
@@ -217,7 +244,7 @@
         void wmRun("wm_hide", "", "window.minimize");
       },
     },
-    { id: "window.zoom", labelKey: "desktop.menu.window.zoomUnavailable" },
+    { id: "window.zoom", labelKey: "desktop.menu.window.zoom", run: () => windowAction("zoom") },
     {
       id: "window.bring-all",
       labelKey: "desktop.menu.window.bringAllToFrontUnavailable",
@@ -240,6 +267,15 @@
 
   let openId = $state<MenuGroup["id"] | null>(null);
   let wrapEl = $state<HTMLElement | null>(null);
+  /** The open panel (`{#if openId === …}` means at most one exists), for REQ-A436's keys. */
+  let panelEl = $state<HTMLElement | null>(null);
+
+  // REQ-A436: the bar's menus are keyboard usable — the shared layer walks the rows with the
+  // arrows / Home / End and hands Escape to *this* menu's closer.
+  $effect(() => {
+    if (!panelEl || !openId) return;
+    return installMenuKeyboard(panelEl, { onClose: () => (openId = null) });
+  });
 
   async function choose(row: MenuRow) {
     if (!row.run) return;
@@ -295,6 +331,7 @@
         <div
           class="absolute left-0 top-full z-50 mt-1 {CHROME_MENU_PANEL}"
           style={CHROME_MENU_PANEL_STYLE}
+          bind:this={panelEl}
           role="menu"
           aria-label={t(group.titleKey)}
           data-testid="menu-{group.id}-panel"

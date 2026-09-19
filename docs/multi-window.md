@@ -111,6 +111,14 @@ panic）：`crates/amos-wm/src/form.rs`。
 - `home()` → 聚焦 Launcher
 - Launcher 不可 hide/close
 
+**平台还有一个我们没有的状态（REQ-A441，2026-09-19 实测）**：macOS 的黄灯（`miniaturize:`）与 AppKit 自己的 ⌘M 会把窗口放进 Dock —— 那是**平台**的状态，模型里没有第三个值（这是有意的：多一个状态就要多一套语义）。实测过的后果与处置：
+
+| 事实 | 处置 |
+|---|---|
+| 黄灯后 `AXMinimized=true`，而模型仍说 `Shown` | **不改模型**：模型如实描述"窗口存在且未被隐藏" ✓ |
+| 黄灯后按 ⌘N ⇒ `AXMinimized` **仍是 true**（`wm_open` 只发 focus 事件，`set_focus()`/`show()` 都不还原最小化窗口）⇒ AmOS 自己的 Dock 图标与 ⌘N 都失效 | 适配层新增 `WmState::reveal_window()`：先问 `is_minimized()`，是则 `unminimize()` 再 show/focus；接在 `WmEvent::Shown` 与 `WmEvent::FocusChanged` 两处（⌘N 走后者），并置于 REQ-A435 的"页面未加载不夺键"判定之前——**可见性与键盘焦点是两件事** |
+| `wm_windows` 不报告"被平台最小化" ⇒ Dock 右键菜单的 `隐藏/显示` 不区分（macOS 对最小化窗口显示"显示"） | **登记为边界**，不造状态：两行都可用（`显示` 会经上面那条路径还原 ✓），影响薄 |
+
 `amos-tauri` 接入示例（后续落地）：
 ```rust
 // 适配层：WmEvent -> 真实窗口

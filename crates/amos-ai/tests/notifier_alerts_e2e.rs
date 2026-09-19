@@ -24,7 +24,7 @@
 use std::sync::Mutex;
 
 use amos_ai::alerts::{ActiveAlert, AlertTracker, Observations, Severity};
-use amos_ai::notifier_bridge::{Alert, AlertBridge, AlertSink, severity_to_p_level};
+use amos_ai::notifier_bridge::{severity_to_p_level, Alert, AlertBridge, AlertSink};
 
 #[derive(Default, Debug)]
 struct Capture {
@@ -166,7 +166,10 @@ fn multiple_independent_breaches_each_page_once() {
     assert_eq!(log.len(), 2, "two distinct ids = two P0 pages");
     let mut ids: Vec<&str> = log.iter().map(|a| a.id.as_str()).collect();
     ids.sort_unstable();
-    assert_eq!(ids, vec!["amos-ai.breaker_open", "amos-ai.log_trail_incomplete"]);
+    assert_eq!(
+        ids,
+        vec!["amos-ai.breaker_open", "amos-ai.log_trail_incomplete"]
+    );
     for a in log.iter() {
         assert_eq!(severity_to_p_level(a.severity), "P0");
     }
@@ -183,8 +186,8 @@ fn mixed_severity_breaches_each_go_to_their_own_p_level() {
         &mut tracker,
         &mut bridge,
         &Observations {
-            breaker_state: Some("open".into()),         // Error → P0
-            degraded: true,                            // Warn → P1
+            breaker_state: Some("open".into()), // Error → P0
+            degraded: true,                     // Warn → P1
             ..Default::default()
         },
     );

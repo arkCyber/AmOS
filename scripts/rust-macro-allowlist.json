@@ -1,0 +1,30 @@
+{
+  "policy": "Every `macro_rules!` in production Rust (`crates/<crate>/src/**`) must be listed here with a `why` that names the constraint forcing a macro instead of a function/trait/generic (Power of 10 rule #10, enforced by scripts/rust-macro-scan.mjs). There is deliberately no writer flag: adding an exemption is a decision a human writes down. Test code (`crates/<crate>/tests/**`) is out of scope.",
+  "captured": "2026-09-19 (REQ-A442: docs/POWER_OF_10.md rule #10 claimed 「0 处生产代码」 while four definitions existed — the four below are the measured set, each already documented at its definition)",
+  "entries": [
+    {
+      "crate": "amos-jni",
+      "name": "jni_call",
+      "file": "crates/amos-jni/src/lib.rs",
+      "why": "The `jni` wrappers take `&mut self`, so the call must be expanded as its own statement to release that borrow before the shared-borrow exception check (`ClearAfterFailure::clear_after`) — a function taking both `&mut env` and the call cannot express that borrow order."
+    },
+    {
+      "crate": "amos-link",
+      "name": "forward_samples",
+      "file": "crates/amos-link/src/zenoh.rs",
+      "why": "Zenoh's handler types (`FifoChannelHandler`, `RingChannelHandler`, …) share no trait exposing `recv_async`, yet the forwarding loop is identical for all of them; a generic function would need a trait the dependency does not provide."
+    },
+    {
+      "crate": "amos-link",
+      "name": "forward_latest",
+      "file": "crates/amos-link/src/zenoh.rs",
+      "why": "Same constraint as `forward_samples` (no shared handler trait), with the one-slot latest-only store as the target; keeping both as macros is what lets the two profiles stay one loop shape."
+    },
+    {
+      "crate": "amos-radio",
+      "name": "jni",
+      "file": "crates/amos-radio/src/android.rs",
+      "why": "Same `&mut self` borrow-split as `amos-jni::jni_call`, plus a crate-local error mapping (`jerr`): every JNI call in the module must turn a refusal into a returned error, and the borrow order cannot be expressed by a function signature."
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "_comment": "scripts/unreached-source-scan.mjs: a file under crates/<crate>/src that the compiler never reads. Each entry is a **decision** (an asset the crate really embeds, or a deliberate draft kept out of the build), which is the one thing a reader cannot re-derive from the tree — so the reason lives here, next to the entry. A reason is required, and an entry whose path is no longer reported fails as stale (a suppression that outlives its cause hides the next regression).",
+  "entries": [
+    {
+      "path": "crates/amos-media/src/protocol.rs",
+      "reason": "A deliberate draft, and the decision is already written down in `crates/amos-media/src/lib.rs` (§'protocol.rs exists in this tree as a **draft** for REQ-A302'): the module is *not* declared (`pub mod protocol;` is commented out on purpose) because its API surface is half-finished — it calls `range::UnknownPlan` / `MediaManager::read_range`, which `range.rs` and `manager.rs` do not export yet. It stays in `src/` so the design notes next to the code survive until the settled version lands. Recorded here rather than deleted: the file is a decision, and this entry is what makes the decision visible to the gate (REQ-A459)."
+    }
+  ]
+}

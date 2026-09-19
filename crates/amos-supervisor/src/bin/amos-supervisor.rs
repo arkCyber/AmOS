@@ -97,7 +97,36 @@ async fn main() -> ExitCode {
     #[cfg(not(feature = "timesync"))]
     let _timekeeper = ();
 
-    let sup = Supervisor::new();
+    // Arm the alert path (REQ-A444). `Supervisor::with_alert_sink` is the **only** thing that
+    // installs a sink, and until this round nothing in the tree called it: `rust-unwired-scan`
+    // reported it as "referenced nowhere", the field stayed `None` in every build, and a daemon
+    // that exhausted its restart budget produced a P0 alert object that nobody could ever
+    // receive — while `alert_sink.rs`'s module docs claimed the notifier build "wires this in".
+    // The dispatcher's stderr fallback is enabled, so an unconfigured box still gets one
+    // structured line per alert (the notifier's own "we never silently drop a P0" guarantee):
+    // arming the sink can only make the supervisor louder, never quieter.
+    #[cfg(feature = "notifier")]
+    let sup = {
+        let dispatcher = amos_notifier::Dispatcher::builder()
+            .with_stderr_fallback(true)
+            .build();
+        Supervisor::new().with_alert_sink(amos_supervisor::shared(
+            amos_supervisor::NotifierSink::new(dispatcher),
+        ))
+    };
+    // Without the feature there is no sink type to install, so a crash or an exhausted restart
+    // budget is logged but never notified. Say that out loud: an unarmed supervisor and an armed
+    // one must not look identical (DO-178C §5.4.1 — the requirement `alert_sink.rs` cites).
+    #[cfg(not(feature = "notifier"))]
+    let sup = {
+        eprintln!(
+            "daemon alerts: NOT wired — this build has no `notifier` feature, so a daemon that \
+             crashes or exhausts its restart budget is logged but not notified \
+             (rebuild with `--features notifier`)"
+        );
+        Supervisor::new()
+    };
+
     let results = start_all(&sup, &config).await;
     let mut any_failed = false;
     for (name, r) in results {

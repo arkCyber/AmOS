@@ -30,7 +30,8 @@
   } from "../lib/mediaExport";
   import type { Capability } from "../lib/permissions";
   import { grantCapability } from "./osPermissions";
-  import { PHOTOS_KEY, newPhoto, newCapturePhoto, type Photo } from "../lib/photos";
+  import { PHOTOS_KEY, newPhotoForCapture, newCapturePhoto, type Photo } from "../lib/photos";
+  import { localId } from "../lib/localId";
   import {
     ZOOM_STEPS,
     ZOOM_MIN,
@@ -64,10 +65,6 @@
   import { openPhoto } from "./appLinks";
   import { amosWarn } from "../lib/debugLog";
 
-  // Monotonic counter: burst / rapid captures get unique ids even if two frames
-  // land in the same millisecond (photo ids are timestamp-based).
-  let shotSeq = 0;
-
   /** Read the most recent real captured photo (thumbnail chip). */
   function latestPhoto(list: Photo[]): Photo | undefined {
     for (const p of list) if (p.data) return p;
@@ -76,8 +73,10 @@
 
   // Default-allowed camera: there is no in-app permission gate or confirmation
   // screen — always granted so the app opens straight into the live viewfinder.
-  // Goes through the capability seam so the *daemon* (authoritative, audited) is
-  // told too, not just the local ledger.
+  // The boot-time seed (`svelte/osCapabilities.ts`) writes the ledger once; that
+  // path also mirrors to the daemon so the audit trail agrees with what the UI
+  // shows. This top-level `grantCapability` is a defensive re-seed for a
+  // pre-default-on build / a store-installed variant where boot may have raced.
   const APP_ID = "camera";
   const CAMERA_CAP: Capability = "camera";
   grantCapability(APP_ID, CAMERA_CAP);
@@ -360,7 +359,11 @@
   function doCapture(): void {
     const list = readStoreValue<Photo[]>(PHOTOS_KEY, []);
     const now = Date.now();
-    const cid = `c${now}-${shotSeq++}`; // unique even for same-ms burst frames
+    // REQ-A402: the shot's id comes from `localId`. It used to be `c${now}-${shotSeq++}` —
+    // a wall-clock reading plus a **per-process** counter, i.e. no entropy at all: two
+    // contexts (this shell runs several windows over one store) that agree on a millisecond
+    // mint the same string, and the album renders keyed `{#each … (p.id)}`.
+    const cid = localId("shot");
     const video = videoEl;
     let photo: Photo;
     if (live && video && typeof document !== "undefined" && video.videoWidth > 0) {
@@ -385,13 +388,13 @@
           if (mirrorPreview(facing)) ctx.restore();
           photo = newCapturePhoto(cid, now, cv.toDataURL("image/jpeg", 0.82));
         } else {
-          photo = newPhoto(cid, now);
+          photo = newPhotoForCapture(cid, now);
         }
       } catch {
-        photo = newPhoto(cid, now);
+        photo = newPhotoForCapture(cid, now);
       }
     } else {
-      photo = newPhoto(cid, now);
+      photo = newPhotoForCapture(cid, now);
     }
     // The claim follows the write: "已保存到相册" for a photo the store rejected would
     // be data loss the user never notices until the album is empty.

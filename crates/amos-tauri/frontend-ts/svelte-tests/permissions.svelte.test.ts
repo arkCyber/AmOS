@@ -11,6 +11,13 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import PermissionsApp from "../src/svelte/PermissionsApp.svelte";
 import { readStoreValue, writeStoreValue } from "../src/lib/amosStore";
 import { PERMISSIONS_KEY } from "../src/lib/permissions";
+// The **oracles** the assertions below read, so the test holds no copy of the UI's
+// tables: the app names come from `lib/appMeta`, the strings from the zh dictionary,
+// and the default-on matrix from `osCapabilities` itself.
+import { appTitleKey } from "../src/lib/appMeta";
+import { zh } from "../src/i18n/locales/zh";
+import { translate } from "../src/svelte/i18n";
+import { DEFAULT_ON_CAPABILITIES, defaultAppsFor } from "../src/svelte/osCapabilities";
 
 function candidates(h: { container: HTMLElement }): HTMLButtonElement[] {
   return [...h.container.querySelectorAll("button[aria-pressed]")];
@@ -69,6 +76,81 @@ describe("PermissionsApp.svelte (offline ledger)", () => {
   test("no app holds anything → the app-centric section is absent", () => {
     const host = render(PermissionsApp);
     expect(host.container.querySelector('[data-testid="perm-by-app"]')).toBeNull();
+  });
+});
+
+/**
+ * The **default-on** apps (REQ-A380: `svelte/osCapabilities.ts` seeds Camera and
+ * Voice Memos' microphone on the first boot) must be offerable in the capability
+ * row that grants them.
+ *
+ * The defect this pins: `CANDIDATES` in `PermissionsApp.svelte` is a hand-written
+ * showcase list, and it did not mention `vmemos` — so the app the OS *itself*
+ * grants the microphone to was missing from the microphone row. The user could
+ * revoke it (it appears as a granted holder) and then had **no way back on** in
+ * that session: the holder chip disappears with the grant and the row that turns
+ * a capability back on never listed it. `osCapabilities.defaultAppsFor` is the one
+ * function that knows the matrix, and it had no production caller at all.
+ */
+describe("PermissionsApp.svelte (default-on apps stay reachable)", () => {
+  afterEach(() => {
+    cleanup();
+    window.localStorage.clear();
+  });
+
+  /** The per-capability section whose header names `label` (e.g. 麦克风). */
+  function capSection(h: { container: HTMLElement }, label: string): HTMLElement | undefined {
+    return [...h.container.querySelectorAll("section")].find((s) =>
+      (s.querySelector("h3")?.textContent ?? "").includes(label),
+    );
+  }
+  /** The candidate buttons (the row that grants) of one capability section. */
+  function rowButtons(section: HTMLElement | undefined): HTMLButtonElement[] {
+    return [...(section?.querySelectorAll("button[aria-pressed]") ?? [])] as HTMLButtonElement[];
+  }
+
+  test("every default-on (app, capability) pair is offered in its row — the table cannot drift", () => {
+    // Table-driven **from the module**, not from a list copied into the test: a new
+    // default-on entry (a new app, a new capability) that `PermissionsApp` forgets now
+    // fails here instead of shipping a dead end. `vmemos` + microphone was that case.
+    const host = render(PermissionsApp);
+    for (const cap of DEFAULT_ON_CAPABILITIES) {
+      const row = rowButtons(capSection(host, translate(zh, `perm.cap.${cap}`)));
+      expect(row.length, `no candidate row for ${cap}`).toBeGreaterThan(0);
+      for (const app of defaultAppsFor(cap)) {
+        const key = appTitleKey(app);
+        // The localized name from `lib/appMeta` — a raw id (`vmemos`) must fail too.
+        const name = key ? translate(zh as unknown as Record<string, string>, key) : app;
+        const offered = row.some((b) => (b.textContent ?? "").startsWith(name));
+        expect(offered, `${name} is missing from the ${cap} candidate row`).toBe(true);
+      }
+    }
+  });
+
+  test("revoking a default-on grant is reversible in the same session", async () => {
+    const host = render(PermissionsApp);
+    const vmemos = () =>
+      rowButtons(capSection(host, "麦克风")).find((b) =>
+        (b.textContent ?? "").startsWith("语音备忘录"),
+      );
+
+    // Grant it from the row, revoke it through the granted holder chip (the path a
+    // user takes), and then go back through the row — the way back on.
+    await fireEvent.click(vmemos()!);
+    expect(vmemos()!.getAttribute("aria-pressed")).toBe("true");
+
+    const holder = [...host.container.querySelectorAll("button")].find(
+      (b) =>
+        (b.textContent ?? "").startsWith("语音备忘录") && !!b.querySelector('[data-icon="x"]'),
+    );
+    expect(holder, "the granted holder chip should exist").toBeTruthy();
+    await fireEvent.click(holder as HTMLButtonElement);
+    expect(vmemos()!.getAttribute("aria-pressed")).toBe("false");
+
+    await fireEvent.click(vmemos()!);
+    expect(vmemos()!.getAttribute("aria-pressed")).toBe("true");
+    const ledger = readStoreValue<Record<string, string[]>>(PERMISSIONS_KEY, {});
+    expect(ledger.vmemos ?? []).toContain("microphone");
   });
 });
 

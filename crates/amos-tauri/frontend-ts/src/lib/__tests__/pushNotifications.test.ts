@@ -520,8 +520,10 @@ describe("推送通知服务 - 航空航天级审计", () => {
       const id1 = generateNotificationId();
       const id2 = generateNotificationId();
 
-      expect(id1).toMatch(/^push_\d+_[a-z0-9]+$/);
-      expect(id2).toMatch(/^push_\d+_[a-z0-9]+$/);
+      // The prefix is the contract; the tail is opaque (REQ-A401 moved the id to `localId`,
+      // so it no longer reads `push_<decimal-ms>_<random>`).
+      expect(id1).toMatch(/^push-/);
+      expect(id2).toMatch(/^push-/);
       expect(id1).not.toBe(id2);
     });
   });

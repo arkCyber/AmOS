@@ -145,7 +145,13 @@ export async function fetchBundleEntry(mid: string): Promise<BundleEntryResult> 
   }
   const raw = await invoke<unknown>(BUNDLE_ENTRY_COMMAND, { id });
   if (raw === null) {
-    return { kind: "failed", ...bundleFailureFromDiag(bridgeDiag()) };
+    // REQ-A407: 按本文件上面的约定，读**自己那条命令**的槽（导出 `BUNDLE_ENTRY_COMMAND`
+    // 就是为了这个"键不会漂"）。诚实说明：这一处**今天不可能**读到过期的全局槽 ——
+    // `invoke` 在同一个续体里先写自己的结论、只隔一个微任务跳就是这次读，而微任务队列是
+    // FIFO ⇒ 任何更早排队的续体都跑在写之前（审计结论见 CHANGELOG REQ-A407）。所以这是
+    // **契约一致性**（`backend.bridgeDiag` 的文档明确写着"prefer the named form"），不是
+    // 行为修复；它的价值是：将来若在这两行之间插入任何 await，有参形式仍然对。
+    return { kind: "failed", ...bundleFailureFromDiag(bridgeDiag(BUNDLE_ENTRY_COMMAND)) };
   }
   const entry = normalizeBundleEntry(raw);
   if (entry === null) {

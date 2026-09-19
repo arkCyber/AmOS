@@ -27,6 +27,7 @@
   import { capTail } from "../lib/bounded";
   import { parseVoiceEvent } from "../lib/voice";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { localId } from "../lib/localId";
   import { NOTES_KEY, normalizeNotes } from "../lib/notes";
   import { buildCitedSnippet, buildRagPrompt, NOTES_RAG_INDEXED_KEY } from "../lib/notesRag";
   import { askNotes, liveRagClient, syncNotesIndex } from "../lib/notesRagRun";
@@ -99,8 +100,13 @@
   let aborted = false;
   let clearTimer: number | null = null;
 
-  const uid = (tag: string) =>
-    `${tag}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  /**
+   * A message id. Identity, not a label: `{#each msgs … (m.id)}` keys rows by it and
+   * `patchCur` finds the streaming agent bubble by it — a duplicate would make one
+   * stream's tokens land in the wrong bubble. Hence the shared `localId` (REQ-A401),
+   * which is counter-backed; the `tag` (`a` / `u`) is kept as the prefix.
+   */
+  const uid = (tag: string) => localId(tag);
 
   // Append into the in-progress assistant message only.
   const patchCur = (fn: (m: AiMsg) => AiMsg) => {

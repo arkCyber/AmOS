@@ -20,6 +20,7 @@
  */
 
 import { invoke } from "./backend";
+import type { WmWindowInfo, WmWindowsSnapshot } from "./wm";
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -103,6 +104,18 @@ export async function moveWindowToSpace(
   spaceId: string,
 ): Promise<boolean> {
   const result = await invoke<null>("spaces_move_window", { windowLabel, spaceId });
+  return result !== null;
+}
+
+/**
+ * 把一个窗口从**所有**虚拟桌面移出 —— `moveWindowToSpace` 的反向操作（REQ-A450）。
+ *
+ * 未归档的窗口在**每个**桌面都可见：那是每个窗口的初始状态，也是这条命令唯一能到达的状态
+ * （`move_window_to_space` 只能在桌面之间搬，搬不回"谁都没归档"）。
+ * Returns `true` on success, `false` on failure.
+ */
+export async function unfileWindow(windowLabel: string): Promise<boolean> {
+  const result = await invoke<null>("spaces_unfile_window", { windowLabel });
   return result !== null;
 }
 
@@ -218,4 +231,25 @@ export function indexOfCreatedSpace(
   newId: string,
 ): number {
   return refreshed.findIndex((s) => s.id === newId);
+}
+
+/**
+ * The windows a desktop can own, out of a `wm_windows` snapshot (REQ-A449).
+ *
+ * Only `kind === "App"` and not `external`. Each exclusion is a decision, not a filter for
+ * tidiness:
+ *
+ *   1. the **Launcher** *is* the surface the desktops live on — the host's `switch_plan` never
+ *      hides or focuses it, so offering to file it would be a lie the UI then has to explain;
+ *   2. a **System** surface (notification centre, control panel, dialogs) belongs to no desktop
+ *      and follows focus instead;
+ *   3. an `external` composited surface has no `WebviewWindow` of ours, so "hide it" cannot
+ *      resolve to anything.
+ *
+ * Pure and typed against the host's own snapshot ([`WmWindowsSnapshot`]) so a caller cannot pass a
+ * half-shaped object: the import is type-only, so nothing new is pulled in at runtime. Testable
+ * without a bridge, the same way [`newSpaceName`] and [`prevSpaceIndex`] are.
+ */
+export function fileableWindows(snapshot: WmWindowsSnapshot): WmWindowInfo[] {
+  return snapshot.windows.filter((w) => w.kind === "App" && !w.external);
 }

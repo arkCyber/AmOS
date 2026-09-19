@@ -9,7 +9,8 @@
   // 数据：wm_windows → 过滤 App 类、非 Hidden 的窗口；用 label 反查 i18n 显示名。
   //       spaces_list / spaces_active → Spaces 栏显示。
   import { onMount } from "svelte";
-  import { bridgeDiag, invoke } from "../lib/backend";
+  import { invoke } from "../lib/backend";
+  import { wmFocusWithDiag } from "../lib/wm";
   import { appIcon, appTitleKey } from "../lib/appMeta";
   import { shouldShowMissionControl } from "../lib/desktopLayout";
   import { t } from "./locale.svelte";
@@ -102,9 +103,9 @@
   // the launcher log, the panel still closes (the user has chosen —
   // staying on a dead overlay is worse), and the failure is visible.
   async function focusWindow(label: string) {
-    const result = await invoke<unknown>("wm_focus", { label });
-    if (result === null) {
-      const diag = bridgeDiag("wm_focus");
+    const r = await wmFocusWithDiag(label);
+    if (!r.ok) {
+      const diag = r.diag;
       if (!diag.ok) {
         const code =
           diag.kind === "command-failed" &&

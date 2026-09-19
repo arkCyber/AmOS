@@ -218,7 +218,10 @@ mod device {
     /// the exactly-once process-global install.
     fn install(vm: JavaVM, env: &JNIEnv<'_>, glue: JObject<'_>) {
         if let Ok(p) = android_backend(vm, env, glue) {
-            let _ = DEVICE.set(p); // first attach wins (exactly-once)
+            // First attach wins (exactly-once). Safe because the Activity is not recreated under
+            // us — the generated manifest's `configChanges` is what makes that true, and
+            // `scripts/android-glue-mirror.sh` now gates it (REQ-A448).
+            let _ = DEVICE.set(p);
         }
     }
 

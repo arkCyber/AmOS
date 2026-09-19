@@ -55,33 +55,26 @@ describe("LmkDebugPanel.svelte", () => {
   });
 
   /**
-   * A refused reclaim must not be shown as "frozen" (REQ-A299): both carry
-   * `killed: false`, and the panel used to read exactly that boolean — so a kill the
-   * container refused was displayed as a freeze that never happened. The daemon's
-   * observed `outcome` is now what the row reads, and the container's own reason is
-   * shown with it.
+   * The victim row is judged by `killed` **alone**, because that is the only signal the
+   * wire carries (REQ-A399). `proto/android_compat.proto::LmkVictim` =
+   * `{package_name, window_id, killed}` — "true = killed (surface torn down); false =
+   * frozen" — and `amos-android::service::trigger_lmk` sets exactly that, with its own
+   * tests naming the semantics ("low pressure freezes, not kills" → the task stays
+   * `cached`). There is no per-victim `outcome`/`refusal_reason`, so this case feeds the
+   * **real** shape: the previous version injected `outcome: "refused"` + `refusal_reason`
+   * (fields no producer emits), which made the test green against a payload the device
+   * cannot send and left the real freeze path — reported as "unknown" by the old code —
+   * unexercised.
    */
-  test("a refused reclaim reads 'refused' with the container's reason, never 'frozen'", async () => {
+  test("a victim row reads killed/frozen from the wire, never from an absent `outcome`", async () => {
     const invoke = async (cmd: string) => {
       if (cmd === "android_lmk_tasks") return [];
       if (cmd === "android_lmk_debug") {
         return {
           note: "trigger_lmk returned 2 victim(s)",
           victims: [
-            {
-              package_name: "com.example.busy",
-              window_id: "w9",
-              killed: false,
-              outcome: "refused",
-              refusal_reason: "waydroid: `am force-stop` exited 1",
-            },
-            {
-              package_name: "com.example.idle",
-              window_id: "w8",
-              killed: false,
-              outcome: "frozen",
-              refusal_reason: "",
-            },
+            { package_name: "com.example.reclaimed", window_id: "w9", killed: true },
+            { package_name: "com.example.frozen", window_id: "w8", killed: false },
           ],
         };
       }
@@ -107,17 +100,13 @@ describe("LmkDebugPanel.svelte", () => {
         (s.textContent ?? "").includes(pkg),
       )?.textContent ?? "";
 
-    expect(rowText("com.example.busy")).toContain("refused");
-    expect(rowText("com.example.busy")).toContain("am force-stop"); // the container's reason
-    expect(rowText("com.example.busy")).not.toContain("frozen");
-    expect(rowText("com.example.idle")).toContain("frozen");
-
-    // A refusal is a warning colour, not the reclaimed (danger) one.
-    const warned = [...host.container.querySelectorAll("span")].some(
-      (s) => (s.textContent ?? "").includes("refused") && s.className.includes("amber"),
-    );
-    expect(warned).toBe(true);
+    expect(rowText("com.example.reclaimed")).toContain("killed");
+    expect(rowText("com.example.reclaimed")).not.toContain("frozen");
+    // The regression this pins: `killed: false` used to render "unknown".
+    expect(rowText("com.example.frozen")).toContain("frozen");
+    expect(rowText("com.example.frozen")).not.toContain("unknown");
   });
+
 });
 
 describe("startPeriodicReconcile (bridged, fake timers)", () => {

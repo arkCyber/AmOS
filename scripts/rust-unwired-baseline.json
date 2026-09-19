@@ -1,26 +1,126 @@
 {
-  "values": [
-    "crates/amos-ai/src/life_guard.rs::with_path",
-    "crates/amos-android/src/manager.rs::clear_cache",
-    "crates/amos-appstore/src/client.rs::android_bridge",
-    "crates/amos-appstore/src/model.rs::with_checksum",
-    "crates/amos-asr/src/recognizer.rs::with_lang",
-    "crates/amos-audio/src/android/tinyalsa.rs::header_layout_notes",
-    "crates/amos-devocare/src/spec.rs::with_owner",
-    "crates/amos-monitor/src/monitor.rs::sampler_name",
-    "crates/amos-network-guard/src/audit.rs::dns",
-    "crates/amos-pdf-parser/src/model.rs::refresh_metrics",
-    "crates/amos-power/src/freq.rs::applied_plan",
-    "crates/amos-power/src/policy.rs::with_high_temp",
-    "crates/amos-profiling/src/android.rs::with_voltage_mv",
-    "crates/amos-sms/src/trash.rs::trashed_in",
-    "crates/amos-tauri/src/android_glue.rs::is_armed",
-    "crates/amos-tauri/src/appstore.rs::installed_name",
-    "crates/amos-tauri/src/incall.rs::is_default_dialer_bound",
-    "crates/amos-tauri/src/spaces.rs::active_space_windows",
-    "crates/amos-tauri/src/spaces.rs::is_window_in_active_space",
-    "crates/amos-tauri/src/spaces.rs::space_for_window",
-    "crates/amos-timesync/src/timekeeper.rs::with_name",
-    "crates/amos-web3/src/secp.rs::to_uncompressed_bytes"
+  "policy": "Every `pub fn` this gate reports as unwired (zero references anywhere, `tests/` included) must be listed here with a `kind` and a real `why`. An entry is a decision to leave a public function unwired — the one thing a reader cannot re-derive from the code — so the reason lives *here*, next to the entry, and not only in prose. Enforced by scripts/rust-unwired-scan.mjs (REQ-A445): R1 an entry with no real `why` fails, R2 an entry whose symbol is referenced now fails (the ratchet must shrink, not rot), R3 a duplicate fails. `--update-baseline` keeps existing reasons and marks a new entry `UNREVIEWED` with a placeholder R1 refuses, so a writer can never silently excuse a new finding. Kinds: `library-surface` (public API a consumer composes), `planned-feature` (the unwired half of a feature whose write side exists), `inspection-api` (accessor a host may call), `host-missing` (helper whose host/test does not exist yet). The prose rationale for each kind is in docs/rust-unwired-audit.md.",
+  "captured": "2026-09-19 (REQ-A445: this file was a bare list of 26 strings with no reasons, while both the script's failure message and docs/rust-unwired-audit.md claimed a reason was recorded — the reasons existed in prose and are now attached per entry; no symbol changed, only the record) | 2026-09-19 (REQ-A446: -2 — `spaces.rs::active_space_windows` and `spaces.rs::is_window_in_active_space` are **wired** now that `spaces_switch` really moves windows through `SpaceManager::switch_plan`, so R2 removed them; 26 → 24. `space_for_window` stays: mapping a window *to* its space is the reverse direction the switch never needs.)",
+  "entries": [
+    {
+      "value": "crates/amos-ai/src/life_guard.rs::with_path",
+      "kind": "library-surface",
+      "why": "Fluent constructor on a public type: in-workspace callers build the struct directly, and it is additionally the documented injection point ('tests inject a tempdir') — deleting it would remove a seam without fixing a defect."
+    },
+    {
+      "value": "crates/amos-android/src/manager.rs::clear_cache",
+      "kind": "inspection-api",
+      "why": "Maintenance entry point on a public service so a host can flush the manager's cache; the daemon surfaces the underlying state through its own RPC/status path, so no in-workspace caller needs it yet."
+    },
+    {
+      "value": "crates/amos-appstore/src/client.rs::android_bridge",
+      "kind": "inspection-api",
+      "why": "Accessor exposing the client's Android bridge handle so a host can inspect the installed backend; the daemon reports the same state through its own RPC path, so nothing in the workspace reads it yet."
+    },
+    {
+      "value": "crates/amos-appstore/src/model.rs::with_checksum",
+      "kind": "library-surface",
+      "why": "Fluent constructor on a public model type; in-workspace callers build the struct directly (or via `Default`), so it is unused today — deleting it would shrink the library API for no defect fixed."
+    },
+    {
+      "value": "crates/amos-asr/src/recognizer.rs::with_lang",
+      "kind": "library-surface",
+      "why": "Fluent constructor so a caller can pin a recognizer's language in one expression; in-workspace callers pass the language per call instead, so the builder has no caller today but is part of the public API."
+    },
+    {
+      "value": "crates/amos-audio/src/android/tinyalsa.rs::header_layout_notes",
+      "kind": "host-missing",
+      "why": "The `pcm.h` facts the Android audio bring-up depends on, surfaced so a bring-up test can assert the header has not drifted; that test needs the `android` feature + the NDK and is not written yet."
+    },
+    {
+      "value": "crates/amos-devocare/src/spec.rs::with_owner",
+      "kind": "library-surface",
+      "why": "Fluent constructor on a public spec type: it exists so a consumer can compose a value in one expression, while the in-workspace callers build the struct directly — unused today, and not a defect."
+    },
+    {
+      "value": "crates/amos-mdm/src/db.rs::fail_command",
+      "kind": "planned-feature",
+      "why": "The only writer of `status = 'failed'` in the MDM command lifecycle; the ack request carries `result: Option<String>` and no failure signal, so a device reporting a failed lock/wipe is recorded as acknowledged — wiring it is a protocol decision."
+    },
+    {
+      "value": "crates/amos-monitor/src/monitor.rs::sampler_name",
+      "kind": "inspection-api",
+      "why": "Read-only accessor naming the sampler a monitor is using, exposed so a host can inspect it; the daemon reports the same fact through its status path, so there is no in-workspace caller yet."
+    },
+    {
+      "value": "crates/amos-network-guard/src/audit.rs::dns",
+      "kind": "host-missing",
+      "why": "Constructor for a DNS `EgressEvent`; the tests build the struct literal instead and no production caller constructs that event yet, so the constructor has no host."
+    },
+    {
+      "value": "crates/amos-pdf-parser/src/model.rs::refresh_metrics",
+      "kind": "host-missing",
+      "why": "Documented as 'recompute after a caller mutates `text`' — and no caller in the workspace mutates `text`, so there is nothing to refresh; the helper waits for the mutating path to exist."
+    },
+    {
+      "value": "crates/amos-power/src/freq.rs::applied_plan",
+      "kind": "inspection-api",
+      "why": "Read-only accessor returning the frequency plan actually applied, exposed so a host can inspect it; the state is already surfaced through the daemon's status path, so no in-workspace caller needs it."
+    },
+    {
+      "value": "crates/amos-power/src/policy.rs::with_high_temp",
+      "kind": "library-surface",
+      "why": "Fluent constructor on a public policy type so a consumer can set the high-temperature threshold in one expression; in-workspace callers build the struct directly, so it is unused today."
+    },
+    {
+      "value": "crates/amos-profiling/src/android.rs::with_voltage_mv",
+      "kind": "library-surface",
+      "why": "Fluent constructor on the Android profiling type so a consumer can supply the voltage in one expression; the in-workspace caller fills the field directly, so the builder has no caller today."
+    },
+    {
+      "value": "crates/amos-sms/src/trash.rs::trashed_in",
+      "kind": "inspection-api",
+      "why": "Read-only accessor over the SMS trash, exposed so a host can inspect what a conversation trashed; the daemon answers the same question over its own RPC path, so nothing in the workspace calls it yet."
+    },
+    {
+      "value": "crates/amos-tauri/src/android_glue.rs::is_armed",
+      "kind": "inspection-api",
+      "why": "Read-only accessor telling whether the Android glue is installed, for a host that wants to inspect it; the host-side path reports the same state through its own command, so there is no caller yet."
+    },
+    {
+      "value": "crates/amos-tauri/src/appstore.rs::installed_name",
+      "kind": "inspection-api",
+      "why": "Read-only accessor giving the installed name of a package, exposed for host inspection; the app store reads the same information through its own store path, so no in-workspace caller needs it."
+    },
+    {
+      "value": "crates/amos-tauri/src/incall.rs::is_default_dialer_bound",
+      "kind": "inspection-api",
+      "why": "Read-only accessor reporting whether the default-dialer binding is present, exposed so a host can inspect it; the call UI surfaces the same condition through its command, so nothing calls it yet."
+    },
+    {
+      "value": "crates/amos-tauri/src/jni_glue.rs::peek_tag",
+      "kind": "planned-feature",
+      "why": "Half-wired device feature (REQ-A411): Kotlin writes a discovered NFC tag into this host-side cell, but nothing reads it — a non-consuming peek has no caller until an `nfc_*` command exists (screen + i18n + a device run), which is the missing piece."
+    },
+    {
+      "value": "crates/amos-tauri/src/jni_glue.rs::take_pending_notification",
+      "kind": "planned-feature",
+      "why": "Half-wired device feature (REQ-A411): Kotlin callbacks deposit a BLE GATT notification value here, but no host command consumes it; the BLE half is otherwise wired (`take_services` / `take_pending_read`), so this is the remaining read side, not dead code."
+    },
+    {
+      "value": "crates/amos-tauri/src/jni_glue.rs::take_tag",
+      "kind": "planned-feature",
+      "why": "Half-wired device feature (REQ-A411): the consuming reader of the discovered NFC tag; its author already marked it `#[allow(dead_code)]`, i.e. the intent was recorded but never turned into a wiring — the missing piece is an `nfc_*` command, not the accessor."
+    },
+    {
+      "value": "crates/amos-tauri/src/spaces.rs::space_for_window",
+      "kind": "planned-feature",
+      "why": "The window half of Spaces (REQ-A389): maps a window to its space; kept so the gap stays visible instead of reading as done — wiring it means the shell hiding/showing windows on switch, which is device-visible behaviour."
+    },
+    {
+      "value": "crates/amos-timesync/src/timekeeper.rs::with_name",
+      "kind": "library-surface",
+      "why": "Fluent constructor on the timekeeper so a consumer can name it in one expression; in-workspace callers build the struct directly (or via `Default`), so it is unused today and deleting it would only shrink the API."
+    },
+    {
+      "value": "crates/amos-web3/src/secp.rs::to_uncompressed_bytes",
+      "kind": "host-missing",
+      "why": "SEC1 compressed-to-uncompressed key conversion; it needs a caller that actually consumes uncompressed keys, and no such path exists in the workspace yet, so the helper has no host."
+    }
   ]
 }

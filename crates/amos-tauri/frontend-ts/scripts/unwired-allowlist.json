@@ -1,22 +1,37 @@
 [
+ {
+  "path": "src/lib/sandboxBridge.ts",
+  "module": true,
+  "reason": "Deny-by-default capability decision seam for sandboxed web-bundles. Its own docs state that wiring it into a real postMessage listener / origin host is device/ecosystem work (docs/permissions-sandbox-audit-plan.md Phase 3) and intentionally not faked. UPDATE (2026-09-13, REQ-A169/A170): the *origin host* half now exists (ExtAppHost.svelte + the amos-app:// bundle host), so what is still missing is precisely the other half — the postMessage listener and the daemon `perm_authorize` chokepoint behind it. Nothing in the shell has a capability to hand out yet, which is why every frame stays deny-by-default."
+ },
   {
-    "path": "src/lib/sandboxBridge.ts",
-    "module": true,
-    "reason": "Deny-by-default capability decision seam for sandboxed web-bundles. Its own docs state that wiring it into a real postMessage listener / origin host is device/ecosystem work (docs/permissions-sandbox-audit-plan.md Phase 3) and intentionally not faked. UPDATE (2026-09-13, REQ-A169/A170): the *origin host* half now exists (ExtAppHost.svelte + the amos-app:// bundle host), so what is still missing is precisely the other half — the postMessage listener and the daemon `perm_authorize` chokepoint behind it. Nothing in the shell has a capability to hand out yet, which is why every frame stays deny-by-default."
-  },
-  {
-    "path": "src/lib/externalFiles.ts",
-    "module": true,
-    "reason": "Read-only view model for standard Android collections served by the media_* bridge. Awaits the Files screen's external-collection section; until then it is a documented, tested library surface ('Wire: crates/amos-media -> media_list -> this lib')."
-  },
-  {
-    "path": "src/svelte/cellularRadio.ts",
-    "name": "setCellularRadio",
-    "reason": "Install a REAL cellular radio+signal reading into the Notification Center store. There is no host yet: amos-tauri exposes no cellular-signal command, so the store stays at the honest `absent` default ('no modem' → no bars). This is device bring-up (Android TelephonyManager/RadioSignal on the Rust side); wiring it now would fabricate a signal source."
-  },
-  {
-    "path": "src/svelte/cellularRadio.ts",
-    "name": "clearCellularRadio",
-    "reason": "Teardown half of setCellularRadio: restore the honest `absent` default. Same missing host as setCellularRadio — it becomes reachable only once a device radio source installs one."
-  }
+  "path": "src/svelte/cellularRadio.ts",
+  "name": "setCellularRadio",
+  "reason": "Install a REAL cellular radio+signal reading into the Notification Center store. There is no host yet: amos-tauri exposes no cellular-signal command, so the store stays at the honest `absent` default ('no modem' → no bars). This is device bring-up (Android TelephonyManager/RadioSignal on the Rust side); wiring it now would fabricate a signal source."
+ },
+ {
+  "path": "src/svelte/cellularRadio.ts",
+  "name": "clearCellularRadio",
+  "reason": "Teardown half of setCellularRadio: restore the honest `absent` default. Same missing host as setCellularRadio — it becomes reachable only once a device radio source installs one."
+ },
+ {
+  "path": "src/lib/biometric.ts",
+  "module": true,
+  "reason": "Host-side wrapper for biometric availability/authentication (`biometric_available` / `biometric_authenticate`) plus the label helpers a prompt renders. Its consumer is a biometric prompt surface (Settings → Security, or the Lock screen's unlock path) that does not exist yet; the two commands are registered and already allow-listed in `scripts/tauri-command-allowlist.json` as \"registered host API with no consumer yet\" (REQ-A389). The lib is fully unit-tested — what is missing is a screen, not the seam."
+ },
+ {
+  "path": "src/lib/ble.ts",
+  "module": true,
+  "reason": "BLE GATT client: the Kotlin bridge path (`ble_*` commands) with a Web Bluetooth fallback for desktop/Chromium. The BLE screen (scan → connect → services → characteristics → read/write/subscribe) is not built, so nothing imports it; the host commands it calls are registered and allow-listed for the same reason. REQ-A412 fixed two real defects inside it — the subscription never reached the bridge at all, and `invoke<T>(…) ?? false` leaked `null` into a `Promise<boolean>` — which is why its tests now pin both."
+ },
+ {
+  "path": "src/lib/gps.ts",
+  "module": true,
+  "reason": "Read-only view model for the location block (`gnssSnapshot`, `gnssHasFix`, `accuracyLabel`, `describeLocation`, …). The **wired** GNSS path is `src/lib/sensors.ts`'s normalized snapshot; this module is the formatting/derivation layer a dedicated Location screen would use, and that screen does not exist yet (the Settings sensor card shows raw fields). Tested; a library surface pending a consumer."
+ },
+ {
+  "path": "src/lib/nfc.ts",
+  "module": true,
+  "reason": "NDEF record encode/decode (text/URI/MIME + the TNF constants) plus the dispatch/read/write/format commands and the tag-event subscription. The NFC screen is not built, so nothing imports it. The Rust half is reachable only through this module, which is why REQ-A412's audit was valuable here: it found that the subscription never reached the bridge **and** that `nfc_read_bytes`' argument key did not match what this module sends (`tagId` vs a Rust parameter named `_tag_id`) — the only caller was broken in two places at once."
+ }
 ]

@@ -45,6 +45,65 @@ export const LAUNCHPAD_COLS_DEFAULT = 8;
 /** Launchpad 默认行数（≥900px 高度）。 */
 export const LAUNCHPAD_ROWS_DEFAULT = 5;
 
+/** macOS Overlay 标题栏高度（px）—— G-α。
+ *
+ * 宿主已经在 `wm.rs` 设置 `title_bar_style(Overlay)`（desktop 形态），所以原生 chrome
+ * 不再画，但 WebView 内容区会贴边 —— 需要前端自己留出 28 px 给红绿灯 + 居中标题。
+ * 28 px 是 macOS 标准标题栏高度的整数部分（含刘海感知）。
+ *
+ * 这是**唯一**真源：组件读它，不写第二份（仓内桌面常量全部收口在
+ * `lib/desktopLayout.ts` —— `PC_DESKTOP_AUDIT.md` §3 钉住的几何纪律）。
+ */
+export const APP_WINDOW_TITLEBAR_HEIGHT = 28;
+
+/** macOS Overlay 标题栏左侧留给**系统红绿灯**的宽度（px）—— G-α / REQ-A440。
+ *
+ * 真机实测（2026-09-19，截图 2× 放大核对）：`title_bar_style(Overlay)` 下 AppKit 在**同一条**
+ * 28 px 带上画真正的红绿灯（三个圆点占窗口左侧约 14…66 px），与 WebView 内容重叠 —— 所以
+ * 前端要留出这块宽度给它们，而**不要**自绘第二组（自绘那组点不到，且与真的一组叠成双影）。
+ * 74 = 66（最右一个点的右沿）+ 8（呼吸余量），取 macOS 自己的间距口径（直径 12、间距 20）。
+ */
+export const APP_WINDOW_TITLEBAR_INSET = 74;
+
+/** 桌面通知 banner 距顶栏下沿的偏移（px）—— G-γ。
+ *
+ * macOS Big Sur+ 实测 6 px；保留为常量是因为「顶栏 + 6 px」是 macOS 的标准间距，
+ * 任意改一处都意味着「通知视觉上离开了顶栏」，不该由调用方自算。
+ *
+ * 与 `NOTIF_BANNER_RIGHT_OFFSET` 配合得到 banner 绝对定位的 (top, right)。
+ * 真实真源是 `TOPBAR_HEIGHT + NOTIF_BANNER_TOP_OFFSET`——
+ * `desktop-notification-banner.svelte.test.ts` 中 `data-banner-top` 数据属性直接
+ * 计算这个加法，方便后续如果顶栏高度变了 banner 自动跟随。
+ */
+export const NOTIF_BANNER_TOP_OFFSET = 6;
+
+/** 桌面通知 banner 距屏幕右沿的偏移（px）—— G-γ。
+ *
+ * macOS 实测 8 px；与上面 `NOTIF_BANNER_TOP_OFFSET` 同样道理。
+ */
+export const NOTIF_BANNER_RIGHT_OFFSET = 8;
+
+/** 桌面通知 banner 最大宽度（px）—— G-γ。
+ *
+ * 与 `DesktopNotificationCenter.svelte` 的右栏宽度（`NC_RIGHT_PANEL_WIDTH`）一致——
+ * 同一份通知视觉宽度在两个 surface 上保持一致，是 macOS 的可见特征。
+ * 这里不复用 `NC_RIGHT_PANEL_WIDTH`：banner 是浮层、面板是抽屉，未来调整其中之一
+ * 不应该自动带动另一个（它们的滚动 / 折叠语义不同），但**初值**保持一致。
+ */
+export const NOTIF_BANNER_MAX_WIDTH = 360;
+
+/** 通知 banner 自动消失时长（ms）—— G-γ。
+ *
+ * **与 phone 形态 `NotificationBanner.svelte` 同源**：
+ * 桌面与手机用同一个时长，避免「同一 app 的通知，在 PC 上停留 4.2s，在手机上停留
+ * 别的时长」这种 UX 分裂。
+ *
+ * 把字面值集中到 desktopLayout.ts 是为了**一条 grep 就能审计全部几何/时间常量**：
+ * G-α 的"标题栏高度 = 28"就靠这条纪律钉住的，G-γ 沿用同一纪律
+ * （`desktop-notification-banner.svelte.test.ts` 的负控 #1 钉此）。
+ */
+export const NOTIF_BANNER_SHOW_MS = 4200;
+
 /** 每个 Launchpad 图标尺寸（px）。 */
 export const LAUNCHPAD_ICON_SIZE = 80;
 

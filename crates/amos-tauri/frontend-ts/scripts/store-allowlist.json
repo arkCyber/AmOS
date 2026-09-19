@@ -8,81 +8,323 @@
     "device-expectation": "Keys the app **reads but nothing in this build writes** (`amos.app.version`, `amos.user.id/name/email` — read by the enterprise audit trail to stamp each entry, written by no component). Losing them costs nothing today because they are always empty; they are listed so the gap is documented (the audit entries carry empty identity/version) instead of looking like a configured value that quietly failed to load."
   },
   "keys": [
-    { "key": "amos-ui.locale", "kind": "configuration" },
-    { "key": "amos-ui.theme", "kind": "configuration" },
-    { "key": "amos-ui.ime", "kind": "configuration" },
-    { "key": "amos.settings", "kind": "configuration" },
-    { "key": "amos.settings.view", "kind": "configuration" },
-    { "key": "amos.home.layout", "kind": "configuration" },
-    { "key": "amos.appLibrary.groups", "kind": "configuration" },
-    { "key": "amos.displayAutoOffSec", "kind": "configuration" },
-    { "key": "amos.wakeHome", "kind": "configuration" },
-    { "key": "amos.focus", "kind": "configuration" },
-    { "key": "amos.lock", "kind": "configuration" },
-    { "key": "amos.magnifier", "kind": "configuration" },
-    { "key": "amos.notesPrefs", "kind": "configuration" },
-    { "key": "amos.interp", "kind": "configuration" },
-    { "key": "amos.permissions", "kind": "configuration" },
-    { "key": "amos.player", "kind": "configuration" },
-    { "key": "amos.sound", "kind": "configuration" },
-    { "key": "amos.weather.cities", "kind": "configuration" },
-    { "key": "amos.weather.city", "kind": "configuration" },
-    { "key": "amos.worldclock", "kind": "configuration" },
-    { "key": "amos.debug.level", "kind": "configuration" },
-    { "key": "amos.debug.log", "kind": "configuration" },
-    { "key": "amos.keyboard.config", "kind": "configuration" },
-    { "key": "amos.ringtone", "kind": "configuration" },
-    { "key": "amos.appstore.id_empty", "kind": "configuration" },
-    { "key": "amos.appstore.id_invalid", "kind": "configuration" },
-    { "key": "amos.appstore.id_too_long", "kind": "configuration" },
-    { "key": "amos.appstore.install_failed", "kind": "configuration" },
-    { "key": "amos.appstore.rpc_failed", "kind": "configuration" },
-    { "key": "amos.appstore.uninstall_failed", "kind": "configuration" },
-    { "key": "amos.appstore.upgrade_failed", "kind": "configuration" },
-    { "key": "amos.spaces.delete_last", "kind": "configuration" },
-    { "key": "amos.spaces.index_out_of_bounds", "kind": "configuration" },
-    { "key": "amos.spaces.lock_failed", "kind": "configuration" },
-    { "key": "amos.spaces.not_found", "kind": "configuration" },
-    { "key": "amos.spaces.serialization_failed", "kind": "configuration" },
-    { "key": "amos.ai.session", "kind": "derived" },
-    { "key": "amos.alarmNotifFired", "kind": "derived" },
-    { "key": "amos.calendarFired", "kind": "derived" },
-    { "key": "amos.reminderFired", "kind": "derived" },
-    { "key": "amos.notesRagIndexed", "kind": "derived" },
-    { "key": "amos.notifications", "kind": "derived" },
-    { "key": "amos.app_focused", "kind": "derived" },
-    { "key": "amos.recents", "kind": "derived" },
-    { "key": "amos.android.recent", "kind": "derived" },
-    { "key": "amos.timer", "kind": "derived" },
-    { "key": "amos.calculator.history", "kind": "derived" },
-    { "key": "amos.wifi", "kind": "device-state" },
-    { "key": "amos.bluetooth", "kind": "device-state" },
-    { "key": "amos.cellular", "kind": "device-state" },
-    { "key": "amos.hotspot", "kind": "device-state" },
-    { "key": "amos.flashlight", "kind": "device-state" },
-    { "key": "amos.cloud.backup", "kind": "meta" },
-    { "key": "amos.compass.settings", "kind": "configuration" },
-    { "key": "amos.measure.settings", "kind": "configuration" },
-    { "key": "amos.hotcorners", "kind": "configuration" },
-    { "key": "amos.cloud.sync.config", "kind": "configuration" },
-    { "key": "amos.webman.settings", "kind": "configuration" },
-    { "key": "amos.measure.history", "kind": "derived" },
-    { "key": "amos.cloud.sync.metrics", "kind": "derived" },
-    { "key": "amos.webman.history", "kind": "derived" },
-    { "key": "amos.webman.tabs", "kind": "derived" },
-    { "key": "amos.shortcuts.execLog", "kind": "derived" },
-    { "key": "amos.shortcuts.api.config", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.api.rate_limits", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.audit.config", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.audit.sync_queue", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.mdm.config", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.mdm.execution_count", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.enterprise.categories", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.enterprise.installations", "kind": "enterprise-admin" },
-    { "key": "amos.shortcuts.webhooks", "kind": "enterprise-admin" },
-    { "key": "amos.app.version", "kind": "device-expectation" },
-    { "key": "amos.user.id", "kind": "device-expectation" },
-    { "key": "amos.user.name", "kind": "device-expectation" },
-    { "key": "amos.user.email", "kind": "device-expectation" }
+    {
+      "key": "amos-ui.locale",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos-ui.theme",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos-ui.ime",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.settings",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.settings.view",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.home.layout",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appLibrary.groups",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.displayAutoOffSec",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.wakeHome",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.focus",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.lock",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.magnifier",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.notesPrefs",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.interp",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.permissions",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.player",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.sound",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.weather.cities",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.weather.city",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.worldclock",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.debug.level",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.debug.log",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.keyboard.config",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.ringtone",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appstore.id_empty",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appstore.id_invalid",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appstore.id_too_long",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appstore.install_failed",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appstore.rpc_failed",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appstore.uninstall_failed",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.appstore.upgrade_failed",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.spaces.delete_last",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.spaces.index_out_of_bounds",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.spaces.lock_failed",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.spaces.not_found",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.spaces.serialization_failed",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.ai.session",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.alarmNotifFired",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.calendarFired",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.reminderFired",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.notesRagIndexed",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.notifications",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.app_focused",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.recents",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.android.recent",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.timer",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.calculator.history",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.wifi",
+      "kind": "device-state"
+    },
+    {
+      "key": "amos.bluetooth",
+      "kind": "device-state"
+    },
+    {
+      "key": "amos.cellular",
+      "kind": "device-state"
+    },
+    {
+      "key": "amos.hotspot",
+      "kind": "device-state"
+    },
+    {
+      "key": "amos.flashlight",
+      "kind": "device-state"
+    },
+    {
+      "key": "amos.cloud.backup",
+      "kind": "meta"
+    },
+    {
+      "key": "amos.compass.settings",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.measure.settings",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.hotcorners",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.cloud.sync.config",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.webman.settings",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.measure.history",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.cloud.sync.metrics",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.webman.history",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.webman.tabs",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.shortcuts.execLog",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.shortcuts.api.config",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.api.rate_limits",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.audit.config",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.audit.sync_queue",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.mdm.config",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.mdm.execution_count",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.enterprise.categories",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.enterprise.installations",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.shortcuts.webhooks",
+      "kind": "enterprise-admin"
+    },
+    {
+      "key": "amos.app.version",
+      "kind": "device-expectation"
+    },
+    {
+      "key": "amos.user.id",
+      "kind": "device-expectation"
+    },
+    {
+      "key": "amos.user.name",
+      "kind": "device-expectation"
+    },
+    {
+      "key": "amos.user.email",
+      "kind": "device-expectation"
+    },
+    {
+      "key": "amos.files.cloud",
+      "kind": "derived"
+    },
+    {
+      "key": "amos.brightness",
+      "kind": "configuration",
+      "note": "WebView-only display dimming (G-β-1); deliberately device-local — restoring a 60% value onto an external monitor would dim the wrong physical screen."
+    },
+    {
+      "key": "amos.files.reveal",
+      "kind": "derived",
+      "why": "A one-shot **command**, not state (REQ-A458): whoever wants the Files screen to show one entry writes {id, nonce} here from another window, and the Files screen clears it the moment it has. Losing it loses nothing (a reveal nobody served is a reveal nobody is waiting for), and keeping it in a backup would make a restore re-fire a reveal that happened days ago."
+    }
   ]
 }

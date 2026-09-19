@@ -25,9 +25,13 @@
     shouldVibrateOnArrival,
   } from "../lib/sound";
   import { playNotifyTone } from "../lib/notifyTone";
+  import { NOTIF_BANNER_SHOW_MS } from "../lib/desktopLayout";
   import { createStoreValue } from "./store";
 
-  const SHOW_MS = 4200;
+  /** 自动消失时长（ms）—— G-γ 起从 `lib/desktopLayout.ts` 取，与桌面 banner 同源。
+   * 仓内仅 desktopLayout.ts 持有一份字面值；其他位置都 import 这个常量
+   * （`desktop-notification-banner.svelte.test.ts` 的负控 #1 钉此）。 */
+  const SHOW_MS = NOTIF_BANNER_SHOW_MS;
   /** Haptic pulse length (ms) for one arriving notification. */
   const HAPTIC_MS = 30;
 

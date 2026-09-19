@@ -66,17 +66,27 @@ export function staleLegacySurfaceLabels(
   windows: WmWindowInfo[],
   tasks: AndroidLmkTask[],
 ): string[] {
+  // REQ-A407: `t &&` —— 一个坏元素（null / 不是对象）不该让整轮对账炸掉；没有 window_id 的
+  // 行本来就不算"活着的容器任务"，丢掉它只会让**更少**的面被保留（保守方向）。
   const alive = new Set(
-    tasks.filter((t) => t.window_id).map((t) => legacySurfaceLabel(t.window_id)),
+    tasks.filter((t) => t && t.window_id).map((t) => legacySurfaceLabel(t.window_id)),
   );
   return windows
     .filter((w) => isLegacyLabel(w.label) && !alive.has(w.label))
     .map((w) => w.label);
 }
 
-/** Fetch the daemon's authoritative live LMK tasks (null when the daemon is down). */
+/**
+ * Fetch the daemon's authoritative live LMK tasks (null when the daemon is down).
+ *
+ * REQ-A407: 形状守卫 —— 契约是"权威快照，取不到就是 null"。宿主回一个**不是数组**的东西
+ * （旧版守护进程、半截应答、被序列化坏的对象）时不能把它当快照交给对账：`tasks.filter`
+ * 会抛，而调用方是把对账 `void` 出去的 ⇒ 一次没人看见的未处理拒绝，`reconcileLegacySurfaces`
+ * 自己的"守卫"（daemon down ≠ app dead）也就失效了。取不到 ⇒ null。
+ */
 export async function androidLmkTasks(): Promise<AndroidLmkTask[] | null> {
-  return invoke<AndroidLmkTask[]>("android_lmk_tasks");
+  const raw = await invoke<unknown>("android_lmk_tasks");
+  return Array.isArray(raw) ? (raw as AndroidLmkTask[]) : null;
 }
 
 /**
@@ -130,22 +140,44 @@ export function startPeriodicReconcile(intervalMs = RECONCILE_INTERVAL_MS): () =
 
 // ---- LMK debug / user entry (bring-up `docs/android-lmk-e2e.md` G3) ---------
 
-/** One container app the daemon LMK reclaimed/froze in a trigger round. */
+/** One container app the daemon LMK reclaimed/froze in a trigger round.
+ *
+ * The wire shape has **one owner**: `proto/android_compat.proto`'s `LmkVictim`
+ * (mirrored by `amos-tauri::android_lmk::LmkVictimOutcome`). It carries exactly
+ * `{package_name, window_id, killed}` — there is **no per-victim `outcome`** and no
+ * `refusal_reason`, and a round the container refused produces **no row at all**:
+ * `amos-android::service::trigger_lmk` builds one row per *decided* victim and ignores
+ * the `am force-stop` result entirely. So this type must not invent fields the host
+ * cannot send — a UI that reads them is reading its own imagination.
+ */
 export interface LmkVictim {
   package_name: string;
   window_id: string;
   killed: boolean;
-  outcome?: string;
-  refusal_reason?: string;
 }
 
-export type LmkVictimState = "reclaimed" | "frozen" | "refused" | "unknown";
+/** The three states a victim row can honestly show. */
+export type LmkVictimState = "reclaimed" | "frozen" | "unknown";
 
-/** Determine victim state from daemon outcome. */
+/**
+ * Determine a victim's state from the wire.
+ *
+ * - `killed === true` ⇒ **reclaimed**: the proto documents `true = killed (surface torn
+ *   down)` and the server sets `killed: v.action == LmkAction::Kill`
+ *   (`trigger_lmk_critical_reclaims_background_app`: "critical reclaim kills the process").
+ * - `killed === false` ⇒ **frozen**: the proto's own comment is `false = frozen`, and the
+ *   server's `trigger_lmk_low_freezes_not_kills` moves the task to `cached` — still
+ *   tracked, not killed. This is exactly what the host reported, so we say it.
+ * - anything else ⇒ **unknown**: a payload whose `killed` is absent or not a boolean is
+ *   not evidence of a freeze, so it is not claimed as one.
+ *
+ * (History: this used to read a per-victim `outcome` — a field the wire never carried —
+ * which left `frozen` unreachable and reported every freeze as `unknown`. That inverted
+ * the honesty rule: it hid a fact the daemon *had* told us.)
+ */
 export function victimState(v: LmkVictim): LmkVictimState {
-  if (v.killed) return "reclaimed";
-  if (v.outcome === "frozen") return "frozen";
-  if (v.outcome === "refused") return "refused";
+  if (v.killed === true) return "reclaimed";
+  if (v.killed === false) return "frozen";
   return "unknown";
 }
 

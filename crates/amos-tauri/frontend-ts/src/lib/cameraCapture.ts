@@ -9,6 +9,7 @@
 
 import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 import { defaultMediaStore, type MediaStore } from "./mediaStore";
+import { localId } from "./localId";
 
 export class RecordingUnavailableError extends Error {}
 
@@ -177,7 +178,17 @@ export async function startVideoRecording(
   return { stop, cancel };
 }
 
-/** UID for a fresh capture (kept small & unique). */
+/**
+ * UID for a fresh capture.
+ *
+ * This id is **load-bearing**, not a label: `mediaId(id)` is the MediaStore key the
+ * video's bytes are written under (`persistVideoCapture`), so two captures that minted
+ * the same id would mean the second recording **overwrites the first one's bytes** while
+ * both rows stay in `amos.captures`. The old form kept only 5 base-36 random digits
+ * (~26 bits): measured under a frozen clock, 20,000 ids collide 3 times (REQ-A401).
+ * The shared `localId` adds a process-monotonic counter, so the guarantee no longer
+ * rests on the random tail.
+ */
 export function newCaptureId(): string {
-  return `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  return localId("v");
 }

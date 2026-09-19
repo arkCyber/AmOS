@@ -71,8 +71,9 @@ A `function` / `const` / `class` / `enum` export (in `src/lib/**` or
 included, minus its own `export` declaration). The only remaining mentions are in
 tests, or nowhere at all. Public API that is deliberately ahead of its host is
 allow-listed; everything else is tracked in `scripts/unwired-baseline.json` and the
-gate fails only when a **new** one appears. A stale baseline entry (now wired) is
-reported so the ratchet cannot rot.
+gate fails when a **new** one appears — and also when a baseline entry is wired again,
+or an allow-list entry no longer names a hole (REQ-A447: the ratchet must shrink, not
+rot; reporting a stale entry was not enough).
 
 ### 3. Unused type export — informational
 
@@ -138,7 +139,7 @@ next manual audit.
 | `lib/wm.ts` | allow-listed — split-layout bridge + pure placement helpers; awaits a split-screen surface (`docs/multi-window.md`) |
 | `lib/bundle.ts` | allow-listed — web-bundle `srcdoc` inliner; awaits a real `amos-app://` origin host (`docs/appstore.md`) |
 | `lib/sandboxBridge.ts` | allow-listed — deny-by-default capability seam; wiring is deferred device work (`docs/permissions-sandbox-audit-plan.md` Phase 3) |
-| `lib/externalFiles.ts` | allow-listed — external-collections view model; awaits the Files screen section |
+| `lib/externalFiles.ts` | **wired** (REQ-A447) — `svelte/FilesApp.svelte` imports it for the external-collections section, so the allow-list entry was **removed** by the new stale rule (it had outlived the hole it excused) |
 
 `wm.ts` is the notable one: a complete, unit-tested bridge to the Rust `wm_*`
 commands with **zero importers** — it had been invisible because its test imports
@@ -308,14 +309,14 @@ they are decisions rather than unexplained debt:
 | `sensors.sensorAcquire` | Asks the **daemon's gRPC `SensorService`**, while the Settings sensor card consumes the **in-process** `sensor_host` feed (whose own gate, `sensor_host_acquire`, the frontend does not expose). Wiring this would query a *different* manager than the one producing the card — see Round 10. |
 | `sensors.sensorPixels` | Returns a **pixel total**, while the panel shows `W×H`; wiring it would turn "1920×1080" into "2073600". |
 | `contacts.contactById` | **wired (Round 41)** — the reason recorded here ("no duplicate to merge into") had gone **stale**: the *Spotlight → contact* deep link added to `ContactsApp` later resolved its target with a hand-rolled `contacts.find((c) => c.id === v.id)`. The screen now calls `contactById(contacts, v.id)`, so the tested lookup has its consumer and the baseline dropped **45 → 44**. |
-| `calculator.calcDisplay` / `calcRun` | A **single-line** display model and a press-sequence runner used by the calculator's own unit tests; the two-line iOS UI computes its display from `cur`/`pendingOp`. They are the tests' display oracle — deleting them would delete assertions, not add coverage. |
+| `calculator.calcDisplay` | A **single-line** display model used by the calculator's own unit tests; the two-line iOS UI computes its display from `cur`/`pendingOp`. It is the tests' display oracle — deleting it would delete assertions, not add coverage. (**`calcRun` left this table in REQ-A458**: Spotlight's calculation row evaluates through it — the app's own engine is what keeps the two surfaces from disagreeing — so the baseline dropped **115 → 114**.) |
 | `ansi.hasEscape` | The ANSI parser already drops every escape safely; "mark the line as raw" was a proposed UI affordance that no screen needs. |
 | `keepAwakeCore.resetHoldBusForTest` | A **test seam** for the module-singleton hold bus (tests must reset it between cases). It has no production caller *by construction*, and the `…ForTest` suffix states that. |
 | `propsBus.resetPropsChannels` | A **test/setup seam**: the module-singleton channel registry must be wiped between cases (46 test call sites). No production path may clear *all* channels — the shell disposes only the ones it owns (`disposePropsChannel`, now wired in `Shell.onDestroy`). |
 | `osAlarmArm.armedNativeAlarmIds` / `resetArmedNativeAlarmsForTest` | **Diagnostics / test seam** for the native exact-alarm bookkeeping: the accessor exposes "what this module believes is registered" and the `…ForTest` setter forgets it so each case starts clean. The host side is mocked in tests; production only ever calls `reconcileNativeAlarms`. |
 | `sandboxBridge.decideCapabilityRequest` | The single value export of the allow-listed `sandboxBridge` module — same deferred host (a real postMessage/origin listener) as its module entry. |
 | `cellularRadio.setCellularRadio` / `clearCellularRadio` | Allow-listed (see `scripts/unwired-allowlist.json`): the install/teardown halves of a **real** cellular radio source for the Notification Center. `amos-tauri` exposes no cellular-signal command, so the store stays at the honest `absent` default ("no modem" → no bars); wiring would fabricate a signal. Device bring-up (`TelephonyManager`). |
-| `wm.ts` / `bundle.ts` / `sandboxBridge.ts` / `externalFiles.ts` (modules) | Allow-listed: their hosts (split-screen UI, `amos-app://` origin, postMessage listener, Files external section) do not exist yet. |
+| `wm.ts` / `bundle.ts` / `sandboxBridge.ts` (modules) | Allow-listed: their hosts (split-screen UI, `amos-app://` origin, postMessage listener) do not exist yet. (`externalFiles.ts` was in this list until REQ-A447 — the Files screen wired it, so the entry was removed.) |
 
 ### Round 10 — two superseded event-reducer models, and a sensor bridge asymmetry
 
@@ -646,7 +647,7 @@ and the note is not claimed in that window rather than guessed at.
 Every remaining entry in the backlog is now **explained** rather than silent — the
 non-wirings table above gained rows for `sensors.sensorAcquire` / `sensorPixels`,
 `contacts.contactById` (later **wired** in Round 41 — its reason had gone stale),
-`calculator.calcDisplay` / `calcRun`, `ansi.hasEscape`,
+`calculator.calcDisplay` (`calcRun` was wired in REQ-A458 — see the table), `ansi.hasEscape`,
 `keepAwakeCore.resetHoldBusForTest` and `sandboxBridge.decideCapabilityRequest`. They
 stay baselined (so a **new** export is still caught); what changes is that the backlog
 is now a set of decisions, not a list of unknowns.
@@ -870,8 +871,9 @@ The baseline today (43), by module:
 * `media.ts` (2) — `mediaSave` (device-gated DCIM write) / `mediaGrantWrite` (a write
   grant should arrive with the flow that needs it). `normalizeGrant` was wired in
   Round 42.
-* `calculator.ts` (2) — `calcDisplay` / `calcRun`, the tests' display oracle (the
-  two-line iOS screen computes its display from `cur`/`pendingOp`).
+* `calculator.ts` (1) — `calcDisplay`, the tests' display oracle (the two-line iOS
+  screen computes its display from `cur`/`pendingOp`). `calcRun` left this list in
+  REQ-A458: Spotlight's calculation row evaluates through it.
 * `sensors.ts` (2) — `sensorAcquire` (asks a *different* manager than the card the
   Settings page reads, Round 10) / `sensorPixels` (a pixel total for a `W×H` panel).
 * `osAlarmArm.ts` (2) — `armedNativeAlarmIds` / `resetArmedNativeAlarmsForTest`:
@@ -898,3 +900,37 @@ Round 42 another (`normalizeGrant`, a reply parser no reply was run through).
 
 This backlog is the concrete work list for future rounds; the ratchet guarantees
 it can only shrink-or-hold, never silently grow.
+
+## REQ-A412 — the device-feature libraries enter the backlog (and two of them were broken)
+
+The `bun run typecheck` gate was red with **39** errors, almost all of them in the
+newest modules (REQ-A409/A410's device features). Working through them turned up two
+defects that had nothing to do with types — and they are precisely the defects this
+document's family exists for:
+
+| Defect | Shape | Why no gate saw it |
+| --- | --- | --- |
+| `ble.ts::bleOnValueChanged`, `nfc.ts::subscribeNfcTag` never subscribed | `.listen` called on `bridged()` — a **boolean** — so it threw and the file's own `try/catch` swallowed it. Every BLE value / NFC tag event was silently dropped | The tests asserted `typeof result === "boolean"` and ran **unbridged** (where a no-op is correct) |
+| `nfc_read_bytes` could not be called at all | The only caller sends `tagId`; the Rust parameter was named `_tag_id`, so Tauri looked up a different key and answered "invalid args" before reaching the glue | `tauri-args-scan` (Round 46) *did* see it — it is in this family for exactly this reason |
+
+Both are fixed (see `CHANGELOG.md` REQ-A412); the third member of the family,
+`tauri-command-scan`, also got its `sensor_host_record_video` case resolved in REQ-A411
+(declared `#[tauri::command]` but missing from `generate_handler!`).
+
+**What enters the backlog here**, with reasons in
+`scripts/unwired-allowlist.json` (module gate) and counts in
+`scripts/unwired-baseline.json` (the ratchet moved `values` **81 → 113**, `modules`
+2, `components` 8 — nothing was removed):
+
+| Module | What it is | What is missing |
+| --- | --- | --- |
+| `src/lib/biometric.ts` | host wrapper for `biometric_available` / `biometric_authenticate` + prompt labels | a biometric prompt surface (Settings → Security, or the Lock screen's unlock path) |
+| `src/lib/ble.ts` | BLE GATT client (Kotlin bridge + Web Bluetooth fallback) | the BLE screen (scan → connect → services → read/write/subscribe) |
+| `src/lib/gps.ts` | read-only location view model (`gnssSnapshot`, `accuracyLabel`, `describeLocation`, …) | a dedicated Location screen (the **wired** GNSS path is `sensors.ts`'s snapshot) |
+| `src/lib/nfc.ts` | NDEF encode/decode + dispatch/read/write/format + tag subscription | the NFC screen |
+
+**Honest boundary**: these four are still unwired — the rows above are a work list,
+not a claim that the features work. What changed is that the gate now reads the
+truth (a documented, tested library surface awaiting a screen) instead of a defect
+invisible to `tsc`, and that the two *broken* seams inside them are fixed and pinned
+by tests.

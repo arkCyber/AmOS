@@ -64,6 +64,10 @@
     "reason": "The in-process host's stream gate. Recorded in docs/unwired-exports-audit.md Round 10: exposing it would ask a *different* manager than the one producing the Settings card's stream."
   },
   {
+    "name": "sensor_host_record_video",
+    "reason": "Registered host API with no producer **yet**: the command pushes one finished clip's *metadata* (never the bytes) into the in-process sensor host, and `SensorHostSnapshot.video_clips` already surfaces the list (REQ-A409's video half). It was declared `#[tauri::command]` but missing from `generate_handler!`, i.e. unreachable — the wiring is now in, and what is missing is the *caller*: the clip is produced by the Android/WebView `MediaRecorder` through the glue, and that glue does not exist yet. Recorded here so the gate reads the truth (a reachable API with no producer) instead of the defect (a command nothing could ever invoke)."
+  },
+  {
     "name": "perm_granted",
     "reason": "Per-app grant list from the daemon authority. The privacy dashboard reviews with `perm_grants_all` (one round-trip for every app) and gates with `perm_authorize`, so the per-app call has no consumer."
   },

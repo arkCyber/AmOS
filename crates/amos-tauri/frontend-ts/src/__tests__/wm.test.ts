@@ -16,6 +16,10 @@ import {
   splitActive,
   wmLayoutSetScreen,
   wmLayoutSnapshot,
+  wmClose,
+  wmFocus,
+  wmHide,
+  wmOpen,
   wmSplit,
   wmSplitResize,
   wmSplitDemo,
@@ -115,6 +119,27 @@ describe("wm command wrappers", () => {
       command: "wm_layout_set_screen",
       args: { width: 800, height: 1000 },
     });
+  });
+
+  test("the boolean window commands report the HOST's answer (not the snapshot they get back)", async () => {
+    // REQ-A415: the host answers `wm_open`/`wm_focus`/`wm_hide`/`wm_close` with a
+    // `WmSnapshot` object. The old bodies were
+    // `(await invoke<boolean>(cmd, { label })) ?? false`, so on success the value was a
+    // snapshot — the declared `boolean` was never what came back, and any caller writing
+    // `if (await wmHide(x))` would have been reading an object. The contract pinned here
+    // is the one the type promises: success ⇒ `true`, "no bridge / refused" (`null`) ⇒
+    // `false`.
+    respond = () => splitSnap; // a successful command answers with a snapshot
+    expect(await wmHide("notes")).toBe(true);
+    expect(await wmFocus("notes")).toBe(true);
+    expect(await wmOpen("notes")).toBe(true);
+    expect(await wmClose("notes")).toBe(true);
+
+    respond = () => null; // the host refused (or there is no bridge at all)
+    expect(await wmHide("notes")).toBe(false);
+    expect(await wmFocus("notes")).toBe(false);
+    expect(await wmOpen("notes")).toBe(false);
+    expect(await wmClose("notes")).toBe(false);
   });
 
   test("returns null when not running inside Tauri", async () => {

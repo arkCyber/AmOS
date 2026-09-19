@@ -1,3 +1,5 @@
+import { localId } from "./localId";
+
 export interface Note {
   id: string;
   text: string;
@@ -47,14 +49,21 @@ export function noteDayOf(ts: number, now: number): number {
   return Math.round((startOfDay(ts) - startOfDay(now)) / 86_400_000);
 }
 
-// Process-local monotonic counter so ids stay unique even for two notes created
-// in the same millisecond (and deterministic within a process for tests).
-let seq = 0;
-
-/** Create a new note with a unique id. Creation time == last-modified time. */
+/**
+ * Create a new note with a unique id. Creation time == last-modified time.
+ *
+ * The id used to be `${now.toString(36)}-${seq}` — a wall-clock reading plus a
+ * **per-process** counter, i.e. no entropy at all. Two contexts that agree on a
+ * millisecond mint the *same string*: this shell runs several windows over ONE store
+ * (`svelte/store.ts` mirrors the host's `store-updated` event into every window), so a
+ * per-process counter is not a per-store guarantee. Measured (REQ-A402): two processes
+ * with a frozen clock both produced `loyw3v28-1`, while `localId` differed by its
+ * crypto tail. The consequence here would be silent too — `normalizeNotes` *renames* a
+ * repeated id, so every stored reference to that note breaks (the RAG index id
+ * `note:<id>`, `openNote`'s channel payload, the editor's selection).
+ */
 export function makeNote(text: string, now: number): Note {
-  seq += 1;
-  return { id: `${now.toString(36)}-${seq}`, text, ts: now, created: now };
+  return { id: localId("note"), text, ts: now, created: now };
 }
 
 /** Duplicate the note with `id`: a fresh copy (new id, same text, new created/ts,

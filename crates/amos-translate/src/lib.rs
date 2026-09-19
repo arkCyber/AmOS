@@ -71,6 +71,18 @@ impl TranslatorService {
     }
 }
 
+/// Deliver one translation segment to the client.
+///
+/// Returns `false` when the consumer is gone, and **every** caller must treat that as "stop":
+/// `mpsc::Sender::send` fails only when the receiver was dropped — a *full* buffer waits, it does
+/// not fail — so a failure always means nobody is left to receive. Keeping the rule in one place
+/// is the point: it used to be applied in the text branch and silently skipped in the two audio
+/// branches, so a client that went away mid-stream left the daemon running ASR on frames it could
+/// never receive (Power of 10 rule #7 — a dropped result that changes what the daemon does).
+async fn deliver(tx: &mpsc::Sender<Result<TranslateOut, Status>>, out: TranslateOut) -> bool {
+    tx.send(Ok(out)).await.is_ok()
+}
+
 #[tonic::async_trait]
 impl Translator for TranslatorService {
     async fn translate(
@@ -147,13 +159,14 @@ impl Translator for TranslatorService {
                             .await
                         {
                             Ok(segment) => {
-                                if tx
-                                    .send(Ok(TranslateOut {
+                                if !deliver(
+                                    &tx,
+                                    TranslateOut {
                                         segment,
                                         done: false,
-                                    }))
-                                    .await
-                                    .is_err()
+                                    },
+                                )
+                                .await
                                 {
                                     break;
                                 }
@@ -174,15 +187,25 @@ impl Translator for TranslatorService {
                                 // stream it back (the client can then translate it).
                                 match r.transcribe(&audio, "", "").await {
                                     Ok(text) if !text.is_empty() => {
-                                        let _ = tx
-                                            .send(Ok(TranslateOut {
+                                        // The consumer-gone rule lives in `deliver` — this branch
+                                        // used to discard the answer and keep running ASR for a
+                                        // client that had already left.
+                                        if !deliver(
+                                            &tx,
+                                            TranslateOut {
                                                 segment: text,
                                                 done: false,
-                                            }))
-                                            .await;
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            break;
+                                        }
                                     }
                                     Ok(_) => {}
                                     Err(e) => {
+                                        // Nobody left to tell if this fails — the same documented
+                                        // case as the text branch above; the `break` is the point.
                                         let _ = tx.send(Err(Status::internal(e.to_string()))).await;
                                         break;
                                     }
@@ -191,12 +214,17 @@ impl Translator for TranslatorService {
                             None => {
                                 // ASR not wired yet: acknowledge the frame honestly.
                                 let note = format!("[语音] {} 字节音频，ASR 未接入", audio.len());
-                                let _ = tx
-                                    .send(Ok(TranslateOut {
+                                if !deliver(
+                                    &tx,
+                                    TranslateOut {
                                         segment: note,
                                         done: false,
-                                    }))
-                                    .await;
+                                    },
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -297,7 +325,12 @@ pub async fn serve(path: std::path::PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    let _ = std::fs::remove_file(&path);
+    // Best-effort, but not invisible: `serve()` binds this exact path, and `bind` fails with
+    // `EADDRINUSE` on a socket file left behind — so a failed cleanup breaks the *next* start,
+    // which is precisely what a silent `let _` would hide.
+    if let Err(e) = std::fs::remove_file(&path) {
+        tracing::warn!("failed to remove the socket file {}: {e}", path.display());
+    }
     Ok(())
 }
 
@@ -345,6 +378,71 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::provider::MockProvider;
+
+    /// The contract every streaming branch depends on (REQ-A443): `send` fails **only** when the
+    /// consumer is gone, and `deliver` must report that as `false` so the caller stops. Pinning it
+    /// here is what keeps the rule from being half-applied again — the audio branches used to
+    /// discard the answer and keep running ASR for a client that had already left.
+    #[tokio::test]
+    async fn deliver_is_true_for_a_live_consumer_and_false_once_it_is_gone() {
+        let (tx, mut rx) = mpsc::channel::<Result<TranslateOut, Status>>(4);
+        assert!(
+            deliver(
+                &tx,
+                TranslateOut {
+                    segment: "a".into(),
+                    done: false,
+                },
+            )
+            .await
+        );
+        let got = rx.recv().await.expect("the segment is delivered").unwrap();
+        assert_eq!(got.segment, "a");
+        assert!(!got.done);
+
+        // A *full* buffer must not be mistaken for a gone consumer: with the receiver alive and
+        // the channel at capacity, `send` waits rather than failing. (If it failed here, every
+        // slow client would be treated as a departed one.)
+        let (tx1, mut rx1) = mpsc::channel::<Result<TranslateOut, Status>>(1);
+        assert!(
+            deliver(
+                &tx1,
+                TranslateOut {
+                    segment: "fill".into(),
+                    done: false,
+                },
+            )
+            .await
+        );
+        let pending = deliver(
+            &tx1,
+            TranslateOut {
+                segment: "more".into(),
+                done: false,
+            },
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), pending)
+                .await
+                .is_err(),
+            "a full channel waits; it must not report the consumer as gone"
+        );
+        let drained = rx1.recv().await.expect("drain one slot");
+        assert_eq!(drained.expect("the queued segment").segment, "fill");
+
+        drop(rx);
+        assert!(
+            !deliver(
+                &tx,
+                TranslateOut {
+                    segment: "b".into(),
+                    done: false,
+                },
+            )
+            .await,
+            "a dropped receiver is the signal every branch must act on"
+        );
+    }
 
     #[tokio::test]
     async fn translate_returns_provider_result() {

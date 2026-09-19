@@ -12,6 +12,19 @@
 - 权限片段 `android-glue/AndroidManifest.permissions.xml`（READ_MEDIA_* / READ_EXTERNAL_STORAGE / WRITE_EXTERNAL_STORAGE 已声明）。
 - 例程 `crates/amos-media/examples/scan_dir.rs`（裸扫 DCIM 出 JSON，交叉编译命令见其头注释）。
 
+### 0.1 设备看不见？先跑只读诊断
+
+```sh
+make android-usb              # = bash scripts/diagnose-android-usb.sh（7 步只读探针）
+make android-usb ARGS=--fix   # 只在合适处重启 adb；不触碰 USB 硬件
+```
+
+`adb devices` 为空时本清单 §1 的每一步都无法执行。这个探针在 **macOS 主机**上按 7 步
+逐条给出结论（adb 本体 / USB 线缆与端口 / ROM 的开发者选项 / `usbmuxd` 层 …），并把
+「看到什么」与「所以该怎么办」分开写；它**不修改任何状态**（`--fix` 只重启 adb）。
+（REQ-A454 之前它没有任何调用点 —— Makefile、CI 与每一个可达脚本都不提它，
+`unwired-script-scan` 因此把它判成死重量。）
+
 ## 1. 路径 A：root 测试机先验 `scan_dir`（最快验证裸读通路）
 ```sh
 # 交叉编译（本仓库方式：直连 NDK clang，非 cargo-ndk）

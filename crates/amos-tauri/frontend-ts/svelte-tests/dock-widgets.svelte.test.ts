@@ -94,8 +94,12 @@ describe("dock widgets (mounted alone)", () => {
     const tile = container.querySelector<HTMLButtonElement>('[data-testid="dock-trash"]')!;
     expect(tile.disabled).toBe(true);
     expect(tile.getAttribute("aria-disabled")).toBe("true");
-    expect(tile.getAttribute("aria-label")).toBe(zh["desktop.trashUnavailable"]);
-    expect(tile.getAttribute("aria-label")).toContain("尚未接入");
+    expect(tile.getAttribute("aria-label")).toBe(zh["desktop.trashInFiles"]);
+    // The name says **where the trash is**. REQ-A455 shipped the trash (inside Files) and
+    // made the old reason — "not wired up yet: there is no trash view" — **untrue**; a
+    // reason that has stopped being true is worse than none, because it sends the reader
+    // looking for a feature that already exists.
+    expect(tile.getAttribute("aria-label")).toContain("文件");
     // Dimmed rather than invisible: the slot is still part of the dock's shape.
     expect(tile.className).toContain("opacity-40");
   });

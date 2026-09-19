@@ -16,9 +16,13 @@
     createSpace,
     deleteSpace,
     renameSpace,
+    moveWindowToSpace,
+    unfileWindow,
+    fileableWindows,
     type Space,
   } from "../lib/spaces";
   import { bridgeDiag } from "../lib/backend";
+  import { wmWindows, type WmWindowInfo } from "../lib/wm";
   import { t } from "./locale.svelte";
 
   let spaces = $state<Space[]>([]);
@@ -27,6 +31,14 @@
   let error = $state<string | null>(null);
   let editingId = $state<string | null>(null);
   let editingName = $state("");
+  /**
+   * The app windows a desktop can own (REQ-A449). `null` means the host did not answer the
+   * `wm_windows` call — the panel says so rather than drawing an empty list, which would read as
+   * "you have no windows".
+   */
+  let windows = $state<WmWindowInfo[] | null>(null);
+  /** Label of the window being filed (the selects are disabled while one is in flight). */
+  let assigning = $state<string | null>(null);
 
   /**
    * Translate a `spaces_*` error code from `bridgeDiag()` into a user-facing
@@ -75,9 +87,59 @@
       }
       spaces = list;
       currentIndex = active ?? 0;
+      // The window list is read on every ledger reload so the two views cannot disagree: which
+      // desktop owns a window is the ledger's answer, and it is what the panel draws next to it.
+      await loadWindows();
     } finally {
       loading = false;
     }
+  }
+
+  /**
+   * The host's app windows — the ones a desktop can actually own (REQ-A449).
+   *
+   * Which windows qualify is [`fileableWindows`]'s rule (one place, unit-tested); this function
+   * only adds the "the host did not answer" third state, which the panel renders as such instead
+   * of as an empty list.
+   */
+  async function loadWindows() {
+    const snapshot = await wmWindows();
+    windows = snapshot === null ? null : fileableWindows(snapshot);
+  }
+
+  /** Which desktop owns `label`, or `null` when nothing has filed it yet. */
+  function spaceOfWindow(label: string): string | null {
+    return spaces.find((s) => s.windows.includes(label))?.id ?? null;
+  }
+
+  /**
+   * File a window into a desktop — the last piece of Spaces that had **no UI at all** (REQ-A449):
+   * `spaces_move_window` existed on the bridge and nothing called it, so only a window filed by
+   * hand from a shell could ever follow a desktop switch.
+   *
+   * After the move this **re-applies the active desktop** rather than deciding visibility here:
+   * the host's `switch_plan` is the single rule that says what disappears and what appears, and
+   * calling it with the current index is exactly "make the screen match the ledger". A window just
+   * filed to *another* desktop therefore leaves the screen at once — which is what the user asked
+   * for — without this component re-implementing the rule.
+   */
+  async function handleAssignWindow(label: string, spaceId: string) {
+    if (spaceId === (spaceOfWindow(label) ?? "")) return;
+    assigning = label;
+    error = null;
+    // An empty selection is **not** "do nothing": it is the unfiled state — the one every window
+    // starts in, visible on every desktop. `spaces_move_window` only moves a window *between*
+    // desktops, so reaching that state needs its own command (REQ-A450).
+    const ok =
+      spaceId === "" ? await unfileWindow(label) : await moveWindowToSpace(label, spaceId);
+    if (!ok) {
+      error = spacesErrorLabel(spaceId === "" ? "spaces_unfile_window" : "spaces_move_window");
+    } else {
+      await loadSpaces();
+      await switchSpace(currentIndex);
+    }
+    await loadWindows();
+    assigning = null;
   }
 
   async function handleSwitch(index: number) {
@@ -319,6 +381,52 @@
         </div>
       {/each}
     </div>
+
+    <!-- Window filing (REQ-A449): the half of Spaces that had no UI at all — a window can be
+         filed into a desktop, and the host's `switch_plan` then decides whether it stays on
+         screen. Text lives in the dictionary, never here. -->
+    <section class="mt-8" aria-labelledby="spaces-windows-heading">
+      <h3
+        id="spaces-windows-heading"
+        class="font-medium mb-3 text-neutral-800 dark:text-neutral-200"
+      >
+        {t("spaces.windows")}
+      </h3>
+      <p class="text-sm text-neutral-600 dark:text-neutral-400 mb-3">{t("spaces.windowsHint")}</p>
+
+      {#if windows === null}
+        <p class="text-sm text-neutral-600 dark:text-neutral-400">
+          {t("spaces.windowsUnavailable")}
+        </p>
+      {:else if windows.length === 0}
+        <p class="text-sm text-neutral-600 dark:text-neutral-400">{t("spaces.noWindows")}</p>
+      {:else}
+        <ul class="space-y-2">
+          {#each windows as w (w.label)}
+            <li
+              class="flex items-center justify-between gap-3 p-3 rounded-lg bg-neutral-100 dark:bg-neutral-800"
+            >
+              <span class="font-mono text-sm text-neutral-800 dark:text-neutral-200">{w.label}</span>
+              <select
+                class="px-2 py-1 rounded border text-sm text-neutral-900 dark:text-neutral-100 dark:bg-neutral-900 border-neutral-300 dark:border-neutral-700 disabled:opacity-50"
+                aria-label={t("spaces.assignWindow", { label: w.label })}
+                value={spaceOfWindow(w.label) ?? ""}
+                disabled={assigning !== null}
+                onchange={(e) => void handleAssignWindow(w.label, e.currentTarget.value)}
+              >
+                <!-- Choosing this **is** the unfiled state (the window then belongs to every
+                     desktop) — a real action, `spaces_unfile_window`, not a dead placeholder
+                     (REQ-A450). -->
+                <option value="">{t("spaces.unfiled")}</option>
+                {#each spaces as s (s.id)}
+                  <option value={s.id}>{s.name}</option>
+                {/each}
+              </select>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
 
     <!-- 快捷键提示 -->
     <div class="mt-8 p-4 bg-neutral-100 dark:bg-neutral-800 rounded-lg">

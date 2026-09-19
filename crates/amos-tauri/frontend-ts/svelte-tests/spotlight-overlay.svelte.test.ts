@@ -15,7 +15,7 @@
  * identical; this test exists to keep the patterns lockstep.
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { render } from "@testing-library/svelte";
+import { fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SpotlightOverlay from "../src/svelte/SpotlightOverlay.svelte";
 import * as backend from "../src/lib/backend";
@@ -42,5 +42,32 @@ describe("SpotlightOverlay — bridge-contract compliance (REQ-A297 §4)", () =>
     // surface: bridgeDiag is mocked, layout reads return null, and the
     // component should not throw.
     expect(() => render(SpotlightOverlay, { props: { onclose: vi.fn() } })).not.toThrow();
+  });
+
+  test("picking a search result really opens it (wm_open reaches the host)", async () => {
+    // REQ-A414: `openApp` called `wmOpenWithDiag` while the file still imported the
+    // plain `invoke` — every pick (Enter or click) threw a `ReferenceError` inside the
+    // async handler, so Spotlight closed and nothing opened. The case above only
+    // *rendered* the panel, which is exactly why the gap survived.
+    const calls: Array<{ cmd: string; args?: unknown }> = [];
+    vi.mocked(backend.invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      calls.push({ cmd, args });
+      return cmd === "wm_open" ? true : null;
+    });
+    window.localStorage.clear();
+    const onclose = vi.fn();
+    render(SpotlightOverlay, { props: { onclose } });
+    await tick();
+
+    const input = document.querySelector<HTMLInputElement>("input[aria-label]")!;
+    await fireEvent.input(input, { target: { value: "clock" } });
+    await tick();
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await tick();
+
+    const open = calls.find((c) => c.cmd === "wm_open");
+    expect(open, "wm_open never reached the host").toBeTruthy();
+    expect(open!.args).toEqual({ label: "clock" });
+    expect(onclose).toHaveBeenCalled();
   });
 });

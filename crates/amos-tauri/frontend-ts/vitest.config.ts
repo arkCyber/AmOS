@@ -21,7 +21,7 @@ export default defineConfig({
   ],
   test: {
     environment: "happy-dom",
-    setupFiles: ["./svelte-tests/setup-localstorage.ts"],
+    setupFiles: ["./svelte-tests/setup-localstorage.ts", "./svelte-tests/setup-net-sentinel.ts"],
     include: ["svelte-tests/**/*.test.ts"],
     exclude: ["node_modules/**", "src/__tests__/**"],
     // A handful of React↔Svelte parity DOM tests mount + settle on a per-test

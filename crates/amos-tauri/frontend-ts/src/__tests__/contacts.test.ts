@@ -23,6 +23,8 @@ import {
   contactLetter,
   avatarHue,
   groupContacts,
+  getAvatarThemes,
+  isAvatarTheme,
   type Contact,
 } from "../lib/contacts";
 
@@ -205,3 +207,84 @@ describe("contacts: search & sort & store round-trip", () => {
     expect(groups[1]!.items[0]!.name).toBe("bob");
   });
 });
+
+/**
+ * REQ-A406 — 读侧对 `customAvatar` 的校验、`editContact` 清空备注的路径，以及
+ * `isAvatarTheme` 这个类型守卫。三者此前都没有测试碰过（`contacts.ts` 的 60 行缺失里
+ * 最便宜的一块）。
+ */
+describe("customAvatar 读侧校验（REQ-A406）", () => {
+  const avatar = (a: unknown) =>
+    normalizeOne({ name: "张三", phones: ["13800000000"], customAvatar: a }, "id-1", new Set())?.customAvatar;
+
+  test("合法 base64 / file + 非空 data ⇒ 保留（thumbnail 可选）", () => {
+    expect(avatar({ type: "base64", data: "data:image/png;base64,AAAA" })).toEqual({
+      type: "base64",
+      data: "data:image/png;base64,AAAA",
+      thumbnail: undefined,
+    });
+    expect(avatar({ type: "file", data: "/tmp/x.png", thumbnail: "/tmp/t.png" })).toEqual({
+      type: "file",
+      data: "/tmp/x.png",
+      thumbnail: "/tmp/t.png",
+    });
+  });
+
+  test("协议外的 type / 空 data / 非字符串 data ⇒ 整个 customAvatar 丢掉（不留半条）", () => {
+    for (const bad of [
+      { type: "url", data: "/x.png" },
+      { type: "base64", data: "" },
+      { type: "file", data: 42 },
+      { data: "/x.png" },
+      {},
+      "a string",
+      5,
+    ]) {
+      expect([JSON.stringify(bad), avatar(bad)]).toEqual([JSON.stringify(bad), undefined]);
+    }
+  });
+
+  test("thumbnail 不是非空字符串 ⇒ 只丢 thumbnail，头像本体留着", () => {
+    expect(avatar({ type: "base64", data: "/x", thumbnail: "" })).toEqual({
+      type: "base64",
+      data: "/x",
+      thumbnail: undefined,
+    });
+    expect(avatar({ type: "base64", data: "/x", thumbnail: 7 })?.data).toBe("/x");
+  });
+});
+
+describe("editContact：清空备注与被拒的编辑（REQ-A406）", () => {
+  const list = [c("张三", ["138"])];
+
+  test("把备注改成空白 ⇒ 备注被清掉（不是留一个空字符串）", () => {
+    const withNote = editContact(list, list[0]!.id, { note: " 备忘 " });
+    expect(withNote[0]!.note).toBe("备忘");
+    const cleared = editContact(withNote, list[0]!.id, { note: "   " });
+    expect(cleared[0]!.note).toBeUndefined();
+  });
+
+  test("空名字 / 空号码的编辑被拒（原记录不动）", () => {
+    expect(editContact(list, list[0]!.id, { name: "   " })).toEqual(list);
+    expect(editContact(list, list[0]!.id, { phones: [] })).toEqual(list);
+    expect(editContact(list, "no-such-id", { name: "x" })).toEqual(list);
+  });
+});
+
+describe("isAvatarTheme（类型守卫，REQ-A406）", () => {
+  test("七个主题都认，其余一律不认", () => {
+    for (const t of ["animals", "food", "nature", "symbols", "faces", "flags", "sports"]) {
+      expect([t, isAvatarTheme(t)]).toEqual([t, true]);
+    }
+    for (const t of ["", "ANIMALS", "animals ", "system", "emoji"]) {
+      expect([t, isAvatarTheme(t)]).toEqual([t, false]);
+    }
+  });
+
+  test("与 getAvatarThemes() 的清单一致（加了主题却忘了守卫就会红）", () => {
+    const themes = getAvatarThemes();
+    expect(themes).toHaveLength(7);
+    expect(themes.every((t) => isAvatarTheme(t))).toBe(true);
+  });
+});
+

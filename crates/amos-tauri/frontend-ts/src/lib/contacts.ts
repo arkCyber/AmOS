@@ -6,6 +6,7 @@
  * disk). All list operations return new arrays and never mutate their input; they
  * tolerate corrupt / partial stored data via {@link normalizeContacts}.
  */
+import { localId } from "./localId";
 
 /** Custom avatar data for a contact. */
 export interface CustomAvatar {
@@ -69,9 +70,18 @@ export function cleanPhones(phones: unknown): string[] {
   return out;
 }
 
-/** A new unique contact id (time + random suffix). */
+/** A new contact id.
+ *
+ * One owner for the shape: the shared `localId` (REQ-A401). Before, this site minted
+ * `` `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}` `` — ~31
+ * bits of luck, and a tight loop under a frozen clock collides (measured for the 5-char
+ * sibling sites: 3/20,000). Contact ids are identity: a collision makes two entries
+ * indistinguishable to `editContact`/`removeContact` and to the dedup pass in
+ * {@link normalizeContacts}. `localId` adds a process-monotonic counter, so uniqueness
+ * does not rest on the random tail. The `c` prefix is kept (no consumer parses it).
+ */
 export function makeContactId(): string {
-  return `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  return localId("c");
 }
 
 /** A contact is usable iff it has a name and at least one phone number. */

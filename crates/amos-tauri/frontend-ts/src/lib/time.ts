@@ -1,4 +1,6 @@
 /** Pure helpers for UI time/status so they can be unit-tested. */
+import { localId } from "./localId";
+
 export function fmtClock(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}`;
@@ -419,8 +421,6 @@ export interface AlarmState {
   lastKey: string;
 }
 
-let alarmSeq = 0;
-
 export type AlarmAction =
   | { type: "add"; hour: number; min: number; label: string; repeat?: number[]; tone?: string; snoozeMin?: number }
   | {
@@ -469,9 +469,14 @@ export function alarmsReducer(s: AlarmState, a: AlarmAction): AlarmState {
     case "add": {
       const { h, m } = normalizeAlarm(a.hour, a.min);
       const repeat = cleanRepeat(a.repeat);
-      alarmSeq += 1;
       const alarm: Alarm = {
-        id: `${Date.now().toString(36)}-${alarmSeq}`,
+        // REQ-A402: `${Date.now().toString(36)}-${alarmSeq}` carried a wall-clock reading
+        // plus a **per-process** counter — no entropy, so two contexts (this shell runs
+        // several windows over one store) agreeing on a millisecond minted the same id;
+        // measured with two processes + a frozen clock. The id is identity: `dismiss`/
+        // `toggle`/`update`/`remove` and the native-alarm registrations (`alarm:<id>` in
+        // `alarmCore`/`osAlarmArm`) all match on it.
+        id: localId("alarm"),
         hour: h,
         min: m,
         label: a.label.trim() || "",

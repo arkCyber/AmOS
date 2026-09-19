@@ -133,19 +133,39 @@ describe("messages", () => {
     expect(d[0]!.id).toBe("c:王五");
   });
 
+  test("two id-less rows with the same name get DIFFERENT ids (REQ-A402)", () => {
+    // This is the exact corruption `normalizeConversations` exists to tolerate: rows
+    // written without an id. It used to hand both of them `c:<name>` — one id, two
+    // conversations — so `removeConversation` deleted both and a message append could
+    // land in the wrong thread. Its sibling kernels all de-dup; measured before the fix:
+    // ids ["c:小安","c:小安"], removeConversation removed 2 rows.
+    const list = normalizeConversations([{ name: "小安", msgs: [] }, { name: "小安", msgs: [] }]);
+    expect(list).toHaveLength(2);
+    expect(new Set(list.map((c) => c.id)).size).toBe(2);
+    expect(list[0]!.id).toBe("c:小安"); // the first keeps the derived base
+    expect(removeConversation(list, list[0]!.id)).toHaveLength(1); // only one row goes
+  });
+
+  test("addConversation mints an opaque id (not the name + a millisecond)", () => {
+    const c = addConversation(seedConversations(1), "李四");
+    const id = c[1]!.id;
+    expect(id).toMatch(/^chat-/);
+    expect(id).not.toContain("李四");
+  });
+
   test("addConversation adds once and refuses blank/duplicate", () => {
     let c = seedConversations(1);
-    const n1 = addConversation(c, " 李四 ", 2);
+    const n1 = addConversation(c, " 李四 ");
     expect(n1.length).toBe(2);
     // duplicate (same name) and blank → unchanged
-    expect(addConversation(n1, "李四", 3).length).toBe(2);
-    expect(addConversation(n1, "   ", 3).length).toBe(2);
+    expect(addConversation(n1, "李四").length).toBe(2);
+    expect(addConversation(n1, "   ").length).toBe(2);
     const addedConv = n1[1]!;
     expect(findConversation(n1, addedConv.id)?.name).toBe("李四");
   });
 
   test("removeConversation drops by id (absent → unchanged)", () => {
-    const withLi = addConversation(seedConversations(1), "李四", 2);
+    const withLi = addConversation(seedConversations(1), "李四");
     const id = withLi[1]!.id;
     const gone = removeConversation(withLi, id);
     expect(gone.length).toBe(1);

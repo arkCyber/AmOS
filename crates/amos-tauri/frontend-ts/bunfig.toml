@@ -1,0 +1,10 @@
+# bun's config for this package.
+#
+# `[test] preload` arms the network sentinel for **every** `bun test` run in this directory —
+# including the bare ones (`bun test --watch`, `bun run test:coverage`) that bypass
+# `scripts/bun-iso-test.mjs`. The sentinel replaces the default `fetch` with a recorder that
+# rejects, so a test that reaches the network for real fails instead of silently depending on
+# it; the runner turns the record into a per-file failure (REQ-A403). A file's own stub still
+# runs. See `scripts/net-sentinel.mjs` for why this guard is runtime, not a grep.
+[test]
+preload = ["./scripts/net-sentinel.mjs"]

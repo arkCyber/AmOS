@@ -12,7 +12,7 @@
  *   - 运行时通过 `resolveEffectiveBindings()` 合并配置
  *   - 冲突检测在保存前进行，防止无效配置
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 import type { ShellShortcut } from "./shellModule";
 
 /** 快捷键配置存储键名。 */
@@ -63,12 +63,17 @@ export function readKeyboardConfig(): KeyboardConfig {
   return stored;
 }
 
-/** 保存配置。 */
+/**
+ * 保存配置。
+ *
+ * REQ-A406: 返回值此前**恒为 true** —— `writeStoreValue` 的失败被吞掉，而签名承诺了一个
+ * 布尔。设置页现在忽略它，但"API 说谎"本身就是下一处会骗人的地方：改用
+ * `writeStoreValueChecked` 如实回报（存储被拒 = 用户这次改动没落盘）。
+ */
 export function writeKeyboardConfig(config: KeyboardConfig): boolean {
   config.version = CONFIG_VERSION;
   config.updatedAt = Date.now();
-  writeStoreValue(KEYBOARD_CONFIG_KEY, config);
-  return true;
+  return writeStoreValueChecked(KEYBOARD_CONFIG_KEY, config);
 }
 
 /** 重置为默认配置。 */
@@ -152,47 +157,55 @@ export function detectConflicts(
     }
   }
 
-  // 应用用户覆盖
+  // 应用用户覆盖。
+  //
+  // REQ-A406: 覆盖是**替换**，所以每组覆盖生效前先把该 id 从**所有**键里摘掉。原来的两处
+  // 洞都出在这里：`applyOverride` 只往新键里加（换绑后旧键仍指向这个功能 ⇒ 冲突面板会为
+  // 一个已经不存在的重叠报警），而"禁用"分支只算了 `arr.findIndex(...)` 就把结果丢掉 ——
+  // 一个没有副作用的空循环，于是**禁用根本不生效**（默认绑定还在）。
+  const removeEverywhere = (id: string) => {
+    for (const [key, arr] of keyToFunctions) {
+      const kept = arr.filter((x) => x.id !== id);
+      if (kept.length === 0) keyToFunctions.delete(key);
+      else keyToFunctions.set(key, kept);
+    }
+  };
   const applyOverride = (id: string, shortcut: ShellShortcut | null) => {
-    if (!shortcut) return; // 禁用，不加入
+    if (!shortcut) return; // 禁用：由 removeEverywhere 负责（调用方已先行调用）
     const key = serializeShortcut(shortcut);
     const labelKey = labelKeys.get(id) ?? id;
     if (!keyToFunctions.has(key)) {
       keyToFunctions.set(key, []);
     }
     const arr = keyToFunctions.get(key)!;
-    // 移除旧条目（如果有）
-    const filtered = arr.filter((x) => x.id !== id);
-    filtered.push({ id, labelKey });
-    keyToFunctions.set(key, filtered);
+    if (!arr.some((x) => x.id === id)) arr.push({ id, labelKey });
   };
 
   // 应用 overlays
   for (const [id, shortcuts] of Object.entries(config.overlays)) {
+    removeEverywhere(id);
     if (shortcuts) {
       for (const s of shortcuts) {
         applyOverride(id, s);
-      }
-    } else {
-      // 禁用：从所有键映射中移除
-      for (const arr of keyToFunctions.values()) {
-        arr.findIndex((x) => x.id === id);
       }
     }
   }
 
   // 应用 system
   for (const [id, shortcut] of Object.entries(config.system)) {
+    removeEverywhere(id);
     applyOverride(id, shortcut);
   }
 
   // 应用 spaces
   for (const [id, shortcut] of Object.entries(config.spaces)) {
+    removeEverywhere(id);
     applyOverride(id, shortcut);
   }
 
   // 应用 touch
   for (const [id, shortcut] of Object.entries(config.touch)) {
+    removeEverywhere(id);
     applyOverride(id, shortcut);
   }
 

@@ -52,7 +52,7 @@
 | 维度 | 得分 | 说明 |
 |------|------|------|
 | 视觉还原 | 90/100 | 顶栏/Dock/Launchpad 高度还原 macOS Aqua |
-| 交互体验 | 85/100 | 快捷键/手势完整，缺 Drag & Drop |
+| 交互体验 | 85/100 | 快捷键/手势完整；**Dock 拖拽排序已交付（REQ-A456）**，其余拖放（Launchpad / 文件→图标）仍缺 |
 | 窗口管理 | 80/100 | 多窗口完整，缺 Spaces / Exposé |
 | 系统集成 | 70/100 | 原生菜单完整，缺通知中心侧栏 |
 | 可访问性 | 95/100 | ARIA/键盘导航/读屏支持完整 |
@@ -171,11 +171,35 @@ console.log(`Launchpad 打开: ${avg(metrics.launchpadOpen).toFixed(2)}ms`);
 
 ## 三、短期改进建议（本月）
 
-### 1. Drag & Drop 支持（1 周）
+### 1. Drag & Drop 支持（1 周）—— **Dock 一半已交付（REQ-A456，2026-09-19）**
 
 **功能**：Dock 图标拖动排序
 
-**实现要点**：
+> **现状（2026-09-19）**：Dock 拖拽排序**已实现** —— 见
+> `svelte/Dock.svelte`（委托式 pointer 路径）＋ `lib/amosStore.ts::dockReorderIds /
+> reorderVisibleDock`（纯函数）＋ `svelte-tests/dock-reorder.svelte.test.ts`（4 例，含
+> "点击仍然打开 app" 与"释放到系统项上什么都不发生"）。
+>
+> **与本页下面这版草图的差异（有意，且各有理由）**：
+> 1. **没有用 HTML5 `dataTransfer`**：Dock 的瓦片是 `<button>`，HTML5 拖拽会与它的点击
+>    语义打架（拖一下就不再触发 click），而放大镜是 `transform` 上的——`dataTransfer`
+>    的 ghost image 拿不到那个 transform。改用 pointer 事件（`mousedown`/`mousemove`/
+>    `mouseup` + 位移阈值），与 `DesktopStage` 的桌面图标拖拽同一条路。
+> 2. **落位规则不是"插到目标之前"**：`moveBefore`（跨列表移动）总是插在目标**前面**，
+>    在 Dock 里向右拖会少一格。macOS 的规则是"落进被悬停图标的槽位"，所以新函数按
+>    方向决定锚点（`from < to ? anchor + 1 : anchor`），并被 4 条纯逻辑用例钉住。
+> 3. **写回必须保留"看不见的那些"**：桌面不画 `phone`（`withoutPhone`），而
+>    `DEFAULT_DOCK` 里就有它 —— 直接写回显示列表会**删掉**它（手机形态的 Dock 项）。
+>    `reorderVisibleDock` 只置换可见项、其余留在原槽位（负控：换成朴素写回 ⇒ 纯逻辑与
+>    DOM 用例同时红）。
+> 4. **顺带修掉一个潜伏缺陷**：Dock 此前把 layout 当"挂载时的快照"读
+>    （`$derived(getLayout(...))` 不读任何信号），所以别的窗口改了布局它也不跟；现在订阅
+>    共享 store。
+>
+> **仍未做**（本页下面那些仍然是待办）：Launchpad 内的图标排序 / 跨页移动、桌面图标拖到
+> Dock、**把文件拖到 Dock 图标上**（跨应用传数据）。
+
+**实现要点**（下面这版是**原始草图**，保留作为当初的意图记录；实际实现见上面的差异说明）：
 ```typescript
 // Dock.svelte 添加拖拽支持
 let draggedId: string | null = $state(null);
@@ -444,7 +468,7 @@ git commit -m "test(desktop): comprehensive test coverage + audit report
 - [ ] 分批提交代码（4 个 commit）
 
 ### 📅 本月（推荐）
-- [ ] Drag & Drop 支持（1 周）
+- [x] **Drag & Drop：Dock 拖拽排序（REQ-A456，2026-09-19）** —— 剩下 Launchpad 排序 / 跨页移动、桌面图标→Dock、文件→Dock 图标仍是待办（见 §三.1）
 - [ ] Spotlight 计算器（2 天）
 - [ ] 用户手册（3 天）
 

@@ -75,6 +75,7 @@ System UI and the CLI read it through.
     ├── amos-devocare/           # device-care (手机管家) domain core: junk scan→analyze→plan→execute (uri-dedup, review-only needs acknowledgement) with a CleanProvider seam + root-confined `hostfs` backend (bounded depth, no symlink follow, user media never matched), UninstallGuard (system + pinned-critical refusals), read-only sensitive-permission review, and a folded CareReport where unknown areas stay unassessed (docs/devcare.md)
     ├── amos-link/               # AmOS-Link robot middleware (ROS-class): key-expression topics + `*`/`**` with channel-implied QoS profiles, bincode `Envelope` frames with CRC32 + a 16 MiB frame ceiling, ROS-like QoS (best-effort latest-wins vs reliable back-pressure, counted as `blocked`), in-process Broker transport + optional Zenoh inter-board transport (`zenoh`), bus federation + CRC-checked UDP-beacon discovery (`lan`, with a repeating announcer so a peer that joins the LAN later still learns one that booted earlier) with static peers that never TTL-expire, heartbeats/NodeStatus + per-publisher sequence-gap accounting, a JSON→motor-frame robot HAL with validated frame/joint invariants, a latched e-stop + deadman watchdog, and a tonic control plane mounted by the daemon (docs/amos-link.md)
     ├── amos-link-cli/           # robot-middleware CLI: status / topics / pub / sub / bench / discover (mock|bus|lan) / watch / motor over one in-process node, or `--socket <path>` to read a *running* daemon's control plane (status/topics/pub/watch; process-level smoke in tests/cli_smoke.rs)
+    ├── amos-robot/              # autonomy stack above the link: a Mahony 6-DOF attitude estimator that reports `GyroOnly{reason}` when gravity is unreadable and keeps yaw `DeadReckoned` until a heading is actually given; grid A* + line-of-sight smoothing + `Grid::inflated` (for the footprint a planner cannot know) + pure pursuit emitting the *profile's own* set points (`Actuator::check` / `Platform::plan`); and a control loop whose cadence is **measured** (lateness vs overruns, bounded percentile window, `Unknown` before the second tick) (docs/robot-autonomy.md)
     └── amos-tauri/               # Tauri 2 System UI (gRPC *client* bridge)
 ```
 
@@ -290,6 +291,32 @@ cargo run -p amos-link --example uav_mission
 cargo run -p amos-link --example road_autonomy
 cargo test -p amos-link --test platform_cases     # 18 profile contracts (docs/robot-domains.md)
 
+### The layer above it (`amos-robot`)
+
+`crates/amos-robot` is what the middleware deliberately does not do: *which way am I pointing*,
+*how do I get there*, and *is the loop holding its cadence*. An attitude estimator (Mahony 6-DOF)
+that reports what it could not see (`GyroOnly{reason}` when gravity is unreadable, yaw
+`DeadReckoned` until a heading is actually supplied, a stall past 250 ms refused instead of
+bridged); grid A* with deterministic tie-breaking, a corner rule, line-of-sight smoothing and
+`Grid::inflated` for the footprint a planner cannot know; pure pursuit whose aim point is measured
+from the vehicle's projection onto the route and whose output **is** the profile's own set points
+(validated with `Actuator::check`, planned with `Platform::plan`); and a control loop around
+`RobotBridge` that **measures** its cadence (lateness vs overruns, a bounded percentile window that
+says when it rolled, `Unknown` before the second tick). The closed-loop test found two real defects
+on the way — a stateless aim point that aimed *behind* a vehicle which had driven past a waypoint,
+and an arrival radius smaller than the machine's turning radius — both recorded in
+[`docs/robot-autonomy.md`](docs/robot-autonomy.md). A second pass (REQ-A411) added the scanner-shaped
+`Grid::from_occupancy`/`occupancy()` pair and fixed three numbers that lied: `Path::cost()` priced a
+smoothed waypoint leg as one step (a 5-step route's simplification read *cheaper* than the route),
+and a restarted `ControlLoop` charged the loop for the idle gap between two paced runs — both now
+refuse to answer rather than answer wrongly.
+
+```bash
+cargo test -p amos-robot                     # 51 unit + 2 cross-crate e2e + 10 doc tests, offline
+cargo run -p amos-robot --example patrol_loop  # plan → drive → estimate → tick → deadman
+```
+
+
 # The CLI: one in-process node, one command per operator question.
 cargo run -p amos-link-cli -- status                              # identity · counters · peers · verdict
 cargo run -p amos-link-cli -- bench --count 2000 --size 4096      # real publish→decode latency
@@ -483,11 +510,22 @@ Run the full suite (Rust unit + end-to-end UDS RPC + TS System-UI) from the repo
 
 ```bash
 make test          # = cargo test --workspace && bun run test (frontend-ts)
-make check         # fast React/TS check (bun test + typecheck)
+make check         # frontend gate suite (bun run check): bun test + tsc + svelte-check
+                   # (--fail-on-warnings) + the vitest DOM suite + 15 read-only scanners
 make verify        # everything that needs no device: lint + test + cov + ci-local +
                    # smoke/sup-smoke/timesync-smoke/honesty-smoke + e2e-local +
                    # gated-check + the android/glue/audio/pdf/vector-db checks
 ```
+
+The frontend half of `make check` / `make verify` is one script — `bun run check` in
+`crates/amos-tauri/frontend-ts/package.json`. It chains the tests (`bun test`, `tsc --noEmit`,
+`svelte-check --fail-on-warnings`, the vitest DOM suite) and then every **read-only scanner**, with
+`--selftest` first in each case: `unwired` (dead exports / unmounted components), `i18n` (key and
+`{param}` parity, hard-coded copy, unresolved `t("…")`), `store` and `write` (store-key
+classification, write honesty), `a11y`, `svelteignore` (**compiler suppressions** — each declared
+with a reason, that reason quoted on site, and re-proved *live*), `hover`, `lifetime`, `reactfree`,
+`testreach`, `idgen` (unverified id minting), `sentinel` (no network during the suite) and `covgate`
+(core-lib line coverage ≥ threshold).
 
 `make verify` is the sequential local equivalent of the CI jobs (REQ-A193: 18 device-free
 targets, all EXIT=0 on 2026-09-13). Targets that need a phone (`make android-app`, `make device-eval`),
@@ -520,6 +558,48 @@ make ci-local            # local parity gate: shell + workflow YAML + NDK/cargo-
 git-ignored `.cargo/config.toml`, so a stale machine path can't leak into CI.
 Native-gated CI jobs can opt into running inside that pinned container by setting
 the repository Variable `CI_ANDROID_IMAGE`. See `docs/ci-engineering.md`.
+
+## Recent additions (2026-09-19)
+
+- **Compiler suppressions got a carrier and a ratchet (REQ-A472)** — the follow-up to
+  REQ-A471's own honest record. A `svelte-ignore` is a *local* exemption whose reason used to
+  live only in a comment on site, with **nothing** checking that it still held; and
+  `--compiler-warnings` (the per-rule ignore/error mechanism) had **no cross-file carrier**, so
+  relaxing a rule could only be an unexplained flag edit in `package.json`. Measured first: with
+  the real exemption in place, an *extra* `a11y_media_has_caption` ignore sitting above a `<div>`
+  produced `0 errors and 0 warnings`, exit 0 — svelte-check reports an *unknown* code
+  (`unknown_code`, already fatal via `--fail-on-warnings`) but says **nothing** about a suppression
+  that no longer suppresses anything. The fix is a carrier
+  (`crates/amos-tauri/frontend-ts/scripts/svelte-ignore-allowlist.json`: every `file+code` with a
+  `reason` that **quotes the on-site comment verbatim**, plus the only sanctioned way to relax a
+  `--compiler-warnings` code) and a gate (`scripts/svelte-ignore-scan.mjs`, in `bun run check` and
+  `make lint`): undeclared sites, stale entries, drifted reasons, missing on-site prose, a
+  non-Svelte code, a relaxation that is not declared, and — the part nothing else could see — a
+  **liveness** probe that removes *that* suppression, forces that one code to `error` and requires
+  the count of that code in the file to **rise** (a "did it fire at all" test reads a retired
+  exemption as live when the same code fires elsewhere and is separately suppressed). The probe
+  restores the file in a `finally` and verifies it byte-for-byte by sha256 — a failed restore exits
+  `2` instead of leaving a modified tree. Evidence: `--selftest` **24 assertions**, the gate green
+  (`1 suppression, 1 live`), `bun run check` EXIT=0, `fmea-gen --check` **181** (+F-DEV-064), and
+  **8/8 negative controls** (byte-identical restore each time) covering every rule. Honest
+  boundaries: the liveness probe really does un-suppress the file for ~10 s, so it must run
+  serially; sites outside `tsconfig.json`'s `include` (`svelte-tests/`) are declared but reported as
+  liveness `skipped`; the recognised-code set is read from the **installed** Svelte; and the gate
+  checks the *syntax and declaration* of a relaxation, not whether relaxing it was wise. See
+  `docs/FMEA.md` (F-DEV-064) · `docs/TRACEABILITY_MATRIX.md` (REQ-A472).
+
+- **The compiler's own warnings became a gate (REQ-A471)**: `svelte-check` ran in `bun run check` /
+  `make check` / CI but **without** `--fail-on-warnings`, so three real a11y warnings sat in the
+  output forever while every gate stayed green — two `<label>`s not associated with their control
+  in `VoiceMemosApp.svelte` and a preview `<video>` with no captions track in `FilesApp.svelte`.
+  Both instruments were silent: the repo's own `a11y-scan` (6 heuristic dimensions) reported **0
+  gaps** because neither class is one of its dimensions. Fixed by giving the two trim sliders
+  `for`/`id` (the accessible name is unchanged — the inputs already had matching `aria-label`s; the
+  missing relation was "this label belongs to this control"), and by a **reasoned** `svelte-ignore
+  a11y_media_has_caption` on the user's own file (a captions track can only come from the file
+  itself — synthesising one would put a claim on screen that nobody made), with
+  `--fail-on-warnings` added so the class cannot come back. The video exemption is deliberately
+  **kept**; REQ-A472 later gave it the carrier and the liveness instrument.
 
 ## Recent additions (2026-09-14 → 2026-09-15)
 
@@ -591,6 +671,8 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — How to contribute
 - [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) — Community guidelines
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
+- [docs/FMEA.md](./docs/FMEA.md) — FMEA ledger: failure modes whose mitigations are verified against the code by `scripts/fmea-gen.mjs` (`make lint` runs its `--check`)
+- [docs/TRACEABILITY_MATRIX.md](./docs/TRACEABILITY_MATRIX.md) — Requirements → code → verification ledger (a **partial** index; `scripts/trace-scan.mjs` keeps it readable as an index)
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture
 - [docs/PC_DESKTOP_AUDIT.md](./docs/PC_DESKTOP_AUDIT.md) — PC desktop (macOS) form-factor audit + roadmap
 - [docs/PC_DESKTOP_ARCHITECTURE.md](./docs/PC_DESKTOP_ARCHITECTURE.md) — PC desktop (macOS) shell architecture: `DesktopShell` + TopBar/Dock/Launchpad/Spotlight/MissionControl + multi-window stage

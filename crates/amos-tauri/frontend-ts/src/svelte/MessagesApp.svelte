@@ -507,7 +507,7 @@
   };
   const confirmAdd = () => {
     const before = conversations;
-    const next = addConversation(before, newName, Date.now());
+    const next = addConversation(before, newName);
     if (next.length === before.length) return; // blank or duplicate → no-op
     const added = next[next.length - 1] as Conversation; // addConversation appended it
     saveConvs(next);

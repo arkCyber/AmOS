@@ -14,14 +14,14 @@
   //
   // 数据：实时读 home layout（page + dock，去重） → APP_META 元信息。
   import { onMount } from "svelte";
-  import { bridgeDiag, invoke } from "../lib/backend";
+  import { announceAppOpened } from "../lib/shortcuts";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import { LAYOUT_KEY, type HomeLayout, getLayout, saveLayout } from "../lib/amosStore";
   import { withoutPhone } from "../lib/phoneApps";
   import { launchpadCols, launchpadRows, LAUNCHPAD_COLS_DEFAULT, LAUNCHPAD_ROWS_DEFAULT, LAUNCHPAD_ICON_SIZE, LAUNCHPAD_ICON_GAP } from "../lib/desktopLayout";
   import { GLASS_LAUNCHPAD_STYLE } from "../lib/shellChrome";
   import { t } from "./locale.svelte";
-  import { wmLayoutSnapshot } from "../lib/wm";
+  import { wmLayoutSnapshot, wmOpenWithDiag } from "../lib/wm";
   import { createStoreValue } from "./store";
 
   // 关闭由**壳**决定：浮层从注册表渲染（`DesktopShell`），壳把 `onclose` 传进来。
@@ -106,8 +106,11 @@
   // surface via `bridgeDiag("wm_open")`.
 
   async function openApp(id: string) {
-    const result = await invoke<unknown>("wm_open", { label: id });
-    if (result !== null) {
+    const r = await wmOpenWithDiag(id);
+    if (r.ok) {
+      // An app really opened → tell the automation runtime (`app` triggers). Every
+      // desktop launcher announces here, so `shellState.open` is not the only path.
+      announceAppOpened(id);
       onclose?.();
       return;
     }
@@ -115,7 +118,7 @@
     // The earlier `try/catch` was dead code — `invoke` swallows rejections
     // into `null` per REQ-A296. The user used to see a dead launcher; now
     // we keep a breadcrumb and decide closure from the typed outcome.
-    const diag = bridgeDiag("wm_open");
+    const diag = r.diag;
     if (diag.ok) {
       // Last command succeeded but result was null? Invariant violation —
       // close out of caution.

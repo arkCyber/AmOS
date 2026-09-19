@@ -47,6 +47,11 @@ amos-ime = { path = "../amos-ime" }
 # seam backs the local `media_*` commands (Mock on host; Android MediaStore on-device
 # later). See docs/android-storage-unify.md + docs/media.md.
 amos-media = { path = "../amos-media" }
+# amos-pdf-parser: PDF text extraction backed by lopdf. Used by the files
+# preview command (files_preview_bytes) to render PDF previews in the UI.
+amos-pdf-parser = { path = "../amos-pdf-parser" }
+# flate2: gzip compression for the files bundle export/import.
+flate2 = "1"
 # Shared host<->guest clipboard-sync protocol + ClipboardProvider seam + guest
 # agent core (single source of truth for the wire contract). The host transport
 # (src/clipboard_guest.rs) re-exports crate::amos_clipboard::proto from here.
@@ -87,6 +92,13 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDict
 objc2-av-foundation = { version = "0.3", features = ["AVRouteDetector", "AVPlayer", "AVAudioSession"] }
 block2 = "0.5"
 
+# `NSApplication` (menu.rs): the two app-menu items that macOS means **app-wide** cannot
+# be expressed with muda items — `hideOtherApplications:` / `unhideAllApplications:` ARE
+# the semantics of "Hide Others" (⌘⌥H) and "Show All" (REQ-A423). Already in the lock via
+# tauri (which enables this exact feature set), so this adds no new code to build.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication"] }
+
 # Opt-in local streaming ASR: compiles + links the native sherpa-onnx lib.
 # Enable with `--features sherpa-asr` (or via tauri), and set AMOS_SHERPA_MODEL_DIR
 # to a directory with tokens.txt + encoder/decoder/joiner .onnx so interpret_start
@@ -97,6 +109,19 @@ block2 = "0.5"
 # AMOS_PIPER_MODEL_DIR to a voice dir so tts_synthesize uses local Piper.
 [features]
 default = []
+# **The production-UI switch, and the reason a release run used to show a white
+# window** (REQ-A421; measured 2026-09-18). `tauri` decides at *compile* time
+# whether the WebView loads `build.devUrl` or the embedded `frontendDist`
+# (`tauri::is_dev() == !cfg!(feature = "custom-protocol")`, and tauri-codegen
+# stamps the same `dev` cfg through `DEP_TAURI_DEV`). The Tauri CLI passes
+# `--features tauri/custom-protocol` on its own, which is why `make app-open`
+# worked — while `cargo build --release -p amos-tauri` did NOT, so
+# `scripts/run-ui-release.sh` ("the PC path that embeds dist") built a binary that
+# fetched `http://localhost:1420`, found nothing and rendered an empty window
+# (measured: main-frame -1004, 1 176 colours, zero `[csp-probe]` lines). Declaring
+# the feature here is what lets a *plain cargo* build ask for the same thing, and
+# `scripts/release-ui-mode-scan.mjs` fails if a release UI build forgets it.
+custom-protocol = ["tauri/custom-protocol"]
 # On-device System UI: back RadioBridge with amos-radio's AndroidRadioProvider
 # and sensor_host with amos-sensor's AndroidSensorProvider (both jni). Desktop/CI
 # omit it so no JNI stack is compiled. Host `cargo check --features android` still
@@ -146,3 +171,10 @@ amos-devocare = { path = "../amos-devocare" }
 # Used by recording.rs tests to create ephemeral directories without needing
 # platform-specific /tmp logic.
 tempfile = "3"
+# `tauri::test::{mock_app, mock_builder, mock_context}` — the only way to drive
+# `dock_badge::apply()` through its **production** path (the ledger it writes, the
+# `dock-badge-changed` emit, the empty-label collapse) without a real window.
+# `test` is an empty feature on the tauri side (no extra dependencies); it exists
+# because tauri's own mock module is behind `cfg(any(test, feature = "test"))`,
+# and a dependency is never compiled with `cfg(test)`.
+tauri = { workspace = true, features = ["test"] }

@@ -92,6 +92,16 @@ pub fn install() {
 /// `RUST_LOG` wins when set (standard `EnvFilter` grammar, e.g. `RUST_LOG=debug`);
 /// otherwise our targets log at INFO and everything else only at WARN. `try_init` keeps
 /// a second call (tests, an embedder that already installed one) a no-op.
+///
+/// **`with_writer(std::io::stderr)` is load-bearing** (REQ-A422, measured 2026-09-18):
+/// `tracing_subscriber::fmt::layer()` defaults to **stdout**, while this module's whole
+/// reason for existing is a sink an operator can capture on the *error* stream — the
+/// stream the platform's own diagnostics use. Launching the built `.app` through
+/// LaunchServices with `open --stderr FILE` produced a file containing only the
+/// `eprintln!` probes and none of these events, because every `tracing` line had gone to
+/// stdout (which `open` discards unless `--stdout` is also passed). Any embedder,
+/// launcher or CI step that captures stderr alone therefore saw a silent host — the
+/// exact failure REQ-A229 set out to end.
 #[cfg(not(target_os = "android"))]
 fn install_stderr() {
     use tracing_subscriber::layer::SubscriberExt;
@@ -101,7 +111,7 @@ fn install_stderr() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("amos=info,warn"));
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .try_init();
 }
 

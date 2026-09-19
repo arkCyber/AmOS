@@ -20,6 +20,8 @@ import type { Locale } from "../i18n/types";
 import { isLocale } from "../i18n/types";
 import { currentLocale, translate, LOCALE_KEY } from "./i18n";
 import { systemStoreSet } from "../lib/backend";
+import { amosWarn } from "../lib/debugLog";
+import { menuSetLocale } from "../lib/wm";
 import { SVELTE_LOCALE_EVENT } from "./locale-events";
 import { AMOS_LOCALE_CHANGED_EVENT } from "./ui-events";
 
@@ -59,6 +61,19 @@ export function setLocale(l: Locale): void {
     // Mirror to the Rust shared store (the locale is stored *raw*, like the theme,
     // not JSON-encoded — `currentLocale()` reads the same raw string back).
     void systemStoreSet(LOCALE_KEY, l);
+    // REQ-A437: the **native menu bar** is drawn by the host, so it has to be told which
+    // language the shell is in — otherwise a Chinese UI keeps an English File / Edit / View
+    // (measured on this machine 2026-09-18). The host rebuilds the tree and answers with the
+    // locale it applied; a failure is reported, not swallowed: an unlocalized menu bar is
+    // exactly the surface nobody would think to look at.
+    void menuSetLocale(l).then((applied) => {
+      if (applied !== null && applied !== l) {
+        amosWarn("shell", "the host drew the menu bar in a different language", {
+          asked: l,
+          applied,
+        });
+      }
+    });
   } catch {
     /* ignore */
   }

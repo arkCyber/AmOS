@@ -338,6 +338,11 @@ function r5_liveRegion(file, content) {
     "crates/amos-tauri/frontend-ts/src/svelte/CalendarApp.svelte",      // 60 s tick recomputes agenda view; no per-minute user-facing change
     "crates/amos-tauri/frontend-ts/src/svelte/DeviceMicButton.svelte",   // 1 s poll of mic level for the level meter; visual only
     "crates/amos-tauri/frontend-ts/src/svelte/Dock.svelte",              // 5 s poll of open windows for the "running" dot; visual only
+    // 5 s poll of the focused window as the *target* of the system intents (⌘W/⌘M/⌘H):
+    // `focusedWindowLabel` is read to decide which window a chord acts on and is never drawn,
+    // so there is nothing to announce — an aria-live here would read out a window title every
+    // 5 s. Visual "running" state lives in Dock.svelte (entry above).
+    "crates/amos-tauri/frontend-ts/src/svelte/DesktopShell.svelte",
     "crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte",          // role=timer on the clock card mitigates; the weather/grid poll stays visual
     "crates/amos-tauri/frontend-ts/src/svelte/ImeOverlay.svelte",        // setTimeout for caret-restoration, not a value change
     "crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte",        // 2 s poll of CPU/mem/battery; exposed as role=progressbar, on-demand readable

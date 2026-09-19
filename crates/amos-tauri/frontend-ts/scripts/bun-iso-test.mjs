@@ -16,7 +16,8 @@
  *   node scripts/bun-iso-test.mjs coverage      # pure-batch coverage + P2-1 gate
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, renameSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -74,8 +75,88 @@ const rest = all.filter((f) => tzOf(f) === null);
 const pure = rest.filter((f) => !isDom(f));
 const dom = rest.filter(isDom);
 
+/**
+ * The network sentinel (REQ-A403): `scripts/net-sentinel.mjs` is preloaded into **every**
+ * `bun test` process and replaces the default `fetch` with a recorder that rejects. A
+ * *preload* is the only way to see the defect that matters — a module that catches its own
+ * network error and degrades (REQ-A400's `fetchDeclination`) turns real egress into a
+ * green test, and a grep cannot see it. A file's stub still runs (the sentinel is only the
+ * default), and restoring what a test saved restores the *sentinel*, so the guard cannot
+ * be un-armed by accident.
+ *
+ * Reporting per file: the sentinel appends one JSON line per unstubbed call to
+ * `AMOS_NET_SENTINEL_LOG`; this runner points that at a fresh tmp file, and after each run
+ * reports the URLs and fails — file-attributed, because each process is one file.
+ */
+const SENTINEL = "./scripts/net-sentinel.mjs";
+const SENTINEL_LOG = join(tmpdir(), `amos-net-sentinel-${process.pid}.log`);
+
+/**
+ * `--preload` is a `bun test` flag, and it must also come **after** the `test` subcommand.
+ *
+ * Two measured mistakes live here, both caught by running things rather than reading them:
+ *   • passing it first (`bun --preload … test <files>`) makes bun fall back to
+ *     `bun run test` — this very script — i.e. **infinite recursion** (1,220 nested runs,
+ *     a 7.8 MB log, no test ever finishing);
+ *   • appending it to a *non-`test`* child (the coverage-mode step that runs
+ *     `scripts/lib-coverage-gate.mjs`) turned into `… gate.mjs --preload ./scripts/…`, and
+ *     the gate read `--preload` as its threshold ⇒ `invalid coverage threshold`. `make cov`
+ *     was broken while `bun run check` stayed green (it does not run coverage mode).
+ * So: only `test` invocations get the sentinel; everything else is passed through verbatim.
+ */
+function withPreload(binArgs) {
+  if (binArgs[0] !== "test") return binArgs;
+  return [binArgs[0], "--preload", SENTINEL, ...binArgs.slice(1)];
+}
+
+/** Unstubbed calls recorded during the last run (`[{ url }]`). */
+function sentinelEgress() {
+  try {
+    if (!existsSync(SENTINEL_LOG)) return [];
+    return readFileSync(SENTINEL_LOG, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return { url: l };
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
 function run(binArgs, opts = {}) {
-  const r = spawnSync("bun", binArgs, { cwd: root, stdio: "inherit", ...opts });
+  const { label, ...spawnOpts } = opts;
+  try {
+    rmSync(SENTINEL_LOG, { force: true });
+  } catch {
+    /* a missing tmp file is the normal case */
+  }
+  const r = spawnSync("bun", withPreload(binArgs), {
+    cwd: root,
+    stdio: "inherit",
+    ...spawnOpts,
+    env: { ...process.env, AMOS_NET_SENTINEL_LOG: SENTINEL_LOG, ...(spawnOpts.env ?? {}) },
+  });
+  const egress = sentinelEgress();
+  if (egress.length > 0) {
+    console.error(
+      `\n[bun-iso] NETWORK EGRESS in ${label ?? binArgs.join(" ")} — ${egress.length} unstubbed call(s):`,
+    );
+    for (const e of egress) {
+      console.error(`  ${e.url}`);
+      for (const at of e.at ?? []) console.error(`      at ${at}`);
+    }
+    console.error(
+      "  A test reached the network for real. Stub it (globalThis.fetch = …) or inject the\n" +
+        "  client: see scripts/net-sentinel.mjs for why this is a failure even when the test\n" +
+        "  passes (a caught network error makes an online test look green — REQ-A400).",
+    );
+    return false;
+  }
   return r.status === 0;
 }
 
@@ -86,13 +167,13 @@ if (mode === "test") {
   console.log(
     `\n[bun-iso] ${pure.length} pure file(s) in one process, ${dom.length} DOM file(s) isolated, ${zoned.length} zoned file(s) in their own process.\n`,
   );
-  ok = run(["test", ...pure.map(rel)]) && ok;
+  ok = run(["test", ...pure.map(rel)], { label: `the pure batch (${pure.length} files)` }) && ok;
   for (const f of dom) {
-    ok = run(["test", rel(f)]) && ok;
+    ok = run(["test", rel(f)], { label: rel(f) }) && ok;
   }
   for (const f of zoned) {
     // Own process **and** its declared zone: a zone cannot be switched for an instant reliably.
-    ok = run(["test", rel(f)], { env: { ...process.env, TZ: tzOf(f) } }) && ok;
+    ok = run(["test", rel(f)], { env: { ...process.env, TZ: tzOf(f) }, label: rel(f) }) && ok;
   }
 } else if (mode === "coverage") {
   // P2-1 gate measures src/lib only. It used to be fed by the **pure batch alone**, which
@@ -126,8 +207,10 @@ if (mode === "test") {
   for (const f of all) {
     const tz = tzOf(f);
     ok =
-      run(["test", "--coverage", "--coverage-reporter=lcov", rel(f)], tz ? { env: { ...process.env, TZ: tz } } : {}) &&
-      ok;
+      run(
+        ["test", "--coverage", "--coverage-reporter=lcov", rel(f)],
+        tz ? { env: { ...process.env, TZ: tz }, label: rel(f) } : { label: rel(f) },
+      ) && ok;
     const lcov = join(root, "coverage", "lcov.info");
     if (existsSync(lcov)) {
       renameSync(lcov, join(root, "coverage", `lcov.part-${String(part).padStart(3, "0")}.info`));

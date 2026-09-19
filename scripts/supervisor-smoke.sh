@@ -14,7 +14,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 build_sup() {
-  cargo build -q -p amos-supervisor -p amos-ai -p amos-translate
+  # The supervisor is built **with its alerting armed** (REQ-A444): `--features notifier` is what
+  # makes `Supervisor::with_alert_sink` exist at all, and the smoke run is the deployment path an
+  # operator uses — so the armed wiring is the one exercised here. (Cargo writes the same
+  # `target/debug/amos-supervisor` path either way; whichever build ran last is what runs.)
+  cargo build -q -p amos-supervisor --features notifier
+  cargo build -q -p amos-ai -p amos-translate
 }
 
 die() { echo "FAIL: $*" >&2; exit 1; }

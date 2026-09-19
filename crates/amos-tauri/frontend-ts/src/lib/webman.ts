@@ -9,6 +9,7 @@
  * - 并发安全
  */
 import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "./amosStore";
+import { localId } from "./localId";
 
 // ==================== 常量定义 ====================
 
@@ -140,15 +141,16 @@ export const logger = {
 
 // ==================== 安全函数 ====================
 
-/** 生成唯一 ID (加密安全) */
+/**
+ * 生成唯一 ID。
+ *
+ * 走共享的 `localId`（REQ-A401）。旧实现把计数器挂在函数对象上
+ * （`(generateId as any).counter`，1000 取模）并只保留 8 位 base36 随机尾巴 ——
+ * 计数器一绕回就只剩运气。这个 id 是书签/历史/下载/标签页这些**持久化行**的身份，
+ * 所以它必须由构造保证唯一，而不是大概率唯一。
+ */
 export function generateId(): string {
-  // 使用时间戳 + 随机数 + 计数器确保唯一性
-  const timestamp = Date.now().toString(36);
-  const random = Math.random().toString(36).slice(2, 10);
-  const counter = (generateId as any).counter || 0;
-  (generateId as any).counter = (counter + 1) % 1000;
-  
-  return `${timestamp}-${random}-${counter.toString(36)}`;
+  return localId("wm");
 }
 
 /** 安全的 URL 验证 */
@@ -161,6 +163,62 @@ export function isValidUrl(input: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * `hostname` 是否只在本机 / 局域网内有意义（生产模式的黑名单）。
+ *
+ * REQ-A405 修的是这条边界**既漏又误杀**：
+ *  * 漏：只比了 IPv4 的字符串前缀，于是 IPv6 回环 `[::1]`、唯一本地 `fc00::/7`、链路
+ *    本地 `fe80::/10`、IPv4 链路本地 `169.254.0.0/16`、以及 RFC 6761 的 `*.localhost`
+ *    全部**放行** —— 一个"生产环境不允许访问本地地址"的门，绕过去只要换一种写法。
+ *  * 误杀：`hostname.startsWith("172.")` 把整个 172/8 当私网，而 RFC 1918 的私网只有
+ *    172.16.0.0/12 ⇒ 公网的 `172.32.1.1` 在生产环境被拒（用户打不开的站点）。
+ *
+ * WHATWG `URL` 已经把各种 IPv4 怪写法（`0x7f.1`、`2130706433`、八进制）规范化成
+ * dotted-quad，所以这里只需要按十进制四段判断；IPv6 由 `URL` 规范化为压缩小写形式
+ * （`hostname` 带方括号）。
+ */
+function isPrivateIPv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4) return false;
+  const octets = parts.map((p) => (/^\d{1,3}$/.test(p) ? Number(p) : Number.NaN));
+  if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  const a = octets[0] ?? -1; // 长度已判为 4；`?? -1` 只是为了不用非空断言
+  const b = octets[1] ?? -1;
+  return (
+    a === 0 || // 0.0.0.0/8 — "this network"
+    a === 10 || // 10.0.0.0/8
+    a === 127 || // 127.0.0.0/8 — loopback
+    (a === 169 && b === 254) || // 169.254.0.0/16 — link-local
+    (a === 172 && b >= 16 && b <= 31) || // 172.16.0.0/12 (NOT all of 172/8)
+    (a === 192 && b === 168) // 192.168.0.0/16
+  );
+}
+
+/** `hostname` 指向本机 / 内网？（导出以便直接测这条安全边界。） */
+export function isLocalHostname(hostname: string): boolean {
+  const host = String(hostname ?? "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".localhost")) return true; // RFC 6761
+  if (host.includes(":")) {
+    if (host === "::" || host === "::1") return true; // unspecified / loopback
+    // IPv4-mapped (`::ffff:a.b.c.d`) — **两种写法都要认**：`new URL("http://[::ffff:127.0.0.1]/")`
+    // 交给你的 hostname 是 `[::ffff:7f00:1]`（WHATWG 把点分改写成十六进制），所以只匹配点分的
+    // 判断会放行一个真正的回环地址（生产模式下就是绕过本地地址门）。实测见测试文件。
+    const mappedDotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
+    if (mappedDotted) return isPrivateIPv4(mappedDotted[1]!);
+    const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1]!, 16);
+      const lo = parseInt(mappedHex[2]!, 16);
+      return isPrivateIPv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+    }
+    const first = parseInt(host.split(":")[0] || "0", 16);
+    if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7 — unique-local
+    if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10 — link-local
+    return false;
+  }
+  return isPrivateIPv4(host);
 }
 
 /** 清理和验证 URL (P0 安全修复) */
@@ -208,21 +266,11 @@ export function sanitizeUrl(url: string): ValidationResult {
 
     // 阻止本地 IP (生产环境) - 但测试/开发环境允许
     const isDev = import.meta.env?.DEV !== false; // 默认允许开发模式
-    if (!isDev) {
-      const hostname = parsed.hostname;
-      if (
-        hostname === 'localhost' ||
-        hostname === '127.0.0.1' ||
-        hostname === '0.0.0.0' ||
-        hostname.startsWith('192.168.') ||
-        hostname.startsWith('10.') ||
-        hostname.startsWith('172.')
-      ) {
-        return { 
-          valid: false, 
-          error: '生产环境不允许访问本地地址' 
-        };
-      }
+    if (!isDev && isLocalHostname(parsed.hostname)) {
+      return {
+        valid: false,
+        error: '生产环境不允许访问本地地址'
+      };
     }
 
     return { 
@@ -237,30 +285,43 @@ export function sanitizeUrl(url: string): ValidationResult {
   }
 }
 
-/** 验证标题 */
+/**
+ * 验证标题。
+ *
+ * REQ-A404: `sanitized` **任何情况都给**（清洗 + 截断到上限），不再只在 `valid` 时给。
+ * 原实现里超长标题只回 `{valid:false}` ⇒ 调用方若要"仍然记录这次访问"就**没有可用的
+ * 清洗值**，只能退回落盘**原始**标题（`addToHistory` 当时正是这么做的：带 `<>`、
+ * 超限长度原样入库）；而 `addBookmark` 用 `valid` 直接拒绝 —— 同一份输入两条相反处理。
+ * 现在两种策略都能拿到同一个清洗值：拒绝的继续拒绝，要记录的记**清洗后**的。
+ */
 export function validateTitle(title: string): ValidationResult {
+  const clean = (t: string) =>
+    t
+      .replace(/[<>]/g, '')       // HTML
+      .replace(/[\r\n\t]/g, ' ')  // 换行符
+      .trim()
+      .slice(0, LIMITS.TITLE_MAX_LENGTH);
+
   if (!title || typeof title !== 'string') {
-    return { valid: false, error: '标题不能为空' };
+    return { valid: false, error: '标题不能为空', sanitized: '' };
   }
 
   if (title.length > LIMITS.TITLE_MAX_LENGTH) {
-    return { 
-      valid: false, 
-      error: `标题超过最大长度 ${LIMITS.TITLE_MAX_LENGTH} 字符` 
+    return {
+      valid: false,
+      error: `标题超过最大长度 ${LIMITS.TITLE_MAX_LENGTH} 字符`,
+      sanitized: clean(title),
     };
   }
 
-  // 移除危险字符
-  const sanitized = title
-    .replace(/[<>]/g, '')       // HTML
-    .replace(/[\r\n\t]/g, ' ')  // 换行符
-    .trim();
-
-  return { valid: true, sanitized };
+  return { valid: true, sanitized: clean(title) };
 }
 
 /** 解析输入 (URL 或搜索) - 增强安全版 */
 export function parseInput(input: string, searchEngine: WebManSettings["searchEngine"]): string {
+  // 非字符串入参（地址栏在 DOM 事件里可能拿到 null）回空串：与"没输入"同一答复，
+  // 而不是把 `input.trim is not a function` 抛给调用方（REQ-A405 A 的同一类修复）。
+  if (typeof input !== "string") return "";
   const trimmed = input.trim();
   
   // 空输入
@@ -371,33 +432,48 @@ export function applySafeSearch(url: string, enabled: boolean): string {
   }
 }
 
+/**
+ * 非字符串输入下的降级值（REQ-A405 A）。
+ *
+ * `extractDomain` / `extractTitle` 的 `catch` 原先写的是 `url.slice(0, 50)` —— 也就是
+ * **刚刚失败的那个表达式**。非字符串输入（`null` / 数字 / 对象）先被 `sanitizeUrl`
+ * 判为无效，走到 `return url.slice(0, 50)` 抛 TypeError，被 `catch` 接住，然后在
+ * `catch` 里**又抛一次**，这次直接交给调用方：一个自称"增强错误处理"的函数成了崩溃点。
+ * 兜底值只算一次、放在 `try` 外面，两条路径都吐它，且它本身不可能抛。
+ */
+function shortFallback(input: unknown): string {
+  return typeof input === "string" ? input.slice(0, 50) : "";
+}
+
 /** 提取域名 - 增强错误处理 */
 export function extractDomain(url: string): string {
+  const fallback = shortFallback(url);
   try {
     const result = sanitizeUrl(url);
     if (!result.valid || !result.sanitized) {
-      return url.slice(0, 50);
+      return fallback;
     }
     const u = new URL(result.sanitized);
     return u.hostname;
   } catch (error) {
     logger.warn(`Failed to extract domain from: ${url}`, error);
-    return url.slice(0, 50);
+    return fallback;
   }
 }
 
 /** 提取标题 (从 URL) - 增强错误处理 */
 export function extractTitle(url: string): string {
+  const fallback = shortFallback(url);
   try {
     const result = sanitizeUrl(url);
     if (!result.valid || !result.sanitized) {
-      return url.slice(0, 50);
+      return fallback;
     }
     const u = new URL(result.sanitized);
     return (u.hostname + u.pathname).slice(0, LIMITS.TITLE_MAX_LENGTH);
   } catch (error) {
     logger.warn(`Failed to extract title from: ${url}`, error);
-    return url.slice(0, 50);
+    return fallback;
   }
 }
 
@@ -423,6 +499,19 @@ export function getFaviconUrl(url: string): string {
 interface BookmarkStore {
   version: number;
   data: Bookmark[];
+}
+
+/**
+ * 一个 store 的 version**归一化**读法：不是数字就当 0（读侧本来就这么做）。
+ *
+ * REQ-A404: 写侧原先拿**原值**比对（`current.version !== expectedVersion`），而读侧把
+ * 非数字 version 归一化成 0 ⇒ 一个"有行、没 version"的 store（旧版本 / 导入器 / 手工编辑）
+ * 永远 `undefined !== 0`，**每一次写都失败**、重试 3 次后放弃；`addToHistory` 的返回值是
+ * void ⇒ 用户看不到任何提示。四处 store（书签/历史/下载/标签）同形。归一化不会掩盖真正的
+ * 并发写：写者一律写数字 version。
+ */
+function normalizedVersion(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
 /** 加载书签存储 */
@@ -455,7 +544,7 @@ function loadBookmarkStore(): BookmarkStore {
     });
 
     return {
-      version: typeof stored.version === 'number' ? stored.version : 0,
+      version: normalizedVersion(stored.version),
       data: validBookmarks.slice(0, LIMITS.BOOKMARK_MAX_COUNT),
     };
   } catch (error) {
@@ -470,7 +559,7 @@ function saveBookmarkStore(bookmarks: Bookmark[], expectedVersion: number): bool
     const current = readStoreValue<BookmarkStore>(BOOKMARKS_KEY, { version: 0, data: [] });
     
     // 版本检查 (乐观锁)
-    if (current.version !== expectedVersion) {
+    if (normalizedVersion(current.version) !== expectedVersion) {
       logger.warn(`Bookmark version mismatch: expected ${expectedVersion}, got ${current.version}`);
       return false;
     }
@@ -629,7 +718,7 @@ function loadHistoryStore(): HistoryStore {
     });
 
     return {
-      version: typeof stored.version === 'number' ? stored.version : 0,
+      version: normalizedVersion(stored.version),
       data: validHistory.slice(0, LIMITS.HISTORY_MAX_COUNT),
     };
   } catch (error) {
@@ -643,7 +732,7 @@ function saveHistoryStore(history: HistoryEntry[], expectedVersion: number): boo
   try {
     const current = readStoreValue<HistoryStore>(HISTORY_KEY, { version: 0, data: [] });
     
-    if (current.version !== expectedVersion) {
+    if (normalizedVersion(current.version) !== expectedVersion) {
       logger.warn(`History version mismatch: expected ${expectedVersion}, got ${current.version}`);
       return false;
     }
@@ -699,7 +788,10 @@ export function addToHistory(url: string, title?: string, privateMode = false): 
     // 添加新记录
     historyMap.set(urlResult.sanitized, {
       url: urlResult.sanitized,
-      title: titleResult.valid && titleResult.sanitized ? titleResult.sanitized : titleText,
+      // REQ-A404: 用 `validateTitle` 给的**清洗值**，而不是在它判 `valid:false` 时回落到
+      // 原始标题 —— 那条回落路径会把超长/带 `<>` 的标题原样写进历史（实测落盘 220+ 字符
+      // 含 `<img src=x onerror=…>`）。`sanitized` 现在任何情况都有值。
+      title: titleResult.sanitized ?? titleText,
       favicon: getFaviconUrl(urlResult.sanitized),
       visitedAt: Date.now(),
     });
@@ -765,6 +857,19 @@ interface DownloadStore {
   data: Download[];
 }
 
+/**
+ * 下载状态是**存储契约**的一部分：`loadDownloadStore` 按它过滤，所以写侧也必须按它
+ * 校验（REQ-A405）。原来两边各抄了一份四值列表，而写侧（`updateDownload`）根本不校验：
+ * 一个协议外的 status 会**顺利落盘**，然后在下一次加载时被读侧丢掉 —— 用户看到"进度更新
+ * 成功"，再打开时**整行消失**（静默的数据丢失）。现在列表只有一处。
+ */
+const DOWNLOAD_STATUSES: readonly Download["status"][] = [
+  "pending",
+  "downloading",
+  "completed",
+  "failed",
+];
+
 /** 加载下载存储 */
 function loadDownloadStore(): DownloadStore {
   try {
@@ -783,16 +888,17 @@ function loadDownloadStore(): DownloadStore {
         typeof d.url === 'string' &&
         typeof d.filename === 'string' &&
         typeof d.progress === 'number' &&
+        Number.isFinite(d.progress) &&
         typeof d.status === 'string' &&
         typeof d.createdAt === 'number' &&
-        ['pending', 'downloading', 'completed', 'failed'].includes(d.status) &&
+        DOWNLOAD_STATUSES.includes(d.status as Download["status"]) &&
         d.progress >= 0 &&
         d.progress <= 100
       );
     });
 
     return {
-      version: typeof stored.version === 'number' ? stored.version : 0,
+      version: normalizedVersion(stored.version),
       data: validDownloads.slice(0, LIMITS.DOWNLOAD_MAX_COUNT),
     };
   } catch (error) {
@@ -806,7 +912,7 @@ function saveDownloadStore(downloads: Download[], expectedVersion: number): bool
   try {
     const current = readStoreValue<DownloadStore>(DOWNLOADS_KEY, { version: 0, data: [] });
     
-    if (current.version !== expectedVersion) {
+    if (normalizedVersion(current.version) !== expectedVersion) {
       return false;
     }
 
@@ -888,8 +994,17 @@ export function updateDownload(id: string, progress: number, status?: Download["
     return false;
   }
 
-  if (typeof progress !== 'number' || progress < 0 || progress > 100) {
+  // REQ-A405: `NaN` 是 `typeof === 'number'` 且**所有比较都为 false**，所以原来
+  // `NaN < 0` / `NaN > 100` 都放行 ⇒ `NaN` 进度被写进 store，而读侧的
+  // `d.progress >= 0 && d.progress <= 100` 又必然为 false ⇒ 下次加载**整行消失**。
+  if (typeof progress !== 'number' || !Number.isFinite(progress) || progress < 0 || progress > 100) {
     logger.error(`Invalid progress value: ${progress}`);
+    return false;
+  }
+
+  // 同上：协议外的 status 写进去就是一条读不回来的行（读侧按 DOWNLOAD_STATUSES 过滤）。
+  if (status !== undefined && !DOWNLOAD_STATUSES.includes(status)) {
+    logger.error(`Invalid download status: ${status}`);
     return false;
   }
 
@@ -1026,7 +1141,12 @@ function loadTabStore(): TabStore {
     const stored = readStoreValue<TabStore>(TABS_KEY, { version: 0, data: [] });
     
     if (!stored || typeof stored !== 'object' || !Array.isArray(stored.data)) {
-      return { version: 0, data: [] };
+      // REQ-A405: 这条早退**绕过了**下面的"至少一个标签"不变量（它与 catch 分支的
+      // `{ version: 0, data: [createTab()] }` 是同一条契约）。原来它回 `data: []` ⇒ 一条
+      // **形状**不对的 store（旧版本 / 导入器 / 手工编辑）让浏览器打开时**零标签** ——
+      // 而同一个文件里 `closeTab` 关掉最后一个标签都会补一个。同一个"坏 store"的两种
+      // 形状给出两种行为，其中一种违反自己的不变量。
+      return { version: 0, data: [createTab()] };
     }
 
     const validTabs = stored.data.filter((t): t is Tab => {
@@ -1049,7 +1169,7 @@ function loadTabStore(): TabStore {
     }
 
     return {
-      version: typeof stored.version === 'number' ? stored.version : 0,
+      version: normalizedVersion(stored.version),
       data: validTabs.slice(0, LIMITS.TAB_MAX_COUNT),
     };
   } catch (error) {
@@ -1063,7 +1183,7 @@ function saveTabStore(tabs: Tab[], expectedVersion: number): boolean {
   try {
     const current = readStoreValue<TabStore>(TABS_KEY, { version: 0, data: [] });
     
-    if (current.version !== expectedVersion) {
+    if (normalizedVersion(current.version) !== expectedVersion) {
       return false;
     }
 

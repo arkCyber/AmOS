@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { addHistory, calcClearLabel, calcDisplay, calcEntry, calcFontPx, calcFromKey, calcInit, calcPendingOperator, calcPress, calcRun, ERR } from "../lib/calculator";
+import { addHistory, calcClearLabel, calcDisplay, calcEntry, calcFontPx, calcFromKey, calcInit, calcPendingOperator, calcPress, calcRun, calcQuery, ERR } from "../lib/calculator";
 
 describe("calculator", () => {
   test("adds 2 + 3 = 5", () => {
@@ -215,3 +215,38 @@ describe("calculator", () => {
     expect(calcFontPx(long)).toBe(23);
   });
 });
+
+/**
+ * REQ-A458 — `calcQuery`, the **Spotlight** calculation row. The row exists because macOS's
+ * Spotlight answers "what is this worth?" in the same box; the engine is the app's own, so the
+ * two surfaces cannot disagree — including the parts a reader might expect to differ.
+ */
+describe("calcQuery — Spotlight's calculation row (REQ-A458)", () => {
+  test("evaluates through the app's own engine, with the app's own semantics", () => {
+    expect(calcQuery("12*3+4")).toBe("40");
+    expect(calcQuery("8 - 3")).toBe("5");
+    expect(calcQuery("1.5+2.25")).toBe("3.75");
+    // **Left-to-right, no precedence** — the same answer the Calculator app gives, which is the
+    // point of using one engine: Spotlight must not disagree with the app it opens.
+    expect(calcQuery("2+3*4")).toBe("20");
+    // …and the display glyphs the reducer also speaks.
+    expect(calcQuery("6×7")).toBe("42");
+  });
+
+  test("refuses what is not a calculation — no row beats a row that says nothing", () => {
+    expect(calcQuery("42")).toBeNull(); // a bare number is not a calculation
+    expect(calcQuery("abc")).toBeNull(); // no digit, no operator
+    expect(calcQuery("")).toBeNull();
+    expect(calcQuery("   ")).toBeNull();
+    expect(calcQuery("1÷0")).toBeNull(); // ERR is not a result
+    expect(calcQuery("((1+2))*3")).toBeNull(); // the app has no parentheses key
+  });
+
+  test("a trailing operator answers the accumulator, exactly like the app does", () => {
+    // Pinned rather than hidden: `1+2+` then `=` shows 3 in the Calculator (the pending operator
+    // applies the accumulator to itself), so Spotlight shows 3 too. If that rule changes, this
+    // case fails and both surfaces get re-checked together.
+    expect(calcQuery("1+2+")).toBe("3");
+  });
+});
+

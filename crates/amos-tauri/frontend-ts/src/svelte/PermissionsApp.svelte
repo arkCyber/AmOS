@@ -11,11 +11,22 @@
   import { capForWire, daemonGrantsAll, daemonRecentAudit, toAuditViews } from "../lib/privacyBackend";
   import type { AuditView, DaemonGrantRow } from "../lib/privacyBackend";
   import { daemonVerdict, grantCapability, revokeCapability } from "./osPermissions";
+  import { defaultAppsFor, isDefaultOnGrant } from "./osCapabilities";
+  import { appTitleKey } from "../lib/appMeta";
   import { isExtId, tileById } from "../lib/storeApps";
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
 
-  /** Built-in apps that actually request each sensitive capability (a showcase). */
+  /**
+   * Built-in apps that actually request each sensitive capability (a showcase).
+   *
+   * This is the **declared** half only. The other half — the apps the OS itself
+   * default-grants the capability to (`osCapabilities.DEFAULT_CAPABILITIES`) — is
+   * unioned in by {@link candidatesFor}, because a default-on app that is not in
+   * this list could be *revoked* (it shows up as a granted holder) and then had no
+   * way back on: the holder chip disappears with the grant (`vmemos` + microphone
+   * was exactly that case).
+   */
   const CANDIDATES: Record<Capability, string[]> = {
     camera: ["camera"],
     microphone: ["ai", "interpreter", "phone"],
@@ -55,18 +66,15 @@
     storage: t("perm.cap.storage"),
     notifications: t("perm.cap.notifications"),
   });
-  const appName = $derived<Record<string, string>>({
-    camera: t("app.camera"),
-    ai: t("app.ai"),
-    interpreter: t("app.interpreter"),
-    phone: t("app.phone"),
-    maps: t("app.maps"),
-    weather: t("app.weather"),
-    messages: t("app.messages"),
-    mail: t("app.mail"),
-  });
-  const labelOf = (id: string): string =>
-    isExtId(id) ? tileById(id)?.name ?? id : (appName[id] ?? id);
+  // The display name comes from `lib/appMeta` — the one table that owns it — instead of
+  // a hand-maintained copy here. That copy had no `vmemos`, so a default-on app rendered
+  // as the raw id `vmemos`; and any newly added built-in would do the same until someone
+  // remembered to edit this file too.
+  const labelOf = (id: string): string => {
+    if (isExtId(id)) return tileById(id)?.name ?? id;
+    const key = appTitleKey(id);
+    return key ? t(key) : id;
+  };
 
   // App-centric view: the capability sections below answer "who holds 相机?"; this
   // answers "what can this app access?". Both read the SAME ledger, and an app's
@@ -77,6 +85,24 @@
       .map((app) => ({ app, caps: grantedCaps(ledger, app) }))
       .filter((e) => e.caps.length > 0),
   );
+
+  /**
+   * The apps a capability's row offers to turn on: the declared showcase **plus** every
+   * app the OS default-grants it to (`osCapabilities.defaultAppsFor`). Declared order
+   * first (the showcase is the curated order), default-on apps appended.
+   *
+   * Why the union is load-bearing: the row is the only way *on*. A default-on app that
+   * the row does not list can still be revoked (it is a granted holder), and then the
+   * capability is unreachable until the next boot re-seeds the matrix — a dead end the
+   * user cannot see or explain.
+   */
+  function candidatesFor(cap: Capability): string[] {
+    const out = [...CANDIDATES[cap]];
+    for (const app of defaultAppsFor(cap)) {
+      if (!out.includes(app)) out.push(app);
+    }
+    return out;
+  }
 
   // ---- the daemon's own grant store (the authority) -------------------------
   // Everything above reads the LOCAL ledger. A grant can exist only daemon-side
@@ -240,6 +266,14 @@
               class="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2.5 py-1 text-xs text-green-600 dark:text-green-400"
             >
               {labelOf(app)}<span data-icon="x" class="grid h-3 w-3 place-items-center">{@html iconSvg("x", "h-3 w-3")}</span>
+              {#if isDefaultOnGrant(app, cap)}
+                <span
+                  data-testid={`perm-default-${app}-${cap}`}
+                  aria-label={t("perm.defaultOn")}
+                  title={t("perm.defaultOn")}
+                  class="text-blue-500"
+                >★</span>
+              {/if}
               {#if drift[`${app}|${cap}`]}
                 <span
                   data-testid={`perm-drift-${app}-${cap}`}
@@ -254,7 +288,7 @@
       {/if}
 
       <div class="mt-2 flex flex-wrap gap-1.5 border-t border-black/5 pt-2 dark:border-white/10">
-        {#each CANDIDATES[cap] as app (app)}
+        {#each candidatesFor(cap) as app (app)}
           {@const on = capSet(ledger, app, cap)}
           <button
             onclick={() => toggle(app, cap)}

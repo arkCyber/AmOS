@@ -28,6 +28,7 @@ describe("SpacesPanel.svelte - 模块完整性", () => {
     expect(typeof spaces.createSpace).toBe("function");
     expect(typeof spaces.deleteSpace).toBe("function");
     expect(typeof spaces.moveWindowToSpace).toBe("function");
+    expect(typeof spaces.unfileWindow).toBe("function");
     expect(typeof spaces.renameSpace).toBe("function");
     expect(typeof spaces.isSpacesAvailable).toBe("function");
     expect(typeof spaces.getSpacesStatus).toBe("function");
@@ -66,5 +67,36 @@ describe("SpacesPanel.svelte - 模块完整性", () => {
     expect(content).toContain("startEdit");
     expect(content).toContain("saveEdit");
     expect(content).toContain("cancelEdit");
+  });
+
+  /**
+   * REQ-A449 — 窗口归档。Spaces 的一半此前**没有 UI**：`spaces_move_window` 在桥上有导出、
+   * 却没有任何调用者（`scripts/unwired-baseline.json` 里挂着它），于是只有手工从 shell 归档过的
+   * 窗口才会跟着桌面切换走。这里按本文件既有口径（源码扫描）钉住那块 UI 的存在与两条纪律。
+   */
+  test("窗口归档 UI 存在，且规则仍在宿主一侧", () => {
+    const content = readFileSync(componentPath, "utf-8");
+    expect(content).toContain("moveWindowToSpace");
+    expect(content).toContain("unfileWindow");
+    expect(content).toContain("spaces_unfile_window");
+    expect(content).toContain("handleAssignWindow");
+    expect(content).toContain("wmWindows");
+    expect(content).toContain("fileableWindows");
+    // 归档之后**重新应用当前桌面**（不是在这里自己判断可见性）：可见性的唯一规则在宿主的
+    // `switch_plan`，这一行就是"让屏幕跟上账本"。
+    expect(content).toContain("switchSpace(currentIndex)");
+    // 三个状态都要能显示：读不到 / 没有窗口 / 有列表。
+    expect(content).toContain("spaces.windows");
+    expect(content).toContain("spaces.windowsUnavailable");
+    expect(content).toContain("spaces.noWindows");
+    expect(content).toContain("spaces.unfiled");
+    expect(content).toContain("spaces.assignWindow");
+  });
+
+  test("新文案没有以字面量进 markup（i18n-scan 的硬要求）", () => {
+    const content = readFileSync(componentPath, "utf-8");
+    expect(content).not.toContain("窗口归档");
+    expect(content).not.toContain("未归档");
+    expect(content).not.toContain("读不到窗口列表");
   });
 });

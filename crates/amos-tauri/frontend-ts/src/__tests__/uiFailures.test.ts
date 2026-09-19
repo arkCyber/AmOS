@@ -126,4 +126,126 @@ describe("uiFailures — the WebView's last line of defence", () => {
     // No listener called preventDefault ⇒ the platform still sees it as unhandled.
     expect(ev.defaultPrevented).toBe(false);
   });
+
+/**
+ * REQ-A406 — the observer's *relationship with its target*, and the three "never throw"
+ * fallbacks. All four were unentered code: the file's own header promises "the observer
+ * must never become a new failure source", but nothing proved the promise.
+ */
+describe("uiFailures — target handover and the never-throw fallbacks (REQ-A406)", () => {
+  type Handler = (ev: Event) => void;
+  /** A minimal event target: records handlers so a test can fire them by hand. */
+  function fakeTarget() {
+    const handlers = new Map<string, Set<Handler>>();
+    return {
+      addEventListener(type: string, fn: Handler) {
+        const set = handlers.get(type) ?? new Set<Handler>();
+        set.add(fn);
+        handlers.set(type, set);
+      },
+      removeEventListener(type: string, fn: Handler) {
+        handlers.get(type)?.delete(fn);
+      },
+      listenerCount(type: string) {
+        return handlers.get(type)?.size ?? 0;
+      },
+      fire(type: string, ev: Event) {
+        for (const fn of [...(handlers.get(type) ?? [])]) fn(ev);
+      },
+    };
+  }
+
+  test("handing the observer to a new target detaches the old one (no double recording)", () => {
+    const a = fakeTarget();
+    const b = fakeTarget();
+    installUiFailureObserver(a as unknown as Window);
+    a.fire("error", errorEvent("first"));
+    expect(errorEntries()).toHaveLength(1);
+
+    installUiFailureObserver(b as unknown as Window);
+    expect(a.listenerCount("error")).toBe(0); // the old pair must be gone
+    clearDiag();
+
+    a.fire("error", errorEvent("on A after B took over"));
+    expect(errorEntries()).toHaveLength(0); // A is no longer the observed target
+    b.fire("error", errorEvent("on B"));
+    expect(errorEntries()).toHaveLength(1);
+  });
+
+  test("a target whose removeEventListener throws does not break the handover", () => {
+    const sticky = {
+      addEventListener() {},
+      removeEventListener() {
+        throw new Error("sticky host");
+      },
+    };
+    installUiFailureObserver(sticky as unknown as Window);
+    const ok = fakeTarget();
+    expect(() => installUiFailureObserver(ok as unknown as Window)).not.toThrow();
+    ok.fire("error", errorEvent("still works"));
+    expect(errorEntries()).toHaveLength(1);
+  });
+
+  test("a target with no event bus leaves nothing half-installed", () => {
+    const hostile = {
+      addEventListener() {
+        throw new Error("no event bus in this host");
+      },
+      removeEventListener() {},
+    };
+    expect(() => installUiFailureObserver(hostile as unknown as Window)).not.toThrow();
+
+    // …and a usable target still installs cleanly afterwards.
+    const ok = fakeTarget();
+    installUiFailureObserver(ok as unknown as Window);
+    ok.fire("error", errorEvent("works"));
+    expect(errorEntries()).toHaveLength(1);
+  });
+
+  test("a circular rejection reason is described instead of throwing", () => {
+    installUiFailureObserver();
+    const circular: Record<string, unknown> = { code: 7 };
+    circular.self = circular;
+    window.dispatchEvent(rejectionEvent(circular));
+
+    const entry = errorEntries()[0];
+    expect(entry?.msg).toContain("unhandled rejection");
+    expect(entry?.msg).toContain("<unprintable rejection reason>");
+  });
+
+  test("a reason whose stack getter throws has no location and still records", () => {
+    installUiFailureObserver();
+    const hostile = new Error("hostile stack");
+    Object.defineProperty(hostile, "stack", {
+      get() {
+        throw new Error("no stack for you");
+      },
+    });
+    window.dispatchEvent(rejectionEvent(hostile));
+
+    const entry = errorEntries()[0];
+    expect(entry?.msg).toContain("Error: hostile stack");
+    expect(entry?.msg).not.toMatch(/:\d+:\d+/); // no fabricated file:line
+  });
+
+  test("an error event without a filename is recorded without a fabricated location", () => {
+    installUiFailureObserver();
+    window.dispatchEvent(errorEvent("no location"));
+
+    const entry = errorEntries()[0];
+    expect(entry?.msg).toBe("uncaught error: no location");
+  });
+
+  test("an error event carrying the thrown Error keeps its stack as the detail", () => {
+    installUiFailureObserver();
+    const err = new Error("inner");
+    err.stack = "Error: inner\n    at handler (webpack:///src/lib/x.ts:7:3)";
+    const ev = errorEvent("inner") as unknown as { error?: unknown };
+    ev.error = err;
+    window.dispatchEvent(ev as unknown as Event);
+
+    expect(errorEntries()[0]?.detail).toContain("at handler");
+  });
+});
+
 });

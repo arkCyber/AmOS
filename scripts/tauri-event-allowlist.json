@@ -8,7 +8,7 @@
     "reason": "Emitted by `crates/amos-tauri/src/dock_badge.rs`, which is **compiled and registered** since REQ-A389 (it used to be outside the module tree), so this emit is live: applying a badge now reaches the frontend bus. No Svelte screen subscribes yet — the Dock tile does not paint the badge the host offers (same state as the two `dock_badge_*` commands in `tauri-command-allowlist.json`). The entry stays so the gate records a deliberate no-subscriber, and it is reported as stale the moment a screen subscribes."
   },
   {
-    "name": "show-about-dialog",
-    "reason": "Deliberate hook in the **compiled** menu path: `crates/amos-tauri/src/menu.rs`::show_about_dialog logs the version and emits it, and its own doc says the native modal (`NSApplication.runModal`) is a Phase-2 item, \"for now we emit a show-about-dialog event the frontend can surface however it likes\". No About surface exists in the shell, so no screen subscribes. Allow-listed with that reason (same shape as `hardware-button`); when an About surface lands it should `listen(\"show-about-dialog\", …)` and this entry is reported as stale."
+    "name": "biometric-result",
+    "reason": "Deliberate mirror with no consumer (REQ-A412). The biometric result reaches the UI through the **command**: `biometric_authenticate` awaits the `oneshot` the JNI callback fills (`jni_glue::Java_..._BiometricGlue_onBiometricResult` sets the state and fires the sender), and `src/lib/biometric.ts` resolves with it. The `emit(\"biometric-result\", …)` in the same callback exists for a screen that renders results without owning the call (a notification, a lock-screen affordance); that screen does not exist yet — `src/lib/biometric.ts` itself is allow-listed as an unwired library surface in `crates/amos-tauri/frontend-ts/scripts/unwired-allowlist.json`. Recorded here so the gate says \"deliberate mirror\", not \"the host is shouting into the void\"."
   }
 ]

@@ -10,7 +10,7 @@
    * *running dot*, and the registry row supplies the window label for it
    * (`windowLabel: "files"`), not the widget id.
    */
-  import { invoke } from "../../lib/backend";
+  import { wmOpen } from "../../lib/wm";
   import { t } from "../locale.svelte";
   import DockTileButton from "./DockTileButton.svelte";
   import IconFinder from "../../assets/icons/IconFinder.svelte";
@@ -18,7 +18,7 @@
   /** `wm_open` = create + focus; a failure is recorded in the diagnostics ledger by
    * `lib/backend` and needs no handler here. */
   function openFinder() {
-    void invoke("wm_open", { label: "files" });
+    void wmOpen("files");
   }
 </script>
 

@@ -47,8 +47,8 @@
  * counts of **hand-written** discards live in `scripts/rust-discard-baseline.json`
  * (`macroGenerated` there records the informational set). A file that gains a discard — or
  * a new file that appears with one — **fails** the gate until the addition is acknowledged
- * there; a file that drops below its baseline is reported `[stale]` so the baseline cannot
- * rot; a file that disappears is reported too.
+ * there; a file that drops below its baseline **fails** as a stale entry (REQ-A447 — the ratchet
+ * must shrink, not rot; printing a note was not enough), and so does a file that disappears.
  *
  * Run:
  *   node scripts/rust-discard-scan.mjs              # gate (runs clippy itself)
@@ -197,6 +197,18 @@ export function ratchet(counts, baseline) {
 // --- main --------------------------------------------------------------------
 const args = process.argv.slice(2);
 
+// An unrecognised flag is a failure, not a no-op (measured 2026-09-19: `docs/POWER_OF_10.md`
+// spelled this gate's selftest `--self-test`, which it does not implement, so the documented
+// "verification" line silently ran the gate instead — see `rust-recursion-scan.mjs`).
+const KNOWN_FLAGS = new Set(["--selftest", "--json"]);
+const unknownFlags = args.filter((f) => f.startsWith("-") && !KNOWN_FLAGS.has(f));
+if (unknownFlags.length > 0) {
+  console.error(
+    `[rust-discard-scan] unknown flag(s): ${unknownFlags.join(", ")} — known: ${[...KNOWN_FLAGS].join(", ")}`,
+  );
+  process.exit(2);
+}
+
 /**
  * Run clippy over the workspace's production targets (`--lib --bins`: `#[cfg(test)]` code
  * and test/example targets are excluded, since discarding a temp-file cleanup result there
@@ -241,13 +253,49 @@ function clippyPass(extra) {
       { cwd: root, encoding: "utf8", maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] },
     );
   } catch (e) {
-    // A build failure still produces diagnostics on stdout; only a run that produced
-    // *nothing* is a hard error (otherwise a red build would look like "0 findings").
-    if (typeof e.stdout === "string" && e.stdout.includes('"reason":"compiler-message"')) {
-      return e.stdout;
+    const out = typeof e.stdout === "string" ? e.stdout : "";
+    // A **build failure** means this pass did not measure the workspace: the crates that never
+    // compiled contribute no diagnostics, so the counts silently *drop* — which reads as "this debt
+    // went away" and, since REQ-A447, as a cascade of **stale** baseline entries pointing at files
+    // nobody touched. Measured 2026-09-19: a concurrent session's crate failed to compile in the
+    // featured pass, and four baselined files (blocklist/buttons/clipboard_glue…) looked wired —
+    // the previous run, with a working build, reported none of them. The lints are passed as
+    // warnings (`-W`), so a non-zero exit here is a compile error, not a lint.
+    //
+    // Refusing to report a count this gate could not take is the whole point: "0 findings" and
+    // "I could not look" must not render the same way (the F-DEV-005 family).
+    const firstError = firstCompilerError(out);
+    if (firstError) {
+      throw new Error(
+        `[rust-discard-scan] could not measure: \`cargo clippy --workspace --lib --bins ${extra.join(" ") || "(default features)"}\` failed to build.\n` +
+          `  first error: ${firstError}\n` +
+          "  A pass that does not compile reports fewer discards than exist, so this gate refuses to\n" +
+          "  report a count it could not take — fix the build, then re-run.",
+      );
     }
+    if (out.includes('"reason":"compiler-message"')) return out;
     throw e;
   }
+}
+
+/** The first `level: "error"` compiler message in a clippy JSON stream, with its location, or `null`. */
+export function firstCompilerError(json) {
+  for (const line of json.split("\n")) {
+    if (!line.trim()) continue;
+    let m;
+    try {
+      m = JSON.parse(line);
+    } catch {
+      continue; // not a JSON line (cargo's own chatter)
+    }
+    if (m?.reason === "compiler-message" && m.message?.level === "error") {
+      const spans = m.message.spans ?? [];
+      const span = spans.find((s) => s.is_primary) ?? spans[0];
+      const where = span?.file_name ? ` (${span.file_name}:${span.line_start})` : "";
+      return `${m.message.message}${where}`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -408,12 +456,44 @@ function runSelfTest() {
   );
   check("no baseline ⇒ everything new is a problem", ratchet({ "x.rs": 1 }, {}).problems.length === 1);
 
+  // REQ-A452 — "0 findings" and "I could not look" must not render the same way. A pass that
+  // failed to *build* produced fewer diagnostics than the tree has, and the counts then dropped
+  // (which REQ-A447 turned into stale baseline entries pointing at untouched files).
+  const errorLine = JSON.stringify({
+    reason: "compiler-message",
+    message: {
+      level: "error",
+      message: "cannot find value `x` in this scope",
+      spans: [{ file_name: "crates/b/src/lib.rs", line_start: 7, is_primary: true }],
+    },
+  });
+  const warnLine = JSON.stringify({
+    reason: "compiler-message",
+    message: { level: "warning", message: "non-binding `let` on a `#[must_use]` type" },
+  });
+  check(
+    "an error-level message is found in a failed pass",
+    firstCompilerError(`${warnLine}\n${errorLine}`) ===
+      "cannot find value `x` in this scope (crates/b/src/lib.rs:7)",
+  );
+  check("a warnings-only pass has no error to refuse on", firstCompilerError(warnLine) === null);
+  check("cargo's own chatter is skipped", firstCompilerError("Compiling x\n") === null);
+  check("an empty stream has no error", firstCompilerError("") === null);
+
   console.log(`[rust-discard-scan] selftest: ${assertions} assertion(s), ${failures} failure(s).`);
   process.exit(failures === 0 ? 0 : 1);
 }
 
 function main() {
-  const text = runClippy();
+  let text;
+  try {
+    text = runClippy();
+  } catch (e) {
+    // `clippyPass` refuses to hand back a count it could not take (REQ-A452). That is a **failure of
+    // this gate**, not of the code under it, and it must read as such — not as a stack trace.
+    console.error(String(e?.message ?? e));
+    return 1;
+  }
   const { perFile, perFileMacro, perLint, findings } = findingsFromMessages(text);
   if (args.includes("--json")) {
     console.log(JSON.stringify({ perFile, perFileMacro, perLint, findings }, null, 2));
@@ -426,13 +506,14 @@ function main() {
   const macro = Object.values(perFileMacro).reduce((a, b) => a + b, 0);
 
   if (stale.length > 0) {
-    console.log("[rust-discard-scan] note — baseline entries to tighten:");
+    console.log("[rust-discard-scan] FAIL — baseline entries to tighten (the ratchet must shrink):");
     for (const s of stale) console.log(`  [stale] ${s}`);
   }
-  if (problems.length > 0) {
+  if (problems.length > 0 || stale.length > 0) {
     for (const p of problems) console.error(`[rust-discard-scan] ${p}`);
     console.error(
-      `[rust-discard-scan] FAIL — ${problems.length} problem(s); ${total} hand-written discard(s) in production code (baseline total ${Object.values(baseline).reduce((a, b) => a + b, 0)}).`,
+      `[rust-discard-scan] FAIL — ${problems.length} problem(s), ${stale.length} stale baseline entr(ies); ` +
+        `${total} hand-written discard(s) in production code (baseline total ${Object.values(baseline).reduce((a, b) => a + b, 0)}).`,
     );
     return 1;
   }

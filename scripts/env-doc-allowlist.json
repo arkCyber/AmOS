@@ -20,6 +20,14 @@
     "reason": "Legacy boolean on the removed dead `Config` struct (CLAIMS table in CODE_COMPLETION_SUMMARY.md). The accelerator strategy is configured by `AMOS_ACCEL` (accel.rs) and reported via `AccelProfile::from_env`; `AMOS_ACCELERATION` is honoured nowhere."
   },
   {
+    "name": "AMOS_LOG_SHIPPER",
+    "reason": "Named only in **what-is-missing** contexts, never as a live knob: `docs/devops.md` §6 lists it under '本页故意不写的东西' precisely to say there is no reader, and `DEV_OPS_INVENTORY_20260918.md` §3 (titled '日志聚合（❌）') names it as a planned optional shipper. There is no read site in the tree. Allow-listed so both docs may keep recording the gap; wire it (or delete the mentions) when the shipper lands."
+  },
+  {
+    "name": "AMOS_SESSION_",
+    "reason": "A truncated fragment, not a variable name: `DEV_OPS_INVENTORY_20260918.md` §4 writes `AMOS_SESSION_*` while listing the session layer that does **not** exist (the `Layer` enum has exactly four variants and none is session-scoped). Same shape as the entries above — the doc names a missing layer, not a knob an operator can set."
+  },
+  {
     "name": "AMOS_THEME_CHANGED_EVENT",
     "reason": "Not a knob at all: it is the TypeScript event-name constant quoted out of source in docs/FINAL_CODE_AUDIT_2026_SEP17.md (a code block showing `new CustomEvent(AMOS_THEME_CHANGED_EVENT, …)`). The constant lives in crates/amos-tauri/frontend-ts/src/svelte/ui-events.ts and is imported by theme.svelte.ts; the scanner is right that it is never read as configuration (a bare identifier, not a quoted env lookup), so the doc's quote is the only reason it looks like one."
   }

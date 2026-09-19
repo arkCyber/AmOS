@@ -171,7 +171,9 @@ describe("快捷指令执行引擎", () => {
     })!;
     const r = await executeShortcut(sc.id);
     expect(r.success).toBe(false);
-    expect(r.actionsCompleted).toBe(0);
+    // 第 1 步（`text`）**真的完成了**。失败不再把计数抹成 0：那个 0 在引入嵌套控制流
+    // 之后会变成假话（一个 20 步的指令在第 19 步失败时，用户看到的不是"0/20 完成"）。
+    expect(r.actionsCompleted).toBe(1);
     expect(typeof r.error).toBe("string");
     expect(r.actionsTotal).toBe(2);
   });

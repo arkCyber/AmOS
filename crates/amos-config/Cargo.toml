@@ -1,0 +1,23 @@
+[package]
+name = "amos-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "amos: layered configuration (system → user → session → remote) with JSON-schema validation, hot-reload, and runtime feature flags. docs/devops.md §4."
+
+[lib]
+name = "amos_config"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror = "2"
+
+[dev-dependencies]
+# Tests construct small JSON files in temp dirs; `std::env::temp_dir() + a
+# unique suffix` is enough (the workspace already does this — the same pattern
+# is in `logfile.rs::tests::tmpdir`). Adding `tempfile` here would force a
+# full registry rebuild on a clean cache.

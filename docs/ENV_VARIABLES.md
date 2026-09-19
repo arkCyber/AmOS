@@ -68,6 +68,9 @@
 | `AMOS_LOG_DIR` | path | `~/.amos/logs` | `→ mkdir-p` | 日志落盘目录;设为 `off`/`none`/`0` 关闭文件 sink |
 | `AMOS_LOG_MAX_BYTES` | int | `5_242_880` | `→ 5MB` | 单文件大小上限(行边界才轮转) |
 | `AMOS_LOG_KEEP` | int | `3` (max 64) | `→ 3` | 保留历史日志数 |
+| `AMOS_LOG_JSON` | bool | (未设置) | `→ sink-off` | JSON 行 sink 的**显式 opt-in**；未设置 / `0` / `false` ⇒ **关闭**（第二个 sink 把事件悄悄发到远端＝本项目专门审计的隐形外泄形状）。路径仍随 `AMOS_LOG_DIR` |
+| `AMOS_LOG_SERVICE` | string | `amos-ai` | `→ amos-ai` | 每条 JSON 记录上的 `service` 标签（截断到 128 B；空串按未设置处理） |
+| `AMOS_LOG_HOST` | string | `gethostname()` | `→ gethostname` | 可选的 hostname / pod 名覆盖（截断到 128 B；取不到主机名时为 `unknown`） |
 
 ---
 
@@ -175,7 +178,7 @@
 | `AMOS_MAIL_STORE` | path | (none) | `→ empty` | 邮件存储路径 |
 | `AMOS_FORM_FACTOR` | enum | `auto` | `→ auto` | 形态因子:`auto`/`desktop`/`mobile` |
 | `AMOS_ROOT` | path | (none) | `→ cwd` | 应用根目录 |
-| `AMOS_DESKTOP_SHORTCUTS` | enum | `enabled` | `→ enabled` | 系统快捷键(`⌘W` / `⌘M` / `⌘H` / `⌘,`)作用于焦点窗口的开关:`enabled`(默认)/`disabled`(也接受 `shortcuts` 列表写法)。`disabled` ⇒ `DesktopShell.handleSystemShortcut` 直接返回,焦点窗口仍可关,但**前端不抢键**(适合 WebView/宿主 OS 已经接管的场景,如 macOS 真机上的 `⌘H`)。**读取方是宿主**(`crates/amos-tauri/src/desktop_features.rs`,启动时解析并在 boot 日志里如实上报),UI 在 `DesktopShell` 挂载时通过 `desktop_features_disabled` 取回并缓存 —— WebView 里没有环境变量可读(REQ-A287),每个变量只管自己那一个能力,把另一个能力键写进来不会生效但在 boot 日志里有 warning | 
+| `AMOS_DESKTOP_SHORTCUTS` | enum | `enabled` | `→ enabled` | 系统快捷键(`⌘W` / `⌘M` / `⌘H` / `⌘,`)作用于焦点窗口的开关:`enabled`(默认)/`disabled`(也接受 `shortcuts` 列表写法)。`disabled` ⇒ `DesktopShell.handleSystemShortcut` 与 `DesktopWindowKeys` 直接返回,焦点窗口仍可关,但**前端不抢键**(适合 WebView/宿主 OS 已经接管的场景,如 macOS 真机上的 `⌘H`)。**读取方是宿主**(`crates/amos-tauri/src/desktop_features.rs`,启动时解析并在 boot 日志里如实上报);UI 侧的答案缓存是 **per-WebView 的模块状态**,所以**每一个桌面壳面各自取一次**(启动器 `DesktopShell`、应用窗口 `DesktopAppWindow` —— REQ-A453 修掉的就是「只有启动器问过」⇒ 该开关在应用窗口里曾经完全不生效) —— WebView 里没有环境变量可读(REQ-A287),每个变量只管自己那一个能力,把另一个能力键写进来不会生效但在 boot 日志里有 warning | 
 | `AMOS_DOCK_CONTEXT_MENU` | enum | `enabled` | `→ enabled` | Dock 右键菜单开关:`enabled`(默认)/`disabled`(也接受 `dock-context-menu` 列表写法)。`disabled` ⇒ Dock 的 `oncontextmenu` 不弹 `DockContextMenu`(调试 / 自动化截图时用)。读取方/上报方式同上(REQ-A287) |
 
 ---
@@ -247,16 +250,29 @@
 
 ---
 
-## 18. 使用说明
+## 18. 告警与分层配置(amos-notifier / amos-config)
 
-### 17.1 透明度原则
+| 变量 | 类型 | 默认 | 失效语义 | 说明 |
+|------|------|------|----------|------|
+| `AMOS_NOTIFIER` | bool | (未设置) | `→ sink-off` | 告警 sink 的**显式 opt-in**。truthy 集**恰好**是 `1`/`true`/`yes`/`on`(大小写无关、前后空白 trim)；**任何**其它值(含 `tru`/`2`/`enable`)**不 arm** —— 打错字不会意外开门。读取点:`crates/amos-ai/src/notifier_sink.rs` |
+| `AMOS_NOTIFIER_WEBHOOK` | list | - | `→ stderr-only` | 逗号分隔的 webhook URL 列表(空白 trim、空项跳过)。`https://` 与坏 scheme 的项被**拒绝并 warn**,不影响 daemon 启动；没有任何有效 URL 时仍装 stderr 兜底,所以「一个 `AMOS_NOTIFIER=1` 但没有 URL 的机器」也会落一行 |
+| `AMOS_FEATURE_FLAGS_FILE` | path | `~/.amos/feature-flags.json` | `→ empty-set` | 运行时 feature flag 的本地文件。非空即覆盖默认路径；路径解析不出 / 文件缺失 / 文件损坏 ⇒ **空集**(fail-closed,绝不 fail-open)。读取点:`FeatureFlagSet::from_local()`(`AMOS_FEATURE_FLAGS_FILE` → `from_file`) |
+| `AMOS_CONFIG_SYSTEM` | path | 平台默认(`/etc/amos/config.json`；macOS 为 `/Library/Application Support/amos/config.json`；Windows 为 `%ProgramData%\amos\config.json`) | `→ platform-default` | 分层配置的**系统层**文件路径覆盖 |
+| `AMOS_CONFIG_USER` | path | `~/.amos/config.json` | `→ layer-absent` | 分层配置的**用户层**文件路径覆盖；`$HOME` 未设置或为空 ⇒ 该层**不存在**(不是空值) |
+| `AMOS_CONFIG_RELOAD_SECS` | int | `60` | `→ 60s` | 热重载 worker 的 tick 间隔(秒)。非法 / 负数 / `0` 一律**拒绝并 warn** 后回落 60 —— 零间隔不是「更快重载」而是**无界忙循环**。读取点:`reload::interval_from_env()`(嵌入方把它交给 `Worker::spawn`) |
+
+---
+
+## 19. 使用说明
+
+### 19.1 透明度原则
 
 - **未设置 ≠ 0 / false**:很多变量"未设置"意为"自动探测",**不应被解读为关闭**
 - **`true`/`1`**:接受 Rust 标准布尔解析
 - **持续时间**:`30s`/`5m`/`1h` 等,内部以 `humantime` 或 `Duration` 直接解析
 - **路径相对性**:相对路径以 `cwd` 为基准,生产部署建议使用绝对路径
 
-### 17.2 安全相关(高敏感)
+### 19.2 安全相关(高敏感)
 
 下列变量涉及**认证或权限**,改动前需明确**新的失效语义**:
 
@@ -266,6 +282,6 @@
 - `AMOS_CRED_FILE` — 改路径 ⇒ 旧路径下的 0600 文件**不会被自动清理**
 - `AMOS_API_KEY` / `AMOS_ASR_API_KEY` / `AMOS_OLLAMA_API_KEY` — 出现在云端请求,**切勿写入日志**
 
-### 17.3 自动生成
+### 19.3 自动生成
 
 本文档由 `scripts/env-doc-gen.mjs` 从代码扫描生成。运行时行为以代码为准。

@@ -8,14 +8,20 @@
   // 搜索：按名称 / id 子串匹配（大小写不敏感）。
   // 选中：Enter 打开 / 单击打开 → wm_open(id) → 关闭浮层。
   import { onMount } from "svelte";
-  import { bridgeDiag, invoke } from "../lib/backend";
+  import { announceAppOpened } from "../lib/shortcuts";
   import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
   import { LAYOUT_KEY, type HomeLayout, getLayout } from "../lib/amosStore";
   import { withoutPhone } from "../lib/phoneApps";
+  import { wmOpenWithDiag, wmOpen } from "../lib/wm";
   import { createStoreValue } from "./store";
   import { t } from "./locale.svelte";
   import { SPOTLIGHT_WIDTH, SPOTLIGHT_HEIGHT, SPOTLIGHT_INPUT_HEIGHT } from "../lib/desktopLayout";
   import { GLASS_SPOTLIGHT_STYLE, GLASS_BORDER_SUBTLE } from "../lib/shellChrome";
+  import { calcQuery } from "../lib/calculator";
+  import { FILES_KEY, folderPath, normalizeFiles, searchFiles, type FEntry } from "../lib/files";
+  import { buildSpotlightResults, type SpotlightRow } from "../lib/spotlightSearch";
+  import { revealFileAcrossWindows } from "./appLinks";
+  import { clipboardWrite } from "../lib/clipboard";
 
   // 关闭由壳决定（浮层从注册表渲染，壳传 `onclose`）——见 Launchpad.svelte 的同一处说明。
   let { onclose }: { onclose?: () => void } = $props();
@@ -54,14 +60,42 @@
     return result;
   });
 
-  // ─── 搜索结果 ─────────────────────────────────────────────────────────────────
-  const results = $derived.by<AppEntry[]>(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return [];
-    return allApps.filter(
-      (a) => a.name.toLowerCase().includes(q) || a.id.toLowerCase().includes(q),
-    ).slice(0, 8); // macOS Spotlight 最多展示 ~10 条
+  // ─── 搜索结果（REQ-A458：应用 + 文件 + 计算，一张列表）────────────────────────────
+  // 规则、顺序与上界住在 `lib/spotlightSearch.ts`（纯函数、已单测）；这里只负责把三个
+  // 来源喂给它：应用的（已本地化）名字、文件域自己的匹配器 `searchFiles`、以及计算器
+  // app 自己的引擎 `calcQuery`。三个来源各自都有"唯一真源"，所以 Spotlight 不会算出
+  // 一个与「计算器」不同的答案，也不会发明自己的文件匹配规则。
+  const filesStore = createStoreValue<unknown>(FILES_KEY, []);
+  let files = $state<FEntry[]>([]);
+  $effect(() => {
+    const un = filesStore.subscribe((raw) => {
+      files = normalizeFiles(raw);
+    });
+    return un;
   });
+
+  const results = $derived.by(() => {
+    const q = query.trim();
+    const lower = q.toLowerCase();
+    return buildSpotlightResults(query, {
+      apps: allApps.filter(
+        (a) => a.name.toLowerCase().includes(lower) || a.id.toLowerCase().includes(lower),
+      ),
+      files: q
+        ? searchFiles(files, q, true).map((e) => ({
+            id: e.id,
+            name: e.name,
+            // Where the hit lives — a global file search must say so (same rule the touch
+            // panel and the Files screen's own global search follow).
+            subtitle: folderPath(files, e.id) || null,
+          }))
+        : [],
+      calculation: calcQuery(q),
+    });
+  });
+
+  /** What the last activation did, when it needs saying (a copied calculation). */
+  let notice = $state("");
 
   // 键盘：上下选择 + Enter 打开
   let selected = $state(0);
@@ -79,9 +113,9 @@
     // Spotlight would feel like "Enter doesn't do anything" — log the null
     // for ops but still close the panel (better than leaving the user with
     // a dead modal over their desktop).
-    const result = await invoke<unknown>("wm_open", { label: id });
-    if (result === null) {
-      const diag = bridgeDiag("wm_open");
+    const r = await wmOpenWithDiag(id);
+    if (!r.ok) {
+      const diag = r.diag;
       if (!diag.ok) {
         // Only the `{ ok: false, kind: ... }` shape carries `kind` / `detail`
         // — narrowed here so svelte-check sees the union.
@@ -95,7 +129,47 @@
         // in the diagnostic ledger without overwhelming the user.
         console.warn(`[Spotlight] wm_open(${id}) refused`, code ?? diag.kind);
       }
+    } else {
+      // An app really opened → tell the automation runtime (`app` triggers).
+      announceAppOpened(id);
     }
+    onclose?.();
+  }
+
+  /**
+   * Run a row (REQ-A458). The three kinds end differently, and each difference is the promise the
+   * row makes:
+   *
+   *   * `app` — `wm_open` (create + focus) and the panel closes: the user is now looking at it.
+   *   * `calc` — the value goes to the **clipboard** and the panel stays open. The shell cannot
+   *     seed the Calculator window with a value (`wm_open` carries a label and nothing else), so
+   *     opening it would lose the number the user just typed; macOS's own answer here (⌘C on a
+   *     calculation) is honest *and* useful. A refused clipboard write says so instead of claiming
+   *     a copy that did not happen.
+   *   * `file` — open the Files window and hand it the entry through the **cross-window** store.
+   *     A refused write is reported: "Files opened at the root" is not what the row promised.
+   */
+  function activate(row: SpotlightRow): void {
+    notice = "";
+    if (row.kind === "app") {
+      void openApp(row.id);
+      return;
+    }
+    if (row.kind === "calc") {
+      // `invoke` never rejects — it resolves to `null` when the bridge is missing or the host
+      // refused (REQ-A296) — so the answer is read from the **value**, not from a `.catch()`
+      // (a catch here would be dead code, and this repo has removed that shape before).
+      void clipboardWrite({ kind: "text", text: row.id }, "spotlight.calc").then((entry) => {
+        notice = entry === null ? t("desktop.spotlightCopyFailed") : t("desktop.spotlightCopied");
+      });
+      return;
+    }
+    if (!revealFileAcrossWindows(row.id)) {
+      // The store refused the intent (full/unavailable) — say it, then still open Files: the
+      // user asked for a window, and a window is what they can get.
+      console.warn(`🛟 [Spotlight] could not queue the reveal for '${row.id}' (store refused)`);
+    }
+    void wmOpen("files");
     onclose?.();
   }
 
@@ -106,14 +180,14 @@
     }
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      selected = Math.min(selected + 1, Math.max(0, results.length - 1));
+      selected = Math.min(selected + 1, Math.max(0, results.rows.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       selected = Math.max(selected - 1, 0);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const r = results[selected];
-      if (r) void openApp(r.id);
+      const r = results.rows[selected];
+      if (r) activate(r);
     }
   }
 
@@ -178,22 +252,43 @@
     </div>
 
     <!-- 结果列表 -->
-    {#if results.length > 0}
+    {#if results.rows.length > 0}
       <div class="flex-1 overflow-y-auto p-2" role="listbox" aria-label={t("desktop.searchResults")}>
-        {#each results as result, i (result.id)}
+        {#each results.rows as result, i (result.key)}
           <button
             class="flex w-full items-center gap-3 rounded-lg px-4 py-3 text-left text-[15px] text-white/80 transition-colors {i === selected ? 'bg-blue-500/40 text-white' : 'hover:bg-white/10'}"
             role="option"
             aria-selected={i === selected}
+            data-testid="spotlight-row-{result.kind}"
             onmouseenter={() => (selected = i)}
-            onclick={() => openApp(result.id)}
+            onclick={() => activate(result)}
           >
-            <span class="text-xl">{result.icon}</span>
-            <span class="flex-1">{result.name}</span>
-            <span class="text-[11px] text-white/40">↵</span>
+            <span class="text-xl" aria-hidden="true">{result.icon ?? (result.kind === "calc" ? "=" : "📄")}</span>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate">{result.title}</span>
+              {#if result.subtitle}
+                <span class="block truncate text-[11px] text-white/40">{result.subtitle}</span>
+              {/if}
+            </span>
+            <!-- What this row is — a screen reader must not have to guess from the glyph. -->
+            <span class="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-white/50 ring-1 ring-white/15">
+              {t(`desktop.spotlightKind.${result.kind}`)}
+            </span>
+            {#if i === selected}<span class="text-[11px] text-white/40">↵</span>{/if}
           </button>
         {/each}
+        {#if results.hidden.apps + results.hidden.files > 0}
+          <!-- Bounded, not silently truncated: the caps live in `lib/spotlightSearch.ts`. -->
+          <p class="px-4 py-1 text-[11px] text-white/30" data-testid="spotlight-more">
+            {t("desktop.spotlightMore", { n: results.hidden.apps + results.hidden.files })}
+          </p>
+        {/if}
       </div>
+      {#if notice}
+        <p class="border-t border-white/10 px-5 py-2 text-[12px] text-white/70" role="status" data-testid="spotlight-notice">
+          {notice}
+        </p>
+      {/if}
     {:else if query.trim()}
       <div class="flex items-center justify-center p-8 text-[13px] text-white/30">
         {t("desktop.noResults")}

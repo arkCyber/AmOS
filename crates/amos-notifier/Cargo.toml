@@ -1,0 +1,21 @@
+[package]
+name = "amos-notifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "amos: alert dispatcher — P0/P1/P2 levels, suppression windows, per-channel rate limits, webhook + SMTP transport. docs/devops.md §3."
+
+[lib]
+name = "amos_notifier"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror = "2"
+
+[dev-dependencies]
+# Same stdlib-only policy as the rest of the workspace: tests use
+# `std::env::temp_dir()` + a unique suffix instead of pulling `tempfile`.

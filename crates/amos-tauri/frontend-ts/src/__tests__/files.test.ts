@@ -3,8 +3,6 @@ import {
   addEntry,
   childrenOf,
   contentContains,
-  deleteEntry,
-  deleteEntries,
   filterByName,
   folderPath,
   isInside,
@@ -21,6 +19,11 @@ import {
   normalizeFiles,
   folderTree,
   hasName,
+  moveToTrash,
+  restoreFromTrash,
+  purgeFromTrash,
+  normalizeTrash,
+  MAX_TRASH_ITEMS,
   type FEntry,
 } from "../lib/files";
 
@@ -61,8 +64,8 @@ describe("files tree ops", () => {
     expect(isInside(small, "b", "a")).toBe(true);
   });
 
-  test("deleting a folder cascades to descendants only", () => {
-    const after = deleteEntry(list, "a");
+  test("moving a folder to the trash cascades to descendants only", () => {
+    const after = moveToTrash(list, [], new Set(["a"]), 1).list;
     expect(after.map((e) => e.id)).toEqual(["r"]);
   });
 
@@ -178,7 +181,7 @@ describe("files tree ops", () => {
     expect(recentFiles(files, 0)).toEqual([]);
   });
 
-  test("deleteEntries removes the union of subtrees and is a no-op when empty", () => {
+  test("the trash removes the union of subtrees and is a no-op when empty", () => {
     const files = [
       mk("a", "folder", "A"),
       mk("a1", "file", "inA", "a"),
@@ -186,11 +189,13 @@ describe("files tree ops", () => {
       mk("b1", "file", "inB", "b"),
       mk("c", "file", "C"),
     ];
-    // delete folders a + file c → also removes a's child, keeps b subtree
-    const next = deleteEntries(files, new Set(["a", "c"]));
-    expect(next.map((e) => e.id).sort()).toEqual(["b", "b1"]);
-    expect(deleteEntries(files, new Set())).toBe(files); // same ref (no-op)
-    expect(deleteEntries(files, new Set(["nope"]))).toEqual(files); // unknown → unchanged
+    // trashing folders a + file c → also takes a's child, keeps b's subtree
+    const r = moveToTrash(files, [], new Set(["a", "c"]), 1);
+    expect(r.list.map((e) => e.id).sort()).toEqual(["b", "b1"]);
+    // …and the ledger receives **one item per selected top-most entry**.
+    expect(r.moved.map((m) => m.id)).toEqual(["a", "c"]);
+    expect(moveToTrash(files, [], new Set(), 1).list).toBe(files); // same ref (no-op)
+    expect(moveToTrash(files, [], new Set(["nope"]), 1).list).toEqual(files); // unknown → unchanged
   });
 
   test("moveEntries relocates several items under a destination", () => {
@@ -271,8 +276,8 @@ describe("files tree ops", () => {
     expect(p.length).toBeGreaterThan(0);
     // isInside tolerates the cycle (returns a definitive answer, no hang)
     expect(typeof isInside(cyc, "b", "a")).toBe("boolean");
-    // deleteEntries removes a subtree even when the parent chain is cyclic
-    const removed = deleteEntries(cyc, new Set(["a"]));
+    // the trash removes a subtree even when the parent chain is cyclic
+    const removed = moveToTrash(cyc, [], new Set(["a"]), 1).list;
     expect(removed.length).toBe(1); // only `self` survives (a's subtree = a+b+x)
     expect(removed[0]!.id).toBe("self");
     expect(removed.every((e) => e.id !== "a" && e.id !== "x" && e.id !== "b")).toBe(true);
@@ -305,6 +310,90 @@ describe("files tree ops", () => {
   });
 });
 
+/**
+ * REQ-A455 — the trash. Every case here is a property the *safety net* must have, in the
+ * order they matter: nothing is lost by deleting (`moveToTrash` is reversible), a folder
+ * comes back whole, the ledger cannot grow without bound, and the ways a restore can fail
+ * are **named** instead of silently resolved.
+ */
+describe("trash: moveToTrash", () => {
+  const tree = (): FEntry[] => [
+    mk("doc", "folder", "文档"),
+    mk("a", "file", "a.txt", "doc"),
+    mk("b", "file", "b.txt", "doc"),
+    mk("c", "file", "c.txt"),
+  ];
+
+  test("a deleted file leaves the tree and is recoverable byte-for-byte", () => {
+    const before = tree();
+    const r = moveToTrash(before, [], new Set(["c"]), 1000);
+    expect(r.list.map((e) => e.id)).toEqual(["doc", "a", "b"]);
+    expect(r.moved).toHaveLength(1);
+    expect(r.moved[0]!).toMatchObject({ id: "c", deletedAt: 1000 });
+    expect(r.trash[0]!.members).toEqual([before.find((e) => e.id === "c")!]);
+    // …and putting it back is the identity (the property a safety net is judged on).
+    const back = restoreFromTrash(r.list, r.trash, "c");
+    expect(back.outcome).toEqual({ kind: "restored", to: undefined });
+    expect(back.trash).toEqual([]);
+    expect(back.list.find((e) => e.id === "c")).toEqual(before.find((e) => e.id === "c")!);
+  });
+
+  test("a folder takes its whole subtree, and remembers where it came from", () => {
+    const r = moveToTrash(tree(), [], new Set(["doc"]), 7);
+    expect(r.list.map((e) => e.id)).toEqual(["c"]);
+    expect(r.trash[0]!.members.map((e) => e.id)).toEqual(["doc", "a", "b"]); // root FIRST
+    // A root-level entry carries **no** `fromParent` key at all (not `undefined`): the
+    // ledger must not claim a location it never had.
+    expect(r.moved[0]!.id).toBe("doc");
+    expect("fromParent" in r.moved[0]!).toBe(false);
+    // Put back: root under the same parent, children still pointing at the root.
+    const back = restoreFromTrash(r.list, r.trash, "doc");
+    expect(back.outcome.kind).toBe("restored");
+    expect(back.list.map((e) => e.id).sort()).toEqual(["a", "b", "c", "doc"]);
+    expect(back.list.find((e) => e.id === "a")!.parent).toBe("doc");
+  });
+
+  test("selecting a folder AND something inside it yields ONE item, not two", () => {
+    // Otherwise the ledger would hold a copy of a child whose parent is also inside it,
+    // and restoring the parent would resurrect a duplicate.
+    const r = moveToTrash(tree(), [], new Set(["doc", "a"]), 1);
+    expect(r.moved).toHaveLength(1);
+    expect(r.moved[0]!.id).toBe("doc");
+    expect(r.trash[0]!.members.map((e) => e.id)).toEqual(["doc", "a", "b"]);
+  });
+
+  test("an empty selection and an unknown id are no-ops that keep the ledger object", () => {
+    const t = tree();
+    const empty = moveToTrash(t, [], new Set(), 1);
+    expect(empty).toEqual({ list: t, trash: [], moved: [], dropped: 0 });
+    const unknown = moveToTrash(t, [], new Set(["ghost"]), 1);
+    expect(unknown.list).toBe(t);
+    expect(unknown.dropped).toBe(0);
+  });
+
+  test("the ledger is bounded: the OLDEST item is evicted, and each eviction is reported", () => {
+    let list: FEntry[] = [];
+    let trash: ReturnType<typeof moveToTrash>["trash"] = [];
+    let evicted = 0;
+    const total = MAX_TRASH_ITEMS + 3;
+    for (let i = 0; i < total; i++) {
+      list = [...list, mk(`f${i}`, "file", `f${i}.txt`)];
+      const r = moveToTrash(list, trash, new Set([`f${i}`]), i);
+      list = r.list;
+      trash = r.trash;
+      // `dropped` is **per call** ("this delete evicted N"), which is what the UI can say.
+      expect(r.dropped).toBe(i < MAX_TRASH_ITEMS ? 0 : 1);
+      evicted += r.dropped;
+    }
+    expect(evicted).toBe(3);
+    expect(trash).toHaveLength(MAX_TRASH_ITEMS);
+    // Newest first, oldest gone — the whole point of a bounded safety net.
+    expect(trash[0]!.id).toBe(`f${total - 1}`);
+    expect(trash.some((t) => t.id === "f0")).toBe(false);
+    expect(trash.some((t) => t.id === "f3")).toBe(true);
+  });
+});
+
 describe("hasName (child-name lookup)", () => {
   test("detects whether a child with the given name exists", () => {
     const kids = [
@@ -315,6 +404,89 @@ describe("hasName (child-name lookup)", () => {
     expect(hasName(kids, "readme.md")).toBe(true);
     expect(hasName(kids, "missing.txt")).toBe(false);
     expect(hasName([], "anything")).toBe(false);
+  });
+});
+
+describe("trash: restoreFromTrash", () => {
+  test("a trashed child is only reachable with its parent (the ledger holds the subtree)", () => {
+    const r = moveToTrash(
+      [mk("doc", "folder", "文档"), mk("a", "file", "a.txt", "doc")],
+      [],
+      new Set(["doc"]),
+      1,
+    );
+    // The child left the tree *inside* its folder, so it is not a ledger row of its own…
+    expect(restoreFromTrash(r.list, r.trash, "a").outcome).toEqual({ kind: "not-found" });
+    // …and restoring the folder brings both back.
+    const back = restoreFromTrash(r.list, r.trash, "doc");
+    expect(back.list.map((e) => e.id).sort()).toEqual(["a", "doc"]);
+  });
+
+  test("a folder that disappeared while its child was in the trash restores at the root", () => {
+    const moved = moveToTrash(
+      [mk("doc", "folder", "文档"), mk("a", "file", "a.txt", "doc")],
+      [],
+      new Set(["a"]),
+      1,
+    );
+    expect(moved.trash[0]!.fromParent).toBe("doc");
+    // The user deleted the folder afterwards — the child's home no longer exists.
+    const back = restoreFromTrash([], moved.trash, "a");
+    expect(back.outcome).toEqual({ kind: "restored-to-root" });
+    expect(back.list[0]!.parent).toBeUndefined();
+  });
+
+  test("two collisions are REFUSED by name, never resolved behind the user's back", () => {
+    const r = moveToTrash(
+      [mk("doc", "folder", "文档"), mk("a", "file", "a.txt", "doc")],
+      [],
+      new Set(["a"]),
+      1,
+    );
+    // (1) a new sibling took the name while it was away
+    const sameName = restoreFromTrash([r.list[0]!, mk("other", "file", "a.txt", "doc")], r.trash, "a");
+    expect(sameName.outcome).toEqual({ kind: "name-conflict", name: "a.txt" });
+    // (2) the same id is already back in the tree (hand-edited store)
+    const sameId = restoreFromTrash([...r.list, mk("a", "file", "a.txt", "doc")], r.trash, "a");
+    expect(sameId.outcome).toEqual({ kind: "id-conflict", id: "a" });
+    // Neither refusal changed anything.
+    expect(sameName.trash).toHaveLength(1);
+    expect(sameId.list.find((e) => e.id === "a")).toBeTruthy();
+  });
+
+  test("an unknown key is not-found (another window may have purged it)", () => {
+    expect(restoreFromTrash([], [], "nope").outcome).toEqual({ kind: "not-found" });
+  });
+});
+
+describe("trash: purgeFromTrash + normalizeTrash", () => {
+  test("purge is the only destructive op, and an empty set keeps the same array", () => {
+    const r = moveToTrash([mk("c", "file", "c.txt")], [], new Set(["c"]), 1);
+    expect(purgeFromTrash(r.trash, new Set())).toBe(r.trash);
+    expect(purgeFromTrash(r.trash, new Set(["c"]))).toEqual([]);
+    // An id that is not in the ledger also leaves the array untouched.
+    expect(purgeFromTrash(r.trash, new Set(["ghost"]))).toBe(r.trash);
+  });
+
+  test("normalizeTrash repairs a hand-edited ledger instead of trusting it", () => {
+    expect(normalizeTrash("nope")).toEqual([]);
+    expect(normalizeTrash([null, 42, {}])).toEqual([]);
+    // Root missing from `members` ⇒ nothing to name, nothing to look up ⇒ dropped.
+    expect(normalizeTrash([{ id: "x", members: [mk("y", "file", "y.txt")], deletedAt: 5 }])).toEqual(
+      [],
+    );
+    // A duplicate id keeps the first; a bad clock becomes 0; members are re-ordered root-first.
+    const out = normalizeTrash([
+      { id: "a", members: [mk("b", "file", "b.txt"), mk("a", "folder", "A")], deletedAt: "soon" },
+      { id: "a", members: [mk("a", "folder", "other")], deletedAt: 3 },
+      { id: "z", members: [mk("z", "file", "z.txt")], deletedAt: 9, fromParent: "" },
+    ]);
+    expect(out.map((t) => t.id)).toEqual(["a", "z"]);
+    expect(out[0]!.members.map((m) => m.id)).toEqual(["a", "b"]);
+    expect(out[0]!.deletedAt).toBe(0);
+    // An empty `fromParent` is noise, not a location.
+    expect(out[1]!.fromParent).toBeUndefined();
+    expect(out[1]!.deletedAt).toBe(9);
   });
 });
 

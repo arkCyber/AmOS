@@ -19,6 +19,12 @@ anyhow.workspace = true
 # unchanged; the supervisor stays transport-agnostic unless told otherwise.
 amos-timesync = { workspace = true, optional = true }
 
+# Optional integration: fire-and-forget alerts through the `amos-notifier`
+# dispatcher when a supervised daemon crashes, exhausts its restart budget, or
+# fails to spawn. Off by default so the supervisor's core (which is itself an
+# offline test surface) is not pulled into the notifier's transitive deps.
+amos-notifier = { workspace = true, optional = true }
+
 [[bin]]
 name = "amos-supervisor"
 path = "src/bin/amos-supervisor.rs"
@@ -27,3 +33,6 @@ path = "src/bin/amos-supervisor.rs"
 default = []
 # Enables periodic network time calibration orchestrated by the supervisor.
 timesync = ["dep:amos-timesync", "amos-timesync/ntp"]
+# Enables notifier-backed observability of the supervisor's monitor loop.
+# The two `dep:` markers guarantee the right build script reaches the crate.
+notifier = ["dep:amos-notifier"]

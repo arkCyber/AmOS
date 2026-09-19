@@ -20,7 +20,8 @@
  *      escape runs until its task/process is aborted; who aborts it must be written
  *      next to it (a comment mentioning exit/stop/shutdown/signal/until/…). The
  *      pre-existing backlog lives in `scripts/hot-loop-baseline.json`; a **new**
- *      undocumented loop fails the scan with instructions.
+ *      undocumented loop fails the scan with instructions, and an entry that no longer
+ *      matches any loop **fails** too (REQ-A447 — the ratchet must shrink, not rot).
  *
  * Scope: production Rust under `crates/<crate>/src` (recursively). `tests/`
  * directories and `#[cfg(test)]` sections are skipped — test loops are not
@@ -270,6 +271,20 @@ function runSelfTest() {
   console.log(`[hot-loop] selftest OK — ${cases.length} classifier case(s), incl. 3 that must fail.`);
 }
 
+// An unrecognised flag is a failure, not a no-op (measured 2026-09-19: `docs/POWER_OF_10.md`
+// spelled this gate's selftest `--self-test`, which it does not implement, so the documented
+// "verification" line silently ran the gate instead — see `rust-recursion-scan.mjs`).
+const KNOWN_FLAGS = new Set(["--selftest", "--json", "--update-baseline"]);
+const unknownFlags = process.argv
+  .slice(2)
+  .filter((f) => f.startsWith("-") && !KNOWN_FLAGS.has(f));
+if (unknownFlags.length > 0) {
+  console.error(
+    `[hot-loop] unknown flag(s): ${unknownFlags.join(", ")} — known: ${[...KNOWN_FLAGS].join(", ")}`,
+  );
+  process.exit(2);
+}
+
 if (process.argv.includes("--selftest")) {
   runSelfTest();
   process.exit(0);
@@ -325,7 +340,7 @@ if (json) {
       2,
     ),
   );
-  process.exit(newHotSpins.length + newUndocumented.length > 0 ? 1 : 0);
+  process.exit(newHotSpins.length + newUndocumented.length + stale.length > 0 ? 1 : 0);
 }
 
 console.log(`[hot-loop] ${rustFiles.length} production .rs file(s) scanned.`);
@@ -345,7 +360,7 @@ for (const f of newUndocumented) {
   );
 }
 for (const k of stale) {
-  console.log(`  [..] baseline entry no longer matches any loop (remove it): ${k}`);
+  console.log(`  [FAIL] baseline entry no longer matches any loop (remove it): ${k}`);
 }
 
 if (newHotSpins.length > 0) {
@@ -361,6 +376,14 @@ if (newUndocumented.length > 0) {
 
 if (newHotSpins.length + newUndocumented.length > 0) {
   console.log("[hot-loop] FAIL — regressions above.");
+  process.exit(1);
+}
+if (stale.length > 0) {
+  // A note was not enough (REQ-A447): the ratchet must **shrink**. A baselined loop that no longer
+  // matches anything is a licence nobody has revoked — it fails until the entry is removed.
+  console.log(
+    `[hot-loop] FAIL — ${stale.length} stale baseline entr(ies); remove them (the ratchet must shrink, not rot).`,
+  );
   process.exit(1);
 }
 console.log("[hot-loop] OK — every production loop waits or has an exit; long runners are documented or baselined.");

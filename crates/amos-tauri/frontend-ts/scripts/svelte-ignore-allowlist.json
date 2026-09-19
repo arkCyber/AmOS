@@ -1,0 +1,11 @@
+{
+  "comment": "The cross-file carrier for every compiler suppression in the System-UI tree (REQ-A472). `svelte-ignore` is a LOCAL exemption whose reason used to live only in a comment on site, with nothing checking that it still held; `--compiler-warnings` was a flag nobody had written a reason into. This file is the missing carrier, and `scripts/svelte-ignore-scan.mjs` keeps it honest: file+code must be declared here (R1), the reason must quote the on-site comment verbatim so the two cannot drift (R2), an entry with no site is a finding (R3), the site must keep a real prose reason (R4), the suppression must still suppress something — proven by removing it and requiring the code to fire (R5) — and any relaxed warning code needs a reason HERE rather than an unexplained flag edit (R6).",
+  "compilerWarnings": [],
+  "ignores": [
+    {
+      "file": "src/svelte/FilesApp.svelte",
+      "code": "a11y_media_has_caption",
+      "reason": "The file is the user's own: a captions track can only come from the file itself, and synthesizing one we do not have would put a claim on screen that nobody made. (REQ-A471 wrote this exemption and the reason above is quoted verbatim from the on-site comment; REQ-A472 gave it this carrier and a liveness probe: removing the ignore makes svelte-check report a11y_media_has_caption again, which is what keeps the exemption from outliving its reason.)"
+    }
+  ]
+}

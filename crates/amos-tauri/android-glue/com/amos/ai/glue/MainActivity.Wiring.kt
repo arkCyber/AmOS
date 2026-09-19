@@ -333,3 +333,30 @@ object AlwaysOn {
   }
 }
 
+/**
+ * AmOS **BLE / NFC / Biometric JNI binding** — install the JavaVM so Kotlin
+ * can call back into Rust.
+ *
+ * This wiring MUST be placed in the generated `MainActivity.onStart` BEFORE any
+ * BLE/NFC/Biometric operation. It installs the bidirectional JNI bridge:
+ * - Rust calls Kotlin: `ble::ble_connect()`, `nfc_start_dispatch()`, etc.
+ * - Kotlin calls Rust: `BluetoothGattGlue.onConnectionStateChange()`, `NfcGlue.onNfcTagDiscovered()`, etc.
+ *
+ * Wire it in the generated `MainActivity`:
+ * ```
+ * override fun onStart() {
+ *   super.onStart()
+ *   // Install JNI binding for BLE/NFC/Biometric FIRST.
+ *   NativeBootGuard.quiet("device-glue") {
+ *     BluetoothGattGlue.install(this)
+ *     NfcGlue.init(this)
+ *   }
+ *   // ... other wiring (PermissionWire.requestNeeded, etc.)
+ * }
+ * ```
+ *
+ * The `BluetoothGattGlue.install()` call is the bootstrap — it calls `nativeInstall()`
+ * which installs the JavaVM + Context into Rust. After this, all three glue objects
+ * (BLE, NFC, Biometric) can use the same binding.
+ */
+

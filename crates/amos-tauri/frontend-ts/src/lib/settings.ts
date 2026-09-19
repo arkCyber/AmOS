@@ -1,3 +1,5 @@
+import { localId } from "./localId";
+
 export type QuickKey = "wifi" | "bluetooth" | "airplane" | "hotspot" | "darkmode" | "dnd" | "location";
 
 /** The radios that go through the real `radio_*` backend (wifi / bluetooth / airplane / hotspot). */
@@ -116,6 +118,20 @@ export function countForApp(list: Notif[], appName: string): number {
 /** Remove every notification belonging to an app (open = read). */
 export function removeAppNotifs(list: Notif[], appName: string): Notif[] {
   return list.filter((n) => n.app !== appName);
+}
+
+/**
+ * A new notification-centre row id (REQ-A401).
+ *
+ * The shell-produced notifications (phone / contacts call banners, reminder & calendar
+ * alerts, telemetry-spy hits …) all need an id, and the store treats it as identity:
+ * `normalizeNotifs` **drops rows whose id repeats**, and `newestAddedNotif` decides what
+ * "just arrived" means by comparing id sets — so a repeated id makes a real notification
+ * invisible after a reload (and silent when it was shown). Sites that used to inline
+ * `Date.now()` + five random digits call this instead.
+ */
+export function newNotifId(): string {
+  return localId("notif");
 }
 
 /** Prepend one notification, newest-first, capped at `NOTIF_CAP` (immutable). */

@@ -1,0 +1,42 @@
+{
+  "kinds": {
+    "sanctioned-fallback": "The random tail inside `lib/localId.ts` itself, used only when the host has no `crypto.getRandomValues`. It is zero-padded to 7 base-36 digits and it is not what makes the id unique — the process-monotonic counter in front of it is. This is the one permitted home for a random draw in an id.",
+    "presentation-draw": "`lib/photos.ts`: the gradient palette pair and the emoji of a demo photo. These are *appearance*, not identity — the row's id comes from `localId` (or from the counter-based back-fill in `normalizePhotos`). Two photos that picked the same gradient are identical, not confused.",
+    "shuffle-order": "`lib/player.ts::buildOrder`'s default shuffle RNG (injectable, so tests are deterministic). It decides an *order*, and a repeated order is a repeated shuffle, not a lost row; nothing persists the draws.",
+    "csprng-fallback": "`lib/hotspot.ts::csprngDraw`'s `Math.random` return when the host has no CSPRNG: it feeds a *suggested* Wi-Fi PSK the user can edit before applying. The file's own comment records that the fallback is not cryptographically strong — it is a suggestion, not an identity, and not a silent security claim.",
+    "mock-token": "`lib/pushNotifications.ts::generateMockDeviceToken`: 64 hex digits standing in for an APNs device token in the simulator path (`generateMockDeviceToken` is in the unwired baseline — no production call site). A token is a *given* identifier handed to the host, not one the shell mints for a row, and the real token path goes through Rust (`push_get_token`).",
+    "user-requested-draw": "`src/lib/shortcuts.ts`'s `random_number` action: the user's own shortcut asked for a random integer in a range ([min, max]). It is a *value the shortcut computes*, not an identity — nothing keys a row by it, and the same draw twice is the same number twice, not two different records."
+  },
+  "sites": [
+    {
+      "file": "src/lib/localId.ts",
+      "kind": "sanctioned-fallback",
+      "hits": 1
+    },
+    {
+      "file": "src/lib/photos.ts",
+      "kind": "presentation-draw",
+      "hits": 2
+    },
+    {
+      "file": "src/lib/player.ts",
+      "kind": "shuffle-order",
+      "hits": 1
+    },
+    {
+      "file": "src/lib/hotspot.ts",
+      "kind": "csprng-fallback",
+      "hits": 1
+    },
+    {
+      "file": "src/lib/pushNotifications.ts",
+      "kind": "mock-token",
+      "hits": 1
+    },
+    {
+      "file": "src/lib/shortcuts.ts",
+      "kind": "user-requested-draw",
+      "hits": 1
+    }
+  ]
+}

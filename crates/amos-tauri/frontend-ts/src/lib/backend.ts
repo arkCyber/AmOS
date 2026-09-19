@@ -5,6 +5,7 @@
  */
 import type { AiProviderId } from "./providers";
 import { amosWarn } from "./debugLog";
+import { localId } from "./localId";
 
 interface TauriBridge {
   invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
@@ -320,12 +321,18 @@ export async function switchAiBackend(
   });
 }
 
-/** Stable conversation id persisted for multi-turn memory. */
+/**
+ * Stable conversation id persisted for multi-turn memory.
+ *
+ * Minted once per install and then read back, so a collision is not a momentary lost row —
+ * it is two sessions sharing one multi-turn history. Uses the shared `localId` (REQ-A401);
+ * the `conv-` prefix is kept (`backend-bridge.test.ts` keys on it).
+ */
 export function conversationId(): string {
   const KEY = "amos.ai.session";
   const existing = readStored(KEY, "");
   if (existing) return existing;
-  const id = `conv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const id = localId("conv");
   writeStored(KEY, id);
   return id;
 }
@@ -1171,6 +1178,109 @@ export async function systemStoreSnapshot(): Promise<Record<string, string> | nu
   return invoke<Record<string, string>>("store_snapshot");
 }
 
+/* ---- Files app: preview + bundle export/import (Rust-side, real FS work) ----
+ * Real filesystem operations live in `crates/amos-tauri/src/files.rs`. The JS layer
+ * never inlines PDF parsing or gzip compression — those were `reqdev/preview-failed`
+ * gap fillers before the Rust commands landed (see i18n-allowlist.json
+ * "files.preview*" history).
+ */
+
+/** Result of `files_preview_bytes`: a typed classification + the data the renderer
+ *  needs.  `data` is a decoded text string for kind="text", a data URL for media,
+ *  or empty for binary/empty.  `error` is non-null only for truncation notices. */
+export interface FilesPreviewResult {
+  /** "text" | "image" | "audio" | "video" | "binary" | "empty" */
+  kind: string;
+  data: string;
+  mime: string | null;
+  isText: boolean;
+  sizeLabel: string;
+  error: string | null;
+}
+
+/** Preview bytes via the Rust command (real MIME classification + safe text decode). */
+export async function filesPreviewBytes(
+  name: string,
+  mime: string | null,
+  bytes: Uint8Array | number[],
+): Promise<FilesPreviewResult | null> {
+  return invoke<FilesPreviewResult>("files_preview_bytes", {
+    name,
+    mime: mime ?? "",
+    data: Array.from(bytes),
+  });
+}
+
+/** Bundle export reply. */
+export interface FilesBundleExport {
+  text: string;
+  originalBytes: number;
+  compressedBytes: number;
+  entryCount: number;
+  ratioLabel: string;
+}
+
+/** Externally-tagged bundle import reply: `{tag: "Ok", data: {...}}` or
+ *  `{tag: "Err", data: {reason, compressedBytes?, uncompressedBytes?}}`. */
+export type FilesBundleImport =
+  | {
+      tag: "Ok";
+      data: {
+        entries: unknown[];
+        originalBytes: number;
+        compressedBytes: number;
+        entryCount: number;
+      };
+    }
+  | {
+      tag: "Err";
+      data: {
+        reason: string;
+        compressedBytes: number | null;
+        uncompressedBytes: number | null;
+      };
+    };
+
+/** Serialize an FEntry[] array into a gzip-compressed, base64-encoded bundle
+ *  suitable for sharing (`.amos-bundle` text). */
+export async function filesBundleExport(
+  entries: unknown[],
+): Promise<FilesBundleExport | null> {
+  return invoke<FilesBundleExport>("files_bundle_export", { entries });
+}
+
+/** Parse + decompress + validate an `.amos-bundle` text into FEntry[].  The
+ *  reply is structured so a corrupted bundle is reported honestly, never as
+ *  a fabricated empty list. */
+export async function filesBundleImport(raw: string): Promise<FilesBundleImport | null> {
+  return invoke<FilesBundleImport>("files_bundle_import", { raw });
+}
+
+/** Validate a cloud snapshot structure on the Rust side before persisting.  Returns
+ *  the normalised snapshot (with `savedAt` defaulted if absent) or `null` if the
+ *  JSON serialisation fails — the WebView stores the validated reply. */
+export interface FilesCloudSnapshot {
+  label: string;
+  savedAt: number;
+  collections: string[];
+  totalBytes: number;
+  fileCount: number;
+  files: Array<{
+    id: string;
+    name: string;
+    kind: string;
+    collection: string;
+    sizeBytes: number | null;
+    ts: number;
+  }>;
+}
+
+export async function filesCloudValidate(
+  snapshot: FilesCloudSnapshot,
+): Promise<FilesCloudSnapshot | null> {
+  return invoke<FilesCloudSnapshot>("files_cloud_validate", { snapshot });
+}
+
 
 
 /* ---- Notes export: write a .txt via the Rust core ---- */
@@ -1400,7 +1510,11 @@ export type SmsFolderSnapshotResult =
 export async function smsFolderSnapshot(folder: SmsFolder): Promise<SmsFolderSnapshotResult> {
   const threads = await invoke<SmsThreadOut[]>("sms_snapshot", { folder });
   if (threads) return { ok: true, threads };
-  const diag = bridgeDiag();
+  // REQ-A407: 同上 —— 问的是**这一次**调用，就用 `bridgeDiag("sms_snapshot")`
+  // （`backend.bridgeDiag` 的文档："prefer the named form whenever the question is about
+  // one specific call"）。今天两者结果相同（写与读只隔一个微任务跳，见 bundleHost 的注释），
+  // 改的是"将来插入 await 也仍然对"。
+  const diag = bridgeDiag("sms_snapshot");
   if (!diag.ok && diag.kind === "not-bridged") {
     return { ok: false, error: "not bridged", denied: false, notBridged: true };
   }

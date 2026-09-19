@@ -11,8 +11,9 @@
  */
 import { saveLayout, pushRecent, getLayout, defaultLayout, type HomeLayout } from "../lib/amosStore";
 import { appTitleKey, appIds } from "../lib/appMeta";
-import { bridgeDiag, invoke } from "../lib/backend";
+import { announceAppOpened } from "../lib/shortcuts";
 import type { LayoutSnapshot } from "../lib/wm";
+import { wmOpenWithDiag } from "../lib/wm";
 
 export type Surface =
   | { kind: "home" }
@@ -92,6 +93,11 @@ function clearOverlays() {
 export async function open(id: string): Promise<void> {
   if (appTitleKey(id) !== null) pushRecent(id);
   clearOverlays();
+
+  // Tell the automation runtime that an app was opened (`app` triggers). Announced
+  // **here** — at the single point the shell commits to opening — so a trigger cannot
+  // fire twice for one open, and a refused `wm_open` below never announces an app that
+  // did not open (the announce sits after the desktop branch's outcome check).
   
   // Desktop form factor: multi-window (each app is a real WebviewWindow).
   //
@@ -103,9 +109,9 @@ export async function open(id: string): Promise<void> {
   // result and only commit to "the app opened" (the surface reset)
   // when the host actually accepted the request.
   if (_layoutSnap?.form === "desktop") {
-    const result = await invoke<unknown>("wm_open", { label: id });
-    if (result === null) {
-      const diag = bridgeDiag("wm_open");
+    const r = await wmOpenWithDiag(id);
+    if (!r.ok) {
+      const diag = r.diag;
       if (!diag.ok) {
         const code =
           diag.kind === "command-failed" &&
@@ -125,6 +131,7 @@ export async function open(id: string): Promise<void> {
     }
     // Desktop stays on home after opening an app window (macOS behavior).
     _surface = { kind: "home" };
+    announceAppOpened(id);
     return;
   }
   
@@ -142,6 +149,7 @@ export async function open(id: string): Promise<void> {
   // records the chain. Giving a tablet real windows means changing **this** line —
   // and moving the test and that doc section with it.
   _surface = { kind: "app", id };
+  announceAppOpened(id);
 }
 
 /** Enter the iOS-style "App Library" page (grouped apps + frequently used). */

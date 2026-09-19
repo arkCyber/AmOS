@@ -11,6 +11,7 @@
  * pathological or corrupt row can never make a range query loop forever —
  * defensive by construction, not certified.
  */
+import { localId } from "./localId";
 
 export const DAY_MS = 86_400_000;
 export const MINUTE_MS = 60_000;
@@ -507,11 +508,18 @@ export function calendarById(
 
 export type EventDraft = Omit<CalendarEvent, "id" | "createdAt">;
 
-/** Process-local monotonic counter keeps ids unique within a millisecond. */
-let seq = 0;
-export function makeId(now: number): string {
-  seq += 1;
-  return `${now.toString(36)}-${seq}`;
+/**
+ * A new event (or custom calendar) id.
+ *
+ * REQ-A402: was `${now.toString(36)}-${seq}` with a **per-process** counter — no entropy at
+ * all, so two contexts that agree on a millisecond mint the same string (measured: two
+ * processes with a frozen clock both produced `loyw3v28-1`; `localId` differed by its
+ * crypto tail). This shell runs several windows over one store, so a per-process counter
+ * is not a per-store guarantee — and a repeated event id is *renamed* by
+ * `normalizeEvents`, which silently breaks every reference to it.
+ */
+export function makeId(): string {
+  return localId("ev");
 }
 
 /** Clean one editor payload into the authoritative persisted shape. */
@@ -548,7 +556,7 @@ export function addEvent(
 ): CalendarEvent[] {
   const clean = sanitizeDraft(draft);
   if (!clean) return [...list];
-  const next = [...list, { ...clean, id: makeId(now), createdAt: now }];
+  const next = [...list, { ...clean, id: makeId(), createdAt: now }];
   return next.length > EVENT_CAP ? next.slice(next.length - EVENT_CAP) : next;
 }
 
@@ -579,7 +587,7 @@ export function addCalendar(
   if (!name) return [...groups];
   return [
     ...groups,
-    { id: makeId(now), custom: true, name, color: draft.color, enabled: true, createdAt: now },
+    { id: makeId(), custom: true, name, color: draft.color, enabled: true, createdAt: now },
   ];
 }
 
@@ -714,6 +722,6 @@ export function seedEvents(now: number): CalendarEvent[] {
       alertMinutes: null, createdAt: now + 5,
     },
   ];
-  return base.map((e) => ({ ...e, id: makeId(now) }));
+  return base.map((e) => ({ ...e, id: makeId() }));
 }
 

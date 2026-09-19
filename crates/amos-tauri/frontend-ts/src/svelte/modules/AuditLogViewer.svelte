@@ -13,6 +13,7 @@
   import { auditLogger } from "../../lib/enterprise";
   import { t } from "../locale.svelte";
   import { attachFocusTrap } from "../../lib/focusTrap";
+  import { installMenuKeyboard } from "../../lib/menuKeys";
   import type { AuditLog, AuditLogQuery, AuditLogLevel, AuditResult, AuditEventType } from "../../lib/enterprise/audit";
   import VirtualList from "../components/VirtualList.svelte";
 
@@ -35,6 +36,12 @@
   let exporting = $state(false);
   /** 导出菜单是否展开（点击/回车是显式路径；hover 只是指针设备上的顺带）。 */
   let exportMenuOpen = $state(false);
+  /** 展开的下拉菜单元素，交给 REQ-A436 的共享键盘层（方向键 / Home / End / Escape）。 */
+  let exportMenuEl = $state<HTMLDivElement | undefined>();
+  $effect(() => {
+    if (!exportMenuEl || !exportMenuOpen) return;
+    return installMenuKeyboard(exportMenuEl, { onClose: () => (exportMenuOpen = false) });
+  });
   let loading = $state(false);
   let autoRefresh = $state(false);
   let refreshInterval: number | null = null;
@@ -341,7 +348,7 @@
         >
           {exporting ? t("audit.exporting") : t("audit.export")}
         </button>
-        <div class="dropdown-menu" class:open={exportMenuOpen} role="menu">
+        <div class="dropdown-menu" class:open={exportMenuOpen} bind:this={exportMenuEl} role="menu">
           <button
             role="menuitem"
             onclick={() => {

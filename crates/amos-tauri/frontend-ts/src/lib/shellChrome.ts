@@ -101,6 +101,17 @@ export const DOCK_RUNNING_DOT = "mt-1 h-[5px] w-[5px] rounded-full bg-white shad
 /** The reserved space the dot would occupy, so a running item does not change height. */
 export const DOCK_RUNNING_DOT_SLOT = "mt-1 h-[5px] w-[5px]";
 
+/**
+ * The tile a dock drag would drop the dragged icon into (REQ-A456).
+ *
+ * A **separate** token from `DESKTOP_ICON_FOCUSED`/`DESKTOP_ICON_SELECTED` on purpose: those
+ * answer "what has the keyboard" and "what did you pick", this one answers "where will it
+ * land" — three different questions, and collapsing two of them into one ring is how a UI
+ * starts telling the user something it does not mean. It rings the tile's own box (no
+ * offset), so the hint sits on the icon the pointer is actually over.
+ */
+export const DOCK_DROP_TARGET = "rounded-[16px] ring-2 ring-accent";
+
 /** The `+N` chip the dock shows for items its width could not fit (never silent). */
 export const DOCK_OVERFLOW_CHIP =
   "flex items-center justify-center rounded-2xl bg-white/15 text-[13px] font-semibold text-white/85";

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core capabilities for the AmOS System UI. Notably `core:event:default`: Tauri v2 does not inject a `listen` helper and gates `plugin:event|listen` behind the ACL — without this permission every event-driven UI path (sms-received live refresh, ai-token-received streaming, sensor-data, layout-changed, telephony-event, store-updated) is silently dead on device.",
+  "description": "Core capabilities for the AmOS System UI. Notably `core:event:default`: Tauri v2 does not inject a `listen` helper and gates `plugin:event|listen` behind the ACL — without this permission every event-driven UI path (sms-received live refresh, ai-token-received streaming, sensor-data, layout-changed, telephony-event, store-updated) is silently dead on device. And `core:window:allow-start-dragging`: the injected `drag.js` moves a window by invoking `plugin:window|start_dragging`, so an overlay window's `data-tauri-drag-region` strip does **nothing** without it — measured 2026-09-19 (REQ-A440): a real CGEvent drag moved the app window 0 px while the same tool moved TextEdit 208,126 → 328,196. Deliberately **not** granted: `core:window:allow-internal-toggle-maximize` (the platform's own double-click maximize) — the title bar's double-click goes through `wm_maximize` so the window model stays the single source of truth (F-SH-005), and the keyboard path (Enter/Space twice) shares it.",
   "windows": ["*"],
-  "permissions": ["core:event:default"]
+  "permissions": ["core:event:default", "core:window:allow-start-dragging"]
 }

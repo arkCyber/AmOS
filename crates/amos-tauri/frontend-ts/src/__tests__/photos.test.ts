@@ -4,6 +4,7 @@ import {
   removePhoto,
   removePhotos,
   newPhoto,
+  newPhotoForCapture,
   newCapturePhoto,
   isRealPhoto,
   neighborOf,
@@ -29,8 +30,10 @@ describe("photos helpers", () => {
     const list = seedPhotos(2, 1000);
     const after = removePhoto(list, list[0]!.id);
     expect(after.length).toBe(1);
-    const p = newPhoto("x", 5000);
-    expect(p.id).toBe("x");
+    const p = newPhoto(5000);
+    // The factory mints its own id (REQ-A402): the caller used to pass `p${Date.now()}`,
+    // which gave two same-millisecond adds one id. It now comes from `localId`.
+    expect(p.id).toMatch(/^p-/);
     expect(p.ts).toBe(5000);
     expect(PALETTE.some(([a]) => a === p.a)).toBe(true);
     expect(p.emoji !== undefined && EMOJIS.includes(p.emoji)).toBe(true);
@@ -40,7 +43,18 @@ describe("photos helpers", () => {
     const p = newCapturePhoto("c1", 123, "data:image/jpeg;base64,abc");
     expect(p).toEqual({ id: "c1", data: "data:image/jpeg;base64,abc", ts: 123 });
     expect(isRealPhoto(p)).toBe(true);
-    expect(isRealPhoto(newPhoto("d1", 1))).toBe(false);
+    expect(isRealPhoto(newPhoto(1))).toBe(false);
+  });
+
+  test("newPhotoForCapture keeps the caller's id (one shot, one identity — REQ-A402)", () => {
+    // The frame path (`newCapturePhoto`) and the no-frame fallback must agree on the id,
+    // so the caller mints it (with `localId`) and this factory keeps it verbatim. Before,
+    // the camera's own id was `c${Date.now()}-${shotSeq++}` — the clock plus a per-process
+    // counter, which two contexts can both produce.
+    const p = newPhotoForCapture("shot-abc-1-0gur3ba", 5000);
+    expect(p.id).toBe("shot-abc-1-0gur3ba");
+    expect(p.ts).toBe(5000);
+    expect(isRealPhoto(p)).toBe(false);
   });
 
   test("removePhotos batch-deletes only the selected ids, immutably", () => {

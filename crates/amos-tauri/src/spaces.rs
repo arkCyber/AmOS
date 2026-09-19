@@ -219,6 +219,28 @@ impl SpaceManager {
         Ok(())
     }
 
+    /// Take a window out of **every** Space (REQ-A450) — the inverse of [`Self::move_window_to_space`],
+    /// which can only move a window *between* Spaces.
+    ///
+    /// A window listed in no Space belongs to **every** Space (see [`Self::switch_plan`]): that is
+    /// the state every window starts in, and the reason an unfiled window is never hidden. Without
+    /// this method a window filed by mistake could only ever be moved to *another* desktop — never
+    /// back — so the feature's own initial state was a **one-way door**, and the panel could only
+    /// draw it as a placeholder it refused to accept.
+    ///
+    /// **Idempotent by design**: unfiling a window nothing has filed is not an error, because the
+    /// caller is asking for an end state and that state already holds. Returns whether the ledger
+    /// actually changed, so the caller can skip the platform work when it did not.
+    pub fn unfile_window(&mut self, window_label: &str) -> bool {
+        let mut changed = false;
+        for space in &mut self.spaces {
+            let before = space.windows.len();
+            space.windows.retain(|w| w != window_label);
+            changed |= space.windows.len() != before;
+        }
+        changed
+    }
+
     /// Rename a Space
     pub fn rename_space(&mut self, id: &str, name: String) -> AmosResult<()> {
         let space = self.spaces.iter_mut().find(|s| s.id == id).ok_or_else(|| {
@@ -246,6 +268,46 @@ impl SpaceManager {
         self.spaces[self.active_index]
             .windows
             .contains(&window_label.to_string())
+    }
+
+    /// The window work a switch to the **active** Space implies (REQ-A446): the labels that must
+    /// disappear and the ones that must appear. Call it *after* [`Self::switch_space`], which is
+    /// what makes "active" mean the destination.
+    ///
+    /// Until this existed the ledger was the whole feature: `switch_space` moved `active_index`,
+    /// `SpacesPanel` showed the new desktop as current, and **every window stayed exactly where it
+    /// was** — a switch that says it did something it did not do. These three semantics are stated
+    /// here because a list of labels cannot express them, and the honest ones are not the
+    /// convenient ones:
+    ///
+    ///   * a window listed in **no** Space belongs to **every** Space and is never touched. The
+    ///     only way a window joins a Space is an explicit `move_window_to_space`, so an unassigned
+    ///     window is not an oversight — it is a window nobody has filed yet, and hiding unfiled
+    ///     windows would blank a desktop the first time this feature is turned on;
+    ///   * the **screen window** (the Launcher, `crate::wm::is_screen_window`) is neither hidden
+    ///     nor focused: it *is* the desktop, so hiding it leaves the user with no surface to click,
+    ///     and focusing it would take the keyboard away from the app the user just returned to;
+    ///   * a label filed under two Spaces is shown in the Space that owns it and hidden only when
+    ///     the destination does not, so `hide` and `show` never name the same window.
+    pub fn switch_plan(&self) -> (Vec<String>, Vec<String>) {
+        let show: Vec<String> = self
+            .active_space_windows()
+            .iter()
+            .filter(|label| !crate::wm::is_screen_window(label))
+            .cloned()
+            .collect();
+        let mut hide: Vec<String> = Vec::new();
+        for space in &self.spaces {
+            for label in &space.windows {
+                if self.is_window_in_active_space(label) || crate::wm::is_screen_window(label) {
+                    continue;
+                }
+                if !hide.contains(label) {
+                    hide.push(label.clone());
+                }
+            }
+        }
+        (hide, show)
     }
 }
 
@@ -438,5 +500,145 @@ mod tests {
         assert_eq!(SpacesNotFound.group(), "spaces");
         assert_eq!(SpacesIndexOutOfBounds.group(), "spaces");
         assert_eq!(SpacesDeleteLast.group(), "spaces");
+    }
+
+    /// REQ-A446 — the switch must name the windows to move, not just the index. Before
+    /// `switch_plan` the whole feature was the ledger: `spaces_switch` changed a number, the
+    /// panel drew the new desktop as current, and every window stayed on screen.
+    #[test]
+    fn a_switch_plan_names_the_windows_that_change_side() {
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space("files", "space-0").unwrap();
+        mgr.move_window_to_space("notes", "space-1").unwrap();
+
+        let (hide, show) = mgr.switch_plan();
+        assert_eq!(
+            hide,
+            vec!["notes".to_string()],
+            "the other Space's window goes"
+        );
+        assert_eq!(show, vec!["files".to_string()], "this Space's window comes");
+
+        mgr.switch_space(1).unwrap();
+        let (hide, show) = mgr.switch_plan();
+        assert_eq!(hide, vec!["files".to_string()]);
+        assert_eq!(show, vec!["notes".to_string()]);
+    }
+
+    /// A window nobody filed is in **every** Space. The alternative (hide anything unfiled) would
+    /// blank a desktop the first time Spaces is used, so it is pinned here rather than left to the
+    /// reader of the loop.
+    #[test]
+    fn a_window_in_no_space_is_never_touched_by_a_switch() {
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space("notes", "space-1").unwrap();
+        mgr.move_window_to_space("files", "space-0").unwrap();
+
+        mgr.switch_space(1).unwrap();
+        let (hide, show) = mgr.switch_plan();
+        assert_eq!(hide, vec!["files".to_string()]);
+        assert!(
+            !hide.contains(&"settings".to_string()) && !show.contains(&"settings".to_string()),
+            "an unfiled window is not named by either list"
+        );
+    }
+
+    /// The screen window is the surface the Spaces live on, so a ledger that files it under
+    /// another Space must not be able to hide the desktop — or to have the switch steal the
+    /// keyboard back to it.
+    #[test]
+    fn the_screen_window_is_neither_hidden_nor_focused_by_a_switch() {
+        const SCREEN: &str = "main";
+        assert!(
+            crate::wm::is_screen_window(SCREEN),
+            "the label this test files away must be the screen window"
+        );
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space(SCREEN, "space-1").unwrap();
+
+        let (hide, show) = mgr.switch_plan();
+        assert!(hide.is_empty(), "the desktop is never hidden: {hide:?}");
+        assert!(show.is_empty(), "and never focused: {show:?}");
+    }
+
+    /// A window may be filed under two Spaces at once. It belongs to the destination if either
+    /// entry owns it, and it is never in both lists — a plan that hides and shows one label would
+    /// leave the screen depending on the order the two loops ran.
+    #[test]
+    fn a_window_in_two_spaces_is_revealed_and_never_both() {
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space("files", "space-0").unwrap();
+        // Filed again under the second Space *without* the first entry being corrected — the state
+        // `move_window_to_space` cannot produce, but a hand-edited store can.
+        mgr.spaces[1].windows.push("files".to_string());
+
+        let (hide, show) = mgr.switch_plan();
+        assert_eq!(show, vec!["files".to_string()]);
+        assert!(
+            hide.is_empty(),
+            "the destination owns it, so it is not hidden"
+        );
+    }
+
+    /// REQ-A450 — the inverse of `move_window_to_space`. Without it the feature's own initial state
+    /// ("nobody has filed this window") was unreachable, so a window filed by mistake was stuck on
+    /// some desktop forever.
+    #[test]
+    fn unfiling_takes_a_window_out_of_every_space() {
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space("files", "space-0").unwrap();
+        // The degenerate state a hand-edited store can hold: filed under two Spaces at once.
+        mgr.spaces[1].windows.push("files".to_string());
+        mgr.move_window_to_space("notes", "space-1").unwrap();
+
+        assert!(mgr.unfile_window("files"), "the ledger changed");
+        assert!(
+            mgr.spaces
+                .iter()
+                .all(|s| !s.windows.contains(&"files".to_string())),
+            "every Space let it go, not just the first one found"
+        );
+        assert!(
+            mgr.spaces[1].windows.contains(&"notes".to_string()),
+            "another window's filing is untouched"
+        );
+    }
+
+    /// Idempotent: the caller asks for an end state, and "not filed anywhere" already holds. The
+    /// `false` return is what lets the command skip the platform work (and stay quiet).
+    #[test]
+    fn unfiling_a_window_nobody_filed_changes_nothing() {
+        let mut mgr = SpaceManager::new();
+        mgr.move_window_to_space("files", "space-0").unwrap();
+
+        assert!(!mgr.unfile_window("settings"), "nothing to unfile");
+        assert_eq!(
+            mgr.active_space_windows(),
+            &["files".to_string()],
+            "the ledger is untouched"
+        );
+    }
+
+    /// The property that makes "unfiled" honest: an unfiled window is named by **neither** list of
+    /// the switch plan, which is why it stays on screen on every desktop.
+    #[test]
+    fn an_unfiled_window_is_never_named_by_a_switch_plan() {
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space("files", "space-0").unwrap();
+        mgr.move_window_to_space("notes", "space-1").unwrap();
+        assert!(mgr.unfile_window("notes"));
+
+        let (hide, show) = mgr.switch_plan();
+        assert_eq!(show, vec!["files".to_string()]);
+        assert!(
+            !hide.contains(&"notes".to_string()),
+            "the window belongs to every desktop now, so a switch must not hide it: {hide:?}"
+        );
     }
 }

@@ -17,24 +17,30 @@
   // - 位置切换（底部/左侧/右侧）
   import { appIcon, appTitleKey, APP_META } from "../lib/appMeta";
   import { bridgeDiag, invoke } from "../lib/backend";
-  import { getLayout, readStoreValue } from "../lib/amosStore";
+  import {
+    getLayout,
+    readStoreValue,
+    reorderVisibleDock,
+    LAYOUT_KEY,
+    type HomeLayout,
+  } from "../lib/amosStore";
+  import { createStoreValue } from "./store";
   import { DOCK_PREFS_KEY, normalizeDockPrefs, DEFAULT_DOCK_PREFS } from "../lib/dockPrefs";
   import type { DockPrefs } from "../lib/dockPrefs";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { withoutPhone } from "../lib/phoneApps";
   import { isDesktopFeatureEnabled } from "../lib/desktopFeatures";
   import { t } from "./locale.svelte";
   import { modulesFor } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
   import {
-    DOCK_HEIGHT,
-    DOCK_MIN_WIDTH,
     dockCapacity,
     dockOverflowCount,
     dockIconScale,
   } from "../lib/desktopLayout";
   import {
     DOCK_ITEM_COLUMN,
+    DOCK_DROP_TARGET,
     DOCK_OVERFLOW_CHIP,
     DOCK_RUNNING_DOT,
     DOCK_RUNNING_DOT_SLOT,
@@ -43,17 +49,24 @@
     GLASS_BORDER_DOCK,
   } from "../lib/shellChrome";
   import {
+    dockCapacityExtent,
+    dockHideTransform,
+    dockMagnifyAxis,
+    dockPanelStyle,
     dockPositionClass,
+    dockRevealZone,
+    dockWrapperStyle,
     isFullscreen,
     onDockBounce,
   } from "../lib/dockConfig";
   import DockAppItem from "./modules/DockAppItem.svelte";
   import DockContextMenu from "./modules/DockContextMenu.svelte";
   import DockGlobalContextMenu from "./modules/DockGlobalContextMenu.svelte";
+  import DockOverflowMenu from "./modules/DockOverflowMenu.svelte";
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import { writeStoreValueChecked } from "../lib/amosStore";
   import type { DockPosition } from "../lib/dockPrefs";
-  import { openApp } from "./appLinks";
+  import { wmOpen } from "../lib/wm";
 
   // ─── P4: 读取用户偏好 ────────────────────────────────────────────────────
   let prefs = $state<DockPrefs>({ ...DEFAULT_DOCK_PREFS });
@@ -96,11 +109,16 @@
 
   // 鼠标移近时显示 Dock（自动隐藏功能）
   function onMouseNearDock(e: MouseEvent) {
-    // 同时更新 mouseX 以维持放大镜效果
+    // 放大镜跟的是 Dock **自己的轴**：底部条用 X，左右侧栏用 Y（REQ-A414 ——
+    // 旧实现只更新 mouseX，侧栏里每个图标的 X 中心几乎相同 ⇒ 所有图标一起放大）。
     mouseX = e.clientX;
+    mouseY = e.clientY;
     if (!autoHide) return;
-    const threshold = 80; // 底部 80px 范围内显示
-    if (e.clientY > window.innerHeight - threshold) {
+    // 唤起的边也要跟位置走：旧实现只看底部 80px，于是"左侧 + 自动隐藏"是一个
+    // 死角——Dock 正确隐藏之后，唯一能把它叫回来的手势永远够不到。
+    if (
+      dockRevealZone(dockPosition, e.clientX, e.clientY, window.innerWidth, window.innerHeight)
+    ) {
       dockVisible = true;
       if (hideTimer) {
         clearTimeout(hideTimer);
@@ -131,8 +149,22 @@
   // ─── Home Layout（哪些 app 进 Dock）────────────────────────────────────────
   // 桌面形态下，home layout 的 dock 项就是 Dock 栏显示的内容。
   // 电话类 app（有 SIM / 蜂窝需求）在桌面形态下不出现。
-  const dockLayout = $derived(getLayout(APP_META.map((a) => a.id)));
-  const dockAppIds = $derived(withoutPhone(dockLayout.dock).filter((id) => appTitleKey(id) !== null));
+  //
+  // REQ-A456：布局现在**订阅共享 store**（不再是挂载时读一次的快照）。这是拖拽排序的
+  // 前提（拖完必须立刻按新顺序重画），也修掉了一个潜伏问题：此前另一个窗口改了布局
+  // （或 `store-updated` 从别处到达），Dock 不会跟。
+  const layoutStore = createStoreValue<HomeLayout>(
+    LAYOUT_KEY,
+    getLayout(APP_META.map((a) => a.id)),
+  );
+  let layout = $state<HomeLayout>(getLayout(APP_META.map((a) => a.id)));
+  $effect(() => {
+    const un = layoutStore.subscribe((v) => {
+      if (v && Array.isArray(v.dock)) layout = v;
+    });
+    return un;
+  });
+  const dockAppIds = $derived(withoutPhone(layout.dock).filter((id) => appTitleKey(id) !== null));
 
   // ─── 注册表里的系统项（启动台 / 访达 / 废纸篓）─────────────────────────────
   // 「有哪些、什么顺序、在哪划线」住在 shellModules.ts；这里只是槽位。
@@ -152,28 +184,44 @@
   );
 
   // ─── 容量：Dock 装得下才画得下 ──────────────────────────────────────────────
-  // 窗口宽度来自**自己这条 bar 的实测值**（拿不到就退到窗口宽度），绝不猜。
+  // 长边来自**自己这条 bar 的实测值**（拿不到就退到窗口的长边），绝不猜。
+  // 长边是哪一条取决于位置：底部条量宽、左右侧栏量高（`dockCapacityExtent`）——
+  // 旧实现只量宽，于是侧栏会永远报“只能放 3 个”。
   // 系统项（启动台 / 访达 / 废纸篓）永远保留，先压缩用户 app —— macOS 同样不会
   // 因为图标多就把废纸篓挤掉；被压掉的 app 以 `+N` 计数**显式**告知，而不是悄悄消失。
-  let dockWidth = $state(0);
+  let dockSize = $state({ width: 0, height: 0 });
   $effect(() => {
     const el = dockEl;
     if (!el) return;
     const measure = () => {
-      dockWidth = el.getBoundingClientRect().width;
+      const r = el.getBoundingClientRect();
+      dockSize = { width: r.width, height: r.height };
     };
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
   });
-  const capacity = $derived(dockCapacity(dockWidth > 0 ? dockWidth : windowWidth()));
+  const capacity = $derived(
+    dockCapacity(
+      dockCapacityExtent(
+        dockPosition,
+        dockSize.width > 0 ? dockSize.width : windowWidth(),
+        dockSize.height > 0 ? dockSize.height : windowHeight(),
+      ),
+    ),
+  );
   const appCapacity = $derived(Math.max(0, capacity - dockModules.length));
   const visibleApps = $derived(dockAppItems.slice(0, appCapacity));
   const overflow = $derived(dockOverflowCount(dockAppItems.length, appCapacity));
-  const hiddenNames = $derived(dockAppItems.slice(appCapacity).map((i) => i.label).join(", "));
+  /** 装不下、被 `visibleApps` 截掉的那些 app —— 溢出芯片的「完整列表」就是它。 */
+  const hiddenItems = $derived(dockAppItems.slice(appCapacity));
+  const hiddenNames = $derived(hiddenItems.map((i) => i.label).join(", "));
 
   function windowWidth(): number {
     return typeof window === "undefined" ? 0 : window.innerWidth;
+  }
+  function windowHeight(): number {
+    return typeof window === "undefined" ? 0 : window.innerHeight;
   }
 
   // ─── 已打开窗口状态（只用于「正在运行」白点）────────────────────────────────
@@ -231,17 +279,21 @@
   }
 
   // ─── 放大镜效果 ────────────────────────────────────────────────────────────
-  // 鼠标 X 坐标（视口坐标）—— 放大镜 + 自动隐藏共用 `onMouseNearDock`，
-  // 在那里一并更新 `mouseX`。先前 `onMouseMove` 与 `onMouseNearDock` 两个处理器
-  // 各自更新自己的状态，会因为覆盖顺序产生闪烁（自动隐藏处理器先到、放大镜丢一帧）。
+  // 指针坐标（视口坐标）—— 放大镜 + 自动隐藏共用 `onMouseNearDock`，在那里一并更新
+  // `mouseX` / `mouseY`。先前 `onMouseMove` 与 `onMouseNearDock` 两个处理器各自更新
+  // 自己的状态，会因为覆盖顺序产生闪烁（自动隐藏处理器先到、放大镜丢一帧）。
+  // 两个坐标都留：Dock 走哪条轴由位置决定（`dockMagnifyAxis`），用错轴时侧栏上每个
+  // 图标的中心几乎相同 ⇒ 整列一起放大。
   let mouseX = $state(0);
+  let mouseY = $state(0);
   // Dock 容器 ref
   let dockEl = $state<HTMLElement | null>(null);
 
-  // 每个图标的 scale：判定复用 `lib/desktopLayout::dockIconScale`（已单测的纯函数），
-  // 位置则**实测**——`data-dock-item` 包裹层不带 transform，所以量到的中心是布局中心，
-  // 不会因为上一帧的放大而漂移；分隔线与 `+N` 也因此被算进去（先前用
-  // `index × (ICON + GAP)` 推算，把分隔线之后的项全部算偏了一个身位）。
+  // 每个图标的 scale：判定复用 `lib/desktopLayout::dockIconScale`（已单测的纯函数，
+  // 它的两个位置参数是**沿轴的距离**，与哪条轴无关），位置则**实测**——`data-dock-item`
+  // 包裹层不带 transform，所以量到的中心是布局中心，不会因为上一帧的放大而漂移；
+  // 分隔线与 `+N` 也因此被算进去（先前用 `index × (ICON + GAP)` 推算，把分隔线之后的
+  // 项全部算偏了一个身位）。
   //
   // `$derived.by`（不是 `$derived(() => …)`）：后者存下的是**函数本身**，只有调用点恰好
   // 在渲染上下文里才碰巧工作；`by` 明确表示"这段计算的值"。
@@ -249,12 +301,15 @@
     const el = dockEl;
     const scales = new Map<string, number>();
     if (!el) return scales;
+    const axis = dockMagnifyAxis(dockPosition);
     for (const item of el.querySelectorAll<HTMLElement>("[data-dock-item]")) {
       const id = item.dataset.dockItem;
       if (!id) continue;
       const rect = item.getBoundingClientRect();
+      const pointer = axis === "y" ? mouseY : mouseX;
+      const centre = axis === "y" ? rect.top + rect.height / 2 : rect.left + rect.width / 2;
       // P4: 使用用户配置的放大倍数
-      scales.set(id, dockIconScale(mouseX, rect.left + rect.width / 2, userMagnification));
+      scales.set(id, dockIconScale(pointer, centre, userMagnification));
     }
     return scales;
   });
@@ -321,11 +376,141 @@
     globalCtxMenu = null;
   }
 
+  // ─── 拖拽排序（REQ-A456）─────────────────────────────────────────────────────
+  // macOS 的 Dock：按住图标横向（侧边栏时纵向）拖动，指针下的那个图标就是插入位置，
+  // 松手即落位。规则本身住在 `lib/amosStore.ts::reorderVisibleDock`（纯函数、已单测）；
+  // 这里只负责"谁在拖、指针在谁上面、松手时交给谁"。
+  //
+  // 两个刻意的选择：
+  //   * **只有用户 app 瓦片是投放目标**：系统项（启动台 / 访达 / 废纸篓）的位置是产品
+  //     决定，不是用户数据（`layout.dock` 里根本没有它们）——把 app 拖到废纸篓上不该
+  //     发生任何事，也不该被画成"会落在这里"。
+  //   * **投放目标取自事件本身**（`e.target.closest`），不是 `elementFromPoint`：
+  //     mousemove 的 target **就是**指针下的元素，这条路径既更短，也能在 happy-dom 里
+  //     被测试驱动（`elementFromPoint` 在无布局的测试环境里没有意义）。
+  let dragState = $state<{ id: string; x: number; y: number; active: boolean } | null>(null);
+  let dropTargetId = $state<string | null>(null);
+  /** 一次成功落位之后要吃掉紧随其后的那次 click —— 否则拖完会顺手把 app 打开。 */
+  let dragJustEnded = false;
+  /** 小于这个位移算点击（用户只是点了一下图标，肌肉记忆是"打开"而不是"排序"）。 */
+  const DOCK_DRAG_THRESHOLD_PX = 4;
+
+  /**
+   * Drag start — **delegated on the dock container**, not one listener per tile.
+   *
+   * Two reasons. (1) The tile wrapper is a `<div role="listitem">`, and hanging a mouse
+   * listener on a non-interactive element is exactly the a11y warning this repo keeps at
+   * zero (`svelte-check` flags it, and the warning is right: the *button* inside is the
+   * interactive thing). (2) One listener cannot drift from another: "which tiles are
+   * draggable" is one predicate, evaluated where the drag starts.
+   */
+  function onDockMouseDown(e: MouseEvent) {
+    if (e.button !== 0) return; // right click belongs to the context menu
+    const el = e.target instanceof Element ? e.target : null;
+    const item = el?.closest("[data-dock-item]") as HTMLElement | null;
+    const id = item?.dataset.dockItem ?? null;
+    // System tiles (launchpad / finder / trash) are not in `layout.dock` and are not
+    // draggable: their positions are a product decision, not user data.
+    if (!id || !dockAppIds.includes(id)) return;
+    dragState = { id, x: e.clientX, y: e.clientY, active: false };
+  }
+
+  function onWindowDragMove(e: MouseEvent) {
+    const d = dragState;
+    if (!d) return;
+    if (!d.active) {
+      if (
+        Math.abs(e.clientX - d.x) < DOCK_DRAG_THRESHOLD_PX &&
+        Math.abs(e.clientY - d.y) < DOCK_DRAG_THRESHOLD_PX
+      ) {
+        return;
+      }
+      d.active = true;
+    }
+    const el = e.target instanceof Element ? e.target : null;
+    const item = el?.closest("[data-dock-item]") as HTMLElement | null;
+    const over = item?.dataset.dockItem ?? null;
+    // `dockAppIds.includes` is **defence in depth**, not the protection: the rule itself
+    // lives in the pure layer, where a hovered id that is not in the dock makes
+    // `reorderVisibleDock` return the layout unchanged (unit-tested). Keeping the predicate
+    // here states the intent where the pointer is read — and stops a system tile from ever
+    // becoming a target if a later edit paints the hint from this state instead.
+    dropTargetId = over && over !== d.id && dockAppIds.includes(over) ? over : null;
+  }
+
+  function onWindowDragEnd() {
+    const d = dragState;
+    dragState = null;
+    const target = dropTargetId;
+    dropTargetId = null;
+    if (!d?.active || !target) return;
+    const next = reorderVisibleDock(layout, dockAppIds, d.id, target);
+    if (next === layout) return; // 落回原位：什么都不写
+    if (!writeStoreValueChecked(LAYOUT_KEY, next)) {
+      // 与 Dock 的其他写入同一条纪律：写不进去就如实说，并**保持内存里的旧顺序**。
+      storeError = t("common.storeWriteFailed");
+      return;
+    }
+    storeError = "";
+    layout = next;
+    dragJustEnded = true;
+    void tick().then(() => {
+      dragJustEnded = false;
+    });
+  }
+
+  /** 捕获阶段：拖拽结束后的那一次 click 属于"用户刚把图标放下"，不是"请打开它"。 */
+  function onItemClickCapture(e: MouseEvent) {
+    if (!dragJustEnded) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  $effect(() => {
+    window.addEventListener("mousemove", onWindowDragMove);
+    window.addEventListener("mouseup", onWindowDragEnd);
+    return () => {
+      window.removeEventListener("mousemove", onWindowDragMove);
+      window.removeEventListener("mouseup", onWindowDragEnd);
+    };
+  });
+
+  // ─── 溢出「完整列表」（macOS 点 `+N` 芯片 → 菜单）────────────────────────────
+  // REQ-A415：芯片原来是 `<span title="…">` —— 看着像 Dock 的溢出入口，实际是个
+  // tooltip：点不动、键盘到不了。现在它是个真按钮，列出**装不下的那些 app**，
+  // 条目走与 Dock 瓦片**同一条** `wm_open` 路径。
+  interface OverflowMenu {
+    x: number;
+    y: number;
+  }
+  let overflowMenu = $state<OverflowMenu | null>(null);
+
+  function onOverflowClick(e: MouseEvent) {
+    // 没有隐藏项就不摆一个空菜单（容量变化后正好全部装得下时）。
+    if (hiddenItems.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    overflowMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  function closeOverflowMenu() {
+    overflowMenu = null;
+  }
+
+  /** 从列表里打开一个装不下的 app（与 Dock 瓦片同一动作）。 */
+  function openOverflowApp(id: string) {
+    // REQ-A415: must be `wm_open`, not `openApp(...)` — `openApp` switches the **touch
+    // shell's** surface (`shellState`), which the desktop form never renders (Shell
+    // mounts `DesktopShell` for it). Every other Dock action (`DockAppItem`,
+    // `DockFinderItem`) goes through `wm_open`; the overflow list is one of them.
+    void wmOpen(id);
+  }
+
   function handlePositionChange(position: DockPosition) {
     prefs.position = position;
     const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
     if (!success) {
-      storeError = "Failed to save Dock position preference";
+      storeError = t("common.storeWriteFailed");
       // 恢复到之前的值
       const raw = readStoreValue<unknown>(DOCK_PREFS_KEY, {});
       prefs = normalizeDockPrefs(raw);
@@ -338,7 +523,7 @@
     prefs.autoHide = !prefs.autoHide;
     const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
     if (!success) {
-      storeError = "Failed to save Dock auto-hide preference";
+      storeError = t("common.storeWriteFailed");
       // 恢复到之前的值
       const raw = readStoreValue<unknown>(DOCK_PREFS_KEY, {});
       prefs = normalizeDockPrefs(raw);
@@ -353,7 +538,7 @@
     prefs.magnification = parseFloat(newMag.toFixed(1));
     const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
     if (!success) {
-      storeError = "Failed to save Dock magnification preference";
+      storeError = t("common.storeWriteFailed");
       prefs.magnification = oldMag;
     } else {
       storeError = "";
@@ -366,7 +551,7 @@
     prefs.iconSize = newSize;
     const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
     if (!success) {
-      storeError = "Failed to save Dock icon size preference";
+      storeError = t("common.storeWriteFailed");
       prefs.iconSize = oldSize;
     } else {
       storeError = "";
@@ -374,23 +559,45 @@
   }
 
   function handleOpenPreferences() {
-    openApp("settings", "dock");
+    // REQ-A415: this used to be `openApp("settings", "dock")` — the **touch** shell's
+    // surface switcher. In the desktop form `Shell.svelte` mounts `DesktopShell` and
+    // never renders that surface, so the row was a silent no-op (the FMEA F-SH-001
+    // shape: a menu item that says something will happen). It opens the real Settings
+    // window through `wm_open`, exactly like the desktop stage's 「显示设置」 row.
+    //
+    // Honest boundary: landing on the Dock *pane* is not wired. The page channel
+    // (`settingsChannel`) is an in-window props bus, and the Settings screen runs in
+    // its own webview — there is no cross-window page route on the host
+    // (`wm_open(label)` carries a label and nothing else). The row's label states what
+    // actually happens instead of promising a pane we cannot reach.
+    void wmOpen("settings");
   }
 
   // 点击空白处关闭菜单（与桌面 stage 右键菜单同一条规则）。
   $effect(() => {
     const onDown = (e: MouseEvent) => {
-      if (!ctxMenu && !globalCtxMenu) return;
-      const target = e.target as Node | null;
-      const menuEl = dockEl?.querySelector('[data-testid="dock-context-menu"]') ?? null;
-      const globalMenuEl = dockEl?.querySelector('[data-testid="dock-global-context-menu"]') ?? null;
-      if (ctxMenu && target && menuEl && !menuEl.contains(target)) closeCtxMenu();
-      if (globalCtxMenu && target && globalMenuEl && !globalMenuEl.contains(target)) closeGlobalCtxMenu();
+      if (!ctxMenu && !globalCtxMenu && !overflowMenu) return;
+      // REQ-A414: both menus render as **siblings** of the `bind:this={dockEl}`
+      // container (see the template comment), so `dockEl.querySelector(...)` could
+      // never find them and the two close branches were dead — the menu stayed put on
+      // every outside click. Ask the event's own target instead: `closest` walks up
+      // from wherever the mousedown landed and finds the menu regardless of nesting.
+      const target = e.target instanceof Element ? e.target : null;
+      if (ctxMenu && !target?.closest('[data-testid="dock-context-menu"]')) closeCtxMenu();
+      if (globalCtxMenu && !target?.closest('[data-testid="dock-global-context-menu"]')) {
+        closeGlobalCtxMenu();
+      }
+      // REQ-A415: same rule for the overflow list (and same reasoning — it is a
+      // sibling too).
+      if (overflowMenu && !target?.closest('[data-testid="dock-overflow-menu"]')) {
+        closeOverflowMenu();
+      }
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         closeCtxMenu();
         closeGlobalCtxMenu();
+        closeOverflowMenu();
       }
     };
     document.addEventListener("mousedown", onDown);
@@ -404,10 +611,10 @@
 
 <!--
   macOS Dock：
-  - position: fixed bottom-0
-  - 高度 68px（macOS 标准，含 16px 底部 padding）
+  - position: bottom-0（或 left-0 / right-0，见 `dockPositionClass` + `dockWrapperStyle`）
+  - 高度 68px（macOS 标准，含 16px 底部 padding）——侧边时改为从顶栏下沿到底边的**竖列**
   - 毛玻璃背景
-  - 放大镜效果（CSS scale，JS 鼠标追踪 + **实测**中心）
+  - 放大镜效果（CSS scale，JS 鼠标追踪 + **实测**中心，轴由位置决定）
   - 已打开 app 底部白点指示
   - 点击弹跳动画（active:scale，在 dock 瓦片 token 里）
 -->
@@ -416,12 +623,13 @@
 <div
   bind:this={dockEl}
   class="pointer-events-none absolute flex {dockPositionClass(dockPosition)}"
-  style="height:{DOCK_HEIGHT}px;"
+  style="{dockWrapperStyle(dockPosition)}"
   role="toolbar"
   aria-label={t("desktop.dock")}
-  aria-orientation="horizontal"
+  aria-orientation={dockPosition === "bottom" ? "horizontal" : "vertical"}
   tabindex="-1"
   onmousemove={onMouseNearDock}
+  onmousedown={onDockMouseDown}
 >
   <!-- Dock 容器 -->
   <div
@@ -432,12 +640,12 @@
     aria-label={t("desktop.dockApps")}
     oncontextmenu={onDockContainerContextMenu}
     style="
-      min-width: {DOCK_MIN_WIDTH}px;
+      {dockPanelStyle(dockPosition)}
       {GLASS_DOCK_STYLE}
       {GLASS_BORDER_DOCK}
       box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.15);
       transition: transform 0.3s ease-in-out;
-      transform: translateY({dockVisible || !autoHide ? '0' : '100%'});
+      transform: {dockHideTransform(dockPosition, autoHide && !dockVisible)};
       --dock-icon-size: {userIconSize}px;
     "
   >
@@ -446,10 +654,12 @@
       {@const appScale = iconScales.get(item.id) ?? 1.0}
       {@const isBouncing = bouncingAppId === item.id}
       <div
-        class={DOCK_ITEM_COLUMN}
+        class="{DOCK_ITEM_COLUMN} {dropTargetId === item.id ? DOCK_DROP_TARGET : ''}"
         data-dock-item={item.id}
+        data-dock-drop-target={dropTargetId === item.id ? "true" : undefined}
         role="listitem"
         aria-label={item.label}
+        onclickcapture={onItemClickCapture}
         oncontextmenu={(e) => onItemContextMenu(e, item.id, null)}
       >
         <!-- 放大镜只作用在这一层：包裹层自身不缩放，容器才量得到稳定的中心。
@@ -489,10 +699,12 @@
       </div>
     {/each}
 
-    <!-- 装不下的用户 app：显式计数，不静默消失 -->
+    <!-- 装不下的用户 app：显式计数，不静默消失。点它 → macOS 的「完整列表」菜单
+         （REQ-A415：此前是个 `<span title>`，看着像入口却点不动）。 -->
     {#if overflow > 0}
       <div class={DOCK_ITEM_COLUMN} data-testid="dock-overflow">
-        <span
+        <button
+          type="button"
           class={DOCK_OVERFLOW_CHIP}
           style="
             width:{userIconSize}px;
@@ -501,9 +713,12 @@
           "
           title={hiddenNames}
           aria-label={t("desktop.dockOverflow", { n: overflow })}
+          aria-haspopup="menu"
+          aria-expanded={overflowMenu !== null}
+          onclick={onOverflowClick}
         >
           {t("desktop.dockOverflowBadge", { n: overflow })}
-        </span>
+        </button>
         <span class={DOCK_RUNNING_DOT_SLOT}></span>
       </div>
     {/if}
@@ -534,5 +749,17 @@
     onMagnificationChange={handleMagnificationChange}
     onIconSizeChange={handleIconSizeChange}
     onOpenPreferences={handleOpenPreferences}
+  />
+{/if}
+
+<!-- 溢出「完整列表」（macOS 点 `+N` 芯片 → 列出装不下的 app）。同样渲染在 Dock 容器
+     之外：z-index 与浮层一致，且不参与放大镜测量。 -->
+{#if overflowMenu}
+  <DockOverflowMenu
+    items={hiddenItems}
+    x={overflowMenu.x}
+    y={overflowMenu.y}
+    onpick={openOverflowApp}
+    onclose={closeOverflowMenu}
   />
 {/if}

@@ -114,6 +114,9 @@ describe("云同步系统 - 航空航天级审计", () => {
         "amos.webman.downloads", // DOWNLOADS_KEY
         "amos.shortcuts.enterprise.templates", // TEMPLATES_KEY
         "amos.shortcuts.audit.logs", // AUDIT_LOGS_KEY
+        // REQ-A455：废纸篓账本 —— 它必须与它所属的文件树一起旅行，否则备份恢复后
+        // 树里少了的东西会**静默地**变成不可恢复（本文件顶部注释记过两次的那种半成品）。
+        "amos.files.trash", // FILES_TRASH_KEY
       ];
       for (const key of requiredStores) {
         expect(SYNC_STORES.some(s => s === key)).toBe(true);

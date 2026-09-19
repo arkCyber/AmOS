@@ -42,7 +42,7 @@
     recordCall,
   } from "../lib/calllog";
   import type { CallRecord } from "../lib/calllog";
-  import { NOTIF_KEY, addNotif } from "../lib/settings";
+  import { NOTIF_KEY, addNotif, newNotifId } from "../lib/settings";
   import type { Notif } from "../lib/settings";
   import { zh } from "../i18n/locales/zh";
   import { t } from "./locale.svelte";
@@ -515,7 +515,7 @@
     storeErr = "";
     const label = name && name.trim() !== "" ? name.trim() : num;
     const entry: Notif = {
-      id: `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      id: newNotifId(),
       app: zh["app.phone"],
       title: label,
       body,

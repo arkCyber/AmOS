@@ -38,6 +38,7 @@ import TopbarAppleMenu from "./modules/TopbarAppleMenu.svelte";
 import TopbarAppName from "./modules/TopbarAppName.svelte";
 import TopbarMainMenu from "./modules/TopbarMainMenu.svelte";
 import Launchpad from "./Launchpad.svelte";
+import DesktopNotificationCenter from "./DesktopNotificationCenter.svelte";
 import MissionControl from "./MissionControl.svelte";
 import SpotlightOverlay from "./SpotlightOverlay.svelte";
 import SpacesPanel from "./SpacesPanel.svelte";
@@ -161,7 +162,7 @@ export const SHELL_MODULES: ShellModule[] = [
     id: "dock-trash",
     slot: "dock",
     order: 30,
-    titleKey: "desktop.trashUnavailable",
+    titleKey: "desktop.trashInFiles",
     testId: "dock-trash",
     separatorBefore: true,
     component: DockTrashItem,
@@ -244,6 +245,26 @@ export const SHELL_MODULES: ShellModule[] = [
     // (§4.3 7-knock audit) made this invariant load-bearing for the
     // accessibility-first keyboard contract.
     component: SpacesPanel,
+  },
+  /**
+   * DesktopNotificationCenter — macOS's right-hand notification panel (REQ-A417).
+   *
+   * The entry point is the **clock** in the bar (`modules/ClockWidget.svelte`), which is
+   * macOS's own behaviour; there is deliberately no `shortcuts:` row, because macOS binds
+   * no default key to Notification Center and inventing one would advertise a binding
+   * nobody asked for (the same reasoning as `control-center-panel`). It is also why the
+   * shortcut-set invariant (`F3 / F4 / ⌘Space / ⌘Tab`) stays untouched by this row.
+   *
+   * Order 60 keeps it after `spaces-panel (50)`, so the documented overlay order in
+   * `__tests__/shellModule.test.ts` only gains an entry at the end.
+   */
+  {
+    id: "notifications",
+    slot: "overlay",
+    order: 60,
+    titleKey: "nc.title",
+    testId: "desktop-notification-center",
+    component: DesktopNotificationCenter,
   },
 ];
 

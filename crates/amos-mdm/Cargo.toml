@@ -1,0 +1,46 @@
+[package]
+name = "amos-mdm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["Amos Team"]
+description = "AmOS MDM Server - Enterprise Mobile Device Management"
+
+[features]
+# Test-only helpers (in-memory DB, seed-enrollment-token). Off in
+# production builds — see `db.rs` for the security rationale.
+test-helpers = []
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { workspace = true, features = ["full"] }
+tower = { workspace = true }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Hashing
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+built = "0.7"

@@ -1,7 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  BUNDLE_ENTRY_COMMAND,
   BUNDLE_FRAME_SANDBOX,
   bundleFailureFromDiag,
+  fetchBundleEntry,
   isFrameableBundleUrl,
   normalizeBundleEntry,
 } from "../lib/bundleHost";
@@ -134,3 +136,100 @@ describe("bundleHost — telling the failure apart", () => {
     });
   });
 });
+
+/**
+ * REQ-A407 — `fetchBundleEntry` 的**桥接侧**（15 行，此前只有纯函数被测）。这一半是"用户按了
+ * 打开某个商店应用"时要面对的四种结局：守护进程不在 / 宿主拒了（带它自己的原因）/ 宿主答了
+ * 但没内容 / 宿主给了一个我们**拒绝内联**的 URL —— 每一种都必须说清是哪一种，因为 UI 要照着
+ * 翻译成用户能懂的话（"没装"、"宿主没配安装目录"…）。假宿主同 `backend-bridge.test.ts`。
+ */
+let respond: (command: string, args?: Record<string, unknown>) => unknown = () => null;
+const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+
+function installBundleBridge(): void {
+  calls.length = 0;
+  (globalThis as { window?: unknown }).window = {
+    __TAURI_INTERNALS__: {
+      invoke: async (command: string, args?: Record<string, unknown>) => {
+        calls.push({ command, args });
+        return respond(command, args);
+      },
+    },
+  };
+}
+
+beforeEach(() => {
+  installBundleBridge();
+  respond = () => null;
+});
+
+afterEach(() => {
+  delete (globalThis as { window?: unknown }).window;
+});
+
+describe("bundleHost — fetchBundleEntry 的四种结局（REQ-A407）", () => {
+  test("空 / 只有空白的 app id ⇒ 连宿主都不问（blocked: empty app id）", async () => {
+    for (const mid of ["", "   "]) {
+      expect([mid, await fetchBundleEntry(mid)]).toEqual([
+        mid,
+        { kind: "failed", reason: "blocked", detail: "empty app id" },
+      ]);
+    }
+    expect(calls).toEqual([]); // 没必要的桥调用一条都不发
+  });
+
+  test("id 前后空白被 trim 掉再发给宿主", async () => {
+    respond = () => ({ url: "amos-app://org.amos.demo/index.html", start: "index.html" });
+    const result = await fetchBundleEntry("  org.amos.demo  ");
+    expect(calls).toEqual([{ command: BUNDLE_ENTRY_COMMAND, args: { id: "org.amos.demo" } }]);
+    expect(result.kind).toBe("ok");
+  });
+
+  test("宿主答了但没内容（null）⇒ blocked / host returned no entry", async () => {
+    respond = () => null;
+    expect(await fetchBundleEntry("org.amos.demo")).toEqual({
+      kind: "failed",
+      reason: "blocked",
+      detail: "host returned no entry",
+    });
+  });
+
+  test("宿主拒了这次调用（抛错）⇒ unavailable + 宿主自己的话", async () => {
+    respond = () => {
+      throw new Error("no web install dir (set AMOS_APPSTORE_INSTALL_DIR)");
+    };
+    const result = await fetchBundleEntry("org.amos.demo");
+    expect(result.kind).toBe("failed");
+    if (result.kind === "failed") {
+      expect(result.reason).toBe("unavailable");
+      expect(result.detail).toContain("AMOS_APPSTORE_INSTALL_DIR");
+    }
+  });
+
+  test("未桥接 ⇒ offline / no Tauri bridge（不是「宿主拒绝」）", async () => {
+    delete (globalThis as { window?: unknown }).window;
+    expect(await fetchBundleEntry("org.amos.demo")).toEqual({
+      kind: "failed",
+      reason: "offline",
+      detail: "no Tauri bridge",
+    });
+  });
+
+  test("宿主给了一个我们拒绝内联的 URL ⇒ blocked / refused to frame the host's URL", async () => {
+    respond = () => ({ url: "https://evil.test/index.html", start: "index.html" });
+    expect(await fetchBundleEntry("org.amos.demo")).toEqual({
+      kind: "failed",
+      reason: "blocked",
+      detail: "refused to frame the host's URL",
+    });
+  });
+
+  test("好应答 ⇒ 原样落地成 { kind: ok, entry }", async () => {
+    respond = () => ({ url: "amos-app://org.amos.demo/index.html", start: "index.html" });
+    expect(await fetchBundleEntry("org.amos.demo")).toEqual({
+      kind: "ok",
+      entry: { url: "amos-app://org.amos.demo/index.html", start: "index.html" },
+    });
+  });
+});
+

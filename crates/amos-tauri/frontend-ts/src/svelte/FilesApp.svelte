@@ -7,10 +7,10 @@
   import {
     FILES_FAV_KEY,
     FILES_KEY,
+    FILES_REVEAL_KEY,
+    FILES_TRASH_KEY,
     addEntry,
     childrenOf,
-    deleteEntries,
-    deleteEntry,
     filterByName,
     folderPath,
     folderTree,
@@ -18,20 +18,26 @@
     makeEntry,
     moveEntries,
     moveEntry,
+    moveToTrash,
     normalizeFiles,
+    normalizeReveal,
+    normalizeTrash,
     pathOf,
+    purgeFromTrash,
     recentFiles,
     renameEntry,
+    restoreFromTrash,
     searchFiles,
     sortChildren,
     toggleFav,
   } from "../lib/files";
-  import type { FEntry, SortKey } from "../lib/files";
+  import type { FEntry, SortKey, TrashItem } from "../lib/files";
   import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import { createStoreValue } from "./store";
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import FileErrorBanner from "./modules/FileErrorBanner.svelte";
   import { fmtTime } from "../lib/notes";
-  import { canonicalPath, hasMediaBridge, mediaGrantRead, mediaList, type StandardDir } from "../lib/media";
+  import { canonicalPath, hasMediaBridge, mediaGrantRead, mediaList, mediaLoad, type StandardDir } from "../lib/media";
   import {
     buildExternalFileView,
     externalGlyph,
@@ -42,6 +48,9 @@
     sortExternalFiles,
     type ExternalSort,
   } from "../lib/externalFiles";
+  import { planPreview, previewBytesLabel, type PreviewPlan } from "../lib/filesPreview";
+  import { exportBundle, importBundle } from "../lib/filesCompression";
+  import { buildSnapshot, deleteSnapshot, loadSnapshot, saveSnapshot, formatSnapshotSize, type CloudSnapshot } from "../lib/filesCloud";
   import { t } from "./locale.svelte";
   import { filesChannel } from "./appLinks";
   import { onMount } from "svelte";
@@ -95,6 +104,37 @@
 
   let list = $state<FEntry[]>(seed);
   let cwd = $state<string | undefined>(undefined);
+  /**
+   * The trash ledger (REQ-A455), read with the same "repair, don't trust" rule the tree
+   * uses (`normalizeTrash`) and **without a demo seed**: an empty trash is the honest
+   * initial state — seeding one would show the user a deleted file they never deleted.
+   */
+  let trash = $state<TrashItem[]>(
+    normalizeTrash(readStoreValue<unknown>(FILES_TRASH_KEY, undefined)),
+  );
+  /** What the last trash action actually did (a fallback location, a refusal, an eviction). */
+  let trashNote = $state("");
+  /**
+   * The cross-window reveal intent (REQ-A458) — the desktop Spotlight's only route into this
+   * window. Subscribed here so a request that arrives while this screen is open lands immediately,
+   * and a request that arrives **before** the window exists is picked up from the store's initial
+   * value (`createStoreValue` seeds from it).
+   */
+  const revealStore = createStoreValue<unknown>(FILES_REVEAL_KEY, null);
+  /** Highest reveal nonce this window has served (a repeat of the same id still fires). */
+  let revealNonce = 0;
+  /**
+   * Ledger rows paired with their root entry.
+   *
+   * `normalizeTrash` guarantees a root (`members[0]`), but the type system cannot know it —
+   * and a template should not have to assert its way past that. One derivation, so the
+   * rows and the actions below always agree on which entry a row names.
+   */
+  const trashRows = $derived(
+    trash
+      .map((item) => ({ item, root: item.members[0] }))
+      .filter((r): r is { item: TrashItem; root: FEntry } => r.root !== undefined),
+  );
   let creating = $state<null | "folder" | "file">(null);
   let name = $state("");
   let content = $state("");
@@ -111,7 +151,7 @@
   let sortKey = $state<SortKey>("default");
   let query = $state("");
   let globalSearch = $state(false);
-  let mode = $state<"all" | "fav" | "recent">("all");
+  let mode = $state<"all" | "fav" | "recent" | "trash">("all");
   const initFavs = readStoreValue<string[]>(FILES_FAV_KEY, []);
   let favs = $state<string[]>(initFavs);
   let selecting = $state(false);
@@ -121,6 +161,28 @@
   let linkNonce = 0;
   // Keyboard navigation state
   let focusedId = $state<string | null>(null);
+
+  // ---- Preview (Rust-side classification) --------------------------------
+  // `previewTarget` is the entry the user wants to preview (`null` = none);
+  // `previewPlan` is the result from `files_preview_bytes`.  Bytes are loaded
+  // lazily: local files use `FEntry.content` (text-only); device files fetch
+  // bytes via `media_load` so we can show a real image / audio / video preview.
+  let previewTarget = $state<FEntry | null>(null);
+  let previewPlan = $state<PreviewPlan | null>(null);
+  let previewBusy = $state(false);
+
+  // ---- Import / export (Rust gzip bundle) ----------------------------------
+  let importText = $state("");
+  let importBusy = $state(false);
+  let importMsg = $state("");
+  let exportBusy = $state(false);
+  let exportMsg = $state("");
+  let lastExportBytes = $state<{ original: number; compressed: number } | null>(null);
+
+  // ---- Cloud snapshot (local mirror of device files) -----------------------
+  let cloudSnap = $state<CloudSnapshot | null>(loadSnapshot());
+  let cloudBusy = $state(false);
+  let cloudMsg = $state("");
 
   const persist = (l: FEntry[]): boolean => {
     if (!writeStoreValueChecked(FILES_KEY, l)) {
@@ -138,6 +200,97 @@
     isErrorStorm = false;
     list = l;
     return true;
+  };
+
+  /**
+   * Persist the trash ledger, with the same reporting discipline as `persist`.
+   *
+   * A refused ledger write is a **file-safety** event, so it records a `write` error too:
+   * the next delete would otherwise take the item out of the tree with no ledger to put it
+   * back into — which is exactly the permanent delete this feature exists to remove.
+   */
+  const persistTrash = (next: TrashItem[]): boolean => {
+    if (!writeStoreValueChecked(FILES_TRASH_KEY, next)) {
+      storeErr = t("common.storeWriteFailed");
+      const error = createFileError("write", "store_locked", { store: FILES_TRASH_KEY });
+      errorHistory = addError(errorHistory, error);
+      currentError = error;
+      isErrorStorm = detectErrorStorm(errorHistory);
+      return false;
+    }
+    storeErr = "";
+    currentError = null;
+    isErrorStorm = false;
+    trash = next;
+    return true;
+  };
+
+  /**
+   * Commit a delete/restore as **one** user-visible action, in the order that cannot lose
+   * data: the **ledger first**, the tree second.
+   *
+   * The two keys cannot be written atomically, so one of the two orders has to be the
+   * fallback. Ledger-first, a failed tree write leaves the item in **both** places — a
+   * duplicate the user can see and fix. Tree-first, a failed ledger write would leave the
+   * item in **neither** — the data is gone, which is the one outcome a safety net must not
+   * have (the same reasoning `writeJson`'s callers use for "commit, then announce").
+   */
+  const commitTrash = (next: FEntry[], nextTrash: TrashItem[]): boolean => {
+    if (!persistTrash(nextTrash)) return false;
+    return persist(next);
+  };
+
+  /**
+   * Delete = **move to the trash** (REQ-A455). This is the only path the UI offers for
+   * "delete" now; the destructive act lives in the trash view, behind a second click.
+   */
+  const removeToTrash = (ids: ReadonlySet<string>): boolean => {
+    if (ids.size === 0) return false;
+    const r = moveToTrash(list, trash, ids, Date.now());
+    if (r.moved.length === 0) return false;
+    if (!commitTrash(r.list, r.trash)) return false;
+    trashNote =
+      r.dropped > 0 ? t("files.trashEvicted", { n: r.dropped }) : "";
+    return true;
+  };
+
+  /** Put one item back where it came from, and say what actually happened. */
+  const restoreItem = (id: string): void => {
+    const item = trash.find((x) => x.id === id);
+    const name = item?.members[0]?.name ?? "";
+    const r = restoreFromTrash(list, trash, id);
+    switch (r.outcome.kind) {
+      case "not-found":
+        // Another window purged it; the ledger view must not keep showing a ghost.
+        persistTrash(r.trash);
+        trashNote = t("files.trashNotFound");
+        return;
+      case "name-conflict":
+        trashNote = t("files.trashNameConflict", { name: r.outcome.name });
+        return;
+      case "id-conflict":
+        trashNote = t("files.trashIdConflict");
+        return;
+      case "restored-to-root":
+        if (commitTrash(r.list, r.trash)) trashNote = t("files.trashRestoredToRoot", { name });
+        return;
+      case "restored":
+        if (commitTrash(r.list, r.trash)) trashNote = "";
+        return;
+    }
+  };
+
+  /** Delete one ledger row for good (the read-only `dismiss` vs. this: a real destroy). */
+  const purgeItem = (id: string): void => {
+    const next = purgeFromTrash(trash, new Set([id]));
+    if (next === trash) return;
+    if (persistTrash(next)) trashNote = "";
+  };
+
+  /** Empty the trash. Nothing is written when it is already empty. */
+  const emptyTrash = (): void => {
+    if (trash.length === 0) return;
+    if (persistTrash([])) trashNote = "";
   };
   const fav = (id: string) => {
     const next = toggleFav(favs, id);
@@ -173,11 +326,9 @@
   };
   const deleteSelected = () => {
     if (selIds.size === 0) return;
-    const result = deleteEntries(list, selIds);
-    if (!persist(result)) {
-      // Error already recorded in persist()
-      return;
-    }
+    // Delete = move to the trash (REQ-A455); a refusal (store write) keeps the selection
+    // so the user can retry instead of hunting for what they just lost.
+    if (!removeToTrash(new Set(selIds))) return;
     exitSelect();
   };
   const moveSelectedTo = (destId: string) => {
@@ -230,11 +381,11 @@
   const handleKeyDelete = () => {
     if (!focusedId) return;
     if (selecting) {
-      // In selecting mode, delete means delete selected items
+      // In selecting mode, delete means move the selected items to the trash.
       deleteSelected();
     } else {
-      // Otherwise delete the focused item
-      persist(deleteEntry(list, focusedId));
+      // Otherwise the focused item — same path, one id.
+      removeToTrash(new Set([focusedId]));
       focusedId = null;
     }
   };
@@ -274,18 +425,43 @@
     return filesChannel().subscribe((v) => {
       if (!v || v.id.trim() === "" || v.nonce === linkNonce) return;
       linkNonce = v.nonce;
-      const target = list.find((e) => e.id === v.id);
-      if (target) {
-        mode = "all";
-        globalSearch = false;
-        query = "";
-        exitSelect();
-        cwd = target.parent; // show the entry where it actually lives
-        spotId = target.id;
-      }
+      reveal(v.id);
       filesChannel().set({ id: "", nonce: linkNonce });
     });
   });
+
+  /**
+   * The **cross-window** half of the same reveal (REQ-A458): the desktop Spotlight runs in the
+   * launcher window, so its request arrives through the shared store rather than the in-page bus.
+   * Same destination, same consume-and-clear discipline — a stale intent must never re-fire, and a
+   * second Files window opened later must find nothing pending.
+   */
+  $effect(() => {
+    const un = revealStore.subscribe((raw) => {
+      const v = normalizeReveal(raw);
+      if (!v || v.nonce === revealNonce) return;
+      revealNonce = v.nonce;
+      reveal(v.id);
+      // Cleared **after** the reveal: the key is a command, not state, and the next reader must
+      // find `null` rather than a request that has already been served.
+      if (!writeStoreValueChecked(FILES_REVEAL_KEY, null)) {
+        storeErr = t("common.storeWriteFailed");
+      }
+    });
+    return un;
+  });
+
+  /** Show `id` where it actually lives, marking its row. Gone ⇒ nothing (no phantom row). */
+  function reveal(id: string): void {
+    const target = list.find((e) => e.id === id);
+    if (!target) return;
+    mode = "all";
+    globalSearch = false;
+    query = "";
+    exitSelect();
+    cwd = target.parent; // show the entry where it actually lives
+    spotId = target.id;
+  }
 
   const openFolder = (id: string) => {
     if (globalSearch) {
@@ -298,6 +474,151 @@
   };
   const cycleSort = () =>
     (sortKey = sortKey === "default" ? "name" : sortKey === "name" ? "time" : "default");
+
+  // ---- Preview ----------------------------------------------------------
+  // Local `FEntry` files have their text body inline; the Rust command handles
+  // binary detection, MIME inference from name, and (when present) PDF/audio/
+  // video rendering via data URLs.  Closing the preview clears the target so the
+  // banner disappears and the keyboard focus returns to the list.
+  const closePreview = (): void => {
+    previewTarget = null;
+    previewPlan = null;
+    previewBusy = false;
+  };
+
+  async function openPreview(entry: FEntry): Promise<void> {
+    previewTarget = entry;
+    previewPlan = null;
+    previewBusy = true;
+    try {
+      // Local files: use the inline `content` if any (text-only), else report
+      // empty.  In a future revision, the Files app could persist binary bytes
+      // by reference (e.g. `media_uri`) and route through `media_load` here too.
+      const body = entry.content ?? "";
+      if (entry.type === "file" && body.length === 0) {
+        previewPlan = await planPreview(entry.name, null, new Uint8Array(0));
+      } else if (entry.type === "file") {
+        const bytes = new TextEncoder().encode(body);
+        previewPlan = await planPreview(entry.name, null, bytes);
+      } else {
+        // Folders cannot be previewed — show a clear "binary" panel.
+        previewPlan = { kind: "binary", src: "", bytes: 0, isText: false, error: null, sizeLabel: "—", mime: null };
+      }
+    } finally {
+      previewBusy = false;
+    }
+  }
+
+  async function openExternalPreview(uri: string, name: string, mime: string | null): Promise<void> {
+    previewTarget = { id: uri, type: "file", name, ts: Date.now() } as FEntry;
+    previewPlan = null;
+    previewBusy = true;
+    try {
+      const item = { id: uri, kind: "file" as const, collection: "download" as StandardDir, name, uri, mime, size_bytes: null, ts: Date.now() };
+      const bytes = await mediaLoad(item);
+      if (bytes) {
+        previewPlan = await planPreview(name, mime, bytes);
+      } else {
+        previewPlan = { kind: "binary", src: "", bytes: 0, isText: false, error: null, sizeLabel: "—", mime };
+      }
+    } finally {
+      previewBusy = false;
+    }
+  }
+
+  // ---- Bundle export / import -------------------------------------------
+  // The Rust `files_bundle_export` does the gzip + base64 work; the WebView
+  // only formats the result.  Imports go through `files_bundle_import` and
+  // surface a 3-way merge decision (merge with existing / replace all / skip)
+  // so a bundle never silently clobbers the live store.
+  async function doExportBundle(): Promise<void> {
+    exportBusy = true;
+    exportMsg = "";
+    try {
+      const r = await exportBundle(list);
+      if (!r) {
+        exportMsg = t("files.bundleImportFailed", { reason: t("files.bundleFormatError") });
+        return;
+      }
+      lastExportBytes = { original: r.originalBytes, compressed: r.compressedBytes };
+      // Persist the bundle to the host's clipboard via the standard "save to
+      // clipboard" pattern; in a future revision a download button will replace
+      // this.  For now the user copies from the textbox below.
+      exportMsg = `${t("files.bundleExported")} (${r.ratioLabel}, ${r.compressedBytes} B)`;
+      // Stash the bundle text in `importText` so the user can copy it.
+      importText = r.text;
+    } finally {
+      exportBusy = false;
+    }
+  }
+
+  async function doImportBundle(): Promise<void> {
+    if (!importText.trim()) {
+      importMsg = t("files.bundleImportFailed", { reason: t("files.bundleFormatError") });
+      return;
+    }
+    importBusy = true;
+    importMsg = "";
+    try {
+      const r = await importBundle(importText, normalizeFiles);
+      if (!r.ok) {
+        importMsg = t("files.bundleImportFailed", { reason: r.reason });
+        return;
+      }
+      if (r.entries.length === 0) {
+        // Empty bundle is valid: clear the store so an intentionally emptied
+        // export-import round-trip stays honest.
+        persist([]);
+      } else {
+        // Replace: the bundle is the source of truth.
+        persist(r.entries);
+      }
+      importMsg = t("files.bundleImported", { n: r.entryCount });
+    } finally {
+      importBusy = false;
+    }
+  }
+
+  // ---- Cloud snapshot ----------------------------------------------------
+  // Saves a read-only snapshot of the device-file list to localStorage, keyed
+  // by `amos.files.cloud` (mirrored through Rust `store_set` for cross-window
+  // durability).  The "cloud" here is local — AmOS does not have a real cloud
+  // sync service.  Restore re-loads the snapshot and surfaces its metadata; the
+  // actual device-file list refreshes naturally on the next `loadExternal` tick.
+  async function doSaveCloud(): Promise<void> {
+    if (extFlat.length === 0) {
+      cloudMsg = t("files.cloudEmpty");
+      return;
+    }
+    cloudBusy = true;
+    try {
+      const snap = buildSnapshot("device-files", extFlat);
+      const ok = await saveSnapshot(snap);
+      if (ok) {
+        cloudSnap = snap;
+        cloudMsg = t("files.cloudSaved", { count: snap.fileCount });
+      } else {
+        cloudMsg = t("files.cloudSaveFailed");
+      }
+    } finally {
+      cloudBusy = false;
+    }
+  }
+
+  function doDeleteCloud(): void {
+    deleteSnapshot();
+    cloudSnap = null;
+    cloudMsg = "";
+  }
+
+  function doRestoreCloud(): void {
+    const snap = loadSnapshot();
+    if (snap) {
+      cloudSnap = snap;
+      cloudMsg = t("files.cloudRestored", { count: snap.fileCount });
+    }
+  }
+
   const beginCreate = (kind: "folder" | "file") => {
     creating = kind;
     name = "";
@@ -458,6 +779,10 @@
   <div class="flex flex-wrap gap-2">
     <button onclick={() => beginCreate("folder")} class={btnCls("accent")}>{t("files.addFolder")}</button>
     <button onclick={() => beginCreate("file")} class={btnCls("neutral")}>{t("files.addFile")}</button>
+    <button onclick={() => void doExportBundle()} disabled={exportBusy}
+      class={btnCls("neutral")}>{t("files.exportBundle")}</button>
+    <button onclick={() => void doImportBundle()} disabled={importBusy || !importText.trim()}
+      class={btnCls("neutral")}>{t("files.importFromDevice")}</button>
     {#if display.length > 0}
       <button onclick={() => (selecting ? exitSelect() : (selecting = true))} class={chip(selecting)}>
         {selecting ? t("files.cancel") : t("files.select")}
@@ -488,11 +813,13 @@
     {/if}
   </div>
 
-  <!-- view: all / favorites / recent -->
+  <!-- view: all / favorites / recent / trash -->
   <div class="mt-2 flex flex-wrap gap-1.5">
     <button onclick={() => (mode = "all")} aria-pressed={mode === "all"} class={chip(mode === "all")}>{t("files.all")}</button>
     <button onclick={() => (mode = "fav")} aria-pressed={mode === "fav"} class={chip(mode === "fav")}>{t("files.fav")}</button>
     <button onclick={() => (mode = "recent")} aria-pressed={mode === "recent"} class={chip(mode === "recent")}>{t("files.recent")}</button>
+    <button onclick={() => (mode = "trash")} aria-pressed={mode === "trash"} class={chip(mode === "trash")}
+      data-testid="files-trash-tab">{t("files.trash")}{trash.length > 0 ? ` (${trash.length})` : ""}</button>
   </div>
 
   <!-- search + sort -->
@@ -585,6 +912,54 @@
   {/if}
 
 
+  {#if mode === "trash"}
+    <!-- Trash (REQ-A455). Two acts only, and both are reversible-or-explicit:
+         「放回原处」 moves the item back into the tree, 「永久删除」/「清空」 destroys it —
+         the destructive side lives here, behind a second click, never in the list view. -->
+    <div class="mt-2 flex flex-wrap items-center gap-2">
+      <button onclick={emptyTrash} disabled={trash.length === 0} class={btnCls("danger")}
+        data-testid="files-trash-empty">{t("files.emptyTrash")}</button>
+      <span class="text-xs opacity-60">{t("files.trashCount", { n: trash.length })}</span>
+    </div>
+    {#if trashNote}
+      <!-- A live region, not a toast: what happened (a fallback location, a refusal, an
+           eviction) has to be readable after the fact, including by a screen reader. -->
+      <p class="mt-2 rounded-lg bg-amber-100/70 px-2 py-1 text-xs text-amber-900 dark:bg-amber-900/30 dark:text-amber-200"
+        role="status" data-testid="files-trash-note">{trashNote}</p>
+    {/if}
+    {#if trash.length === 0}
+      <p class="py-8 text-center text-sm opacity-60" data-testid="files-trash-empty-hint">
+        {t("files.trashEmptyHint")}
+      </p>
+    {:else}
+      <div class="divide-y divide-black/5 dark:divide-white/10 mt-2 {CARD_GROUP}"
+        role="grid" aria-label={t("files.trashList")} data-testid="files-trash-list">
+        {#each trashRows as row (row.item.id)}
+          {@const item = row.item}
+          {@const root = row.root}
+          <div class="flex items-center gap-2" role="row" data-trash-id={item.id}>
+            <div class="flex min-w-0 flex-1 items-center gap-2 px-3.5 py-2.5">
+              <span class="text-xl" aria-hidden="true">{root.type === "folder" ? FOLDER : FILE}</span>
+              <span class="min-w-0 flex-1">
+                <span class="block truncate text-sm">{root.name}</span>
+                <span class="block text-xs opacity-50">
+                  {t("files.trashDeletedAt", { time: fmtTime(item.deletedAt) })}{item.members.length > 1
+                    ? ` · ${t("files.trashMembers", { n: item.members.length - 1 })}`
+                    : ""}
+                </span>
+              </span>
+            </div>
+            <div class="flex gap-1 pr-2" role="gridcell">
+              <button onclick={() => restoreItem(item.id)} aria-label={t("files.trashRestoreAria", { name: root.name })}
+                class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.trashRestore")}</button>
+              <button onclick={() => purgeItem(item.id)} aria-label={t("files.trashDeleteForeverAria", { name: root.name })}
+                class="rounded-full bg-neutral-100 px-2 py-0.5 text-xs text-danger dark:bg-neutral-900/70">{t("files.trashDeleteForever")}</button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  {:else}
   <!-- list -->
   {#if display.length === 0}
     <p class="py-8 text-center text-sm opacity-60">
@@ -641,12 +1016,112 @@
               </button>
               <button onclick={() => beginRename(e.id, e.name)} aria-label={t("files.rename")} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.rename")}</button>
               <button onclick={() => doCut(e.id)} aria-label={t("files.move")} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.move")}</button>
-              <button onclick={() => persist(deleteEntry(list, e.id))} aria-label={t("files.delete")} class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs text-danger dark:bg-neutral-700/70">{t("files.delete")}</button>
+              {#if e.type === "file"}
+                <button onclick={() => void openPreview(e)} aria-label={t("files.previewOpen", { name: e.name })}
+                  class="rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70">{t("files.preview")}</button>
+              {/if}
+              <button onclick={() => removeToTrash(new Set([e.id]))} aria-label={t("files.delete")} class="rounded-full bg-neutral-100 px-2 py-0.5 text-xs text-danger dark:bg-neutral-900/70">{t("files.delete")}</button>
             </div>
           {/if}
         </div>
       {/each}
     </div>
+  {/if}
+  {/if}
+
+  <!-- Preview panel: shown when the user asks to preview a local file. The Rust
+       command (files_preview_bytes) classifies the bytes; the renderer picks the
+       surface (text block / <img> / <audio> / <video> / "binary"). -->
+  {#if previewTarget}
+    <div class="mt-3 rounded-xl bg-neutral-200/60 p-3 ring-1 ring-black/5 dark:bg-neutral-800/60 dark:ring-white/10"
+      data-testid="preview-panel">
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <h3 class="text-sm font-semibold" data-testid="preview-title">
+          {t("files.previewTitle", { name: previewTarget.name, size: previewPlan?.sizeLabel ?? "" })}
+        </h3>
+        <button onclick={closePreview} aria-label={t("files.previewClose")}
+          class="rounded-full bg-neutral-300 px-2 py-0.5 text-xs dark:bg-neutral-700">
+          ✕
+        </button>
+      </div>
+      {#if previewBusy}
+        <p class="text-xs opacity-60">…</p>
+      {:else if previewPlan}
+        {#if previewPlan.kind === "text"}
+          <pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded bg-white p-2 text-xs dark:bg-neutral-900"
+            data-testid="preview-text">{previewPlan.src}</pre>
+        {:else if previewPlan.kind === "image"}
+          <img src={previewPlan.src} alt={previewTarget.name}
+            class="max-h-96 max-w-full rounded" data-testid="preview-image" />
+        {:else if previewPlan.kind === "audio"}
+          <audio src={previewPlan.src} controls class="w-full" data-testid="preview-audio"></audio>
+        {:else if previewPlan.kind === "video"}
+          <video src={previewPlan.src} controls class="max-h-96 w-full rounded" data-testid="preview-video"></video>
+        {:else if previewPlan.kind === "empty"}
+          <p class="text-xs opacity-60">{t("files.previewEmpty")}</p>
+        {:else}
+          <p class="text-xs opacity-60" data-testid="preview-binary">{t("files.previewBinary")}</p>
+        {/if}
+        {#if previewPlan.error}
+          <p class="mt-1 text-xs text-amber-600 dark:text-amber-400">{previewPlan.error}</p>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+
+  <!-- Bundle export/import textbox.  The Rust `files_bundle_export` produces a
+       base64-encoded gzip bundle; the WebView shows the text so the user can
+       copy it (a future revision will wire a file-download bridge). -->
+  <details class="mt-3 rounded-xl bg-neutral-200/40 p-2 dark:bg-neutral-800/40" data-testid="bundle-section">
+    <summary class="cursor-pointer text-xs font-semibold opacity-80">{t("files.exportBundle")} / {t("files.importFromDevice")}</summary>
+    <textarea
+      bind:value={importText}
+      placeholder=".amos-bundle"
+      rows={4}
+      data-testid="bundle-text"
+      aria-label={t("files.importFromDevice")}
+      class="mt-2 w-full rounded bg-white p-2 font-mono text-xs outline-none dark:bg-neutral-900"
+    ></textarea>
+    {#if lastExportBytes}
+      <p class="mt-1 text-xs opacity-60" data-testid="bundle-stats">
+        {t("files.compressionRatio", {
+          ratio: Math.round((100 * lastExportBytes.compressed) / Math.max(1, lastExportBytes.original)),
+          from: previewBytesLabel(lastExportBytes.original),
+          to: previewBytesLabel(lastExportBytes.compressed),
+        })}
+      </p>
+    {/if}
+    {#if exportMsg}<p class="mt-1 text-xs text-green-700 dark:text-green-300">{exportMsg}</p>{/if}
+    {#if importMsg}<p class="mt-1 text-xs text-amber-700 dark:text-amber-300">{importMsg}</p>{/if}
+  </details>
+
+  <!-- Cloud snapshot (local mirror): save / restore / delete the device-file
+       snapshot.  This is the honest "cloud sync" AmOS Files supports without a
+       real cloud account — the snapshot lives in localStorage and the Rust side
+       validates the structure on every save. -->
+  {#if hasMediaBridge()}
+    <details class="mt-3 rounded-xl bg-neutral-200/40 p-2 dark:bg-neutral-800/40" data-testid="cloud-section">
+      <summary class="cursor-pointer text-xs font-semibold opacity-80">{t("files.cloudSnapshot")}</summary>
+      <div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+        <button onclick={() => void doSaveCloud()} disabled={cloudBusy}
+          class="rounded-full bg-neutral-300 px-3 py-1 dark:bg-neutral-700">{t("files.cloudSnapshot")}</button>
+        <button onclick={doRestoreCloud} disabled={!cloudSnap}
+          class="rounded-full bg-neutral-300 px-3 py-1 dark:bg-neutral-700">{t("files.cloudRestore")}</button>
+        {#if cloudSnap}
+          <button onclick={doDeleteCloud}
+            class="rounded-full bg-neutral-100 px-3 py-1 text-danger dark:bg-neutral-900/70">{t("files.cloudDelete")}</button>
+        {/if}
+      </div>
+      {#if cloudSnap}
+        <p class="mt-1 text-xs opacity-70" data-testid="cloud-info">
+          {cloudSnap.label} · {cloudSnap.fileCount} 项 · {formatSnapshotSize(cloudSnap.totalBytes)}
+          · {new Date(cloudSnap.savedAt).toLocaleString()}
+        </p>
+      {:else}
+        <p class="mt-1 text-xs opacity-60">{t("files.cloudEmpty")}</p>
+      {/if}
+      {#if cloudMsg}<p class="mt-1 text-xs text-green-700 dark:text-green-300">{cloudMsg}</p>{/if}
+    </details>
   {/if}
 
   <!-- External collections (read-only). Rendered only once the media bridge has
@@ -712,6 +1187,10 @@
                         {formatBytes(f.sizeBytes)} · {f.ts ? fmtTime(f.ts) : "—"} · {t("files.externalReadOnly")}
                       </span>
                     </span>
+                    <button onclick={() => void openExternalPreview(f.uri, f.name, f.mime)}
+                      aria-label={t("files.previewOpen", { name: f.name })}
+                      class="shrink-0 rounded-full bg-neutral-300/70 px-2 py-0.5 text-xs dark:bg-neutral-700/70"
+                      data-testid="external-preview-btn">{t("files.preview")}</button>
                   </div>
                 {/each}
               </div>

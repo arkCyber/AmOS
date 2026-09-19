@@ -14,6 +14,7 @@
  * - Priority Handling: Critical alerts and time-sensitive notifications
  */
 import { invoke } from "./backend";
+import { localId } from "./localId";
 
 /** Device token for remote push notifications (64 hex chars in production). */
 export type DeviceToken = string;
@@ -434,8 +435,17 @@ export function updatePushStatistics(
 /**
  * Generate unique notification identifier.
  */
+/**
+ * A new notification id.
+ *
+ * Uses the shared `localId` (REQ-A401). The old form
+ * (`` `push_${Date.now()}_${Math.random().toString(36).substring(2, 11)}` ``) is the same
+ * "time + luck" family as the rest of the shell's ids, and an id here is identity: the
+ * notification centre keys rows by it, and `amos.notifications` is re-read through
+ * `normalizeNotifs`, which **drops duplicate ids**. The `push` prefix is kept.
+ */
 export function generateNotificationId(): string {
-  return `push_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+  return localId("push");
 }
 
 /**

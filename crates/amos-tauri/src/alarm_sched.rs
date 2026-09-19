@@ -260,25 +260,25 @@ fn open_device_settings() -> Result<bool, String> {
 }
 
 #[cfg(feature = "android")]
-fn arm_device(id: &str, at_ms: u64) -> DeviceOutcome {
+pub(crate) fn arm_device(id: &str, at_ms: u64) -> DeviceOutcome {
     android::schedule(id, at_ms)
 }
 
 /// Desktop / CI: there is no `AlarmManager` here, and saying so is the answer.
 #[cfg(not(feature = "android"))]
-fn arm_device(_id: &str, _at_ms: u64) -> DeviceOutcome {
+pub(crate) fn arm_device(_id: &str, _at_ms: u64) -> DeviceOutcome {
     DeviceOutcome::HostOnly
 }
 
 /// Hand one cancellation to the OS exact-wake binding (feature `android`).
 #[cfg(feature = "android")]
-fn cancel_device(id: &str) -> DeviceOutcome {
+pub(crate) fn cancel_device(id: &str) -> DeviceOutcome {
     android::cancel(id)
 }
 
 /// Desktop / CI: nothing to cancel outside the ledger.
 #[cfg(not(feature = "android"))]
-fn cancel_device(_id: &str) -> DeviceOutcome {
+pub(crate) fn cancel_device(_id: &str) -> DeviceOutcome {
     DeviceOutcome::HostOnly
 }
 

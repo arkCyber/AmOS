@@ -1,12 +1,20 @@
 import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
+  dockCapacityExtent,
+  dockHideTransform,
+  dockIsVertical,
+  dockMagnifyAxis,
+  dockPanelStyle,
   dockPositionClass,
+  dockRevealZone,
+  dockWrapperStyle,
   emitDockBounce,
   isFullscreen,
   onDockBounce,
   type DockPosition,
 } from "../dockConfig";
+import { DOCK_HEIGHT, DOCK_MIN_WIDTH, TOPBAR_HEIGHT } from "../desktopLayout";
 
 beforeAll(() => {
   GlobalRegistrator.register();
@@ -18,11 +26,13 @@ describe("dockPositionClass", () => {
   });
 
   it("returns left classes for 'left'", () => {
-    expect(dockPositionClass("left")).toBe("left-0 top-[24px] bottom-0 justify-start");
+    // REQ-A414: `top-[24px]` / `bottom-0` moved to `dockWrapperStyle`; keeping them in
+    // BOTH places is what over-constrained the side dock's box (CSS dropped `bottom`).
+    expect(dockPositionClass("left")).toBe("left-0 justify-start");
   });
 
   it("returns right classes for 'right'", () => {
-    expect(dockPositionClass("right")).toBe("right-0 top-[24px] bottom-0 justify-end");
+    expect(dockPositionClass("right")).toBe("right-0 justify-end");
   });
 
   it("exhaustiveness — adding a new DockPosition causes a type error", () => {
@@ -31,6 +41,71 @@ describe("dockPositionClass", () => {
     // test merely documents the contract; the real check is the type system.
     const positions: DockPosition[] = ["bottom", "left", "right"];
     expect(positions).toHaveLength(3);
+  });
+});
+
+describe("dock geometry per edge (REQ-A414)", () => {
+  it("'vertical' is exactly the two side edges", () => {
+    expect(dockIsVertical("bottom")).toBe(false);
+    expect(dockIsVertical("left")).toBe(true);
+    expect(dockIsVertical("right")).toBe(true);
+  });
+
+  it("the wrapper is a 68px bar at the bottom, a full-height column on a side", () => {
+    expect(dockWrapperStyle("bottom")).toBe(`height:${DOCK_HEIGHT}px;`);
+    // `top` + `bottom` (and NO fixed height): the three-way constraint is what CSS
+    // resolves by dropping `bottom`.
+    expect(dockWrapperStyle("left")).toBe(`top:${TOPBAR_HEIGHT}px; bottom:0;`);
+    expect(dockWrapperStyle("right")).toBe(`top:${TOPBAR_HEIGHT}px; bottom:0;`);
+    for (const wrong of [`height:${DOCK_HEIGHT}px;`]) {
+      expect(dockWrapperStyle("left")).not.toContain(wrong);
+    }
+  });
+
+  it("the panel's minimum box follows the axis (min-width vs min-height)", () => {
+    expect(dockPanelStyle("bottom")).toBe(`min-width:${DOCK_MIN_WIDTH}px;`);
+    // A side dock is as narrow as the bar is tall — 320px would be wrong.
+    expect(dockPanelStyle("left")).toBe(`min-height:${DOCK_MIN_WIDTH}px;`);
+    expect(dockPanelStyle("right")).toBe(`min-height:${DOCK_MIN_WIDTH}px;`);
+    expect(dockPanelStyle("left")).not.toContain("min-width");
+  });
+
+  it("the hide transform slides off the dock's OWN edge", () => {
+    for (const p of ["bottom", "left", "right"] as const) {
+      expect(dockHideTransform(p, false)).toBe("translate(0, 0)");
+    }
+    expect(dockHideTransform("bottom", true)).toBe("translateY(100%)");
+    expect(dockHideTransform("left", true)).toBe("translateX(-100%)");
+    expect(dockHideTransform("right", true)).toBe("translateX(100%)");
+  });
+
+  it("the magnifier tracks X along a bottom bar and Y along a side column", () => {
+    expect(dockMagnifyAxis("bottom")).toBe("x");
+    expect(dockMagnifyAxis("left")).toBe("y");
+    expect(dockMagnifyAxis("right")).toBe("y");
+  });
+
+  it("the reveal zone follows the edge the dock hides behind", () => {
+    const W = 1000;
+    const H = 800;
+    // bottom: the last 80px of the height
+    expect(dockRevealZone("bottom", 500, H - 10, W, H)).toBe(true);
+    expect(dockRevealZone("bottom", 500, H - 100, W, H)).toBe(false);
+    // left: the first 80px of the width (this is the dead-end the old bottom-only
+    // check left behind)
+    expect(dockRevealZone("left", 10, 400, W, H)).toBe(true);
+    expect(dockRevealZone("left", 200, H - 10, W, H)).toBe(false);
+    // right: the last 80px of the width
+    expect(dockRevealZone("right", W - 10, 400, W, H)).toBe(true);
+    expect(dockRevealZone("right", 200, 400, W, H)).toBe(false);
+    // a custom threshold is honoured
+    expect(dockRevealZone("left", 150, 400, W, H, 200)).toBe(true);
+  });
+
+  it("capacity is measured along the dock's long edge", () => {
+    expect(dockCapacityExtent("bottom", 900, 68)).toBe(900);
+    expect(dockCapacityExtent("left", 68, 600)).toBe(600);
+    expect(dockCapacityExtent("right", 68, 600)).toBe(600);
   });
 });
 

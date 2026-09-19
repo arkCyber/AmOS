@@ -156,7 +156,7 @@
     vids = r.list;
   };
   const shown = $derived(favOnly ? favsOf(list) : list);
-  const add = () => persist([newPhoto(`p${Date.now()}`, Date.now()), ...list]);
+  const add = () => persist([newPhoto(Date.now()), ...list]);
 
   const toggleSelect = (id: string) => {
     const next = new Set(selected);

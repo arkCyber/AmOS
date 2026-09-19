@@ -5,14 +5,14 @@
 > contract and this page cannot drift apart.
 
 The daemon serves all of these over **one shared Unix Domain Socket** (default $AMOS_SOCKET).
-11 services · 64 RPCs · 129 messages · 19 enums,
+11 services · 64 RPCs · 130 messages · 19 enums,
 across 10 `.proto` files.
 
 ## Index
 
 | File | Package | Services | RPCs | Messages | Enums |
 |---|---|---|---|---|---|
-| [`ai_agent.proto`](#ai_agentproto) | `ai_agent` | 2 | 11 | 40 | 0 |
+| [`ai_agent.proto`](#ai_agentproto) | `ai_agent` | 2 | 11 | 41 | 0 |
 | [`android_compat.proto`](#android_compatproto) | `android_compat` | 1 | 9 | 18 | 4 |
 | [`governor.proto`](#governorproto) | `amos_governor` | 1 | 6 | 9 | 2 |
 | [`netguard.proto`](#netguardproto) | `amos_netguard` | 1 | 3 | 7 | 1 |
@@ -129,6 +129,7 @@ RAG retrieval service: offline local vector search over the daemon's indexed not
 | `generation_pool` | `GenerationPoolMetrics` | 17 | Daemon-wide generation admission gate (REQ-A43), added 2026-09-11: live concurrency bounded by AMOS_MAX_SESSIONS. `in_flight` never exceeds `capacity` (the pool enforces it structurally). Present on every reply from this daemon version; a pre-this-field daemon leaves it absent (= unknown). |
 | `response_cache` | `ResponseCacheMetrics` | 18 | Inference-response cache (REQ-A44), added 2026-09-11: opt-in via AMOS_RESPONSE_CACHE=1. When disabled (`enabled=false`) every counter is the honest zero of a cache that stored/looked up nothing — never fabricated. |
 | `log_sink` | `LogSinkMetrics` | 19 | On-disk log sink health (REQ-A87), added 2026-09-11: the daemon persists its tracing output to a bounded, self-rotating file when AMOS_LOG_DIR is set (default ~/.amos/logs). `enabled=false` means stdout only — the counters are then the honest zeros of a sink that never persisted anything. A non-zero `lost_bytes`/`write_failures` is how an operator learns the on-disk trail is *incomplete* instead of assuming it is complete. |
+| `json_log_sink` | `JsonLogSinkMetrics` | 22 | Structured JSON-line sink health (REQ-A420), added 2026-09-18: an *opt-in* companion to the human log sink that writes one machine-parseable JSON object per event into `amos-ai.jsonl` next to the human `amos-ai.log`. `enabled=false` means stdout only (or AMOS_LOG_JSON is unset) — the counters are then the honest zeros of a sink that never persisted anything, and never a fabricated reading. The two sinks are independent: either may be enabled alone; `get_status` reports each one in its own block so an operator never has to cross-reference two files to learn which sinks are alive. Wire shape mirrors `LogSinkMetrics` so a single UI card can render both. |
 | `breaker` | `BreakerMetrics` | 20 | Backend circuit breaker (REQ-A131), added 2026-09-12: while a backend is down, generations fail fast with a stated reason instead of every caller walking the full backend timeout. `enabled=false` (AMOS_BREAKER=0) means the decorator is not in the serving path at all — the counters are then the honest zeros of a breaker that never made a decision. `state` is "closed" \| "open" \| "half_open"; a non-zero `rejections` is how an operator learns calls were *skipped on purpose* rather than lost. See docs/daemon-resource-gate.md. |
 | `alerts` | `Alerts` | 21 | Threshold alerts derived from the counters above (REQ-A133), added 2026-09-12: one place that says what is *wrong right now* instead of making an operator read eight blocks. `alerts` is EMPTY for a healthy daemon — absence means "no rule fired", never "checked and all good by some other authority". Nothing is delivered anywhere: this is a report, not a notification channel. |
 
@@ -171,6 +172,18 @@ RAG retrieval service: offline local vector search over the daemon's indexed not
 | `lost_bytes` | `uint64` | 4 | bytes a failed write could not persist |
 | `write_failures` | `uint64` | 5 | failed write/flush/rotation attempts |
 | `rotations` | `uint64` | 6 | completed roll-overs (older lines moved to .1…) |
+| `active_bytes` | `uint64` | 7 | size of the active file right now |
+
+**`JsonLogSinkMetrics`** — Wire mirror of `JsonSinkReport` in `crates/amos-ai/src/jsonlog.rs`. Same shape as `LogSinkMetrics` by design — a UI card can render both with the same code path.
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `enabled` | `bool` | 1 | a JSON sink is open (false => human sink + stdout) |
+| `path` | `string` | 2 | the active file ("" when disabled) |
+| `bytes_written` | `uint64` | 3 | bytes appended since start-up |
+| `lost_bytes` | `uint64` | 4 | bytes a failed write could not persist |
+| `write_failures` | `uint64` | 5 | failed write/flush/rotation attempts |
+| `rotations` | `uint64` | 6 | completed roll-overs |
 | `active_bytes` | `uint64` | 7 | size of the active file right now |
 
 **`GenerationPoolMetrics`** — Live state + monotonic counters of the daemon's generation admission pool (amos_ai::pool::GenerationPool). `in_flight <= capacity` is an invariant, not a hope: the semaphore cannot hand out more permits than it holds.

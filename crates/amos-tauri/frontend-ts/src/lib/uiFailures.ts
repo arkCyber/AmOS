@@ -98,11 +98,39 @@ function record(what: string, reason: unknown, where = ""): void {
 }
 
 /**
+ * Detach the currently installed pair, resetting the module's slots.
+ *
+ * REQ-A406: `installUiFailureObserver` 原来只比 `installedOn === target` 就直接返回 ⇒
+ * `install(A)` 之后再 `install(B)` 会**在 B 上加一对、却把 A 的那对留着**：同一条失败被记
+ * 两次，而 `resetUiFailuresForTest()` 只摘得掉最后一个 —— 这个文件自己的注释就警告过
+ * "a test-only helper that quietly corrupts the thing it resets"，而生产里两个入口都传同一个
+ * `window`，所以这个洞只在"验收页 / 测试注入别的 target"时显形：正是注入能力存在的理由。
+ * 摘不干净也不许把交接弄崩（宿主可能没有可用的 `removeEventListener`）。
+ */
+function detach(): void {
+  const target = installedOn;
+  const rejection = onRejection;
+  const error = onError;
+  installedOn = null;
+  onRejection = null;
+  onError = null;
+  if (!target || !rejection || !error) return;
+  try {
+    target.removeEventListener("unhandledrejection", rejection);
+    target.removeEventListener("error", error);
+  } catch {
+    /* a host whose removeEventListener throws must not break the handover */
+  }
+}
+
+/**
  * Install the observer on `target` (defaults to the page `window`). Idempotent: calling it
  * twice is a no-op, so every entry point (shell, headless acceptance page) may call it.
+ * Installing on a *different* target first detaches the previous one (REQ-A406).
  */
 export function installUiFailureObserver(target: Window = window): void {
   if (installedOn === target) return;
+  detach();
   try {
     onRejection = (ev: Event) => {
       const reason = (ev as PromiseRejectionEvent).reason;
@@ -140,14 +168,9 @@ export function installUiFailureObserver(target: Window = window): void {
  *
  * Detaching is not optional: leaving the listeners attached would make a later install add a
  * second pair, and every failure would then be recorded twice — a test-only helper that
- * quietly corrupts the thing it resets.
+ * quietly corrupts the thing it resets. Same routine the handover uses (REQ-A406), so the
+ * two can no longer drift.
  */
 export function resetUiFailuresForTest(): void {
-  if (installedOn && onRejection && onError) {
-    installedOn.removeEventListener("unhandledrejection", onRejection);
-    installedOn.removeEventListener("error", onError);
-  }
-  installedOn = null;
-  onRejection = null;
-  onError = null;
+  detach();
 }

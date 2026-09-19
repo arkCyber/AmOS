@@ -1,8 +1,45 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import {
   isCachedDeclinationValid,
   fetchDeclinationWithCache,
 } from "../compass";
+
+// ---------------------------------------------------------------------------
+// `fetch` 缝：**这个文件曾经真的去打 NOAA 的 HTTPS 接口**。
+//
+// `fetchDeclinationWithCache` 在缓存失效/缺失时调用 `fetchDeclination`，后者 `fetch` 的是
+// `https://www.ngdc.noaa.gov/…` 并带 `AbortSignal.timeout(5000)`。实测的后果是这条用例
+// 在负载下**超时失败**：`Test "returns fromCache=false when no cache exists" timed out
+// after 5009ms` —— 因为那个 5s 中止与 bun 的 5s 单测默认超时是同一个量级，慢网时谁也
+// 不会先完成。测试不该依赖网络与外部服务：这里把应答换成确定性的（`beforeAll` 装 /
+// `afterAll` 还原，pure 批次是一个进程跑所有文件，桩漏出去会改别的文件的行为）。
+// ---------------------------------------------------------------------------
+
+interface StubbedResponse {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  json: () => Promise<unknown>;
+}
+
+const realFetch = globalThis.fetch;
+let respondWith: (url: string) => StubbedResponse;
+
+beforeAll(() => {
+  (globalThis as { fetch: unknown }).fetch = (input: unknown) =>
+    Promise.resolve(respondWith(String(input)));
+});
+afterAll(() => {
+  (globalThis as { fetch: unknown }).fetch = realFetch;
+});
+beforeEach(() => {
+  respondWith = () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    json: async () => ({ result: [{ declination: 12.5 }] }),
+  });
+});
 
 describe("compass caching", () => {
   describe("isCachedDeclinationValid", () => {
@@ -99,6 +136,8 @@ describe("compass caching", () => {
       expect(result.cachedLocation).toBeDefined();
       expect(result.cachedLocation.lat).toBe(40.7128);
       expect(result.cachedLocation.lon).toBe(-74.006);
+      // 走到 API 时取的是**API 的值**，不是传进来的旧值（离线时这条会退化到 0）。
+      expect(result.declination).toBeCloseTo(12.5, 5);
     });
 
     it("creates new cache with current timestamp", async () => {

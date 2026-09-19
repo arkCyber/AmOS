@@ -27,25 +27,39 @@
  *   node scripts/lock-across-await-scan.mjs --json
  *   node scripts/lock-across-await-scan.mjs --selftest   # pin the scope tracker
  */
-import { readdirSync, statSync, readFileSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SKIP_DIRS = new Set(["target", "node_modules", ".git", "dist"]);
 
 /** Production Rust sources (`crates/**\/src`, test dirs excluded). */
-export function productionSources() {
+export function productionSources(dir = join(root, "crates")) {
   const out = [];
   const walk = (d) => {
     for (const e of readdirSync(d)) {
       if (SKIP_DIRS.has(e) || e === "tests") continue;
       const p = join(d, e);
-      if (statSync(p).isDirectory()) walk(p);
+      // `statSync` **follows symlinks**, so a dangling one throws ENOENT. That is a real
+      // state here: a device build leaves `crates/amos-tauri/gen/android/.../jniLibs/
+      // libamos_tauri_lib.so` as a link into `target/<triple>/`, and a later `cargo clean`
+      // makes it point at nothing — the unguarded walk died with a Node stack trace
+      // instead of a finding. A gate must *report*, never crash: skip what cannot be stat'd.
+      // (Same defect + same fix as `unsafe-scan.mjs`, which found it first; this file was
+      // still carrying the unguarded copy.)
+      let stat;
+      try {
+        stat = statSync(p);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) walk(p);
       else if (p.endsWith(".rs") && p.includes("/src/")) out.push(p);
     }
   };
-  walk(join(root, "crates"));
+  if (existsSync(dir)) walk(dir);
   return out.sort();
 }
 
@@ -255,6 +269,30 @@ async fn f() {
 `;
   const hits = scan1(two);
   cases.push(["only the offending guard is reported", hits.length === 1 && hits[0].name === "b"]);
+
+  // A **dangling symlink** under a walked directory must be skipped, not fatal: a device
+  // build leaves `crates/amos-tauri/gen/android/.../jniLibs/libamos_tauri_lib.so` pointing
+  // into `target/<triple>/`, and a later `cargo clean` makes it dangle — the unguarded walk
+  // died with ENOENT and `make lint` reported a Node stack trace instead of a finding.
+  // (Same case as `unsafe-scan.mjs`, which found it first.)
+  const tmp = mkdtempSync(join(tmpdir(), "amos-lock-across-await-"));
+  try {
+    mkdirSync(join(tmp, "crate", "src"), { recursive: true });
+    writeFileSync(join(tmp, "crate", "src", "real.rs"), "fn f() {}\n");
+    symlinkSync(join(tmp, "gone", "lib.so"), join(tmp, "crate", "src", "dangling.so"));
+    let survivors;
+    try {
+      survivors = productionSources(tmp);
+    } catch {
+      survivors = null; // the regression: the walk threw instead of skipping
+    }
+    cases.push([
+      "a dangling symlink is skipped, not fatal",
+      survivors !== null && survivors.length === 1 && survivors[0].endsWith("real.rs"),
+    ]);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 
   let failed = 0;
   for (const [name, ok] of cases) {

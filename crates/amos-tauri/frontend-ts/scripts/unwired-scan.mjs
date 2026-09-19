@@ -339,11 +339,17 @@ const readProd = (f) => {
 
 const findings = []; // zero production usage → gated (testRefs > 0 means test-only)
 const typeFindings = []; // unused type exports → informational
+// Every symbol with **zero** production usage, *before* the allow-list filter — the set the
+// allow-list staleness test needs. Testing membership in `findings` instead would be circular:
+// `findings` excludes exactly the allowed symbols, so every allow-list entry would look stale
+// (measured: 8 false positives on the first attempt).
+const unwiredKeys = new Set();
 for (const file of symbolFiles) {
   const rel = relative(root, file);
   const src = stripBlockComments(readFileSync(file, "utf8"));
   for (const { name, kind } of extractExports(src)) {
     const used = prodUsage(name, src, cache);
+    if (used === 0) unwiredKeys.add(allowKey(rel, name));
     if (used > 0 || allowed.has(allowKey(rel, name))) continue;
     const testRefs = countIn(name, testFiles, cache);
     if (kind === "type") typeFindings.push({ path: rel, name, kind, testRefs });
@@ -360,11 +366,11 @@ typeFindings.sort(byPathName);
 // reached when ANY production file outside `src/lib` imports it (transitively).
 const libRoots = prodFiles.filter((f) => !libFileSet.has(f));
 const libReachable = reachable(cache, libRoots);
-const deadModules = libFiles
+const unreachableModules = libFiles
   .map((f) => relative(root, f))
   .filter((p) => !libReachable.has(join(root, p)))
-  .filter((p) => !allowedModules.has(p))
   .sort();
+const deadModules = unreachableModules.filter((p) => !allowedModules.has(p));
 
 // Component-level: a `.svelte` file no production entry chain mounts. This is the
 // `.svelte` analogue of the dead-module check and catches the historical
@@ -385,16 +391,18 @@ const mountRoots = prodFiles.filter(
   (f) => !importedBy.has(f) && !libFileSet.has(f) && !f.endsWith(".svelte"),
 );
 const mountReachable = reachable(cache, mountRoots);
-const unmountedComponents = componentFiles
+const unmountedAll = componentFiles
   .map((f) => relative(root, f))
   .filter((p) => !mountReachable.has(join(root, p)))
-  .filter((p) => !allowedModules.has(p))
   .sort();
+const unmountedComponents = unmountedAll.filter((p) => !allowedModules.has(p));
 
 // --- baseline ratchet -------------------------------------------------------
 // `scripts/unwired-baseline.json` records the known backlog so the gate fails on
 // *new* unwired exports (regressions) without forcing a big-bang cleanup. A
-// stale entry (now wired) is also reported, so the baseline cannot rot.
+// stale entry (now wired) **fails too** (REQ-A447 — the ratchet must shrink, not
+// rot; a note was not enough), and so does an allow-list entry whose hole has been
+// filled.
 const baselinePath = join(root, "scripts", "unwired-baseline.json");
 let baseline = { values: [], modules: [], components: [] };
 if (existsSync(baselinePath)) baseline = JSON.parse(readFileSync(baselinePath, "utf8"));
@@ -439,6 +447,25 @@ if (updateBaseline) {
   process.exit(0);
 }
 
+// An excuse that outlived its file (REQ-A447). Two kinds, and neither used to be checked at all:
+//   • a baseline entry whose symbol is wired now (`fixedValues`) — the ratchet must shrink;
+//   • an allow-list entry whose module became reachable, or whose symbol is wired now — an
+//     exemption for a hole that has been filled is a licence nobody revoked.
+// The header said "a stale entry is reported, so the baseline cannot rot"; reporting was not
+// enough, so both are failures now (the same rule the Rust ratchets got).
+const allowStale = allow
+  .filter((e) => {
+    // An allow-list entry is a claim that its subject is *still* unwired. The sets the gate
+    // reports are filtered by this very list, so the test has to use the **unfiltered** ones
+    // (see `unwiredKeys` / `unreachableModules` / `unmountedAll`) or it would flag every entry.
+    if (e.module) {
+      return !unreachableModules.includes(e.path) && !unmountedAll.includes(e.path);
+    }
+    return !unwiredKeys.has(allowKey(e.path, e.name));
+  })
+  .map((e) => `${e.path}${e.name ? `::${e.name}` : " (module)"}`);
+const staleProblems = fixedValues.length + allowStale.length;
+
 if (process.argv.includes("--json")) {
   console.log(
     JSON.stringify(
@@ -451,6 +478,8 @@ if (process.argv.includes("--json")) {
         newValues,
         typeFindings,
         allowed: allow.length,
+        allowStale,
+        fixedValues,
         scanned: symbolFiles.length,
         baseline: {
           values: baseValues.size,
@@ -475,7 +504,14 @@ if (process.argv.includes("--json")) {
     console.log("[unwired-scan] OK — every production .svelte component is mounted by an entry.");
   }
   if (fixedValues.length > 0) {
-    console.log(`[unwired-scan] baseline: ${fixedValues.length} entr(y/ies) now wired — shrink the baseline with --update-baseline.`);
+    console.error(
+      `[unwired-scan] FAIL — ${fixedValues.length} baseline entr(y/ies) now wired; shrink the baseline with --update-baseline (the ratchet must shrink, not rot).`,
+    );
+  }
+  if (allowStale.length > 0) {
+    console.error(
+      `[unwired-scan] FAIL — ${allowStale.length} allow-list entr(y/ies) no longer name a hole (the module is reachable / the symbol is wired): ${allowStale.join(", ")}`,
+    );
   }
   const testOnly = findings.filter((f) => f.testRefs > 0).length;
   console.log(
@@ -518,4 +554,8 @@ if (process.argv.includes("--json")) {
   }
 }
 
-process.exit(newModules.length === 0 && newComponents.length === 0 && newValues.length === 0 ? 0 : 1);
+process.exit(
+  newModules.length === 0 && newComponents.length === 0 && newValues.length === 0 && staleProblems === 0
+    ? 0
+    : 1,
+);
