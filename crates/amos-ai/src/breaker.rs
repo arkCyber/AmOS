@@ -314,6 +314,18 @@ pub fn lock(breaker: &SharedBreaker) -> std::sync::MutexGuard<'_, CircuitBreaker
     breaker.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(test)]
+impl CircuitBreaker {
+    /// Force the breaker into a specific state. **Tests only**: production
+    /// code must go through `decide` / `on_success` / `on_failure` so the
+    /// cooldown/probe invariants are preserved. Tests that need to verify
+    /// the alerting/bridge machinery on the recovery side without paying
+    /// the wall-clock cost of a real cooldown use this hook.
+    pub fn force_state_for_test(&mut self, state: BreakerState) {
+        self.state = state;
+    }
+}
+
 /// Transparent breaker decorator around any [`InferenceBackend`].
 ///
 /// Composition guidance (also what `server.rs` wires): put this **inside** the

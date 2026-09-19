@@ -40,6 +40,12 @@ amos-monitor = { workspace = true, features = ["linux"] }
 # Egress data-plane firewall domain core (policy + seam + Mock). Default build is
 # pure std; the daemon mounts a Mock-backed NetGuardService (docs/anti-telemetry-egress-guard.md).
 amos-network-guard.workspace = true
+# Threshold-alert delivery. Pulls the dispatcher that the bridge fires into;
+# the default daemon build (the one that ships to devices) keeps the bridge
+# as a `None`-sink so it compiles to a no-op rather than gaining a transitive
+# dependency. Operators who want paging set `notifier = ["dep:amos-notifier"]`
+# (or build with `--features notifier`) and wire `Dispatcher` into the bridge.
+amos-notifier = { workspace = true, optional = true }
 # Passive egress telemetry-spy domain core (pure std). Only pulled in by the
 # `telemetry-spy` feature, which adds the EgressMatch -> EgressHit mapping +
 # `TelemetrySpySvc::ingest_match` feed seam (host-testable). Live pnet capture
@@ -87,6 +93,11 @@ telemetry-spy = ["dep:amos-telemetry-spy"]
 # match into the SAME TelemetrySpySvc Watch stream serve() mounts. Device/AOSP
 # path — needs raw-socket privilege; default build never compiles it (quiet).
 telemetry-spy-audit = ["telemetry-spy", "amos-telemetry-spy/audit"]
+# Pulls `amos-notifier` so the alert bridge can page on state transitions. Off
+# by default so the standalone daemon (the build that ships to devices) keeps
+# its transitive deps minimal; opt in for a deployment with a webhook/SMTP
+# relay configured.
+notifier = ["dep:amos-notifier"]
 
 [dev-dependencies]
 tower.workspace = true

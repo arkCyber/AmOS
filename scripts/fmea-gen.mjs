@@ -55,6 +55,8 @@ const KNOWN_FAILURES = [
   { id: 'F-AI-011', module: 'amos-ai', files: ['crates/amos-ai/src/tcp_auth.rs'], markers: ['tcp_auth', 'AMOS_TCP_TOKEN'], severity: 5 },
   { id: 'F-AI-012', module: 'amos-ai', files: ['crates/amos-ai/src/alerts.rs'], markers: ['derive', 'rank', 'BreakerOpen'], severity: 3 },
   { id: 'F-AI-013', module: 'amos-ai', files: ['crates/amos-ai/src/security.rs'], markers: ['RateLimiter', 'validate_probe'], severity: 3 },
+  { id: 'F-AI-014', module: 'amos-ai', files: ['crates/amos-ai/src/notifier_bridge.rs', 'crates/amos-ai/src/notifier_sink.rs'], markers: ['AlertBridge', 'observe', 'transition', 'paging'], severity: 3 },
+  { id: 'F-AI-015', module: 'amos-ai', files: ['crates/amos-ai/src/alerts.rs'], markers: ['RULES', 'governor', 'privacy', 'netguard'], severity: 3 },
 
   // 窗口管理 (形态策略强制到真实窗口: G5 / REQ-A256 主体, REQ-A257 复核收口)
   { id: 'F-WM-014', module: 'amos-tauri', files: ['crates/amos-tauri/src/wm.rs', 'crates/amos-wm/src/form.rs'], markers: ['check_new_app_window', 'check_app_window'], severity: 3 },
@@ -108,6 +110,105 @@ const KNOWN_FAILURES = [
   { id: 'F-MED-001', module: 'amos-media', files: ['crates/amos-media/src/android.rs', 'crates/amos-media/src/mapping.rs'], markers: ['kind_and_mime_for_name(&name)', 'audio/mpeg'], severity: 4 },
   { id: 'F-DEV-001', module: 'process', files: ['scripts/device-probe-media-export.js', 'scripts/device-ui-eval.mjs'], markers: ['__probeExpect', 'settledMs', 'IS_PENDING'], severity: 3 },
   { id: 'F-TAU-007', module: 'amos-tauri', files: ['crates/amos-tauri/src/alarm_sched.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AlarmGlue.kt'], markers: ['scheduler_alarm_register', 'AlarmGlue.schedule', 'setExactAndAllowWhileIdle'], severity: 4 },
+  // REQ-A404: 覆盖率门的分母把"只有收尾括号"的行当成可执行行（bun 的 lcov 只发 DA:n,0、从不标命中）⇒ 读数被压约 10 个点，
+  // 门长期红着而真实覆盖率高于阈值（实测 84.67% → 94.95%）。判据 + 自检 + 负控见 CHANGELOG REQ-A404。
+  { id: 'F-DEV-010', module: 'process', files: ['crates/amos-tauri/frontend-ts/scripts/lib-coverage-gate.mjs', 'crates/amos-tauri/frontend-ts/scripts/bun-iso-test.mjs'], markers: ['executableLinesFromSource', 'substantive', 'selftest'], severity: 3 },
+  // 覆盖率门的**第二个**盲区（REQ-A405）：分母是从 lcov 的 `SF:` 记录建的 ⇒ 没被任何测试
+  // import 过的模块**根本没有 SF 记录** ⇒ 它在门的世界里不存在（实测 153 个模块只"看见"
+  // 150 个，门却说"150 files"，其中 `sysIcons.ts` 是真逻辑：图标映射 + 电池字形，被 20+
+  // 个组件使用）。处置：每个 `src/lib` 模块必须可测量，否则必须带理由登记进
+  // `coverage-unmentioned-allowlist.json`（陈旧条目判死）；三个隐形模块补齐真测试。
+  { id: 'F-DEV-011', module: 'process', files: ['crates/amos-tauri/frontend-ts/scripts/lib-coverage-gate.mjs'], markers: ['libModulesOnDisk', 'coverage-unmentioned-allowlist.json', 'measurable', 'REQ-A405'], severity: 3 },
+  // 冲突检测/保存/观察者的"说了要做、其实没做"（REQ-A406）：键位配置里禁用分支是个空循环
+  // （`arr.findIndex` 结果丢掉）+ 换绑不摘旧键 ⇒ 设置页报不存在的冲突；`writeKeyboardConfig`
+  // 恒回 true；`uiFailures` 换 target 时旧监听留着（同一失败记两次）；`customGroups` 对
+  // `apps` 逐元素不校验。全部测试先行（先红后修），负控逐字节还原（`detectConflicts` 原块
+  // 还原 ⇒ 30 pass / 3 fail）。
+  { id: 'F-DEV-012', module: 'process', files: ['crates/amos-tauri/frontend-ts/src/lib/keyboardConfig.ts', 'crates/amos-tauri/frontend-ts/src/lib/uiFailures.ts', 'crates/amos-tauri/frontend-ts/src/lib/customGroups.ts'], markers: ['removeEverywhere', 'detach', 'typeof a === "string"', 'REQ-A406'], severity: 3 },
+  // **守卫函数的输入形状没被守卫**（REQ-A407）：`androidLmkTasks` 把宿主应答原样透传成
+  // `AndroidLmkTask[]`，于是非数组应答会在对账里变成 `tasks.filter` 抛错 —— 而对账是被
+  // `void` 出去的 ⇒ 一次没人看见的未处理拒绝，函数自己"daemon down ≠ app dead"的守卫失效；
+  // 同一个对账的坏元素（null / 无 window_id）也会让整轮炸掉。两处都补了形状判据 + 测试。
+  { id: 'F-DEV-013', module: 'process', files: ['crates/amos-tauri/frontend-ts/src/lib/lmk.ts'], markers: ['Array.isArray', 'androidLmkTasks', 'reconcileLegacySurfaces', 'REQ-A407'], severity: 3 },
+  { id: 'F-DEV-018', module: 'process', files: ['crates/amos-tauri/src/menu.rs'], markers: ['collect_item_ids', 'Menu::get', 'the_tree_check_descends_into_submenus', 'REQ-A427'], severity: 3 },
+
+  { id: 'F-DEV-019', module: 'process', files: ['crates/amos-tauri/src/wm.rs'], markers: ['resolved_title', 'resolve_caller_title', 'a_window_names_itself_and_never_the_launchers_title', 'REQ-A428'], severity: 3 },
+  { id: 'F-DEV-020', module: 'process', files: ['crates/amos-tauri/src/wm.rs'], markers: ['close_target', 'a_close_resolves_the_platform_window_before_the_state_forgets_it', 'the platform refused to close the window', 'REQ-A430'], severity: 4 },
+  { id: 'F-DEV-021', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/shellNav.ts', 'crates/amos-tauri/frontend-ts/src/lib/__tests__/shellNav.test.ts'], markers: ['windowOwnsShellNav', 'REQ-A429'], severity: 3 },
+  { id: 'F-DEV-022', module: 'process', files: ['crates/amos-tauri/frontend-ts/src/lib/earlySystemKeys.ts', 'crates/amos-tauri/src/menu.rs'], markers: ['installEarlySystemKeys', 'handOverSystemKeys', 'close_target_label', 'REQ-A431'], severity: 3 },
+  { id: 'F-DEV-023', module: 'process', files: ['crates/amos-tauri/src/menu.rs'], markers: ['orderFrontStandardAboutPanel', 'About panel requested from menu', 'REQ-A432'], severity: 2 },
+  { id: 'F-DEV-024', module: 'process', files: ['crates/amos-tauri/src/menu.rs', 'crates/amos-tauri/src/lib.rs'], markers: ['sync_window_items', 'WINDOW_ITEMS', 'the_window_menu_items_are_declared_ids', 'REQ-A433'], severity: 3 },
+  { id: 'F-DEV-025', module: 'process', files: ['crates/amos-tauri/src/wm.rs'], markers: ['page_loaded', 'focus deferred until the page loads', 'REQ-A435'], severity: 3 },
+  { id: 'F-DEV-026', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/menuKeys.ts', 'crates/amos-tauri/frontend-ts/src/__tests__/menuKeys.test.ts'], markers: ['installMenuKeyboard', 'nextMenuIndex', 'REQ-A436'], severity: 2 },
+  { id: 'F-DEV-027', module: 'process', files: ['crates/amos-tauri/src/menu.rs', 'crates/amos-tauri/frontend-ts/src/svelte/locale.svelte.ts', 'scripts/menu-i18n-scan.mjs'], markers: ['MenuLocale', 'MenuLabels', 'menu_set_locale', 'menu-i18n-scan', 'REQ-A437'], severity: 2 },
+  { id: 'F-DEV-028', module: 'frontend', files: ['crates/amos-tauri/src/menu.rs', 'crates/amos-tauri/frontend-ts/src/lib/editKeys.ts', 'crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte'], markers: ['selectAllInFocus', 'selectAllFromMenu', 'trackEditableFocus', 'select_all_with_text', 'REQ-A439'], severity: 2 },
+  // REQ-A440: a window nobody can move, because the one place that can drag it was never marked
+  // (`data-tauri-drag-region`) *and* the ACL never granted `plugin:window|start_dragging` — two
+  // silent layers; plus the strip painted a second set of traffic lights and the OS drew its own
+  // title beside them.
+  { id: 'F-DEV-029', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopAppWindow.svelte', 'crates/amos-tauri/capabilities/default.json', 'crates/amos-tauri/src/wm.rs', 'crates/amos-tauri/frontend-ts/src/lib/desktopLayout.ts'], markers: ['data-tauri-drag-region', 'allow-start-dragging', 'hidden_title', 'APP_WINDOW_TITLEBAR_INSET', 'REQ-A440'], severity: 2 },
+  // REQ-A441: the OS's own minimize (yellow light) leaves a window the model cannot represent, so
+  // the open/focus path had nothing to restore — the window was unreachable from AmOS's own UI.
+  { id: 'F-DEV-030', module: 'frontend', files: ['crates/amos-tauri/src/wm.rs', 'docs/multi-window.md'], markers: ['reveal_window', 'is_minimized', 'unminimize', 'REQ-A441'], severity: 2 },
+  // REQ-A442: the aerospace audit doc asserted a property it never measured ("零处 macro_rules! 生产
+  // 代码" while four existed) — the whole point of an audit register is that its claims are checkable.
+  { id: 'F-DEV-031', module: 'process', files: ['scripts/rust-macro-scan.mjs', 'scripts/rust-macro-allowlist.json', 'docs/POWER_OF_10.md', 'crates/amos-tauri/src/wm.rs'], markers: ['rust-macro-scan', 'unlisted-macro', 'stale-exemption', 'wm_split_swap', 'REQ-A442'], severity: 2 },
+  // REQ-A443: two "invisible" gaps, both in the audit's own instruments. ① the call-flow gate
+  // linked only functions defined in the *same file*, so a cycle split across two files (or two
+  // crates) could not be seen — a gap the audit's own residual-risk table had registered. ② the
+  // same document's verification block spelled the five `-scan` selftests `--self-test`, a flag
+  // none of them implements: the line printed a clean *gate* result while asserting nothing
+  // (F-DEV-005's shape — an instrument answering a different question).
+  { id: 'F-DEV-032', module: 'process', files: ['scripts/rust-recursion-scan.mjs', 'crates/amos-translate/src/lib.rs', 'docs/POWER_OF_10.md'], markers: ['scanWorkspace', 'cross-file cycle', 'deliver', 'REQ-A443'], severity: 2 },
+  // REQ-A444: the supervisor's alerting seam was registered as a *mitigation* but never armed.
+  // `Supervisor::with_alert_sink` had no caller anywhere (`rust-unwired-scan`: "referenced
+  // nowhere"), so `alert_sink` stayed `None` and `fire_alert` was dead in both feature
+  // configurations while `alert_sink.rs` asserted the notifier build "wires this in"; and the
+  // give-up branch itself printed nothing, so in a default build a daemon simply stopped
+  // existing with no line at all. This is F-AI-012's failure mode ("alert never delivered ⇒ the
+  // operator does not know"), one component over.
+  { id: 'F-DEV-033', module: 'process', files: ['crates/amos-supervisor/src/bin/amos-supervisor.rs', 'crates/amos-supervisor/src/lib.rs', 'crates/amos-supervisor/tests/alert_wiring.rs'], markers: ['with_alert_sink', 'exhausted its restart budget', 'an_armed_supervisor_reports_a_crash_then_the_exhaustion', 'REQ-A444'], severity: 3 },
+  // REQ-A445: the unwired ratchet's excuse list had no reasons — a bare `{ "values": [...] }` of
+  // 26 strings, while the gate's own failure text and docs/rust-unwired-audit.md both stated that a
+  // reason was recorded. Its `--update-baseline` rewrote the whole file, so a new finding could be
+  // excused with no reason anywhere and no check ever failed; and an entry that became wired was
+  // only *printed*, never required to be removed. Same discipline the macro whitelist got in
+  // REQ-A442 (R1 reason / R2 ratchet-must-shrink / R3 duplicate), applied to the older ratchet.
+  { id: 'F-DEV-034', module: 'process', files: ['scripts/rust-unwired-scan.mjs', 'scripts/rust-unwired-baseline.json', 'docs/rust-unwired-audit.md'], markers: ['baselineProblems', 'missing-reason', 'stale-entry', 'REQ-A445'], severity: 2 },
+  // REQ-A446: the Spaces feature promised "each desktop has its own window set" while
+  // `spaces_switch` only moved `active_index` — a switch that reports an effect it does not have,
+  // and the panel drew the new desktop as current while every window stayed put. The ledger half
+  // was wired (REQ-A389); the window half was three uncalled helpers with a baselined excuse.
+  { id: 'F-DEV-035', module: 'process', files: ['crates/amos-tauri/src/spaces.rs', 'crates/amos-tauri/src/spaces_commands.rs'], markers: ['switch_plan', 'apply_switch_plan', 'the space switch moved the ledger but not the screen', 'REQ-A446'], severity: 3 },
+  // REQ-A447: "the ratchet must shrink" was enforced in some gates and only *printed* in others.
+  // Measured across every allow-list/baseline: 7 gates failed on a stale exemption, 5 merely
+  // logged it (unsafe, discard, recursion, hot-loop, and the frontend unwired-scan, whose comment
+  // claimed a check that did not exist). Tightening the five found real rot on the first run
+  // (an allow-list excuse whose hole had been filled), and `unsafe-baseline.json`'s headline
+  // `total` had never been re-measured against the per-file counts.
+  { id: 'F-DEV-036', module: 'process', files: ['scripts/unsafe-scan.mjs', 'scripts/rust-recursion-scan.mjs', 'crates/amos-tauri/frontend-ts/scripts/unwired-scan.mjs'], markers: ['the ratchet must shrink', 'totalProblems', 'allowStale', 'REQ-A447'], severity: 2 },
+  // REQ-A448: nine amos-tauri files implement one family — a process-global handle installed
+  // exactly once, where "a redundant attach keeps the first" is only safe while the Activity is
+  // not recreated. What makes that true lives in the *generated* manifest (`android:configChanges`,
+  // Tauri's template), was written down nowhere, and was checked by nothing — so a template change
+  // would have silently turned 17 deliberate discards into bridges driving a dead Kotlin instance.
+  { id: 'F-DEV-037', module: 'process', files: ['scripts/android-glue-mirror.sh', 'crates/amos-tauri/src/mic_permission.rs', 'crates/amos-tauri/src/clipboard_glue.rs'], markers: ['configChanges', 'Activity is not recreated under us', 'REQ-A448'], severity: 3 },
+  // REQ-A409: BLE GATT 写后 read 缓存被读成"已写入"，但实际是前一次应答。
+  // `ble::install_glue` 一次性注入 `JavaVM` + `Context`；读写命令走严格 `JValue` 类型；
+  // `pending_read` 仅由 Kotlin `onCharacteristicReadResult` 写入并 `take` 后即清空。
+  { id: 'F-DEV-014', module: 'process', files: ['crates/amos-tauri/src/ble.rs', 'crates/amos-tauri/src/jni_glue.rs'], markers: ['ble_connect', 'take_pending_read', 'with_binding', 'REQ-A409'], severity: 3 },
+  // REQ-A409: NFC 写一条 NDEF 之后 UI 立即读，UI 看到的不是刚刚写的那条。
+  // `nfc_start_dispatch` 走 `NfcGlue.init(context)`；`nfc_write_message` 把 `Vec<NdefRecord>`
+  // 转 `ArrayList<HashMap>` 后 JNI 调用，写完返回 `bytes_written`；`nfc_read_bytes` 同步返回。
+  { id: 'F-DEV-015', module: 'process', files: ['crates/amos-tauri/src/ble.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/NfcGlue.kt'], markers: ['nfc_start_dispatch', 'nfc_write_message', 'NfcGlue', 'REQ-A409'], severity: 3 },
+  // REQ-A409: BiometricPrompt 在非用户手势上下文被触发 ⇒ Android 12+ 静默失败。
+  // `biometric_authenticate` 是 `tauri::command`；`BiometricGlue.authenticate` 走
+  // `BiometricPrompt.authenticate(promptInfo, callback)`；pending 绝不四舍五入成 `ok=true`。
+  { id: 'F-DEV-016', module: 'process', files: ['crates/amos-tauri/src/ble.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/BiometricGlue.kt'], markers: ['biometric_authenticate', 'BiometricPrompt', 'onBiometricResult', 'REQ-A409'], severity: 4 },
+  // REQ-A409: 视频录制 metadata 进 `SensorHost` 但 snapshot 不返回。
+  // `sensor_host_record_video` 把 `HostVideoClip` 压入 `video_clips: Mutex<Vec<_>>`（环形 32
+  // 条上限），`snapshot()` 一并返回；`MAX_CLIP_BYTES = 4 GiB` 写前硬卡，溢出返 `Err`。
+  { id: 'F-DEV-017', module: 'process', files: ['crates/amos-tauri/src/sensor_host.rs'], markers: ['sensor_host_record_video', 'video_clips', 'MAX_CLIP_BYTES', 'REQ-A409'], severity: 2 },
   { id: 'F-DEV-002', module: 'process', files: ['scripts/fmea-gen.mjs', 'docs/FMEA.md'], markers: ['tableShapeProblems', 'cell count != their header', 'FMEA_DOC'], severity: 3 },
   // REQ-A365 收口: `pidof` exits 1 when the app is gone — a normal *answer*, not "adb is broken"
   { id: 'F-DEV-003', module: 'process', files: ['scripts/device-ui-eval.mjs'], markers: ['adbRaw', 'exited ${r.status}', 'app is not running'], severity: 2 },
@@ -140,6 +241,8 @@ const KNOWN_FAILURES = [
   // REQ-A382: the tile<->loader consistency test validated a hand-copied list (29 ids) while the
   // live grid table had 33 — a new tile with no screen could not fail any gate.
   { id: 'F-SH-026', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/svelte-tests/app-registry.svelte.test.ts', 'crates/amos-tauri/frontend-ts/src/svelte/appRegistry.ts'], markers: ['missingLoaders', 'unreachableScreens', 'the comparison itself can fail'], severity: 2 },
+  // REQ-A410: voice memo playback progress, edit/trim (edit-keep), and ASR transcription were missing.
+  { id: 'F-SH-027', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/voiceMemos.ts', 'crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte'], markers: ['progressPercent', 'clampTrimRange', 'trimMemo', 'classifyTranscribe', 'REQ-A410'], severity: 3 },
 
   // System UI 桥
   { id: 'F-TAU-001', module: 'amos-tauri', files: ['crates/amos-tauri/frontend-ts/src/lib/backend.ts'], markers: ['bridgeDiag', 'ok-error'], severity: 3 },
@@ -233,6 +336,21 @@ const KNOWN_FAILURES = [
   { id: 'F-DA-003', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/bounded.ts'], markers: ['capTail', 'CHAT_MSG_CAP'], severity: 3 },
   { id: 'F-DA-004', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/cloud.ts'], markers: ['SYNC_STORES', 'snapshotStores'], severity: 4 },
   { id: 'F-DA-005', module: 'amos-ai', files: ['crates/amos-ai/src/server.rs', 'crates/amos-ai/src/session.rs'], markers: ['GetHistory', 'history'], severity: 3 },
+  // REQ-A401: 一份"时钟 + 一把随机数字"的 id 就是一个*赌*：冻结时钟下 5 位 base36（≈26 bit）
+  // 在 20,000 次紧循环里撞 3 次（前端实测，种子可复算），而撞了**没有任何东西会报错** ——
+  // 媒体字节被后一次覆盖、通知按 id 去重后被丢掉、流式气泡按 id 串号。身份改走 `localId()`
+  // （进程内单调计数器），并由 `scripts/idgen-scan.mjs` 的 R1/R2 钉住（id 惯用法不可豁免）。
+  { id: 'F-DA-006', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/lib/localId.ts', 'crates/amos-tauri/frontend-ts/scripts/idgen-scan.mjs'], markers: ['localId', 'seq', 'id-idiom'], severity: 3 },
+  // REQ-A402: 同一族的另一半 —— "时钟 + 进程内计数器"**没有熵**。两个上下文在同一毫秒铸 id 得到
+  // 同一个字符串（前端实测：两个进程 + 冻结时钟都产出 `loyw3v28-1`，而 `localId` 有 7 位 crypto 尾），
+  // 消费者还是静默的：voiceMemos/calendars 丢行、notes/events 改名、conversations 曾根本不查重
+  // （删一个会话删掉两个）。现已并入 `localId()`，并由 idgen-scan 的 R3（`id-from-clock`，不可豁免，
+  // 按名豁免 `localId.ts` 本身）钉住 —— 这一族的**新成员**也逃不过。
+  // REQ-A403: "我们的测试不打网络"此前没有任何东西在验，而这个缺陷的形态**静态扫描看不见** ——
+  // 模块自己 catch 网络错误并降级（`fetchDeclination`）⇒ 没打桩的测试照样绿。哨兵在运行时记录 + 拒绝
+  // 未打桩的 fetch（打桩不受影响；还原到的是哨兵），两个 runner 各自归因到文件/用例。
+  { id: 'F-DA-008', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/net-sentinel.mjs', 'crates/amos-tauri/frontend-ts/svelte-tests/setup-net-sentinel.ts'], markers: ['AMOS-NET-SENTINEL', 'rearm', 'egressRecords'], severity: 3 },
+  { id: 'F-DA-007', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/scripts/idgen-scan.mjs', 'crates/amos-tauri/frontend-ts/src/lib/localId.ts'], markers: ['id-from-clock', 'clockInTemplate', 'localId'], severity: 3 },
 
   // Android 集成
   { id: 'F-AND-001', module: 'amos-tauri', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/CameraGlue.kt'], markers: ['attach', 'detach', 'epoch'], severity: 4 },

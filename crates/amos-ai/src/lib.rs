@@ -18,6 +18,7 @@ pub mod energy;
 pub mod governor;
 pub mod governor_service;
 pub mod inference;
+pub mod jsonlog;
 pub mod life_guard;
 pub mod logfile;
 pub mod monitoring;
@@ -37,6 +38,19 @@ pub mod breaker;
 // Threshold alerts over the counters the daemon already reports
 // (CODE_AUDIT_REPORT "添加警告和告警机制"): one place that says what is wrong now.
 pub mod alerts;
+
+// Bridge the threshold alerts to `amos-notifier` so an operator pages on a
+// state transition (appear + clear), not on every poll. The bridge is a
+// `Send + Sync` value type so it sits on the status-poll task; the actual
+// `Dispatcher` wiring is the operator's choice (compile-time feature
+// `notifier` pulls `amos-notifier`; default build is a no-op).
+pub mod notifier_bridge;
+
+#[cfg(feature = "notifier")]
+mod notifier_sink;
+
+#[cfg(feature = "notifier")]
+pub use notifier_sink::{notifier_sink, NotifierSink};
 
 // Peer-credential check for the daemon's unix socket (gap #28 / REQ-A141): the 0700
 // mode keeps other users out, but that is a filesystem property — this asks the

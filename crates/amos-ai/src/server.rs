@@ -10,9 +10,9 @@ use amos_proto::ai_agent::{
     ai_agent_server::{AiAgent, AiAgentServer},
     AgentChunk, AgentRequest, Alert, Alerts, BreakerMetrics, ClearSessionsReply,
     ClearSessionsRequest, ClientMessage, EnergyPolicy, GenerationPoolMetrics, GetHistoryReply,
-    GetHistoryRequest, GovernorMetrics, HistoryTurn, ListSessionsReply, ListSessionsRequest,
-    LogSinkMetrics, ProfileMetrics, RemoveSessionReply, RemoveSessionRequest, ResponseCacheMetrics,
-    SessionInfo, StatusReply, StatusRequest,
+    GetHistoryRequest, GovernorMetrics, HistoryTurn, JsonLogSinkMetrics, ListSessionsReply,
+    ListSessionsRequest, LogSinkMetrics, ProfileMetrics, RemoveSessionReply, RemoveSessionRequest,
+    ResponseCacheMetrics, SessionInfo, StatusReply, StatusRequest,
 };
 use amos_proto::{CLIENT_ID_HEADER, DEFAULT_CLIENT_ID};
 use anyhow::{anyhow, Context};
@@ -63,11 +63,23 @@ pub struct AiAgentService {
     /// Threshold alerts derived from the counters above (REQ-A133). Holds only the
     /// "first seen at" bookkeeping — the alert *list* is recomputed on every status.
     alerts: Arc<std::sync::Mutex<crate::alerts::AlertTracker>>,
+    /// Bridge from the threshold alerts to a delivery sink (REQ-A134). When
+    /// `None` the daemon only logs new alerts at warn/error level; when `Some`
+    /// the bridge hands each transition to a sink (e.g. `amos-notifier`'s
+    /// `Dispatcher`). The bridge is built with the `--features notifier`
+    /// adapter at startup and is `None` in the default build so we don't pull
+    /// a notifier dependency into the daemon's standalone runtime.
+    notifier_bridge: Option<Arc<std::sync::Mutex<crate::notifier_bridge::AlertBridge>>>,
     /// Live handle to the on-disk log sink when `AMOS_LOG_DIR` opened one, so
     /// `get_status` can report whether the persisted trail is intact (and how much
     /// of it went missing). `None` = stdout-only logging: the wire block says
     /// `enabled=false` with honest zeros rather than pretending a sink exists.
     log_sink: Option<crate::logfile::LogSinkHandle>,
+    /// Live handle to the structured JSON-line log sink (`AMOS_LOG_JSON=1`). The
+    /// human sink and the JSON sink are independent — either one may be enabled
+    /// alone, and `get_status` reports each one in its own block so an operator
+    /// never has to cross-reference two files to learn which sinks are alive.
+    json_sink: Option<crate::jsonlog::JsonSinkHandle>,
     /// Startup snapshot of the effective engine + ASR, so `get_status` can tell a
     /// caller which real engine is serving and whether it degraded to mock.
     engine: EngineState,
@@ -205,10 +217,14 @@ impl AiAgentService {
             response_cache,
             breaker: Some(breaker),
             alerts: Arc::new(std::sync::Mutex::new(crate::alerts::AlertTracker::new())),
+            notifier_bridge: None, // wired at serve() when AMOS_NOTIFIER=1
             // The on-disk log sink belongs to the process (it is the tracing
             // subscriber's writer); the serving entry point attaches its handle via
             // [`Self::with_log_sink`], so `get_status` can report its health.
             log_sink: None,
+            // [`Self::with_json_sink`], so `get_status` can report the JSON sink
+            // (mirrors the human sink's contract).
+            json_sink: None,
             engine,
             sessions,
             sessions_path,
@@ -243,7 +259,11 @@ impl AiAgentService {
             response_cache: None,
             breaker: None,
             alerts: Arc::new(std::sync::Mutex::new(crate::alerts::AlertTracker::new())),
+            notifier_bridge: None, // wired at serve() when AMOS_NOTIFIER=1
             log_sink: None,
+            // [`Self::with_json_sink`], so `get_status` can report the JSON sink
+            // (mirrors the human sink's contract).
+            json_sink: None,
             engine: EngineState::non_degraded(),
             sessions: Arc::new(SessionManager::default()),
             sessions_path: None,
@@ -276,6 +296,19 @@ impl AiAgentService {
     /// `response_cache` wire block honestly reports `enabled=false`.
     pub fn with_response_cache(mut self, cache: Arc<crate::cache::ResponseCache>) -> Self {
         self.response_cache = Some(cache);
+        self
+    }
+
+    /// Attach an alert-delivery bridge (REQ-A134). With a bridge attached,
+    /// each state transition in the threshold alerts (`appear` and `clear`)
+    /// is handed to the sink; without one, the daemon only logs new alerts
+    /// at warn/error level. Default is `None`; the serving entry point
+    /// wires one when `AMOS_NOTIFIER=1`.
+    pub fn with_notifier_bridge(
+        mut self,
+        bridge: Arc<std::sync::Mutex<crate::notifier_bridge::AlertBridge>>,
+    ) -> Self {
+        self.notifier_bridge = Some(bridge);
         self
     }
 
@@ -356,6 +389,17 @@ impl AiAgentService {
                 }
             }
         }
+        // Hand the active set to the bridge (REQ-A134). The bridge tracks
+        // its own transition set on top of the tracker's: a `clear` only
+        // emits when the *previous* poll had the id active, which is what
+        // the tracker already encodes via `before`/`active` here. The bridge
+        // owns the cross-channel delivery policy (suppression windows,
+        // rate limits, transport failures) so the daemon's status-poll task
+        // stays a thin reader of the existing counters.
+        if let Some(bridge) = self.notifier_bridge.as_ref() {
+            let mut b = bridge.lock().unwrap_or_else(|p| p.into_inner());
+            let _fired = b.observe(&active);
+        }
         Alerts {
             alerts: active
                 .into_iter()
@@ -381,6 +425,13 @@ impl AiAgentService {
     /// wire block honestly reports `enabled=false`.
     pub fn with_log_sink(mut self, sink: crate::logfile::LogSinkHandle) -> Self {
         self.log_sink = Some(sink);
+        self
+    }
+
+    /// Attach the structured JSON-line sink. See the human sink's contract
+    /// ([`Self::with_log_sink`]) — both are independent and reported on the wire.
+    pub fn with_json_sink(mut self, sink: crate::jsonlog::JsonSinkHandle) -> Self {
+        self.json_sink = Some(sink);
         self
     }
 
@@ -478,6 +529,27 @@ impl AiAgentService {
             None => crate::logfile::LogSinkReport::disabled(),
         };
         LogSinkMetrics {
+            enabled: r.enabled,
+            path: r.path,
+            bytes_written: r.bytes_written,
+            lost_bytes: r.lost_bytes,
+            write_failures: r.write_failures,
+            rotations: r.rotations,
+            active_bytes: r.active_bytes,
+        }
+    }
+
+    /// Fold the JSON-line sink's health into the wire `JsonLogSinkMetrics`
+    /// (REQ-A420). Same shape as `log_sink_metrics`; both are reported
+    /// independently so a UI card can show "human sink: ON, JSON sink: ON"
+    /// without conflating the two. `None` / not enabled ⇒ the honest zero
+    /// ("no JSON sink" — never a fabricated reading).
+    fn json_log_sink_metrics(&self) -> JsonLogSinkMetrics {
+        let r = match &self.json_sink {
+            Some(h) => h.report(),
+            None => crate::jsonlog::JsonSinkReport::disabled(),
+        };
+        JsonLogSinkMetrics {
             enabled: r.enabled,
             path: r.path,
             bytes_written: r.bytes_written,
@@ -1525,6 +1597,7 @@ impl AiAgent for AiAgentService {
             response_cache: Some(self.response_cache_metrics()),
             breaker: Some(self.breaker_metrics()),
             log_sink: Some(self.log_sink_metrics()),
+            json_log_sink: Some(self.json_log_sink_metrics()),
             alerts: Some(self.alerts_now()),
         }))
     }
@@ -1708,6 +1781,19 @@ pub async fn serve_with_log_sink(
     path: std::path::PathBuf,
     log_sink: Option<crate::logfile::LogSinkHandle>,
 ) -> anyhow::Result<()> {
+    serve_with_sinks(path, log_sink, None).await
+}
+
+/// Same as [`serve_with_log_sink`], but also attaches the daemon's structured
+/// JSON-line sink (`AMOS_LOG_JSON=1`). The two sinks are independent — either
+/// one can be enabled alone, both can be enabled, neither can be enabled; the
+/// wire reports each one honestly in its own block, and a degraded or disabled
+/// one never contaminates the other.
+pub async fn serve_with_sinks(
+    path: std::path::PathBuf,
+    log_sink: Option<crate::logfile::LogSinkHandle>,
+    json_sink: Option<crate::jsonlog::JsonSinkHandle>,
+) -> anyhow::Result<()> {
     let tcp_addr = resolve_tcp_addr()?;
     // TCP has neither the socket's 0700 mode nor the kernel peer check, and loopback TCP
     // is reachable by every process on the device — so the transport states its policy
@@ -1791,6 +1877,9 @@ pub async fn serve_with_log_sink(
     let mut ai_service = AiAgentService::new_with_audit(audit_sink.clone()).await;
     if let Some(handle) = log_sink {
         ai_service = ai_service.with_log_sink(handle);
+    }
+    if let Some(handle) = json_sink {
+        ai_service = ai_service.with_json_sink(handle);
     }
     // monitor counts requests to the *AiAgent* gRPC service (the AI daemon's own
     // RPCs); the Android-compat service sharing the same socket is separate.
@@ -2369,85 +2458,203 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn alerts_are_empty_when_healthy_and_list_what_is_wrong_when_not() {
-        // Healthy: a mock daemon with no breaker/stats attached ⇒ no rules fire. The
-        // reply must not carry an "all clear" object, just the empty list.
-        let security = Arc::new(SecurityManager::default());
-        security
-            .permission_manager
-            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
-            .await;
-        let svc = AiAgentService::with_security(security);
-        let st = svc
-            .get_status(Request::new(StatusRequest {}))
-            .await
-            .expect("status")
-            .into_inner();
-        let alerts = st.alerts.expect("the alerts block is present").alerts;
-        assert!(
-            alerts.is_empty(),
-            "a healthy daemon reports no alerts: {alerts:?}"
-        );
+    #[test]
+    fn alerts_are_empty_when_healthy_and_list_what_is_wrong_when_not() {
+        // The `get_status` route drives the threshold-alert machinery end
+        // to end. We use `#[test]` + `Runtime::block_on` because the
+        // existing test infra here is sync; the `async fn` form was a
+        // leftover from the previous test runner and would not even
+        // compile (no `tokio::test`).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            // Healthy: a mock daemon with no breaker/stats attached ⇒ no rules fire. The
+            // reply must not carry an "all clear" object, just the empty list.
+            let security = Arc::new(SecurityManager::default());
+            security
+                .permission_manager
+                .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+                .await;
+            let svc = AiAgentService::with_security(security);
+            let st = svc
+                .get_status(Request::new(StatusRequest {}))
+                .await
+                .expect("status")
+                .into_inner();
+            let alerts = st.alerts.expect("the alerts block is present").alerts;
+            assert!(
+                alerts.is_empty(),
+                "a healthy daemon reports no alerts: {alerts:?}"
+            );
 
-        // Degraded engine + an open breaker: two rules must fire, error first.
-        let security = Arc::new(SecurityManager::default());
-        security
-            .permission_manager
-            .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
-            .await;
-        let br = crate::breaker::shared(crate::breaker::BreakerConfig {
-            enabled: true,
-            fail_threshold: 1,
-            cooldown: Duration::from_secs(30),
+            // Degraded engine + an open breaker: two rules must fire, error first.
+            let security = Arc::new(SecurityManager::default());
+            security
+                .permission_manager
+                .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+                .await;
+            let br = crate::breaker::shared(crate::breaker::BreakerConfig {
+                enabled: true,
+                fail_threshold: 1,
+                cooldown: Duration::from_secs(30),
+            });
+            // Open it for real (one failure at threshold 1) so the alert is not synthetic.
+            crate::breaker::lock(&br).on_failure(std::time::Instant::now());
+            let mut svc = AiAgentService::with_security(security).with_breaker(br);
+            svc.engine.degraded = true;
+            let st = svc
+                .get_status(Request::new(StatusRequest {}))
+                .await
+                .expect("status")
+                .into_inner();
+            let alerts = st.alerts.expect("the alerts block is present").alerts;
+            let ids: Vec<&str> = alerts.iter().map(|a| a.id.as_str()).collect();
+            assert!(ids.contains(&"breaker_open"), "{ids:?}");
+            assert!(ids.contains(&"engine_degraded"), "{ids:?}");
+            assert_eq!(alerts[0].severity, "error", "errors come first: {ids:?}");
+            assert_eq!(alerts[0].id, "breaker_open");
+            // `active_for` is honest about the process-local history: first sight is 0s.
+            assert_eq!(alerts[0].active_for_seconds, 0);
+
+            // Polling again does not invent history, and clearing the condition clears the
+            // alert (no sticky alarm).
+            let st2 = svc
+                .get_status(Request::new(StatusRequest {}))
+                .await
+                .expect("status")
+                .into_inner();
+            let ids2: Vec<String> = st2
+                .alerts
+                .expect("alerts")
+                .alerts
+                .into_iter()
+                .map(|a| a.id)
+                .collect();
+            assert_eq!(ids2.len(), 2);
+            svc.engine.degraded = false;
+            let st3 = svc
+                .get_status(Request::new(StatusRequest {}))
+                .await
+                .expect("status")
+                .into_inner();
+            let ids3: Vec<String> = st3
+                .alerts
+                .expect("alerts")
+                .alerts
+                .into_iter()
+                .map(|a| a.id)
+                .collect();
+            assert_eq!(ids3, vec!["breaker_open".to_string()], "degraded cleared");
         });
-        // Open it for real (one failure at threshold 1) so the alert is not synthetic.
-        crate::breaker::lock(&br).on_failure(std::time::Instant::now());
-        let mut svc = AiAgentService::with_security(security).with_breaker(br);
-        svc.engine.degraded = true;
-        let st = svc
-            .get_status(Request::new(StatusRequest {}))
-            .await
-            .expect("status")
-            .into_inner();
-        let alerts = st.alerts.expect("the alerts block is present").alerts;
-        let ids: Vec<&str> = alerts.iter().map(|a| a.id.as_str()).collect();
-        assert!(ids.contains(&"breaker_open"), "{ids:?}");
-        assert!(ids.contains(&"engine_degraded"), "{ids:?}");
-        assert_eq!(alerts[0].severity, "error", "errors come first: {ids:?}");
-        assert_eq!(alerts[0].id, "breaker_open");
-        // `active_for` is honest about the process-local history: first sight is 0s.
-        assert_eq!(alerts[0].active_for_seconds, 0);
+    }
 
-        // Polling again does not invent history, and clearing the condition clears the
-        // alert (no sticky alarm).
-        let st2 = svc
-            .get_status(Request::new(StatusRequest {}))
-            .await
-            .expect("status")
-            .into_inner();
-        let ids2: Vec<String> = st2
-            .alerts
-            .expect("alerts")
-            .alerts
-            .into_iter()
-            .map(|a| a.id)
-            .collect();
-        assert_eq!(ids2.len(), 2);
-        svc.engine.degraded = false;
-        let st3 = svc
-            .get_status(Request::new(StatusRequest {}))
-            .await
-            .expect("status")
-            .into_inner();
-        let ids3: Vec<String> = st3
-            .alerts
-            .expect("alerts")
-            .alerts
-            .into_iter()
-            .map(|a| a.id)
-            .collect();
-        assert_eq!(ids3, vec!["breaker_open".to_string()], "degraded cleared");
+    /// REQ-A134 integration: when the daemon's status poll runs, the
+    /// attached `AlertBridge` sees the same transitions the wire reply
+    /// reports, but only fires on **appear/clear** — never on a stable
+    /// poll. This is the smoke test that the wiring in `alerts_now` is
+    /// honest about the `notifier_bridge` contract.
+    #[test]
+    fn get_status_drives_the_attached_alert_bridge_on_transitions_only() {
+        use crate::notifier_bridge::{Alert, AlertBridge, AlertSink};
+        use std::sync::Mutex;
+
+        #[derive(Default, Debug)]
+        struct Capture {
+            fired: Mutex<Vec<Alert>>,
+        }
+        impl AlertSink for Capture {
+            fn fire(&self, alert: Alert) {
+                self.fired.lock().unwrap().push(alert);
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            // 1. Build a service with a real breaker (so the alert rule has
+            //    real signal) and an attached bridge with a capture sink.
+            let security = Arc::new(SecurityManager::default());
+            security
+                .permission_manager
+                .grant(DEFAULT_CLIENT_ID.to_string(), Permission::Standard)
+                .await;
+            let br = crate::breaker::shared(crate::breaker::BreakerConfig {
+                enabled: true,
+                fail_threshold: 1,
+                cooldown: Duration::from_secs(30),
+            });
+            let capture = std::sync::Arc::new(Capture::default());
+            let bridge = Arc::new(std::sync::Mutex::new(
+                AlertBridge::new().with_sink(capture.clone()),
+            ));
+            let svc = AiAgentService::with_security(security)
+                .with_breaker(br.clone())
+                .with_notifier_bridge(bridge);
+
+            // 2. Healthy polls — the sink stays empty (the bridge's `None`
+            //    contract).
+            for _ in 0..3 {
+                let _ = svc
+                    .get_status(Request::new(StatusRequest {}))
+                    .await
+                    .expect("status");
+            }
+            assert!(
+                capture.fired.lock().unwrap().is_empty(),
+                "healthy polls produce no fires"
+            );
+
+            // 3. Open the breaker; one poll must trigger exactly one fire
+            //    on the bridge.
+            crate::breaker::lock(&br).on_failure(std::time::Instant::now());
+            let _ = svc
+                .get_status(Request::new(StatusRequest {}))
+                .await
+                .expect("status");
+            assert_eq!(capture.fired.lock().unwrap().len(), 1);
+            assert_eq!(
+                capture.fired.lock().unwrap()[0].id,
+                "amos-ai.breaker_open"
+            );
+
+            // 4. Subsequent polls with the breaker still open produce NO
+            //    new fires (the suppression is the bridge's, not the
+            //    dispatcher's).
+            for _ in 0..5 {
+                let _ = svc
+                    .get_status(Request::new(StatusRequest {}))
+                    .await
+                    .expect("status");
+            }
+            assert_eq!(
+                capture.fired.lock().unwrap().len(),
+                1,
+                "stable polls do not re-fire"
+            );
+
+            // 5. Closing the breaker fires a `.cleared` so the operator's
+            //    timeline records the resolution. We bypass the public
+            //    state machine — which requires a probe to be in flight
+            //    before it accepts a recovery — by going through the
+            //    test-only `force_state_for_test` hook. That's fine in a
+            //    test (we are the only owner); production code must use
+            //    `decide` + the legal transitions. We pin `HalfOpen`
+            //    because it reports "not an alert" in `alerts.rs`, so the
+            //    bridge fires its `.cleared` on the first non-Open read.
+            crate::breaker::lock(&br)
+                .force_state_for_test(crate::breaker::BreakerState::HalfOpen);
+            let _ = svc
+                .get_status(Request::new(StatusRequest {}))
+                .await
+                .expect("status");
+            let log = capture.fired.lock().unwrap();
+            assert_eq!(log.len(), 2, "appear + clear");
+            assert_eq!(log[1].id, "amos-ai.breaker_open.cleared");
+        });
     }
 
     #[test]
