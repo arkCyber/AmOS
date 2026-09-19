@@ -11,7 +11,7 @@ name = "amos_sensor"
 path = "src/lib.rs"
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 amos-proto.workspace = true
 tonic.workspace = true
 # Real Android backend (CameraManager / LocationManager / SensorManager via JNI,
