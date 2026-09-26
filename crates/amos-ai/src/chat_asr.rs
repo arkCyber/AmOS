@@ -226,6 +226,27 @@ fn bounded_model_dir(raw: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(trimmed))
 }
 
+/// Read one model-directory env key with its three input states kept distinct:
+/// **unset** is silent (the ordinary case), while **present but not Unicode** and
+/// **present but blank/over-cap** are each reported before being ignored. A value
+/// the operator set must never be dropped without a word — the same shape
+/// F-AI-025/F-AI-026 fixed in `bundled_model::env_path`.
+#[cfg(feature = "asr-sherpa")]
+fn bounded_env_dir(key: &str) -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os(key)?;
+    let Some(raw) = raw.to_str() else {
+        tracing::warn!("{key} is not valid Unicode; ignoring it");
+        return None;
+    };
+    match bounded_model_dir(raw) {
+        Some(dir) => Some(dir),
+        None => {
+            tracing::warn!("{key} is blank or exceeds {MAX_MODEL_DIR_BYTES} bytes; ignoring it");
+            None
+        }
+    }
+}
+
 /// Resolve the sherpa model dir via the documented chain (Gap 8):
 ///
 /// 1. `AMOS_SHERPA_MODEL_DIR` — operator override (wins outright when usable);
@@ -236,6 +257,8 @@ fn bounded_model_dir(raw: &str) -> Option<std::path::PathBuf> {
 ///
 /// A candidate only counts when it actually contains `tokens.txt`, so a
 /// directory that merely exists can never be reported as a usable model.
+/// A value the operator set that cannot be used (blank, over-cap, non-Unicode)
+/// is reported before being skipped; an **unset** key stays silent.
 /// Returns `None` (honest "not staged") when no candidate qualifies — the
 /// caller decides the fallback and logs it; this function never fabricates a
 /// model and never panics.
@@ -243,24 +266,12 @@ fn bounded_model_dir(raw: &str) -> Option<std::path::PathBuf> {
 pub fn resolve_sherpa_model_dir() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
-    if let Ok(raw) = std::env::var("AMOS_SHERPA_MODEL_DIR") {
-        match bounded_model_dir(&raw) {
-            Some(p) => candidates.push(p),
-            None => {
-                if !raw.trim().is_empty() {
-                    tracing::warn!(
-                        "AMOS_SHERPA_MODEL_DIR is blank or exceeds {MAX_MODEL_DIR_BYTES} bytes; \
-                         ignoring it and trying the bundled dirs"
-                    );
-                }
-            }
-        }
+    if let Some(dir) = bounded_env_dir("AMOS_SHERPA_MODEL_DIR") {
+        candidates.push(dir);
     }
     for env_key in ["AMOS_BUNDLE_RES_DIR", "AMOS_BUNDLE_MODELS_DIR"] {
-        if let Ok(root) = std::env::var(env_key) {
-            if let Some(root) = bounded_model_dir(&root) {
-                candidates.push(root.join("sherpa"));
-            }
+        if let Some(root) = bounded_env_dir(env_key) {
+            candidates.push(root.join("sherpa"));
         }
     }
     candidates.extend(BUNDLED_SHERPA_DIRS.iter().map(std::path::PathBuf::from));
@@ -556,6 +567,41 @@ mod tests {
 mod sherpa_tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// Counts WARN events, so the assertions land on the *observable* diagnostic
+    /// (the operator's only view of a dropped override) rather than on a
+    /// re-statement of the code. Thread-local via `set_default`, so the count is
+    /// not perturbed by other tests running in parallel.
+    struct WarnProbe(Arc<AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// A bundle root whose `sherpa/` subdir carries the `tokens.txt` marker, so
+    /// the resolver has a real second link to fall back to.
+    fn staged_bundle_root(tag: &str) -> std::path::PathBuf {
+        let root = staging_dir(tag, false);
+        let model = root.join("sherpa");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("tokens.txt"), b"<blk> 0\n").unwrap();
+        root
+    }
 
     #[test]
     fn first_existing_prefers_int8_then_falls_back_to_plain() {
@@ -724,5 +770,119 @@ mod sherpa_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F-ASR-003: a present-but-blank `AMOS_SHERPA_MODEL_DIR` (an unexpanded shell
+    /// variable, a stray space) is ignored — but the operator must be told, since
+    /// the warn beside the site already claims to cover "blank". Dropping it in
+    /// silence is exactly the shape F-AI-025 fixed in `bundled_model::env_path`.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn a_blank_override_is_reported_not_silently_dropped() {
+        let root = staged_bundle_root("blank-override");
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        env.set("AMOS_SHERPA_MODEL_DIR", "   ");
+        env.set("AMOS_BUNDLE_RES_DIR", root.to_str().unwrap());
+
+        let warns = Arc::new(AtomicU64::new(0));
+        let resolved = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            resolve_sherpa_model_dir()
+        };
+
+        let expected = root.join("sherpa");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(expected.as_path()),
+            "a blank override is ignored, so the bundled root must still win"
+        );
+        assert!(
+            warns.load(Ordering::Relaxed) >= 1,
+            "a present-but-blank AMOS_SHERPA_MODEL_DIR must be reported; dropping it in \
+             silence is the F-ASR-003 defect"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The disjointness control for the test above: an **unset** variable is the
+    /// ordinary case and must stay silent. A blanket "warn whenever the value is
+    /// unusable" fix that also fires here would be caught by this assertion.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unset_override_stays_silent() {
+        let root = staged_bundle_root("unset-override");
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        env.set("AMOS_BUNDLE_RES_DIR", root.to_str().unwrap());
+        // AMOS_SHERPA_MODEL_DIR is deliberately left unset.
+
+        let warns = Arc::new(AtomicU64::new(0));
+        let resolved = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            resolve_sherpa_model_dir()
+        };
+
+        let expected = root.join("sherpa");
+        assert_eq!(resolved.as_deref(), Some(expected.as_path()));
+        assert_eq!(
+            warns.load(Ordering::Relaxed),
+            0,
+            "an unset variable is the ordinary case and must not warn — only a \
+             present-but-unusable value does"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F-ASR-004: a present-but-non-Unicode override is dropped by the old
+    /// `std::env::var(..).ok()`/`if let Ok` read **without a word** — the same
+    /// fold F-AI-026 fixed in `bundled_model::env_path`.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(env_lock)]
+    fn a_non_unicode_override_is_reported_not_silently_dropped() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = staged_bundle_root("nonunicode-override");
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        std::env::set_var(
+            "AMOS_SHERPA_MODEL_DIR",
+            std::ffi::OsStr::from_bytes(b"/tmp/amos-\xff-sherpa"),
+        );
+        env.set("AMOS_BUNDLE_RES_DIR", root.to_str().unwrap());
+
+        let warns = Arc::new(AtomicU64::new(0));
+        let resolved = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            resolve_sherpa_model_dir()
+        };
+
+        let expected = root.join("sherpa");
+        assert_eq!(resolved.as_deref(), Some(expected.as_path()));
+        assert!(
+            warns.load(Ordering::Relaxed) >= 1,
+            "a present-but-non-Unicode AMOS_SHERPA_MODEL_DIR must be reported; the old read \
+             folded it into the same silent None as 'unset' (F-ASR-004)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F-ASR-004, the second half: the two **bundle-root** keys never reported a
+    /// blank/over-cap value at all (the `if let Some(root) = bounded_model_dir(..)`
+    /// arm has no else). A present-but-unusable `AMOS_BUNDLE_RES_DIR` must warn.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn a_blank_bundle_root_is_reported_not_silently_dropped() {
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        env.set("AMOS_BUNDLE_RES_DIR", "  ");
+
+        let warns = Arc::new(AtomicU64::new(0));
+        let _resolved = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            resolve_sherpa_model_dir()
+        };
+
+        assert!(
+            warns.load(Ordering::Relaxed) >= 1,
+            "a present-but-blank AMOS_BUNDLE_RES_DIR must be reported; the bundle-root arm \
+             dropped it without a word (F-ASR-004)"
+        );
     }
 }

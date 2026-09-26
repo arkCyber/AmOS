@@ -1932,6 +1932,22 @@ const KNOWN_FAILURES = [
   // 对缺 token 的目录返回 `None`(诚实 "not staged"),显式 `sherpa` 请求绝不降级为 mock。
   { id: 'F-ASR-002', module: 'amos-ai', files: ['crates/amos-ai/src/chat_asr.rs'], markers: ['resolve_sherpa_model_dir', 'resolve_returns_none_for_missing_or_tokenless_dirs'], severity: 3 },
 
+  // F-ASR-003（REQ-A1914）—— `AMOS_SHERPA_MODEL_DIR` 的告警字面写着「is blank or exceeds」，
+  // 而它前面的 `if !raw.trim().is_empty()` 守卫恰好在**空**时掐灭这条告警 —— 算子设的空值
+  // （未展开的 shell 变量、一个多余空格）被静默丢弃，进程照常回退到 bundled 目录，日志一声不响。
+  // 这是 F-AI-025 在 `bundled_model::env_path` 修掉的同一形状，落在没被那轮扫到的兄弟文件
+  // （`chat_asr::resolve_sherpa_model_dir`）。修法：删守卫，抽 `bounded_env_dir(key)` 让空 ∕ 超长
+  // 一律 `warn!`；**未设**仍由 `std::env::var_os(key)?` 早退而静默。
+  { id: 'F-ASR-003', module: 'the-chat-asr-model-dir-override-s-warn-text-says-blank-or-exceeds-but-the-if-raw-trim-is-empty-guard-before-it-exactly-suppresses-that-warn-when-the-value-is-blank-so-an-operator-set-empty-value-an-unexpanded-shell-variable-a-stray-space-is-dropped-in-silence-bounded_model_dir-returns-none-for-both-blank-and-over-cap-yet-the-guard-only-lets-the-non-blank-case-through-so-the-code-is-weakr-than-its-own-prose-the-consequence-matches-f-ai-025-the-operator-believes-the-override-applied-while-the-fallback-dir-is-used-and-no-log-line-says-so-fix-delete-the-guard-and-extract-a-bounded_env_dir-key-helper-so-blank-or-over-cap-always-warns-while-an-unset-key-stays-silent-the-same-shape-a-prior-round-fixed-in-bundled-model-env-path', files: ['crates/amos-ai/src/chat_asr.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1914', 'bounded_env_dir', 'a_blank_override_is_reported_not_silently_dropped', 'AMOS_SHERPA_MODEL_DIR', 'not valid Unicode'], severity: 1 },
+
+  // F-ASR-004（REQ-A1914）—— `chat_asr` 的三处 env 读取用 `std::env::var(..)` 加 `if let Ok`，
+  // 把「未设」与「设了但读不出（非 Unicode）」折成同一句沉默；两个 bundle 根
+  // （`AMOS_BUNDLE_RES_DIR` ∕ `AMOS_BUNDLE_MODELS_DIR`）的 `if let Some(root) = bounded_model_dir(..)`
+  // **没有 else** ⇒ 连「设了但空 ∕ 超长」都不报告。修法：`bounded_env_dir` 改走 `std::env::var_os`
+  // （保 `NotPresent` ∕ `NotUnicode` 两态），`to_str()` 失配 ⇒ `warn!` 后 `None`；三键一律经它。
+  // 与 F-AI-026 同族（那条修 `bundled_model::env_path` 的 `.ok()?`）。
+  { id: 'F-ASR-004', module: 'the-chat-asr-env-reads-use-std-env-var-plus-if-let-ok-folding-unset-and-present-but-unreadable-non-unicode-into-one-silent-none-std-env-var-answers-err-notpresent-for-the-former-and-err-notunicode-for-the-latter-and-the-two-bundle-root-keys-have-no-else-arm-at-all-so-even-a-blank-or-over-cap-value-is-dropped-without-a-word-the-consequence-matches-f-asr-003-a-corrupted-mount-or-malformed-path-in-amos-sherpa-model-dir-makes-the-daemon-quietly-serve-another-model-fix-read-via-std-env-var-os-keeping-both-states-silent-early-return-only-for-notpresent-warn-and-return-none-when-to-str-fails-and-route-all-three-keys-through-one-bounded-env-dir-helper', files: ['crates/amos-ai/src/chat_asr.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1914', 'bounded_env_dir', 'a_non_unicode_override_is_reported_not_silently_dropped', 'an_unset_override_stays_silent', 'a_blank_bundle_root_is_reported_not_silently_dropped'], severity: 1 },
+
   // Gap 4 — default AI backend (crates/amos-ai/src/{bundled_model.rs,inference/real.rs}).
   // F-AI-016: 守护进程默认 mock,而运维以为跑的是真 AI。缓解:未配置部署解析到
   // `UnconfiguredBackend`(engine.kind == "unconfigured"),路径链 `resolve_model_path`
