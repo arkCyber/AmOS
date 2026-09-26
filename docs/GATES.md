@@ -52,6 +52,7 @@ this page exists to answer.
 | `android-glue-nv21-check.sh` | Host-JVM check for the Android glue's host-testable Kotlin — **no device needed**. | prints | — |
 | `android-permission-scan.mjs` | "the app never asked for the permission its own | hard | yes |
 | `android-rag-bringup.sh` | one-shot **device** driver for the offline RAG chain | prints | — |
+| `android-role-scan.mjs` | "the app can never be granted the Android role its own components need, because the intent-filter that qualifies it is scoped by `<data>`". | hard | yes |
 | `android-voice-bringup.sh` | one-shot **device** driver for the always-on native | prints | — |
 | `biometric-glue-const-scan.mjs` | "the Kotlin biometric glue's answer disagrees with the androidx `canAuthenticate` code it was answering" — `BiometricGlue.kt` shipped with `BIOMETRIC_ERROR_NO_HARDWARE` (12) on the arm that reports the sensor **present** and `BIOMETRIC_ERROR_NONE_ENROLLED` (11) falling to `else`, so the two phones that needed opposite sentences got each other's. Pins all seven codes (dumped with `javap -constants` from the linked artifact) to their Kotlin answer and to the Rust `BiometricState` variants the frontend switches on (REQ-A779). | hard | yes |
 | `blocking-in-async-scan.mjs` | "blocking work inside an `async fn`". | ratchet | yes |
@@ -104,6 +105,7 @@ this page exists to answer.
 | `phony-target-scan.mjs` | Makefile `.PHONY` hygiene. | ratchet | yes |
 | `proto-doc.mjs` | generate the gRPC API reference from `proto/*.proto` | hard | yes |
 | `py-stub-scan.mjs` | "a checked-in `.pyi` that describes an API the module does not have" — the `amos-link-py` stub must name exactly the classes/members (and constructor parameter names) the pyo3 surface in `src/lib.rs` exposes, and must sit where PEP 561 resolves it (REQ-A719). | hard | yes |
+| `recording-e2e.sh` | End-to-end device check for the in-call recording flow (`make android-recording-e2e`) — four layers, from the host-JVM glue tests up to the on-device recorder. | hard | — |
 | `release-artifacts.sh` | build the headless release bundle. | prints | — |
 | `release-ui-mode-scan.mjs` | "a release UI build that does not embed the UI". | hard | yes |
 | `run-backends.sh` | production-ish boot entry: start the backends the System UI | prints | — |

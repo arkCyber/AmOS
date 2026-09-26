@@ -220,6 +220,14 @@ gated-check:
 	# skips a target whose `required-features` are unmet, silently (REQ-A191 — this was the
 	# one such target with no step). `docs/telemetry-spy.md` documents running it.
 	cargo build -p amos-telemetry-spy --all-targets --features audit
+	# amos-tauri's `podcast-live` gates `src/podcast.rs`'s live fetcher **and** the
+	# `decide_live` tests (`#[cfg(feature = "podcast-live")]`). The `lint` step compiles
+	# that code under `-D warnings` (the `--features …podcast-live…` clippy line), but
+	# nothing **runs** it: `cargo test --workspace` never enables the feature, so those
+	# tests were dead weight — `scripts/feature-test-scan.mjs` reported `src/podcast.rs`
+	# as "run by no `cargo test` step". Same shape as the `amos-podcast/live` step above;
+	# loopback-only (the gate tests are pure predicates), so it belongs here, not in `test`.
+	cargo test -p amos-tauri --features amos-tauri/podcast-live --lib
 
 # Format the workspace (Rust): the writing counterpart of `make lint`'s
 # `cargo fmt --all --check`. `GETTING_STARTED.md` hands a newcomer `make fmt`; until
