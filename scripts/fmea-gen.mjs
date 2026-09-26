@@ -9489,6 +9489,45 @@ const KNOWN_FAILURES = [
   // 负控 ×2 互不相交：扰回 `.ok()?`（新用例红）；把「未设也 warn」的 else 臂加上（**空值用例**红）。
   { id: 'F-AI-026', module: 'the-bundled-model-env-path-resolver-silently-drops-a-present-but-non-unicode-operator-override-because-ok-folds-notpresent-and-notunicode-into-one-answer-the-module-contract-says-only-a-genuinely-unset-variable-is-silent-yet-a-non-utf8-value-is-set-and-unreadable-so-it-fell-through-as-silently-as-an-unset-one-the-sibling-input-of-f-ai-025s-blank-arm-one-input-over-user-candidates-already-reads-home-through-var-os-which-keeps-both-facts-fix-switch-to-var-os-warn-when-to-str-is-none-the-red-first-is-the-new-test-exactly-one-red-and-the-two-disjoint-negative-controls-pin-both-arms-reverting-to-ok-makes-the-new-test-red-adding-a-warn-to-the-unset-else-arm-makes-the-blank-test-red', files: ['crates/amos-ai/src/bundled_model.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1892', 'a_non_unicode_env_override_is_reported_not_silently_dropped', 'is not valid Unicode', 'var_os'], severity: 1 },
 
+  // F-AI-027（REQ-A1903）—— F-AI-025/026 的**第三个兄弟**，这次在布尔开关上：`std::env::var(k).ok()`
+  // 加一个 truthy `matches!` 把「未设」「显式 off」「设了一个我读不懂的值」折成同一个裸 `false`。
+  // 两处：告警 opt-in 闸 `AMOS_NOTIFIER`（`notifier_sink::amos_notifier_enabled`）与抓包取帧的
+  // `AMOS_SPY_LAYER3`（`telemetry_spy_capture::env_flag`）。前者的静默意味着「操作员以为开了页面、
+  // 其实只在 `get_status` 上可见」；后者更硬 —— 它不是开关而是 L2/L3 的选择，读成 L2 就恰好漏掉
+  // 操作员要的那些包。`energy.rs::parse_flag` 的 doc 曾把两者当作「anything else is false 是有意且
+  // 安全的」豁免掉：那只在**arm 方向**成立（笔误不能开门），在**读取方向**不成立，而 `main.rs` 在
+  // 没有 notifier feature 的构建里对「设了 AMOS_NOTIFIER」本来就会打印一行 —— 能 arm 的构建不该更安静。
+  // 修法：两处都用 `energy` 记载的同一对 token 集（1/true/yes/on 与 0/false/no/off），集合之外**存在**
+  // 的值（笔误、空串、非 Unicode）走 `var_os` + `warn!`；原来静默的「未设」与「显式 off」仍静默。
+  // 红先=两处各恰 1 红（都是「诊断缺失」不是返回值变化）；负控 ×2 互不相交：把 warn 扩到显式 off 值上，
+  // 两处的「recognised off must stay silent」对照各自变红（证明对照非空）。
+  { id: 'F-AI-027', module: 'two-strict-bool-env-readers-and-the-caller-side-comment-read-a-present-but-unrecognised-value-in-silence-the-notifier-opt-in-gate-and-the-telemetry-spy-layer3-framing-flag-each-collapsed-unset-explicitly-off-and-a-value-outside-both-token-sets-into-one-bare-false-via-std-env-var-ok-plus-a-truthy-matches-so-a-typo-enable-tru-2-a-blank-unexpanded-shell-variable-or-a-non-unicode-value-left-the-operator-with-no-signal-that-the-thing-they-asked-for-was-not-read-the-energy-modules-parse-flag-doc-had-excused-both-as-anything-else-is-false-deliberate-and-safe-which-held-only-in-the-arming-direction-a-typo-cannot-open-the-gate-but-not-in-the-reading-direction-and-main-rs-already-prints-a-line-when-a-feature-less-build-cannot-honour-a-set-amos-notifier-so-the-build-that-can-must-not-be-the-quieter-one-fix-both-use-the-same-true-false-token-sets-energy-documents-and-warn-on-a-value-outside-them-while-unset-and-the-documented-off-spellings-stay-silent', files: ['crates/amos-ai/src/notifier_sink.rs', 'crates/amos-ai/src/telemetry_spy_capture.rs', 'crates/amos-ai/src/energy.rs', 'docs/ENV_VARIABLES.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1903', 'an_unrecognised_env_value_is_reported_not_silently_read_as_off', 'an_unrecognised_layer3_value_is_reported_not_silently_read_as_l2', 'treating alerting as OFF', 'FALSE_TOKENS'], severity: 2 },
+
+  // F-DEV-167（REQ-A1906）—— ENV 文档门把「谁算 env 名」定义在**拼法**上：`env-doc-gen.mjs` 只认字面量
+  // 直接写在调用处的形状（`env::var("X")`）加一张固定 helper 名表（`env_flag`/`get_env`/…）。于是凡经
+  // **参数转发**到达 `env::var` 的读取一律隐形 —— `amos-podcast/src/manager.rs::PodcastPaths::from_env`
+  // 里 `let pick = |name: &str, file: &str| … env::var(name) …` 的四个调用点 `pick("AMOS_PODCAST_SUBSCRIPTIONS", …)`
+  // 等扫不到。后果双向锁死：门红着点三个名（`AMOS_PODCAST_DIR` ∕ `AMOS_PODCAST_LIVE` ∕ `AMOS_INSTALL_ID`），
+  // 而**把四个兄弟补进文档又会翻转成**「docs 列了代码不用的 ENV」（同一道门反方向拒绝）—— 门由构造禁止登记
+  // 它们。修法：语料改按**使用点**定义 —— 查出「形参被送进 `env::var`」的 `fn` ∕ 闭包，再取它们调用点上的
+  // `"AMOS_*"` 实参（隐藏它们的恰是**闭包**形状，故两种都要认）。自测 +4：正例（fn 与闭包各一）、负例
+  //（形参**不**转发的 helper 不得凭一个 `"AMOS_*"` 实参造出 env 名）、真树（四个 store 名必须被扫到）、
+  // 兄弟读法（`env::var_os` 也是使用点 —— 同一「拼法定义语料」根因：F-AI-026 系的 `var_os` 若不算使用点，
+  // 经它读的 `AMOS_PODCAST_LIVE` 会被门反判成「docs 列了代码不用的 ENV」，与上面同一次翻转）。
+  { id: 'F-DEV-167', module: 'the-env-doc-gate-defines-its-corpus-by-spelling-so-every-env-name-read-through-a-parameter-forwarding-helper-is-invisible-env-doc-gen-mjs-only-recognises-a-literal-written-at-the-call-site-plus-a-fixed-helper-name-table-but-amos-podcasts-podcastpaths-from-env-reads-four-store-paths-through-a-let-pick-closure-that-forwards-its-parameter-into-std-env-var-so-pick-amos-podcast-subscriptions-was-never-scanned-the-consequence-is-locked-both-ways-the-check-reported-three-names-as-declared-but-undocumented-yet-adding-the-four-siblings-to-the-doc-flipped-the-same-gate-to-lists-envs-not-used-in-code-so-the-gate-structurally-forbade-registering-them-fix-define-the-corpus-by-the-use-site-discover-fns-and-closures-that-forward-a-parameter-into-env-var-then-take-the-amos-literal-arguments-at-their-call-sites-both-shapes-are-needed-and-the-closure-is-the-one-that-hid-them-four-self-tests-added-a-positive-fn-and-closure-a-disjoint-negative-a-helper-that-does-not-forward-must-not-invent-an-env-the-real-tree-must-discover-the-four-podcast-store-names-and-the-sibling-read-style-env-var-os-the-spelling-that-had-hidden-amos-podcast-live-must-count-as-a-use-site-too', files: ['scripts/env-doc-gen.mjs', 'docs/ENV_VARIABLES.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1906', 'collectForwardingHelpers', 'a value forwarded through a helper parameter is discovered', 'a helper parameter not forwarded to env::var is not a use site', 'a value read through env::var_os is a use site', 'env::var_os'], severity: 3 },
+
+  // F-SH-925（REQ-A1906）—— 播客桥的 live 闸把**文档里的 off 拼法读成 ON**：`crates/amos-tauri/src/podcast.rs`
+  // 的 `provider()` 逐字 `std::env::var("AMOS_PODCAST_LIVE").map(|v| !v.is_empty() && v != "0")`，于是
+  // `AMOS_PODCAST_LIVE=false` ∕ `no` ∕ `off` 与任何笔误（`enable`、`2`、全空白）都**打开真实 HTTP 抓取** ——
+  // 方向与全仓约定相反（`docs/ENV_VARIABLES.md` §20.1：`1`/`true`/`yes`/`on` 才是 on），而这是**联网**开关，
+  // 安全侧本应是 mock。该模块 `//!` 与 `provider()` 的 doc 都写「with `AMOS_PODCAST_LIVE=1`」，即文档契约
+  // 本就只有 `=1`。修法：抽**纯判据** `decide_live(Option<&OsStr>)`，用与 `energy::parse_flag` 同一对 token
+  // 集，集合之外**存在**的值（含非 Unicode）⇒ mock 且 `warn!`。必得纯函数化的原因之一：`AMOS_PODCAST_LIVE`
+  // 是进程级、而 `PodcastBridge::new()` 会读它 —— 测试若 set 它，并行跑的其他 podcast 用例会一并拿到 http
+  // provider（首版真发生：8 个无关用例连带 red），故判据必须不碰环境。红先=3 例（off 拼法、集合外值、
+  // 非 Unicode）各 red、对照（unset ∕ truthy 不相交）绿、**零连带**。
+  { id: 'F-SH-925', module: 'the-podcast-bridges-live-network-gate-reads-the-documented-off-spellings-as-on-providers-read-was-std-env-var-amos-podcast-live-mapped-to-non-empty-and-not-literally-zero-so-amos-podcast-live-false-no-and-off-every-typo-enable-two-and-a-blank-but-set-value-all-armed-the-real-http-fetcher-the-opposite-of-the-repo-wide-bool-env-convention-1-true-yes-on-is-on-and-this-gate-opts-in-to-the-network-so-its-safe-side-is-the-offline-mock-the-modules-own-doc-and-providers-say-with-amos-podcast-live-1-so-the-documented-contract-was-already-just-one-fix-extract-a-pure-decide-live-over-the-raw-value-using-the-same-true-false-token-sets-energy-documents-warn-and-keep-the-mock-outside-them-including-a-non-unicode-value-pure-because-the-variable-is-process-global-and-podcastbridge-new-reads-it-so-a-test-that-set-it-armed-the-live-fetcher-for-every-other-podcast-test-running-in-parallel-first-cut-produced-eight-collateral-failures-three-red-first-cases-off-spellings-outside-the-sets-non-unicode-with-the-disjointness-control-green-and-no-collateral', files: ['crates/amos-tauri/src/podcast.rs', 'docs/ENV_VARIABLES.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1906', 'decide_live', 'an_explicitly_off_podcast_live_value_stays_on_the_offline_mock', 'an_unrecognised_podcast_live_value_is_reported_not_armed', 'keeping the offline mock'], severity: 4 },
+
   // F-SH-917（REQ-A1856）—— 一个测试的**唯一断言坐在它自己 `#[cfg]` 的反面**，于是在任何平台上都断不了言。
   // 原生 macOS 菜单栏里唯一触碰 `NSMenuItem` 的函数是 `apply_accelerators`；守卫它「没有菜单栏就不许报同步数」
   // 契约的 `a_disabled_accelerator_still_counts_as_applied` 被 `#[cfg(target_os = "macos")]` 门住，而它仅有的

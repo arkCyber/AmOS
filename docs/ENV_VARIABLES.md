@@ -206,7 +206,7 @@
 | `AMOS_NETGUARD_STATE_PATH` | path | (none) | `→ in-memory` | 网络守卫状态 |
 | `AMOS_NETGUARD_ALLOW_INJECT` | bool | `0` | `→ observed-only` | 是否允许注入 netguard 状态 |
 | `AMOS_SPY_IFACE` | string | (none) | `→ all-ifaces` | 抓包接口 |
-| `AMOS_SPY_LAYER3` | bool | (none) | `→ L2-default` | 抓包是否下沉到 L3(`rmnet`-style IPv4 接口);未设置按 L2 处理 |
+| `AMOS_SPY_LAYER3` | bool | (none) | `→ L2-default` | 抓包是否下沉到 L3(`rmnet`-style IPv4 接口);**严格读**:truthy `1`/`true`/`yes`/`on`、off `0`/`false`/`no`/`off`;未设置按 L2 处理(静默),两个集合之外的值(含空串与笔误)**按 L2 处理并 `warn!`** —— 它不只是开关,还是 L2/L3 取帧的选择,无声读成 L2 会让抓包恰好漏掉操作员要的那些包(REQ-A1903) |
 | `AMOS_SPY_IDS` | string | (none) | `→ match-nothing` | 间谍关注 ID 列表(逗号分隔) |
 | `AMOS_SPY_ALLOW_INJECT` | bool | `0` | `→ observed-only` | 是否允许注入遥测事件 |
 
@@ -266,25 +266,39 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_NOTIFIER` | bool | (未设置) | `→ sink-off` | 告警 sink 的**显式 opt-in**。truthy 集**恰好**是 `1`/`true`/`yes`/`on`(大小写无关、前后空白 trim)；**任何**其它值(含 `tru`/`2`/`enable`)**不 arm** —— 打错字不会意外开门。读取点:`crates/amos-ai/src/notifier_sink.rs` |
+| `AMOS_NOTIFIER` | bool | (未设置) | `→ sink-off` | 告警 sink 的**显式 opt-in**。truthy 集**恰好**是 `1`/`true`/`yes`/`on`(大小写无关、前后空白 trim)；off 集是 `0`/`false`/`no`/`off`。**未设置**与**两个集合内的值**都静默；**存在但两个集合之外**的值(笔误 `tru`/`enable`/`2`、空串或全空白、非 Unicode)一律**不 arm 且 `warn!`** —— 打错字不会意外开门,也**不再**把「操作员以为开了」读成无声的关闭(REQ-A1903)。读取点:`crates/amos-ai/src/notifier_sink.rs` |
 | `AMOS_NOTIFIER_WEBHOOK` | list | - | `→ stderr-only` | 逗号分隔的 webhook URL 列表(空白 trim、空项跳过)。`https://` 与坏 scheme 的项被**拒绝并 warn**,不影响 daemon 启动；没有任何有效 URL 时仍装 stderr 兜底,所以「一个 `AMOS_NOTIFIER=1` 但没有 URL 的机器」也会落一行 |
 | `AMOS_FEATURE_FLAGS_FILE` | path | `~/.amos/feature-flags.json` | `→ empty-set` | 运行时 feature flag 的本地文件。非空即覆盖默认路径；路径解析不出 / 文件缺失 / 文件损坏 ⇒ **空集**(fail-closed,绝不 fail-open)。读取点:`FeatureFlagSet::from_local()`(`AMOS_FEATURE_FLAGS_FILE` → `from_file`) |
 | `AMOS_CONFIG_SYSTEM` | path | 平台默认(`/etc/amos/config.json`；macOS 为 `/Library/Application Support/amos/config.json`；Windows 为 `%ProgramData%\amos\config.json`) | `→ platform-default` | 分层配置的**系统层**文件路径覆盖 |
 | `AMOS_CONFIG_USER` | path | `~/.amos/config.json` | `→ layer-absent` | 分层配置的**用户层**文件路径覆盖；`$HOME` 未设置或为空 ⇒ 该层**不存在**(不是空值) |
 | `AMOS_CONFIG_RELOAD_SECS` | int | `60` | `→ 60s` | 热重载 worker 的 tick 间隔(秒)。非法 / 负数 / `0` 一律**拒绝并 warn** 后回落 60 —— 零间隔不是「更快重载」而是**无界忙循环**。读取点:`reload::interval_from_env()`(嵌入方把它交给 `Worker::spawn`) |
+| `AMOS_INSTALL_ID` | string | (未设置) | `→ $AMOS_SOCKET → pid-<pid>` | 本机的 **per-install 标识**,用于把进程放进百分比发布(percent rollout)环。解析链:`AMOS_INSTALL_ID` → `AMOS_SOCKET` → `pid-<pid>`;**每段都 trim,空段跳过**(设成 `""` 不构成一个标识 —— 否则所有此类设备会落进同一个桶,而这正是该入口要避免的)。链尾保证返回非空,故 `percent` 规则总有一个桶可放。读取点:`amos-config/src/feature_flag.rs::default_install_id`(经 `FlagContext::for_this_process`) |
 
 ---
 
-## 19. 使用说明
+## 19. 播客(amos-podcast ∕ amos-tauri)
 
-### 19.1 透明度原则
+| 变量 | 类型 | 默认 | 失效语义 | 说明 |
+|------|------|------|----------|------|
+| `AMOS_PODCAST_LIVE` | bool | (未设置) | `→ offline-mock` | 真实 HTTP 抓取的**显式 opt-in**,且**只在** `podcast-live` 特性构建里被读取(默认构建忽略它,故默认 UI 构建触不到网络)。truthy 集**恰好**是 `1`/`true`/`yes`/`on`(大小写无关、前后空白 trim)、off 集是 `0`/`false`/`no`/`off`;未设置与两个集合内的值都静默,**存在但两个集合之外**的值(笔误 `enable`/`2`、空串或全空白、非 Unicode)一律**不 arm 且 `warn!`** —— 打错字或写 `false` 都不会意外把真实网络打开(REQ-A1906)。读取点:`crates/amos-tauri/src/podcast.rs::provider()` |
+| `AMOS_PODCAST_DIR` | path | (未设置) | `→ 内存态` | 把该进程的**四个** store 同置此目录。未设置且无逐 store 覆盖 ⇒ 全部 store 只在内存(不写用户磁盘,除非被要求)。读取点:`amos-podcast/src/manager.rs::PodcastPaths::from_env`(经 `pick` 闭包读取,故本表由 REQ-A1906 补登记) |
+| `AMOS_PODCAST_SUBSCRIPTIONS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/subscriptions.json` | 订阅 store 的逐文件路径覆盖(优先于 `AMOS_PODCAST_DIR`) |
+| `AMOS_PODCAST_LIBRARY` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/library.json` | 剧集库 store 的逐文件路径覆盖 |
+| `AMOS_PODCAST_PROGRESS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/progress.json` | 播放进度 store 的逐文件路径覆盖 |
+| `AMOS_PODCAST_DOWNLOADS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/downloads.json` | 下载登记 store 的逐文件路径覆盖 |
+
+---
+
+## 20. 使用说明
+
+### 20.1 透明度原则
 
 - **未设置 ≠ 0 / false**:很多变量"未设置"意为"自动探测",**不应被解读为关闭**
 - **`true`/`1`**:接受 Rust 标准布尔解析
 - **持续时间**:`30s`/`5m`/`1h` 等,内部以 `humantime` 或 `Duration` 直接解析
 - **路径相对性**:相对路径以 `cwd` 为基准,生产部署建议使用绝对路径
 
-### 19.2 安全相关(高敏感)
+### 20.2 安全相关(高敏感)
 
 下列变量涉及**认证或权限**,改动前需明确**新的失效语义**:
 
@@ -294,6 +308,6 @@
 - `AMOS_CRED_FILE` — 改路径 ⇒ 旧路径下的 0600 文件**不会被自动清理**
 - `AMOS_API_KEY` / `AMOS_ASR_API_KEY` / `AMOS_OLLAMA_API_KEY` — 出现在云端请求,**切勿写入日志**
 
-### 19.3 自动生成
+### 20.3 自动生成
 
 本文档由 `scripts/env-doc-gen.mjs` 从代码扫描生成。运行时行为以代码为准。

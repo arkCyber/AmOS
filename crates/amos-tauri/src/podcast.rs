@@ -65,16 +65,13 @@ pub struct PodcastBridge {
 }
 
 /// The provider this process uses: a real HTTP fetcher when `AMOS_PODCAST_LIVE`
-/// is set **and** the bridge is built with `podcast-live`, otherwise the offline
-/// mock. Without the feature the env var is ignored, so the default UI build
-/// cannot reach the network.
+/// is a **truthy token** *and* the bridge is built with `podcast-live`, otherwise
+/// the offline mock. Without the feature the env var is ignored, so the default
+/// UI build cannot reach the network.
 fn provider() -> Box<dyn FeedProvider> {
     #[cfg(feature = "podcast-live")]
     {
-        if std::env::var("AMOS_PODCAST_LIVE")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-        {
+        if live_enabled() {
             // One bucket for every feed: the domain is transport-agnostic, so the
             // bridge does not need a per-subscription provider choice.
             tracing::info!("podcast: using the live HTTP feed provider");
@@ -82,6 +79,57 @@ fn provider() -> Box<dyn FeedProvider> {
         }
     }
     Box::new(MockFeedProvider::new())
+}
+
+/// The two token sets of the repo-wide bool-env convention
+/// (`docs/ENV_VARIABLES.md` §20.1, coined by `amos-ai`'s `energy::parse_flag`).
+#[cfg(feature = "podcast-live")]
+const TRUE_TOKENS: [&str; 4] = ["1", "true", "yes", "on"];
+#[cfg(feature = "podcast-live")]
+const FALSE_TOKENS: [&str; 4] = ["0", "false", "no", "off"];
+
+/// Whether the live HTTP provider is armed, read **strictly**.
+///
+/// The gate is an *opt-in to the network*, so the safe side is "mock": a value
+/// outside the two documented sets — a typo (`enable`), a stray `2`, a
+/// blank-but-set string, a non-Unicode one — keeps the mock **and warns**. The
+/// previous read (`!v.is_empty() && v != "0"`) armed the live fetcher on
+/// `AMOS_PODCAST_LIVE=false` / `no` / `off` and on any typo, i.e. it treated the
+/// documented **off** spellings as ON — the opposite of the convention every
+/// other bool knob in the tree follows (REQ-A1906).
+#[cfg(feature = "podcast-live")]
+fn live_enabled() -> bool {
+    decide_live(std::env::var_os("AMOS_PODCAST_LIVE").as_deref())
+}
+
+/// The **pure** decision behind [`live_enabled`], over the raw env value.
+///
+/// Split out so the rule can be pinned without mutating the process environment:
+/// `AMOS_PODCAST_LIVE` is process-global and `PodcastBridge::new()` reads it, so
+/// a test that set it would arm the live fetcher for every other podcast test
+/// running in parallel (REQ-A1906).
+#[cfg(feature = "podcast-live")]
+fn decide_live(raw: Option<&std::ffi::OsStr>) -> bool {
+    let Some(raw) = raw else {
+        return false; // unset = the documented offline-mock default, quiet
+    };
+    let Some(raw) = raw.to_str() else {
+        tracing::warn!("AMOS_PODCAST_LIVE is set but not valid Unicode; keeping the offline mock");
+        return false;
+    };
+    let token = raw.trim().to_ascii_lowercase();
+    if TRUE_TOKENS.contains(&token.as_str()) {
+        return true;
+    }
+    if FALSE_TOKENS.contains(&token.as_str()) {
+        return false;
+    }
+    tracing::warn!(
+        value = %raw,
+        "AMOS_PODCAST_LIVE is set to a value this gate does not recognise — keeping the offline \
+         mock (arm with 1/true/yes/on, stay off with 0/false/no/off)"
+    );
+    false
 }
 
 /// The store paths for this process, from the environment.
@@ -799,6 +847,124 @@ mod tests {
         #[cfg(not(feature = "podcast-live"))]
         assert_eq!(b.provider_name().await, "mock");
         assert!(matches!(b.provider_name().await, "mock" | "http"));
+    }
+
+    /// Counts WARN events so the assertion is on the *observable* diagnostic, not
+    /// on a re-statement of the code. A test-only probe, deliberately local: a
+    /// shared `#[cfg(test)]` helper would have to compile under every feature
+    /// combination this crate is built with, and where it is unused `-D warnings`
+    /// refuses it (F-DEV-155).
+    #[cfg(feature = "podcast-live")]
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    #[cfg(feature = "podcast-live")]
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Count the WARN events `f` emits on this thread.
+    #[cfg(feature = "podcast-live")]
+    fn warns_during(f: impl FnOnce()) -> u64 {
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f();
+        }
+        warns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run [`decide_live`] on one raw value, returning `(armed, warns)`.
+    #[cfg(feature = "podcast-live")]
+    fn decide(raw: Option<&str>) -> (bool, u64) {
+        let mut armed = false;
+        let warns = warns_during(|| armed = decide_live(raw.map(std::ffi::OsStr::new)));
+        (armed, warns)
+    }
+
+    /// The gate is an opt-in to the **network**, so its safe side is the mock.
+    /// The previous read armed the live fetcher on the documented **off**
+    /// spellings (`false` / `no` / `off`) and on every typo, because it asked only
+    /// "non-empty and not literally `0`" (REQ-A1906).
+    #[cfg(feature = "podcast-live")]
+    #[test]
+    fn an_explicitly_off_podcast_live_value_stays_on_the_offline_mock() {
+        for val in ["0", "false", "no", "off", "FALSE", "  Off  "] {
+            let (armed, warns) = decide(Some(val));
+            assert!(
+                !armed,
+                "AMOS_PODCAST_LIVE={val:?} is a recognised off — it must not arm the network"
+            );
+            assert_eq!(
+                warns, 0,
+                "a recognised off is a deliberate off, not a misread"
+            );
+        }
+    }
+
+    #[cfg(feature = "podcast-live")]
+    #[test]
+    fn an_unrecognised_podcast_live_value_is_reported_not_armed() {
+        for val in ["enable", "2", "l3", " " /* blank-but-set */] {
+            let (armed, warns) = decide(Some(val));
+            assert!(
+                !armed,
+                "AMOS_PODCAST_LIVE={val:?} is outside both sets — the safe side is the mock"
+            );
+            assert_eq!(
+                warns, 1,
+                "AMOS_PODCAST_LIVE={val:?} is present but unreadable — the operator must learn \
+                 the live request was dropped"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "podcast-live", unix))]
+    #[test]
+    fn a_non_unicode_podcast_live_value_is_reported_not_armed() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"\xff\xfe");
+        let mut armed = true;
+        let warns = warns_during(|| armed = decide_live(Some(raw)));
+        assert!(!armed, "an unreadable value must not arm the network");
+        assert_eq!(
+            warns, 1,
+            "the operator must learn the live request was dropped"
+        );
+    }
+
+    /// Disjointness controls: unset is the documented `→ mock` default and the
+    /// truthy tokens are the only values that arm the fetcher.
+    #[cfg(feature = "podcast-live")]
+    #[test]
+    fn unset_and_truthy_podcast_live_values_are_disjoint() {
+        let (armed, warns) = decide(None);
+        assert_eq!(
+            warns, 0,
+            "unset is the documented offline-mock default — silent, not a misread"
+        );
+        assert!(!armed);
+
+        for val in ["1", "true", "yes", "on", " On "] {
+            let (armed, warns) = decide(Some(val));
+            assert_eq!(
+                warns, 0,
+                "AMOS_PODCAST_LIVE={val:?} is a recognised on value"
+            );
+            assert!(armed, "AMOS_PODCAST_LIVE={val:?} must arm the live fetcher");
+        }
     }
 
     /// A temp directory for one test's downloaded audio.

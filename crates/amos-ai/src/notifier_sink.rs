@@ -62,11 +62,16 @@ pub fn notifier_sink(dispatcher: amos_notifier::Dispatcher) -> Arc<dyn AlertSink
 /// the auto-wire isn't done" gap).
 ///
 /// Contract — what the operator sees:
-/// * `AMOS_NOTIFIER` is unset / `0` / `false` (case-insensitive) ⇒ `None`.
-///   The daemon's threshold alerts are still computed (and still visible on
-///   `get_status`), they just don't go anywhere — same as the default build
-///   before this round. The default build **must** stay quiet by default;
-///   the function that builds a daemon explicitly opts in.
+/// * `AMOS_NOTIFIER` is unset / `0` / `false` / `no` / `off`
+///   (case-insensitive, whitespace-trimmed) ⇒ `None`, silently. The daemon's
+///   threshold alerts are still computed (and still visible on `get_status`),
+///   they just don't go anywhere — same as the default build before this round.
+///   The default build **must** stay quiet by default; the function that builds
+///   a daemon explicitly opts in.
+/// * `AMOS_NOTIFIER` is *present but outside both sets* (a typo, a blank value,
+///   a non-Unicode value) ⇒ `None` **and a `warn!`**: the operator asked for
+///   something this gate cannot read, and a silently-closed opt-in is a missed
+///   page. See [`amos_notifier_enabled`].
 /// * `AMOS_NOTIFIER=1` (or `true` / `yes` / `on`) ⇒ build a dispatcher. If
 ///   the env also lists at least one `AMOS_NOTIFIER_WEBHOOK=` URL, every URL
 ///   becomes a `WebhookChannel`. If no webhook URL is given, the dispatcher
@@ -143,21 +148,55 @@ fn build_dispatcher_from_env() -> (amos_notifier::Dispatcher, usize) {
     (b.build(), webhooks_wired)
 }
 
+/// The tokens `AMOS_NOTIFIER` accepts as **on** / **off**. The truthy set is
+/// deliberately narrow (a typo must never arm paging); `0`/`false` are the
+/// documented spellings of the off switch and `no`/`off` are their obvious
+/// twins — the same two sets `energy::parse_flag` documents as the repo-wide
+/// convention for a `bool` env var. Nothing outside these sets is a value this
+/// gate understands.
+const TRUE_TOKENS: [&str; 4] = ["1", "true", "yes", "on"];
+const FALSE_TOKENS: [&str; 4] = ["0", "false", "no", "off"];
+
 /// Worker split out for unit testing. Returns true when the env tells us
-/// the operator wants the notifier sink armed. Accepted truthy values:
-/// `1`, `true`, `yes`, `on` (case-insensitive, surrounding whitespace
-/// trimmed). Everything else — unset, empty, anything not on the list —
-/// returns `false`. We deliberately do **not** treat every non-empty
-/// string as truthy: a typo like `AMOS_NOTIFIER=tru` would otherwise
-/// silently arm the path.
+/// the operator wants the notifier sink armed.
+///
+/// Three distinct facts are **not** collapsed into one bare `false`:
+/// * **unset** — nothing was asked for; the default build's quiet contract, so
+///   silent;
+/// * **a token in one of the two sets** — an explicit on/off, so silent;
+/// * **present but outside both sets** (a typo like `enable`/`tru`, a bare
+///   `2`, a blank value left by an unexpanded `AMOS_NOTIFIER="$FLAG"`, or a
+///   non-Unicode value) — the operator *did* ask for something this gate cannot
+///   read, so it is reported and the gate stays off.
+///
+/// The third case used to be read in silence (`std::env::var(..).ok()` plus a
+/// truthy `matches!`), which turned "I typo'd the opt-in" into "alerting is off
+/// and nobody said so". `main.rs` already prints a line when a *feature-less*
+/// build cannot honour a set `AMOS_NOTIFIER`; the build that can must not be
+/// the quieter one. (REQ-A1903 / F-AI-027.)
 fn amos_notifier_enabled() -> bool {
-    let Ok(raw) = std::env::var("AMOS_NOTIFIER") else {
+    // `var_os` keeps the two facts `std::env::var` folds together — genuinely
+    // unset (the one silent case) and set-but-not-Unicode (reported below).
+    let Some(raw) = std::env::var_os("AMOS_NOTIFIER") else {
         return false;
     };
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    let Some(raw) = raw.to_str() else {
+        tracing::warn!("AMOS_NOTIFIER is set but not valid Unicode; treating alerting as OFF");
+        return false;
+    };
+    let token = raw.trim().to_ascii_lowercase();
+    if TRUE_TOKENS.contains(&token.as_str()) {
+        return true;
+    }
+    if FALSE_TOKENS.contains(&token.as_str()) {
+        return false;
+    }
+    tracing::warn!(
+        value = %raw,
+        "AMOS_NOTIFIER is set to a value this gate does not recognise — treating alerting as \
+         OFF (arm with 1/true/yes/on, stay off with 0/false/no/off)"
+    );
+    false
 }
 
 /// Worker split out for unit testing. Reads `AMOS_NOTIFIER_WEBHOOK` as a
@@ -290,7 +329,7 @@ mod tests {
 
     #[test]
     fn env_off_returns_none_and_the_daemon_stays_quiet() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(None, None);
         assert!(
             notifier_sink_from_env().is_none(),
@@ -298,9 +337,141 @@ mod tests {
         );
     }
 
+    /// Counts WARN events so the assertions below are on the *observable*
+    /// diagnostic, not a re-statement of the code (same probe as
+    /// `bundled_model::tests::WarnProbe`, which `set_default` keeps thread-local
+    /// so a sibling test's warns cannot be counted here).
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Count the WARN events `f` emits on this thread.
+    fn warns_during(f: impl FnOnce()) -> u64 {
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f();
+        }
+        warns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The misread direction of the allow-list above: `AMOS_NOTIFIER` set to a
+    /// value **outside both token sets** (`enable`, `tru`, `2`, …) is a *present*
+    /// operator intent that this gate reads as "off" — and the gate used to read
+    /// it in **silence**, because `std::env::var(..).ok()?`-style reading
+    /// collapsed "unset" and "set to something I do not understand" into one bare
+    /// `false`. The operator who typed `AMOS_NOTIFIER=enable` therefore believed
+    /// paging was armed while every alert was only visible on `get_status`:
+    /// nothing said otherwise. The same variable is *already* reported when a
+    /// build cannot honour it at all (`main.rs`'s `no notifier feature` eprintln),
+    /// so the build that *can* arm it must not be the quieter one
+    /// (REQ-A1903 / F-AI-027).
+    #[test]
+    fn an_unrecognised_env_value_is_reported_not_silently_read_as_off() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _e = ScopedEnv::set(Some("enable"), None);
+        let mut armed = true;
+        let warns = warns_during(|| armed = amos_notifier_enabled());
+        assert!(
+            !armed,
+            "a value outside the truthy allow-list must never arm the sink"
+        );
+        assert_eq!(
+            warns, 1,
+            "a present-but-unrecognised AMOS_NOTIFIER must be reported; reading it as a \
+             bare `false` is the silent-misconfiguration defect"
+        );
+    }
+
+    /// A blank value is the *same* present-but-unreadable fact as the typo above
+    /// (an unexpanded `AMOS_NOTIFIER="$FLAG"` lands here): the operator set the
+    /// variable, this gate cannot use it, and `main.rs` already treats a
+    /// set-to-anything value as worth a line in the no-feature build.
+    #[test]
+    fn an_empty_env_value_is_reported_not_silently_read_as_off() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _e = ScopedEnv::set(Some("   "), None);
+        let mut armed = true;
+        let warns = warns_during(|| armed = amos_notifier_enabled());
+        assert!(!armed, "whitespace names no switch value");
+        assert_eq!(warns, 1, "a blank-but-set AMOS_NOTIFIER must be reported");
+    }
+
+    /// Disjointness control A: a *genuinely unset* variable is not operator
+    /// intent at all — the default build's quiet contract — so it stays silent.
+    #[test]
+    fn an_unset_env_var_is_never_armed_and_stays_silent() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _e = ScopedEnv::set(None, None);
+        let mut armed = true;
+        let warns = warns_during(|| armed = amos_notifier_enabled());
+        assert!(!armed, "unset is the off default");
+        assert_eq!(warns, 0, "unset must not warn — only a *present* value can");
+    }
+
+    /// Disjointness control B: the documented off spellings (and their obvious
+    /// twins) are a *deliberate* "off", not a misread, so they stay silent too —
+    /// a fix that warned on every non-truthy value would be the other defect.
+    #[test]
+    fn the_explicit_off_spellings_stay_silent() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for val in ["0", "false", "FALSE", "no", "off", "  Off  "] {
+            let _e = ScopedEnv::set(Some(val), None);
+            let mut armed = true;
+            let warns = warns_during(|| armed = amos_notifier_enabled());
+            assert!(!armed, "AMOS_NOTIFIER={val:?} is an explicit off");
+            assert_eq!(
+                warns, 0,
+                "AMOS_NOTIFIER={val:?} is a recognised off value — it must not warn"
+            );
+        }
+    }
+
+    /// A present-but-not-UTF-8 value is the *sibling input* of the typo above:
+    /// `std::env::var` answers `Err` for both "unset" and "set but unreadable
+    /// here", so the old reader dropped a non-Unicode value as silently as an
+    /// unset one (the shape REQ-A1892 / F-AI-026 fixed in `bundled_model::env_path`).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_env_value_is_reported_not_silently_read_as_off() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("AMOS_NOTIFIER").ok();
+        std::env::set_var("AMOS_NOTIFIER", OsStr::from_bytes(b"\xff"));
+        let mut armed = true;
+        let warns = warns_during(|| armed = amos_notifier_enabled());
+        match &prev {
+            Some(v) => std::env::set_var("AMOS_NOTIFIER", v),
+            None => std::env::remove_var("AMOS_NOTIFIER"),
+        }
+        assert!(!armed, "a non-Unicode value names no switch value");
+        assert_eq!(
+            warns, 1,
+            "a present-but-non-Unicode AMOS_NOTIFIER must be reported, not dropped like an \
+             unset one"
+        );
+    }
+
     #[test]
     fn env_off_explicit_zero_returns_none() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(Some("0"), None);
         assert!(
             notifier_sink_from_env().is_none(),
@@ -310,7 +481,7 @@ mod tests {
 
     #[test]
     fn env_off_explicit_false_returns_none() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(Some("false"), None);
         assert!(
             notifier_sink_from_env().is_none(),
@@ -322,7 +493,7 @@ mod tests {
     /// Only the explicit truthy words on the allow-list arm the sink.
     #[test]
     fn env_off_typo_does_not_silently_arm() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(Some("tru"), None);
         assert!(
             notifier_sink_from_env().is_none(),
@@ -338,7 +509,7 @@ mod tests {
         // should be silently dropped. The dispatcher's stderr_fallback then
         // guards the "no channels" case if for some reason the fallback
         // channel goes missing too.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(Some("1"), None);
         let sink = notifier_sink_from_env();
         assert!(sink.is_some(), "AMOS_NOTIFIER=1 with no webhook must arm");
@@ -349,7 +520,7 @@ mod tests {
 
     #[test]
     fn env_on_with_one_webhook_url_arms_a_sink() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // 127.0.0.1:1 is the "almost certainly closed" port on a dev
         // machine; the URL parses (WebhookChannel::try_new returns Ok) and
         // a real send will return Failed, but that's the dispatcher's job
@@ -361,7 +532,7 @@ mod tests {
 
     #[test]
     fn env_on_with_multiple_webhook_urls_arms_a_sink() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(
             Some("on"),
             Some("http://127.0.0.1:1/a, http://127.0.0.1:2/b"),
@@ -377,7 +548,7 @@ mod tests {
         // factory then attaches StdoutChannel::stderr() so an alert is
         // not silently dropped just because the operator misconfigured
         // every URL.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(
             Some("1"),
             Some("https://hooks.example.com/x,ftp://hooks.example.com/y"),
@@ -395,7 +566,7 @@ mod tests {
     /// three-URL config where two are dead wires exactly one webhook.
     #[test]
     fn the_wired_webhook_count_excludes_urls_the_constructor_refused() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(
             Some("1"),
             Some("ftp://a/x, http://127.0.0.1:1/ok, https://b/y"),
@@ -409,7 +580,7 @@ mod tests {
 
     #[test]
     fn env_on_with_whitespace_in_webhook_list_is_trimmed() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _e = ScopedEnv::set(Some("1"), Some("  http://127.0.0.1:1/h  ,,  "));
         let sink = notifier_sink_from_env();
         assert!(
@@ -421,7 +592,7 @@ mod tests {
     #[test]
     fn env_on_case_insensitive_truthy_value_arms() {
         for val in ["1", "TRUE", "True", "YES", "yes", "On", "  on  "] {
-            let _g = ENV_LOCK.lock().unwrap();
+            let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let _e = ScopedEnv::set(Some(val), None);
             assert!(
                 notifier_sink_from_env().is_some(),

@@ -9,7 +9,7 @@
  *
  * 扫描源:
  *   - crates 目录树下所有 .rs 文件中出现的 "AMOS_*" 字面量
- *     (env::var / option_env! / read_env / parse_env 等调用)
+ *     (env::var / env::var_os / option_env! / read_env / parse_env 等调用)
  *   - crates 目录树下 src/bin 同样扫描
  *
  * 不替代代码 —— 仅供文档同步与失配检测。
@@ -49,7 +49,97 @@ function scanRustFiles() {
 }
 
 function extractEnvsFromFile(file) {
-  const text = fs.readFileSync(file, 'utf8');
+  return extractEnvsFromText(fs.readFileSync(file, 'utf8'));
+}
+
+/**
+ * Skip a Rust double-quoted string starting at `i` (which must be the opening
+ * `"`), returning the index of the closing quote — honouring `\` escapes so a
+ * `\"` inside the literal does not end it early.
+ */
+function skipString(text, i) {
+  for (let j = i + 1; j < text.length; j++) {
+    if (text[j] === '\\') { j++; continue; }
+    if (text[j] === '"') return j;
+  }
+  return text.length - 1;
+}
+
+/**
+ * The brace-matched body of the `fn` whose signature begins at `sigIndex`, with
+ * line and block comments plus string literals skipped so a brace inside either
+ * does not unbalance the match. `null` when the signature has no `{` body.
+ */
+function fnBodyAt(text, sigIndex) {
+  const open = text.indexOf('{', sigIndex);
+  if (open === -1) return null;
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '/' && text[i + 1] === '/') {
+      const nl = text.indexOf('\n', i);
+      i = nl === -1 ? text.length : nl;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    if (ch === '"') { i = skipString(text, i); continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return text.slice(open, i + 1); }
+  }
+  return null;
+}
+
+/**
+ * Names of local fns that forward a **parameter** into `env::var` — e.g.
+ * `fn pick(name: &str, file: &str) { … std::env::var(name) … }` called as
+ * `pick("AMOS_PODCAST_SUBSCRIPTIONS", …)`.
+ *
+ * The direct-call scan can only see a literal written *at* the call, so every
+ * env name that reaches the environment through such a helper was invisible:
+ * `amos-podcast`'s four per-store paths read through `pick`, and the doc gate
+ * structurally **forbade** documenting them (adding the names flipped the check
+ * to "lists ENVs not used in code"). The corpus must be *the use site* — a value
+ * handed to something that calls `env::var` — not the spelling of the helper
+ * (REQ-A1906 / F-DEV-167).
+ */
+function collectForwardingHelpers(text) {
+  const names = new Set();
+
+  /** `bodyStart` is where the parameter list ends; the body is the brace-matched
+   * block if one opens before the next `;`, otherwise the expression up to it. */
+  const consider = (name, paramsSrc, bodyStart) => {
+    const params = paramsSrc
+      .split(',')
+      .map(p => p.split(':')[0].trim())
+      .filter(p => /^[a-z_][A-Za-z0-9_]*$/.test(p) && p !== 'mut');
+    if (params.length === 0) return;
+    const open = text.indexOf('{', bodyStart);
+    const semi = text.indexOf(';', bodyStart);
+    let body = null;
+    if (open !== -1 && (semi === -1 || open < semi)) body = fnBodyAt(text, bodyStart);
+    else if (semi !== -1) body = text.slice(bodyStart, semi);
+    if (!body) return;
+    if (params.some(p => new RegExp(`env::var(?:_os)?\\s*\\(\\s*${p}\\b`).test(body))) {
+      names.add(name);
+    }
+  };
+
+  for (const m of text.matchAll(/\bfn\s+([a-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)/g)) {
+    consider(m[1], m[2], m.index + m[0].length);
+  }
+  // Closures are the shape that hid the podcast stores: `let pick = |name: &str,
+  // file: &str| -> Option<PathBuf> { … }` — no `fn` keyword to match on.
+  for (const m of text.matchAll(/\blet\s+([a-z_][A-Za-z0-9_]*)\s*=\s*(?:move\s*)?\|([^|]*)\|/g)) {
+    consider(m[1], m[2], m.index + m[0].length);
+  }
+  return names;
+}
+
+function extractEnvsFromText(text) {
   const envs = new Set();
 
   // 策略:
@@ -58,8 +148,8 @@ function extractEnvsFromFile(file) {
   // 3. set_var("AMOS_X") 测试驱动入口,也算
 
   const directRe = [
-    /env::var\(\s*"AMOS_[A-Z][A-Z0-9_]*"/g,
-    /std::env::var\(\s*"AMOS_[A-Z][A-Z0-9_]*"/g,
+    /env::var(?:_os)?\(\s*"AMOS_[A-Z][A-Z0-9_]*"/g,
+    /std::env::var(?:_os)?\(\s*"AMOS_[A-Z][A-Z0-9_]*"/g,
     /env!\(\s*"AMOS_[A-Z][A-Z0-9_]*"/g,
     /option_env!\(\s*"AMOS_[A-Z][A-Z0-9_]*"/g,
     /read_env\(\s*"AMOS_[A-Z][A-Z0-9_]*"/g,
@@ -80,7 +170,7 @@ function extractEnvsFromFile(file) {
     const envName = m[2];
     // 查找该常量名是否在文件中被 helper 调用
     const helperCallRe = new RegExp(
-      `\\b(?:std::)?env::var\\s*\\(\\s*${constName}\\b` +
+      `\\b(?:std::)?env::var(?:_os)?\\s*\\(\\s*${constName}\\b` +
       `|\\b(?:env_flag|get_env|env_or|env_or_default|env_bool|env_int|env_string|opt_env_u32|opt_env_i32|env_governor_flag|env_parsed|env_parse_or|env_value)\\s*\\(\\s*${constName}\\b`
     );
     if (helperCallRe.test(text)) {
@@ -90,6 +180,14 @@ function extractEnvsFromFile(file) {
       // (下一轮 --check 会通过文档覆盖检测漏报)
       envs.add(envName);
     }
+  }
+
+  // (c) 经由**转发型 helper** 的读取: `fn pick(name: &str, …) { env::var(name) }`
+  //     的调用点 `pick("AMOS_X", …)`。直接调用的正则看不到它 —— 字面量是在
+  //     helper 内部以**参数**到达 `env::var` 的(REQ-A1906 / F-DEV-167)。
+  for (const helper of collectForwardingHelpers(text)) {
+    const callRe = new RegExp(`\\b${helper}\\s*\\(\\s*"(AMOS_[A-Z][A-Z0-9_]*)"`, 'g');
+    for (const m of text.matchAll(callRe)) envs.add(m[1]);
   }
 
   return [...envs];
@@ -219,6 +317,89 @@ function cmdSelfTest() {
         const sample = '`AMOS_BACKEND` and AMOS_TCP_TOKEN both work.';
         const matches = [...sample.matchAll(/`?(AMOS_[A-Z][A-Z0-9_]*)`?/g)].map(m => m[1]);
         assert(matches.length === 2, `expected 2, got ${matches.length}`);
+      },
+    },
+    {
+      // The blind spot this round closes: a name whose literal reaches
+      // `env::var` through a **parameter** (`amos-podcast`'s `pick`). Before the
+      // fix the direct-call scan missed it, and the doc side *forbade*
+      // documenting it ("lists ENVs not used in code").
+      name: 'a value forwarded through a helper parameter is discovered',
+      run: () => {
+        const fnSample = [
+          'fn pick(name: &str, file: &str) -> Option<PathBuf> {',
+          '    if let Ok(v) = std::env::var(name) { return Some(v.into()); }',
+          '    None',
+          '}',
+          'let subs = pick("AMOS_PROBE_FORWARDED", "x.json");',
+        ].join('\n');
+        const gotFn = extractEnvsFromText(fnSample);
+        assert(gotFn.includes('AMOS_PROBE_FORWARDED'),
+          `expected the forwarded name via a fn, got ${gotFn}`);
+
+        // The shape that actually hid the podcast store paths — a closure.
+        const closureSample = [
+          'let pick = |name: &str, file: &str| -> Option<PathBuf> {',
+          '    if let Ok(v) = std::env::var(name) { return Some(v.into()); }',
+          '    None',
+          '};',
+          'let subs = pick("AMOS_PROBE_CLOSURE", "x.json");',
+        ].join('\n');
+        const gotClosure = extractEnvsFromText(closureSample);
+        assert(gotClosure.includes('AMOS_PROBE_CLOSURE'),
+          `expected the forwarded name via a closure, got ${gotClosure}`);
+      },
+    },
+    {
+      // The sibling read style: `env::var_os` returns `Option<OsString>` and is
+      // how the F-AI-026 lineage keeps "unset" distinct from "not valid
+      // Unicode". A gate that spells the use site `env::var` alone is blind to
+      // it — the podcast live gate reads `AMOS_PODCAST_LIVE` through `var_os`,
+      // so the doc row looked like an ENV "not used in code" (REQ-A1906).
+      name: 'a value read through env::var_os is a use site',
+      run: () => {
+        const sample = [
+          'fn live_enabled() -> bool {',
+          '    decide_live(std::env::var_os("AMOS_PROBE_OS").as_deref())',
+          '}',
+        ].join('\n');
+        const got = extractEnvsFromText(sample);
+        assert(got.includes('AMOS_PROBE_OS'),
+          `expected env::var_os to count as a use site, got ${got}`);
+
+        // And through a forwarding parameter, the forwarded name must survive too.
+        const forwarded = [
+          'fn read(name: &str) -> Option<OsString> { std::env::var_os(name) }',
+          'let v = read("AMOS_PROBE_OS_FORWARDED");',
+        ].join('\n');
+        const gotForwarded = extractEnvsFromText(forwarded);
+        assert(gotForwarded.includes('AMOS_PROBE_OS_FORWARDED'),
+          `expected a var_os-forwarding helper to be followed, got ${gotForwarded}`);
+      },
+    },
+    {
+      // Disjoint negative control: the rule is "the parameter reaches
+      // `env::var`", **not** "any `"AMOS_*"` argument". A helper that merely
+      // takes a parameter must not make its argument look like an env name.
+      name: 'a helper parameter not forwarded to env::var is not a use site',
+      run: () => {
+        const sample = [
+          'fn join(a: &str, b: &str) -> String { format!("{a}{b}") }',
+          'let s = join("AMOS_PROBE_NOT_ENV", "x");',
+        ].join('\n');
+        const got = extractEnvsFromText(sample);
+        assert(!got.includes('AMOS_PROBE_NOT_ENV'),
+          `must not invent an env from a non-forwarding helper, got ${got}`);
+      },
+    },
+    {
+      name: 'the real tree discovers the helper-forwarded podcast store names',
+      run: () => {
+        const inv = buildInventory();
+        for (const n of ['AMOS_PODCAST_SUBSCRIPTIONS', 'AMOS_PODCAST_LIBRARY',
+          'AMOS_PODCAST_PROGRESS', 'AMOS_PODCAST_DOWNLOADS']) {
+          assert(inv[n], `expected ${n} (read via amos-podcast's pick helper)`);
+        }
       },
     },
   ];

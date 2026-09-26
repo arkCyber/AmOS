@@ -258,12 +258,18 @@ const FALSE_TOKENS: [&str; 4] = ["0", "false", "no", "off"];
 ///
 /// A misread is no longer silent: each distinct unrecognized `(key, value)` pair is
 /// logged at WARN once per process — the same "no silently inert configuration"
-/// rule `telemetry_spy_capture::plan_from_env_values` already follows. (Note the
-/// contrast with the *opt-in gates* — `notifier_sink::amos_notifier_enabled`,
-/// `telemetry_spy_capture::env_flag` — where "anything else is false" is
-/// deliberate and safe: there the safe side of the gate is `false`, so a typo
-/// cannot open it. Here the safe side differs per flag, which is exactly what a
-/// silent collapse cannot express.)
+/// rule `telemetry_spy_capture::plan_from_env_values` already follows.
+///
+/// (This comment used to exempt the *opt-in gates* — `notifier_sink::amos_notifier_enabled`,
+/// `telemetry_spy_capture::env_flag` — as "anything else is false … deliberate and
+/// safe". Half of that held: a typo landing on the gate's off side cannot *open*
+/// it, so the collapse was safe in the arming direction. It was not safe in the
+/// reading direction, and that half was wrong: an operator who writes
+/// `AMOS_NOTIFIER=enable` believes paging is armed, and `AMOS_SPY_LAYER3=enable`
+/// silently frames the capture at L2 — neither was told otherwise. Both now use
+/// the same two token sets as this function and warn on a value outside them;
+/// the off default still applies, so a typo still cannot arm anything.
+/// REQ-A1903.)
 fn parse_flag(key: &str, raw: Option<&str>) -> Option<bool> {
     let raw = raw?;
     let tok = raw.trim().to_ascii_lowercase();
