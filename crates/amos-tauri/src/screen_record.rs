@@ -868,7 +868,16 @@ pub async fn screen_record_start(
         // Re-check under the lock the same conditions the fast path checked: a concurrent
         // start could have slipped in during the awaits above, and it must not be clobbered.
         if inner.active.is_some() || inner.stopping.is_some() {
-            let _ = child.kill().await;
+            if let Err(e) = child.kill().await {
+                // The refusal below is the user's answer; this reports the *other* fact — a
+                // recorder we just spawned could not be stopped and may still be writing
+                // `out` until its own `-t` bound ends it (REQ-A1913, Power of 10 #7).
+                tracing::warn!(
+                    pid,
+                    error = %e,
+                    "could not stop the concurrently-started screen recorder"
+                );
+            }
             return Err(AmosError::new(
                 ErrorCode::ScreenRecordAlreadyRecording,
                 "a screen recording was started concurrently; this one was not kept",
@@ -965,7 +974,16 @@ pub async fn screen_record_stop(
             }
             Ok(Err(e)) => Err(format!("could not wait for the recording tool: {e}")),
             Err(_) => {
-                let _ = child.kill().await;
+                if let Err(e) = child.kill().await {
+                    // The timeout below is the user's answer; this reports the *other* fact —
+                    // the recording tool outlived both the interrupt and the kill and may still
+                    // be appending to `out` until its own `-t` bound ends it (REQ-A1913).
+                    tracing::warn!(
+                        out = %out.display(),
+                        error = %e,
+                        "the recording tool did not stop and could not be killed"
+                    );
+                }
                 Err(format!(
                 "the recording tool did not finish within {STOP_WAIT_SECS}s of the stop request"
             ))

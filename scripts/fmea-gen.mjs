@@ -9575,6 +9575,27 @@ const KNOWN_FAILURES = [
   // 而非把回溯搜索改写成显式栈（在安全相关组件上徒增风险、收益为零）。`ekf.rs` 未改动。
   { id: 'F-DEV-172', module: 'the-slam-jcbb-branch-and-bound-search-ekf-rs-jcbb-search-is-recursive-but-its-depth-is-capped-by-a-compile-time-constant-associate-joint-refuses-observations-len-greater-than-max-jcbb-observations-eight-before-it-constructs-the-searcher-and-jcbb-s-hypothesis-and-candidate-buffers-are-fixed-arrays-sized-by-that-same-constant-so-search-recurses-at-most-eight-frames-with-max-jcbb-nodes-four-thousand-ninety-six-additionally-capping-visited-nodes-the-depth-is-a-constant-not-input-derived-fix-freeze-it-in-scripts-rust-recursion-baseline-json-with-a-real-reason-naming-both-bounds-rather-than-rewriting-a-backtracking-search-into-an-explicit-stack-on-a-safety-relevant-component-the-baseline-is-a-per-path-fn-ratchet-that-fails-when-stale-req-a447-not-an-exemption', files: ['scripts/rust-recursion-baseline.json', 'crates/amos-robot/src/slam/ekf.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1912', 'Jcbb::search', 'MAX_JCBB_OBSERVATIONS', 'rust-recursion-baseline.json', 'no stale baseline entries'], severity: 2 },
 
+  // F-DEV-173（REQ-A1913）—— 屏录 `stop()` 的两条出口都把 `child.kill()` 的结果丢掉：并发拒收臂与
+  // `STOP_WAIT_SECS` 超时臂各逐字 `let _ = child.kill().await;`。录制进程先由 `interrupt_command(pid)`
+  // 收停止信号、再等 `STOP_WAIT_SECS`；这两处正对应「它没按时停」与「它根本没停」—— `kill()` 是最后
+  // 手段，它的失败（`ESRCH` ∕ 无权限 ∕ 僵尸）恰是「录制器可能还在写 `out`」的唯一信号，`let _ =` 抹掉后
+  // 用户只看到拒绝 ∕ 超时，输出文件却可能被孤儿进程继续追加。同文件其余尽力步骤都已就结果回话
+  // （`interrupt_command` 的 `status()` 那条另有注释说明「失败不致命、但这正是我们仍要等的原因」）。
+  // 修法：两处改 `if let Err(e) = child.kill().await { tracing::warn!(pid ∕ out, error = %e, …) }`，
+  // 拒绝 ∕ 超时语义一字未改。门禁盲区：`clippy::let_underscore_must_use` 看得见这两处，
+  // 真正的盲区是**没有门读「丢弃的后果由谁承担」**，于是「真缺陷」与「已论证的重复安装」同灯混同。
+  { id: 'F-DEV-173', module: 'the-screen-recorders-stop-discards-the-result-of-child-kill-on-both-of-its-exits-the-concurrent-start-refusal-arm-and-the-stop-wait-secs-timeout-arm-each-litterally-let-child-kill-await-so-a-recorder-that-survived-both-the-interrupt-signal-and-the-kill-can-keep-appending-to-the-output-file-while-nothing-says-so-the-kill-failure-esrch-no-permission-a-zombie-is-the-only-signal-that-the-recorder-may-still-be-writing-out-fix-report-both-through-tracing-warn-with-the-pid-or-out-path-and-the-kill-error-leaving-the-refusal-or-timeout-return-unchanged-the-gates-clippy-let-underscore-must-use-sees-both-sites-the-real-blind-spot-is-that-no-gate-reads-who-bears-the-consequence-of-a-drop', files: ['crates/amos-tauri/src/screen_record.rs', 'scripts/rust-discard-baseline.json', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1913', 'child.kill().await', 'STOP_WAIT_SECS', 'rust-discard-scan', 'screen_record_stop'], severity: 2 },
+
+  // F-DEV-174（REQ-A1913）—— 三个文件带着未认领的手写 `let _ = <must_use>` 进入树内，`rust-discard-scan`
+  // 棘轮（本轮实扫 101 ∕ 基线 96）因此红着。逐处判读：`ota.rs` 三处皆 `let _ = machine.fail(…)` 紧接
+  // `return Ok(OtaInstallResult::from_machine(&machine))`，而 `crates/amos-ota/src/install.rs:370 pub fn fail`
+  // 仅在**已是终态**或**无在飞版本**时返回 `Err`，三处都在 `begin` 刚成功、其间无其它转移之后 ⇒ 不可达，
+  // 且效果被下一行读回；`incall.rs` 的 `CLASS.set(global)` 是已基线 `APP.set` ∕ `VM.set` 同族的 `OnceLock`
+  // 恰一次安装（安全前提是生成的 Activity 从不重建 —— `configChanges`，由 `android-glue-mirror.sh` 守）。
+  // 修法：基线认领（`ota.rs: 3`、`screen_record.rs: 1`、`incall.rs 2 → 3`、`total 96 → 101`），**不**把可
+  // 认领项改写成假 `if let`。缺的不是门（门正确报红），是「新入树的手写丢弃须逐处认领」这一动作。
+  { id: 'F-DEV-174', module: 'three-files-entered-the-tree-with-unacknowledged-hand-written-let-underscore-must-use-sites-so-the-rust-discard-scan-ratchet-was-red-this-round-101-scanned-versus-a-baseline-total-of-96-two-of-the-screen-record-sites-are-real-defects-see-f-dev-173-the-six-in-ota-rs-and-incall-rs-are-existing-shapes-that-owed-an-acknowledgement-ota-rs-s-three-are-let-machine-fail-immediately-before-return-ok-otainstallresult-from-machine-and-installmachine-fail-answers-err-only-when-already-terminal-or-no-version-in-flight-install-rs-370-neither-reachable-here-and-the-effect-is-read-back-by-the-next-line-incall-rs-s-class-set-is-the-same-oncelock-install-once-family-the-baseline-already-records-for-app-set-and-vm-set-safe-because-the-generated-activity-is-never-recreated-configchanges-gated-by-android-glue-mirror-sh-fix-acknowledge-in-scripts-rust-discard-baseline-json-rather-than-rewriting-each-into-a-fake-if-let-err-that-would-have-nothing-to-do-with-e', files: ['scripts/rust-discard-baseline.json', 'crates/amos-tauri/src/ota.rs', 'crates/amos-tauri/src/incall.rs', 'crates/amos-ota/src/install.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1913', 'rust-discard-baseline.json', 'InstallMachine::fail', 'OnceLock', 'no stale baseline entries'], severity: 2 },
+
 
 
   // F-SH-925（REQ-A1906）—— 播客桥的 live 闸把**文档里的 off 拼法读成 ON**：`crates/amos-tauri/src/podcast.rs`
