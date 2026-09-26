@@ -7537,6 +7537,12 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-645', module: 'the-quick-setting-tiles-in-the-control-center-and-the-notification-center-handed-the-verdict-of-their-amos-settings-write-to-void-both-panels-wrapped-it-as-persist-next-writestorevalue-settings-key-next-so-a-refused-setitem-dispatches-no-store-changed-event-and-the-tile-simply-does-not-move-the-display-is-therefore-honest-which-is-why-it-hid-but-the-tap-becomes-a-silent-no-op-the-user-cannot-tell-a-refusal-from-a-frozen-tile-while-the-radios-and-the-brightness-slider-in-the-same-panels-both-speak-fix-route-both-wrappers-through-writestorevaluechecked-and-render-one-storeerrorbar-line-under-each-quick-grid-the-dark-mode-tile-shares-the-same-persist-but-still-flips-the-theme-immediately-because-that-visible-result-rides-amos-ui-theme-and-a-full-localstorage-fails-that-key-too-so-the-unsaved-line-is-the-accurate-thing-to-say', files: ['crates/amos-tauri/frontend-ts/src/svelte/ControlCenter.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/NotificationCenter.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/quick-tile-refusal.svelte.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1382', 'if (!writeStoreValueChecked(SETTINGS_KEY, next))'], severity: 2 },
   // F-SH-646（REQ-A1383）—— WebMan 下载行那一颗 ✕ 只写了裁决为真的那一支。`removeDownloadEntry` 修前逐字 `if (removeDownload(id)) { … downloadsTick++; showToast(t("webman.download.remove")); }`，**没有 `else`**；而 `lib/webman.ts::removeDownload` 在三种情形回 `false`（id 不合法 ∕ `index === -1` ∕ 三次 `saveDownloadStore` 全拒）。`downloads` 是 `$derived.by(() => { downloadsTick; return loadDownloads(); })`，拒写时不升 tick ⇒ 行照画，而屏幕上**一个字也没有** —— 一次没生效的删除与一颗坏掉的按钮一模一样。同文件四处同类动作两向都说话（书签行 ✕ REQ-A1258 ∕ `clearHistory` REQ-A1330 ∕ `onClearCompleted` ∕ 本函数 `removeNotAsked`）。`write-scan` 看不见它：它审的是**被丢弃的**裁决，而这里裁决**被读了** —— 缺的是 `else` 分支。修法：补 `else { showToast(t("webman.download.removeFailed")); }`，**不**升 `downloadsTick`（盘上没变，播报与画面不许互相打脸）。负控 ×3：M1 撤 `else` ⇒ 2 红；M2 失败句无条件播 ⇒ 恰 1 红（对照例），与 M1 不相交；M3 `else` 在但播「删除」⇒ 2 红。如实边界：`removeDownload` 的 `false` 仍混着两件事（行不在库里 vs 存储拒写），本轮只补另一半答复，未拆这个哨兵；真机未复核。
   { id: 'F-SH-646', module: 'webmans-download-row-remove-button-discarded-the-refusal-half-of-removedownload-s-answer-removedownloadentry-was-verbatim-if-removedownload-id-then-prune-tick-and-showtoast-webman-download-remove-with-no-else-so-when-all-three-savedownloadstore-retries-refused-the-row-stayed-drawn-downloadsttick-was-not-bumped-and-the-screen-said-nothing-at-all-a-removal-that-did-not-take-effect-was-indistinguishable-from-a-dead-button-removedownload-returns-false-for-three-different-facts-an-invalid-id-index-1-and-all-retries-refused-four-sibling-actions-in-the-same-file-all-speak-both-ways-the-bookmark-row-s-cross-req-a1258-clearhistory-req-a1330-onclearcompleted-and-this-function-s-own-remove-not-asked-arm-write-scan-cannot-see-it-because-it-audits-discarded-verdicts-and-this-verdict-is-read-the-missing-thing-is-an-else-arm-fix-add-the-else-arm-naming-webman-download-remove-failed-and-deliberately-do-not-bump-downloads-tick-because-nothing-changed-on-disk-and-the-message-must-not-contradict-the-screen', files: ['crates/amos-tauri/frontend-ts/src/svelte/WebManApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/webman-remove-download.svelte.test.ts', 'crates/amos-tauri/frontend-ts/src/i18n/locales/zh.ts', 'crates/amos-tauri/frontend-ts/src/i18n/locales/en.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1383', 'showToast(t("webman.download.removeFailed"))'], severity: 2 },
+  // F-SH-923（REQ-A461）—— 换号登记，原为 F-SH-646 **重复登记**（上一轮并发遗留的在制品：`docs/FMEA.md` 里
+  // `interpret_*` 那行与 WebMan 那行同用 F-SH-646，`fmea-gen --check` 一直因此红着，且此前多轮账本的如实边界
+  // 都逐字记着这条红是**对方**留下的、非本轮）。号归 WebMan 行（其账本对象早已以 F-SH-646 登记、且日期更早
+  // 2026-09-24），`interpret_*` 那行让至本号（2026-09-25）。内容一字未改（6 个 Interpret* ErrorCode +
+  // `interpret.rs` 的 `AmosResult<T>` + `interp.err.*` i18n + `statusForInterpError`）。
+  { id: 'F-SH-923', module: 'amos-tauri', files: ['crates/amos-tauri/src/error.rs', 'crates/amos-tauri/src/interpret.rs', 'crates/amos-tauri/frontend-ts/src/lib/backend.ts', 'crates/amos-tauri/frontend-ts/src/svelte/InterpApp.svelte', 'crates/amos-tauri/frontend-ts/src/i18n/locales/zh.ts', 'crates/amos-tauri/frontend-ts/src/i18n/locales/en.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A461', 'InterpretNoActive', 'InterpretSessionIdMismatch', 'interp.err.noActive', 'statusForInterpError'], severity: 2 },
   { id: 'F-SH-648', module: 'the-notification-centers-last-two-controls-handed-the-verdict-of-their-store-write-to-void-the-torch-tile-showed-nothing-on-a-refusal-and-the-rotation-lock-was-worse-it-moved-the-local-reading-first-rotation-mode-then-void-wrote-amos-rotation-and-writejson-dispatches-no-store-changed-event-on-a-refused-setitem-so-the-mirror-subscription-never-pulled-it-back-the-locked-pill-lit-data-frozen-turned-true-and-the-heading-swapped-to-the-new-mode-while-the-key-stayed-null-a-panel-asserting-a-preference-that-was-never-stored-and-saying-nothing-fix-the-unbridged-branch-writes-first-and-only-moves-the-reading-once-it-landed-reporting-common-storewritfailed-the-bridged-branch-keeps-rotation-next-because-that-is-the-devices-own-reported-state-and-only-adds-the-sentence-when-the-device-had-nothing-to-say-and-the-torchs-three-writes-go-through-a-new-commitflash-that-lights-its-own-storeerrorbar-the-notif-key-verbs-of-clear-dismiss-mark-read-still-discard-their-verdict-but-they-have-their-own-device-side-refusal-slot', files: ['crates/amos-tauri/frontend-ts/src/svelte/NotificationCenter.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/rotation-torch-refusal.svelte.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1385', 'if (!writeStoreValueChecked(ROTATION_KEY, { mode }))'], severity: 2 },
   // F-SH-649（REQ-A1390）—— `amos.home.layout` 的**第四个**写者把裁决丢在地上。`DesktopStage.svelte::onWindowMouseUp` 的 move 支收尾修前逐字 `saveLayout(next); layout = getLayout(APP_META.map((a) => a.id));`，而 `lib/amosStore.ts::saveLayout` 签 `void`（`export function saveLayout(layout): void { writeJson(LAYOUT_KEY, layout); }`）⇒ 存储拒写时下面那句**从盘上重读**读到的是旧顺序，图标**静静地弹回原位**、一个字也没有。同一枚键的另外三个写者早就门住了裁决（`Dock.svelte::onWindowDragEnd` REQ-A1346 ∕ F-SH-611、`Launchpad` 的隐藏 ∕ 还原 REQ-A1346 ∕ F-SH-611、`shellState.svelte.ts::applyLayout` REQ-A1378 ∕ F-SH-641）；REQ-A1378 那一轮把自己的写者数成「三个」—— 因为它是按**形状**（`_layout = next; saveLayout(next)`）枚举的，而桌面这一处从**另一个面**（桌面舞台，不是手机主屏）写同一个键，只有按**键**枚举才看得见。`write-scan` 也看不见：它的调用正则只认 `writeStoreValue(Checked)`，这里调的是 `saveLayout`。修法：改走 `writeStoreValueChecked(LAYOUT_KEY, next)`，被拒时置 `stageErr = t("common.storeWriteFailed")` 并渲染共用的 `StoreErrorBar`（testid `store-write-error`），与 `Dock` 的 `storeError` 同一条纪律。
   { id: 'F-SH-649', module: 'the-fourth-writer-of-amos-home-layout-discarded-the-verdict-of-its-write-the-desktop-stages-icon-drag-reorder-called-the-void-savelayout-and-then-reread-the-layout-from-disk-so-a-refused-store-write-left-the-old-order-on-disk-and-getlayout-sprang-the-icons-back-to-their-old-places-without-saying-a-word-a-drag-that-did-not-take-effects-and-a-broken-icon-look-identical-the-other-three-writers-of-the-same-key-were-already-gated-dock-s-onwindowdragend-req-a1346-f-sh-611-launchpads-hide-and-restore-req-a1346-f-sh-611-and-shellstate-s-applylayout-req-a1378-f-sh-641-the-req-a1378-round-counted-its-writers-as-three-because-it-enumerated-by-shape-layout-next-savelayout-next-and-this-surface-writes-the-same-key-from-a-different-face-the-desktop-stage-not-the-phone-home-only-enumeration-by-key-sees-it-write-scan-is-blind-too-its-call-regex-only-matches-writestorevaluechecked-fix-route-through-writestorevaluechecked-layout-key-next-set-stageerr-to-common-storewritefailed-and-render-the-shared-storeerrorbar-testid-store-write-error-clear-it-on-success-keeping-the-reread-because-both-branches-are-right-accepted-new-order-refused-old-order-the-screen-always-draws-what-is-on-disk', files: ['crates/amos-tauri/frontend-ts/src/svelte/DesktopStage.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/desktop-icon-drag-refusal.svelte.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1390', 'if (!writeStoreValueChecked(LAYOUT_KEY, next))'], severity: 2 },
@@ -8713,7 +8719,7 @@ const KNOWN_FAILURES = [
   // Unreadable(String) }`，`read_string` 的读经 `amos_jni::jni_call!`（失败即清异常并入 `Unreadable`）；两个消费者
   // 各配纯缝 `toggle_change_from_read` ∕ `report_from_read`，三个 upcall 字段（`direction`∕`state`∕`peer`）改经
   // `read_field`（`Unreadable` 记 `warn!` 后仍送「空 = 不主张」）。证据：红先 + 正控 + 三例负控（见 `incall::tests`）。
-  { id: 'F-TEL-050', module: 'amos-tauri', files: ['crates/amos-tauri/src/incall.rs', 'crates/amos-tauri/src/lib.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1871', 'enum StringRead', 'toggle_change_from_read', 'report_from_read'], severity: 6 },
+  { id: 'F-TEL-050', module: 'amos-tauri', files: ['crates/amos-tauri/src/incall.rs', 'crates/amos-tauri/src/lib.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1871', 'enum StringRead', 'toggle_change_from_read', 'report_from_read'], severity: 5 },
   // F-TEL-051（REQ-A1878）—— `SmsGlue.bind` 的首行幂等早退 `if (app != null) return` 连坐掉了它体内
   // **权限门控**的入站接收器注册：`SMS_RECEIVED` 动态接收器只在 `bind` 内注册、且注册前查 `RECEIVE_SMS`
   // （`if (!SmsPermissions.hasReceive(ctx)) { Log.i(…); return }`），而 `bind` 的第一个调用者
@@ -8755,7 +8761,7 @@ const KNOWN_FAILURES = [
   // `amos-mail` 新增 `MockMailProvider::snapshot()` ∕ `restore()`，`error.rs` 新增 `MailPersistFailed`
   // = `amos.mail.persist_failed`；读入侧 `preserve_unreadable_store` 把坏 store `rename` 成
   // `store.corrupt-<ns>` 后才空启。
-  { id: 'F-SH-921', module: 'amos-tauri', files: ['crates/amos-tauri/src/mail.rs', 'crates/amos-tauri/src/error.rs', 'crates/amos-mail/src/provider.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1898', 'persist_or_undo', 'preserve_unreadable_store', 'MailPersistFailed', 'a_failed_persist_undoes_the_mutation_and_reports_it', 'an_unreadable_store_is_preserved_not_silently_replaced'], severity: 6 },
+  { id: 'F-SH-921', module: 'amos-tauri', files: ['crates/amos-tauri/src/mail.rs', 'crates/amos-tauri/src/error.rs', 'crates/amos-mail/src/provider.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1898', 'persist_or_undo', 'preserve_unreadable_store', 'MailPersistFailed', 'a_failed_persist_undoes_the_mutation_and_reports_it', 'an_unreadable_store_is_preserved_not_silently_replaced'], severity: 5 },
   // F-SH-922（REQ-A1899）—— 一条**开机时按当时后端派生**的策略（媒体授权集），在后端被设备侧
   // JNI 附着**替换**之后从不重算。`MediaBridge::boot()` → `over(mock)` → `pre_grant` 只对 boot 的
   // `MockMediaProvider` 的 4 个集合（camera ∕ screenshots ∕ download ∕ recordings）授予读写；
@@ -9580,6 +9586,50 @@ const KNOWN_FAILURES = [
   // 文本钉住「这道门只读 `undoCode`、不得长回第二个 conjunct」，与 `sensor_host.rs` 钉 Kotlin 源码同一手法。
   // **如实边界**：端到端真机链路（Android 设置里选中「AmOS 输入法」并在第三方 app 里打字）仍未验收。
   { id: 'F-DEV-162', module: 'the-ime-forget-chip-visibility-gate-folded-two-independent-facts-a-nonempty-undo-code-and-a-nonempty-candidate-list-so-the-undo-affordance-was-gone-exactly-when-there-was-something-to-undo-because-a-freshly-learned-dictionary-word-is-the-commit-that-leaves-no-association-candidates-amos-ime-engine-predictions-returns-nothing-until-two-words-were-committed-fix-gate-on-the-undo-code-alone-via-a-top-level-pure-forgetchipvisible-pinned-on-a-host-jvm-and-drop-the-now-unused-total-parameter-plain-rust-text-pin-that-the-gate-reads-the-undo-code-alone', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AmosImeService.kt', 'crates/amos-tauri/android-glue/tests/com/amos/ai/glue/AmosImeServiceTest.kt', 'crates/amos-tauri/src/android_ime.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1896', 'forgetChipVisible', 'the_forget_chip_gate_reads_the_undo_code_alone', 'AmosImeServiceTest'], severity: 2 },
+  // F-DEV-164（REQ-A1900）—— 一个**权威、两个持有者**，而单例的「先到先得」只挡住了重复安装、没挡住**晚到者另管一台**。
+  // 进程级 `static SHARED: OnceLock<ImeBridge>` 自述「first wins is the only answer that cannot silently split the
+  // learner in two」；两个发布者都真实存在：`AmosImeService.onCreate` → `nativeAttach` → `shared_or_boot`（IME 侧，可能**先到**），
+  // `lib.rs::run` → `ImeBridge::boot()` + `install_shared`（宿主侧）。`install_shared` 原签名返回 `()`，于是宿主
+  // **无法得知**自己是否落败，转而把**自己那台新 boot** `.manage` 给全部 `ime_*` 命令 —— 同进程两台引擎、两个学习器、
+  // 同一个 `amos-ime.json`，各自 `persist()`（temp+rename，整文件）互相覆写，一边学的词被另一边抹掉。
+  // 可达性在真机抓到：第三方 app 聚焦输入框后 `adb shell run-as com.amos.ai kill -9 <pid>`，logcat 逐字
+  // `Scheduling restart of crashed service com.amos.ai/.glue.AmosImeService in 1000ms for connection` +
+  // `Start proc 13323:com.amos.ai/u0a211 for service {com.amos.ai/com.amos.ai.glue.AmosImeService}`
+  // —— **只为服务冷启、没有任何 Activity**；随后 `am start -n com.amos.ai/.MainActivity`，pid 仍 13323（同进程），
+  // logcat 出现 `AmosRust: amos::ime message=IME profile loaded path=…/files/amos-ime.json pins=0` —— 那是 `run()`
+  // 里**新 boot 的那台**在 `configure` 时读档（服务那台早在 `nativeAttach` 配过同一路径，只是当时 `host_log` 尚未
+  // 安装、服务侧那行**无订阅者**故不入 logcat）。既有测试全绿：`ime.rs` 现有 36 例含 REQ-A1880 的 `Clone` 共享，
+  // 全仓**无一条**调用 `install_shared`；`rust-unwired-scan` 只问「有没有调用者」，而这里有两个、各自都「合法」。
+  // 修法：`install_shared` 返回**真正共享的那台**（`SHARED.get_or_init(|| bridge).clone()`，先到先得且回答赢家；
+  // 用 `get_or_init` 而非 `set`+`get`+`expect` 以避开本 crate 的 `deny(clippy::expect_used)`），`lib.rs` 改为
+  // `let ime_bridge = ime::install_shared(ime::ImeBridge::boot());` —— 晚到的宿主**采纳**已发布的引擎。
+  // 红先不可编译（签名变更）：新增例逐字报 `error[E0599]: no method named 'fuzzy_toggle' found for unit type '()'`，
+  // 故补**可编译负控** `two_boots_are_disjoint_learners`（两台 `boot()` 各改各的、互不可见 ⇒ 「受管的那台就是共享的那台」
+  // 是可失败断言），并实测扰回 `bridge`（回候选者）⇒ 恰 1 红。
+  // 修后**真机差分已做**（装本轮含修的 arm64 debug APK，K-Touch S5 ∕ Android 14）：IME 先到序 `Start proc
+  // 13823:com.amos.ai/u0a211 for service {…AmosImeService}`（无 Activity），随后 `am start -n com.amos.ai/.MainActivity`
+  // （pid 仍 13823、MainActivity 聚焦、`desktop shell capabilities` 证 `run()` 真跑过）⇒「IME profile loaded」**0** 行
+  // （晚到宿主采纳了服务已配好的引擎，`configure(同一路径)` 走 `inner.path` 早退）；**修前** APK 同场景为 **1** 行；
+  // **对照组「应用先到」**（`Start proc 14131 … for next-top-activity {…MainActivity}`）为 **1** 行 ⇒ 该行在应出现时仍打印，
+  // 先到的 0 是修复而非哑日志。**回归**：系统 IME 仍渲染真候选（敲 `a` → `啊 啊 啊`）。
+  // 仍未做：双键盘交替学习的端到端回放（本轮证据是前提 + 修前∕修后差分 + 对照组）。
+  { id: 'F-DEV-164', module: 'the-android-process-can-be-cold-started-by-the-platform-for-the-ime-service-alone-before-the-system-ui-activity-ever-runs-so-amosimeservice-oncreate-nativeattach-shared-or-boot-publishes-the-services-engine-into-the-process-wide-shared-oncelock-first-and-the-host-then-arrives-late-in-lib-rs-run-boots-a-second-engine-and-install-shared-which-returned-unit-could-not-tell-the-caller-it-had-lost-so-lib-rs-managed-its-own-fresh-boot-as-the-type-every-ime-command-injects-leaving-two-engines-two-learners-and-one-amos-ime-json-whose-every-persist-is-a-whole-file-temp-plus-rename-so-each-side-overwrites-the-words-the-other-just-learned-exactly-the-split-the-singletons-own-doc-comment-promises-cannot-happen-reachable-and-device-confirmed-the-platform-restarted-the-crashed-service-and-started-the-process-for-the-imesservice-component-with-no-activity-then-mainactivity-in-the-same-pid-and-run-s-fresh-bridge-logged-ime-profile-loaded-for-the-same-path-the-service-had-already-configured-though-the-service-side-line-had-no-subscriber-yet-fix-install-shared-returns-the-instance-that-is-actually-shared-via-oncelock-get-or-init-which-is-first-writer-wins-and-answers-the-winner-without-an-expect-denied-by-the-crate-so-a-late-installer-adopts-the-published-engine', files: ['crates/amos-tauri/src/ime.rs', 'crates/amos-tauri/src/lib.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1900', 'a_late_installer_adopts_the_already_shared_bridge', 'two_boots_are_disjoint_learners'], severity: 4 },
+  // F-DEV-165（REQ-A1901）—— 这一份账本**自己的门**红着，且它报红的方式藏起了一半。
+  // 两条互不相干的数据缺陷（都在 `46f0c647` 全量落盘时进来）：①`docs/FMEA.md` 里 `F-SH-646` **重复登记**
+  // （WebMan 行 REQ-A1383 ∕ 2026-09-24 与 `interpret_*` 行 2026-09-25 同号，`--check` 的 `fmea-doc` 因此
+  // 一直 FAIL，此前多轮账本的如实边界逐字记着这条红「是并发轮留下的、非本轮」）；②两条账本对象的
+  // `severity` 是 **6**（`F-TEL-050` ∕ `F-SH-921`），越出本文件自订的 1-5 区间（462 ∕ 561 ∕ 108 条用 2 ∕ 3 ∕ 4，
+  // 仅此两条用 6）。③**承重的第三点**：`every failure has files and markers` 这一项把 `assert` 写在
+  // `for` 循环里，抛在**第一条**越界项上就中止 —— 它逐字只报 `F-TEL-050: severity 1-5`，而 `F-SH-921` 的
+  // 同一个 6 藏在它后面、从未被点名（这正是本仓的「一个门报一个、藏起兄弟」家族）。修法：数据侧
+  // ①`interpret_*` 那行让号至 `F-SH-923` 并补登记本对象（号归 WebMan 行，它更早、且其对象早已以 F-SH-646 登记）；
+  // ②两条 `severity` 6→5（同时把 FMEA 表里那两行的 S 与 RPN 一并对齐：`F-TEL-050` 6→5 ⇒ RPN 90→75，
+  // `F-SH-921` 6→5 ⇒ RPN 168→140，因该文件的约定是「对象 `severity` == 表内 S」，`F-SH-034` 等旧行逐字相合）；
+  // 门侧 ③把该检查改成**先收齐**再断言（`probs` 数组 + 一次 `assert(probs.length === 0, probs.join('; '))`），
+  // 一次点名全部越界项。证据：修前 `--self-test` 逐字只报一条；把两份 severity 扰回 9 的**副本**逐字报
+  // `F-TEL-050: severity 1-5; F-SH-921: severity 1-5`（两条同时点名）。修后 `--self-test` **12 ∕ 12 通过**、
+  // `--check` 退出码 **0**（`[OK] fmea-doc: 1168 failure modes documented`，重复号 FAIL 消失）。
+  { id: 'F-DEV-165', module: 'the-fmea-ledgers-own-gate-was-red-in-two-independent-ways-a-duplicate-row-id-column-and-two-inventory-severities-out-of-the-1-5-range-the-doc-check-failed-on-the-duplicate-f-sh-646-webman-req-a1383-2026-09-24-and-the-interpret-row-2026-09-25-both-claiming-it-while-the-severity-check-failed-on-f-tel-050-and-f-sh-921-both-at-6-and-the-severity-check-itself-aborted-on-the-first-offender-naming-only-f-tel-050-and-hiding-f-sh-921-so-fixing-the-named-one-still-left-self-test-red-fix-renumber-the-interpret-row-to-f-sh-923-and-register-it-cap-both-severities-at-5-recomputing-the-table-s-and-rpn-cells-and-collect-every-offender-before-asserting-so-the-check-names-all-of-them', files: ['scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1901', 'F-SH-923', "probs.join"], severity: 2 },
   // F-DEV-163（REQ-A1897）—— 一道**自证**的门：`android-component-scan.mjs` 的 `PLATFORM_ACTIONS` 是一张自撰的
   // 封闭表，它给系统 IME 的那一条写了**包名形状**的 `android.view.inputmethod.InputMethod`（就是类名小写，同本仓
   // 其余每个 action），而平台发现 IME 用的是 `new Intent(InputMethod.SERVICE_INTERFACE)`，那个常量的逐字值是
@@ -9938,11 +9988,17 @@ function cmdSelfTest() {
     {
       name: 'every failure has files and markers',
       run: () => {
+        // Collect *every* offender, not just the first. An `assert` inside the loop
+        // aborts on the earliest bad entry and hides its siblings — this check once
+        // named F-TEL-050 while a second entry (F-SH-921) sat at severity 6 unseen,
+        // so fixing the reported one still left `--self-test` red.
+        const probs = [];
         for (const f of KNOWN_FAILURES) {
-          assert(Array.isArray(f.files) && f.files.length >= 1, `${f.id}: need >=1 file`);
-          assert(Array.isArray(f.markers) && f.markers.length >= 1, `${f.id}: need >=1 marker`);
-          assert(f.severity >= 1 && f.severity <= 5, `${f.id}: severity 1-5`);
+          if (!Array.isArray(f.files) || f.files.length < 1) probs.push(`${f.id}: need >=1 file`);
+          if (!Array.isArray(f.markers) || f.markers.length < 1) probs.push(`${f.id}: need >=1 marker`);
+          if (!(f.severity >= 1 && f.severity <= 5)) probs.push(`${f.id}: severity 1-5`);
         }
+        assert(probs.length === 0, probs.join('; '));
       },
     },
     {

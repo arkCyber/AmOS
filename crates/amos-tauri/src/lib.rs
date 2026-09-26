@@ -352,11 +352,13 @@ pub fn run() {
     // The IME bridge is managed here *and* published process-wide: the Android
     // system IME (`crate::android_ime`) is bound by the platform in this same
     // process and must drive the very same engine, learner and profile file as the
-    // WebView's on-screen keyboard. The managed handle stays the type every
-    // `ime_*` command injects; the shared handle is a clone of the same `Arc`
-    // (REQ-A1880).
-    let ime_bridge = ime::ImeBridge::boot();
-    ime::install_shared(ime_bridge.clone());
+    // WebView's on-screen keyboard (REQ-A1880). `install_shared` answers with the
+    // instance that *is* shared: if the platform cold-started this process for the
+    // IME service, the service already published its engine (`shared_or_boot`) and
+    // this boot is discarded by adoption — otherwise the host would manage a second
+    // learner over the same profile file and the two would overwrite each other's
+    // picks. The managed handle stays the type every `ime_*` command injects.
+    let ime_bridge = ime::install_shared(ime::ImeBridge::boot());
 
     tauri::Builder::default()
         .manage(AiBridge::new())

@@ -128,12 +128,25 @@ pub const ANDROID_WINDOW: &str = "android-ime";
 /// service is bound before the Activity ever ran.
 static SHARED: std::sync::OnceLock<ImeBridge> = std::sync::OnceLock::new();
 
-/// Publish `bridge` as the shared instance. First writer wins; a later call is a
-/// no-op (the app and the JNI service may both race to install, and they race to
-/// install the *same* thing, so "first wins" is the only answer that cannot
-/// silently split the learner in two).
-pub fn install_shared(bridge: ImeBridge) {
-    let _ = SHARED.set(bridge);
+/// Publish `bridge` as the shared instance and answer with the instance that is
+/// **actually** shared.
+///
+/// First writer wins; a later call is a no-op. But it still returns the winner,
+/// because the losers are not always installing "the same thing": the platform can
+/// cold-start this process for the bound `InputMethodService` before the System UI
+/// Activity ever runs (`AmosImeService.onCreate` → `nativeAttach` →
+/// [`shared_or_boot`]), so the host's own [`ImeBridge::boot`] is then the late
+/// arrival. Returning the winner lets it **adopt** the service's engine; managing
+/// the fresh boot instead would leave two learners behind one `amos-ime.json`, each
+/// `persist` overwriting the other's picks — exactly the split this singleton exists
+/// to prevent.
+pub fn install_shared(bridge: ImeBridge) -> ImeBridge {
+    // `get_or_init` is first-writer-wins *and* answers with the winner, with no
+    // panic path: when the slot is empty `bridge` moves in and is what we return;
+    // when an earlier caller already installed one, `bridge` is dropped unused and
+    // the earlier instance comes back (the losing boot was a private learner that
+    // nothing ever drove).
+    SHARED.get_or_init(|| bridge).clone()
 }
 
 /// The shared bridge, booting a fallback configured at `profile` if none was
@@ -1603,5 +1616,56 @@ mod tests {
         bridge.key(ANDROID_WINDOW, "wo");
         assert_eq!(bridge.snapshot(ANDROID_WINDOW).input, "wo");
         assert_eq!(bridge.snapshot(MAIN).input, "", "MAIN must not see it");
+    }
+
+    /// Negative control for [`a_late_installer_adopts_the_already_shared_bridge`]:
+    /// two independent `boot()`s are two engines, so "the managed handle *is* the
+    /// shared engine" is an assertion a non-adopting fix can actually fail — it is
+    /// not a tautology of "there is one process". Never touches the process-wide
+    /// singleton, so it is order-independent and compiles with or without the fix.
+    #[test]
+    fn two_boots_are_disjoint_learners() {
+        let a = ImeBridge::boot();
+        let b = ImeBridge::boot();
+        a.fuzzy_toggle(MAIN, "z_zh").expect("known pair");
+        assert!(!a.snapshot(MAIN).strict, "A must see its own change");
+        assert!(
+            b.snapshot(MAIN).strict,
+            "a second boot must not see A's setting — two boots really are two learners"
+        );
+    }
+
+    /// The process has exactly one `AmosImeService` and one Tauri host, and both
+    /// must drive the same learner over the same `amos-ime.json`. The platform can
+    /// cold-start this process for the *service* first (`AmosImeService.onCreate` →
+    /// `nativeAttach` → [`shared_or_boot`]), so the host's own boot then arrives
+    /// second: `install_shared` must let it **adopt** the published engine instead of
+    /// managing a private second one. Two learners behind one file would clobber
+    /// each other's picks on every `persist` — exactly the split the singleton's
+    /// doc-comment promises cannot happen.
+    ///
+    /// Red-first note: the pre-fix `install_shared` answered `()` (no way to learn
+    /// which instance won), so this test **did not compile** against it — the
+    /// compiler refused `let service = install_shared(..)` (E0308). The disjoint
+    /// negative control above is the compilable half that proves the property has
+    /// teeth.
+    #[test]
+    fn a_late_installer_adopts_the_already_shared_bridge() {
+        // The service publishes its engine first (the IME-first cold start).
+        let service = install_shared(ImeBridge::boot());
+        // The host boots its own — and must be handed the service's, not its own.
+        let host_boot = ImeBridge::boot();
+        let host = install_shared(host_boot.clone());
+
+        host.fuzzy_toggle(ANDROID_WINDOW, "z_zh")
+            .expect("known pair");
+        assert!(
+            !service.snapshot(ANDROID_WINDOW).strict,
+            "the managed handle must be the shared engine, not a second boot"
+        );
+        assert!(
+            host_boot.snapshot(ANDROID_WINDOW).strict,
+            "the boot that lost the race keeps its own defaults — 'adopt' means the other one"
+        );
     }
 }
