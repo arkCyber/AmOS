@@ -404,6 +404,24 @@ pub enum ErrorCode {
     /// The command needs a foreground window (the in-call/recording gate,
     /// `recording.rs::require_recordings_foreground`) and there is none.
     ScreenRecordForegroundRequired,
+    // --- the Android system IME's entry point (REQ-A1904 — `ime.rs`) ---
+    /// `ime_system_open_picker` / `ime_system_open_settings` could not reach the
+    /// platform: this is a host/desktop build, no `Context` has been bound yet
+    /// (`MainActivity.onStart` has not run), or the glue class is not on the app's
+    /// loader. Distinct from [`Self::ImeSystemOpenFailed`] because the user can act on
+    /// it differently: nothing is going to launch until the app is really running.
+    ImeSystemGlueUnavailable,
+    /// The platform was reached and **refused** the launch (or the JNI call threw) —
+    /// e.g. a ROM with no input-method settings screen. The platform's own words are in
+    /// the message rather than folded into "not available".
+    ImeSystemOpenFailed,
+    /// `ime_system_open_picker` was refused by the platform's own precondition: nothing in
+    /// the window is accepting text, so there is no IME window for the keyboard switcher to be
+    /// drawn from and the platform returns having shown nothing. Distinct from
+    /// [`Self::ImeSystemOpenFailed`] because the user's next step differs — put the caret in a
+    /// text field, or use the settings door (`ime_system_open_settings`), which needs no input
+    /// connection — and because retrying this one unchanged cannot ever work.
+    ImeSystemNoTextEditor,
     // --- simultaneous interpretation (REQ-A461 follow-up: typed envelope) ---
     /// A session-driving command (`interpret_text` / `_audio` / `_pause` / `_resume` /
     /// `_stop` / `_restart` / `_abort` / `_end_of_speech`) was called with no active
@@ -678,6 +696,9 @@ impl ErrorCode {
             Self::ScreenRecordConfirmFailed => "amos.screenrecord.confirm_failed",
             Self::ScreenRecordDurationOutOfRange => "amos.screenrecord.duration_out_of_range",
             Self::ScreenRecordForegroundRequired => "amos.screenrecord.foreground_required",
+            Self::ImeSystemGlueUnavailable => "amos.ime.system_glue_unavailable",
+            Self::ImeSystemOpenFailed => "amos.ime.system_open_failed",
+            Self::ImeSystemNoTextEditor => "amos.ime.system_no_text_editor",
             Self::InterpretNoActive => "amos.interpret.no_active",
             Self::InterpretSessionIdMismatch => "amos.interpret.session_id_mismatch",
             Self::InterpretTextTooLong => "amos.interpret.text_too_long",
@@ -940,6 +961,9 @@ mod tests {
         ErrorCode::ScreenRecordConfirmFailed,
         ErrorCode::ScreenRecordDurationOutOfRange,
         ErrorCode::ScreenRecordForegroundRequired,
+        ErrorCode::ImeSystemGlueUnavailable,
+        ErrorCode::ImeSystemOpenFailed,
+        ErrorCode::ImeSystemNoTextEditor,
         ErrorCode::InterpretNoActive,
         ErrorCode::InterpretSessionIdMismatch,
         ErrorCode::InterpretTextTooLong,
@@ -995,7 +1019,7 @@ mod tests {
     /// its old value kept this test green. The set comparison against [`ALL_VARIANTS`] below
     /// closes that direction; the enum→list link stays a human obligation (see
     /// [`ALL_VARIANTS`]' doc for why stable Rust cannot close it here).
-    const FROZEN_VARIANT_COUNT: usize = 156;
+    const FROZEN_VARIANT_COUNT: usize = 159;
 
     #[test]
     fn wire_codes_are_frozen() {
@@ -1321,6 +1345,18 @@ mod tests {
                 ErrorCode::ScreenRecordForegroundRequired,
                 "amos.screenrecord.foreground_required",
             ),
+            (
+                ErrorCode::ImeSystemGlueUnavailable,
+                "amos.ime.system_glue_unavailable",
+            ),
+            (
+                ErrorCode::ImeSystemOpenFailed,
+                "amos.ime.system_open_failed",
+            ),
+            (
+                ErrorCode::ImeSystemNoTextEditor,
+                "amos.ime.system_no_text_editor",
+            ),
             (ErrorCode::InterpretNoActive, "amos.interpret.no_active"),
             (
                 ErrorCode::InterpretSessionIdMismatch,
@@ -1499,7 +1535,7 @@ mod tests {
     #[test]
     fn wm_frozen_count_is_pinned() {
         // Total variants = 156 (this run). 18 are window manager.
-        assert_eq!(FROZEN_VARIANT_COUNT, 156);
+        assert_eq!(FROZEN_VARIANT_COUNT, 159);
         let wm = ALL_VARIANTS
             .iter()
             // Match `amos.wm.<kind>` exactly — anything starting with `amos.wm.`

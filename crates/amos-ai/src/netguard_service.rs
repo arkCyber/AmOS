@@ -28,7 +28,11 @@
 //! daemon restart (a restored armed guard re-applies its restored rules). The
 //! file is outside the trust boundary, so a restored registry is re-validated
 //! before it becomes rules. Enforcement and the live audit counter stay
-//! runtime-only and are never fabricated from the file.
+//! runtime-only and are never fabricated from the file. A file that exists but
+//! cannot be read back is **moved aside** (`<name>.corrupt-<nonce>`), not
+//! overwritten: the path stays live for the next save, so silently starting
+//! empty on top of it would destroy the operator's only copy of their
+//! declarations.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -502,13 +506,66 @@ fn state_path_from_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Read the persisted state (armed intent + declared registry). A missing,
-/// unreadable or corrupt file yields the honest default: disarmed, no apps.
+/// Read the persisted state (armed intent + declared registry).
+///
+/// A **missing** file is the honest default — disarmed, no apps — and stays
+/// silent: nothing was there to lose. A file that *exists* but cannot be read
+/// back is a different fact, and it is **kept aside** (`<name>.corrupt-<nonce>`)
+/// before the default is used: [`NetGuardSvc::persist_snapshot`] keeps this same
+/// path live, so starting empty *on top of* it would let the next `SetAppEgress`
+/// or `Toggle` overwrite the operator's only copy of the declared egress
+/// registry. The returned default is unchanged — the file stays outside the
+/// trust boundary and its contents are still never trusted; what the aside buys
+/// is that the bytes are not destroyed (REQ-A1918 / F-AI-028).
 fn load_state(path: &Path) -> NetGuardState {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<NetGuardState>(&bytes).ok())
-        .unwrap_or_default()
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<NetGuardState>(&bytes) {
+            Ok(state) => state,
+            Err(e) => {
+                keep_state_aside(path, &format!("is unparseable: {e}"));
+                NetGuardState::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => NetGuardState::default(),
+        Err(e) => {
+            keep_state_aside(path, &format!("is unreadable: {e}"));
+            NetGuardState::default()
+        }
+    }
+}
+
+/// Move an unreadable/unparseable state file aside so a fresh snapshot cannot
+/// overwrite it, and report it. `persist_snapshot` keeps the original path live,
+/// so the aside is what stops the next save from destroying the operator's only
+/// copy of the declared registry. Mirrors `appstore::preserve_unreadable_registry`.
+fn keep_state_aside(path: &Path, reason: &str) {
+    match preserve_unreadable_state(path) {
+        Some(kept) => tracing::warn!(
+            "netguard state {} {reason}; kept at {} and starting with the default",
+            path.display(),
+            kept.display()
+        ),
+        None => tracing::warn!(
+            "netguard state {} {reason}; could not be moved aside, starting with the default",
+            path.display()
+        ),
+    }
+}
+
+/// Rename `path` to a `<name>.corrupt-<nonce>` sibling. `None` when there was
+/// nothing to keep (not a regular file) or the rename failed — the caller warns
+/// either way and still returns the default. (Renaming works even when the file
+/// itself cannot be read, since it is a directory operation.)
+fn preserve_unreadable_state(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
 }
 
 /// Write the state to `path` atomically; best-effort, never panics.
@@ -794,6 +851,49 @@ mod tests {
         ))
     }
 
+    /// A fresh, empty directory for a test that needs to look for a sibling
+    /// file next to the state path (not just the path itself).
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("amos-netguard-{tag}-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `*.corrupt-*` file the loader kept beside `dir`'s state file, if any.
+    fn corrupt_aside(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains("corrupt-"))
+    }
+
+    /// Counts WARN events so an assertion lands on the *observable* diagnostic
+    /// (a bootstrap has no caller to return a `Status` to, so tracing is the one
+    /// channel that tells the operator what happened).
+    struct WarnProbe(std::sync::Arc<AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
     /// REQ-A744 (F-SH-202): a persistence feature is only real if a production
     /// launcher turns it on. The daemon reads `AMOS_NETGUARD_STATE_PATH` and its
     /// own default is honest in-memory, so the on-device init rc is the thing
@@ -834,12 +934,92 @@ mod tests {
         let _ = std::fs::remove_file(&missing);
         assert!(!load_state(&missing).enabled, "missing file => disarmed");
 
-        let garbage = tmp_state_path("garbage");
+        // The corrupt arm also yields the default; since REQ-A1918 the file is
+        // kept aside rather than overwritten, so use a throwaway dir to clean up.
+        let dir = tmp_dir("load-garbage");
+        let garbage = dir.join("netguard-state.json");
         std::fs::write(&garbage, "{ not json").unwrap();
         let loaded = load_state(&garbage);
         assert!(!loaded.enabled, "corrupt file => disarmed (never crashes)");
         assert!(loaded.apps.is_empty(), "corrupt file => no declarations");
-        let _ = std::fs::remove_file(&garbage);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state file that exists but cannot be read back is **kept aside** before
+    /// the default is used, because `persist_snapshot` keeps this same path live:
+    /// without the aside, the next `SetAppEgress` (or `Toggle`) rewrites the file
+    /// from scratch and the operator's only copy of the declared egress registry
+    /// is gone. The loaded default is unchanged — the fix is about *not losing*
+    /// the bytes, not about trusting them (REQ-A1918 / F-AI-028).
+    #[test]
+    fn a_corrupt_state_file_is_kept_aside_before_the_next_save_overwrites_it() {
+        let dir = tmp_dir("state-corrupt");
+        let path = dir.join("netguard-state.json");
+        let original: &[u8] = b"{ this is not the netguard state";
+        std::fs::write(&path, original).unwrap();
+
+        let warns = std::sync::Arc::new(AtomicU64::new(0));
+        let loaded = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            load_state(&path)
+        };
+        assert!(!loaded.enabled, "a corrupt file still starts disarmed");
+        assert!(
+            loaded.apps.is_empty(),
+            "a corrupt file still declares no apps"
+        );
+        assert_eq!(
+            warns.load(Ordering::Relaxed),
+            1,
+            "the drop must be audible: bootstrap has no caller to return an error to"
+        );
+
+        let kept = corrupt_aside(&dir).expect("the unreadable state was kept beside the original");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            original,
+            "the bytes the operator left behind survive byte-for-byte"
+        );
+
+        // The proof that matters: a later save rewrites `path`, and the kept copy
+        // is still there to be recovered.
+        persist_state(&path, true, &BTreeMap::new());
+        assert!(path.exists(), "the live path is rewritten with fresh state");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            original,
+            "the aside is not the file a save touches"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Negative control, disjoint from the case above: a **missing** file is not
+    /// corruption. There is nothing to keep, so no aside is written and no
+    /// warning is emitted — the honest default the module doc names.
+    #[test]
+    fn a_missing_state_file_keeps_nothing_aside_and_stays_silent() {
+        let dir = tmp_dir("state-missing");
+        let path = dir.join("netguard-state.json");
+
+        let warns = std::sync::Arc::new(AtomicU64::new(0));
+        let loaded = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            load_state(&path)
+        };
+        assert!(!loaded.enabled);
+        assert!(loaded.apps.is_empty());
+        assert!(
+            corrupt_aside(&dir).is_none(),
+            "a missing file is not corruption; nothing is kept aside"
+        );
+        assert_eq!(
+            warns.load(Ordering::Relaxed),
+            0,
+            "a missing state file is the ordinary first boot, not a warning"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

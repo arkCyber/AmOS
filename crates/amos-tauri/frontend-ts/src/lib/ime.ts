@@ -22,7 +22,7 @@
  * mode a punctuation key is the **Chinese** glyph (`，。？！`); the half-width forms
  * live on the English page, and digits stay half-width in both modes.
  */
-import { invoke } from "./backend";
+import { bridgeDiag, invoke } from "./backend";
 import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 
 /** The nine fuzzy pairs, in display order (must match `amos_ime::FUZZY_PAIRS`). */
@@ -194,6 +194,121 @@ export async function imeLearningClear(): Promise<ImeState | null> {
 /** Undo the just-committed dictionary word (drop its learned pin). */
 export async function imeForgetLast(): Promise<ImeState | null> {
   return invoke<ImeState>("ime_forget_last");
+}
+
+/* ---- The Android **system** IME's entry point (REQ-A1904) -------------------- */
+
+/**
+ * What the **platform** says about AmOS's own keyboard, as
+ * `ime_system_status` answers it (mirror of `SystemImeStatus`).
+ *
+ * `enabled` / `selected` / `current_id` are `null` when the platform was never asked,
+ * and that is **not** the same as `false` / `""`: `false` is the platform's own
+ * sentence ("this keyboard is not enabled"), and folding "we could not ask" into it
+ * would print the platform's word for a question nobody answered (REQ-A775 /
+ * F-AND-007, the family `nfc_status` paid for).
+ */
+export interface SystemImeStatus {
+  available: boolean;
+  /** Why not, in the host's own words; `""` when `available`. */
+  reason: string;
+  enabled: boolean | null;
+  selected: boolean | null;
+  /** The platform's current keyboard id; `""` is the platform reporting *none*. */
+  current_id: string | null;
+}
+
+/**
+ * Which of the four things the user needs to be told, from the platform's answer
+ * alone. Pure, so the branch a device would take is pinned headlessly.
+ *
+ * The order matters and is the point of the function: `unavailable` is asked
+ * **before** any of the flags, because a status whose reads failed has no flags to
+ * read — a classifier that tested `enabled` first would answer `"disabled"` (a
+ * platform statement) for a device that never spoke.
+ */
+export type SystemImeState =
+  /** This build cannot ask the platform (a desktop/host build, or no bound Context). */
+  | "unavailable"
+  /** In force: AmOS's keyboard is the one the platform is using. */
+  | "current"
+  /** Enabled but another keyboard is in force — the ordinary Gboard case. */
+  | "enabled"
+  /** The platform says AmOS's keyboard is not in its enabled list. */
+  | "disabled"
+  /** The platform answered, but not in a shape this build recognises. */
+  | "unknown";
+
+export function imeSystemState(status: SystemImeStatus): SystemImeState {
+  if (!status.available) return "unavailable";
+  if (status.enabled === null) return "unknown";
+  if (!status.enabled) return "disabled";
+  if (status.selected === null) return "unknown";
+  return status.selected ? "current" : "enabled";
+}
+
+/** The platform's answer about AmOS's keyboard (never throws — see `SystemImeStatus`). */
+export async function imeSystemStatus(): Promise<SystemImeStatus | null> {
+  return invoke<SystemImeStatus>("ime_system_status");
+}
+
+/**
+ * Show the platform's keyboard switcher (lists **enabled** keyboards only).
+ *
+ * `true` when the platform took the request. The command returns `()`, which the wire
+ * carries as `null` — and the bridge *also* answers `null` for a refusal — so
+ * `result !== null` would be false even on success (REQ-A513). The one place the two
+ * are distinguishable is the diagnostic ledger, read back by command name, exactly as
+ * `spaces.ts::unitMutationOk` does it.
+ */
+export async function imeSystemOpenPicker(): Promise<boolean> {
+  await invoke<null>("ime_system_open_picker");
+  return bridgeDiag("ime_system_open_picker").ok;
+}
+
+/**
+ * Open the platform's input-method settings — the screen where AmOS 拼音 is
+ * **enabled**. This is the door a user who has never enabled it cannot reach from the
+ * picker, which lists enabled keyboards only.
+ *
+ * `true` when the platform took the request (see [`imeSystemOpenPicker`] for why the
+ * ledger, not the reply, is what says so).
+ */
+export async function imeSystemOpenSettings(): Promise<boolean> {
+  await invoke<null>("ime_system_open_settings");
+  return bridgeDiag("ime_system_open_settings").ok;
+}
+
+/** The two commands [`imeSystemFailureKey`] can be asked about. */
+export type ImeSystemOpenCommand = "ime_system_open_picker" | "ime_system_open_settings";
+
+/**
+ * Which sentence a refused `ime_system_open_*` earns — the one rule, so a refusal can never be
+ * rendered as "nothing happened" (`spacesFailure`, F-SH-577).
+ *
+ * The specific case is the picker's **platform precondition**, and it is the reason this rule
+ * exists: `showInputMethodPicker()` draws the switcher from the serving IME's window, so with
+ * nothing accepting text the platform returns having shown nothing (measured on the S5
+ * 2026-09-26: `mServedInputConnection=null` ⇒ no window, `mCurrentFocus` still AmOS's own
+ * activity; with a served connection the 「选择输入法」 dialog appeared). The glue now answers
+ * `no_editor` for that, which the host carries as `amos.ime.system_no_text_editor` — a retry
+ * word ("could not open the system screen. Please try again.") would be a lie about what the
+ * user must do, which is put the caret in a text field or use the settings door.
+ *
+ * `bridgeDiag` keeps one reading **per command name**, so the caller must pass the command its
+ * own `open()` just ran (with concurrent calls it reads the most recently completed one — this
+ * repo's established reading for an unseparable return value).
+ */
+export function imeSystemFailureKey(command: ImeSystemOpenCommand): string {
+  const diag = bridgeDiag(command);
+  if (diag.ok) return "ime.systemOpenFailed";
+  const detail =
+    diag.kind === "command-failed" && diag.detail && typeof diag.detail === "object"
+      ? (diag.detail as { code?: string })
+      : null;
+  return detail?.code === "amos.ime.system_no_text_editor"
+    ? "ime.systemNoTextEditor"
+    : "ime.systemOpenFailed";
 }
 
 /**

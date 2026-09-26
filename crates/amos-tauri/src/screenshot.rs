@@ -95,10 +95,44 @@ pub fn screenshot_dir_in(home: &Path) -> PathBuf {
     home.join(SCREENSHOT_REL_DIR)
 }
 
-/// The capture directory under the real user's home, or `None` when there is no home
-/// directory to resolve (`dirs::home_dir()` — never a guessed path).
-pub fn screenshot_dir() -> Option<PathBuf> {
-    Some(screenshot_dir_in(&dirs::home_dir()?))
+/// The refusal a platform with no capture tool owes the caller, **naming the OS**.
+///
+/// One spelling for both the pre-check ([`resolve_capture_dir`]) and the run
+/// ([`run_capture`]), so the two can never phrase the same refusal differently.
+fn unsupported_refusal(os: &str) -> String {
+    format!("screenshot capture is not implemented on {os} (macOS only for now)")
+}
+
+/// Whether this build has a capture tool. [`capture_command`] is the one authority, so
+/// this bit cannot drift from what a run would actually spawn.
+fn capture_supported() -> bool {
+    capture_command(Path::new("")).is_some()
+}
+
+/// The directory a capture should land in — or the refusal owed **first** (REQ-A1905).
+///
+/// The order is the whole point and is what this seam exists to pin. Resolving the home
+/// directory first (the shipped order) has two harms, both measured: on a platform that
+/// *does* have a home (Linux/Windows) the command went on to **create**
+/// `~/Pictures/Screenshots` as a side effect of a capture it then refused; and on Android
+/// — where there is no home directory — it answered 「no home directory」 instead of the
+/// 「not implemented on android」 this module's own honest boundary promises (the device
+/// answered exactly that, `screenshot_capture ERR no home directory: cannot resolve
+/// Pictures/Screenshots`, 2026-09-26). Answering a question the platform can already
+/// settle, before doing work that only the wrong answer justifies, is the fix.
+///
+/// Pure (the support bit and the home are injected), so both orders' difference is pinned
+/// without a filesystem or a device.
+pub fn resolve_capture_dir(
+    supported: bool,
+    os: &str,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    if !supported {
+        return Err(unsupported_refusal(os));
+    }
+    home.map(|h| screenshot_dir_in(&h))
+        .ok_or_else(|| "no home directory: cannot resolve Pictures/Screenshots".to_string())
 }
 
 /// macOS's capture tool writing a silent (`-x`, no shutter sound) PNG to `out`.
@@ -128,12 +162,14 @@ pub fn capture_command(out: &Path) -> Option<(&'static str, Vec<String>)> {
 }
 
 /// Run the platform capture into `out`, or a typed refusal naming why it could not.
+///
+/// The no-tool arm is **defence in depth**: [`screenshot_capture`] already refuses an
+/// unsupported platform through [`resolve_capture_dir`], so a caller arriving here has a
+/// tool — but a caller that resolved its directory by another route still gets the same
+/// refusal ([`unsupported_refusal`], one spelling with the pre-check).
 fn run_capture(out: &Path) -> Result<(), String> {
     let Some((program, args)) = capture_command(out) else {
-        return Err(format!(
-            "screenshot capture is not implemented on {} (macOS only for now)",
-            std::env::consts::OS
-        ));
+        return Err(unsupported_refusal(std::env::consts::OS));
     };
     let status = std::process::Command::new(program)
         .args(&args)
@@ -172,14 +208,14 @@ fn confirm_written(out: &Path, exists: &impl Fn(&Path) -> bool) -> Result<String
 /// Tauri command: capture the screen into `~/Pictures/Screenshots`, returning the
 /// **absolute path** of the file that was written.
 ///
-/// `Err(String)` is a typed refusal — no home directory, an unwritable directory, an
-/// unsupported platform, the tool failing, or (the subtle one) the tool reporting
-/// success while leaving no file behind. A capture that did not happen must not look
-/// like one that did.
+/// `Err(String)` is a typed refusal — an unsupported platform (named, and settled
+/// **before** any directory is resolved or created), no home directory, an unwritable
+/// directory, the tool failing, or (the subtle one) the tool reporting success while
+/// leaving no file behind. A capture that did not happen must not look like one that did
+/// — and a refusal must not do the work only a capture would justify.
 #[tauri::command]
 pub fn screenshot_capture() -> Result<String, String> {
-    let dir = screenshot_dir()
-        .ok_or_else(|| "no home directory: cannot resolve Pictures/Screenshots".to_string())?;
+    let dir = resolve_capture_dir(capture_supported(), std::env::consts::OS, dirs::home_dir())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let out = unique_in(&dir, &filename_for(now_ms()), &|p| p.exists());
     run_capture(&out)?;
@@ -297,5 +333,63 @@ mod tests {
     #[test]
     fn other_platforms_have_no_capture_command() {
         assert_eq!(capture_command(Path::new("/tmp/a.png")), None);
+    }
+
+    #[test]
+    fn an_unsupported_platform_is_named_not_blamed_on_the_home_directory() {
+        // Android: no home directory *and* no tool. The message the user reads must be
+        // the one the module promises ("not implemented on <OS>"), not a home-dir error
+        // that names neither the platform nor the real reason. Measured on the device
+        // (2026-09-26) the shipped order answered 「no home directory」.
+        assert_eq!(
+            resolve_capture_dir(false, "android", None).unwrap_err(),
+            "screenshot capture is not implemented on android (macOS only for now)"
+        );
+        // Linux/Windows: a home *is* resolvable, and the shipped order went on to
+        // create `~/Pictures/Screenshots` for a capture it then refused. The platform
+        // is settled first, so nothing is resolved to create.
+        assert_eq!(
+            resolve_capture_dir(false, "linux", Some(PathBuf::from("/home/me"))).unwrap_err(),
+            "screenshot capture is not implemented on linux (macOS only for now)"
+        );
+    }
+
+    #[test]
+    fn a_supported_platform_with_no_home_is_the_home_refusal() {
+        assert_eq!(
+            resolve_capture_dir(true, "macos", None).unwrap_err(),
+            "no home directory: cannot resolve Pictures/Screenshots"
+        );
+    }
+
+    #[test]
+    fn a_supported_platform_with_a_home_resolves_the_photos_directory() {
+        assert_eq!(
+            resolve_capture_dir(true, "macos", Some(PathBuf::from("/Users/me"))).unwrap(),
+            PathBuf::from("/Users/me/Pictures/Screenshots")
+        );
+    }
+
+    #[test]
+    fn the_command_settles_support_before_it_touches_the_filesystem() {
+        // The seam is only load-bearing if `screenshot_capture` goes through it: a
+        // command that still resolved `dirs::home_dir()` first would refuse with the
+        // home message on Android however correct the seam is. Pin the call order in
+        // the command body itself.
+        let src = include_str!("screenshot.rs");
+        let body = src
+            .split("pub fn screenshot_capture")
+            .nth(1)
+            .expect("the command body");
+        let resolve = body
+            .find("resolve_capture_dir(")
+            .expect("the command resolves through the seam");
+        let create = body
+            .find("create_dir_all(")
+            .expect("the command creates the directory");
+        assert!(
+            resolve < create,
+            "support must be settled before the directory is created"
+        );
     }
 }

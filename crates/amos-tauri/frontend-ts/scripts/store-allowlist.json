@@ -218,6 +218,10 @@
       "kind": "host-error-code"
     },
     {
+      "key": "amos.ime.system_no_text_editor",
+      "kind": "host-error-code"
+    },
+    {
       "key": "amos.spaces.delete_last",
       "kind": "configuration"
     },

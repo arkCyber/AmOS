@@ -355,6 +355,33 @@ means in Chinese mode* are platform facts Kotlin cannot import from TypeScript, 
 `ImeOverlay.svelte`. `ImeLayoutTest`/`ImeRoutingTest` pin every value against the TS
 literals so the two cannot drift unnoticed.
 
+**The entry point is inside AmOS (REQ-A1904).** The service above is only reachable
+once it is *enabled* **and** *selected*, and those are platform facts a user could
+previously change only by leaving AmOS for `设置 → 语言与输入法 → 键盘` — AmOS's own
+Input-method settings page managed the **WebView** keyboard only, so a page named
+"输入法" said nothing about the other half. `ImePage` now carries a second section
+(testids `settings-ime-system-*`) that asks the platform and offers both platform
+surfaces. `ime_system_status` reads `InputMethodManager.enabledInputMethodList` and
+`Settings.Secure.DEFAULT_INPUT_METHOD` through `ImeSettingsGlue` (compared by
+`ComponentName` equality against `AmosImeService`); `ime_system_open_picker` runs the
+platform's `showInputMethodPicker()`; `ime_system_open_settings` opens
+`Settings.ACTION_INPUT_METHOD_SETTINGS`. Presence is carried in the type all the way
+down: a read that reached the platform answers `state \t ok` with all three facts —
+`current \t <id>`, `ours_enabled \t 0|1`, `ours_selected \t 0|1` — and a read that
+could not reach it answers `state \t unavailable` with a `why \t <reason>` record
+instead. `parse_platform_ime_facts` requires **all three** facts on `state=ok`: a
+partial `ok` is an error rather than a `false`-filled field, so a fact the glue did not
+write never becomes 「未启用」. On any error `system_ime_status_from` yields one shape —
+`available: false`, `enabled`/`selected`/`current_id` all `None`, the host's own
+`reason` — and the page renders 「本平台不适用」 with that reason, never 「未启用」.
+(`imeSystemState` keeps an `unknown` branch for an `available` answer whose flags came
+back `None`, i.e. a shape this host does not emit; it is the page refusing to fold an
+absent reading into a sentence rather than a state the user will see.) The three
+`Option`s exist so "we could not ask" is structurally distinct from "the platform said
+no": the anti-fold rule (`nfc_status`, F-AND-007) applied to a keyboard. The glue holds
+no state: it answers the same two platform questions every call, so the section is
+re-asked on `visibilitychange` when the user comes back from the platform screen.
+
 ## Honest boundaries
 
 * **The system IME is device-verified end to end, including the profile path; the
@@ -381,6 +408,41 @@ literals so the two cannot drift unnoticed.
   Chinese-glyph commit and the pager are pinned by the host JUnit suite
   (`ImeRoutingTest`/`ImeLayoutTest`) and exercised by tap on device, but the
   host-JVM suite remains their authority.
+* **The platform's picker draws only while a connection is being served, and the glue
+  now answers that precondition instead of claiming success (REQ-A1904, REQ-A1915).**
+  `showInputMethodPicker()` hangs its 「选择输入法」 window on the serving IME's window,
+  so with no input connection it returns having drawn nothing. On the handset a real CDP
+  click on an injected `<input>` produced
+  `mServedInputConnection=RemoteInputConnectionImpl{… mServedView=com.amos.ai.RustWebView}`
+  and the dialog appeared (`mCurrentFocus=Window{… Select input method}`); a bare
+  synthetic `.focus()` left `mServedInputConnection=null` and the call did nothing
+  (`mInputMethodWindow` `mHasSurface=false isVisible=false`, focus still AmOS's own
+  activity). `InputMethodManager.isAcceptingText()` is precisely
+  `mServedInputConnection != null` — the field the measurement read — so
+  `ImeSettingsGlue.openPicker` asks it first and returns `STATUS_NO_EDITOR` without
+  calling the platform; Rust maps that to `ErrorCode::ImeSystemNoTextEditor`
+  (`amos.ime.system_no_text_editor`) and the page prints a sentence naming the real next
+  step (put the caret in a field, or use the settings door) rather than a retry that
+  cannot work. Before this the glue returned `STATUS_OK` and the button reported success
+  over a screen nobody saw. So `ime_system_open_picker` is device-verified *with* a
+  connection, and the no-connection branch is device-measured (the `null` reading above);
+  the `isAcceptingText()` guard itself has no host-JVM test — `InputMethodManager` does
+  not exist on a plain JVM — so the device is its authority.
+* **The new Settings section is device-verified by DOM read, not by a screenshot
+  (REQ-A1904).** The three commands and the two platform surfaces they open were
+  exercised end to end on `YY000286` (three status readings taken verbatim, the
+  Settings activity focused, the picker dialog drawn), *and* the section was rendered
+  on the handset by driving the shell over CDP (`设置 → 输入法`) and reading its own
+  testids in two live platform states: with `AmosImeService` selected,
+  `settings-ime-system-state` read 「使用中」 and `settings-ime-system-current` read
+  「当前键盘：com.amos.ai/.glue.AmosImeService」; after `adb shell ime set
+  …LatinIME` and a fresh navigation, the same two read 「已启用，未使用」 and
+  「当前键盘：com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME」.
+  So `imeSystemState`'s `current` and `enabled` branches are both exercised against
+  real platform state, and the re-ask on mount is exercised too. The record is a DOM
+  read rather than a screenshot only because both captures of those two states landed
+  on the page-transition animation — the DOM read is the more precise artifact
+  regardless.
 * **The IME lives in the app's process, so the app's lifecycle is the keyboard's.**
   The service is declared in `com.amos.ai` with no `android:process`, so it is
   hosted by the same process as the Tauri Activity — the price of reaching the same

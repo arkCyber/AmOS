@@ -144,14 +144,22 @@ describe("ShareSheet.svelte (REQ-A703)", () => {
     expect(host.container.querySelector('[data-testid="share-target-s-share"]')).toBeNull();
   });
 
-  test("没有可分享指令时给出提示，但面板仍可拷贝", async () => {
+  test("没有可分享指令时，面板仍列内置目标与拷贝，且不说「没有目标」（REQ-A1917）", async () => {
     saveShortcuts([shortcut("s-quiet", "不分享", false)]);
     const host = render(ShareSheet);
     await settle();
     openShareSheet({ kind: "text", value: "x", title: "t" });
     await settle();
 
-    expect(host.container.textContent ?? "").toContain(zh["shareSheet.noTargets"]);
+    // A library with nothing opted in is **not** an empty sheet any more: Notes and Mail
+    // are always offered for a text payload (REQ-A1458). The old rule keyed the empty
+    // state on the shortcut half alone, so this exact configuration drew the
+    // 「还没有快捷指令，打开快捷指令开启分享菜单」 hint *underneath* two working rows —
+    // a sentence telling the user there is nowhere to hand the content off to, an inch
+    // below two places to hand it off to.
     expect(host.container.querySelector('[data-testid="share-target-copy"]')).toBeTruthy();
+    expect(host.container.querySelector('[data-testid="share-target-notes"]')).toBeTruthy();
+    expect(host.container.querySelector('[data-testid="share-target-mail"]')).toBeTruthy();
+    expect(host.container.textContent ?? "").not.toContain(zh["shareSheet.noTargets"]);
   });
 });

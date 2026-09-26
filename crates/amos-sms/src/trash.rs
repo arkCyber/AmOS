@@ -222,10 +222,22 @@ impl SmsTrash {
     /// Store the replacement preview for `thread_id` (replaces any previous
     /// one; bounded to one per thread, and only threads with trashed content
     /// get one).
-    pub fn set_preview(&mut self, o: PreviewOverride) {
+    ///
+    /// The text is bounded to [`MAX_BODY_CHARS`] **here**, at the only door into
+    /// the store, because [`Self::from_json`] refuses a stored `last_text` over
+    /// that cap: the writer must not be able to produce a file its own reader
+    /// rejects. The bound is not hypothetical — the producer redacts the whole
+    /// ingested body and redaction *grows* it (`redact.rs`: output is input plus
+    /// up to 2 bytes per masked span, since an amount span can be a single digit
+    /// while `REDACTION` is three characters), so a body the wire accepted can
+    /// redact past the cap. Redaction runs **before** this clamp, so truncating
+    /// here can never store an unmasked tail; and a preview is a display excerpt
+    /// of a body the protocol already caps at [`MAX_BODY_CHARS`].
+    pub fn set_preview(&mut self, mut o: PreviewOverride) {
         if o.thread_id.trim().is_empty() {
             return; // defensive: a blank thread id can never match a live thread
         }
+        o.last_text = clamp_preview_text(o.last_text);
         match self
             .previews
             .iter_mut()
@@ -323,36 +335,40 @@ impl SmsTrash {
         // Newest first; a total key (Reverse) keeps the sort deterministic and
         // clippy-clean (`sort_by_key` over the closure comparator).
         entries.sort_by_key(|e| std::cmp::Reverse(e.trashed_ms));
+        // An *absent* `previews` key is a legitimate minimal/older shape (no
+        // overrides stored); a *present* key of the wrong shape is an error, never
+        // silence — the same two-facts split the `entries` block keeps.
         let mut previews = Vec::new();
-        if let Some(list) = v.get("previews").and_then(Value::as_array) {
-            if list.len() > cap {
-                return Err(SmsError::Invalid(format!(
-                    "trash json has {} previews; cap is {cap}",
-                    list.len()
-                )));
-            }
-            for (i, p) in list.iter().enumerate() {
-                let thread_id = req_str(p, "thread_id", i)?;
-                if thread_id.trim().is_empty() {
+        match v.get("previews") {
+            None => {}
+            Some(Value::Array(list)) => {
+                if list.len() > cap {
                     return Err(SmsError::Invalid(format!(
-                        "trash preview {i} has a blank id"
+                        "trash json has {} previews; cap is {cap}",
+                        list.len()
                     )));
                 }
-                let last_text = p
-                    .get("last_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .chars()
-                    .take(MAX_BODY_CHARS)
-                    .collect::<String>();
-                previews.push(PreviewOverride {
-                    thread_id,
-                    at_last_ts_ms: req_i64(p, "at_last_ts_ms", i)?,
-                    last_text,
-                    last_ts_ms: req_i64(p, "last_ts_ms", i)?,
-                    unread: p.get("unread").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    hidden: p.get("hidden").and_then(Value::as_bool).unwrap_or(false),
-                });
+                for (i, p) in list.iter().enumerate() {
+                    let thread_id = req_str(p, "thread_id", i)?;
+                    if thread_id.trim().is_empty() {
+                        return Err(SmsError::Invalid(format!(
+                            "trash preview {i} has a blank id"
+                        )));
+                    }
+                    previews.push(PreviewOverride {
+                        thread_id,
+                        at_last_ts_ms: req_i64(p, "at_last_ts_ms", i)?,
+                        last_text: req_text(p, "last_text", i)?,
+                        last_ts_ms: req_i64(p, "last_ts_ms", i)?,
+                        unread: req_u32(p, "unread", i)?,
+                        hidden: req_bool(p, "hidden", i)?,
+                    });
+                }
+            }
+            Some(_) => {
+                return Err(SmsError::Invalid(
+                    "trash json 'previews' is not an array".into(),
+                ))
             }
         }
         Ok(Self {
@@ -401,6 +417,52 @@ fn req_i64(v: &Value, key: &str, i: usize) -> Result<i64, SmsError> {
     v.get(key)
         .and_then(Value::as_i64)
         .ok_or_else(|| SmsError::Invalid(format!("trash json [{i}] missing '{key}'")))
+}
+
+/// One required bool field. Mirrors [`crate::wire`]'s `req_bool` rule (REQ-A1772):
+/// a missing/wrong field is an honest error, never a silent default — a fabricated
+/// `hidden = false` would show a thread whose *every* message is trashed.
+fn req_bool(v: &Value, key: &str, i: usize) -> Result<bool, SmsError> {
+    v.get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| SmsError::Invalid(format!("trash json [{i}] missing '{key}'")))
+}
+
+/// One required unsigned count. Mirrors [`crate::wire`]'s `req_u32` rule
+/// (REQ-A1786): a missing field is an honest error rather than a fabricated `0`
+/// badge, and an out-of-range value **saturates** instead of wrapping — a count
+/// is a measurement, so `u32::MAX` keeps the "there is something unread" fact
+/// where a `0` mints a small number the file never held.
+fn req_u32(v: &Value, key: &str, i: usize) -> Result<u32, SmsError> {
+    v.get(key)
+        .and_then(Value::as_u64)
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .ok_or_else(|| SmsError::Invalid(format!("trash json [{i}] missing '{key}'")))
+}
+
+/// One required preview text. A body over [`MAX_BODY_CHARS`] is refused, not
+/// silently truncated — mirrors [`crate::wire`]'s `clamp_body` ("a protocol
+/// violation, not a silently-truncated message").
+fn req_text(v: &Value, key: &str, i: usize) -> Result<String, SmsError> {
+    let s = req_str(v, key, i)?;
+    if s.chars().count() > MAX_BODY_CHARS {
+        return Err(SmsError::Invalid(format!(
+            "trash json [{i}] '{key}' exceeds {MAX_BODY_CHARS} characters"
+        )));
+    }
+    Ok(s)
+}
+
+/// The **writer's** half of `req_text`'s cap: bound a preview on its way into
+/// the store to the same [`MAX_BODY_CHARS`], so `to_json` → `from_json` is total
+/// for every state this store can hold. A cap, not a rewrite — a text already
+/// within the bound is returned untouched (no allocation), which is why the
+/// boundary is `>` and not `>=` on both sides.
+fn clamp_preview_text(text: String) -> String {
+    if text.chars().count() <= MAX_BODY_CHARS {
+        return text;
+    }
+    text.chars().take(MAX_BODY_CHARS).collect()
 }
 
 #[cfg(test)]
@@ -613,6 +675,155 @@ mod tests {
         assert!(
             t.previews().is_empty(),
             "blank thread id cannot match anything"
+        );
+    }
+
+    /// Build one-preview JSON so each leaf perturbs exactly one field (`None`
+    /// omits the key entirely — the "missing" case).
+    fn preview_json(last_text: Option<&str>, unread: Option<&str>, hidden: Option<&str>) -> String {
+        let mut fields = vec![
+            r#""thread_id":"1""#.to_string(),
+            r#""at_last_ts_ms":10"#.to_string(),
+            r#""last_ts_ms":5"#.to_string(),
+        ];
+        if let Some(t) = last_text {
+            fields.push(format!("\"last_text\":{t}"));
+        }
+        if let Some(u) = unread {
+            fields.push(format!("\"unread\":{u}"));
+        }
+        if let Some(h) = hidden {
+            fields.push(format!("\"hidden\":{h}"));
+        }
+        format!(
+            r#"{{"version":1,"entries":[],"previews":[{{{}}}]}}"#,
+            fields.join(",")
+        )
+    }
+
+    #[test]
+    fn previews_present_but_wrong_shaped_is_an_error_while_absent_is_empty() {
+        // A *present* key of the wrong shape is a protocol violation, not silence:
+        // the old `if let Some(list) = …as_array()` folded it into "no previews"
+        // and hid the corruption.
+        assert!(SmsTrash::from_json(
+            r#"{"version":1,"entries":[],"previews":"nope"}"#,
+            DEFAULT_TRASH_CAP
+        )
+        .is_err());
+        // An *absent* key stays legitimate (a minimal/older file) …
+        assert!(SmsTrash::from_json(r#"{"version":1,"entries":[]}"#, DEFAULT_TRASH_CAP).is_ok());
+        // … and an empty array is the ordinary "no overrides" shape.
+        let t = SmsTrash::from_json(
+            r#"{"version":1,"entries":[],"previews":[]}"#,
+            DEFAULT_TRASH_CAP,
+        )
+        .unwrap();
+        assert!(t.previews().is_empty());
+    }
+
+    #[test]
+    fn a_preview_missing_a_field_is_an_error_not_a_fabricated_default() {
+        let ok = preview_json(Some(r#""x""#), Some("1"), Some("true"));
+        assert!(SmsTrash::from_json(&ok, DEFAULT_TRASH_CAP).is_ok());
+        // `hidden` absent: a fabricated `false` would show a thread whose every
+        // message is trashed.
+        let no_hidden = preview_json(Some(r#""x""#), Some("1"), None);
+        assert!(SmsTrash::from_json(&no_hidden, DEFAULT_TRASH_CAP).is_err());
+        // `unread` absent: a fabricated `0` would drop a real badge.
+        let no_unread = preview_json(Some(r#""x""#), None, Some("false"));
+        assert!(SmsTrash::from_json(&no_unread, DEFAULT_TRASH_CAP).is_err());
+        // `last_text` absent: a fabricated `""` would draw an empty preview.
+        let no_text = preview_json(None, Some("0"), Some("false"));
+        assert!(SmsTrash::from_json(&no_text, DEFAULT_TRASH_CAP).is_err());
+    }
+
+    #[test]
+    fn a_preview_unread_above_u32_saturates_instead_of_wrapping() {
+        // 2^32 as a u64 used to wrap to `0` through `as u32`.
+        let j = preview_json(Some(r#""x""#), Some("4294967296"), Some("false"));
+        let t = SmsTrash::from_json(&j, DEFAULT_TRASH_CAP).unwrap();
+        assert_eq!(t.previews()[0].unread, u32::MAX);
+        // An ordinary value passes through unchanged (positive control).
+        let j = preview_json(Some(r#""x""#), Some("7"), Some("false"));
+        let t = SmsTrash::from_json(&j, DEFAULT_TRASH_CAP).unwrap();
+        assert_eq!(t.previews()[0].unread, 7);
+    }
+
+    #[test]
+    fn a_preview_text_over_the_protocol_limit_is_refused_not_truncated() {
+        let too_long = "a".repeat(MAX_BODY_CHARS + 1);
+        let j = preview_json(Some(&format!("\"{too_long}\"")), Some("0"), Some("false"));
+        assert!(SmsTrash::from_json(&j, DEFAULT_TRASH_CAP).is_err());
+        // Exactly at the limit is accepted (boundary control).
+        let at_limit = "a".repeat(MAX_BODY_CHARS);
+        let j = preview_json(Some(&format!("\"{at_limit}\"")), Some("0"), Some("false"));
+        let t = SmsTrash::from_json(&j, DEFAULT_TRASH_CAP).unwrap();
+        assert_eq!(t.previews()[0].last_text.chars().count(), MAX_BODY_CHARS);
+    }
+
+    /// A **writer** must not be able to produce a file its own reader refuses
+    /// (REQ-A1919). `from_json` caps a stored `last_text` at [`MAX_BODY_CHARS`],
+    /// and the only producer of `last_text` redacts the *whole* ingested body —
+    /// and redaction grows it (`redact.rs`: output is input plus up to 2 bytes
+    /// per masked span, since a masked amount span can be a single digit while
+    /// `REDACTION` is three characters). So a body the wire accepted can redact
+    /// past the cap, be written, and be refused on the next start — where the
+    /// bridge `warn!`s and **starts empty**, and the next save makes that loss
+    /// permanent. `set_preview` is the one door into the store, so the bound
+    /// lives there.
+    #[test]
+    fn a_preview_longer_than_the_protocol_cap_is_bounded_by_the_store() {
+        let mut t = SmsTrash::new();
+        t.set_preview(PreviewOverride {
+            thread_id: "1".into(),
+            at_last_ts_ms: 10,
+            last_text: "a".repeat(MAX_BODY_CHARS + 50),
+            last_ts_ms: 5,
+            unread: 0,
+            hidden: false,
+        });
+        assert_eq!(
+            t.previews()[0].last_text.chars().count(),
+            MAX_BODY_CHARS,
+            "the stored preview is bounded where it enters the store"
+        );
+        let back = SmsTrash::from_json(&t.to_json(), DEFAULT_TRASH_CAP)
+            .expect("what this store writes, this store must read");
+        assert_eq!(back.previews(), t.previews(), "and it round-trips");
+    }
+
+    /// The bound is a *cap*, not a rewrite: an ordinary preview is stored
+    /// verbatim, including exactly at the limit (the same boundary `req_text`
+    /// keeps with `>` rather than `>=`).
+    #[test]
+    fn a_preview_at_the_cap_is_stored_unchanged() {
+        let at_cap = "a".repeat(MAX_BODY_CHARS);
+        let mut t = SmsTrash::new();
+        t.set_preview(PreviewOverride {
+            thread_id: "1".into(),
+            at_last_ts_ms: 10,
+            last_text: at_cap.clone(),
+            last_ts_ms: 5,
+            unread: 2,
+            hidden: true,
+        });
+        assert_eq!(t.previews()[0].last_text, at_cap);
+        assert_eq!(t.previews()[0].unread, 2);
+        assert!(t.previews()[0].hidden);
+    }
+
+    /// Negative control, disjoint from the case above: the fix is in the
+    /// **writer**, never the reader — a hand-written file that still carries an
+    /// over-long preview must keep answering `Err` (REQ-A1916's rule stands; a
+    /// reader relaxed to accept it would load a shape this version never wrote).
+    #[test]
+    fn a_hand_written_file_over_the_cap_is_still_refused() {
+        let too_long = "a".repeat(MAX_BODY_CHARS + 1);
+        let j = preview_json(Some(&format!("\"{too_long}\"")), Some("0"), Some("false"));
+        assert!(
+            SmsTrash::from_json(&j, DEFAULT_TRASH_CAP).is_err(),
+            "the reader is untouched: an over-cap preview on disk is still a violation"
         );
     }
 }

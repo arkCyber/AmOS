@@ -598,6 +598,40 @@ mod tests {
         assert!(out.len() <= text.len() * 2 + 8, "output must stay bounded");
     }
 
+    /// The one producer that can hand the trash store a preview its own reader
+    /// refuses (REQ-A1919): redaction **grows** the text, and it is applied to
+    /// the whole body, so a body the wire accepted can come out over
+    /// `MAX_BODY_CHARS` — the cap `trash::from_json` enforces on a stored
+    /// `last_text`. The growth is the module doc's ("input length plus at most 2
+    /// bytes per masked span"): a masked span may be a **single digit** while
+    /// `REDACTION` is three characters.
+    ///
+    /// Pinned against the authority constant rather than a local literal, so a
+    /// change to either cap fails here instead of on a user's trash file.
+    #[test]
+    fn a_redacted_body_can_grow_past_the_protocol_body_cap() {
+        let body = "余额1".repeat(crate::wire::MAX_BODY_CHARS / 3);
+        assert!(
+            body.chars().count() <= crate::wire::MAX_BODY_CHARS,
+            "the fixture must itself be a body the wire would have accepted, got {} chars",
+            body.chars().count()
+        );
+        let out = masked("95588", &body);
+        assert!(
+            out.chars().count() > crate::wire::MAX_BODY_CHARS,
+            "masked body grew from {} to {} chars, but the trash store refuses a stored \
+             preview over {} — the writer must bound it",
+            body.chars().count(),
+            out.chars().count(),
+            crate::wire::MAX_BODY_CHARS
+        );
+        assert!(
+            out.starts_with("余额***"),
+            "the amount is still masked, so the clamp this motivates can never store an \
+             unmasked tail: masked text is what gets truncated"
+        );
+    }
+
     #[test]
     fn full_width_digits_are_an_honest_limitation() {
         // Documented: full-width digits are not recognized — less masking, no

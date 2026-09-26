@@ -100,3 +100,24 @@ describe("HealthApp.svelte — the no-reading banner names its cause (REQ-A1886)
     expect(txt(h)).not.toContain(zh["health.noSensor"]);
   });
 });
+
+/**
+ * HealthApp.svelte — a sample whose only scalar the screen refuses is no reading (REQ-A1902).
+ *
+ * The banner was withheld because the sample's `heart_rate_bpm` was not `null` — but the cell
+ * beside it draws `normalizeHeartRate(...)`, which refuses anything outside 25–250. A contact
+ * artifact reporting 12 bpm clears the Rust seam (which only refuses a non-positive rate), so
+ * the screen ended up showing three `—` (steps `—`, pulse `—`, calories `—`) with no sentence
+ * explaining anything. The banner and the cell must read the same value.
+ */
+describe("HealthApp.svelte — a refused pulse is no reading either (REQ-A1902)", () => {
+  test("an out-of-range heart rate keeps the banner, it does not blank the screen silently", async () => {
+    installBridge({ timestamp_ms: Date.now(), steps_total: null, heart_rate_bpm: 12 });
+    const h = render(HealthApp);
+    await settle();
+
+    // The pulse cell refuses 12, so `—` is on screen; the banner must say why.
+    expect(txt(h)).toContain(zh["health.noReadingYet"]);
+    expect(txt(h)).not.toContain(zh["health.noSensor"]);
+  });
+});

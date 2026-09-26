@@ -4,9 +4,11 @@
    *
    * The visible half of the two-sided share contract. A producing surface (Files,
    * for now) calls `openShareSheet({ kind, value, title })`; this island lists the
-   * handlers: every shortcut whose `quickActions` includes `shareSheet` (toggled in
-   * the Shortcuts editor), plus the built-in Copy. Choosing a shortcut runs it with
-   * the payload as `input`; the run is recorded in the shared execution log.
+   * handlers: the built-in destinations that accept the payload's kind (`lib/shareTargets`
+   * — Notes / Mail), every shortcut whose `quickActions` includes `shareSheet` (toggled in
+   * the Shortcuts editor), plus the built-in Copy. A built-in hands the content to its app's
+   * deep-link channel as a draft; a shortcut runs with the payload as `input`, and the run is
+   * recorded in the shared execution log.
    *
    * Renders nothing while closed, so it is safe to mount unconditionally in Shell.
    */
@@ -226,7 +228,18 @@
         </p>
       {/if}
 
-      {#if targets.length === 0}
+      <!--
+        The empty state is about the sheet having **no destination at all**, not about
+        the shortcut half being empty (REQ-A1917). It used to test `targets.length === 0`
+        — true when the shortcut library has nothing opted in — while the built-in rows
+        above are offered for every payload kind (`builtinTargetsFor`), so the default
+        configuration drew 「还没有快捷指令。打开「快捷指令」开启「出现在分享菜单」。」
+        directly under working Notes and Mail rows: the screen asserting there is nowhere
+        to share to, an inch below two places to share to, and pointing the user at
+        shortcuts they do not need in order to share at all. The hint is the sheet's
+        *empty* state, so it may only stand where the sheet really is empty.
+      -->
+      {#if builtins.length === 0 && targets.length === 0}
         <p class="mt-2 px-3 text-xs text-neutral-500 dark:text-neutral-400">
           {t("shareSheet.noTargets")}
         </p>

@@ -41,6 +41,8 @@ use amos_ime::{
 };
 use serde::Serialize;
 
+use crate::error::{AmosError, ErrorCode};
+
 /// File name inside the app data dir.
 pub const IME_FILE: &str = "amos-ime.json";
 
@@ -843,6 +845,306 @@ pub fn ime_forget_last(
     bridge: tauri::State<'_, ImeBridge>,
 ) -> Result<ImeStateOut, String> {
     Ok(bridge.forget_last(window.label()))
+}
+
+/* ---- The Android system IME's in-app entry point ---------------------------- */
+
+/// The Kotlin glue object that answers the platform's input-method state.
+///
+/// **Dotted**, because it is handed to `glue_class` → `ClassLoader#loadClass`, which
+/// takes a binary name — the slashed JNI form `find_class` wants would not load (the
+/// `BLE_CLASS` convention; REQ-A1866 / F-AND-017 is the round that paid for it).
+#[cfg(feature = "android")]
+pub(crate) const SYSTEM_IME_GLUE_CLASS: &str = "com.amos.ai.glue.ImeSettingsGlue";
+
+/// What the **platform** says about AmOS's own input method.
+///
+/// The fields are `Option` on purpose. `enabled` / `selected` are answers the platform
+/// may never have given, and `false` is itself a platform **statement** ("this keyboard
+/// is not enabled" / "another keyboard is in force"). Folding "we could not ask" into
+/// `false` would put that sentence in the platform's mouth — the family `nfc_status`
+/// paid for, where five distinct failures all reached the screen as "this device has no
+/// NFC hardware" (REQ-A775 / F-AND-007).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SystemImeStatus {
+    /// Can this build ask the platform at all — an Android build with a bound `Context`
+    /// and the glue class on the app's loader?
+    pub available: bool,
+    /// Why not, in the host's own words (`""` when `available`). Invariant:
+    /// `available == reason.is_empty()`, the same one `RecordingCaptureStatus` keeps.
+    pub reason: String,
+    /// Is AmOS's keyboard in the platform's **enabled** list? `None` = not asked.
+    pub enabled: Option<bool>,
+    /// Is AmOS's keyboard the platform's **current** one? `None` = not asked.
+    pub selected: Option<bool>,
+    /// The platform's current keyboard id — what `selected` was compared against.
+    /// `None` = not asked; `Some("")` is the platform reporting *no* keyboard selected.
+    pub current_id: Option<String>,
+}
+
+/// The four records `ImeSettings.ok(…)` writes, as this side reads them.
+///
+/// Every field is a **measurement**: the struct cannot be built unless all three fact
+/// records were present, which is what makes the `Option`s on [`SystemImeStatus`]
+/// honest — their absence means the Kotlin half wrote `unavailable`, not that a parser
+/// defaulted them.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PlatformImeFacts {
+    pub current_id: String,
+    pub ours_enabled: bool,
+    pub ours_selected: bool,
+}
+
+/// Read the line/tab wire `ImeSettings` writes (`ImeSettingsTest.kt` pins those exact
+/// bytes; this is the other end of the same contract).
+///
+/// A record is `<name>\t<value>` up to the next newline; the value is everything after
+/// the first tab. Unknown records are ignored so a future Kotlin field is additive, but
+/// the three facts are **required** on `ok` — a missing one is an error, never a
+/// default (see [`PlatformImeFacts`]).
+pub(crate) fn parse_platform_ime_facts(wire: &str) -> Result<PlatformImeFacts, String> {
+    let mut state = None;
+    let mut current = None;
+    let mut enabled = None;
+    let mut selected = None;
+    let mut why = None;
+    for line in wire.lines() {
+        let Some((name, value)) = line.split_once('\t') else {
+            continue;
+        };
+        match name {
+            "state" => state = Some(value),
+            "current" => current = Some(value),
+            "ours_enabled" => enabled = Some(value),
+            "ours_selected" => selected = Some(value),
+            "why" => why = Some(value),
+            _ => {}
+        }
+    }
+    match state {
+        Some("ok") => {
+            let (Some(current), Some(enabled), Some(selected)) = (current, enabled, selected)
+            else {
+                return Err(
+                    "the platform's answer was missing a current/enabled/selected record"
+                        .to_string(),
+                );
+            };
+            Ok(PlatformImeFacts {
+                current_id: current.to_string(),
+                ours_enabled: parse_flag(enabled, "ours_enabled")?,
+                ours_selected: parse_flag(selected, "ours_selected")?,
+            })
+        }
+        Some("unavailable") => Err(format!(
+            "Android could not be asked: {}",
+            why.unwrap_or("no reason given")
+        )),
+        Some(other) => Err(format!("the platform answer's state was {other:?}")),
+        None => Err("the platform's answer had no state record".to_string()),
+    }
+}
+
+/// A `0`/`1` flag. Anything else is an error rather than a `false`: an unreadable field
+/// is not a measurement of "no".
+fn parse_flag(value: &str, name: &str) -> Result<bool, String> {
+    match value {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        other => Err(format!("the {name} record was {other:?}, not 0 or 1")),
+    }
+}
+
+/// The one place a platform answer — or this build's inability to ask — becomes the
+/// struct the UI reads. Pure, so every shape is pinned by a unit test rather than only
+/// by a device.
+pub(crate) fn system_ime_status_from(reply: Result<String, String>) -> SystemImeStatus {
+    match reply.and_then(|wire| parse_platform_ime_facts(&wire)) {
+        Ok(facts) => SystemImeStatus {
+            available: true,
+            reason: String::new(),
+            enabled: Some(facts.ours_enabled),
+            selected: Some(facts.ours_selected),
+            current_id: Some(facts.current_id),
+        },
+        Err(reason) => SystemImeStatus {
+            available: false,
+            reason,
+            enabled: None,
+            selected: None,
+            current_id: None,
+        },
+    }
+}
+
+/// The platform's answer to "launch this surface".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImeOpenOutcome {
+    /// The platform took the request.
+    Opened,
+    /// No `InputMethodManager` on the `Context` (never seen on a device).
+    Unavailable,
+    /// The platform refused, or the call threw.
+    Denied,
+    /// Nothing in this window is accepting text, so the platform's picker had no IME window to
+    /// hang its switcher on and drew nothing (measured; see the glue's `STATUS_NO_EDITOR`).
+    /// This is a **refusal to report success**, not a failure of the platform.
+    NoEditor,
+    /// A word the glue does not emit — a contract drift between the two halves.
+    Unknown,
+}
+
+/// Map one `ImeSettingsGlue.STATUS_*` word to an outcome.
+///
+/// The one place the glue's spellings live on this side, so a rename on either side is a
+/// failing unit test rather than a user who presses the button and sees nothing — the
+/// `RotationGlue` precedent (`rotation_outcome_from_status`, F-TAU-021).
+pub(crate) fn ime_open_outcome_from_status(status: &str) -> ImeOpenOutcome {
+    match status {
+        "ok" => ImeOpenOutcome::Opened,
+        "unavailable" => ImeOpenOutcome::Unavailable,
+        "denied" => ImeOpenOutcome::Denied,
+        "no_editor" => ImeOpenOutcome::NoEditor,
+        _ => ImeOpenOutcome::Unknown,
+    }
+}
+
+/// The platform's answer about the input method, or this build's honest inability.
+#[cfg(feature = "android")]
+pub(crate) fn ask_the_platform_for_system_ime() -> Result<String, String> {
+    call_system_ime_glue("status")
+}
+
+/// Ask the platform to **show its keyboard switcher**.
+#[cfg(feature = "android")]
+pub(crate) fn ask_the_platform_to_show_ime_picker() -> Result<String, String> {
+    call_system_ime_glue("openPicker")
+}
+
+/// Ask the platform to open its **input-method settings** screen.
+#[cfg(feature = "android")]
+pub(crate) fn ask_the_platform_for_ime_settings() -> Result<String, String> {
+    call_system_ime_glue("openSettings")
+}
+
+/// Call one `(Context) -> String` static on [`SYSTEM_IME_GLUE_CLASS`].
+///
+/// The class is resolved through the bound `Context`'s loader rather than *named* at the
+/// call site: `call_static_method(&str, …)` is a `find_class` one step removed, and a
+/// tokio worker's loader cannot see `com.amos.ai.glue.*` (REQ-A1866 / F-AND-017;
+/// `jni-exception-scan.mjs` rule 3 fails the build for it). Resolving is correct from
+/// any thread, so this stays right if these commands ever become `async`.
+#[cfg(feature = "android")]
+fn call_system_ime_glue(member: &str) -> Result<String, String> {
+    crate::ble::android_jni::with_context_result(|ctx, env| {
+        let class = crate::ble::android_jni::glue_class(env, ctx, SYSTEM_IME_GLUE_CLASS)?;
+        let class: &::jni::objects::JClass<'_> = class.as_obj().into();
+        let sig = "(Landroid/content/Context;)Ljava/lang/String;";
+        let args = [::jni::objects::JValue::Object(ctx.as_ref())];
+        let value = amos_jni::jni_call!(env, env.call_static_method(class, member, sig, &args))
+            .map_err(|e| e.to_string())?;
+        // The owned object is bound to a local rather than chained: `get_string` borrows
+        // through the `JString` view it is converted into, so a temporary would be freed
+        // at the end of that statement (E0716).
+        let object = match value {
+            ::jni::objects::JValueOwned::Object(object) => object,
+            _ => return Err(format!("{member} answered with a non-object")),
+        };
+        if object.is_null() {
+            return Err(format!("{member} answered null"));
+        }
+        let text = env
+            .get_string((&object).into())
+            .map_err(|e| e.to_string())?;
+        Ok(String::from(text))
+    })
+}
+
+#[cfg(not(feature = "android"))]
+pub(crate) fn ask_the_platform_for_system_ime() -> Result<String, String> {
+    Err(host_without_ime_glue())
+}
+
+#[cfg(not(feature = "android"))]
+pub(crate) fn ask_the_platform_to_show_ime_picker() -> Result<String, String> {
+    Err(host_without_ime_glue())
+}
+
+#[cfg(not(feature = "android"))]
+pub(crate) fn ask_the_platform_for_ime_settings() -> Result<String, String> {
+    Err(host_without_ime_glue())
+}
+
+#[cfg(not(feature = "android"))]
+fn host_without_ime_glue() -> String {
+    "this build has no Android input-method glue (host/desktop target)".to_string()
+}
+
+/// Tauri command: what does the **platform** say about AmOS's own keyboard?
+///
+/// Returns the value directly rather than a `Result`, mirroring
+/// `screen_record_capability`: "this build cannot ask" is a **fact** the UI renders,
+/// not a failed read, and an `Err` would be indistinguishable from the command being
+/// missing. The failure's own sentence rides in [`SystemImeStatus::reason`].
+#[tauri::command]
+pub fn ime_system_status() -> SystemImeStatus {
+    system_ime_status_from(ask_the_platform_for_system_ime())
+}
+
+/// Tauri command: show the platform's keyboard switcher.
+#[tauri::command]
+pub fn ime_system_open_picker() -> Result<(), AmosError> {
+    let status = ask_the_platform_to_show_ime_picker().map_err(glue_unavailable)?;
+    check_ime_open(ime_open_outcome_from_status(&status))
+}
+
+/// Tauri command: open the platform's input-method settings — the screen where AmOS
+/// 拼音 is **enabled**, which is the door a user who has never enabled it cannot reach
+/// from the picker (that one lists enabled keyboards only).
+#[tauri::command]
+pub fn ime_system_open_settings() -> Result<(), AmosError> {
+    let status = ask_the_platform_for_ime_settings().map_err(glue_unavailable)?;
+    check_ime_open(ime_open_outcome_from_status(&status))
+}
+
+/// The one failure the two launchers can hit *before* the platform is reached: no bound
+/// `Context`, or the glue class is not on the app's loader. Both mean "this build cannot
+/// ask", which is [`ErrorCode::ImeSystemGlueUnavailable`] — the same word
+/// `ime_system_status` carries as a *fact* rather than an `Err`.
+fn glue_unavailable(reason: String) -> AmosError {
+    AmosError::new(ErrorCode::ImeSystemGlueUnavailable, reason)
+}
+
+/// Turn a glue outcome into the command's answer. `Opened` is the only success: a word
+/// the glue never emits is a contract drift, and reporting it as "opened" would tell the
+/// user a screen came up that did not.
+pub(crate) fn check_ime_open(outcome: ImeOpenOutcome) -> Result<(), AmosError> {
+    match outcome {
+        ImeOpenOutcome::Opened => Ok(()),
+        // The glue's own word for "this Context has no `InputMethodManager`". Asking the
+        // platform a *different* question here (e.g. `status`) would be a second JNI call
+        // about something else and would report its reason for the wrong failure.
+        ImeOpenOutcome::Unavailable => Err(AmosError::new(
+            ErrorCode::ImeSystemGlueUnavailable,
+            "this build has no Android input-method glue (host/desktop target)",
+        )),
+        ImeOpenOutcome::Denied => Err(AmosError::new(
+            ErrorCode::ImeSystemOpenFailed,
+            "the platform refused to open the input-method surface",
+        )),
+        // Its own code, not `ImeSystemOpenFailed`: the user's next step is different — put the
+        // caret in a text field (or use the settings door, which needs no input connection) —
+        // and "could not open the screen" would send them to retry something that cannot work.
+        ImeOpenOutcome::NoEditor => Err(AmosError::new(
+            ErrorCode::ImeSystemNoTextEditor,
+            "nothing in this window is accepting text, so the platform had no keyboard window to \
+             draw its switcher over",
+        )),
+        ImeOpenOutcome::Unknown => Err(AmosError::new(
+            ErrorCode::ImeSystemOpenFailed,
+            "the input-method glue answered a status word this build does not know",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1667,5 +1969,205 @@ mod tests {
             host_boot.snapshot(ANDROID_WINDOW).strict,
             "the boot that lost the race keeps its own defaults — 'adopt' means the other one"
         );
+    }
+
+    /* ---- the Android system IME's entry point (REQ-A1904) -------------------- */
+
+    /// The exact bytes `ImeSettingsTest.kt::aSuccessfulReadWritesEveryFactLine` pins.
+    ///
+    /// Copied here rather than generated, so a change on either side is a red test on
+    /// that side and the two must be re-agreed. `ImeSettings.ok` is the authority for
+    /// the shape; this is the reader's half of the same contract.
+    const ANDROID_SELECTED_WIRE: &str = "state\tok\n\
+         current\tcom.amos.ai/.glue.AmosImeService\n\
+         ours_enabled\t1\n\
+         ours_selected\t1\n";
+
+    #[test]
+    fn the_pinned_kotlin_wire_reads_as_facts() {
+        let facts =
+            parse_platform_ime_facts(ANDROID_SELECTED_WIRE).expect("the pinned bytes parse");
+        assert_eq!(
+            facts,
+            PlatformImeFacts {
+                current_id: "com.amos.ai/.glue.AmosImeService".to_string(),
+                ours_enabled: true,
+                ours_selected: true,
+            }
+        );
+    }
+
+    /// Enabled but **not** in force — the ordinary state for a user who enabled the
+    /// keyboard and stayed on Gboard. The two flags must not be conflated.
+    #[test]
+    fn an_enabled_but_unselected_keyboard_is_two_separate_facts() {
+        let wire = "state\tok\n\
+             current\tcom.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n\
+             ours_enabled\t1\n\
+             ours_selected\t0\n";
+        let facts = parse_platform_ime_facts(wire).expect("parses");
+        assert!(facts.ours_enabled, "AmOS's keyboard is in the enabled list");
+        assert!(!facts.ours_selected, "but LatinIME is the current one");
+        assert_eq!(facts.current_id, parts::latin_ime());
+    }
+
+    /// "No keyboard is selected" is a *measurement*: `current` is an empty value, not an
+    /// absent record. Reading it as absence would turn a platform statement into silence.
+    #[test]
+    fn an_empty_current_id_is_a_measurement_not_an_absence() {
+        let facts =
+            parse_platform_ime_facts("state\tok\ncurrent\t\nours_enabled\t0\nours_selected\t0\n")
+                .expect("the empty current record is present, so this parses");
+        assert_eq!(facts.current_id, "");
+        assert!(!facts.ours_enabled);
+        assert!(!facts.ours_selected);
+    }
+
+    /// A read that did not reach the platform writes **no fact lines** — so it must be an
+    /// `Err` here, never an `Ok` with defaulted `false`s (the `nfc_status` family,
+    /// REQ-A775 / F-AND-007).
+    #[test]
+    fn an_unavailable_answer_is_an_error_carrying_the_platforms_words() {
+        let err =
+            parse_platform_ime_facts("state\tunavailable\nwhy\tSecurityException: no access\n")
+                .expect_err("a failed read is not a set of facts");
+        assert!(err.contains("SecurityException: no access"), "got {err:?}");
+    }
+
+    /// The three facts are required on `ok`: a truncated wire is an error, not a default.
+    #[test]
+    fn a_missing_fact_record_is_an_error_not_a_default() {
+        for wire in [
+            "state\tok\ncurrent\tx\nours_enabled\t1\n",
+            "state\tok\ncurrent\tx\nours_selected\t1\n",
+            "state\tok\nours_enabled\t1\nours_selected\t1\n",
+        ] {
+            assert!(
+                parse_platform_ime_facts(wire).is_err(),
+                "{wire:?} is missing a required record"
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_word_this_build_does_not_know_is_an_error() {
+        assert!(parse_platform_ime_facts("state\tmaybe\n").is_err());
+        assert!(
+            parse_platform_ime_facts("current\tx\n").is_err(),
+            "no state record"
+        );
+    }
+
+    /// A flag is `0`/`1`; anything else is unreadable, and an unreadable flag must not
+    /// become `false` (which is itself a platform sentence).
+    #[test]
+    fn a_flag_that_is_not_zero_or_one_is_an_error() {
+        let err = parse_platform_ime_facts(
+            "state\tok\ncurrent\tx\nours_enabled\ttrue\nours_selected\t0\n",
+        )
+        .expect_err("`true` is not the wire's spelling");
+        assert!(err.contains("ours_enabled"), "got {err:?}");
+    }
+
+    /// An unknown record is ignored, so a future Kotlin field is additive rather than a
+    /// breaking change to this parser.
+    #[test]
+    fn an_unknown_record_does_not_break_the_parse() {
+        let wire = "state\tok\ncurrent\tx\nfuture\twhatever\nours_enabled\t0\nours_selected\t0\n";
+        assert_eq!(
+            parse_platform_ime_facts(wire)
+                .expect("the extra record is additive")
+                .current_id,
+            "x"
+        );
+    }
+
+    /// The invariant the UI leans on: `available` **iff** there is no `reason`. It holds
+    /// by shape — the two arms cannot both be written — so this pins the shape, not two
+    /// hand-written sentences agreeing with each other.
+    #[test]
+    fn availability_and_a_reason_are_mutually_exclusive() {
+        let yes = system_ime_status_from(Ok(ANDROID_SELECTED_WIRE.to_string()));
+        assert!(yes.available && yes.reason.is_empty());
+        assert_eq!(yes.enabled, Some(true));
+        assert_eq!(yes.selected, Some(true));
+        assert_eq!(
+            yes.current_id.as_deref(),
+            Some("com.amos.ai/.glue.AmosImeService")
+        );
+
+        let no = system_ime_status_from(Err("no glue".to_string()));
+        assert!(!no.available && no.reason == "no glue");
+        // The three facts are `None`, **not** `Some(false)`: nothing was asked.
+        assert_eq!((no.enabled, no.selected, no.current_id), (None, None, None));
+    }
+
+    /// A wire that cannot be read leaves the facts absent — the same shape as "never
+    /// asked", because in both cases the platform did not state them.
+    #[test]
+    fn an_unreadable_wire_leaves_every_fact_absent() {
+        let status = system_ime_status_from(Ok("state\tunavailable\nwhy\tboom\n".to_string()));
+        assert!(!status.available);
+        assert!(status.reason.contains("boom"), "got {status:?}");
+        assert_eq!(
+            (status.enabled, status.selected, status.current_id),
+            (None, None, None)
+        );
+    }
+
+    /// The one place the glue's words live. `Unknown` is the caller's fallback for a word
+    /// it does not know — reporting `Opened` for one would tell the user a screen came up
+    /// that did not.
+    #[test]
+    fn the_glues_status_words_map_to_outcomes() {
+        assert_eq!(ime_open_outcome_from_status("ok"), ImeOpenOutcome::Opened);
+        assert_eq!(
+            ime_open_outcome_from_status("unavailable"),
+            ImeOpenOutcome::Unavailable
+        );
+        assert_eq!(
+            ime_open_outcome_from_status("denied"),
+            ImeOpenOutcome::Denied
+        );
+        assert_eq!(
+            ime_open_outcome_from_status("no_editor"),
+            ImeOpenOutcome::NoEditor,
+            "the platform's own precondition, answered as its own word"
+        );
+        assert_eq!(
+            ime_open_outcome_from_status("Opened"),
+            ImeOpenOutcome::Unknown,
+            "the spelling is the wire's, not this enum's"
+        );
+    }
+
+    #[test]
+    fn only_the_opened_outcome_is_a_success() {
+        assert!(check_ime_open(ImeOpenOutcome::Opened).is_ok());
+        for refused in [
+            ImeOpenOutcome::Unavailable,
+            ImeOpenOutcome::Denied,
+            ImeOpenOutcome::NoEditor,
+            ImeOpenOutcome::Unknown,
+        ] {
+            let err = check_ime_open(refused).expect_err("only `Opened` succeeds");
+            let expected = match refused {
+                ImeOpenOutcome::Unavailable => ErrorCode::ImeSystemGlueUnavailable,
+                // Its own code, so the UI can say "put the caret in a text field" instead of
+                // "could not open the screen, please retry" — the two need different actions.
+                ImeOpenOutcome::NoEditor => ErrorCode::ImeSystemNoTextEditor,
+                _ => ErrorCode::ImeSystemOpenFailed,
+            };
+            assert_eq!(err.code, expected, "for {refused:?}");
+        }
+    }
+
+    /// Tiny helpers for the fixtures above, so a repeated literal cannot drift from the
+    /// one place it is spelled.
+    mod parts {
+        pub(super) fn latin_ime() -> String {
+            "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+                .to_string()
+        }
     }
 }

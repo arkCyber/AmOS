@@ -38,8 +38,8 @@ It is **not** a log aggregator, a paging roster, or an HTTP client with TLS.
 | `src/metrics.rs` | `ChannelMetrics`, `DispatchMetrics` |
 | `src/webhook.rs` | the HTTP POST transport (pure std) |
 | `src/smtp.rs` | the RFC 5321 subset transport (pure std) |
-| `src/stdout.rs` | the stderr fallback |
-| `examples/` | `alert_to_stderr` |
+| `src/stdout.rs` | the stderr fallback (the channel's line *and* the dispatcher's last-resort line) |
+| `examples/` | `alert_to_stderr`, `alert_fallback_line` |
 
 ## Build & test
 
@@ -55,11 +55,17 @@ node scripts/rust-panic-scan.mjs   # every crate root denies unwrap/expect/panic
 # One alert per severity into the stderr fallback, then the counters — including the
 # suppression counter, which is the point of the window. Offline: no socket is opened.
 cargo run -p amos-notifier --example alert_to_stderr
+
+# The fallback path every alert takes when a channel is configured but refuses
+# them — the same JSON-line recipe, over the lines that reached nobody:
+cargo run -q -p amos-notifier --example alert_fallback_line 2>&1 >/dev/null | jq -R 'fromjson?'
 ```
 
 | example | shows |
 |---|---|
 | `alert_to_stderr` | the builder, `fire()` for P0/P1/P2, and `metrics()` reporting `suppressed=1` for the repeated P0 — a merged duplicate rather than a second page |
+| `alert_fallback_line` | a refusing channel plus `with_stderr_fallback(true)`, so each alert takes the dispatcher's last-resort line — and `jq -R 'fromjson?'` recovers all three, labels included |
+
 
 ## Honest boundaries
 

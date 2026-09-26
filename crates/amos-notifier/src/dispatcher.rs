@@ -7,7 +7,10 @@
 //! 3. **Instrument** every send so [`crate::metrics`] stays honest.
 //! 4. **Stderr fallback** — if the alert reaches no channel, it still reaches
 //!    the operator via a structured stderr line (or `tracing` when the stderr
-//!    path is off). This is the "we never silently drop a P0" guarantee, and it
+//!    path is off). The line is one JSON object — the alert's own `severity` /
+//!    `id` / `message` / `labels` plus the `note` reason — the same shape the
+//!    stderr channel writes, so one `jq -R 'fromjson?'` filter over the stream
+//!    reads both. This is the "we never silently drop a P0" guarantee, and it
 //!    holds in **both** no-channel cases: nothing configured at all, and every
 //!    configured channel refusing or failing the alert (REQ-A769).
 
@@ -154,15 +157,13 @@ impl Dispatcher {
     /// daemon's log file is the floor). Both the empty-channel case and the
     /// every-channel-refused case route through here, so the two cannot drift into
     /// describing the same outcome two different ways. `note` is the reason; the
-    /// alert's severity, id and message follow it in one parseable line.
+    /// alert's own `severity` / `id` / `message` / `labels` follow it in one JSON
+    /// line (rendered by [`crate::stdout::operator_line`]), so the same
+    /// `jq -R 'fromjson?'` filter that reads the stderr channel's lines reads
+    /// these too — instead of dropping them without a word.
     fn operator_fallback(&self, alert: &Alert, note: &str) {
         if self.inner.stderr_fallback {
-            eprintln!(
-                "[amos-notifier] {note} — {sev} {id}: {msg}",
-                sev = alert.severity.label(),
-                id = alert.id,
-                msg = alert.message
-            );
+            eprintln!("{}", crate::stdout::operator_line(alert, note));
         } else {
             tracing::warn!(
                 severity = alert.severity.label(),
@@ -371,5 +372,30 @@ mod tests {
         assert_eq!(m.global.sent, 1);
         assert_eq!(m.global.suppressed, 1);
         assert_eq!(m.fallbacks, 0, "suppression is not a delivery failure");
+    }
+
+    /// A pure renderer is only half a fix: `operator_fallback` could keep its own
+    /// `eprintln!` and `stdout::tests::the_dispatcher_fallback_line_is_json_too`
+    /// would still pass while the stream an operator actually reads stayed plain
+    /// text. Pin the delegate to the shared renderer, and pin the old format out
+    /// of the file — a second plain-text producer on the stderr stream is the
+    /// defect, not the wording. (REQ-A1908)
+    ///
+    /// The needle is `concat!`-split on purpose: spelled whole it would appear in
+    /// this very test, and the scan would find itself (a verdict gate whose corpus
+    /// is polluted by its own text always reports the wrong thing).
+    #[test]
+    fn the_operator_fallback_writes_the_shared_json_line() {
+        const SRC: &str = include_str!("dispatcher.rs");
+        assert!(
+            SRC.contains("crate::stdout::operator_line(alert, note)"),
+            "the fallback must render through the shared stderr renderer"
+        );
+        let old_plain_line = concat!("[amos-notifier]", " {note}");
+        assert!(
+            !SRC.contains(old_plain_line),
+            "the plain-text fallback line is exactly what `jq -R 'fromjson?'` \
+             drops without a word; it must be gone"
+        );
     }
 }

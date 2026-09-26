@@ -18,9 +18,16 @@
     imeFuzzyToggle,
     imeLearningClear,
     imeStatus,
+    imeSystemFailureKey,
+    imeSystemOpenPicker,
+    imeSystemOpenSettings,
+    imeSystemState,
+    imeSystemStatus,
     readImeEnabled,
     writeImeEnabled,
     type ImeState,
+    type ImeSystemOpenCommand,
+    type SystemImeStatus,
   } from "../../lib/ime";
   import { STORE_CHANGED_EVENT } from "../../lib/amosStore";
   import { onMount } from "svelte";
@@ -39,10 +46,41 @@
   let storeErr = $state("");
   /** The readout the last command answered with; `null` until the engine replies. */
   let asked = $state(false);
+  /**
+   * The **platform's** answer about AmOS's own system keyboard (REQ-A1904), or `null`
+   * while it is still being asked. Only Android has one — the desktop shells have their
+   * own OS keyboard and no glue — so the section renders the honest "not this platform"
+   * line from `available: false` rather than hiding itself.
+   */
+  let sys = $state<SystemImeStatus | null>(null);
+  /**
+   * The last launcher's verdict, or `""`. `false` is a real refusal the user must see:
+   * a button that opens nothing and says nothing reads as a broken button.
+   */
+  let openErr = $state("");
   // "Forget every learned word" cannot be undone, so it asks once.
   let confirmClear = $state(false);
 
   const learned = $derived((engine?.learned_pins ?? 0) + (engine?.learned_pending ?? 0));
+
+  /** Which sentence the platform's answer earns (never `null`-indexing while unasked). */
+  const sysState = $derived(sys ? imeSystemState(sys) : null);
+
+  function refreshSystemIme(): void {
+    void imeSystemStatus().then((next) => {
+      sys = next;
+    });
+  }
+
+  function openSystemImeSurface(command: ImeSystemOpenCommand, open: () => Promise<boolean>): void {
+    void open().then((ok) => {
+      // The launch hands control to another app, so there is no state to re-read on
+      // success — the user is looking at the platform's screen. A refusal has nowhere
+      // else to be said, and *which* refusal matters: the picker's "nothing is accepting
+      // text" can never be fixed by pressing the button again (see `imeSystemFailureKey`).
+      openErr = ok ? "" : t(imeSystemFailureKey(command));
+    });
+  }
 
   function apply(next: ImeState | null): void {
     asked = true;
@@ -80,6 +118,7 @@
 
   onMount(() => {
     void imeStatus().then(apply);
+    refreshSystemIme();
     // The keyboard owns the **same** preference and can flip it from its own panel
     // (`关闭输入法`). Without this listener the page would only be right until the
     // other surface moved the switch — the docs promise the two agree *live*, so
@@ -93,8 +132,20 @@
       storeErr = "";
       enabled = readImeEnabled();
     };
+    // 「选择器」 / 「系统设置」 hand the user to the platform's own screens, where the
+    // keyboard is enabled and chosen. So the answer this page holds is **stale the
+    // moment the user leaves it** — the state row would keep saying 「未启用」 after the
+    // user enabled it there. Re-ask on return, the one moment the platform's answer can
+    // have changed without this page doing anything.
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refreshSystemIme();
+    };
     window.addEventListener(STORE_CHANGED_EVENT, onStore);
-    return () => window.removeEventListener(STORE_CHANGED_EVENT, onStore);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener(STORE_CHANGED_EVENT, onStore);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   });
 </script>
 
@@ -115,6 +166,73 @@
 <div class="px-1">
   <p class={HINT}>{t("settings.imeHint")}</p>
 </div>
+
+<!-- 系统输入法（REQ-A1904）：上面那个开关管的是 **WebView 里**的屏幕键盘；这一节管的是
+     平台**自己的**输入法列表里那一个 —— `AmosImeService`，任何 app 都能选中它。在此之前
+     用户只能离开 AmOS 去系统设置里手动开启，产品里没有任何入口。 -->
+<section class={GROUP}>
+  <div class={ROW}>
+    <span class={LABEL}>{t("ime.systemTitle")}</span>
+    <span class="text-[13px] opacity-50" data-testid="settings-ime-system-state">
+      {#if sysState === null}
+        <!-- 还在问：宁可空着，也不写一个「未启用」——那是平台的句子，不是暂未读数。 -->
+      {:else if sysState === "unavailable"}
+        {t("ime.systemUnavailable")}
+      {:else if sysState === "unknown"}
+        {t("ime.systemUnknown")}
+      {:else if sysState === "current"}
+        {t("ime.systemCurrent")}
+      {:else if sysState === "enabled"}
+        {t("ime.systemEnabled")}
+      {:else}
+        {t("ime.systemDisabled")}
+      {/if}
+    </span>
+  </div>
+  {#if sys && sys.available}
+    {#if sys.current_id}
+      <div class={ROW}>
+        <span class="truncate text-[13px] opacity-60" data-testid="settings-ime-system-current">
+          {t("ime.systemCurrentId", { id: sys.current_id })}
+        </span>
+      </div>
+    {/if}
+    <div class={SUB}></div>
+    <div class="flex flex-wrap items-center gap-2 px-4 py-3">
+      <button
+        type="button"
+        data-testid="settings-ime-system-picker"
+        onclick={() => openSystemImeSurface("ime_system_open_picker", imeSystemOpenPicker)}
+        class="rounded-full bg-black/5 px-3 py-1 text-xs dark:bg-white/10"
+      >
+        {t("ime.systemPicker")}
+      </button>
+      <button
+        type="button"
+        data-testid="settings-ime-system-settings"
+        onclick={() => openSystemImeSurface("ime_system_open_settings", imeSystemOpenSettings)}
+        class="rounded-full bg-black/5 px-3 py-1 text-xs dark:bg-white/10"
+      >
+        {t("ime.systemOpenSettings")}
+      </button>
+    </div>
+    <div class="px-4 pb-3">
+      <p class={HINT}>{t("ime.systemHint")}</p>
+    </div>
+  {:else if sys}
+    <!-- 「问不到」和「问了，答案是不」是两回事：这里说的是前者，宿主自己的句子原样给出。 -->
+    <div class="px-4 pb-3">
+      <p class={HINT} data-testid="settings-ime-system-unavailable">
+        {t("ime.systemUnavailableHint", { reason: sys.reason })}
+      </p>
+    </div>
+  {/if}
+  {#if openErr}
+    <div class="px-4 pb-3" data-testid="settings-ime-system-open-error">
+      <StoreErrorBar message={openErr} />
+    </div>
+  {/if}
+</section>
 
 <section class={GROUP}>
   <div class={ROW}>

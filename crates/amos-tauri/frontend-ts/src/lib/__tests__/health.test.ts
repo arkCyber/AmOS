@@ -373,3 +373,46 @@ describe("healthNotice — one sentence per reachable cause (REQ-A1886)", () => 
     expect(healthNotice({ timestamp_ms: 1, steps_total: null, heart_rate_bpm: null }, true, false)).toBe("awaiting");
   });
 });
+
+/**
+ * `healthNotice` must judge "a reading is on screen" by the **same rule the cells draw by**
+ * (REQ-A1902).
+ *
+ * The banner asked the raw wire fields (`steps_total !== null || heart_rate_bpm !== null`),
+ * but the pulse cell draws `normalizeHeartRate(...)` (25–250) and the reducer folds only a
+ * non-negative step count. The two seams also disagree above the frontend: `android_glue::reading`
+ * refuses only a **non-positive** heart rate (`v > 0.0`), so a contact artifact reporting
+ * `12 bpm` — or a worn strap at `300` — reaches the UI as a number, `normalizeHeartRate`
+ * refuses to draw it, and the banner was withheld on the strength of the very value the cell
+ * threw away. Result: three `—` and no sentence saying why. The pairs below are that: an
+ * out-of-range scalar is "no reading" (the banner returns), an in-range one is not.
+ */
+describe("healthNotice — an out-of-range scalar is no reading (REQ-A1902)", () => {
+  const at = (steps_total: number | null, heart_rate_bpm: number | null) => ({
+    timestamp_ms: 1,
+    steps_total,
+    heart_rate_bpm,
+  });
+
+  test("a heart rate the cell refuses does not by itself count as a reading", () => {
+    // Reachable: 12 clears the Rust seam (only `> 0.0` is required) but not the cell's range.
+    expect(healthNotice(at(null, 12), true, false)).toBe("awaiting");
+    expect(healthNotice(at(null, 300), true, false)).toBe("awaiting");
+  });
+
+  test("the range is inclusive on both ends, exactly as the cell draws it", () => {
+    expect(healthNotice(at(null, 25), true, false)).toBe("none");
+    expect(healthNotice(at(null, 250), true, false)).toBe("none");
+    // One step outside either bound is refused — the same boundaries `normalizeHeartRate` uses.
+    expect(healthNotice(at(null, 24), true, false)).toBe("awaiting");
+    expect(healthNotice(at(null, 251), true, false)).toBe("awaiting");
+  });
+
+  test("a negative step count is not a reading either", () => {
+    // `sensor_host_record_vitals` takes an unchecked `Option<f64>`; the reducer refuses `raw < 0`.
+    expect(healthNotice(at(-5, null), true, false)).toBe("awaiting");
+    // A cumulative counter at **0** is a real reading (since boot, nothing yet) — unlike a
+    // rejected pulse, it must NOT bring the banner back.
+    expect(healthNotice(at(0, null), true, false)).toBe("none");
+  });
+});

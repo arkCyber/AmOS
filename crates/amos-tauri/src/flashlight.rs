@@ -62,7 +62,23 @@ pub trait PreviewYield: Send + Sync {
 /// free", so the only honest observation of it is the platform's own answer to the
 /// torch request: re-ask, bounded, and report the last word (REQ-A1891 /
 /// FMEA F-AND-021).
-const YIELD_SETTLE_TRIES: u32 = 8;
+///
+/// The budget is measured, not guessed — and measured twice, because the release
+/// is not a fixed latency. On the S5 with the preview holding camera 0
+/// (2026-09-26, logcat 12:47:10): refused at `.559`, teardown begins `.560`,
+/// `CameraProviderManager: torch status is now AVAILABLE_OFF` at `.697`, and
+/// `CameraService: disconnect: Disconnected client for camera 0` at `.701` — the
+/// device freed the torch in **~140 ms**. A later boot measured the same hand-over
+/// at **~266 ms** (18:08:17: refused `.070`, retries every ~28 ms, `AVAILABLE_OFF`
+/// `.320`, `disconnect: Disconnected client for camera 0` `.336`), where the earlier
+/// `8 × 25 ms ≈ 200 ms` budget expired ~41 ms **before** the platform let go and the
+/// torch was refused for good; the immediately following run on the now-warm stack
+/// released in **~195 ms** and lit on the sixth ask. So the worst case is what the
+/// budget must beat, and a `8 × 25 ms` budget sitting on top of a 195–266 ms spread
+/// is a coin flip. `16 × 25 ms ≈ 400 ms` covers ~1.5× the worst observed release.
+/// The attempts are spaced, so the wait is a bounded blocking sleep on a worker
+/// thread, not a busy loop, and only a request that actually took the sensor pays it.
+const YIELD_SETTLE_TRIES: u32 = 16;
 /// The pause between those attempts. Gated with the device seam: the host compiles
 /// the sequence (and its tests pass a recording no-op `settle`), but only the
 /// Android provider actually sleeps, so an ungated constant is dead code there.
@@ -87,19 +103,39 @@ const YIELD_SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(
 /// is not the holder (it was refused at boot, or the camera app owns the sensor)
 /// there is nothing to take, and blaming the preview for a torch that was refused
 /// for its own reason (thermal, low battery, no flash unit) would replace the
-/// platform's real answer with a wrong one. Both calls are logged by their impls.
-pub fn torch_yielding_the_preview<Y, D, W>(
+/// platform's real answer with a wrong one. Dropped is not silent: a failure from
+/// either is logged here, so a release that never took effect is visible as *the
+/// preview could not be stepped out*, not only as the platform's "camera is in use"
+/// — which names the symptom, never the cause.
+///
+/// The error type belongs to the caller: a real provider's `FlashlightError` is
+/// returned unchanged. Re-wrapping it in a second `FlashlightError::Provider` here
+/// printed its prefix twice ("flashlight provider failure: flashlight provider
+/// failure: …"), so the UI carried the wrapper's wording instead of the cause.
+pub fn torch_yielding_the_preview<Y, D, W, E>(
     preview: &Y,
     on: bool,
     mut drive: D,
     mut settle: W,
-) -> Result<(), String>
+) -> Result<(), E>
 where
     Y: PreviewYield,
-    D: FnMut(bool) -> Result<(), String>,
+    D: FnMut(bool) -> Result<(), E>,
     W: FnMut(),
 {
-    let yielded = on && matches!(preview.suspend(), Ok(true));
+    let yielded = if on {
+        match preview.suspend() {
+            Ok(took) => took,
+            Err(e) => {
+                tracing::warn!(
+                    "the preview could not be stepped out before the torch request: {e}"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
     let mut verdict = drive(on);
     if yielded {
         for _ in 0..YIELD_SETTLE_TRIES {
@@ -115,7 +151,9 @@ where
     // with nothing yielded leaves the preview exactly where it was, so `resume` is
     // not owed — and not called, which keeps the recorded order honest.
     if !on || (yielded && verdict.is_err()) {
-        let _ = preview.resume();
+        if let Err(e) = preview.resume() {
+            tracing::warn!("the preview could not be resumed after the torch request: {e}");
+        }
     }
     verdict
 }
@@ -435,8 +473,10 @@ mod device {
     /// [`amos_flashlight::AndroidFlashlightProvider`] with AmOS's own preview stepped
     /// out of the sensor's way for each request. See [`torch_yielding_the_preview`].
     struct YieldingProvider {
-        inner: amos_flashlight::AndroidFlashlightProvider,
-        preview: CameraGluePreview,
+        /// Behind an `Arc` because a request runs on a `spawn_blocking` worker, which
+        /// needs an owned handle rather than a borrow of `self`.
+        inner: Arc<amos_flashlight::AndroidFlashlightProvider>,
+        preview: Arc<CameraGluePreview>,
     }
 
     #[async_trait::async_trait]
@@ -446,14 +486,29 @@ mod device {
         }
 
         async fn set_on(&self, on: bool) -> amos_flashlight::Result<()> {
-            let inner = &self.inner;
-            torch_yielding_the_preview(
-                &self.preview,
-                on,
-                |on| inner.set_on_blocking(on).map_err(|e| e.to_string()),
-                || std::thread::sleep(YIELD_SETTLE_STEP),
-            )
-            .map_err(amos_flashlight::FlashlightError::Provider)
+            // The yield is genuinely blocking work: `set_on_blocking` is a synchronous
+            // JNI `setTorchMode`, and the pause between retries is a `std::thread::sleep`.
+            // Run straight on the runtime it would hold a tokio worker for the whole
+            // settle window (`YIELD_SETTLE_TRIES` × `YIELD_SETTLE_STEP`), queueing
+            // unrelated requests behind a torch toggle — so the pair is handed to
+            // `spawn_blocking`, whose closure the `blocking-in-async-scan` gate requires
+            // this call to sit inside.
+            let inner = Arc::clone(&self.inner);
+            let preview = Arc::clone(&self.preview);
+            tokio::task::spawn_blocking(move || {
+                torch_yielding_the_preview(
+                    preview.as_ref(),
+                    on,
+                    |on| inner.set_on_blocking(on),
+                    || std::thread::sleep(YIELD_SETTLE_STEP),
+                )
+            })
+            .await
+            .map_err(|e| {
+                amos_flashlight::FlashlightError::Provider(format!(
+                    "the torch request could not be joined: {e}"
+                ))
+            })?
         }
 
         fn note_external_state(&self, on: bool) {
@@ -541,8 +596,8 @@ mod device {
             // device — so a bare provider reports "camera in use" for a camera AmOS itself is
             // holding. `YieldingProvider` releases that preview around each request.
             let _ = DEVICE.set(Arc::new(YieldingProvider {
-                inner: provider,
-                preview: CameraGluePreview::new(),
+                inner: Arc::new(provider),
+                preview: Arc::new(CameraGluePreview::new()),
             }));
         }
     }
@@ -918,6 +973,69 @@ mod tests {
         );
         assert!(out.is_ok());
         assert_eq!(preview.log(), vec!["suspend", "torch"]);
+    }
+
+    #[test]
+    fn a_provider_error_reaches_the_caller_without_a_second_wrapper() {
+        // The seam must hand the caller's *own* error back. The pre-fix `set_on`
+        // stringified the provider's already-formatted error and re-wrapped it in a
+        // second `Provider`, so the UI showed the prefix twice — measured on the S5
+        // as `flashlight provider failure: flashlight provider failure: Java
+        // exception was thrown` — naming the wrapper instead of the cause. The drive
+        // here yields the real domain error, the same one `set_on` returns.
+        let preview = RecordingPreview::new(PreviewAnswer::Took);
+        let out: Result<(), amos_flashlight::FlashlightError> = torch_yielding_the_preview(
+            &preview,
+            true,
+            |_on| {
+                Err(amos_flashlight::FlashlightError::Provider(
+                    "Java exception was thrown".to_string(),
+                ))
+            },
+            settle(&preview.log),
+        );
+        let msg = out.unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            "flashlight provider failure: Java exception was thrown"
+        );
+        assert_eq!(
+            msg.matches("flashlight provider failure").count(),
+            1,
+            "the seam must not wrap the caller's error a second time"
+        );
+    }
+
+    #[test]
+    fn the_torch_request_hands_its_blocking_work_to_a_worker() {
+        // `set_on` is `async` but the work it drives is synchronous: a JNI
+        // `setTorchMode`, plus a `std::thread::sleep` pause between retries. Run
+        // inline it holds a tokio worker for the whole settle window
+        // (`YIELD_SETTLE_TRIES` × `YIELD_SETTLE_STEP`) and queues unrelated requests
+        // behind a torch toggle — the shape `blocking-in-async-scan` flags. The seam
+        // is only load-bearing if the pause sits *inside* the closure handed to
+        // `spawn_blocking`, so pin that in the provider's own body. REQ-A1907.
+        let src = include_str!("flashlight.rs");
+        let impl_body = src
+            .split("impl FlashlightProvider for YieldingProvider")
+            .nth(1)
+            .expect("the device provider's impl");
+        let set_on = impl_body
+            .split("async fn set_on")
+            .nth(1)
+            .expect("the device provider's set_on");
+        let offload = set_on
+            .find("spawn_blocking(")
+            .expect("the blocking work is handed to a worker");
+        // Anchor on the *call*, not the bare path: the comment above the closure
+        // spells `std::thread::sleep` too, and a bare `find` would pin the prose.
+        let pause = set_on
+            .find("std::thread::sleep(YIELD_SETTLE_STEP)")
+            .expect("the settle pause is still there");
+        assert!(
+            offload < pause,
+            "the settle pause must run inside the spawn_blocking closure, not on the runtime"
+        );
     }
 
     #[test]

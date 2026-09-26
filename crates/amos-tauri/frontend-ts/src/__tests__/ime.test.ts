@@ -20,6 +20,10 @@ import {
   imeKey,
   imeLearningClear,
   imeStatus,
+  imeSystemFailureKey,
+  imeSystemOpenPicker,
+  imeSystemOpenSettings,
+  imeSystemState,
   insertTextAtCursor,
   isTextEntry,
   pageCandidates,
@@ -373,5 +377,92 @@ describe("lib/ime — layout, preference and paging", () => {
     expect(pageCandidates(items, 99)).toEqual(items.slice(IME_CANDIDATE_PAGE_SIZE * 2));
     expect(pageCandidates(items, -5)).toEqual(items.slice(0, IME_CANDIDATE_PAGE_SIZE));
     expect(pageCandidates([], 3)).toEqual([]);
+  });
+});
+
+/**
+ * 平台读数 → 一句话的分类器（REQ-A1904）。
+ *
+ * 顺序就是这条函数存在的理由：`available: false` 的读数里 `enabled` / `selected` 都是
+ * `null`，而**先问 `enabled`** 的实现会把「没人回答」说成「未启用」—— 那是平台的句子，
+ * 不是这一侧的测量。所以「问不到」必须排在所有旗标之前。
+ */
+describe("the system input method's state classifier", () => {
+  const status = (over: Partial<Parameters<typeof imeSystemState>[0]>) => ({
+    available: true,
+    reason: "",
+    enabled: true,
+    selected: true,
+    current_id: "com.amos.ai/.glue.AmosImeService",
+    ...over,
+  });
+
+  test("an unasked platform is `unavailable`, never `disabled`", () => {
+    expect(
+      imeSystemState(status({ available: false, reason: "no glue", enabled: null, selected: null, current_id: null })),
+    ).toBe("unavailable");
+    // Even if a buggy host left a `false` behind, the missing answer wins.
+    expect(imeSystemState(status({ available: false, reason: "no glue", enabled: false }))).toBe(
+      "unavailable",
+    );
+  });
+
+  test("enabled and selected are two independent facts", () => {
+    expect(imeSystemState(status({}))).toBe("current");
+    expect(imeSystemState(status({ selected: false }))).toBe("enabled");
+    expect(imeSystemState(status({ enabled: false, selected: false }))).toBe("disabled");
+    // Enabled is decided before selected: "not enabled" is not "not selected".
+    expect(imeSystemState(status({ enabled: false, selected: true }))).toBe("disabled");
+  });
+
+  test("an answer in a shape this build does not know is `unknown`, not a verdict", () => {
+    expect(imeSystemState(status({ enabled: null }))).toBe("unknown");
+    expect(imeSystemState(status({ selected: null }))).toBe("unknown");
+  });
+});
+
+/**
+ * 一次被拒的启动说的是**哪一句**（REQ-A1904）。`spacesFailure`（F-SH-577）那一族：同一个拒绝
+ * 只有一条规则，参数化与语言归调用点的 `t()`。
+ *
+ * 判据是平台**自己的前提**：`showInputMethodPicker()` 从正在服务的输入连接上取窗口，没有连接时
+ * 它返回而什么也不画（真机实测：`mServedInputConnection=null` ⇒ 无窗口；有连接 ⇒ 「选择输入法」
+ * 对话框）。宿主把它作为 `amos.ime.system_no_text_editor` 带上来 —— 这**不能**渲染成「请重试」，
+ * 因为再按一次永远不会成功，用户该做的是把光标放进输入框（或用不需要输入连接的设置门）。
+ */
+describe("lib/ime — 被拒的系统输入法启动说的是哪一句", () => {
+  /** A bridge whose one call rejects with the Tauri `AmosError` envelope. */
+  function refusingBridge(code: string) {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: () => Promise.reject({ code, message: "refused" }),
+    };
+  }
+
+  test("the picker's missing-input-connection refusal is its own sentence", async () => {
+    refusingBridge("amos.ime.system_no_text_editor");
+    expect(await imeSystemOpenPicker()).toBe(false);
+    expect(imeSystemFailureKey("ime_system_open_picker")).toBe("ime.systemNoTextEditor");
+  });
+
+  test("every other refusal keeps the retry sentence", async () => {
+    refusingBridge("amos.ime.system_open_failed");
+    expect(await imeSystemOpenSettings()).toBe(false);
+    expect(imeSystemFailureKey("ime_system_open_settings")).toBe("ime.systemOpenFailed");
+  });
+
+  test("the reading is per command — a refusal of one is not read as the other's", async () => {
+    refusingBridge("amos.ime.system_no_text_editor");
+    await imeSystemOpenPicker();
+    // The settings door was never called and needs no input connection: no failure to report.
+    expect(imeSystemFailureKey("ime_system_open_settings")).toBe("ime.systemOpenFailed");
+    expect(imeSystemFailureKey("ime_system_open_picker")).toBe("ime.systemNoTextEditor");
+  });
+
+  test("a host with no envelope is not a specific diagnosis", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: () => Promise.reject("bridge died"),
+    };
+    expect(await imeSystemOpenPicker()).toBe(false);
+    expect(imeSystemFailureKey("ime_system_open_picker")).toBe("ime.systemOpenFailed");
   });
 });

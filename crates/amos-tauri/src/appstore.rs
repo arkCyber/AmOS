@@ -201,8 +201,25 @@ fn seed(
     }
 }
 
+/// Move an unreadable registry aside so the fresh snapshot cannot overwrite it.
+///
+/// The registry is the one file whose loss is unrecoverable, so the bytes a user
+/// (or an upgrade cut short) left behind are kept beside the original rather than
+/// silently replaced. `None` when there was nothing to keep (no file) or when the
+/// rename failed — the caller warns either way and still starts empty.
+fn preserve_unreadable_registry(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
+}
+
 impl StoreBridge {
-    /// The directory installed web-bundles are unpacked under
     /// (`$AMOS_APPSTORE_INSTALL_DIR`), if configured. The `amos-app://` handler
     /// needs it to route a `amos-app://<app-id>/…` request.
     pub fn web_install_dir(&self) -> Option<&Path> {
@@ -233,8 +250,14 @@ impl StoreBridge {
     }
 
     /// Load (or create) the installed registry at `path` over the boot-selected
-    /// provider. If the file is unreadable/corrupt, start empty and warn — the
-    /// next successful write rewrites a clean snapshot.
+    /// provider.
+    ///
+    /// If the file is unreadable/corrupt it is **moved aside** (`<name>.corrupt-<nonce>`)
+    /// before starting empty: [`AppStore::open`] refuses a corrupt registry and
+    /// [`save_file`](amos_appstore::AppStore::save_file) is atomic precisely because this
+    /// file's loss is unrecoverable, so starting empty *on top of* it — while keeping
+    /// `path` for the next `persist_best_effort` — would silently destroy the user's
+    /// installed-app list.
     pub fn from_store(path: &Path) -> Self {
         match AppStore::open(provider(), path) {
             Ok(store) => Self {
@@ -242,10 +265,18 @@ impl StoreBridge {
                 path: Some(path.to_path_buf()),
             },
             Err(e) => {
-                tracing::warn!(
-                    "appstore registry {} unreadable: {e}; starting empty",
-                    path.display()
-                );
+                let kept = preserve_unreadable_registry(path);
+                match &kept {
+                    Some(k) => tracing::warn!(
+                        "appstore registry {} unreadable: {e}; kept at {} and starting empty",
+                        path.display(),
+                        k.display()
+                    ),
+                    None => tracing::warn!(
+                        "appstore registry {} unreadable: {e}; could not be moved aside, starting empty",
+                        path.display()
+                    ),
+                }
                 Self {
                     store: apply_web_dir(AppStore::new(provider())),
                     path: Some(path.to_path_buf()),
@@ -875,6 +906,88 @@ mod tests {
         assert!(third.store.installed().unwrap().is_empty());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A scratch directory unique to this test process + call.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "amos-appstore-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `corrupt-*` sibling of `path`, if the bridge kept one.
+    fn kept_aside(dir: &Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains("corrupt-"))
+    }
+
+    /// An unreadable registry must be **moved aside**, never left where the bridge's next
+    /// successful write would overwrite it — `AppStore::open` refuses a corrupt registry and
+    /// `save_file` is atomic precisely because this file's loss is unrecoverable, so a bridge
+    /// that started empty *on top of* it would invert both (REQ-A1914 / F-STORE-006).
+    #[test]
+    fn an_unreadable_registry_is_preserved_not_silently_overwritten() {
+        let dir = scratch_dir("corrupt");
+        let path = dir.join("registry.json");
+        std::fs::write(&path, b"{ not json at all").unwrap();
+
+        let b = StoreBridge::from_store(&path);
+        assert!(
+            b.store.installed().unwrap().is_empty(),
+            "an unreadable registry starts the bridge empty"
+        );
+        assert!(
+            !path.exists(),
+            "the unreadable registry must be moved aside, not left to be overwritten"
+        );
+        let kept =
+            kept_aside(&dir).expect("the unreadable registry was kept under a corrupt-* name");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{ not json at all",
+            "the user's bytes survive intact"
+        );
+
+        // A later successful write makes a *fresh* registry at the original path — beside,
+        // not over, the kept file.
+        b.persist_best_effort();
+        assert!(
+            path.exists(),
+            "a fresh registry is written at the original path"
+        );
+        assert!(kept.exists(), "and the preserved bytes are still there");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control: a registry that *parses* is loaded in place and nothing is moved
+    /// aside — so the fix cannot degenerate into "rename every file".
+    #[test]
+    fn a_readable_registry_is_loaded_without_being_moved_aside() {
+        let dir = scratch_dir("readable");
+        let path = dir.join("registry.json");
+        // A valid registry: an ephemeral bridge writes its (empty) snapshot.
+        StoreBridge::ephemeral().store.save_file(&path).unwrap();
+
+        let b = StoreBridge::from_store(&path);
+        assert!(b.store.installed().unwrap().is_empty());
+        assert!(path.exists(), "a readable registry stays in place");
+        assert!(
+            kept_aside(&dir).is_none(),
+            "nothing is moved aside when the file parses"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

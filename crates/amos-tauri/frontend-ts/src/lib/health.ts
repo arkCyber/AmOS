@@ -527,18 +527,37 @@ export async function readHealthFeed(): Promise<HealthFeed> {
  *
  * A sample carrying neither scalar is still "no reading": the host drops such a sample
  * (`VitalsLatest::record` keeps the previous value when there is nothing to retract), so this
- * arm is a belt to that braces, not a distinct state.
+ * arm is a belt to that braces, not a distinct state. A sample carrying only a scalar the
+ * screen will not draw — see [`vitalsHasReading`] — is the same state, for the same reason
+ * (REQ-A1902).
  */
 export type HealthNotice = "none" | "unbridged" | "stopped" | "awaiting";
+
+/**
+ * Whether a sample carries a reading the screen will actually draw (REQ-A1902).
+ *
+ * The banner must agree with the cells it stands above. It used to test the raw wire fields —
+ * `steps_total !== null || heart_rate_bpm !== null` — while the pulse cell draws
+ * `normalizeHeartRate(...)` (25–250) and the reducer folds only a non-negative step count. The
+ * two seams do not even agree above the frontend: `android_glue::reading` refuses only a
+ * **non-positive** heart rate (`v > 0.0`), so a contact artifact reporting `12 bpm` (or a worn
+ * strap at `300`) arrives as a number, the cell refuses to draw it, and the banner was withheld
+ * on the strength of the very value the cell discarded — a screen of three `—` with nothing
+ * saying why. Judging by the drawn value is the one rule both faces can share.
+ */
+function vitalsHasReading(v: SensorVitalsDatum): boolean {
+  const steps = v.steps_total;
+  // The reducer's own guard (`applyVitalsTick`): a finite, non-negative cumulative count.
+  const hasSteps = typeof steps === "number" && Number.isFinite(steps) && steps >= 0;
+  return hasSteps || normalizeHeartRate(v.heart_rate_bpm) !== null;
+}
 
 export function healthNotice(
   latest: SensorVitalsDatum | null,
   bridged: boolean,
   stopped: boolean,
 ): HealthNotice {
-  const hasReading =
-    latest !== null && (latest.steps_total !== null || latest.heart_rate_bpm !== null);
-  if (hasReading) return "none";
+  if (latest !== null && vitalsHasReading(latest)) return "none";
   if (!bridged) return "unbridged";
   return stopped ? "stopped" : "awaiting";
 }

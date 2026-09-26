@@ -214,3 +214,212 @@ describe("Settings → Input Method", () => {
     expect(host.container.querySelector('[role="switch"]')).toBeTruthy();
   });
 });
+
+/**
+ * 系统输入法那一节（REQ-A1904）。上面那个开关管的是 WebView 里的屏幕键盘；这一节管的是
+ * **平台自己的**输入法列表里那一个。在此之前产品里没有任何入口：用户只能离开 AmOS 去系统
+ * 设置里手动开启。
+ *
+ * 这里钉的是**读数与拒绝**：三件不同的事（问不到 ∕ 平台答"没启用" ∕ 平台答"在用别的键盘"）
+ * 必须画出三句不同的话 —— 把「问不到」折成「未启用」就是把平台的句子塞进一个没人回答过的
+ * 问题（F-AND-007 那一族）。
+ */
+describe("Settings → Input Method → the system keyboard (REQ-A1904)", () => {
+  /** A fake bridge that answers `ime_system_status` with `status` and records the calls. */
+  function installSystemIme(
+    status: unknown,
+    opts: { refuseOpen?: string; log?: string[] } = {},
+  ): string[] {
+    const calls: string[] = opts.log ?? [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: (command: string) => {
+        calls.push(command);
+        switch (command) {
+          case "ime_system_status":
+            return Promise.resolve(status);
+          case "ime_system_open_picker":
+          case "ime_system_open_settings":
+            return opts.refuseOpen
+              ? Promise.reject({ code: opts.refuseOpen, message: "the launch was refused" })
+              : Promise.resolve(null);
+          case "ime_status":
+            return Promise.resolve(null);
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+    return calls;
+  }
+
+  test("the platform's three answers are three different sentences", async () => {
+    installSystemIme({
+      available: true,
+      reason: "",
+      enabled: true,
+      selected: true,
+      current_id: "com.amos.ai/.glue.AmosImeService",
+    });
+    const host = render(ImePage);
+    await tick();
+    await settle();
+    expect(q(host, "settings-ime-system-state")?.textContent).toContain("使用中");
+    expect(q(host, "settings-ime-system-current")?.textContent).toContain("com.amos.ai");
+    expect(q(host, "settings-ime-system-picker")).toBeTruthy();
+
+    // Enabled but not in force — the ordinary Gboard case, and a *different* sentence.
+    cleanup();
+    installSystemIme({
+      available: true,
+      reason: "",
+      enabled: true,
+      selected: false,
+      current_id: "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME",
+    });
+    const host2 = render(ImePage);
+    await tick();
+    await settle();
+    expect(q(host2, "settings-ime-system-state")?.textContent).toContain("已启用");
+    expect(q(host2, "settings-ime-system-current")?.textContent).toContain("LatinIME");
+
+    // The platform says it is not enabled at all.
+    cleanup();
+    installSystemIme({
+      available: true,
+      reason: "",
+      enabled: false,
+      selected: false,
+      current_id: "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME",
+    });
+    const host3 = render(ImePage);
+    await tick();
+    await settle();
+    expect(q(host3, "settings-ime-system-state")?.textContent).toContain("未启用");
+  });
+
+  /**
+   * 「问不到」**不是**「未启用」。宿主自己写下了它为什么问不到，那一句原样给出 —— 这一节还
+   * 得让用户看见两个按钮都没有了（点了不会有任何事发生）。
+   */
+  test("an unasked platform is not a disabled keyboard", async () => {
+    installSystemIme({
+      available: false,
+      reason: "this build has no Android input-method glue (host/desktop target)",
+      enabled: null,
+      selected: null,
+      current_id: null,
+    });
+    const host = render(ImePage);
+    await tick();
+    await settle();
+
+    expect(q(host, "settings-ime-system-state")?.textContent).toContain("不适用");
+    expect(q(host, "settings-ime-system-state")?.textContent).not.toContain("未启用");
+    expect(q(host, "settings-ime-system-unavailable")?.textContent).toContain(
+      "no Android input-method glue",
+    );
+    expect(q(host, "settings-ime-system-picker")).toBeNull();
+    expect(q(host, "settings-ime-system-settings")).toBeNull();
+  });
+
+  test("both launchers reach the host", async () => {
+    const calls = installSystemIme({
+      available: true,
+      reason: "",
+      enabled: false,
+      selected: false,
+      current_id: "",
+    });
+    const host = render(ImePage);
+    await tick();
+    await settle();
+
+    await fireEvent.click(q(host, "settings-ime-system-settings")!);
+    await tick();
+    expect(calls).toContain("ime_system_open_settings");
+
+    await fireEvent.click(q(host, "settings-ime-system-picker")!);
+    await tick();
+    expect(calls).toContain("ime_system_open_picker");
+    // Neither is a refusal, so the page says nothing.
+    expect(q(host, "settings-ime-system-open-error")).toBeNull();
+  });
+
+  /**
+   * 一次被拒的启动必须留话：按钮按下去什么也没发生、也不说话，读起来就是按钮坏了。
+   */
+  test("a refused launch says so next to the button", async () => {
+    installSystemIme(
+      { available: true, reason: "", enabled: false, selected: false, current_id: "" },
+      { refuseOpen: "amos.ime.system_open_failed" },
+    );
+    const host = render(ImePage);
+    await tick();
+    await settle();
+
+    await fireEvent.click(q(host, "settings-ime-system-settings")!);
+    await tick();
+    await settle();
+    expect(q(host, "settings-ime-system-open-error")?.textContent).toContain("没能打开");
+  });
+
+  /**
+   * 「切换键盘」被平台的前提挡下时，说的一句**不一样**的话（REQ-A1904）。这不是「重试一下」：
+   * 没有任何输入框在用键盘时，平台不会画出切换列表（真机实测：`mServedInputConnection=null`
+   * ⇒ 无窗口、无对话框），再按一次永远不会成功 —— 用户该做的是把光标放进输入框，或改用
+   * 不需要输入连接的「系统输入法设置」。把它渲染成通用失败句，用户就会一直按一个死按钮。
+   */
+  test("the picker's missing-input-connection refusal is not the retry sentence", async () => {
+    installSystemIme(
+      { available: true, reason: "", enabled: true, selected: false, current_id: "LatinIME" },
+      { refuseOpen: "amos.ime.system_no_text_editor" },
+    );
+    const host = render(ImePage);
+    await tick();
+    await settle();
+
+    await fireEvent.click(q(host, "settings-ime-system-picker")!);
+    await tick();
+    await settle();
+    const said = q(host, "settings-ime-system-open-error")?.textContent ?? "";
+    expect(said).toContain("输入框");
+    expect(said).not.toContain("请重试");
+  });
+
+  /**
+   * 用户从这一页跳到平台的界面里启用键盘 → 回到 AmOS。这一页手里的答案是**离开那一刻**的，
+   * 不重问就会继续写着「未启用」。`visibilitychange` 是它唯一能知道自己被留在后台的时机。
+   */
+  test("the state is re-asked when the user comes back from the platform's screen", async () => {
+    const calls = installSystemIme({
+      available: true,
+      reason: "",
+      enabled: false,
+      selected: false,
+      current_id: "",
+    });
+    const host = render(ImePage);
+    await tick();
+    await settle();
+    const asked = calls.filter((c) => c === "ime_system_status").length;
+
+    // The user is on the platform's settings screen; the keyboard was enabled there.
+    // The replacement bridge shares the call log, so the count below is the re-ask.
+    installSystemIme(
+      {
+        available: true,
+        reason: "",
+        enabled: true,
+        selected: false,
+        current_id: "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME",
+      },
+      { log: calls },
+    );
+    document.dispatchEvent(new Event("visibilitychange"));
+    await tick();
+    await settle();
+
+    expect(q(host, "settings-ime-system-state")?.textContent).toContain("已启用");
+    expect(calls.length).toBeGreaterThan(asked);
+  });
+});

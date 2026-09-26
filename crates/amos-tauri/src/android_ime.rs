@@ -490,8 +490,7 @@ mod tests {
     /// *wiring* so the gate cannot re-grow the extra conjunct.
     #[test]
     fn the_forget_chip_gate_reads_the_undo_code_alone() {
-        const KOTLIN: &str =
-            include_str!("../android-glue/com/amos/ai/glue/AmosImeService.kt");
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/AmosImeService.kt");
         let gate_line = KOTLIN
             .lines()
             .position(|l| l.contains("forgetKey?.visibility"))

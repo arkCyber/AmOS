@@ -1705,6 +1705,63 @@ const KNOWN_FAILURES = [
   // `invoke` 可达）；只修 AmOS 自己的持有；`CameraGlue.teardown()` 仍异步；开机常驻预览是否该存在留作后续。
   { id: 'F-AND-021', module: 'amos-tauri-flashlight-torch-denied-by-the-owners-own-camera-preview', files: ['crates/amos-tauri/src/flashlight.rs', 'crates/amos-flashlight/src/android.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/AmosGlue.kt', 'crates/amos-tauri/android-glue/com/amos/ai/glue/CameraGlue.kt', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1891', 'torch_yielding_the_preview', 'PreviewYield', 'CameraGluePreview', 'YIELD_SETTLE_TRIES'], severity: 4 },
 
+  // F-AND-022（REQ-A1904，「一个已交付、真机验收过的能力缺一条从产品到它的路径」）：`AmosImeService`
+  // 是真的（REQ-A1893 ∕ REQ-A1897 已在真机上枚举、启用、绑定、并在第三方 app 里提交过「你好」），
+  // 但选它之前用户必须先离开 AmOS、进 `设置 → 语言与输入法 → 键盘` 手动勾选 —— 全仓
+  // `grep -rn "INPUT_METHOD_SETTINGS\|showInputMethodPicker\|enabledInputMethodList\|DEFAULT_INPUT_METHOD"`
+  // 逐字 **0 命中**，而产品内唯一提到输入法的设置页 `ImePage.svelte` 管的是 **WebView 的**屏幕键盘。
+  // 平台 picker（`showInputMethodPicker`）**只列已启用的键盘** ⇒ 从没启用过的用户连从 picker 里
+  // 够都够不到它，唯一的门是 `Settings.ACTION_INPUT_METHOD_SETTINGS`，而这一侧没有打开它的代码，
+  // 也没有任何命令回答「AmOS 的键盘现在是不是平台正在用的那一个」——按了开关也不知道生效没有。
+  // 修法：Kotlin 拆纯一半 `ImeSettings.kt`（line/tab 线格式；**失败的读不写任何事实行**，因为把
+  // 「问不到」折成 `ours_enabled\t0` 就是替平台说一句它没说过的话 —— F-AND-007 同族）与 Android
+  // 一半 `ImeSettingsGlue.kt`（`ComponentName` 相等判定「哪一个是我们」，不比较拼法 —— F-MDM-011），
+  // 宿主 JVM 的 `ImeSettingsTest.kt` 5 例与 Rust `parse_platform_ime_facts` 12 例从两端钉同一批字节；
+  // 三个**同步**命令 `ime_system_status` ∕ `ime_system_open_picker` ∕ `ime_system_open_settings`
+  // （`SystemImeStatus` 的三个事实是 `Option`，`available == reason.is_empty()`），前端 `ImePage.svelte`
+  // 加「系统输入法」一节 + `visibilitychange` 回来重问（用户是在平台的界面里改的状态）。
+  // **如实边界**：三个新命令的真机回放见 TRACEABILITY 行的「如实边界」；`screencapture` 式的
+  // 「授权被拒但退出 0」在本路径上不适用，但 `openSettings` 只证明**请求被平台接受**，不证明
+  // 用户真的启用了键盘 —— 页面靠回来重问，不靠启动的返回值。
+  { id: 'F-AND-022', module: 'the-system-ime-has-no-entry-point-inside-amos-so-a-user-who-never-enabled-it-cannot-reach-it-at-all-because-the-platform-picker-lists-enabled-keyboards-only-and-nothing-in-the-product-answers-whether-amos-keyboard-is-the-one-in-force', files: ['crates/amos-tauri/src/ime.rs', 'crates/amos-tauri/src/lib.rs', 'crates/amos-tauri/src/error.rs', 'crates/amos-tauri/android-glue/com/amos/ai/glue/ImeSettings.kt', 'crates/amos-tauri/android-glue/com/amos/ai/glue/ImeSettingsGlue.kt', 'crates/amos-tauri/android-glue/tests/com/amos/ai/glue/ImeSettingsTest.kt', 'crates/amos-tauri/frontend-ts/src/lib/ime.ts', 'crates/amos-tauri/frontend-ts/src/svelte/settings/ImePage.svelte', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1904', 'ImeSettingsGlue', 'parse_platform_ime_facts', 'imeSystemState', 'ime_system_open_settings'], severity: 3 },
+
+  // F-AND-023（REQ-A1915，「一个命令回报的成功，用户看不见」—— 与 F-AND-022 同一轮、不同失效模式：
+  // 那一条是「路径不存在」，这一条是「路径回报了一个没人看见的结果」）：`ime_system_open_picker`
+  // 调平台 `InputMethodManager.showInputMethodPicker()`，而后者把「选择输入法」对话框挂在**正在服务
+  // 输入连接的那个 IME 的窗口**上 —— 没有输入连接时它返回了、什么都没画。真机（K-Touch S5 ∕
+  // `YY000286` ∕ Android 14，2026-09-26）两次测量：`mServedInputConnection=null` ⇒ 无窗口
+  // （`mInputMethodWindow` `mHasSurface=false isVisible=false`，`mCurrentFocus` 仍是 AmOS 自己的
+  // activity）；`mServedInputConnection=RemoteInputConnectionImpl{… mServedView=com.amos.ai.RustWebView}`
+  // ⇒ 对话框出现（`mCurrentFocus=Window{… Select input method}`）。而 `ImeSettingsGlue.openPicker`
+  // 当时无条件返回 `STATUS_OK` ⇒ `ImeOpenOutcome::Opened` ⇒ 前端不显示任何错误：用户按了按钮、
+  // 屏幕上什么都没发生、也没人告诉他为什么。判据就在平台自己的 API 上 ——
+  // `InputMethodManager.isAcceptingText()` 逐字就是 `mServedInputConnection != null`（SDK 源码），
+  // 正是真机读到的那个字段，即**调用之前就能知道**（F-AND-007「把平台的沉默说成我们的成功」同族）。
+  // 修法：Kotlin 新增状态词 `STATUS_NO_EDITOR`，`openPicker` 先问 `isAcceptingText()`、为假则不调平台；
+  // Rust `ImeOpenOutcome::NoEditor` → **独有**的 `ErrorCode::ImeSystemNoTextEditor`
+  // （`amos.ime.system_no_text_editor`，`FROZEN_VARIANT_COUNT` 158 → 159）而不是 `ImeSystemOpenFailed`
+  // —— 用户的下一步不同（把光标放进输入框，或改用不需要输入连接的「系统输入法设置」）；前端
+  // `lib/ime.ts::imeSystemFailureKey(command)`（照 `spaces.ts::spacesFailure` 按**命令名**读
+  // `bridgeDiag`）选句，`ImePage.svelte` 按 `detail.code` 显示真实下一步而非「请重试」。
+  // **如实边界**：`isAcceptingText()` 守卫本身无 host-JVM 测试（`InputMethodManager` 在普通 JVM 上
+  // 不存在），其权威是真机；**无连接的拒绝**由后端单测与 svelte 测试两端钉住，真机回放见 TRACEABILITY 行。
+  { id: 'F-AND-023', module: 'the-ime-system-picker-reported-success-over-a-screen-the-platform-never-drew-because-showinputmethodpicker-hangs-its-switcher-on-the-serving-imes-window-and-the-glue-answered-ok-with-no-input-connection', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/ImeSettingsGlue.kt', 'crates/amos-tauri/src/ime.rs', 'crates/amos-tauri/src/error.rs', 'crates/amos-tauri/frontend-ts/src/lib/ime.ts', 'crates/amos-tauri/frontend-ts/src/svelte/settings/ImePage.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/settings-ime.svelte.test.ts', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1915', 'STATUS_NO_EDITOR', 'isAcceptingText', 'ImeSystemNoTextEditor', 'imeSystemFailureKey'], severity: 3 },
+
+  // F-DEV-166（REQ-A1905，「判据用错了权威」）：`screenshot_capture` 在**问平台能不能截图之前**
+  // 就解析（并 `create_dir_all`）`~/Pictures/Screenshots`，于是它自己模块文档逐字承诺的
+  // 「Other platforms return a typed refusal naming the OS」在 Android（`dirs::home_dir()` 为 `None`）
+  // **结构上不可达**，答出的是 `no home directory: cannot resolve Pictures/Screenshots`（真机逐字，
+  // 2026-09-26，`YY000286`）；而在**有 home 的**平台（Linux ∕ Windows）一次**被拒**的截图会先在文件
+  // 系统里**建出**那个目录 —— 拒绝不该做只有截图才需要的工作。既有 9 条单测只钉纯部件的形状，无一条
+  // 钉**两件事实的先后**。修法：纯序 `resolve_capture_dir(supported, os, home)` 先结算「平台能不能截
+  // 图」（不能 ⇒ `unsupported_refusal(os)`）、再解析 home；`capture_supported()` 直接取自
+  // `capture_command`（同一个权威），命令体先过缝再建目录；删掉因此无人使用的 `pub fn screenshot_dir()`。
+  // **如实边界**：修法的真机确认未取得（换入新 APK 后 `YY000286` 的 WebView 渲染器 DEAD，重启 +
+  // 全新安装都未恢复，且**改动前**产物早前出现过同一现象并自行恢复 ⇒ 设备 ∕ WebView 状态）；真机已确认
+  // 的是**缺陷本身**；本轮不实现 Android 截图（`MediaProjection` 需用户同意，另属一件工作）；次序钉是
+  // 源码 `include_str!` 子串先后（命令体要做真实 FS ∕ FFI，主机上无法调用）。
+  { id: 'F-DEV-166', module: 'amos-tauri-screenshot-refusal-order-names-the-wrong-authority', files: ['crates/amos-tauri/src/screenshot.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1905', 'resolve_capture_dir', 'unsupported_refusal', 'capture_supported'], severity: 2 },
+
   { id: 'F-TEL-001', module: 'amos-telephony', files: ['crates/amos-telephony/src/service.rs', 'crates/amos-telephony/src/route.rs'], markers: ['emergency', 'no-record'], severity: 5 },
   { id: 'F-TEL-002', module: 'amos-blocklist', files: ['crates/amos-blocklist/src/lib.rs'], markers: ['blocklistCheck', 'Rule'], severity: 4 },
   { id: 'F-RAD-001', module: 'amos-radio', files: ['crates/amos-radio/src/lib.rs'], markers: ['RadioManager', 'airplane cascade'], severity: 4 },
@@ -1931,22 +1988,6 @@ const KNOWN_FAILURES = [
   // F-ASR-002: 模型目录在、encoder 文件缺 ⇒ 静默退回 mock。缓解:`resolve_sherpa_model_dir`
   // 对缺 token 的目录返回 `None`(诚实 "not staged"),显式 `sherpa` 请求绝不降级为 mock。
   { id: 'F-ASR-002', module: 'amos-ai', files: ['crates/amos-ai/src/chat_asr.rs'], markers: ['resolve_sherpa_model_dir', 'resolve_returns_none_for_missing_or_tokenless_dirs'], severity: 3 },
-
-  // F-ASR-003（REQ-A1914）—— `AMOS_SHERPA_MODEL_DIR` 的告警字面写着「is blank or exceeds」，
-  // 而它前面的 `if !raw.trim().is_empty()` 守卫恰好在**空**时掐灭这条告警 —— 算子设的空值
-  // （未展开的 shell 变量、一个多余空格）被静默丢弃，进程照常回退到 bundled 目录，日志一声不响。
-  // 这是 F-AI-025 在 `bundled_model::env_path` 修掉的同一形状，落在没被那轮扫到的兄弟文件
-  // （`chat_asr::resolve_sherpa_model_dir`）。修法：删守卫，抽 `bounded_env_dir(key)` 让空 ∕ 超长
-  // 一律 `warn!`；**未设**仍由 `std::env::var_os(key)?` 早退而静默。
-  { id: 'F-ASR-003', module: 'the-chat-asr-model-dir-override-s-warn-text-says-blank-or-exceeds-but-the-if-raw-trim-is-empty-guard-before-it-exactly-suppresses-that-warn-when-the-value-is-blank-so-an-operator-set-empty-value-an-unexpanded-shell-variable-a-stray-space-is-dropped-in-silence-bounded_model_dir-returns-none-for-both-blank-and-over-cap-yet-the-guard-only-lets-the-non-blank-case-through-so-the-code-is-weakr-than-its-own-prose-the-consequence-matches-f-ai-025-the-operator-believes-the-override-applied-while-the-fallback-dir-is-used-and-no-log-line-says-so-fix-delete-the-guard-and-extract-a-bounded_env_dir-key-helper-so-blank-or-over-cap-always-warns-while-an-unset-key-stays-silent-the-same-shape-a-prior-round-fixed-in-bundled-model-env-path', files: ['crates/amos-ai/src/chat_asr.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1914', 'bounded_env_dir', 'a_blank_override_is_reported_not_silently_dropped', 'AMOS_SHERPA_MODEL_DIR', 'not valid Unicode'], severity: 1 },
-
-  // F-ASR-004（REQ-A1914）—— `chat_asr` 的三处 env 读取用 `std::env::var(..)` 加 `if let Ok`，
-  // 把「未设」与「设了但读不出（非 Unicode）」折成同一句沉默；两个 bundle 根
-  // （`AMOS_BUNDLE_RES_DIR` ∕ `AMOS_BUNDLE_MODELS_DIR`）的 `if let Some(root) = bounded_model_dir(..)`
-  // **没有 else** ⇒ 连「设了但空 ∕ 超长」都不报告。修法：`bounded_env_dir` 改走 `std::env::var_os`
-  // （保 `NotPresent` ∕ `NotUnicode` 两态），`to_str()` 失配 ⇒ `warn!` 后 `None`；三键一律经它。
-  // 与 F-AI-026 同族（那条修 `bundled_model::env_path` 的 `.ok()?`）。
-  { id: 'F-ASR-004', module: 'the-chat-asr-env-reads-use-std-env-var-plus-if-let-ok-folding-unset-and-present-but-unreadable-non-unicode-into-one-silent-none-std-env-var-answers-err-notpresent-for-the-former-and-err-notunicode-for-the-latter-and-the-two-bundle-root-keys-have-no-else-arm-at-all-so-even-a-blank-or-over-cap-value-is-dropped-without-a-word-the-consequence-matches-f-asr-003-a-corrupted-mount-or-malformed-path-in-amos-sherpa-model-dir-makes-the-daemon-quietly-serve-another-model-fix-read-via-std-env-var-os-keeping-both-states-silent-early-return-only-for-notpresent-warn-and-return-none-when-to-str-fails-and-route-all-three-keys-through-one-bounded-env-dir-helper', files: ['crates/amos-ai/src/chat_asr.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1914', 'bounded_env_dir', 'a_non_unicode_override_is_reported_not_silently_dropped', 'an_unset_override_stays_silent', 'a_blank_bundle_root_is_reported_not_silently_dropped'], severity: 1 },
 
   // Gap 4 — default AI backend (crates/amos-ai/src/{bundled_model.rs,inference/real.rs}).
   // F-AI-016: 守护进程默认 mock,而运维以为跑的是真 AI。缓解:未配置部署解析到
@@ -5931,6 +5972,17 @@ const KNOWN_FAILURES = [
   // 两个 `deserialize_with` 改用它（唯一摄取收口，一并治住 `map_version` ∕ `pick_package` ∕ suggested 匹配）。
   // `map_version` 的 `.max(0)` 故意保留（已无法触发；删之反令直接传入的负数经 base-1000 拆分产垃圾）。
   { id: 'F-STORE-004', module: 'amos-appstore', files: ['crates/amos-appstore/src/fdroid.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['opt_i64_nonneg', 'a_negative_version_code_is_not_clamped_to_build_zero', 'a_negative_suggested_version_code_is_unknown'], severity: 3 },
+  // F-STORE-006（REQ-A1914）—— 应用商店桥的读入侧，与 **F-SH-921**（REQ-A1898，`mail.rs`）逐字同形，一 crate 之隔。
+  // `AppStore::open` **故意拒绝**一个损坏的注册表（`client.rs::save_file` 的文档逐字 «the registry is the one file
+  // whose loss is unrecoverable … [`open`](Self::open) refuses a corrupt registry rather than silently starting empty»），
+  // 而 `StoreBridge::from_store` 逐字 `Err(e) => { tracing::warn!("appstore registry {} unreadable: {e}; starting empty", …);
+  // Self { store: …, path: Some(path.to_path_buf()) } }` —— 只 warn、只空启，**`path` 原样留下**。于是下一次任意
+  // install ∕ upgrade ∕ uninstall 的 `persist_best_effort` 用一个空快照**覆盖**唯一持有用户已安装清单的文件：
+  // 那条「丢不起 ⇒ 原子写 + 拒绝读」的成文保证被桥的两半各自反转。既有 `registry_persists_across_bridges` 只用
+  // 可写且可解析的路径，没有一条构造坏注册表。修法（最小、与 `mail.rs` 的 `preserve_unreadable_store` 同形）：
+  // 新增 `preserve_unreadable_registry(path) -> Option<PathBuf>`（`is_file()` 才动；`rename` 成 `<name>.corrupt-<ns>`），
+  // `from_store` 的 `Err` 臂先调它再空启并按「保住了 ∕ 挪不动」分别 warn。
+  { id: 'F-STORE-006', module: 'amos-tauri', files: ['crates/amos-tauri/src/appstore.rs', 'crates/amos-appstore/src/client.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['preserve_unreadable_registry', 'an_unreadable_registry_is_preserved_not_silently_overwritten', 'a_readable_registry_is_loaded_without_being_moved_aside', 'REQ-A1914'], severity: 4 },
   { id: 'F-WEB-001', module: 'amos-tauri', files: ['crates/amos-tauri/src/webman_download.rs', 'crates/amos-tauri/src/webman_download_tests.rs'], markers: ['reserved', 'PathReservation', 'pick_path', 'begin('], severity: 3 },
 
   // 系统更新 (amos-ota) —— REQ-A671。docs/FEATURE_GAP_AUDIT_2026_SEP20.md §3 记 OTA 为**零命中**
@@ -7389,6 +7441,14 @@ const KNOWN_FAILURES = [
   { id: 'F-TAU-026', module: 'the-stage-manager-rail-paints-a-window-hidden-by-a-desktop-switch-as-one-the-user-parked-because-a-space-switch-and-stage-park-call-the-very-same-wmstate-hide-so-the-window-model-cannot-tell-the-two-acts-apart-and-the-rail-offers-a-tile-for-a-window-that-lives-on-another-desktop-whose-bring-it-back-would-put-a-window-on-a-space-that-does-not-own-it-the-two-managers-disagreeing-about-one-window-in-the-direction-the-user-can-see-fix-not-a-reason-mark-on-each-hidden-window-that-is-a-second-copy-of-the-same-fact-but-let-the-rail-read-spaces-own-answer-a-new-spacemanager-hidden-by-switch-returning-switch-plan-s-hide-half-alone-with-the-lock-released-at-the-reader-because-spaces-switch-runs-spaces-then-window-manager-order', files: ['crates/amos-tauri/src/stage.rs', 'crates/amos-tauri/src/spaces.rs', 'docs/stage-manager.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1686', 'hidden_by_switch', 'a_window_hidden_by_a_space_switch_is_not_parked_on_the_rail'], severity: 2 },
   // F-TAU-027（REQ-A1684）—— 录屏停止路径把「子进程没有 pid」折成 `0`，而 `kill -INT 0` 信号的是**整个进程组**（宿主自己）。`tokio::process::Child::id()` 的 `None` 恰好发生在子进程已被回收之后 —— 而「自我到点的静默回归 idle」与 stop 都会回收子进程，所以「停一个已经自己结束的会话」正落在 `None` 上。修法是结构性的：pid 在 spawn 处读一次并带在 `Active`（`pid: u32`），无 id 即拒绝 start ⇒ 停止路径没有可折的站点。
   { id: 'F-TAU-027', module: 'the-screen-recording-stop-path-folded-a-child-with-no-pid-into-zero-and-kill-int-zero-signals-the-whole-process-group-the-host-itself-tokio-process-child-id-returns-option-u32-and-none-happens-exactly-when-the-child-has-already-been-reaped-after-try-wait-or-wait-while-both-the-self-expiring-silent-return-to-idle-and-screen-record-stop-reap-the-child-so-stopping-a-session-that-had-already-ended-is-exactly-the-path-that-lands-on-none-fix-the-pid-is-read-once-at-spawn-and-carried-on-active-as-a-plain-u32-with-start-refused-when-the-child-reports-no-id-so-the-stop-path-has-no-fold-site-the-sentinel-is-unrepresentable-in-the-type', files: ['crates/amos-tauri/src/screen_record.rs', 'crates/amos-tauri/tests/screen_record_e2e.rs', 'docs/screen-recording.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1684', 'reported no process id', 'interrupt_command'], severity: 4 },
+  // F-TAU-028（REQ-A1907）—— 手电筒的点灯路径是 `async fn`，却在 tokio 工作线程上跑同步的 JNI `setTorchMode` 加一段 `std::thread::sleep`：
+  // `torch_yielding_the_preview` 在预览确实交出了传感器时会对一次被拒的点灯重试 `YIELD_SETTLE_TRIES`（=8）次、每次之间 `settle()` 一次，
+  // 而设备侧 `settle` 就是 `std::thread::sleep(YIELD_SETTLE_STEP)`（=25 ms）⇒ 最坏约 200 ms 落在一个运行时线程上。缺陷落在两面之间：
+  // 纯层被 8 例测试钉住（传入的是只 push 进 log 的空操作 `settle`，从不真睡），会睡的设备层住在 `#[cfg(feature="android")]` 的 `mod device`，
+  // 宿主默认 `cargo test` 不编译它。修法：两字段改 `Arc`（`spawn_blocking` 闭包需 `'static + Send`），整对同步工作交给 `tokio::task::spawn_blocking`，
+  // `.await` 的连接失败映射为 `FlashlightError::Provider` 而不吞；保护性次序测试用 `include_str!` 钉住 `spawn_blocking(` 早于那个带实参的睡眠调用。
+  // 门禁这条本来是红的（`blocking-in-async-scan` 规则一），**未**加 allowlist 条目 —— 该表只收启动 ∕ 关闭期的 5 个站点。
+  { id: 'F-TAU-028', module: 'the-flashlight-set-on-is-an-async-fn-that-runs-a-synchronous-jni-set-torch-mode-and-a-std-thread-sleep-on-a-tokio-worker-so-one-torch-toggle-holds-a-runtime-thread-for-about-two-hundred-milliseconds-and-queues-unrelated-requests-behind-it-the-defect-sits-between-two-faces-the-pure-layer-is-pinned-by-eight-tests-that-pass-a-recording-no-op-settle-and-never-sleep-while-the-sleeping-device-layer-lives-under-cfg-feature-android-mod-device-so-the-host-default-cargo-test-never-compiles-it-fix-give-the-two-fields-arc-handles-because-a-spawn-blocking-closure-needs-static-plus-send-and-hand-the-whole-synchronous-pair-to-tokio-task-spawn-blocking-mapping-a-join-failure-into-flashlight-error-provider-rather-than-swallowing-it', files: ['crates/amos-tauri/src/flashlight.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1907', 'spawn_blocking', 'YieldingProvider', 'the_torch_request_hands_its_blocking_work_to_a_worker', 'YIELD_SETTLE_STEP'], severity: 3 },
   // F-DEV-146（REQ-A1685）—— Android 录屏的 `stop()` 把「胶水答了一个它从不发的词」读成「当前没有录制」，一个这次调用**从未建立**的成因（`STATUS_DENIED` 尤其不同：**有**会话，平台拒绝封口）；兄弟 `start()` 的匹配逐臂命名未知，`stop()` 却把整个剩余折进兜底。修法是抽出**纯函数** `stop_refusal(word)`，于是这些词能在无设备时被枚举。
   { id: 'F-DEV-146', module: 'the-android-screen-recording-stop-mapped-a-word-the-glue-never-sends-into-there-is-no-screen-recording-in-progress-a-cause-this-call-never-established-status-denied-is-the-one-that-differs-most-there-is-a-session-and-the-platform-refused-to-seal-it-its-sibling-start-names-the-unknown-case-arm-by-arm-while-stop-folded-the-whole-remainder-into-a-catch-all-so-a-user-told-nothing-is-recording-will-not-go-look-for-the-session-that-is-still-running-fix-extract-a-pure-stop-refusal-word-consumed-by-stop-so-every-answer-word-is-pinned-without-a-device', files: ['crates/amos-tauri/src/screen_record_android.rs', 'docs/screen-recording.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1685', 'stop_refusal', 'every_stop_answer_word_has_its_own_refusal'], severity: 2 },
   // F-DEV-147（REQ-A1707）—— `unwired-scan` 的剥注释器（原名 `stripBlockComments`）只剥 `/* … */`，文档逐字记下留 `//` 的理由「`//` appears inside string literals (`content://…`)」；于是任何**只在自己旁边的行注释里被提到**的导出都被 `countIn` 数成「已接线」—— 注释既是它的唯一理由，也是它逃过门禁的唯一手段。实测恰九个（`amosStore::saveLayout`、`dockConfig::isFullscreen`、`wm::wmClose ∕ wmFocus ∕ wmMinimize ∕ wmSplit ∕ wmSplitExit ∕ wmSplitMove ∕ wmSplitSwap`），其中 `wm.ts` 的注释逐字把 `unwired-scan` 说成会拦下这类 API 的那台门禁。修法：换成字符串 ∕ 正则感知的 `stripComments`（引号内不剥、正则字面量不剥），取舍方向反转成「宁可少算，绝不虚报未接线」；同轮删掉九个死导出并订正误导注释与钉住旧契约的测试。
@@ -9532,6 +9592,18 @@ const KNOWN_FAILURES = [
   // 两处的「recognised off must stay silent」对照各自变红（证明对照非空）。
   { id: 'F-AI-027', module: 'two-strict-bool-env-readers-and-the-caller-side-comment-read-a-present-but-unrecognised-value-in-silence-the-notifier-opt-in-gate-and-the-telemetry-spy-layer3-framing-flag-each-collapsed-unset-explicitly-off-and-a-value-outside-both-token-sets-into-one-bare-false-via-std-env-var-ok-plus-a-truthy-matches-so-a-typo-enable-tru-2-a-blank-unexpanded-shell-variable-or-a-non-unicode-value-left-the-operator-with-no-signal-that-the-thing-they-asked-for-was-not-read-the-energy-modules-parse-flag-doc-had-excused-both-as-anything-else-is-false-deliberate-and-safe-which-held-only-in-the-arming-direction-a-typo-cannot-open-the-gate-but-not-in-the-reading-direction-and-main-rs-already-prints-a-line-when-a-feature-less-build-cannot-honour-a-set-amos-notifier-so-the-build-that-can-must-not-be-the-quieter-one-fix-both-use-the-same-true-false-token-sets-energy-documents-and-warn-on-a-value-outside-them-while-unset-and-the-documented-off-spellings-stay-silent', files: ['crates/amos-ai/src/notifier_sink.rs', 'crates/amos-ai/src/telemetry_spy_capture.rs', 'crates/amos-ai/src/energy.rs', 'docs/ENV_VARIABLES.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1903', 'an_unrecognised_env_value_is_reported_not_silently_read_as_off', 'an_unrecognised_layer3_value_is_reported_not_silently_read_as_l2', 'treating alerting as OFF', 'FALSE_TOKENS'], severity: 2 },
 
+  // F-AI-028（REQ-A1918）—— netguard 的**状态文件**：`load_state` 把「存在但读不回」折成默认值，
+  // 而 `bootstrap()` 把**同一条路径**交给服务、`persist_snapshot` 在每次 `SetAppEgress` ∕ `Toggle`
+  // 后整份重写它 ⇒ 一次损坏（断电 ∕ 磁盘满 ∕ 升级中断 ∕ 手改）让守卫空启，此后任意一次声明
+  // 就用空快照覆盖运维唯一的出网登记，**无副本**。与一 crate 之隔的 F-STORE-006（REQ-A1914，
+  // `appstore.rs::preserve_unreadable_registry`）及 F-SH-921（REQ-A1898，`mail.rs`）逐字同形。
+  // 修法：`load_state` 拆成 `match std::fs::read` 三分支（缺席静默默认 ∕ 解不开 ∕ 读不回 ⇒
+  // `keep_state_aside` + 默认），新增 `preserve_unreadable_state`（`rename` 成 `<name>.corrupt-<nonce>`；
+  // rename 是目录操作，文件读不出来时依然可行）。红先=新用例的 `WarnProbe` 计数 0 vs 1（可编译，
+  // 因返回值不变、变的是诊断与副作用）；负控=把 `preserve_unreadable_state` 首行改 `return None`
+  // ⇒ 恰 1 红、不相交对照（缺席 ⇒ 无旁支且 0 警告）仍绿。
+  { id: 'F-AI-028', module: 'the-netguard-state-file-exists-but-cannot-be-read-back-is-folded-into-the-default-state-while-the-service-keeps-the-same-path-live-so-the-next-setappegress-or-toggle-rewrites-it-from-a-fresh-snapshot-and-destroys-the-operators-only-copy-of-the-declared-egress-registry-with-no-backup-the-original-triple-folds-three-distinct-facts-absent-versus-present-but-unreadable-versus-present-but-unparseable-into-one-netguardstate-default-and-there-is-no-gate-asking-whether-a-file-that-was-refused-a-read-will-later-be-written-fix-mirrors-the-sibling-preserve-unreadable-registry-and-store-read-the-file-as-a-match-with-three-arms-absent-is-silent-present-but-unparseable-and-present-but-unreadable-both-warn-and-rename-the-file-to-a-corrupt-nonce-sibling-before-returning-the-default-the-rename-is-a-directory-operation-so-it-works-even-when-the-file-itself-cannot-be-read', files: ['crates/amos-ai/src/netguard_service.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1918', 'a_corrupt_state_file_is_kept_aside_before_the_next_save_overwrites_it', 'preserve_unreadable_state', 'keep_state_aside'], severity: 3 },
+
   // F-DEV-167（REQ-A1906）—— ENV 文档门把「谁算 env 名」定义在**拼法**上：`env-doc-gen.mjs` 只认字面量
   // 直接写在调用处的形状（`env::var("X")`）加一张固定 helper 名表（`env_flag`/`get_env`/…）。于是凡经
   // **参数转发**到达 `env::var` 的读取一律隐形 —— `amos-podcast/src/manager.rs::PodcastPaths::from_env`
@@ -9591,28 +9663,15 @@ const KNOWN_FAILURES = [
   // 而非把回溯搜索改写成显式栈（在安全相关组件上徒增风险、收益为零）。`ekf.rs` 未改动。
   { id: 'F-DEV-172', module: 'the-slam-jcbb-branch-and-bound-search-ekf-rs-jcbb-search-is-recursive-but-its-depth-is-capped-by-a-compile-time-constant-associate-joint-refuses-observations-len-greater-than-max-jcbb-observations-eight-before-it-constructs-the-searcher-and-jcbb-s-hypothesis-and-candidate-buffers-are-fixed-arrays-sized-by-that-same-constant-so-search-recurses-at-most-eight-frames-with-max-jcbb-nodes-four-thousand-ninety-six-additionally-capping-visited-nodes-the-depth-is-a-constant-not-input-derived-fix-freeze-it-in-scripts-rust-recursion-baseline-json-with-a-real-reason-naming-both-bounds-rather-than-rewriting-a-backtracking-search-into-an-explicit-stack-on-a-safety-relevant-component-the-baseline-is-a-per-path-fn-ratchet-that-fails-when-stale-req-a447-not-an-exemption', files: ['scripts/rust-recursion-baseline.json', 'crates/amos-robot/src/slam/ekf.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1912', 'Jcbb::search', 'MAX_JCBB_OBSERVATIONS', 'rust-recursion-baseline.json', 'no stale baseline entries'], severity: 2 },
 
-  // F-DEV-173（REQ-A1913）—— 屏录 `stop()` 的两条出口都把 `child.kill()` 的结果丢掉：并发拒收臂与
-  // `STOP_WAIT_SECS` 超时臂各逐字 `let _ = child.kill().await;`。录制进程先由 `interrupt_command(pid)`
-  // 收停止信号、再等 `STOP_WAIT_SECS`；这两处正对应「它没按时停」与「它根本没停」—— `kill()` 是最后
-  // 手段，它的失败（`ESRCH` ∕ 无权限 ∕ 僵尸）恰是「录制器可能还在写 `out`」的唯一信号，`let _ =` 抹掉后
-  // 用户只看到拒绝 ∕ 超时，输出文件却可能被孤儿进程继续追加。同文件其余尽力步骤都已就结果回话
-  // （`interrupt_command` 的 `status()` 那条另有注释说明「失败不致命、但这正是我们仍要等的原因」）。
-  // 修法：两处改 `if let Err(e) = child.kill().await { tracing::warn!(pid ∕ out, error = %e, …) }`，
-  // 拒绝 ∕ 超时语义一字未改。门禁盲区：`clippy::let_underscore_must_use` 看得见这两处，
-  // 真正的盲区是**没有门读「丢弃的后果由谁承担」**，于是「真缺陷」与「已论证的重复安装」同灯混同。
-  { id: 'F-DEV-173', module: 'the-screen-recorders-stop-discards-the-result-of-child-kill-on-both-of-its-exits-the-concurrent-start-refusal-arm-and-the-stop-wait-secs-timeout-arm-each-litterally-let-child-kill-await-so-a-recorder-that-survived-both-the-interrupt-signal-and-the-kill-can-keep-appending-to-the-output-file-while-nothing-says-so-the-kill-failure-esrch-no-permission-a-zombie-is-the-only-signal-that-the-recorder-may-still-be-writing-out-fix-report-both-through-tracing-warn-with-the-pid-or-out-path-and-the-kill-error-leaving-the-refusal-or-timeout-return-unchanged-the-gates-clippy-let-underscore-must-use-sees-both-sites-the-real-blind-spot-is-that-no-gate-reads-who-bears-the-consequence-of-a-drop', files: ['crates/amos-tauri/src/screen_record.rs', 'scripts/rust-discard-baseline.json', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1913', 'child.kill().await', 'STOP_WAIT_SECS', 'rust-discard-scan', 'screen_record_stop'], severity: 2 },
-
-  // F-DEV-174（REQ-A1913）—— 三个文件带着未认领的手写 `let _ = <must_use>` 进入树内，`rust-discard-scan`
-  // 棘轮（本轮实扫 101 ∕ 基线 96）因此红着。逐处判读：`ota.rs` 三处皆 `let _ = machine.fail(…)` 紧接
-  // `return Ok(OtaInstallResult::from_machine(&machine))`，而 `crates/amos-ota/src/install.rs:370 pub fn fail`
-  // 仅在**已是终态**或**无在飞版本**时返回 `Err`，三处都在 `begin` 刚成功、其间无其它转移之后 ⇒ 不可达，
-  // 且效果被下一行读回；`incall.rs` 的 `CLASS.set(global)` 是已基线 `APP.set` ∕ `VM.set` 同族的 `OnceLock`
-  // 恰一次安装（安全前提是生成的 Activity 从不重建 —— `configChanges`，由 `android-glue-mirror.sh` 守）。
-  // 修法：基线认领（`ota.rs: 3`、`screen_record.rs: 1`、`incall.rs 2 → 3`、`total 96 → 101`），**不**把可
-  // 认领项改写成假 `if let`。缺的不是门（门正确报红），是「新入树的手写丢弃须逐处认领」这一动作。
-  { id: 'F-DEV-174', module: 'three-files-entered-the-tree-with-unacknowledged-hand-written-let-underscore-must-use-sites-so-the-rust-discard-scan-ratchet-was-red-this-round-101-scanned-versus-a-baseline-total-of-96-two-of-the-screen-record-sites-are-real-defects-see-f-dev-173-the-six-in-ota-rs-and-incall-rs-are-existing-shapes-that-owed-an-acknowledgement-ota-rs-s-three-are-let-machine-fail-immediately-before-return-ok-otainstallresult-from-machine-and-installmachine-fail-answers-err-only-when-already-terminal-or-no-version-in-flight-install-rs-370-neither-reachable-here-and-the-effect-is-read-back-by-the-next-line-incall-rs-s-class-set-is-the-same-oncelock-install-once-family-the-baseline-already-records-for-app-set-and-vm-set-safe-because-the-generated-activity-is-never-recreated-configchanges-gated-by-android-glue-mirror-sh-fix-acknowledge-in-scripts-rust-discard-baseline-json-rather-than-rewriting-each-into-a-fake-if-let-err-that-would-have-nothing-to-do-with-e', files: ['scripts/rust-discard-baseline.json', 'crates/amos-tauri/src/ota.rs', 'crates/amos-tauri/src/incall.rs', 'crates/amos-ota/src/install.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1913', 'rust-discard-baseline.json', 'InstallMachine::fail', 'OnceLock', 'no stale baseline entries'], severity: 2 },
-
-
+  // F-DEV-173（REQ-A1916）—— `crates/amos-sms/src/trash.rs::SmsTrash::from_json` 的**预览块**逐字段折默认值：
+  // `if let Some(list) = v.get("previews").and_then(Value::as_array)` 把「存在但错形」吞成「没有覆盖」；
+  // `unread…unwrap_or(0) as u32` 缺字段折 0 且 `u64` 回绕；`hidden…unwrap_or(false)` 缺字段折「可见」；
+  // `last_text…unwrap_or("").take(MAX_BODY_CHARS)` 折空串 ∕ 静默截断。而 `from_json` 的文档逐字
+  // 「a wrong shape is an error, never silence」、模块 `//!` 逐字「a corrupt or wrong-shaped file is an error,
+  // never an empty list」，同 crate `wire.rs` 的 `req_bool`（REQ-A1772）∕ `req_u32`（饱和非回绕，REQ-A1786）∕
+  // `clamp_body` 正是为这批字段写的权威 —— 同一个函数的 `entries` 块用的就是这套规则，唯独预览块没有。
+  // 修法：新增本地 `req_bool` ∕ `req_u32` ∕ `req_text`，预览块改用之，并把 `previews` 的「缺席」与「错形」分开。
+  { id: 'F-DEV-173', module: 'the-sms-trash-preview-parser-folds-four-fields-to-silent-defaults-in-crates-amos-sms-src-trash-rs-sms-trash-from-json-a-present-but-wrong-shaped-previews-key-is-swallowed-by-if-let-some-list-v-get-previews-and-then-value-as-array-a-missing-unread-folds-to-zero-through-unwrap-or-zero-as-u32-and-a-u64-above-u32-max-wraps-to-a-small-number-a-missing-hidden-folds-to-false-so-a-thread-whose-every-message-is-trashed-shows-again-and-an-over-long-last-text-is-silently-truncated-while-the-sibling-entries-block-in-the-same-function-uses-required-field-helpers-and-the-crate-s-wire-rs-wrote-req-bool-req-u32-and-clamp-body-with-docs-naming-exactly-this-anti-fold-req-a1772-req-a1786-fix-add-local-req-bool-req-u32-saturating-and-req-text-rejecting-over-long-strings-and-split-absent-previews-from-wrong-shaped-previews', files: ['crates/amos-sms/src/trash.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1916', 'req_text', 'previews_present_but_wrong_shaped_is_an_error_while_absent_is_empty', 'a_preview_unread_above_u32_saturates_instead_of_wrapping'], severity: 3 },
 
   // F-SH-925（REQ-A1906）—— 播客桥的 live 闸把**文档里的 off 拼法读成 ON**：`crates/amos-tauri/src/podcast.rs`
   // 的 `provider()` 逐字 `std::env::var("AMOS_PODCAST_LIVE").map(|v| !v.is_empty() && v != "0")`，于是
@@ -9815,6 +9874,34 @@ const KNOWN_FAILURES = [
   // `bridged` 位，纯选择器 `healthNotice(latest, bridged, stopped)` 给出
   // none∕unbridged∕stopped∕awaiting 四态，三分支渲染各自的句子。
   { id: 'F-SH-919', module: 'the-health-no-reading-banner-collapses-three-distinct-causes-into-one-sentence-because-readhealthvitals-folds-a-missing-host-and-a-host-that-answered-without-a-sample-into-the-same-null-so-on-a-connected-granted-device-whose-step-counter-is-registered-but-has-not-produced-a-sample-yet-the-banner-tells-the-user-to-connect-a-phone-and-grant-a-permission-a-cause-the-code-path-never-established-fix-preserve-the-bridged-bit-in-readhealthfeed-and-select-one-of-four-notice-states-in-a-pure-healthnotice-so-each-rendered-sentence-states-a-cause-the-app-can-actually-see', files: ['crates/amos-tauri/frontend-ts/src/lib/health.ts', 'crates/amos-tauri/frontend-ts/src/svelte/HealthApp.svelte', 'crates/amos-tauri/frontend-ts/src/i18n/locales/zh.ts', 'crates/amos-tauri/frontend-ts/src/i18n/locales/en.ts', 'crates/amos-tauri/frontend-ts/src/lib/__tests__/health.test.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/health-app.svelte.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1886', 'healthNotice', 'readHealthFeed', 'health.noReadingYet'], severity: 2 },
+  { id: 'F-SH-924', module: 'the-health-no-reading-banner-judged-a-reading-by-the-raw-wire-fields-while-the-heart-rate-cell-draws-normalizeheartrate-25-250-and-the-rust-seam-only-refuses-a-non-positive-rate-so-a-contact-artifact-of-12-bpm-or-a-worn-strap-at-300-arrives-as-a-plain-number-the-cell-refuses-to-draw-and-the-banner-stayed-silent-on-the-strength-of-the-very-value-the-cell-discarded-a-screen-of-three-dashes-with-no-sentence-saying-why-fix-add-a-pure-vitalshasreading-that-reuses-the-reducers-step-guard-and-normalizeheartrate-so-the-banner-and-the-cells-share-one-rule', files: ['crates/amos-tauri/frontend-ts/src/lib/health.ts', 'crates/amos-tauri/frontend-ts/src/lib/__tests__/health.test.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/health-app.svelte.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1902', 'vitalsHasReading', 'healthNotice', 'normalizeHeartRate'], severity: 2 },
+  // F-NOT-006（REQ-A1908 ∕ REQ-A1910）—— 同族于本 crate 自己的 REQ-A459 ∕ REQ-A769
+  // 「散文断言了构建没执行的事」。**两个生产者，同一股 stderr 流**：
+  // (a) `stdout.rs` 的模块头逐字承诺「one line per alert, parseable by `jq -R 'fromjson?'`」，
+  // 而 `send` 逐字 `eprintln!("[amos-notifier] {sev} {id} — {msg}", …)` 打纯文本：照文档把
+  // 实时输出接进 jq 永远得到空，既分不清「没有告警」与「过滤器坏了」，也把 `Alert.labels`
+  // （webhook 的 body 逐字带、有测试钉住）整个丢掉。修法是把渲染收口到与
+  // `WebhookChannel::body` 同范式的纯缝 `StdoutChannel::line(&Alert) -> String`，返回
+  // `serde_json::to_string(alert)`，`send` 只 `eprintln!("{}", Self::line(alert))`。
+  // (b) 同流上的**第二个生产者** `dispatcher.rs::operator_fallback`（最后兜底行）仍是纯文本，
+  // 且它正是生产实际走的那条：`notifier_sink::build_dispatcher_from_env` 只在没有 webhook 时
+  // 才挂 `StdoutChannel`，配了 webhook 的机器一律走这行 —— 于是「没送到任何人」的告警对
+  // 文档配方隐形。修法：新增共享渲染器 `operator_line(alert, note)`（紧邻 `StdoutChannel::line`，
+  // 两生产者同流不可形状不同），`operator_fallback` 改调它。
+  { id: 'F-NOT-006', module: 'the-stderr-transport-documents-a-jq-fromjson-recipe-while-send-prints-a-plain-text-line-and-drops-the-alerts-structured-labels-that-every-sibling-transport-ships-so-an-operator-piping-the-live-stream-to-a-collector-gets-nothing-and-cannot-tell-no-alerts-from-a-broken-filter-fix-collect-the-rendering-into-a-pure-stdoutchannel-line-seam-mirroring-webhookchannel-body-returning-serde-json-to-string-of-the-alert-so-severity-id-message-and-labels-all-survive-and-the-dispatchers-own-last-resort-operator-line-on-that-same-stream-was-still-plain-text-so-the-very-line-production-uses-when-a-webhook-is-configured-but-unreachable-was-invisible-to-the-documented-filter-and-dropped-its-labels-too-fix-route-both-producers-through-one-shared-operator-line-renderer-beside-stdoutchannel-line', files: ['crates/amos-notifier/src/stdout.rs', 'crates/amos-notifier/src/dispatcher.rs', 'crates/amos-notifier/examples/alert_to_stderr.rs', 'crates/amos-notifier/examples/alert_fallback_line.rs', 'crates/amos-notifier/README.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1908', 'a_stderr_line_is_one_json_object_an_operator_can_pipe_through_jq', 'StdoutChannel::line', 'the_dispatcher_fallback_line_is_json_too', 'the_operator_fallback_writes_the_shared_json_line', 'operator_line'], severity: 2 },
+  // F-SH-926（REQ-A1917）—— 分享面板的空状态提示按「快捷指令半边为空」判定，而内置的
+  // 备忘录 ∕ 邮件目标对每种可分享类型都恒在（`builtinTargetsFor` 对面板能开的每种负载非空），
+  // 于是默认配置下「还没有快捷指令…」正好画在两个可用目标行下面。修法：判据改
+  // `builtins.length === 0 && targets.length === 0` —— 提示是面板的空状态，只许立在真正为空之处。
+  { id: 'F-SH-926', module: 'the-share-sheets-empty-state-hint-was-keyed-on-the-shortcut-half-alone-while-the-built-in-notes-mail-destinations-accept-both-share-kinds-so-the-default-configuration-drew-no-shortcuts-yet-open-shortcuts-and-turn-on-show-in-share-sheet-directly-under-two-working-destination-rows-the-screen-asserting-there-is-nowhere-to-share-to-an-inch-above-two-places-to-share-to-and-pointing-the-user-at-shortcuts-they-do-not-need-in-order-to-share-at-all-fix-key-the-hint-on-builtins-length-0-and-targets-length-0-so-it-only-stands-where-the-sheet-really-is-empty', files: ['crates/amos-tauri/frontend-ts/src/svelte/ShareSheet.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/share-sheet.svelte.test.ts', 'crates/amos-tauri/frontend-ts/src/lib/shareTargets.ts', 'crates/amos-tauri/frontend-ts/src/svelte/shareSheetState.svelte.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1917', 'builtins.length === 0 && targets.length === 0', '没有可分享指令时，面板仍列内置目标与拷贝'], severity: 2 },
+  // F-DEV-174（REQ-A1919）—— 读写两侧的**同一个上界**只有读者一半：`trash.rs::from_json`
+  // 的 `req_text` 拒绝任何超过 `MAX_BODY_CHARS`（`wire.rs` 的**接收**上限）的 `last_text`，
+  // 而唯一写入者 `SmsTrash::set_preview` 不设限，且它的生产者在 `redact.rs` —— 涂改会**变长**
+  // （`"余额1"` → `"余额***"`，掩码是整条正文上跑的），于是一条 `wire` 收得下的正文能变成存不回去的
+  // 预览：同一版本写出的文件，下次启动读不回，而拒绝路径（`warn!` + 空起 + 下次 `persist()`）
+  // 把整份垃圾箱永久抹掉。修法：在**唯一的入口**按同一个 `MAX_BODY_CHARS` 夹紧
+  //（`clamp_preview_text`），涂改先于夹紧 ⇒ 截断绝不会留下未涂改的尾巴。
+  { id: 'F-DEV-174', module: 'the-sms-trashes-reader-caps-a-stored-last-text-at-wire-max-body-chars-via-req-text-while-the-only-writer-set-preview-does-not-bound-it-and-its-producer-redact-for-grows-the-text-so-a-body-the-wire-accepted-can-be-written-as-a-preview-its-own-reader-refuses-the-same-version-writes-a-file-it-cannot-read-back-and-the-refusal-path-warn-start-empty-then-persist-overwrites-the-operators-only-copy-of-the-trash-permanently-fix-clamp-at-the-only-door-set-preview-through-clamp-preview-text-with-the-same-max-body-chars-bound-and-because-redaction-runs-before-the-clamp-truncation-can-never-store-an-unmasked-tail', files: ['crates/amos-sms/src/trash.rs', 'crates/amos-sms/src/redact.rs', 'crates/amos-tauri/src/sms.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1919', 'clamp_preview_text', 'a_preview_longer_than_the_protocol_cap_is_bounded_by_the_store', 'a_redacted_body_can_grow_past_the_protocol_body_cap'], severity: 3 },
 ];
 
 /**

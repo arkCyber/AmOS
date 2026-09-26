@@ -900,8 +900,10 @@ mod tests {
         const DIAL: &str = include_str!("real_dial.rs");
         const SENSOR: &str = include_str!("sensor_host.rs");
 
-        let dial_wired =
-            concat!("match attach_outcome(bound.is_err(), ", "android_impl::is_bound())");
+        let dial_wired = concat!(
+            "match attach_outcome(bound.is_err(), ",
+            "android_impl::is_bound())"
+        );
         assert!(
             DIAL.contains(dial_wired),
             "TelephonyGlue.nativeAttach must classify its bind result, not warn on every Err"
