@@ -9942,6 +9942,53 @@ const KNOWN_FAILURES = [
   // + 不相交对照 `a_missing_privacy_state_keeps_nothing_aside_and_stays_silent` 也红（2 红）；
   // 负控=NC-1 拿掉 `keep_state_aside` ⇒ 恰 1 红（对照仍绿）；NC-2 让缺席臂也 `keep_state_aside` ⇒ 恰 1 红（损坏用例仍绿）。
   { id: 'F-AI-032', module: 'the-privacy-state-file-that-exists-but-cannot-be-read-back-is-folded-into-one-err-with-the-ordinary-first-boot-so-bootstrap-with-sink-warns-and-starts-a-deny-by-default-manager-while-handing-the-same-path-back-to-the-service-and-persist-save-rewrites-that-path-after-every-grant-revoke-or-revoke-all-so-a-corrupt-truncated-hand-edited-or-non-utf8-privacy-json-silently-empties-the-grant-table-and-the-next-grant-overwrites-the-operators-only-copy-of-every-app-resource-pair-with-no-backup-and-the-same-err-arm-also-fires-a-false-warning-on-every-clean-first-boot-fix-mirrors-the-sibling-preserve-unreadable-state-and-preserve-unreadable-registry-read-through-manager-from-state-file-with-an-absence-test-taken-from-the-anyhow-root-cause-io-error-kind-notfound-and-rename-the-file-to-a-corrupt-nonce-sibling-before-returning-the-default-a-missing-file-is-silent-because-a-first-boot-is-not-an-incident', files: ['crates/amos-ai/src/privacy_service.rs', 'crates/amos-ai/tests/privacy_state_file.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1924', 'manager_from_state_file', 'preserve_unreadable_state', 'keep_state_aside', 'a_corrupt_privacy_state_is_kept_aside_before_the_next_save_overwrites_it', 'a_missing_privacy_state_keeps_nothing_aside_and_stays_silent'], severity: 3 },
+  // F-SH-927（REQ-A1925）—— 应用级**共享持久存储**（`~/.amos/state.json` ∕ `AMOS_STATE_FILE`）的
+  // 读入侧：`SharedStore::from_file` 把「文件在、但读 ∕ 解不开」与「首次启动、无文件」**折成同一个
+  // 空 map**，`warn!` 后照旧把 `path` 交给 `Self`；而 `insert` ∕ `remove_key` ∕ `persist` 在**每一次**
+  // 变更后把**整份** map 重写回该路径。于是一个截断 ∕ 手改 ∕ 升级中断的 `state.json` 让全仓
+  // `amos.*` 键静默空启，此后**第一次** `store_set`（前端 settings ∕ 布局 ∕ 通知都写这里）就用
+  // 这份空快照覆盖用户的**唯一**副本。与同 crate 的 F-SH-723（REQ-A1474，同一 `SharedStore` 的
+  // 写半边锁中毒）无关轴，而与一 crate 之隔的 **F-STORE-006**（REQ-A1914，`appstore.rs`）、
+  // **F-SH-921**（REQ-A1898，`mail.rs`）、**F-AI-028** ∕ **F-AI-032**（REQ-A1918 ∕ A1924）**逐字同形**
+  // —— 同族于 memory `project_bridge_swallows_a_refusal_to_load_and_keeps_the_path`。
+  // 修法（与四处兄弟同形）：新增 `preserve_unreadable_state`（`rename` 成 `<name>.corrupt-<nonce>`，
+  // 返回 `Option<PathBuf>`），`from_file` 的 `None`（解不开）臂先 preserve 再空启，并按 kept ∕
+  // 「移动失败」两条 `warn!`；`from_file` 的 doc 把「就地空启会毁掉整份 map」写明。
+  // 两半独立承重：①preserve 在空启**之前**；②能解析的文件**不碰**（正向对照）。
+  // 负控=NC-1 把调用折成 `None::<PathBuf>` ⇒ 恰 1 红（正向对照仍绿）；NC-2 把调用**无条件**提到
+  // `from_file` 顶部 ⇒ 4 红（正向对照 + 三个既有耐久性用例），证明两半是两条独立断言。
+  { id: 'F-SH-927', module: 'the-whole-durable-amos-key-map-is-rewritten-on-every-mutation-but-its-load-side-folds-file-exists-but-unparseable-into-the-same-empty-map-as-first-boot-while-keeping-the-path-so-a-truncated-hand-edited-or-upgrade-interrupted-amos-state-json-silently-starts-empty-and-the-very-next-store-set-from-settings-layout-or-notifications-overwrites-the-operators-only-copy-of-every-key-with-that-empty-snapshot-fix-mirrors-the-four-sibling-preserve-unreadable-registry-and-preserve-unreadable-state-fixes-rename-the-unparseable-file-to-a-corrupt-nonce-sibling-before-starting-empty-with-a-kept-vs-could-not-be-moved-aside-warning-pair-and-a-readable-file-is-loaded-in-place-untouched', files: ['crates/amos-tauri/src/store.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1925', 'preserve_unreadable_state', 'an_unreadable_state_file_is_preserved_not_silently_overwritten', 'a_readable_state_file_is_loaded_without_being_moved_aside'], severity: 4 },
+  // REQ-A1926 ∕ F-SH-928 —— 「同一事实的两次判断用了两张不同的脸」：说「还没有读数」的那条横幅，判的是
+  // **在线线字段** `latest.steps_total`（自开机起的累计计数器），可它脚下那格步数画的是**历史**
+  // （`daySteps` → `state.days[].steps`，仅当 `steps_recorded === true`）。于是「当天第一次采样」
+  // ——其唯一作用是把计数器重新基线化、并不铸造任何行——恰好把横幅**熄灭**在三格 `—` 上方：屏幕
+  // 无任何读数、却也没有一句解释，正是 REQ-A1902 写下要避免的那个结局。修法=横幅与格子判同一个
+  // 值（新增 [`drawsAReading`]，只认 `todaySteps` 或一格会被画出的心率），并在 S5 实测。
+  // 承重的两半：①`healthNotice` 增第 4 参 `todaySteps`；②调用点传 `daySteps(history, todayKey)`。
+  // 负控（各自独立、正向对照仍绿）：NC-1 把 `drawsAReading` 的 `todaySteps` 臂折回旧判据
+  // （读 `latest.steps_total`）⇒ 「当天无记录但计数在线」用例红而「已记录」用例仍绿；NC-2 把调用点
+  // 改回不传 `todaySteps` ⇒ 同一用例红。证据为真机取证（宿主快照 `steps_total: 1529` 而
+  // `localStorage` `amos.health.history={"days":[],"workouts":[]}`，页面三格 `—` 无横幅）。
+  { id: 'F-SH-928', module: 'the-health-no-reading-banner-judges-the-live-wire-field-latest-steps-total-the-cumulative-since-boot-counter-while-the-step-cell-it-stands-above-draws-from-history-day-steps-over-state-days-steps-and-mints-a-row-only-when-steps-recorded-so-the-first-vitals-sample-of-any-day-whose-only-effect-is-to-re-baseline-the-counter-silences-the-banner-above-three-dashes-exactly-the-outcome-a-prior-round-was-written-to-prevent-fix-judge-the-values-the-cells-draw-a-new-draws-a-reading-that-accepts-a-recorded-day-steps-or-a-heart-rate-the-cell-will-render-and-thread-today-steps-from-the-call-site', files: ['crates/amos-tauri/frontend-ts/src/lib/health.ts', 'crates/amos-tauri/frontend-ts/src/svelte/HealthApp.svelte', 'crates/amos-tauri/frontend-ts/src/lib/__tests__/health.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1926', 'drawsAReading', 'healthNotice', 'a live cumulative counter with no recorded step today is not a reading on screen'], severity: 2 },
+  // REQ-A1928 ∕ F-SH-929 —— 锁屏的电池是 `lib/batterySources.svelte.ts` 所宣称的「the ONE place
+  // that subscribes to live battery data」的**第四份、已漂移副本**：它自带的注释逐字写「daemon →
+  // host → browser」，实际走 `systemStatusWithHostBattery()`（daemon → host），而后者逐字
+  // `const raw = await systemHealth(); if (!raw) return null;` —— daemon 一缺席就**连 host 层
+  // 一起放弃**。于是同一台机器上，状态栏 ∕ 桌面顶栏 ∕ 小组件（三处都 `createBatterySources()`）
+  // 画着 host 的真实电量，锁屏却**什么也不画**；而这恰是设备刚开机 ∕ daemon 重启的窗口。修法=收回
+  // 唯一订阅：`createBatterySources` 增可选 `pollMs`（默认 5000 逐字不变），锁屏传 30_000 用共享
+  // 订阅而非自建一份。承重的两半：①锁屏改走共享模块；②共享模块本身不得折掉 host+browser 层。
+  // 负控（各自独立）：NC-1 把锁屏还原回自建 daemon→host 副本 ⇒ 1 红 ∕ 16 绿；NC-2 让共享模块的
+  // poll 也 `if (!raw) return;` ⇒ 1 红 ∕ 16 绿而纯适配器 8 ∕ 0 仍绿。
+  { id: 'F-SH-929', module: 'the-lockscreen-battery-is-a-fourth-drifted-copy-of-the-subscription-battery-sources-svelte-ts-promises-is-the-one-place-that-subscribes-to-live-battery-data-its-own-comment-claims-daemon-host-browser-but-it-went-through-system-status-with-host-battery-which-folds-the-host-and-browser-layers-away-whenever-the-daemon-is-absent-so-with-the-daemon-restarting-the-lockscreen-draws-no-battery-while-the-status-bar-the-desktop-top-bar-and-the-widget-all-show-the-real-host-level-fix-reclaim-the-one-subscription-an-optional-poll-ms-on-create-battery-sources-default-5000-unchanged-and-the-lockscreen-passes-30000', files: ['crates/amos-tauri/frontend-ts/src/svelte/LockScreen.svelte', 'crates/amos-tauri/frontend-ts/src/lib/batterySources.svelte.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/lockscreen.svelte.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1928', 'createBatterySources', 'shows the host battery even when the daemon is away'], severity: 2 },
+
+  // F-AI-034（REQ-A1930）—— RAG 的 `AMOS_RAG_STATE` 用 `std::env::var(k).ok().filter(|s| !s.is_empty())`
+  // 读基路径，把「缺席」/「空串」/「非 Unicode」折成同一句沉默的 `None`（`.ok()` 折 Err(NotUnicode)
+  // ＝ F-AI-026 的形状，`!is_empty()` 折恰好空串 ＝ F-AI-025 的形状），而 const doc 只承诺
+  // 「Absent => pure in-memory」；纯空白串反被当成合法基路径。运维设一个坏字节路径 ∕ 未展开的 shell
+  // 变量时，索引静默退回内存态、每次重启从零开始。修法：`var_os` 缺席静默、`to_str()` 失配告警、
+  // `trim()` 后为空告警；同族于同文件的 F-AI-031 与同日 F-AI-029 ∕ F-AI-027 ∕ F-AI-026。
+  { id: 'F-AI-034', module: 'the-rag-persist-base-env-amos-rag-state-is-read-with-std-env-var-k-ok-filter-s-is-empty-folding-absence-a-blank-string-and-a-non-unicode-value-into-one-silent-none-so-a-durable-vector-index-silently-becomes-in-memory-and-is-lost-on-every-restart-while-both-the-const-doc-and-the-fn-doc-promise-only-absent-is-silent-and-a-whitespace-only-value-is-even-accepted-as-a-base-path-fix-read-via-var-os-so-absence-is-the-only-silent-state-warn-and-return-none-when-to-str-fails-and-trim-then-warn-when-empty', files: ['crates/amos-ai/src/rag_service.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1930', 'AMOS_RAG_STATE', 'a_blank_state_base_is_reported_not_silently_read_as_in_memory', 'an_unset_state_base_stays_silent_and_runs_in_memory', 'a_non_unicode_state_base_is_reported_not_silently_read_as_in_memory'], severity: 2 },
 ];
 
 /**

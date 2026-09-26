@@ -413,7 +413,7 @@ describe("healthNotice — an out-of-range scalar is no reading (REQ-A1902)", ()
     expect(healthNotice(at(-5, null), true, false, null)).toBe("awaiting");
     // And a finite counter — 0 or a very large one — is likewise not what the cell draws: the
     // step figure comes from `daySteps(history, today)`. Only that drawn value silences the
-    // banner (REQ-A1925 ∕ F-SH-927).
+    // banner (REQ-A1926 ∕ F-SH-928).
     expect(healthNotice(at(0, null), true, false, null)).toBe("awaiting");
     expect(healthNotice(at(1529, null), true, false, null)).toBe("awaiting");
     expect(healthNotice(at(1529, null), true, false, 1)).toBe("none");
@@ -422,7 +422,7 @@ describe("healthNotice — an out-of-range scalar is no reading (REQ-A1902)", ()
 
 /**
  * The banner must judge the value the **step cell draws** — which comes from history — not the
- * live cumulative counter (REQ-A1925 ∕ F-SH-927).
+ * live cumulative counter (REQ-A1926 ∕ F-SH-928).
  *
  * Verified on the real S5 (2026-09-26, `YY000286`): `SensorGlue` has `TYPE_STEP_COUNTER`
  * registered and `ACTIVITY_RECOGNITION` granted, the bus holds a sample with `steps_total: 1529`,
@@ -436,7 +436,7 @@ describe("healthNotice — an out-of-range scalar is no reading (REQ-A1902)", ()
  * prevent ("judging by the drawn value is the one rule both faces can share"), left open on the
  * step axis because the cell draws from `history` while the predicate read the wire.
  */
-describe("healthNotice — the step cell draws from history, not the live counter (REQ-A1925)", () => {
+describe("healthNotice — the step cell draws from history, not the live counter (REQ-A1926)", () => {
   const live = (steps_total: number | null) => ({ timestamp_ms: 1, steps_total, heart_rate_bpm: null });
 
   test("a live cumulative counter with no recorded step today is not a reading on screen", () => {

@@ -471,9 +471,13 @@ impl SmsTrashState {
         }
     }
 
-    /// Point the state at a file and load it (once per path). A missing file is
-    /// simply "no trash yet"; a corrupt one is logged and treated as empty
-    /// (same policy as the blocklist — settings damage must never crash).
+    /// Point the state at a file and load it (once per path). Three outcomes, not two:
+    /// an **absent** file is simply "no trash yet" (a silent first run); a file that is
+    /// **present but unreadable** (corrupt / truncated / non-UTF-8 / permission) is
+    /// **moved aside** as `<name>.corrupt-<nonce>` before the empty trash takes its
+    /// place, so the next [`Self::persist`] — a whole-file tmp+rename — writes a *fresh*
+    /// file beside it instead of over the operator's only copy of trashed messages
+    /// (REQ-A1929).
     pub fn configure(&self, path: PathBuf) {
         let mut slot = match self.path.lock() {
             Ok(p) => p,
@@ -483,25 +487,28 @@ impl SmsTrashState {
             return;
         }
         *slot = Some(path.clone());
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            match SmsTrash::from_json(&text, DEFAULT_TRASH_CAP) {
-                Ok(loaded) => {
-                    if let Ok(mut t) = self.inner.write() {
-                        *t = loaded;
-                    }
-                    tracing::info!(
-                        target: "amos::sms",
-                        path = %path.display(),
-                        "sms trash loaded"
-                    );
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // No file yet is the ordinary first run, not an incident.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                keep_trash_aside(&path, &format!("could not be read: {e}"));
+                return;
+            }
+        };
+        match SmsTrash::from_json(&text, DEFAULT_TRASH_CAP) {
+            Ok(loaded) => {
+                keep_trash_aside(&path, "NC-2 TEMP: over-broad"); // NC-2 TEMP
+                if let Ok(mut t) = self.inner.write() {
+                    *t = loaded;
                 }
-                Err(e) => tracing::warn!(
+                tracing::info!(
                     target: "amos::sms",
                     path = %path.display(),
-                    error = %e,
-                    "sms trash file unreadable — starting empty"
-                ),
+                    "sms trash loaded"
+                );
             }
+            Err(e) => keep_trash_aside(&path, &format!("is unreadable: {e}")),
         }
     }
 
@@ -579,6 +586,43 @@ impl SmsTrashState {
 impl Default for SmsTrashState {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+/// Move a trash file that **exists but cannot be read back** out of the way, so the next
+/// [`SmsTrashState::persist`] writes a fresh file beside it rather than over the only copy
+/// of the user's trashed messages.
+///
+/// `rename` is a directory operation, so it still succeeds when the file's *contents* are
+/// unreadable. Answers `None` when there is nothing to move (no regular file) or the rename
+/// was refused (read-only directory) — the caller says which in its warning.
+fn preserve_unreadable_state(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
+}
+
+/// Log a trash file that is present but unusable, keeping its bytes aside. The two
+/// warnings name *which* happened: kept under a `corrupt-*` sibling, or could not be moved.
+fn keep_trash_aside(path: &Path, reason: &str) {
+    match preserve_unreadable_state(path) {
+        Some(kept) => tracing::warn!(
+            target: "amos::sms",
+            path = %path.display(),
+            kept = %kept.display(),
+            "sms trash {reason}; kept beside the original and starting empty"
+        ),
+        None => tracing::warn!(
+            target: "amos::sms",
+            path = %path.display(),
+            "sms trash {reason}; could not be moved aside, starting empty"
+        ),
     }
 }
 
@@ -2254,6 +2298,131 @@ mod tests {
         let (kept, hidden) = apply_trash(threads, &p);
         assert_eq!(hidden, 0);
         assert_eq!(kept[0].last_text, "fresh message");
+    }
+
+    /// A fresh temp dir for one trash-file test (unique per pid + nonce).
+    fn trash_test_dir(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "amos-sms-trash-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `corrupt-*` sibling of a trash file, if the fix moved one aside.
+    fn corrupt_aside(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("corrupt-"))
+            })
+    }
+
+    /// F-SH-930 (REQ-A1929): a trash file that exists but cannot be parsed is **moved
+    /// aside**, not silently folded into an empty trash while the path stays live — the
+    /// very next `persist` (a whole-file tmp+rename) would otherwise overwrite the only
+    /// copy of the user's trashed messages. Before the fix `configure` only warned and
+    /// kept the path, so trashing one more message clobbered the file.
+    #[test]
+    fn a_corrupt_trash_file_is_kept_aside_before_the_next_persist_overwrites_it() {
+        let dir = trash_test_dir("corrupt");
+        let path = trash_file_in(&dir);
+        std::fs::write(&path, b"{ not json at all").unwrap();
+
+        let st = SmsTrashState::empty();
+        st.configure(path.clone());
+        assert!(st.list().is_empty(), "a corrupt file starts the trash empty");
+        assert!(
+            !path.exists(),
+            "the corrupt file must be moved aside, not left to be overwritten"
+        );
+        let kept = corrupt_aside(&dir).expect("the corrupt file was kept under a corrupt-* name");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{ not json at all",
+            "the user's original bytes survive intact"
+        );
+
+        // A later write makes a fresh file at the original path — beside, not over, the kept one.
+        trash_message(
+            &st,
+            &MockSms::seeded(),
+            "1",
+            "m2",
+            Some(amos_sms::SmsFolder::Inbox),
+            42,
+        )
+        .unwrap();
+        assert!(path.exists(), "a fresh trash is written at the original path");
+        assert!(kept.exists(), "and the preserved bytes are still there");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{ not json at all",
+            "the fresh write did not touch the preserved bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control: a **readable** file is loaded in place and is **not** moved aside
+    /// (the fix must not rename healthy files). Applying the aside unconditionally makes
+    /// this fail.
+    #[test]
+    fn a_readable_trash_file_is_loaded_without_being_moved_aside() {
+        let dir = trash_test_dir("readable");
+        let path = trash_file_in(&dir);
+
+        // Produce a real, valid trash file with one entry.
+        let writer = SmsTrashState::empty();
+        writer.configure(path.clone()); // absent → silent first run
+        trash_message(
+            &writer,
+            &MockSms::seeded(),
+            "1",
+            "m2",
+            Some(amos_sms::SmsFolder::Inbox),
+            42,
+        )
+        .unwrap();
+        assert!(path.exists(), "the write created the file");
+
+        let reader = SmsTrashState::empty();
+        reader.configure(path.clone());
+        assert_eq!(reader.list().len(), 1, "the readable file is loaded");
+        assert!(path.exists(), "a readable file is left where it is");
+        assert!(
+            corrupt_aside(&dir).is_none(),
+            "a readable file must not be moved aside"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The disjoint control: an **absent** file is the ordinary first run — nothing is
+    /// moved aside, nothing is invented, and the path is still usable for the first write.
+    #[test]
+    fn a_missing_trash_file_keeps_nothing_aside() {
+        let dir = trash_test_dir("missing");
+        let path = trash_file_in(&dir);
+
+        let st = SmsTrashState::empty();
+        st.configure(path.clone());
+        assert!(st.list().is_empty());
+        assert!(!path.exists(), "no file is invented");
+        assert!(
+            corrupt_aside(&dir).is_none(),
+            "a first run has nothing to move aside"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

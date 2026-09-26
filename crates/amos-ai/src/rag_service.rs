@@ -53,7 +53,9 @@ const OLLAMA_HOST_ENV: &str = "AMOS_OLLAMA_HOST";
 /// Env var naming a durable-state **base** path. When set, every Index/Remove
 /// persists the vector snapshot to `<base>.idx` and the passage map to
 /// `<base>.passages.json` (atomically); on boot the daemon re-hydrates both so an
-/// index survives a restart. Absent => pure in-memory (fresh each boot).
+/// index survives a restart. Absent => pure in-memory (fresh each boot); a value
+/// that is blank or not valid Unicode is reported and likewise in-memory, never
+/// silently (REQ-A1930 / F-AI-034).
 const STATE_ENV: &str = "AMOS_RAG_STATE";
 /// Default mock dimension (host/CI); device uses a real model's dimension.
 const DEFAULT_DIM: usize = 384;
@@ -71,14 +73,35 @@ struct Persist {
 
 impl Persist {
     /// A `<base>.idx` / `<base>.passages.json` pair from the env base (if any).
+    ///
+    /// Only a **genuinely absent** [`STATE_ENV`] is silent — it takes the
+    /// documented in-memory default. A value the operator *did* set that names no
+    /// usable path — blank (or whitespace-only), or not valid Unicode — is
+    /// reported and falls back to in-memory, so a blank or mojibake base path
+    /// cannot silently turn a durable index into an ephemeral one that is gone at
+    /// the next restart (REQ-A1930 / F-AI-034). Read once per service build, so a
+    /// single `warn!` is already once per build.
     fn from_env() -> Option<Persist> {
-        std::env::var(STATE_ENV)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|base| Persist {
-                idx: sibling(Path::new(&base), ".idx"),
-                passages: sibling(Path::new(&base), ".passages.json"),
-            })
+        let raw = std::env::var_os(STATE_ENV)?;
+        let Some(value) = raw.to_str() else {
+            tracing::warn!(
+                env = STATE_ENV,
+                "value is not valid Unicode — running in-memory (the index will not persist)"
+            );
+            return None;
+        };
+        let base = value.trim();
+        if base.is_empty() {
+            tracing::warn!(
+                env = STATE_ENV,
+                "value is blank — running in-memory (the index will not persist)"
+            );
+            return None;
+        }
+        Some(Persist {
+            idx: sibling(Path::new(base), ".idx"),
+            passages: sibling(Path::new(base), ".passages.json"),
+        })
     }
 }
 
@@ -779,43 +802,46 @@ mod tests {
         fn exit(&self, _id: &tracing::span::Id) {}
     }
 
-    /// Save/wipe/restore the embedder-choice env var for one test.
-    struct EnvGuard(Option<String>);
+    /// Save/wipe/restore one env var for the duration of a test.
+    struct EnvGuard {
+        key: &'static str,
+        saved: Option<String>,
+    }
     impl EnvGuard {
-        fn wipe() -> Self {
-            let saved = std::env::var(EMBEDDER_ENV).ok();
-            std::env::remove_var(EMBEDDER_ENV);
-            Self(saved)
+        fn wipe(key: &'static str) -> Self {
+            let saved = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, saved }
         }
         fn set(&mut self, value: &str) {
-            std::env::set_var(EMBEDDER_ENV, value);
+            std::env::set_var(self.key, value);
         }
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(s) => std::env::set_var(EMBEDDER_ENV, s),
-                None => std::env::remove_var(EMBEDDER_ENV),
+            match self.saved.take() {
+                Some(s) => std::env::set_var(self.key, s),
+                None => std::env::remove_var(self.key),
             }
         }
     }
 
-    /// Resolve the reported label under a WARN probe, and how many WARNs the read produced.
-    fn label_under_probe() -> (&'static str, u64) {
+    /// Run `f` under a WARN probe and report its result plus how many WARNs it produced.
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
         let warns = Arc::new(AtomicU64::new(0));
-        let label = {
+        let out = {
             let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
-            label_from_env()
+            f()
         };
-        (label, warns.load(Ordering::Relaxed))
+        (out, warns.load(Ordering::Relaxed))
     }
 
     #[test]
     #[serial_test::serial(rag_embedder_env_lock)]
     fn an_unrecognised_embedder_is_reported_not_silently_folded_to_mock() {
-        let mut env = EnvGuard::wipe();
+        let mut env = EnvGuard::wipe(EMBEDDER_ENV);
         env.set("olama"); // a typo of `ollama`
-        let (label, warns) = label_under_probe();
+        let (label, warns) = warns_of(label_from_env);
         assert_eq!(
             label, "mock",
             "an unknown backend keeps the offline default"
@@ -829,8 +855,8 @@ mod tests {
     #[test]
     #[serial_test::serial(rag_embedder_env_lock)]
     fn an_unset_embedder_stays_silent_and_defaults_to_mock() {
-        let _env = EnvGuard::wipe();
-        let (label, warns) = label_under_probe();
+        let _env = EnvGuard::wipe(EMBEDDER_ENV);
+        let (label, warns) = warns_of(label_from_env);
         assert_eq!(label, "mock");
         assert_eq!(warns, 0, "a genuinely unset variable is the silent case");
     }
@@ -838,7 +864,7 @@ mod tests {
     #[test]
     #[serial_test::serial(rag_embedder_env_lock)]
     fn the_known_embedder_names_are_accepted_without_a_warning() {
-        let mut env = EnvGuard::wipe();
+        let mut env = EnvGuard::wipe(EMBEDDER_ENV);
         for (value, want) in [
             ("mock", "mock"),
             ("ollama", "ollama"),
@@ -846,7 +872,7 @@ mod tests {
             ("  ollama ", "ollama"),
         ] {
             env.set(value);
-            let (label, warns) = label_under_probe();
+            let (label, warns) = warns_of(label_from_env);
             assert_eq!(label, want, "AMOS_RAG_EMBEDDER={value:?}");
             assert_eq!(warns, 0, "{value:?} names a real backend and must not warn");
         }
@@ -857,13 +883,71 @@ mod tests {
     #[serial_test::serial(rag_embedder_env_lock)]
     fn a_non_unicode_embedder_is_reported_not_silently_folded_to_mock() {
         use std::os::unix::ffi::OsStrExt;
-        let _env = EnvGuard::wipe();
+        let _env = EnvGuard::wipe(EMBEDDER_ENV);
         std::env::set_var(EMBEDDER_ENV, std::ffi::OsStr::from_bytes(b"ol\xfflama"));
-        let (label, warns) = label_under_probe();
+        let (label, warns) = warns_of(label_from_env);
         assert_eq!(label, "mock");
         assert_eq!(
             warns, 1,
             "a present-but-unreadable value must not read as `unset`"
+        );
+    }
+
+    // --- F-AI-034 (REQ-A1930): the durable-state base keeps "absent" apart from "blank"/"unreadable" ---
+
+    #[test]
+    #[serial_test::serial(rag_state_env_lock)]
+    fn a_blank_state_base_is_reported_not_silently_read_as_in_memory() {
+        let mut env = EnvGuard::wipe(STATE_ENV);
+        env.set("");
+        let (persist, warns) = warns_of(Persist::from_env);
+        assert!(persist.is_none(), "a blank base cannot name a path");
+        assert_eq!(
+            warns, 1,
+            "the operator set AMOS_RAG_STATE and it was discarded — that must be reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rag_state_env_lock)]
+    fn an_unset_state_base_stays_silent_and_runs_in_memory() {
+        let _env = EnvGuard::wipe(STATE_ENV);
+        let (persist, warns) = warns_of(Persist::from_env);
+        assert!(persist.is_none());
+        assert_eq!(warns, 0, "a genuinely absent variable is the silent case");
+    }
+
+    #[test]
+    #[serial_test::serial(rag_state_env_lock)]
+    fn a_real_state_base_is_accepted_without_a_warning() {
+        let mut env = EnvGuard::wipe(STATE_ENV);
+        env.set("  /tmp/amos-rag-index  ");
+        let (persist, warns) = warns_of(Persist::from_env);
+        let persist = persist.expect("a real base path yields the sibling pair");
+        assert_eq!(
+            persist.idx,
+            Path::new("/tmp/amos-rag-index.idx"),
+            "the base is trimmed and the `.idx` sibling derived"
+        );
+        assert_eq!(
+            persist.passages,
+            Path::new("/tmp/amos-rag-index.passages.json")
+        );
+        assert_eq!(warns, 0, "a usable base path must not warn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(rag_state_env_lock)]
+    fn a_non_unicode_state_base_is_reported_not_silently_read_as_in_memory() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = EnvGuard::wipe(STATE_ENV);
+        std::env::set_var(STATE_ENV, std::ffi::OsStr::from_bytes(b"/tmp/\xff.idx"));
+        let (persist, warns) = warns_of(Persist::from_env);
+        assert!(persist.is_none());
+        assert_eq!(
+            warns, 1,
+            "a present-but-unreadable value must not read as `absent`"
         );
     }
 }

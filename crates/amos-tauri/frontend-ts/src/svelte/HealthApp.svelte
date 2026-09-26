@@ -174,7 +174,7 @@
    * `todaySteps` is passed because it — not `latest.steps_total` — is what the step cell draws:
    * the live field is the cumulative since-boot counter, and the first sample of a day only
    * re-baselines, drawing `—`. Judging the wire field silenced this banner over three `—` on the
-   * real S5 (REQ-A1925 ∕ F-SH-927).
+   * real S5 (REQ-A1926 ∕ F-SH-928).
    */
   const notice = $derived(healthNotice(latest, bridged, stopped, todaySteps));
 

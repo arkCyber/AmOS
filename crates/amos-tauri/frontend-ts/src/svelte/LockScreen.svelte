@@ -93,7 +93,7 @@
   // face uses (`lib/batterySources`: daemon → host OS → browser API). A bespoke copy
   // used to live here and was daemon→host only, so it drew nothing whenever the daemon
   // was away while the status bar and the widgets still showed the host's real level
-  // (REQ-A1926). Polled slowly — a lock screen can sit for a long time.
+  // (REQ-A1928). Polled slowly — a lock screen can sit for a long time.
   const battery = createBatterySources(30_000);
   /** The shared read-out: the shown text AND the accessible name (see below). */
   const readout = $derived(batteryReadout(battery.batt));

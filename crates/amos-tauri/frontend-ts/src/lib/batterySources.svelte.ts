@@ -71,7 +71,7 @@ export interface BatterySources {
  * `pollMs` defaults to [`BATTERY_POLL_MS`]. A surface that can sit still for a long
  * time (the lock screen, which can stay up for hours) passes its own slower cadence
  * rather than keeping a second, drifted copy of this subscription — one copy is the
- * whole point of this module (REQ-A1926).
+ * whole point of this module (REQ-A1928).
  */
 export function createBatterySources(pollMs: number = BATTERY_POLL_MS): BatterySources {
   // Kept separate so the shown reading can be resolved with explicit precedence.

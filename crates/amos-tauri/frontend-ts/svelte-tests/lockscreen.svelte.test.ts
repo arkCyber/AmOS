@@ -330,7 +330,7 @@ describe("LockScreen.svelte — real battery indicator", () => {
     expect(b?.getAttribute("aria-label")).toBe(zh["a11y.battery"].replace("{pct}", "75%"));
   });
 
-  test("shows the host battery even when the daemon is away — the same reading the other faces show (REQ-A1926)", async () => {
+  test("shows the host battery even when the daemon is away — the same reading the other faces show (REQ-A1928)", async () => {
     // `system_health` refused (daemon down / restarting) while the host OS battery is
     // readable. The lock screen used to keep its own daemon→host copy whose first step
     // (`await systemHealth(); if (!raw) return null;`) abandoned the host layer, so it

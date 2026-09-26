@@ -228,7 +228,7 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_RAG_STATE` | path | (none) | `→ in-memory` | 向量索引持久化路径 |
+| `AMOS_RAG_STATE` | path | (none) | `→ in-memory`（空 ∕ 非 Unicode 值告警一次后同样回退） | 向量索引持久化路径 |
 | `AMOS_RAG_DIM` | int | `384` | `→ 384` | 嵌入维度 |
 | `AMOS_RAG_EMBEDDER` | enum | `mock` | `→ mock`（集合外值告警一次后回退） | 嵌入器:`mock`/`ollama`/`api`（未设静默；拼错 ∕ 空 ∕ 非 Unicode 报告一次） |
 | `AMOS_RAG_EMBED_BASE` | url | (none) | `→ fail` | Ollama embed URL |

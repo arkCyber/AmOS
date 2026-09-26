@@ -524,7 +524,7 @@ export async function readHealthFeed(): Promise<HealthFeed> {
  * * `"awaiting"` — a host answered, no reading is **drawn**, and no detach was announced: the
  *   producer is attached and simply has not produced a drawable reading yet. That covers both a
  *   sample that never arrived and one that arrived carrying nothing the cells render — the
- *   since-boot counter that only re-baselined today's row (REQ-A1925 ∕ F-SH-927) or a pulse the
+ *   since-boot counter that only re-baselined today's row (REQ-A1926 ∕ F-SH-928) or a pulse the
  *   cell's range refuses (REQ-A1902). The banner's hint says so, because from here those are one
  *   fact: walk a few steps and a number appears.
  *
@@ -537,7 +537,7 @@ export type HealthNotice = "none" | "unbridged" | "stopped" | "awaiting";
 
 /**
  * Whether the screen draws a reading, judged by the **values the cells draw** (REQ-A1902,
- * REQ-A1925).
+ * REQ-A1926).
  *
  * The pulse cell draws `normalizeHeartRate(...)` (25–250) — a narrowing the Rust seam refuses to
  * make (`android_glue::reading` rejects only a **non-positive** bpm), so a contact artifact
@@ -547,7 +547,7 @@ export type HealthNotice = "none" | "unbridged" | "stopped" | "awaiting";
  * The step cell draws [`daySteps`] out of **history**, never the live `steps_total`: that field
  * is the cumulative **since-boot** counter, and the first sample of any day only re-baselines —
  * it mints no row, so the tile draws `—`. Judging the wire field here silenced the banner above a
- * screen of three `—` (REQ-A1925 ∕ F-SH-927; measured on the S5, 2026-09-26, where the bus held
+ * screen of three `—` (REQ-A1926 ∕ F-SH-928; measured on the S5, 2026-09-26, where the bus held
  * `steps_total: 1529` while the history was `{"days":[],"workouts":[]}`).
  */
 function drawsAReading(todaySteps: number | null, latest: SensorVitalsDatum | null): boolean {
