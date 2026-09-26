@@ -604,7 +604,8 @@ pub mod timesync {
     //! Periodic wall-clock calibration, orchestrated alongside daemon supervision.
     //!
     //! When enabled at build time (`timesync` feature) and at runtime
-    //! (`AMOS_TIMESYNC=1`), the supervisor spawns a background loop that keeps a
+    //! (`AMOS_TIMESYNC` set to a truthy value — `1`/`true`/`yes`/`on`), the
+    //! supervisor spawns a background loop that keeps a
     //! shared [`SyncedClock`] calibrated from a [`TimeSource`] and persists its
     //! last-known-good offset — exactly like any other supervised concern, but
     //! in-process because a periodic *loop* is not a crash-restartable child.
@@ -632,6 +633,69 @@ pub mod timesync {
     /// frequent by policy.)
     const MIN_SYNC_SECS: u64 = 1;
 
+    /// The repo-wide `AMOS_*` switch vocabulary (`docs/ENV_VARIABLES.md` §20.1,
+    /// coined by `energy::parse_flag` / REQ-A533; shared with the podcast live
+    /// gate / REQ-A1906): these exact words arm, those exact words disarm, and a
+    /// present value in neither set is reported, never silently read as unset.
+    const TRUE_TOKENS: [&str; 4] = ["1", "true", "yes", "on"];
+    const FALSE_TOKENS: [&str; 4] = ["0", "false", "no", "off"];
+
+    /// Pure: is time sync armed? `None` (unset) and the documented off spellings
+    /// are off and silent; a value outside both sets — a typo, or a non-Unicode
+    /// value — is off but reported, so it is never mistaken for "unset".
+    ///
+    /// (Parameter-taking so it can be exercised without mutating the process
+    /// environment, which `AMOS_TIMESYNC` is process-global through.)
+    fn decide_enabled(raw: Option<&std::ffi::OsStr>) -> bool {
+        let Some(raw) = raw else {
+            return false; // unset ⇒ off, silent
+        };
+        let Some(raw) = raw.to_str() else {
+            tracing::warn!("AMOS_TIMESYNC is set but not valid Unicode; leaving time sync off");
+            return false;
+        };
+        let token = raw.trim().to_ascii_lowercase();
+        if TRUE_TOKENS.contains(&token.as_str()) {
+            return true;
+        }
+        if FALSE_TOKENS.contains(&token.as_str()) {
+            return false; // explicitly off ⇒ off, silent
+        }
+        tracing::warn!(
+            value = %raw,
+            "AMOS_TIMESYNC is set to a value this switch does not recognise — leaving time sync off \
+             (arm with 1/true/yes/on, stay off with 0/false/no/off)"
+        );
+        false
+    }
+
+    /// Pure: the calibration interval. Unset is silent (the default); a positive
+    /// integer is kept, `0` is clamped to the operator floor; anything else — a
+    /// non-numeric value, or a non-Unicode value — falls back to the default and
+    /// is reported. The sibling `AMOS_CONFIG_RELOAD_SECS` reader warns on the
+    /// same shape rather than folding silently (REQ-A459).
+    fn decide_interval(raw: Option<&std::ffi::OsStr>) -> Duration {
+        let Some(raw) = raw else {
+            return DEFAULT_INTERVAL;
+        };
+        let Some(raw) = raw.to_str() else {
+            tracing::warn!(
+                "AMOS_TIMESYNC_INTERVAL_SECS is set but not valid Unicode; using the default"
+            );
+            return DEFAULT_INTERVAL;
+        };
+        match raw.trim().parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs).max(Duration::from_secs(MIN_SYNC_SECS)),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "AMOS_TIMESYNC_INTERVAL_SECS must be a positive integer; using the default"
+                );
+                DEFAULT_INTERVAL
+            }
+        }
+    }
+
     /// Runtime configuration for the supervised periodic time sync.
     #[derive(Debug, Clone)]
     pub struct TimeSyncConfig {
@@ -646,25 +710,20 @@ pub mod timesync {
     impl TimeSyncConfig {
         /// Build from the environment, or `None` when time sync is disabled.
         ///
-        /// Enabled only when `AMOS_TIMESYNC=1`. Optional knobs:
-        /// `AMOS_TIMESYNC_INTERVAL_SECS`, `AMOS_TIMESYNC_STATE`,
-        /// `AMOS_NTP_SERVER`.
+        /// Armed when `AMOS_TIMESYNC` is one of the documented truthy spellings
+        /// (`1`/`true`/`yes`/`on`); unset and the documented off spellings
+        /// (`0`/`false`/`no`/`off`) are off, and any other present value is off
+        /// **and reported**. Optional knobs: `AMOS_TIMESYNC_INTERVAL_SECS`,
+        /// `AMOS_TIMESYNC_STATE`, `AMOS_NTP_SERVER`.
         pub fn from_env() -> Option<Self> {
-            let enabled = std::env::var("AMOS_TIMESYNC")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            if !enabled {
+            if !decide_enabled(std::env::var_os("AMOS_TIMESYNC").as_deref()) {
                 return None;
             }
             let state_file = std::env::var_os("AMOS_TIMESYNC_STATE")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_state_file);
-            let interval = std::env::var("AMOS_TIMESYNC_INTERVAL_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_INTERVAL)
-                .max(Duration::from_secs(MIN_SYNC_SECS));
+            let interval =
+                decide_interval(std::env::var_os("AMOS_TIMESYNC_INTERVAL_SECS").as_deref());
             let server = std::env::var("AMOS_NTP_SERVER")
                 .ok()
                 .filter(|s| !s.is_empty());
@@ -881,6 +940,176 @@ pub mod timesync {
             assert!(
                 TimeSyncConfig::from_env().is_none(),
                 "time sync is disabled once AMOS_TIMESYNC is unset"
+            );
+        }
+
+        /// Counts WARN events so the assertions are on the *observable*
+        /// diagnostic, not a restatement of the code. `set_default` keeps it
+        /// thread-local, so a sibling test's warns cannot be counted here. A
+        /// deliberate third copy of the probe in `amos-ai` (F-DEV-155): a shared
+        /// `#[cfg(test)]` helper can become dead code under some feature
+        /// combinations, which `-D warnings` refuses.
+        struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+        impl tracing::Subscriber for WarnProbe {
+            fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+            fn event(&self, ev: &tracing::Event<'_>) {
+                if ev.metadata().level() == &tracing::Level::WARN {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _id: &tracing::span::Id) {}
+            fn exit(&self, _id: &tracing::span::Id) {}
+        }
+
+        /// Run `f` under a fresh thread-local `WarnProbe`; return its value and
+        /// the WARN count.
+        fn warns_during<R>(f: impl FnOnce() -> R) -> (R, u64) {
+            let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let value = {
+                let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+                f()
+            };
+            (value, warns.load(std::sync::atomic::Ordering::Relaxed))
+        }
+
+        /// The documented truthy/falsy vocabulary is accepted silently; this is
+        /// the repo-wide `AMOS_*` convention (`docs/ENV_VARIABLES.md` §20.1),
+        /// which the old `v == "1"` reader did not follow.
+        #[test]
+        fn the_timesync_switch_follows_the_documented_token_sets() {
+            use std::ffi::OsStr;
+            for on in ["1", "true", "yes", "on", "TRUE", "  Yes  ", "On"] {
+                let (armed, warns) = warns_during(|| decide_enabled(Some(OsStr::new(on))));
+                assert!(armed, "AMOS_TIMESYNC={on:?} is a documented on-spelling");
+                assert_eq!(warns, 0, "AMOS_TIMESYNC={on:?} must not warn");
+            }
+            for off in ["0", "false", "no", "off", "OFF", " off "] {
+                let (armed, warns) = warns_during(|| decide_enabled(Some(OsStr::new(off))));
+                assert!(!armed, "AMOS_TIMESYNC={off:?} is a documented off-spelling");
+                assert_eq!(warns, 0, "AMOS_TIMESYNC={off:?} must stay silent");
+            }
+        }
+
+        /// Unset stays silent: only a *present* value is a claim to report.
+        #[test]
+        fn unset_timesync_is_off_and_silent() {
+            let (armed, warns) = warns_during(|| decide_enabled(None));
+            assert!(!armed);
+            assert_eq!(warns, 0, "an unset switch is silent, not a typo");
+        }
+
+        /// The misread direction: `enable` / `tru` / `2` / a blank value were,
+        /// before the fix, folded into the same silent "off" as an unset variable
+        /// — an operator who typed `AMOS_TIMESYNC=true` saw no sign their request
+        /// was not honoured.
+        #[test]
+        fn an_unrecognised_timesync_value_is_off_and_reported() {
+            use std::ffi::OsStr;
+            for bad in ["enable", "2", "   ", "tru", "truee"] {
+                let (armed, warns) = warns_during(|| decide_enabled(Some(OsStr::new(bad))));
+                assert!(!armed, "AMOS_TIMESYNC={bad:?} must leave time sync off");
+                assert_eq!(warns, 1, "AMOS_TIMESYNC={bad:?} must be reported once");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_non_unicode_timesync_value_is_reported_not_silently_off() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let bad = OsStr::from_bytes(b"\xff\xfe");
+            let (armed, warns) = warns_during(|| decide_enabled(Some(bad)));
+            assert!(!armed);
+            assert_eq!(
+                warns, 1,
+                "a non-Unicode value is a set value, not an unset one"
+            );
+        }
+
+        /// Unset ⇒ the default, silently; a positive integer is kept; `0` is
+        /// clamped to the operator floor (never to the default — the floor is the
+        /// documented answer for "too small").
+        #[test]
+        fn the_interval_is_clamped_kept_or_defaulted() {
+            use std::ffi::OsStr;
+            let (unset, warns) = warns_during(|| decide_interval(None));
+            assert_eq!(unset, DEFAULT_INTERVAL, "unset ⇒ the default");
+            assert_eq!(warns, 0, "an unset interval is silent");
+
+            assert_eq!(
+                decide_interval(Some(OsStr::new("0"))),
+                Duration::from_secs(1),
+                "a zero interval clamps to the floor, not the default"
+            );
+            assert_eq!(
+                decide_interval(Some(OsStr::new("600"))),
+                Duration::from_secs(600)
+            );
+        }
+
+        /// A present-but-unparsable interval was silently folded into the default
+        /// — while the sibling `AMOS_CONFIG_RELOAD_SECS` reader warns on the same
+        /// shape (REQ-A459).
+        #[test]
+        fn an_unparsable_interval_is_reported_and_falls_back() {
+            use std::ffi::OsStr;
+            for bad in ["600s", "abc", "", "1.5", "-5"] {
+                let (interval, warns) = warns_during(|| decide_interval(Some(OsStr::new(bad))));
+                assert_eq!(
+                    interval, DEFAULT_INTERVAL,
+                    "AMOS_TIMESYNC_INTERVAL_SECS={bad:?} must fall back to the default"
+                );
+                assert_eq!(
+                    warns, 1,
+                    "AMOS_TIMESYNC_INTERVAL_SECS={bad:?} must be reported, not folded silently"
+                );
+            }
+        }
+
+        /// The env reference is the operator's authority for a default and a
+        /// type; it must not name ones the code does not use. Every timesync row
+        /// in section 12 was wrong before this fix: a public NTP pool the code
+        /// never had (unset ⇒ offline `HostClock`), `enum` for a bool, `in-memory`
+        /// for a `$HOME` state file, and `600` for a 3600-second default.
+        #[test]
+        fn the_env_reference_timesync_rows_match_the_code() {
+            let doc = include_str!("../../../docs/ENV_VARIABLES.md");
+            let cell = |name: &str, idx: usize| -> String {
+                let row = doc
+                    .lines()
+                    .find(|l| l.starts_with(&format!("| `{name}`")))
+                    .unwrap_or_else(|| panic!("ENV_VARIABLES.md must document {name}"));
+                // `| name | type | default | fallback | note |`.
+                let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+                cells[idx].trim_matches('`').trim_matches('*').to_string()
+            };
+            assert_eq!(
+                cell("AMOS_TIMESYNC", 2),
+                "bool",
+                "the switch is a bool, not an `enum`"
+            );
+            assert_eq!(
+                cell("AMOS_TIMESYNC_INTERVAL_SECS", 3),
+                DEFAULT_INTERVAL.as_secs().to_string(),
+                "the documented default must match DEFAULT_INTERVAL ({:?})",
+                DEFAULT_INTERVAL
+            );
+            assert_eq!(
+                cell("AMOS_TIMESYNC_STATE", 3),
+                "~/.amos/timesync.json",
+                "an unset state path is a HOME file, never in-memory"
+            );
+            assert_eq!(
+                cell("AMOS_NTP_SERVER", 3),
+                "(未设置)",
+                "an unset NTP server means the offline HostClock, not a default pool"
             );
         }
     }

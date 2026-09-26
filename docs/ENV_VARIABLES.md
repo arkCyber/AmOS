@@ -199,10 +199,10 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_NTP_SERVER` | url | `pool.ntp.org` | `→ best-effort` | NTP 校时服务器 |
-| `AMOS_TIMESYNC` | enum | (none) | `→ best-effort` | 时间同步策略 |
-| `AMOS_TIMESYNC_STATE` | path | (none) | `→ in-memory` | 时间同步状态文件 |
-| `AMOS_TIMESYNC_INTERVAL_SECS` | int | `600` | `→ 600` | 时间同步间隔 |
+| `AMOS_NTP_SERVER` | url | (未设置) | `→ 离线 HostClock` | NTP 校时服务器。**未设置 ⇒ 用离线 `HostClock`**(只记宿主时间、不做校准),**不是**某个公共池;设了才走真实 SNTP(特性 `ntp`)。读取点:`crates/amos-supervisor/src/lib.rs::TimeSyncConfig::from_env` |
+| `AMOS_TIMESYNC` | bool | (未设置) | `→ off` | 是否武装周期校时(特性 `timesync`)。truthy `1`/`true`/`yes`/`on`,falsy `0`/`false`/`no`/`off`;未设与 falsy **静默** off,**两集之外的存在值** ⇒ off 且 `warn!` 一次(与 `energy::parse_flag` ∕ 播客 live 闸同一约定)。读取点:`…::decide_enabled` |
+| `AMOS_TIMESYNC_STATE` | path | `~/.amos/timesync.json` | `→ 同默认` | 上次校准偏移的落盘位置(`$HOME/.amos/timesync.json`;无 `HOME` 时 `.amos-timesync.json`),并导出给被监管的子进程。**不是**内存态。读取点:`…::default_state_file` |
+| `AMOS_TIMESYNC_INTERVAL_SECS` | int | `3600` | `→ 3600` | 两次校准的间隔(秒),默认 **1 小时**(`DEFAULT_INTERVAL`)。非数值 ∕ 非 Unicode ⇒ `warn!` 后回落 3600;`0` 被夹到下限 `1s`(**不是**回落到默认 —— 「太小」的答案是下限)。读取点:`…::decide_interval` |
 | `AMOS_NETGUARD_STATE_PATH` | path | (none) | `→ in-memory` | 网络守卫状态 |
 | `AMOS_NETGUARD_ALLOW_INJECT` | bool | `0` | `→ observed-only` | 是否允许注入 netguard 状态 |
 | `AMOS_SPY_IFACE` | string | (none) | `→ all-ifaces` | 抓包接口 |
