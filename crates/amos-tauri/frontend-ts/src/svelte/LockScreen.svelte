@@ -19,8 +19,8 @@
   import { propsChannel } from "./propsBus";
   import { isCustomWallpaper, WALLPAPER_FILES } from "../lib/wallpaper";
   import { iconSvg, batterySvg } from "../lib/sysIcons";
-  import { batteryReadout, batteryTone } from "../lib/batteryStatus";
-  import { systemStatusWithHostBattery } from "../lib/system";
+  import { batteryReadout } from "../lib/batteryStatus";
+  import { createBatterySources } from "../lib/batterySources.svelte";
   import { attachFocusTrap } from "../lib/focusTrap";
 
   const bus = propsChannel<{ ready?: boolean }>("lock");
@@ -89,30 +89,14 @@
     }).format(now),
   );
 
-  // Real battery, top-right (iOS-style). Layered daemon → host → browser; when no
-  // source reports a level we render nothing (honest, never a fabricated number).
-  // Polled slowly — a lock screen can sit for a long time.
-  const BATTERY_POLL_MS = 30_000;
-  let batteryLevel = $state<number | null>(null);
-  let batteryCharging = $state<boolean | null>(null);
-  const battTone = $derived(batteryTone({ levelPct: batteryLevel, charging: batteryCharging }));
+  // Real battery, top-right (iOS-style) — the SAME subscription every other battery
+  // face uses (`lib/batterySources`: daemon → host OS → browser API). A bespoke copy
+  // used to live here and was daemon→host only, so it drew nothing whenever the daemon
+  // was away while the status bar and the widgets still showed the host's real level
+  // (REQ-A1926). Polled slowly — a lock screen can sit for a long time.
+  const battery = createBatterySources(30_000);
   /** The shared read-out: the shown text AND the accessible name (see below). */
-  const readout = $derived(batteryReadout({ levelPct: batteryLevel, charging: batteryCharging }));
-  $effect(() => {
-    let stopped = false;
-    const read = async () => {
-      const sys = await systemStatusWithHostBattery();
-      if (!sys || stopped) return;
-      batteryLevel = sys.battery_level_pct;
-      batteryCharging = sys.battery_charging;
-    };
-    void read();
-    const id = window.setInterval(read, BATTERY_POLL_MS);
-    return () => {
-      stopped = true;
-      window.clearInterval(id);
-    };
-  });
+  const readout = $derived(batteryReadout(battery.batt));
 
   const tap = (d: string) => {
     if (pin.length < 6) pin += d;
@@ -208,13 +192,13 @@
     <div aria-hidden="true" class="absolute inset-0 bg-cover bg-center" style={`background-image:url(${lockBgUrl})`}></div>
     <div aria-hidden="true" class="absolute inset-0 bg-black/35"></div>
   {/if}
-  {#if batteryLevel !== null}
+  {#if battery.batt.levelPct !== null}
     <div
       data-testid="lock-battery"
       aria-label={readout ? t(readout.key, { pct: readout.pct }) : t("a11y.batteryLevel")}
       class="absolute right-6 top-6 z-20 flex items-center gap-1.5 text-neutral-100 tabular-nums"
     >
-      {@html batterySvg(batteryLevel, "h-3.5 w-3.5", battTone)}
+      {@html batterySvg(battery.batt.levelPct, "h-3.5 w-3.5", battery.tone)}
       <span aria-hidden="true">{readout?.pct}</span>
     </div>
   {/if}

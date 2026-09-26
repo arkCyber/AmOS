@@ -9902,6 +9902,46 @@ const KNOWN_FAILURES = [
   // 把整份垃圾箱永久抹掉。修法：在**唯一的入口**按同一个 `MAX_BODY_CHARS` 夹紧
   //（`clamp_preview_text`），涂改先于夹紧 ⇒ 截断绝不会留下未涂改的尾巴。
   { id: 'F-DEV-174', module: 'the-sms-trashes-reader-caps-a-stored-last-text-at-wire-max-body-chars-via-req-text-while-the-only-writer-set-preview-does-not-bound-it-and-its-producer-redact-for-grows-the-text-so-a-body-the-wire-accepted-can-be-written-as-a-preview-its-own-reader-refuses-the-same-version-writes-a-file-it-cannot-read-back-and-the-refusal-path-warn-start-empty-then-persist-overwrites-the-operators-only-copy-of-the-trash-permanently-fix-clamp-at-the-only-door-set-preview-through-clamp-preview-text-with-the-same-max-body-chars-bound-and-because-redaction-runs-before-the-clamp-truncation-can-never-store-an-unmasked-tail', files: ['crates/amos-sms/src/trash.rs', 'crates/amos-sms/src/redact.rs', 'crates/amos-tauri/src/sms.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1919', 'clamp_preview_text', 'a_preview_longer_than_the_protocol_cap_is_bounded_by_the_store', 'a_redacted_body_can_grow_past_the_protocol_body_cap'], severity: 3 },
+  // F-DEV-175（REQ-A1922）—— 门禁的语料按**拼写**分类，于是把「不是路径」的拼写读成了路径：
+  // `docs-link-scan.mjs` 对每个 `[text](target)` 目标做**文件系统解析**，而一条账本行逐字
+  // 引用 Rust 文档注释里的**intra-doc link** `` [`open`](Self::open) ``——`Self::open` 是**条目路径**，
+  // 不是文件；`stripCode` 只吃掉 `` `open` ``，剩下 `[](Self::open)` 目标照样进扫描器，
+  // 解析失败 ⇒ 三处幻影断链（CHANGELOG ∕ FMEA ∕ TRACEABILITY 各一）⇒ `make gated-check` 每跑必红、
+  // 且**已进 HEAD**（CI 红）。修法：**收紧语料**而不是改任何人逐字的证据字节 —— 目标**整体**匹配
+  // `A::b`（至少一个 `::`、无 `/`、无 `.`、无 `#`、无空格）即判为条目路径并跳过；真相对链接无法匹配。
+  { id: 'F-DEV-175', module: 'the-docs-link-gate-classifies-its-corpus-by-spelling-so-it-reads-a-rust-intra-doc-link-destination-as-a-relative-file-path-and-a-ledger-row-quoting-a-rust-doc-comment-verbatim-turns-self-open-into-three-phantom-broken-file-links-making-make-gated-check-fail-on-every-run-in-a-tree-that-already-built-that-way-ci-red-fix-by-scoping-the-scanner-to-skip-a-destination-that-is-wholly-a-rust-item-path-at-least-one-double-colon-and-no-slash-dot-hash-or-space-which-can-never-denote-a-file-so-no-real-relative-link-can-be-masked', files: ['scripts/docs-link-scan.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1922', 'isRustItemPath'], severity: 2 },
+
+  // F-AI-029（REQ-A1920）—— JSON 日志的 opt-in `AMOS_LOG_JSON` 用 `match std::env::var(k).ok()` 读，
+  // 把「未设」/「显式关」/「集合外拼法（enable）」/「非 Unicode」四态折成同一句沉默的 `false`；
+  // 这是 F-AI-027（`let Ok(raw) = std::env::var(k) else { false }`）与 F-AI-026（`.ok()?`）**同一形状的
+  // 第三种拼法** —— 前两轮各扫掉一处，`match .ok()` 漏网。修法：`from_env` 改走 `energy::env_flag`，
+  // 并把它从 `.ok()` 改为 `var_os` + `to_str()` 失配告警，使「未设」静默、「非 Unicode」告警两态分开。
+  { id: 'F-AI-029', module: 'the-json-log-opt-in-amós-log-json-is-read-with-match-std-env-var-k-ok-folding-unset-explicit-off-an-out-of-token-set-spelling-and-a-non-unicode-value-into-one-silent-false-the-operator-who-set-enable-believes-a-second-structured-log-is-being-written-while-none-is-the-same-shape-a-prior-round-fixed-twice-let-ok-raw-var-k-else-false-in-f-ai-027-and-ok-in-f-ai-026-this-is-the-third-spelling-match-ok-that-both-sweeps-missed-fix-route-from-env-through-energy-env-flag-and-change-env-flag-from-ok-to-var-os-plus-to-str-so-unset-stays-silent-while-non-unicode-warns', files: ['crates/amos-ai/src/jsonlog.rs', 'crates/amos-ai/src/energy.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1920', 'env_flag', 'AMOS_LOG_JSON', 'an_unrecognised_opt_in_is_reported_not_silently_read_as_off', 'an_unset_opt_in_stays_silent', 'a_non_unicode_opt_in_is_reported_not_silently_read_as_off'], severity: 2 },
+
+  // F-AI-031（REQ-A1923）—— RAG 的 `AMOS_RAG_EMBEDDER` 用 `std::env::var(k).unwrap_or_default()` 再
+  // `match … { "ollama" => …, "api" => …, _ => mock }` 读，把「未设」/「拼错（olama、Ollama）」/
+  // 「空串」/「非 Unicode」四态折成同一句沉默的 `mock`；而同函数 doc 逐字「An invalid dimension /
+  // backend is an honest error」—— 只对 dimension 成立。运维以为在跑本地 Ollama，实则以离线假向量
+  // 建索引。修法：抽 `embedder_choice()` 作唯一读取点（构建 ∕ 上报共用，永不背离），未设静默、
+  // 集合外的存在值按每不同值每进程一次告警后回退 `mock`；同族于 F-AI-026 ∕ F-AI-027 ∕ F-AI-029。
+  { id: 'F-AI-031', module: 'the-rag-embedder-choice-env-amos-rag-embedder-is-read-with-std-env-var-k-unwrap-or-default-then-match-ollama-api-else-mock-folding-unset-a-typo-olama-ollama-a-blank-string-and-a-non-unicode-value-into-one-silent-mock-the-functions-own-doc-promises-an-invalid-backend-is-an-honest-error-which-holds-only-for-the-dimension-not-the-backend-so-an-operator-who-set-a-cloud-or-local-backend-the-daemon-silently-indexed-everything-with-offline-fake-vectors-fix-extract-embedder-choice-as-the-single-reader-shared-by-the-builder-and-the-label-reporter-so-they-can-never-disagree-unset-stays-silent-while-a-present-out-of-set-value-is-reported-once-per-distinct-value-then-falls-back-to-mock', files: ['crates/amos-ai/src/rag_service.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1923', 'embedder_choice', 'AMOS_RAG_EMBEDDER', 'an_unrecognised_embedder_is_reported_not_silently_folded_to_mock', 'an_unset_embedder_stays_silent_and_defaults_to_mock', 'a_non_unicode_embedder_is_reported_not_silently_folded_to_mock'], severity: 2 },
+  // F-AI-032（REQ-A1924）—— privacy_service 的**状态文件**：`bootstrap_with_sink` 把
+  // `PrivacyManager::load` 的同一个 `Err` 既当「首次启动、没文件」又当「有文件但读不回 ∕ 解不开」，
+  // 一律 `warn!` 后起一个 deny-by-default 的空表，**却把那条路径原样交回服务**（`Some(p)`）——
+  // 而 `PrivacySvc::persist_save` 在每一次 `Grant` ∕ `Revoke` ∕ `RevokeAll` 后 `save` → `atomic_write`
+  // 整份重写它。于是一个损坏的 `privacy.json`（断电 ∕ 磁盘满 ∕ 升级中断 ∕ 手改 ∕ 非 UTF-8）
+  // 让权限表静默空启，此后任意一次授予就用空快照覆盖运维**唯一**的授权登记，无副本；
+  // 同一条 `Err` 臂还让每次全新启动都吐一条假 `warn!`。与 F-AI-028（REQ-A1918，
+  // `netguard_service.rs::preserve_unreadable_state`）及一 crate 之隔的 F-STORE-006（REQ-A1914，
+  // `appstore.rs::preserve_unreadable_registry`）、F-SH-921（REQ-A1898，`mail.rs`）逐字同形。
+  // 修法（与三处兄弟同形）：新增 `manager_from_state_file` —— `Err(e)` 且 `load_failure_is_absence(&e)`
+  // （`root_cause().downcast_ref::<std::io::Error>()` 的 `kind() == NotFound`）⇒ 静默默认；
+  // 其余 `Err` ⇒ `keep_state_aside` + 默认；`Ok` ⇒ 原样。新增 `preserve_unreadable_state`（`rename`
+  // 成 `<name>.corrupt-<nonce>`；rename 是目录操作，文件读不出来时依然可行）。
+  // 红先=新集成用例 `a_corrupt_privacy_state_is_kept_aside_before_the_next_save_overwrites_it` 红
+  // + 不相交对照 `a_missing_privacy_state_keeps_nothing_aside_and_stays_silent` 也红（2 红）；
+  // 负控=NC-1 拿掉 `keep_state_aside` ⇒ 恰 1 红（对照仍绿）；NC-2 让缺席臂也 `keep_state_aside` ⇒ 恰 1 红（损坏用例仍绿）。
+  { id: 'F-AI-032', module: 'the-privacy-state-file-that-exists-but-cannot-be-read-back-is-folded-into-one-err-with-the-ordinary-first-boot-so-bootstrap-with-sink-warns-and-starts-a-deny-by-default-manager-while-handing-the-same-path-back-to-the-service-and-persist-save-rewrites-that-path-after-every-grant-revoke-or-revoke-all-so-a-corrupt-truncated-hand-edited-or-non-utf8-privacy-json-silently-empties-the-grant-table-and-the-next-grant-overwrites-the-operators-only-copy-of-every-app-resource-pair-with-no-backup-and-the-same-err-arm-also-fires-a-false-warning-on-every-clean-first-boot-fix-mirrors-the-sibling-preserve-unreadable-state-and-preserve-unreadable-registry-read-through-manager-from-state-file-with-an-absence-test-taken-from-the-anyhow-root-cause-io-error-kind-notfound-and-rename-the-file-to-a-corrupt-nonce-sibling-before-returning-the-default-a-missing-file-is-silent-because-a-first-boot-is-not-an-incident', files: ['crates/amos-ai/src/privacy_service.rs', 'crates/amos-ai/tests/privacy_state_file.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1924', 'manager_from_state_file', 'preserve_unreadable_state', 'keep_state_aside', 'a_corrupt_privacy_state_is_kept_aside_before_the_next_save_overwrites_it', 'a_missing_privacy_state_keeps_nothing_aside_and_stays_silent'], severity: 3 },
 ];
 
 /**

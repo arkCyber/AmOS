@@ -7,7 +7,11 @@
 //! **daemon stays the single authority** and every `Authorize` decision is
 //! audited. When the daemon was started with `AMOS_PRIVACY_PATH`, grants are
 //! persisted there (atomic JSON) and each decision is also mirrored to the
-//! durable unified audit file at `<AMOS_PRIVACY_PATH>.jsonl`.
+//! durable unified audit file at `<AMOS_PRIVACY_PATH>.jsonl`. Because that path
+//! stays live for the whole session, a grants file that exists but cannot be read
+//! back is **kept aside** as `<name>.corrupt-<nonce>` before the deny-by-default
+//! manager takes its place — otherwise the next grant would overwrite the
+//! operator's only copy (REQ-A1924).
 //!
 //! Honest boundaries: this is the *decision/audit* authority. Enforcing the
 //! decision at the OS boundary (intercepting a third-party APK's
@@ -285,11 +289,13 @@ pub fn server(
 }
 
 /// Bootstrap the authoritative manager + persistence from the environment:
-/// `AMOS_PRIVACY_PATH` (if set) is loaded if present (else a fresh deny-by-default
-/// manager) and every decision is mirrored to the daemon's **shared** durable
-/// audit trail (see [`crate::audit::shared_trail_from_env`]): `AMOS_AUDIT_PATH`,
-/// else `<AMOS_PRIVACY_PATH>.jsonl`. Unset ⇒ fresh in-memory manager, no
-/// persistence and no audit trail.
+/// `AMOS_PRIVACY_PATH` (if set) is loaded when it is **readable**; an **absent**
+/// file is the ordinary first boot and an **unusable** one is kept aside (see
+/// [`manager_from_state_file`]), either way starting deny-by-default. Every
+/// decision is mirrored to the daemon's **shared** durable audit trail (see
+/// [`crate::audit::shared_trail_from_env`]): `AMOS_AUDIT_PATH`, else
+/// `<AMOS_PRIVACY_PATH>.jsonl`. Unset ⇒ fresh in-memory manager, no persistence
+/// and no audit trail.
 pub fn bootstrap() -> (Arc<PrivacyManager>, Option<PathBuf>) {
     bootstrap_with_sink(crate::audit::shared_trail_from_env())
 }
@@ -304,16 +310,7 @@ pub fn bootstrap() -> (Arc<PrivacyManager>, Option<PathBuf>) {
 pub fn bootstrap_with_sink(shared: Option<AuditFile>) -> (Arc<PrivacyManager>, Option<PathBuf>) {
     match std::env::var_os("AMOS_PRIVACY_PATH").map(PathBuf::from) {
         Some(p) => {
-            let mut manager = match PrivacyManager::load(&p) {
-                Ok(m) => m,
-                Err(_) => {
-                    tracing::warn!(
-                        "no valid privacy state at {}, starting deny-by-default",
-                        p.display()
-                    );
-                    PrivacyManager::new(2048)
-                }
-            };
+            let mut manager = manager_from_state_file(&p);
             manager = match shared {
                 Some(sink) => manager.with_durable_audit(sink),
                 None => {
@@ -335,6 +332,73 @@ pub fn bootstrap_with_sink(shared: Option<AuditFile>) -> (Arc<PrivacyManager>, O
             (Arc::new(manager), None)
         }
     }
+}
+
+/// Whether a failed [`PrivacyManager::load`] means the file was simply **absent**
+/// (the ordinary first boot) rather than present-but-unusable.
+///
+/// `load` answers one `Err` for "there is no file yet" and "there is a file I
+/// cannot read or parse"; the caller needs them apart, so the distinction is
+/// recovered from the io root cause: only `ErrorKind::NotFound` is absence. A
+/// permission error, a directory in the way, or a parse failure are all "the file
+/// is there and could not be used".
+fn load_failure_is_absence(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Load the grant state at `path`, keeping **absent** and **present-but-unusable**
+/// apart.
+///
+/// Absent ⇒ the silent deny-by-default manager (a first boot is not an incident).
+/// Present but unreadable or unparseable ⇒ the same default, but the bytes are
+/// **kept aside** first and the drop is reported: [`PrivacySvc::persist_save`]
+/// keeps this very path live, so the next grant or revoke rewrites the file from
+/// scratch and would otherwise destroy the operator's only copy of every granted
+/// app↔resource pair — with no backup and no way to tell the loss from a fresh
+/// install (REQ-A1924 / F-AI-032).
+fn manager_from_state_file(path: &std::path::Path) -> PrivacyManager {
+    match PrivacyManager::load(path) {
+        Ok(m) => m,
+        Err(e) if load_failure_is_absence(&e) => PrivacyManager::new(2048),
+        Err(e) => {
+            keep_state_aside(path, &format!("{e:#}"));
+            PrivacyManager::new(2048)
+        }
+    }
+}
+
+/// Report that a state file could not be used, and keep its bytes beside it
+/// before the default manager starts on the same path.
+fn keep_state_aside(path: &std::path::Path, reason: &str) {
+    match preserve_unreadable_state(path) {
+        Some(kept) => tracing::warn!(
+            "privacy state {} {reason}; kept at {} and starting deny-by-default",
+            path.display(),
+            kept.display()
+        ),
+        None => tracing::warn!(
+            "privacy state {} {reason}; could not be moved aside, starting deny-by-default",
+            path.display()
+        ),
+    }
+}
+
+/// Rename a state file that could not be read back to a `<name>.corrupt-<nonce>`
+/// sibling, so the next save cannot overwrite the operator's only copy. `rename`
+/// is a directory operation, so it works even when the file itself cannot be
+/// read.
+fn preserve_unreadable_state(path: &std::path::Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
 }
 #[cfg(test)]
 mod tests {

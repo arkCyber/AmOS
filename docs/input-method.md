@@ -424,10 +424,23 @@ re-asked on `visibilitychange` when the user comes back from the platform screen
   (`amos.ime.system_no_text_editor`) and the page prints a sentence naming the real next
   step (put the caret in a field, or use the settings door) rather than a retry that
   cannot work. Before this the glue returned `STATUS_OK` and the button reported success
-  over a screen nobody saw. So `ime_system_open_picker` is device-verified *with* a
-  connection, and the no-connection branch is device-measured (the `null` reading above);
-  the `isAcceptingText()` guard itself has no host-JVM test — `InputMethodManager` does
-  not exist on a plain JVM — so the device is its authority.
+  over a screen nobody saw. After installing the fixed arm64 debug APK
+  (`make android-app`) both directions were replayed on the same handset, at the command
+  *and* the page level: with nothing focused (`mServedInputConnection=null`, activeElement
+  `BODY`) the command answered
+  `{"ok":false,"code":"amos.ime.system_no_text_editor","message":"nothing in this window is accepting text, so the platform had no keyboard window to draw its switcher over"}`
+  — where it previously answered `null` with no error on screen — and the IME page's
+  `settings-ime-system-open-error` printed 「没能弹出切换列表：当前没有输入框在用键盘。请先点一个输入框，或改用「系统输入法设置」。」 (contains 「输入框」, not 「请重试」); a real tap on the
+  「搜索设置」 field then produced
+  `mServedInputConnection=RemoteInputConnectionImpl{… mServedView=com.amos.ai.RustWebView}`,
+  the command answered `{"ok":true,"r":"null"}`, `mCurrentFocus` became
+  `Window{… Select input method}` (the platform dialog really drew), and the same page
+  error slot read `null`. (That replay needed a handset reboot first: the WebView renderer
+  was stuck in `CR DEAD` — an AMS bookkeeping state that survived force-stop, relaunch,
+  and uninstall+reinstall, and is unrelated to this change.) So `ime_system_open_picker` is
+  device-verified in *both* directions with this fix; the `isAcceptingText()` guard itself
+  still has no host-JVM test — `InputMethodManager` does not exist on a plain JVM — so the
+  device is its authority.
 * **The new Settings section is device-verified by DOM read, not by a screenshot
   (REQ-A1904).** The three commands and the two platform surfaces they open were
   exercised end to end on `YY000286` (three status readings taken verbatim, the

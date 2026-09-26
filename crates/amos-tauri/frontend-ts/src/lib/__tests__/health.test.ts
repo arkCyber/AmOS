@@ -347,30 +347,30 @@ describe("healthNotice — one sentence per reachable cause (REQ-A1886)", () => 
   const reading = { timestamp_ms: 1, steps_total: 10, heart_rate_bpm: null };
 
   test("a real reading says nothing", () => {
-    expect(healthNotice(reading, true, false)).toBe("none");
+    expect(healthNotice(reading, true, false, 10)).toBe("none");
     // A heart-rate-only sample is still a reading, whichever scalar carried it.
-    expect(healthNotice({ timestamp_ms: 1, steps_total: null, heart_rate_bpm: 72 }, true, false)).toBe("none");
+    expect(healthNotice({ timestamp_ms: 1, steps_total: null, heart_rate_bpm: 72 }, true, false, null)).toBe("none");
   });
 
   test("no host at all is the only case the connect-a-phone copy is true for", () => {
-    expect(healthNotice(null, false, false)).toBe("unbridged");
+    expect(healthNotice(null, false, false, null)).toBe("unbridged");
     // A detach the client heard about cannot make an unbridged shell "stopped".
-    expect(healthNotice(null, false, true)).toBe("unbridged");
+    expect(healthNotice(null, false, true, null)).toBe("unbridged");
   });
 
   test("a bridged host with no sample yet is awaiting, not unbridged", () => {
     // The S5: connected, granted, counter registered, no step taken yet.
-    expect(healthNotice(null, true, false)).toBe("awaiting");
+    expect(healthNotice(null, true, false, null)).toBe("awaiting");
   });
 
   test("a bridged host whose producer announced a detach is stopped, not awaiting", () => {
     // Walking changes nothing until re-attach, so this is not the "no sample yet" sentence.
-    expect(healthNotice(null, true, true)).toBe("stopped");
+    expect(healthNotice(null, true, true, null)).toBe("stopped");
   });
 
   test("a sample with neither scalar is no reading, not a zero", () => {
     // A `0` here would be a measurement nobody took; the host drops such a sample anyway.
-    expect(healthNotice({ timestamp_ms: 1, steps_total: null, heart_rate_bpm: null }, true, false)).toBe("awaiting");
+    expect(healthNotice({ timestamp_ms: 1, steps_total: null, heart_rate_bpm: null }, true, false, null)).toBe("awaiting");
   });
 });
 
@@ -396,23 +396,60 @@ describe("healthNotice — an out-of-range scalar is no reading (REQ-A1902)", ()
 
   test("a heart rate the cell refuses does not by itself count as a reading", () => {
     // Reachable: 12 clears the Rust seam (only `> 0.0` is required) but not the cell's range.
-    expect(healthNotice(at(null, 12), true, false)).toBe("awaiting");
-    expect(healthNotice(at(null, 300), true, false)).toBe("awaiting");
+    expect(healthNotice(at(null, 12), true, false, null)).toBe("awaiting");
+    expect(healthNotice(at(null, 300), true, false, null)).toBe("awaiting");
   });
 
   test("the range is inclusive on both ends, exactly as the cell draws it", () => {
-    expect(healthNotice(at(null, 25), true, false)).toBe("none");
-    expect(healthNotice(at(null, 250), true, false)).toBe("none");
+    expect(healthNotice(at(null, 25), true, false, null)).toBe("none");
+    expect(healthNotice(at(null, 250), true, false, null)).toBe("none");
     // One step outside either bound is refused — the same boundaries `normalizeHeartRate` uses.
-    expect(healthNotice(at(null, 24), true, false)).toBe("awaiting");
-    expect(healthNotice(at(null, 251), true, false)).toBe("awaiting");
+    expect(healthNotice(at(null, 24), true, false, null)).toBe("awaiting");
+    expect(healthNotice(at(null, 251), true, false, null)).toBe("awaiting");
   });
 
-  test("a negative step count is not a reading either", () => {
+  test("no live step count is a reading on its own, of any value", () => {
     // `sensor_host_record_vitals` takes an unchecked `Option<f64>`; the reducer refuses `raw < 0`.
-    expect(healthNotice(at(-5, null), true, false)).toBe("awaiting");
-    // A cumulative counter at **0** is a real reading (since boot, nothing yet) — unlike a
-    // rejected pulse, it must NOT bring the banner back.
-    expect(healthNotice(at(0, null), true, false)).toBe("none");
+    expect(healthNotice(at(-5, null), true, false, null)).toBe("awaiting");
+    // And a finite counter — 0 or a very large one — is likewise not what the cell draws: the
+    // step figure comes from `daySteps(history, today)`. Only that drawn value silences the
+    // banner (REQ-A1925 ∕ F-SH-927).
+    expect(healthNotice(at(0, null), true, false, null)).toBe("awaiting");
+    expect(healthNotice(at(1529, null), true, false, null)).toBe("awaiting");
+    expect(healthNotice(at(1529, null), true, false, 1)).toBe("none");
+  });
+});
+
+/**
+ * The banner must judge the value the **step cell draws** — which comes from history — not the
+ * live cumulative counter (REQ-A1925 ∕ F-SH-927).
+ *
+ * Verified on the real S5 (2026-09-26, `YY000286`): `SensorGlue` has `TYPE_STEP_COUNTER`
+ * registered and `ACTIVITY_RECOGNITION` granted, the bus holds a sample with `steps_total: 1529`,
+ * and the stored history is `{"days":[],"workouts":[]}` — the first sample of the day only
+ * **re-baselines** (the counter is since-boot, so today's already-taken steps cannot be recovered
+ * from it) and mints no row. The tile therefore draws 「今日步数 —」, the pulse is `—` (the S5
+ * exposes no heart-rate sensor) and calories are `—`: three `—`.
+ *
+ * The old rule judged `latest.steps_total` — a finite 1529 — and returned `"none"`, so the screen
+ * showed three `—` with nothing saying why. That is exactly the outcome REQ-A1902 was written to
+ * prevent ("judging by the drawn value is the one rule both faces can share"), left open on the
+ * step axis because the cell draws from `history` while the predicate read the wire.
+ */
+describe("healthNotice — the step cell draws from history, not the live counter (REQ-A1925)", () => {
+  const live = (steps_total: number | null) => ({ timestamp_ms: 1, steps_total, heart_rate_bpm: null });
+
+  test("a live cumulative counter with no recorded step today is not a reading on screen", () => {
+    expect(healthNotice(live(1529), true, false, null)).toBe("awaiting");
+  });
+
+  test("a recorded step total is a reading on screen", () => {
+    expect(healthNotice(live(1529), true, false, 512)).toBe("none");
+  });
+
+  test("a recorded day still reads as drawn even with no live sample", () => {
+    // The app restarted: `latest` is null until the next sample, but the day row is already
+    // drawn from the store — the banner must not stand over a number.
+    expect(healthNotice(null, true, false, 512)).toBe("none");
   });
 });

@@ -67,8 +67,13 @@ export interface BatterySources {
 /**
  * Subscribe to live battery data. Call once, during component initialisation (it
  * uses runes). The returned getters stay reactive for the lifetime of the owner.
+ *
+ * `pollMs` defaults to [`BATTERY_POLL_MS`]. A surface that can sit still for a long
+ * time (the lock screen, which can stay up for hours) passes its own slower cadence
+ * rather than keeping a second, drifted copy of this subscription — one copy is the
+ * whole point of this module (REQ-A1926).
  */
-export function createBatterySources(): BatterySources {
+export function createBatterySources(pollMs: number = BATTERY_POLL_MS): BatterySources {
   // Kept separate so the shown reading can be resolved with explicit precedence.
   let systemBatt = $state<BatterySample>(EMPTY_BATTERY);
   let tauriBatt = $state<BatterySample>(EMPTY_BATTERY);
@@ -93,7 +98,7 @@ export function createBatterySources(): BatterySources {
       }
     };
     void poll();
-    const id = window.setInterval(poll, BATTERY_POLL_MS);
+    const id = window.setInterval(poll, pollMs);
     return () => {
       if (stopHost) stopHost();
       window.clearInterval(id);

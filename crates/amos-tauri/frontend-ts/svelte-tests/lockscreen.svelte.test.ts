@@ -329,5 +329,20 @@ describe("LockScreen.svelte — real battery indicator", () => {
     // the name must carry the level — a constant "Battery level" hides it (REQ-A1016).
     expect(b?.getAttribute("aria-label")).toBe(zh["a11y.battery"].replace("{pct}", "75%"));
   });
+
+  test("shows the host battery even when the daemon is away — the same reading the other faces show (REQ-A1926)", async () => {
+    // `system_health` refused (daemon down / restarting) while the host OS battery is
+    // readable. The lock screen used to keep its own daemon→host copy whose first step
+    // (`await systemHealth(); if (!raw) return null;`) abandoned the host layer, so it
+    // drew nothing — while StatusBar / BatteryWidget / WidgetBattery, which all consume
+    // `lib/batterySources`, still showed the real host level.
+    installBridge(null, { level_pct: 61, charging: false });
+    const { container } = render(LockScreen);
+    await tick();
+    await settle();
+    const b = lockBatt(container);
+    expect(b).not.toBeNull();
+    expect(b?.textContent ?? "").toContain("61%");
+  });
 });
 

@@ -170,8 +170,13 @@
    * with no host, and **false** for the phone that is connected, has granted the permission and
    * is simply waiting for its first step (verified on device: the step counter registers and no
    * sample arrives until a step does). `healthNotice` keeps the causes apart (REQ-A1886).
+   *
+   * `todaySteps` is passed because it — not `latest.steps_total` — is what the step cell draws:
+   * the live field is the cumulative since-boot counter, and the first sample of a day only
+   * re-baselines, drawing `—`. Judging the wire field silenced this banner over three `—` on the
+   * real S5 (REQ-A1925 ∕ F-SH-927).
    */
-  const notice = $derived(healthNotice(latest, bridged, stopped));
+  const notice = $derived(healthNotice(latest, bridged, stopped, todaySteps));
 
   const running = $derived(activeWorkout(history));
   const elapsedMs = $derived(running ? Math.max(0, nowMs - running.startedAt) : 0);

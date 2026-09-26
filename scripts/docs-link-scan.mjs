@@ -11,7 +11,10 @@
  * What counts as a link: inline `[text](target)` and `![alt](target)` where the
  * target is **relative** (a path). `http(s):` / `mailto:` / `tel:` / `#anchor` /
  * protocol-relative `//…` links are out of scope (no network access here), and
- * so are links to a bare `#fragment`.
+ * so are links to a bare `#fragment`. Also out of scope is a **Rust intra-doc-link
+ * destination** (`[`open`](Self::open)`), whose target is an item *path*, not a file
+ * (see [`isRustItemPath`], REQ-A1922) — ledger rows quote Rust doc-comments verbatim
+ * and that quotation must not be reported as a broken file link.
  *
  * Correctness details that matter:
  *   • **Code is stripped first** — fenced (``` / ~~~) blocks and inline `` `code` ``,
@@ -183,6 +186,25 @@ export function isExternal(target) {
   return /^(https?:|mailto:|tel:|#|\/\/)/.test(target);
 }
 
+/**
+ * Rust **intra-doc links** are item paths, not files (recorded decision, REQ-A1922).
+ *
+ * A Rust doc-comment may write `` [`open`](Self::open) `` — Rust's intra-doc-link
+ * syntax, where `Self::open` names an **item**, not a document. Ledger rows in this
+ * repo quote such comments **verbatim** (the verbatim-ness *is* the evidence), so the
+ * `(Self::open)` destination reaches this scanner; resolving it against the document's
+ * directory is a category error — it can never denote a file.
+ *
+ * The test is a **strict item path** and nothing else: it must be the **whole**
+ * destination, carry a `::` separator, and contain no `/`, `.`, `#` or space. A real
+ * relative link (a path under `docs/`, `../a`, or even a hypothetical `a::b.md`) cannot
+ * match, so this cannot hide a broken file link. (Contrast `SKIP_PATHS`, which drops
+ * whole files; this drops one class of destination that is provably not a path.)
+ */
+export function isRustItemPath(target) {
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+$/.test(target);
+}
+
 // --- selftest ---------------------------------------------------------------
 export function runSelftest() {
   const checks = [];
@@ -242,6 +264,23 @@ export function runSelftest() {
   ok("isExternal fragment", isExternal("#section"));
   ok("relative is not external", !isExternal("../docs/") && !isExternal("a.md"));
 
+  // REQ-A1922 — a Rust intra-doc-link destination is an item path, never a file. The
+  // quoted-comment shape that hit this gate is `` [`open`](Self::open) ``; after
+  // stripInline removes `` `open` `` the destination `Self::open` is what reaches us.
+  ok("isRustItemPath matches Self::open", isRustItemPath("Self::open"));
+  ok(
+    "isRustItemPath matches a crate-qualified item path",
+    isRustItemPath("crate::atomic::write_atomic"),
+  );
+  ok(
+    "isRustItemPath rejects real relative links and bare names",
+    !isRustItemPath("../docs/") &&
+      !isRustItemPath("a.md") &&
+      !isRustItemPath("a::b.md") &&
+      !isRustItemPath("open") &&
+      !isRustItemPath("docs/a::b"),
+  );
+
   let failed = 0;
   for (const [name, cond] of checks) {
     if (!cond) {
@@ -280,7 +319,7 @@ function runScan() {
   for (const file of mdFiles) {
     const text = stripCode(readFileSync(file, "utf8"));
     for (const raw of extractLinks(text)) {
-      if (isExternal(raw)) continue;
+      if (isExternal(raw) || isRustItemPath(raw)) continue;
       const pathPart = raw.split("#")[0];
       if (!pathPart) continue; // `[x](#frag)` handled by isExternal, but be safe
       let decoded;

@@ -521,43 +521,47 @@ export async function readHealthFeed(): Promise<HealthFeed> {
  * * `"stopped"` — a host answered and its producer **announced a detach** (`cleared`), so the
  *   sensors were released. Walking would change nothing until the app re-attaches, which is
  *   why this is not folded into `"awaiting"`.
- * * `"awaiting"` — a host answered, no sample has arrived, and no detach was announced: the
- *   producer is attached and simply has not reported yet (or the device exposes no motion
- *   sensor at all — the banner's hint says so, because from here the two are one fact).
+ * * `"awaiting"` — a host answered, no reading is **drawn**, and no detach was announced: the
+ *   producer is attached and simply has not produced a drawable reading yet. That covers both a
+ *   sample that never arrived and one that arrived carrying nothing the cells render — the
+ *   since-boot counter that only re-baselined today's row (REQ-A1925 ∕ F-SH-927) or a pulse the
+ *   cell's range refuses (REQ-A1902). The banner's hint says so, because from here those are one
+ *   fact: walk a few steps and a number appears.
  *
  * A sample carrying neither scalar is still "no reading": the host drops such a sample
  * (`VitalsLatest::record` keeps the previous value when there is nothing to retract), so this
- * arm is a belt to that braces, not a distinct state. A sample carrying only a scalar the
- * screen will not draw — see [`vitalsHasReading`] — is the same state, for the same reason
- * (REQ-A1902).
+ * arm is a belt to that braces, not a distinct state. A scalar the screen will not draw — see
+ * [`drawsAReading`] — is the same state, for the same reason (REQ-A1902).
  */
 export type HealthNotice = "none" | "unbridged" | "stopped" | "awaiting";
 
 /**
- * Whether a sample carries a reading the screen will actually draw (REQ-A1902).
+ * Whether the screen draws a reading, judged by the **values the cells draw** (REQ-A1902,
+ * REQ-A1925).
  *
- * The banner must agree with the cells it stands above. It used to test the raw wire fields —
- * `steps_total !== null || heart_rate_bpm !== null` — while the pulse cell draws
- * `normalizeHeartRate(...)` (25–250) and the reducer folds only a non-negative step count. The
- * two seams do not even agree above the frontend: `android_glue::reading` refuses only a
- * **non-positive** heart rate (`v > 0.0`), so a contact artifact reporting `12 bpm` (or a worn
- * strap at `300`) arrives as a number, the cell refuses to draw it, and the banner was withheld
- * on the strength of the very value the cell discarded — a screen of three `—` with nothing
- * saying why. Judging by the drawn value is the one rule both faces can share.
+ * The pulse cell draws `normalizeHeartRate(...)` (25–250) — a narrowing the Rust seam refuses to
+ * make (`android_glue::reading` rejects only a **non-positive** bpm), so a contact artifact
+ * reporting `12 bpm` reaches the UI as a number the cell will not draw. Judging the cell's own
+ * value is what keeps the banner from being withheld on the strength of a reading nobody sees.
+ *
+ * The step cell draws [`daySteps`] out of **history**, never the live `steps_total`: that field
+ * is the cumulative **since-boot** counter, and the first sample of any day only re-baselines —
+ * it mints no row, so the tile draws `—`. Judging the wire field here silenced the banner above a
+ * screen of three `—` (REQ-A1925 ∕ F-SH-927; measured on the S5, 2026-09-26, where the bus held
+ * `steps_total: 1529` while the history was `{"days":[],"workouts":[]}`).
  */
-function vitalsHasReading(v: SensorVitalsDatum): boolean {
-  const steps = v.steps_total;
-  // The reducer's own guard (`applyVitalsTick`): a finite, non-negative cumulative count.
-  const hasSteps = typeof steps === "number" && Number.isFinite(steps) && steps >= 0;
-  return hasSteps || normalizeHeartRate(v.heart_rate_bpm) !== null;
+function drawsAReading(todaySteps: number | null, latest: SensorVitalsDatum | null): boolean {
+  if (todaySteps !== null) return true;
+  return latest !== null && normalizeHeartRate(latest.heart_rate_bpm) !== null;
 }
 
 export function healthNotice(
   latest: SensorVitalsDatum | null,
   bridged: boolean,
   stopped: boolean,
+  todaySteps: number | null,
 ): HealthNotice {
-  if (latest !== null && vitalsHasReading(latest)) return "none";
+  if (drawsAReading(todaySteps, latest)) return "none";
   if (!bridged) return "unbridged";
   return stopped ? "stopped" : "awaiting";
 }

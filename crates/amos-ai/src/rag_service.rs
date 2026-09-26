@@ -329,13 +329,67 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Parse the embedder-choice env and build it. `mock` (default) → a fixed-dim
+/// The one reader of [`EMBEDDER_ENV`], shared by [`embedder_from_env`] (which
+/// builds it) and [`label_from_env`] (which reports it) so the built embedder and
+/// the reported label can never disagree on the backend.
+///
+/// Only a **genuinely unset** variable is silent — it takes the documented `mock`
+/// default. A value the operator *did* set that names no known backend — a typo
+/// (`olama`, `Ollama`), a blank string, a non-Unicode value — is reported once and
+/// falls back to `mock`: the fallback is deliberately the offline, no-egress
+/// backend, so an unrecognised opt-in must never silently promote the daemon to a
+/// network embedder, but neither should the operator be left believing a choice
+/// that was in fact discarded (REQ-A1923 / F-AI-031). Values are trimmed, matching
+/// this crate's flag readers.
+fn embedder_choice() -> &'static str {
+    let Some(raw) = std::env::var_os(EMBEDDER_ENV) else {
+        return "mock";
+    };
+    let Some(value) = raw.to_str() else {
+        return report_unrecognised_embedder("<non-Unicode>");
+    };
+    match value.trim() {
+        "mock" => "mock",
+        "ollama" => "ollama",
+        "api" => "api",
+        other => report_unrecognised_embedder(other),
+    }
+}
+
+/// Report an unrecognised [`EMBEDDER_ENV`] value at WARN **once per distinct value
+/// per process**, then answer the conservative `mock` fallback. The dedup matters
+/// because [`embedder_from_env`] is invoked once per `from_env` *and* re-invoked on
+/// a state-load fallback, so an un-deduped warning would repeat the same line.
+fn report_unrecognised_embedder(value: &str) -> &'static str {
+    let first = reported_embedders()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(value.to_owned());
+    if first {
+        tracing::warn!(
+            env = EMBEDDER_ENV,
+            value,
+            "amos-ai rag: unrecognised embedder backend — using the offline `mock` embedder \
+             (expected `mock`, `ollama` or `api`; a truly unset variable is silent)"
+        );
+    }
+    "mock"
+}
+
+fn reported_embedders() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static REPORTED: std::sync::OnceLock<Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
+/// Build the embedder named by [`embedder_choice`]. `mock` → a fixed-dim
 /// `MockEmbedder`; `ollama` → the real local Ollama adapter (old `/api/embeddings`
 /// or new `/api/embed`); `api` → a cloud OpenAI-compatible `/embeddings`. An
-/// invalid dimension / backend is an honest error (never a panic).
+/// invalid **dimension** is an honest error (never a panic); an unrecognised
+/// *backend* keeps the offline `mock` default and is reported once rather than
+/// folded into silence (REQ-A1923 / F-AI-031).
 fn embedder_from_env() -> Result<Box<dyn Embedder + Send>, String> {
-    let which = std::env::var(EMBEDDER_ENV).unwrap_or_default();
-    match which.as_str() {
+    match embedder_choice() {
         "ollama" => {
             let host =
                 std::env::var(OLLAMA_HOST_ENV).unwrap_or_else(|_| "http://localhost:11434".into());
@@ -368,11 +422,7 @@ fn embedder_from_env() -> Result<Box<dyn Embedder + Send>, String> {
 
 /// The honest embedder label reported by `Status` (`"mock"` | `"ollama"` | `"api"`).
 fn label_from_env() -> &'static str {
-    match std::env::var(EMBEDDER_ENV).as_deref() {
-        Ok("ollama") => "ollama",
-        Ok("api") => "api",
-        _ => "mock",
-    }
+    embedder_choice()
 }
 
 /// Parse a persisted passage map. A payload that cannot be parsed is an **error**: "this
@@ -701,5 +751,119 @@ mod tests {
         assert_eq!(ok.get("note:a").map(String::as_str), Some("text"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- F-AI-031 (REQ-A1923): "unset" and "set but unrecognised" stay apart ---
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counts WARN events on this thread (via `set_default`), so an assertion lands
+    /// on the operator's only view of a discarded backend choice rather than on a
+    /// re-statement of the code.
+    struct WarnProbe(Arc<AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Save/wipe/restore the embedder-choice env var for one test.
+    struct EnvGuard(Option<String>);
+    impl EnvGuard {
+        fn wipe() -> Self {
+            let saved = std::env::var(EMBEDDER_ENV).ok();
+            std::env::remove_var(EMBEDDER_ENV);
+            Self(saved)
+        }
+        fn set(&mut self, value: &str) {
+            std::env::set_var(EMBEDDER_ENV, value);
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(s) => std::env::set_var(EMBEDDER_ENV, s),
+                None => std::env::remove_var(EMBEDDER_ENV),
+            }
+        }
+    }
+
+    /// Resolve the reported label under a WARN probe, and how many WARNs the read produced.
+    fn label_under_probe() -> (&'static str, u64) {
+        let warns = Arc::new(AtomicU64::new(0));
+        let label = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            label_from_env()
+        };
+        (label, warns.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_env_lock)]
+    fn an_unrecognised_embedder_is_reported_not_silently_folded_to_mock() {
+        let mut env = EnvGuard::wipe();
+        env.set("olama"); // a typo of `ollama`
+        let (label, warns) = label_under_probe();
+        assert_eq!(
+            label, "mock",
+            "an unknown backend keeps the offline default"
+        );
+        assert_eq!(
+            warns, 1,
+            "the operator set AMOS_RAG_EMBEDDER and it was discarded — that must be reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_env_lock)]
+    fn an_unset_embedder_stays_silent_and_defaults_to_mock() {
+        let _env = EnvGuard::wipe();
+        let (label, warns) = label_under_probe();
+        assert_eq!(label, "mock");
+        assert_eq!(warns, 0, "a genuinely unset variable is the silent case");
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_env_lock)]
+    fn the_known_embedder_names_are_accepted_without_a_warning() {
+        let mut env = EnvGuard::wipe();
+        for (value, want) in [
+            ("mock", "mock"),
+            ("ollama", "ollama"),
+            ("api", "api"),
+            ("  ollama ", "ollama"),
+        ] {
+            env.set(value);
+            let (label, warns) = label_under_probe();
+            assert_eq!(label, want, "AMOS_RAG_EMBEDDER={value:?}");
+            assert_eq!(warns, 0, "{value:?} names a real backend and must not warn");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(rag_embedder_env_lock)]
+    fn a_non_unicode_embedder_is_reported_not_silently_folded_to_mock() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = EnvGuard::wipe();
+        std::env::set_var(EMBEDDER_ENV, std::ffi::OsStr::from_bytes(b"ol\xfflama"));
+        let (label, warns) = label_under_probe();
+        assert_eq!(label, "mock");
+        assert_eq!(
+            warns, 1,
+            "a present-but-unreadable value must not read as `unset`"
+        );
     }
 }

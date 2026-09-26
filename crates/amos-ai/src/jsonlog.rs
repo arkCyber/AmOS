@@ -46,8 +46,16 @@ pub const JSON_LOG_FILE_NAME: &str = "amos-ai.jsonl";
 /// The sink is **off by default** — the human `logfile.rs` sink is what the
 /// daemon ships enabled today, and a second sink silently shipping events to a
 /// remote without an explicit env would be exactly the invisible-egress shape
-/// this project audits for. Setting `AMOS_LOG_JSON=1` opts in; the path still
-/// follows `AMOS_LOG_DIR` so the two sinks never disagree on the directory.
+/// this project audits for. Setting `AMOS_LOG_JSON` to a truthy token
+/// (`1`/`true`/`yes`/`on`) opts in; the path still follows `AMOS_LOG_DIR` so the
+/// two sinks never disagree on the directory.
+///
+/// The opt-in is read through [`crate::energy::env_flag`], so its three input
+/// states stay distinct: **unset** and the documented off spellings
+/// (`0`/`false`/`no`/`off`) are silent, while a value the operator *did* set that
+/// lies outside both sets (a typo, a blank, a non-Unicode value) is reported once
+/// and left off — the operator is told their opt-in was not honoured instead of
+/// being left to believe a second log is being written (REQ-A1920 / F-AI-029).
 pub const ENV_OPT_IN: &str = "AMOS_LOG_JSON";
 
 /// `service` label stamped on every record (defaults to the binary name).
@@ -75,10 +83,12 @@ impl JsonLogConfig {
     /// `AMOS_LOG_DIR` is resolved with the same precedence as `logfile.rs` —
     /// either file can be turned off independently with `off`/`none`/`0`.
     pub fn from_env() -> Option<Self> {
-        let enabled = match std::env::var(ENV_OPT_IN).ok() {
-            Some(v) => is_on(&v),
-            None => false,
-        };
+        // Route the opt-in through the crate's one strict bool reader
+        // (`energy::env_flag` → `parse_flag`), the rule §20.1 states and that
+        // `notifier_sink` / `telemetry_spy_capture` already follow: a value the
+        // operator set that lies outside both token sets is reported once instead
+        // of being folded into a silent "off" (REQ-A1920 / F-AI-029).
+        let enabled = crate::energy::env_flag(ENV_OPT_IN).unwrap_or(false);
         if !enabled {
             return None;
         }
@@ -112,14 +122,6 @@ impl JsonLogConfig {
     pub fn path(&self) -> PathBuf {
         self.dir.join(JSON_LOG_FILE_NAME)
     }
-}
-
-/// `true` for the documented "turn the sink on" spellings (case-insensitive).
-fn is_on(raw: &str) -> bool {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "on" | "true" | "yes"
-    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -750,6 +752,7 @@ pub struct TraceIdCell(pub Option<String>);
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -998,5 +1001,143 @@ mod tests {
         // `sink_writes_one_json_line_per_event_and_rotates`, which exercises
         // the shared Arc path with `enabled() == true`.
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- F-AI-029 (REQ-A1920): the opt-in reader keeps its three facts apart ---
+
+    /// Counts WARN events on this thread (via `set_default`), so an assertion
+    /// lands on the operator's only view of a dropped opt-in rather than on a
+    /// re-statement of the code.
+    struct WarnProbe(Arc<AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Save/wipe/restore the opt-in env var for one test.
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+    impl EnvGuard {
+        fn wipe(keys: &[&'static str]) -> Self {
+            let mut saved = Vec::with_capacity(keys.len());
+            for k in keys {
+                saved.push((*k, std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            Self(saved)
+        }
+        fn set(&mut self, key: &'static str, value: &str) {
+            std::env::set_var(key, value);
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                match v {
+                    Some(s) => std::env::set_var(k, s),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Read the opt-in under a WARN probe, returning the resolved config and how
+    /// many WARNs that read produced.
+    fn opt_in_under_probe() -> (Option<JsonLogConfig>, u64) {
+        let warns = Arc::new(AtomicU64::new(0));
+        let cfg = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            JsonLogConfig::from_env()
+        };
+        (cfg, warns.load(Ordering::Relaxed))
+    }
+
+    /// F-AI-029: an `AMOS_LOG_JSON` value that is **present but unrecognised** — a
+    /// typo (`enable`), an unexpanded shell variable, a bare button-mash — leaves
+    /// the JSON sink off. Before REQ-A1920 that drop was silent: the reader folded
+    /// "unset" (the ordinary case) and "present but unreadable" (a promise the
+    /// operator made and we failed to honour) into the same bare `false`.
+    #[test]
+    #[serial_test::serial(jsonlog_env_lock)]
+    fn an_unrecognised_opt_in_is_reported_not_silently_read_as_off() {
+        let mut env = EnvGuard::wipe(&[ENV_OPT_IN]);
+        env.set(ENV_OPT_IN, "enable");
+
+        let (cfg, warns) = opt_in_under_probe();
+
+        assert!(cfg.is_none(), "an unrecognised value does not opt in");
+        assert!(
+            warns >= 1,
+            "a present-but-unrecognised AMOS_LOG_JSON must be reported; folding it into \
+             the same silent off as 'unset' is the F-AI-029 defect"
+        );
+    }
+
+    /// Disjointness control: an **unset** opt-in is the ordinary case — the sink is
+    /// off by default — and must stay silent. A blanket "warn whenever the sink is
+    /// off" fix would be caught here.
+    #[test]
+    #[serial_test::serial(jsonlog_env_lock)]
+    fn an_unset_opt_in_stays_silent() {
+        let _env = EnvGuard::wipe(&[ENV_OPT_IN]);
+
+        let (cfg, warns) = opt_in_under_probe();
+
+        assert!(cfg.is_none());
+        assert_eq!(
+            warns, 0,
+            "an unset opt-in is the ordinary case and must not warn"
+        );
+    }
+
+    /// The second disjointness control: the spellings §20.1 defines as **off** are
+    /// values we understood, so they must stay silent.
+    #[test]
+    #[serial_test::serial(jsonlog_env_lock)]
+    fn a_recognised_off_opt_in_stays_silent() {
+        for off in ["0", "false", "FALSE", "no", "off", "  Off  "] {
+            let mut env = EnvGuard::wipe(&[ENV_OPT_IN]);
+            env.set(ENV_OPT_IN, off);
+
+            let (cfg, warns) = opt_in_under_probe();
+
+            assert!(cfg.is_none(), "{off} must not opt in");
+            assert_eq!(
+                warns, 0,
+                "{off} is a recognised off spelling and must stay silent"
+            );
+        }
+    }
+
+    /// F-AI-029, the second face: `std::env::var(..).ok()` also folded a value that
+    /// is present but **not valid Unicode** into the same silent `None` as "unset".
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(jsonlog_env_lock)]
+    fn a_non_unicode_opt_in_is_reported_not_silently_read_as_off() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = EnvGuard::wipe(&[ENV_OPT_IN]);
+        std::env::set_var(ENV_OPT_IN, std::ffi::OsStr::from_bytes(b"o\xffn"));
+
+        let (cfg, warns) = opt_in_under_probe();
+
+        assert!(cfg.is_none());
+        assert!(
+            warns >= 1,
+            "a present-but-non-Unicode AMOS_LOG_JSON must be reported; the old read folded \
+             it into the same silent None as 'unset' (F-AI-029)"
+        );
     }
 }

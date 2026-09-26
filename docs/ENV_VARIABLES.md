@@ -230,7 +230,7 @@
 |------|------|------|----------|------|
 | `AMOS_RAG_STATE` | path | (none) | `→ in-memory` | 向量索引持久化路径 |
 | `AMOS_RAG_DIM` | int | `384` | `→ 384` | 嵌入维度 |
-| `AMOS_RAG_EMBEDDER` | enum | `mock` | `→ mock` | 嵌入器:`mock`/`ollama` |
+| `AMOS_RAG_EMBEDDER` | enum | `mock` | `→ mock`（集合外值告警一次后回退） | 嵌入器:`mock`/`ollama`/`api`（未设静默；拼错 ∕ 空 ∕ 非 Unicode 报告一次） |
 | `AMOS_RAG_EMBED_BASE` | url | (none) | `→ fail` | Ollama embed URL |
 | `AMOS_RAG_EMBED_MODEL` | string | (none) | `→ fail` | 嵌入模型名 |
 

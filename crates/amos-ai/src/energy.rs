@@ -284,8 +284,21 @@ fn parse_flag(key: &str, raw: Option<&str>) -> Option<bool> {
 }
 
 /// Read and strictly parse (see [`parse_flag`]) an optional `bool` env var.
-fn env_flag(key: &str) -> Option<bool> {
-    parse_flag(key, std::env::var(key).ok().as_deref())
+///
+/// Read through [`std::env::var_os`] so the two facts `std::env::var` folds
+/// together stay apart: an **unset** key is silent, while a value that is present
+/// but not valid Unicode is reported once. `std::env::var(..).ok()` mapped both
+/// to the same silent `None`, so a mojibake value read as "not set" (REQ-A1920).
+///
+/// `pub(crate)` so the other flag readers in this crate — the JSON-log opt-in in
+/// particular — share this one rule rather than keeping their own copy of it.
+pub(crate) fn env_flag(key: &str) -> Option<bool> {
+    let raw = std::env::var_os(key)?;
+    let Some(raw) = raw.to_str() else {
+        warn_once_bad_flag(key, "<non-Unicode>");
+        return None;
+    };
+    parse_flag(key, Some(raw))
 }
 
 /// The `(key, value)` pairs already reported as unrecognized (see

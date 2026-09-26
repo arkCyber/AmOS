@@ -98,6 +98,27 @@ fn resolve_state_file() -> Option<PathBuf> {
         .map(|home| Path::new(&home).join(DEFAULT_RELATIVE))
 }
 
+/// Move a state file that could not be read back aside so the store's next write
+/// cannot overwrite it.
+///
+/// This store is the **whole** durable `amos.*` map: every mutation rewrites the
+/// entire file (`persist` above), so starting empty *on top of* an unparseable file
+/// would replace every key the user ever set with whatever the first `store_set`
+/// happens to carry. The bytes are kept beside the original instead. `None` when
+/// there was nothing to keep (no file) or when the rename failed — the caller warns
+/// either way and still starts empty.
+fn preserve_unreadable_state(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    fs::rename(path, &kept).ok().map(|()| kept)
+}
+
 impl Default for SharedStore {
     fn default() -> Self {
         Self::new()
@@ -123,6 +144,10 @@ impl SharedStore {
     }
 
     /// Load (or start empty at) `path`, persisting every mutation there.
+    ///
+    /// A file that will not parse is **moved aside** before we start empty: the store
+    /// rewrites the whole map on every mutation, so an in-place "start empty" would let
+    /// the first `store_set` destroy every key the file still held (`preserve_unreadable_state`).
     pub fn from_file(path: &Path) -> Self {
         let inner = if path.exists() {
             match fs::read(path)
@@ -131,10 +156,17 @@ impl SharedStore {
             {
                 Some(map) => map,
                 None => {
-                    tracing::warn!(
-                        "state file {} unreadable/corrupt; starting empty",
-                        path.display()
-                    );
+                    match preserve_unreadable_state(path) {
+                        Some(kept) => tracing::warn!(
+                            "state file {} unreadable/corrupt; kept at {} and starting empty",
+                            path.display(),
+                            kept.display()
+                        ),
+                        None => tracing::warn!(
+                            "state file {} unreadable/corrupt; could not be moved aside, starting empty",
+                            path.display()
+                        ),
+                    }
                     HashMap::new()
                 }
             }
@@ -545,6 +577,82 @@ mod tests {
         s.insert("amos.settings", "{}".into());
         let again = SharedStore::from_file(&path);
         assert_eq!(again.get("amos.settings").as_deref(), Some("{}"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `<stem>.corrupt-*` sibling of `path`, if one was kept beside it.
+    ///
+    /// Matched on the **stem** rather than by scanning the directory for "corrupt-":
+    /// every test in this module shares one temp dir, so a directory-wide search could
+    /// pick up a sibling test's kept file and make this one pass for the wrong reason.
+    fn kept_aside(path: &Path) -> Option<PathBuf> {
+        let stem = path.file_stem()?.to_string_lossy().into_owned();
+        let prefix = format!("{stem}.corrupt-");
+        std::fs::read_dir(path.parent()?)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+            })
+    }
+
+    /// A state file that cannot be read back must be **moved aside**, never left where the
+    /// store's next write would overwrite it: every mutation rewrites the *whole* map, so
+    /// starting empty *on top of* the user's file replaces their entire durable state with
+    /// whatever the first `store_set` happens to carry (REQ-A1925 / F-SH-927).
+    #[test]
+    fn an_unreadable_state_file_is_preserved_not_silently_overwritten() {
+        let path = temp_path("corrupt-preserved");
+        std::fs::write(&path, "{ not valid json !").unwrap();
+
+        let s = SharedStore::from_file(&path);
+        assert!(s.snapshot().is_empty(), "a corrupt file still starts empty");
+        assert!(
+            !path.exists(),
+            "the corrupt state file must be moved aside, not left to be overwritten"
+        );
+        let kept =
+            kept_aside(&path).expect("the corrupt state file was kept under a corrupt-* name");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{ not valid json !",
+            "the user's bytes survive intact"
+        );
+
+        // The next mutation makes a *fresh* file at the original path — beside, not over,
+        // the kept one.
+        s.insert("amos.settings", "{}".into());
+        assert!(
+            path.exists(),
+            "a fresh state file is written at the original path"
+        );
+        assert!(kept.exists(), "and the preserved bytes are still there");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&kept);
+    }
+
+    /// Positive control: a file that *parses* is loaded in place and nothing is moved
+    /// aside, so the fix cannot degenerate into "rename every state file".
+    #[test]
+    fn a_readable_state_file_is_loaded_without_being_moved_aside() {
+        let path = temp_path("readable");
+        SharedStore::from_file(&path).insert("amos.settings", "{\"wifi\":true}".into());
+
+        let again = SharedStore::from_file(&path);
+        assert_eq!(
+            again.get("amos.settings").as_deref(),
+            Some("{\"wifi\":true}"),
+            "a readable state file is loaded, not discarded"
+        );
+        assert!(path.exists(), "a readable state file stays in place");
+        assert!(
+            kept_aside(&path).is_none(),
+            "nothing is moved aside when the file parses"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
