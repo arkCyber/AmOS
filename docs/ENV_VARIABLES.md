@@ -51,9 +51,9 @@
 | `AMOS_SESSIONS_PATH` | path | (回退) | - | 会话持久化文件 |
 | `AMOS_RATE_LIMIT_RPS` | int | `10` | `→ 10` | 每客户端请求速率上限 |
 | `AMOS_RATE_LIMIT_TPH` | int | `1000` | `→ 1000` | 每客户端每小时配额 |
-| `AMOS_BREAKER` | bool | `1` | `→ enabled` | 后端熔断器开关 |
-| `AMOS_BREAKER_FAILS` | int | `5` | `→ 5` | 熔断器失败阈值 |
-| `AMOS_BREAKER_COOLDOWN_SECS` | int | `30` | `→ 30` | 熔断器冷却时间 |
+| `AMOS_BREAKER` | bool | `1` | `→ enabled`（集合外值告警一次后回退 enabled） | 后端熔断器开关（未设静默；拼错 ∕ 空白 ∕ 非 Unicode 报告一次） |
+| `AMOS_BREAKER_FAILS` | int | `3` | `→ 3`（非 Unicode 告警一次后回退） | 熔断器失败阈值（未设 ∕ 不可解析 ∕ <1 静默回退默认） |
+| `AMOS_BREAKER_COOLDOWN_SECS` | int | `30` | `→ 30`（非 Unicode 告警一次后回退） | 熔断器冷却时间（未设 ∕ 不可解析 ∕ <1 静默回退默认） |
 | `AMOS_PRIVACY_PATH` | path | `~/.amos/privacy.jsonl` | `→ mkdir-p` | 隐私审计落盘 |
 | `AMOS_AUDIT_PATH` | path | `~/.amos/audit.jsonl` | `→ mkdir-p` | 通用审计落盘 |
 | `AMOS_AUDIT_MAX_BYTES` | int | `5_000_000` | `→ 5MB` | 单个审计文件上限 |
@@ -231,8 +231,11 @@
 | `AMOS_RAG_STATE` | path | (none) | `→ in-memory`（空 ∕ 非 Unicode 值告警一次后同样回退） | 向量索引持久化路径 |
 | `AMOS_RAG_DIM` | int | `384` | `→ 384` | 嵌入维度 |
 | `AMOS_RAG_EMBEDDER` | enum | `mock` | `→ mock`（集合外值告警一次后回退） | 嵌入器:`mock`/`ollama`/`api`（未设静默；拼错 ∕ 空 ∕ 非 Unicode 报告一次） |
-| `AMOS_RAG_EMBED_BASE` | url | (none) | `→ fail` | Ollama embed URL |
-| `AMOS_RAG_EMBED_MODEL` | string | (none) | `→ fail` | 嵌入模型名 |
+| `AMOS_RAG_EMBED_BASE` | url | `https://api.openai.com/v1` | `→ https://api.openai.com/v1`（空 ∕ 非 Unicode 值告警一次后回退） | `api` 嵌入器基址(OpenAI 兼容 `/embeddings`) |
+| `AMOS_RAG_EMBED_MODEL` | string | `bge-m3` ∕ `text-embedding-3-small` | `→ bge-m3` ∕ `→ text-embedding-3-small`（空 ∕ 非 Unicode 值告警一次后回退） | 嵌入模型名(`ollama` ∕ `api`) |
+| `AMOS_OLLAMA_HOST` | url | `http://localhost:11434` | `→ http://localhost:11434`（RAG:空 ∕ 非 Unicode 值告警一次后回退） | RAG `ollama` 嵌入器复用该地址 |
+| `AMOS_OLLAMA_API_KEY` | secret | - | `→ no-auth`（空 ∕ 非 Unicode 值告警一次后不发送） | RAG `ollama` 嵌入器复用该 token |
+| `AMOS_API_KEY` | secret | - | `→ 空串`（非 Unicode 值告警一次） | RAG `api` 嵌入器的 bearer |
 
 ---
 

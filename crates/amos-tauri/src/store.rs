@@ -283,6 +283,11 @@ impl SharedStore {
     /// here would make every write after a panic invisible on disk while the in-memory map
     /// still held them, so the two stores would drift apart and the file would win on the
     /// next boot.
+    ///
+    /// The write itself goes through [`write_atomic`], not `fs::write`: this file is
+    /// rewritten in full on *every* mutation, so a torn write would corrupt the one copy
+    /// of the whole durable map — and the read-side preservation (F-SH-927) only protects a
+    /// file that is still intact enough to be moved aside.
     fn persist(&self) {
         let Some(path) = &self.path else {
             return;
@@ -307,10 +312,29 @@ impl SharedStore {
                 );
             }
         }
-        if let Err(e) = fs::write(path, bytes) {
+        if let Err(e) = write_atomic(path, &bytes) {
             tracing::warn!("failed to persist state to {}: {e}", path.display());
         }
     }
+}
+
+/// Replace `path` with `bytes` atomically: write a sibling temp file, then `rename` it
+/// onto the target.
+///
+/// A plain `fs::write` truncates the destination in place, so a torn write (power loss,
+/// full disk, a crash between the truncate and the write) leaves a **partial** state file
+/// at `path`. Because this file is rewritten on *every* mutation, the next boot parses the
+/// wreckage, starts empty, and then the next `store_set` overwrites it — destroying the one
+/// copy of the whole durable map. `rename` within a directory is atomic on POSIX, so a
+/// concurrent reader sees either the complete previous snapshot or the complete new one,
+/// never a truncated prefix. The temp must sit **beside** the target (not in
+/// `std::env::temp_dir()`), or the rename could cross a filesystem boundary and silently
+/// degrade back to copy-then-delete. The `.json.tmp` suffix keeps it from colliding with
+/// the `*.corrupt-*` siblings the read path writes (F-SH-927). (REQ-A1944 / F-SH-940.)
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
 }
 
 /// The JSON **object** stored at `key`, for a *merge*, plus whether a value was present but
@@ -632,6 +656,62 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&kept);
+    }
+
+    /// A reader that opened the state file **before** a mutation must still read the
+    /// complete **previous** snapshot afterwards.
+    ///
+    /// `fs::write` truncates the file it is handed, so the old in-place persist left
+    /// any such reader staring at an empty or half-written buffer — the classic torn
+    /// read, and here the file is the whole `amos.*` map. Replacing it through a temp
+    /// sibling and `rename` swaps the directory entry and leaves the old inode, and
+    /// its readers, untouched. This is the observable face of "atomic": a unit test
+    /// cannot crash the process inside `persist`, but it can hold the file open across
+    /// it (REQ-A1944 / F-SH-940).
+    #[test]
+    fn a_persist_leaves_an_open_reader_on_the_complete_previous_snapshot() {
+        use std::io::Read as _;
+
+        let path = temp_path("atomic-open-reader");
+        std::fs::write(&path, br#"{"a":"1"}"#).unwrap();
+        let store = SharedStore::from_file(&path);
+
+        // Pin the pre-write inode across the mutation.
+        let mut reader = std::fs::File::open(&path).unwrap();
+        store.insert("b", "2".into());
+
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, r#"{"a":"1"}"#,
+            "an in-place write truncates the file under the reader; an atomic replace does not"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Positive control for the atomic replace: the temp sibling is renamed onto the
+    /// target, so it must not survive the write. A fix that wrote the temp and forgot
+    /// the `rename` would fail here (and would leave `state.json` stale).
+    #[test]
+    fn a_persist_leaves_no_temp_sibling_behind() {
+        let path = temp_path("atomic-no-tmp");
+        let store = SharedStore::from_file(&path);
+        store.insert("amos.settings", "{}".into());
+
+        assert!(path.exists(), "the state file is written");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file is renamed away, never left beside the state file"
+        );
+        let again = SharedStore::from_file(&path);
+        assert_eq!(
+            again.get("amos.settings").as_deref(),
+            Some("{}"),
+            "the renamed file is the new state"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Positive control: a file that *parses* is loaded in place and nothing is moved

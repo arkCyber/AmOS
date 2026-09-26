@@ -191,15 +191,10 @@ enum Source {
 
 impl Source {
     fn from_env() -> Source {
-        let image = std::env::var(ENV_IMAGE_PATH)
-            .ok()
-            .filter(|p| !p.trim().is_empty())
-            .map(PathBuf::from);
-        match std::env::var(ENV_MANIFEST_PATH) {
-            Ok(p) if !p.trim().is_empty() => {
-                Source::File(FileUpdateProvider::new(p).with_image(image))
-            }
-            _ => Source::Unconfigured,
+        let image = env_value(ENV_IMAGE_PATH).map(PathBuf::from);
+        match env_value(ENV_MANIFEST_PATH) {
+            Some(p) => Source::File(FileUpdateProvider::new(p).with_image(image)),
+            None => Source::Unconfigured,
         }
     }
 
@@ -257,15 +252,36 @@ fn parse_channel(raw: Option<&str>) -> Result<Channel, String> {
 }
 
 fn device_id_from_env() -> String {
-    std::env::var(ENV_DEVICE_ID)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string())
+    env_value(ENV_DEVICE_ID).unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string())
 }
 
-/// The value of `name`, trimmed, when it is set to something non-empty.
+/// The value of `name`, trimmed, when it is set to something non-blank.
+///
+/// Three states, only two of which are silent. Unset — and set to whitespace,
+/// which names nothing — are `None` with no diagnostic. **Set but not valid
+/// Unicode** is also `None`, but it is a *finding*: `std::env::var(..).ok()`
+/// folded it into plain absence, so [`Source::from_env`] answered
+/// "unconfigured" for a variable the operator had set, and every surface
+/// downstream reported a cause (`AMOS_OTA_MANIFEST_PATH` unset) that was not the
+/// one that applied. This is the same over-claim [`TrustConfig::verifier`]
+/// refuses for an undecodable [`ENV_TRUST_KEY_HEX`], and it is refused the same
+/// way: a warning that names the variable. The trim is not decoration either —
+/// an env file written `AMOS_OTA_MANIFEST_PATH=<path>\r` (CRLF) or
+/// `=" <path> "` names a real file, and handing the padding to
+/// [`FileUpdateProvider`] turned that file into a missing one.
+/// (REQ-A1935 / F-OTA-011.)
 fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.trim().is_empty())
+    let raw = std::env::var_os(name)?;
+    let Some(text) = raw.to_str() else {
+        tracing::warn!("{name} is set but not valid Unicode; treating it as unset");
+        return None;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// How this host can check a package's signature — the two configurations are
@@ -1937,5 +1953,181 @@ const NAMED: &str = \"a // is not a comment\";\n";
             "ota::ota_install,",
             "ota_install not registered"
         );
+    }
+
+    // ---- The env reader's two promises -------------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// Counts WARN events, so an assertion is on the *observable* diagnostic and
+    /// not on a re-statement of the code. Mirrors `bundled_model.rs::WarnProbe`.
+    struct WarnProbe(Arc<AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Save/wipe/restore the variables one test mutates. Process-global state
+    /// with a restoration on `Drop`, so a panicking assertion cannot leak a
+    /// value into the next test.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvGuard {
+        fn wipe(keys: &[&'static str]) -> Self {
+            let mut saved = Vec::with_capacity(keys.len());
+            for k in keys {
+                saved.push((*k, std::env::var_os(k)));
+                std::env::remove_var(k);
+            }
+            Self(saved)
+        }
+        fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            std::env::set_var(key, value);
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                match v {
+                    Some(s) => std::env::set_var(k, s),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// A value that is set but is not valid Unicode — the third state `.ok()`
+    /// folds into "unset".
+    #[cfg(unix)]
+    fn non_unicode_value() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe, b'x'])
+    }
+
+    /// `env_value`'s doc says "the value of `name`, **trimmed**". An env file
+    /// edited to `AMOS_OTA_DEVICE_ID=" dev-7 "` names `dev-7`; returning the
+    /// padding hands a value with whitespace to whoever asked for a *value*, and
+    /// for the path readers it makes the operator's real file read as missing.
+    #[test]
+    #[serial_test::serial(ota_env_lock)]
+    fn env_value_returns_the_value_trimmed() {
+        let mut g = EnvGuard::wipe(&[ENV_DEVICE_ID]);
+        g.set(ENV_DEVICE_ID, "  dev-7 \t");
+        assert_eq!(
+            env_value(ENV_DEVICE_ID).as_deref(),
+            Some("dev-7"),
+            "the documented trim did not happen"
+        );
+    }
+
+    /// A value that is set but not valid Unicode is `None` — *and* it is a
+    /// finding, not a silent absence. `.ok()` erased the difference, so the
+    /// host reported "unconfigured" for a variable the operator had set, the
+    /// exact over-claim `trust_from_env`'s doc refuses for a malformed key.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(ota_env_lock)]
+    fn env_value_warns_when_the_variable_is_set_but_not_valid_unicode() {
+        let mut g = EnvGuard::wipe(&[ENV_DEVICE_ID]);
+        g.set(ENV_DEVICE_ID, non_unicode_value());
+        let warns = Arc::new(AtomicU64::new(0));
+        let value = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            env_value(ENV_DEVICE_ID)
+        };
+        assert_eq!(value, None, "an unreadable value is not a usable path");
+        assert_eq!(
+            warns.load(Ordering::Relaxed),
+            1,
+            "the fold from `set but unreadable` to `unset` must be observable"
+        );
+    }
+
+    /// Negative control for the two tests above: a genuinely unset variable is
+    /// `None` with **no** diagnostic, and a blank-only value is treated as unset
+    /// — also silent, because a value of spaces names nothing (as opposed to a
+    /// value that could not be read at all).
+    #[test]
+    #[serial_test::serial(ota_env_lock)]
+    fn an_unset_or_blank_variable_is_none_without_a_diagnostic() {
+        let mut g = EnvGuard::wipe(&[ENV_DEVICE_ID]);
+        let warns = Arc::new(AtomicU64::new(0));
+        {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            assert_eq!(env_value(ENV_DEVICE_ID), None, "unset is None");
+            g.set(ENV_DEVICE_ID, "   ");
+            assert_eq!(env_value(ENV_DEVICE_ID), None, "blank is unset");
+        }
+        assert_eq!(
+            warns.load(Ordering::Relaxed),
+            0,
+            "neither state is a diagnostic worth a warning"
+        );
+    }
+
+    /// Positive control: an ordinary value is returned and is silent.
+    #[test]
+    #[serial_test::serial(ota_env_lock)]
+    fn an_ordinary_value_is_returned_without_a_diagnostic() {
+        let mut g = EnvGuard::wipe(&[ENV_DEVICE_ID]);
+        g.set(ENV_DEVICE_ID, "dev-9");
+        let warns = Arc::new(AtomicU64::new(0));
+        let value = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            env_value(ENV_DEVICE_ID)
+        };
+        assert_eq!(value.as_deref(), Some("dev-9"));
+        assert_eq!(warns.load(Ordering::Relaxed), 0);
+    }
+
+    /// The identity reader decides with `!s.trim().is_empty()`, so it already
+    /// treats a padded value as *the value modulo padding* — but then keeps the
+    /// padding. `AMOS_OTA_DEVICE_ID=" dev-42 "` is a name the operator wrote.
+    #[test]
+    #[serial_test::serial(ota_env_lock)]
+    fn device_id_from_env_trims_a_padded_identity() {
+        let mut g = EnvGuard::wipe(&[ENV_DEVICE_ID]);
+        g.set(ENV_DEVICE_ID, "  dev-42  ");
+        assert_eq!(device_id_from_env(), "dev-42");
+        g.set(ENV_DEVICE_ID, "   ");
+        assert_eq!(
+            device_id_from_env(),
+            DEFAULT_DEVICE_ID,
+            "blank still falls back to the default"
+        );
+    }
+
+    /// The user-visible half: a padded path names the operator's real file, so
+    /// `Source::from_env` must reach it. Untrimmed, the reader built a provider
+    /// for `"  /tmp/....json  "` — a path that does not exist — and the check
+    /// reported `unreachable` for a file sitting right there.
+    #[test]
+    #[serial_test::serial(ota_env_lock)]
+    fn source_from_env_reads_the_file_named_by_a_padded_manifest_path() {
+        let (_, manifest) =
+            file_source("padded-path", &manifest_json("1.1.0", "stable", true, None));
+        let mut g = EnvGuard::wipe(&[ENV_MANIFEST_PATH, ENV_IMAGE_PATH]);
+        g.set(ENV_MANIFEST_PATH, format!("  {}  ", manifest.display()));
+        let src = Source::from_env();
+        assert!(
+            src.configured(),
+            "a padded path still names a configured source"
+        );
+        let r = check(&src, Channel::Stable, Some(80), false, true, true);
+        assert_eq!(r.kind, "eligible", "{r:?}");
+        let _ = std::fs::remove_file(manifest);
     }
 }

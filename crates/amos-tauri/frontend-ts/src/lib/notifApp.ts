@@ -61,3 +61,30 @@ export function withoutAppNotifs(
 ): Notif[] {
   return list.filter((row) => notifAppId(row, dicts) !== appId);
 }
+
+/**
+ * Publish `fresh` as the **whole** of `appId`'s notifications, at the **head**,
+ * newest-first.
+ *
+ * The store's convention is newest-first and every other producer keeps it: `addNotif`
+ * prepends, `mergePushHistory` sorts its additions by `time` and prepends them, and the
+ * timer / reminder / calendar producers write their row at the head. The notification
+ * centre renders the array **in order** (no sort at render — `NotificationCenter.svelte`
+ * and `DesktopNotificationCenter.svelte` both `{#each notifs}`), so position *is* the
+ * display order.
+ *
+ * The two producers that re-derive their app's whole set on every change — `MailApp` and
+ * `MessagesApp` — build `[...kept, ...fresh]` themselves and therefore put their rows
+ * **after** every other app's, whatever the times say. That is the one place the array
+ * order disagrees with the newest-first reading of the list, and (REQ-A1940) the over-cap
+ * trim now decides by `time`, so on a capped store the *visible* order could not be
+ * recovered from position at all. Keeping the rule here makes both producers one shape.
+ */
+export function replaceAppNotifs(
+  list: Notif[],
+  appId: string,
+  fresh: Notif[],
+  dicts: readonly Record<string, string>[],
+): Notif[] {
+  return [...withoutAppNotifs(list, appId, dicts), ...fresh];
+}

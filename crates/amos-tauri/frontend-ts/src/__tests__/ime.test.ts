@@ -290,6 +290,35 @@ describe("lib/ime — text-entry helpers", () => {
     empty.value = "";
     expect(deleteBeforeCaret(empty)).toBe(false);
   });
+
+  test("a Backspace with the caret after a non-BMP character deletes the whole character, never half a surrogate pair (REQ-A1931 ∕ F-SH-931)", () => {
+    // 😀 is ONE character in two UTF-16 code units. A code-unit Backspace cuts the low
+    // half and leaves the lone high surrogate `\uD83D` in the field — a broken string the
+    // host then stores (JSON round-trips a lone surrogate). The sibling insert path already
+    // refuses exactly this at its truncation boundary; the deletion path had no such guard.
+    const field = document.createElement("input");
+    field.value = "hi😀";
+    field.setSelectionRange(4, 4); // caret after the emoji (both code units)
+    expect(deleteBeforeCaret(field)).toBe(true);
+    expect(field.value).toBe("hi");
+  });
+
+  test("a Backspace from the end of a caret-less field (email/tel) also deletes a whole non-BMP character (REQ-A1931 ∕ F-SH-931)", () => {
+    const noCaret = document.createElement("input");
+    noCaret.value = "😀";
+    Object.defineProperty(noCaret, "selectionStart", { configurable: true, get: () => null });
+    Object.defineProperty(noCaret, "selectionEnd", { configurable: true, get: () => null });
+    expect(deleteBeforeCaret(noCaret)).toBe(true);
+    expect(noCaret.value).toBe("");
+  });
+
+  test("a Backspace over a plain BMP character still deletes one code unit (negative control for the surrogate step)", () => {
+    const bmp = document.createElement("input");
+    bmp.value = "中文";
+    bmp.setSelectionRange(2, 2);
+    expect(deleteBeforeCaret(bmp)).toBe(true);
+    expect(bmp.value).toBe("中");
+  });
 });
 
 describe("lib/ime — layout, preference and paging", () => {

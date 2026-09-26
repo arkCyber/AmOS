@@ -498,7 +498,6 @@ impl SmsTrashState {
         };
         match SmsTrash::from_json(&text, DEFAULT_TRASH_CAP) {
             Ok(loaded) => {
-                keep_trash_aside(&path, "NC-2 TEMP: over-broad"); // NC-2 TEMP
                 if let Ok(mut t) = self.inner.write() {
                     *t = loaded;
                 }
@@ -2339,7 +2338,10 @@ mod tests {
 
         let st = SmsTrashState::empty();
         st.configure(path.clone());
-        assert!(st.list().is_empty(), "a corrupt file starts the trash empty");
+        assert!(
+            st.list().is_empty(),
+            "a corrupt file starts the trash empty"
+        );
         assert!(
             !path.exists(),
             "the corrupt file must be moved aside, not left to be overwritten"
@@ -2361,7 +2363,10 @@ mod tests {
             42,
         )
         .unwrap();
-        assert!(path.exists(), "a fresh trash is written at the original path");
+        assert!(
+            path.exists(),
+            "a fresh trash is written at the original path"
+        );
         assert!(kept.exists(), "and the preserved bytes are still there");
         assert_eq!(
             std::fs::read(&kept).unwrap(),

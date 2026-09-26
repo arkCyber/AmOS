@@ -27,7 +27,7 @@
   import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import { NOTIF_KEY, normalizeNotifs } from "../lib/settings";
-  import { hasNotifsOfApp, withoutAppNotifs } from "../lib/notifApp";
+  import { hasNotifsOfApp, replaceAppNotifs, withoutAppNotifs } from "../lib/notifApp";
   import { bgT } from "./bgText";
   import { iconSvg } from "../lib/sysIcons";
   import type { Notif } from "../lib/settings";
@@ -833,7 +833,6 @@
       .filter(({ m }) => m.from === "them" && !m.read)
       .slice(0, 20);
     if (unread.length === 0 && !hadAppNotifs) return;
-    const others = withoutAppNotifs(existing, "messages", ALL_LABEL_DICTS);
     const fresh: Notif[] = unread.map(({ cid, m }) => ({
       id: messageNotifKey(cid, m.ts),
       app,
@@ -841,7 +840,7 @@
       title: m.text.length > 40 ? `${m.text.slice(0, 40)}…` : m.text,
       time: m.ts,
     }));
-    writeStoreValue(NOTIF_KEY, [...others, ...fresh]);
+    writeStoreValue(NOTIF_KEY, replaceAppNotifs(existing, "messages", fresh, ALL_LABEL_DICTS));
   });
 
   const send = () => {

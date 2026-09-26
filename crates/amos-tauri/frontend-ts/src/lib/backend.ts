@@ -384,7 +384,10 @@ export interface AiBackendSwitchOpts {
 }
 
 /** One-click backend switch (local Ollama | OpenAI | DeepSeek | custom cloud).
- * Returns the daemon launch report. No-op (null) when not running inside Tauri. */
+ * Returns the daemon launch report. `null` means *either* "not running inside
+ * Tauri" *or* "the command answered `Err`" — `invoke` catches the error envelope
+ * and folds both into `null`, so callers must ask `bridgeDiag("ai_backend_switch")`
+ * before treating `null` as success. */
 export async function switchAiBackend(
   provider: AiProviderId,
   opts: AiBackendSwitchOpts = {},

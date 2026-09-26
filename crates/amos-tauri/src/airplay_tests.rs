@@ -195,19 +195,10 @@ mod tests {
         // Only check devices if discovery succeeded
         match result {
             AirPlayResult::Ok => {
-                let devices = manager.get_devices();
-
-                #[cfg(debug_assertions)]
-                {
-                    // In debug mode, should return demo devices
-                    assert_eq!(devices.len(), 3);
-                }
-
-                #[cfg(not(debug_assertions))]
-                {
-                    // In release mode, may be empty or contain real devices
-                    let _ = devices;
-                }
+                // Discovery reports only what the platform enumerated: an empty list is the
+                // honest answer when no receiver was heard. (The old assert_eq!(len, 3) here
+                // pinned the fabricated demo devices REQ-A1945 ∕ F-SH-941 removed.)
+                let _ = manager.get_devices();
             }
             AirPlayResult::Failed { .. } => {
                 // On macOS/iOS test environment, discovery may fail (not on main thread)
@@ -234,19 +225,23 @@ mod tests {
         }
     }
 
+    /// REQ-A1936: this test used to pin the defect — it accepted `Ok` with the comment
+    /// "Disconnect succeeded even when not connected (idempotent)", while `connect` refused.
+    /// There is no receiver behind the operation, so "disconnected" is a report about a
+    /// connection that never existed. It now refuses like its siblings.
     #[test]
-    fn test_manager_disconnect_not_connected() {
+    fn test_manager_disconnect_refuses() {
         let mut manager = AirPlayManager::new();
         let result = manager.disconnect();
 
         match result {
-            AirPlayResult::Ok => {
-                // Disconnect succeeded even when not connected (idempotent)
+            AirPlayResult::NotImplemented { reason } => {
+                assert!(!reason.is_empty(), "a refusal must explain itself");
             }
             AirPlayResult::Unavailable { .. } => {
                 // Platform doesn't support AirPlay
             }
-            _ => panic!("Unexpected result from disconnect"),
+            other => panic!("Expected NotImplemented or Unavailable, got {other:?}"),
         }
     }
 
@@ -322,16 +317,19 @@ mod tests {
         }
     }
 
+    /// REQ-A1936: sibling of `test_manager_disconnect_refuses` — this one accepted `Ok` with
+    /// "Should succeed (idempotent)" while `start_stream` refused. Nothing was told to stop.
     #[test]
-    fn test_stop_stream_no_active_stream() {
+    fn test_stop_stream_refuses() {
         let mut manager = AirPlayManager::new();
         let result = manager.stop_stream();
 
-        // Should succeed (idempotent)
         match result {
-            AirPlayResult::Ok => (),
+            AirPlayResult::NotImplemented { reason } => {
+                assert!(!reason.is_empty(), "a refusal must explain itself");
+            }
             AirPlayResult::Unavailable { .. } => (),
-            _ => panic!("Expected Ok or Unavailable"),
+            other => panic!("Expected NotImplemented or Unavailable, got {other:?}"),
         }
     }
 }

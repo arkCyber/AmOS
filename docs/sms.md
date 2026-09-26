@@ -140,7 +140,7 @@ Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就�
 | 层 | 实现 |
 |---|---|
 | 域 `crates/amos-blocklist`（新增） | `Rule{pattern, kind∈exact\|prefix, channel∈call\|sms\|both, label}` + `Blocklist`：号码规范化（`+`/分隔符/`00`/前导 0）、**同号等价匹配**（`+8618616091470` ≡ `18616091470` ≡ `8618616091470` ≡ `0086…`，只允许丢弃 1–3 位前导国家码，绝不误并无关号码）、前缀规则最短 3 位、未知/隐藏号码开关、一地址一条去重、上限 500（超限淘汰最旧）、JSON 往返且**不信任**损坏文件（版本/非法规则/超限 → 诚实报错） |
-| Rust 桥 `amos-tauri/src/blocklist.rs` | 进程级共享状态（命令 / SMS 过滤 / JNI 三处共用）；命令 `blocklist_snapshot/add/remove/clear/set_unknown/check`；持久化到 `app_data_dir/blocklist.json`（临时文件 + rename 原子写；损坏文件记日志后以空表启动，不崩） |
+| Rust 桥 `amos-tauri/src/blocklist.rs` | 进程级共享状态（命令 / SMS 过滤 / JNI 三处共用）；命令 `blocklist_snapshot/add/remove/clear/set_unknown/check`；持久化到 `app_data_dir/blocklist.json`（临时文件 + rename 原子写；损坏 ∕ 读不回来的文件**记日志 + 移作 `<name>.corrupt-<nonce>` 旁存**后以空表启动，不崩 —— 因为 `persist()` 会在下一次编辑时重写该路径，留在原地就等于让那一次编辑毁掉运维唯一的一份规则；REQ-A1937 / F-SH-935） |
 | **短信执法** | `sms_snapshot` 过滤被屏蔽发件人（带 `hidden` 计数日志）；`sms_messages(threadId, folder, address)` 命中规则即拒绝（诚实报错并指出规则）；**实时收信**在 JNI upcall 里先查黑名单，命中则**不发事件**（不通知、不刷新）；文档明确边界：系统短信库由默认短信应用拥有，AmOS 无法删除行 |
 | **来电执法** | Kotlin `AmosCallScreeningService`（`CallScreeningService` + 清单声明 `BIND_SCREENING_SERVICE`）对每个来电询问 Rust（JNI `BlocklistGlue.shouldBlockCall`），命中则 `disallowCall+rejectCall+skipNotification` —— **系统级拒接**；`BlocklistGlue` 自身可 `configure(filesDir)`，因为系统可能为一次来电冷启动进程。原生不可用时**失败开放**（不静默拦截所有来电） |
 | 权限/角色 | 来电拦截需系统 `ROLE_CALL_SCREENING`：`BlocklistGlue.requestScreeningRoleIfNeeded` 在「存在来电规则且未授权」时于启动后请求（系统弹窗）；`AmosGlue.onStart` 调用 |

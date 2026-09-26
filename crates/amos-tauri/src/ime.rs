@@ -289,6 +289,43 @@ fn remove_staging(tmp: &Path) {
     }
 }
 
+/// Move a profile that **exists but cannot be read back** out of the way, so the next
+/// [`ImeBridge::persist`] writes a fresh profile beside it rather than over the one copy
+/// of the user's learned words and fuzzy preferences.
+///
+/// `rename` is a directory operation, so it still succeeds when the file's *contents* are
+/// unreadable. Answers `None` when there is nothing to move (no regular file) or the rename
+/// was refused (read-only directory); the caller says which in its warning.
+fn preserve_unreadable_state(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
+}
+
+/// Log a profile that is present but unusable, keeping its bytes aside. The two warnings
+/// name *which* happened: kept under a `corrupt-*` sibling, or could not be moved.
+fn keep_profile_aside(path: &Path, reason: &str) {
+    match preserve_unreadable_state(path) {
+        Some(kept) => tracing::warn!(
+            target: "amos::ime",
+            path = %path.display(),
+            kept = %kept.display(),
+            "IME profile {reason}; kept beside the original and keeping defaults"
+        ),
+        None => tracing::warn!(
+            target: "amos::ime",
+            path = %path.display(),
+            "IME profile {reason}; could not be moved aside, keeping defaults"
+        ),
+    }
+}
+
 /// Build the serializable state from one window's session + the shared core.
 ///
 /// **One candidate list, two sources** (REQ-A260): while a code is being composed
@@ -418,9 +455,12 @@ impl ImeBridge {
         }
     }
 
-    /// Point the bridge at its profile file and load it (once per path). A missing
-    /// file is a first run; a corrupt/unreadable one is logged and the defaults are
-    /// kept — never a silent reset of preferences the user can see, never a crash.
+    /// Point the bridge at its profile file and load it (once per path). Three outcomes,
+    /// not two: an **absent** file is a first run; a file that is **present but
+    /// unreadable** (corrupt / truncated / non-UTF-8 / permission, or a *newer* schema
+    /// this build cannot parse) is **moved aside** as `<name>.corrupt-<nonce>` before the
+    /// defaults are kept, so the next [`Self::persist`] — a whole-file tmp+rename — writes
+    /// a fresh profile beside it instead of over the user's learned words (REQ-A1933).
     pub fn configure(&self, path: PathBuf) {
         let mut inner = self.lock();
         if inner.path.as_deref() == Some(path.as_path()) {
@@ -429,7 +469,12 @@ impl ImeBridge {
         inner.path = Some(path.clone());
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(_) => return, // no profile yet — first run
+            // No file yet is the ordinary first run, not an incident.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                keep_profile_aside(&path, &format!("could not be read: {e}"));
+                return;
+            }
         };
         match ImeProfile::from_json(&text) {
             Ok(profile) => {
@@ -442,12 +487,7 @@ impl ImeBridge {
                     "IME profile loaded"
                 );
             }
-            Err(e) => tracing::warn!(
-                target: "amos::ime",
-                path = %path.display(),
-                error = %e,
-                "IME profile unreadable — keeping defaults"
-            ),
+            Err(e) => keep_profile_aside(&path, &format!("is unreadable: {e}")),
         }
     }
 
@@ -1787,6 +1827,107 @@ mod tests {
         let s = b.snapshot(MAIN);
         assert!(s.strict, "a corrupt file cannot conjure preferences");
         assert_eq!(s.learned_pins, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `corrupt-*` sibling of a profile, if the fix moved one aside.
+    fn corrupt_aside(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("corrupt-"))
+            })
+    }
+
+    /// F-SH-933 (REQ-A1933): a profile that exists but cannot be parsed is **moved
+    /// aside**, not silently kept-as-defaults while the path stays live — every later
+    /// keystroke that persists (a toggle, a learned pin) would otherwise rewrite the one
+    /// copy of the user's learned words with the defaults. Before the fix `configure`
+    /// only warned and kept the path, so the next toggle clobbered the file.
+    #[test]
+    fn a_corrupt_profile_is_kept_aside_before_the_next_write_overwrites_it() {
+        let dir = temp_dir("kept-aside");
+        let path = file_in(&dir);
+        std::fs::write(&path, "{ this is not json").expect("write junk");
+
+        let b = ImeBridge::boot();
+        b.configure(path.clone());
+        assert!(b.snapshot(MAIN).strict, "defaults are kept, not faked");
+        assert!(
+            !path.exists(),
+            "the unreadable profile must be moved aside, not left to be overwritten"
+        );
+        let kept = corrupt_aside(&dir).expect("the unreadable profile was kept under corrupt-*");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{ this is not json",
+            "the user's original bytes survive intact"
+        );
+
+        // A later write publishes a fresh profile at the original path — beside, not over.
+        learn(&b, "shi", "时");
+        assert!(
+            path.exists(),
+            "a fresh profile is written at the original path"
+        );
+        assert!(kept.exists(), "and the preserved bytes are still there");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{ this is not json",
+            "the fresh write did not touch the preserved bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control: a **readable** profile is loaded in place and is **not** moved
+    /// aside (the fix must not rename healthy files). Applying the aside unconditionally
+    /// makes this fail.
+    #[test]
+    fn a_readable_profile_is_loaded_without_being_moved_aside() {
+        let dir = temp_dir("readable");
+        let path = file_in(&dir);
+
+        let writer = ImeBridge::boot();
+        writer.configure(path.clone()); // absent → silent first run
+        learn(&writer, "shi", "时");
+        assert!(path.exists(), "the write created the file");
+
+        let reader = ImeBridge::boot();
+        reader.configure(path.clone());
+        assert_eq!(
+            reader.snapshot(MAIN).learned_pins,
+            1,
+            "the readable file loads"
+        );
+        assert!(path.exists(), "a readable profile is left where it is");
+        assert!(
+            corrupt_aside(&dir).is_none(),
+            "a readable profile must not be moved aside"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The disjoint control: an **absent** file is the ordinary first run — nothing is
+    /// moved aside, nothing is invented, and the path stays usable for the first write.
+    #[test]
+    fn a_missing_profile_keeps_nothing_aside() {
+        let dir = temp_dir("missing");
+        let path = file_in(&dir);
+
+        let b = ImeBridge::boot();
+        b.configure(path.clone());
+        assert!(b.snapshot(MAIN).strict);
+        assert!(!path.exists(), "no file is invented");
+        assert!(
+            corrupt_aside(&dir).is_none(),
+            "a first run has nothing to move aside"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -427,6 +427,25 @@ export function pageCandidates<T>(items: readonly T[], page: number): T[] {
 }
 
 /**
+ * The index a Backspace should delete back to: `index - 1`, or `index - 2` when
+ * the preceding code unit is the **low half of a surrogate pair**. Deleting one
+ * UTF-16 code unit there would cut a single character in half and leave a lone
+ * high surrogate in the field — a broken string the host then stores (JSON
+ * round-trips a lone surrogate). One Backspace removes one *character*.
+ *
+ * The mirror of the guard `insertTextAtCursor` applies at its truncation boundary
+ * (REQ-A1931 ∕ F-SH-931). `charCodeAt` of an out-of-range index is `NaN`, so both
+ * comparisons are false at the start of the value and this answers `index - 1`.
+ */
+function codeUnitStartBefore(value: string, index: number): number {
+  const lo = value.charCodeAt(index - 1);
+  const hi = value.charCodeAt(index - 2);
+  const isLowHalf = lo >= 0xdc00 && lo <= 0xdfff;
+  const isHighHalf = hi >= 0xd800 && hi <= 0xdbff;
+  return isLowHalf && isHighHalf ? index - 2 : index - 1;
+}
+
+/**
  * Delete the character before the caret (or the current selection) and notify the
  * host the way a real Backspace would. Returns `false` when there was nothing to
  * delete — an empty field is not a failure the caller should report, but it must
@@ -435,6 +454,11 @@ export function pageCandidates<T>(items: readonly T[], page: number): T[] {
  * A field type with no caret at all (`email`/`number`/… report `null` for
  * `selectionStart`) has exactly one honest position — the end — so Backspace
  * deletes the last character there instead of silently doing nothing.
+ *
+ * "One character" is one **code point**, not one code unit: a non-BMP glyph (an
+ * emoji) is two code units, and deleting only the low half leaves a lone surrogate
+ * behind — the same hazard `insertTextAtCursor` refuses at the truncation boundary
+ * (REQ-A1931 ∕ F-SH-931).
  */
 export function deleteBeforeCaret(
   field: HTMLInputElement | HTMLTextAreaElement,
@@ -446,12 +470,12 @@ export function deleteBeforeCaret(
   let to: number;
   if (start === null || end === null) {
     to = value.length;
-    from = Math.max(0, to - 1);
+    from = Math.max(0, codeUnitStartBefore(value, to));
   } else if (start !== end) {
     from = start;
     to = end; // a selection is what Backspace deletes
   } else {
-    from = Math.max(0, start - 1);
+    from = Math.max(0, codeUnitStartBefore(value, start));
     to = start;
   }
   const next = value.slice(0, from) + value.slice(to);

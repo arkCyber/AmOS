@@ -16,7 +16,7 @@
     type AiProviderId,
   } from "../../lib/providers";
   import { describeEngine, isRealEngine, type EngineView } from "../../lib/aiEngine";
-  import { bridged, getAiStatus, switchAiBackend } from "../../lib/backend";
+  import { bridgeDiag, bridged, getAiStatus, switchAiBackend } from "../../lib/backend";
   import {
     clearDiag,
     clockOf,
@@ -81,6 +81,12 @@
   let aiMsg = $state("");
   /** The store refused the settings write — the save did not happen (REQ-A1379). */
   let storeErr = $state("");
+  /**
+   * The write landed but `ai_backend_switch` answered `Err` — the settings were
+   * saved, yet the live backend did not restart (REQ-A1942). A success sentence
+   * here would bury the reason, which is why this is its own line.
+   */
+  let aiSwitchErr = $state("");
   let aiLive = $state<string | null>(null);
   let aiView = $state<EngineView>(describeEngine(null));
 
@@ -207,13 +213,26 @@
       return;
     }
     storeErr = "";
+    aiSwitchErr = "";
     if (bridged()) {
       void switchAiBackend(cfg.provider, {
         model: cfg.model,
         endpoint: cfg.endpoint,
         apiKey: cfg.apiKey,
       }).then((report) => {
-        aiMsg = report ? `${t("settings.aiApplied")}: ${report}` : t("settings.aiSaved");
+        // `invoke` answers `null` for two different reasons: "not in Tauri" (excluded
+        // by the `bridged()` guard above) and "the command answered `Err`" (it catches
+        // the `AmosError` envelope, records it in the diagnostics ring and returns
+        // `null`). The second is a real failure whose reason — e.g. "openai requires an
+        // API key" — lives only in the ring, so reading `null` as success printed
+        // 「已保存」 in the success colour over a backend that never restarted. Ask the
+        // ledger which of the two happened, as the other bridge callers here do.
+        if (report === null && !bridgeDiag("ai_backend_switch").ok) {
+          aiMsg = "";
+          aiSwitchErr = t("settings.aiSwitchFailed");
+        } else {
+          aiMsg = report ? `${t("settings.aiApplied")}: ${report}` : t("settings.aiSaved");
+        }
         getAiStatus().then((s) => {
           const m = s?.model && s.model.trim() ? s.model : "offline";
           aiLive = m;
@@ -283,6 +302,11 @@
   <StoreErrorBar message={storeErr} />
   {#if aiMsg}
     <p role="status" class="mt-2 text-[11px] text-accent">{aiMsg}</p>
+  {/if}
+  {#if aiSwitchErr}
+    <p data-testid="ai-switch-error" role="status" class="mt-2 text-[11px] text-danger">
+      {aiSwitchErr}
+    </p>
   {/if}
   <p class="mt-1 text-[11px] opacity-60">{t("settings.aiCurrent", { model: aiLive ?? "—" })}</p>
   {#if probeStamp}

@@ -289,6 +289,33 @@ fn persist_cloud_key_reporting(path: Option<&std::path::Path>, key: &str) -> Opt
     }
 }
 
+/// Load the saved cloud key from `path`, reporting a file that is **present but
+/// unreadable** instead of folding it into "no key saved yet".
+///
+/// The two are different facts and only one is benign. A missing file is a first run (or a
+/// key that was never persisted — reported at the point that happened by
+/// [`persist_cloud_key_reporting`]). A file that *exists* and cannot be read — permissions, a
+/// non-UTF-8 encoding, an I/O error — is a credential the operator believes is saved and
+/// that this switch does **not** use: answering both with an empty string launched the
+/// daemon with no key and still reported the switch as a success, which is exactly the
+/// "success message that is quietly wrong" `persist_warning` exists to prevent, one input
+/// over. The returned warning is folded into that same report.
+fn read_cloud_key_reporting(path: &std::path::Path) -> (String, Option<String>) {
+    match std::fs::read_to_string(path) {
+        // No file yet: a first run, or a persist that already reported itself.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
+        Err(e) => (
+            String::new(),
+            Some(format!(
+                "⚠ the saved cloud key at {} could not be read ({e}) — this switch runs with \
+                 NO key; re-enter it, or fix the file",
+                path.display()
+            )),
+        ),
+        Ok(s) => (s.trim().to_string(), None),
+    }
+}
+
 /// One-click backend switch: runs `scripts/ai-backend.sh` which stops the current
 /// amos-ai and starts it with the selected provider (local Ollama | OpenAI |
 /// DeepSeek | custom OpenAI-compatible endpoint). `model`/`endpoint` carry the
@@ -361,13 +388,17 @@ pub async fn ai_backend_switch(
         // A credential that failed to persist (or could not be restricted to 0600) must be
         // visible in the command's report; see `persist_cloud_key_reporting`.
         let mut persist_warning: Option<String> = None;
+        // A *saved* credential that cannot be read back is the same silence on the read side
+        // (the switch would otherwise succeed while running with no key at all); see
+        // `read_cloud_key_reporting`.
+        let mut read_warning: Option<String> = None;
         if cloud {
             if !effective.is_empty() {
                 persist_warning = persist_cloud_key_reporting(cred.as_deref(), &effective);
             } else if let Some(path) = cred {
-                if let Ok(s) = std::fs::read_to_string(&path) {
-                    effective = s.trim().to_string();
-                }
+                let (key, warn) = read_cloud_key_reporting(&path);
+                effective = key;
+                read_warning = warn;
             }
         }
 
@@ -388,12 +419,23 @@ pub async fn ai_backend_switch(
             }
         }
         let out = cmd.output();
-        // `persist_warning` is folded into whichever report the command returns: the user
-        // sees the daemon launch report *and* the fact that the key was not saved (or not
-        // restricted), instead of a success message that is quietly wrong.
-        let with_warning = |report: String| match &persist_warning {
-            Some(w) => format!("{report}\n{w}"),
-            None => report,
+        // Either key warning (the persist half, or the read half) is folded into whichever
+        // report the command returns: the user sees the daemon launch report *and* the fact
+        // that the key was not saved (or not restricted, or not readable), instead of a
+        // success message that is quietly wrong. The two are mutually exclusive by
+        // construction — the persist branch runs only when `effective` is non-empty, the
+        // read branch only when it is empty — but folding both costs nothing and keeps the
+        // invariant local to this closure.
+        let with_warning = |report: String| {
+            let mut out = report;
+            for w in [persist_warning.as_deref(), read_warning.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                out.push('\n');
+                out.push_str(w);
+            }
+            out
         };
         match out {
             Ok(o) => {
@@ -1404,7 +1446,7 @@ pub async fn android_lmk_tasks(
 mod tests {
     use super::{
         codes, legacy_surface_label, merge_system_selection, persist_cloud_key,
-        persist_cloud_key_reporting, status_from_reply,
+        persist_cloud_key_reporting, read_cloud_key_reporting, status_from_reply,
     };
     use crate::clipboard::GlobalClipboard;
     use crate::rag_client;
@@ -1518,6 +1560,57 @@ mod tests {
         let none = persist_cloud_key_reporting(None, "sk-secret").expect("warning");
         assert!(none.contains("NOT persisted"), "{none}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The **read** half of the same silence (REQ-A1938's sibling): a key file that exists but
+    /// cannot be read is the same "success message that is quietly wrong" as a write that never
+    /// landed. The switch would run the daemon with no key and report success.
+    #[test]
+    fn a_present_but_unreadable_cloud_key_is_reported_not_silently_dropped() {
+        let dir =
+            std::env::temp_dir().join(format!("amos-creds-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ai.key");
+        // Present, but not valid UTF-8: `read_to_string` fails with `InvalidData`, which is
+        // *not* `NotFound` and must therefore not be folded into "no key saved yet".
+        std::fs::write(&path, [0x80u8, 0xff, 0xfe, 0x00]).unwrap();
+
+        let (key, warn) = read_cloud_key_reporting(&path);
+        assert_eq!(key, "", "an unreadable file must not yield a key");
+        let warn = warn.expect("a present-but-unreadable key file must produce a warning");
+        assert!(
+            warn.starts_with('⚠') && warn.contains(&path.display().to_string()),
+            "the warning must name the file: {warn}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_readable_cloud_key_is_loaded_without_a_warning() {
+        let dir = std::env::temp_dir().join(format!("amos-creds-readable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ai.key");
+        std::fs::write(&path, "  sk-saved  \n").unwrap();
+
+        let (key, warn) = read_cloud_key_reporting(&path);
+        assert_eq!(key, "sk-saved", "the saved key is loaded, trimmed");
+        assert!(warn.is_none(), "a good read must stay silent: {warn:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Disjoint from the red-first test: a genuinely *absent* file is a first run, not a
+    /// credential failure. Only the missing-file case may be silent.
+    #[test]
+    fn a_missing_cloud_key_file_is_silent() {
+        let dir = std::env::temp_dir().join(format!("amos-creds-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("never-written.key");
+
+        let (key, warn) = read_cloud_key_reporting(&path);
+        assert_eq!(key, "");
+        assert!(warn.is_none(), "no file yet is a first run: {warn:?}");
     }
 
     /// The AI bridge commands now return `AmosError`. The wire vocabulary

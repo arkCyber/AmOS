@@ -405,30 +405,116 @@ fn reported_embedders() -> &'static Mutex<std::collections::BTreeSet<String>> {
     REPORTED.get_or_init(Default::default)
 }
 
+/// One environment variable's outcome, keeping **never set** apart from **set but
+/// unusable** — the distinction every reader in this crate must preserve, so an
+/// operator's discarded choice is never folded into the silent default
+/// (REQ-A1934 / F-AI-036).
+enum EnvRead {
+    /// The operator never set it: take the documented default **silently**.
+    Absent,
+    /// The operator set a usable value, already trimmed.
+    Usable(String),
+    /// The operator set a value that cannot be used — not valid Unicode, or blank.
+    /// The `&'static str` is why, for the report.
+    Unusable(&'static str),
+}
+
+/// Classify one raw env value. **Pure** — it takes the `OsString` rather than
+/// reading the environment — so the non-Unicode and blank arms are both reachable
+/// in a test, where a process can only hold one value per key at a time.
+fn classify_env(raw: Option<std::ffi::OsString>) -> EnvRead {
+    let Some(raw) = raw else {
+        return EnvRead::Absent;
+    };
+    match raw.to_str() {
+        None => EnvRead::Unusable("is not valid Unicode"),
+        Some(s) if s.trim().is_empty() => EnvRead::Unusable("is blank"),
+        Some(s) => EnvRead::Usable(s.trim().to_owned()),
+    }
+}
+
+/// Read `key`, or take `default`. A value the operator *did* set that is unusable
+/// is reported once, then the default applies — so a blank or mojibake host/base
+/// URL cannot silently select a backend the operator did not ask for while looking
+/// like the ordinary unset case (REQ-A1934 / F-AI-036).
+fn env_or_default(key: &str, default: &str) -> String {
+    match classify_env(std::env::var_os(key)) {
+        EnvRead::Absent => default.to_owned(),
+        EnvRead::Usable(value) => value,
+        EnvRead::Unusable(why) => {
+            warn_once_unusable(key, why);
+            default.to_owned()
+        }
+    }
+}
+
+/// Read an optional `key` that has no default (a bearer/token). Absent and
+/// unusable both answer `None`, but only the absent case is silent: a value the
+/// operator set that cannot be used is reported, so a mis-set token does not read
+/// as "no token configured" (REQ-A1934 / F-AI-036).
+fn optional_env(key: &str) -> Option<String> {
+    match classify_env(std::env::var_os(key)) {
+        EnvRead::Absent => None,
+        EnvRead::Usable(value) => Some(value),
+        EnvRead::Unusable(why) => {
+            warn_once_unusable(key, why);
+            None
+        }
+    }
+}
+
+/// Report a set-but-unusable value at WARN **once per (key, reason) per process**.
+/// The dedup matches [`report_unrecognised_embedder`] and for the same reason:
+/// [`embedder_from_env`] runs again on a state-load fallback, so an un-deduped
+/// warning would repeat the same line for one operator mistake.
+fn warn_once_unusable(key: &str, why: &'static str) {
+    let first = unusable_reported()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((key.to_owned(), why));
+    if first {
+        tracing::warn!(
+            env = key,
+            why,
+            "amos-ai rag: environment value {why} — the documented default applies \
+             (a truly unset variable is silent)"
+        );
+    }
+}
+
+fn unusable_reported() -> &'static Mutex<std::collections::BTreeSet<(String, &'static str)>> {
+    static REPORTED: std::sync::OnceLock<
+        Mutex<std::collections::BTreeSet<(String, &'static str)>>,
+    > = std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
 /// Build the embedder named by [`embedder_choice`]. `mock` → a fixed-dim
 /// `MockEmbedder`; `ollama` → the real local Ollama adapter (old `/api/embeddings`
 /// or new `/api/embed`); `api` → a cloud OpenAI-compatible `/embeddings`. An
 /// invalid **dimension** is an honest error (never a panic); an unrecognised
 /// *backend* keeps the offline `mock` default and is reported once rather than
 /// folded into silence (REQ-A1923 / F-AI-031).
+///
+/// The host / base / model / key knobs go through [`env_or_default`] /
+/// [`optional_env`], so a value the operator *set* that is blank or not valid
+/// Unicode is reported rather than folded into the silent unset default
+/// (REQ-A1934 / F-AI-036).
 fn embedder_from_env() -> Result<Box<dyn Embedder + Send>, String> {
     match embedder_choice() {
         "ollama" => {
-            let host =
-                std::env::var(OLLAMA_HOST_ENV).unwrap_or_else(|_| "http://localhost:11434".into());
-            let model = std::env::var(EMBED_MODEL_ENV).unwrap_or_else(|_| "bge-m3".into());
-            let bearer = std::env::var(OLLAMA_KEY_ENV).ok().filter(|k| !k.is_empty());
+            let host = env_or_default(OLLAMA_HOST_ENV, "http://localhost:11434");
+            let model = env_or_default(EMBED_MODEL_ENV, "bge-m3");
+            let bearer = optional_env(OLLAMA_KEY_ENV);
             Ok(
                 Box::new(OllamaEmbedder::new(host, model).with_bearer(bearer))
                     as Box<dyn Embedder + Send>,
             )
         }
         "api" => {
-            let base = std::env::var(CLOUD_BASE_ENV)
-                .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-            let model =
-                std::env::var(EMBED_MODEL_ENV).unwrap_or_else(|_| "text-embedding-3-small".into());
-            let key = std::env::var(API_KEY_ENV).unwrap_or_default();
+            let base = env_or_default(CLOUD_BASE_ENV, "https://api.openai.com/v1");
+            let model = env_or_default(EMBED_MODEL_ENV, "text-embedding-3-small");
+            let key = env_or_default(API_KEY_ENV, "");
             Ok(Box::new(ApiEmbedder::new(base, key, model)) as Box<dyn Embedder + Send>)
         }
         _ => {
@@ -945,6 +1031,137 @@ mod tests {
         std::env::set_var(STATE_ENV, std::ffi::OsStr::from_bytes(b"/tmp/\xff.idx"));
         let (persist, warns) = warns_of(Persist::from_env);
         assert!(persist.is_none());
+        assert_eq!(
+            warns, 1,
+            "a present-but-unreadable value must not read as `absent`"
+        );
+    }
+
+    // --- F-AI-036 (REQ-A1934): the embedder knobs keep "absent" apart from "blank"/"unreadable" ---
+    //
+    // `env_or_default` / `optional_env` are the readers `embedder_from_env` uses for the
+    // host / base / model / key knobs. Each arm lands on a *distinct* key so the report's
+    // per-(key, reason) dedup cannot make one test hide another's warning.
+
+    #[test]
+    fn classify_env_keeps_absent_apart_from_set_but_unusable() {
+        // Pure: no environment is touched, so both unusable arms are reachable here even
+        // though a test process can only hold one value per key at a time.
+        assert!(
+            matches!(classify_env(None), EnvRead::Absent),
+            "never set is the only silent state"
+        );
+        assert!(
+            matches!(
+                classify_env(Some(std::ffi::OsString::from("  http://x  "))),
+                EnvRead::Usable(v) if v == "http://x"
+            ),
+            "a usable value is trimmed"
+        );
+        assert!(
+            matches!(
+                classify_env(Some(std::ffi::OsString::from("   "))),
+                EnvRead::Unusable(_)
+            ),
+            "whitespace-only is set-but-unusable, not absent"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"h\xffst").to_os_string();
+            assert!(
+                matches!(classify_env(Some(raw)), EnvRead::Unusable(_)),
+                "a non-Unicode value is set-but-unusable, not absent"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_knob_env_lock)]
+    fn a_blank_embedder_host_is_reported_not_silently_defaulted() {
+        let mut env = EnvGuard::wipe(OLLAMA_HOST_ENV);
+        env.set("");
+        let (host, warns) = warns_of(|| env_or_default(OLLAMA_HOST_ENV, "http://localhost:11434"));
+        assert_eq!(
+            host, "http://localhost:11434",
+            "a blank value cannot be a host"
+        );
+        assert_eq!(
+            warns, 1,
+            "the operator set AMOS_OLLAMA_HOST and it was discarded — that must be reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_knob_env_lock)]
+    fn an_unset_embedder_host_stays_silent_and_defaults() {
+        let _env = EnvGuard::wipe(OLLAMA_HOST_ENV);
+        let (host, warns) = warns_of(|| env_or_default(OLLAMA_HOST_ENV, "http://localhost:11434"));
+        assert_eq!(host, "http://localhost:11434");
+        assert_eq!(warns, 0, "a genuinely absent variable is the silent case");
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_knob_env_lock)]
+    fn a_usable_cloud_base_is_trimmed_without_a_warning() {
+        let mut env = EnvGuard::wipe(CLOUD_BASE_ENV);
+        env.set("  https://api.example.com/v1  ");
+        let (base, warns) =
+            warns_of(|| env_or_default(CLOUD_BASE_ENV, "https://api.openai.com/v1"));
+        assert_eq!(base, "https://api.example.com/v1");
+        assert_eq!(warns, 0, "a usable base URL must not warn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(rag_embedder_knob_env_lock)]
+    fn a_non_unicode_cloud_base_is_reported_not_silently_defaulted() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = EnvGuard::wipe(CLOUD_BASE_ENV);
+        std::env::set_var(
+            CLOUD_BASE_ENV,
+            std::ffi::OsStr::from_bytes(b"https://x/\xff/v1"),
+        );
+        let (base, warns) =
+            warns_of(|| env_or_default(CLOUD_BASE_ENV, "https://api.openai.com/v1"));
+        assert_eq!(base, "https://api.openai.com/v1");
+        assert_eq!(
+            warns, 1,
+            "a present-but-unreadable value must not read as `absent`"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_knob_env_lock)]
+    fn a_blank_ollama_bearer_is_reported_not_silently_dropped() {
+        let mut env = EnvGuard::wipe(OLLAMA_KEY_ENV);
+        env.set("   ");
+        let (bearer, warns) = warns_of(|| optional_env(OLLAMA_KEY_ENV));
+        assert!(bearer.is_none(), "a blank token cannot be sent");
+        assert_eq!(
+            warns, 1,
+            "the operator set AMOS_OLLAMA_API_KEY and it was discarded — that must be reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rag_embedder_knob_env_lock)]
+    fn an_unset_ollama_bearer_stays_silent() {
+        let _env = EnvGuard::wipe(OLLAMA_KEY_ENV);
+        let (bearer, warns) = warns_of(|| optional_env(OLLAMA_KEY_ENV));
+        assert!(bearer.is_none());
+        assert_eq!(warns, 0, "a genuinely absent variable is the silent case");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(rag_embedder_knob_env_lock)]
+    fn a_non_unicode_api_key_is_reported_not_silently_empty() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = EnvGuard::wipe(API_KEY_ENV);
+        std::env::set_var(API_KEY_ENV, std::ffi::OsStr::from_bytes(b"sk-\xff"));
+        let (key, warns) = warns_of(|| env_or_default(API_KEY_ENV, ""));
+        assert_eq!(key, "", "an unreadable key cannot be a bearer");
         assert_eq!(
             warns, 1,
             "a present-but-unreadable value must not read as `absent`"

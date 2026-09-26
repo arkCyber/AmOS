@@ -107,26 +107,48 @@ impl Default for BreakerConfig {
     }
 }
 
+const ENABLED_ENV: &str = "AMOS_BREAKER";
+const FAILS_ENV: &str = "AMOS_BREAKER_FAILS";
+const COOLDOWN_ENV: &str = "AMOS_BREAKER_COOLDOWN_SECS";
+
+/// Read a numeric knob. Absence is the only silent state; a value that is present
+/// but not valid Unicode is reported once and takes the documented default. An
+/// unparseable or sub-minimum value also takes that default (documented in
+/// [`BreakerConfig::from_env`]) — safe, because the default is never a nonsense
+/// threshold.
+fn numeric_env(key: &str) -> Option<String> {
+    let raw = std::env::var_os(key)?;
+    match raw.to_str() {
+        Some(s) => Some(s.to_owned()),
+        None => {
+            tracing::warn!(
+                key,
+                "amos-ai breaker: value is not valid Unicode — using the documented default"
+            );
+            None
+        }
+    }
+}
+
 impl BreakerConfig {
-    /// `AMOS_BREAKER` (`0`/`false`/`off`/`no` disables), `AMOS_BREAKER_FAILS` (>=1),
-    /// `AMOS_BREAKER_COOLDOWN_SECS` (>=1). Unparseable or zero values fall back to the
-    /// documented default rather than to a nonsense threshold.
+    /// `AMOS_BREAKER` (`0`/`false`/`off`/`no` disables; `1`/`true`/`yes`/`on` enables),
+    /// `AMOS_BREAKER_FAILS` (>=1), `AMOS_BREAKER_COOLDOWN_SECS` (>=1). Unparseable or
+    /// zero values fall back to the documented default rather than to a nonsense
+    /// threshold.
+    ///
+    /// A value that is present but outside both known sets — a typo, a blank, or a
+    /// non-Unicode byte string — is **not** silently folded into "unset": it is
+    /// reported once at WARN and the safe default (enabled) applies. The previous
+    /// reader took *any* `Ok` value that was not one of the four disable tokens as
+    /// "enabled", so `AMOS_BREAKER=flase` left the breaker armed without a word.
     pub fn from_env() -> Self {
         let d = Self::default();
-        let enabled = match std::env::var("AMOS_BREAKER") {
-            Ok(v) => {
-                let v = v.trim().to_lowercase();
-                !(v == "0" || v == "false" || v == "off" || v == "no")
-            }
-            Err(_) => d.enabled,
-        };
-        let fail_threshold = std::env::var("AMOS_BREAKER_FAILS")
-            .ok()
+        let enabled = crate::energy::env_flag(ENABLED_ENV).unwrap_or(d.enabled);
+        let fail_threshold = numeric_env(FAILS_ENV)
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|n| *n >= 1)
             .unwrap_or(d.fail_threshold);
-        let cooldown = std::env::var("AMOS_BREAKER_COOLDOWN_SECS")
-            .ok()
+        let cooldown = numeric_env(COOLDOWN_ENV)
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|n| *n >= 1)
             .map(Duration::from_secs)
@@ -742,5 +764,153 @@ mod tests {
             "every call reached the backend"
         );
         assert_eq!(lock(&br).state(), BreakerState::Closed);
+    }
+
+    // --- F-AI-035 (REQ-A1932): "unset" and "set but unrecognised" stay apart ---
+
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    /// Counts WARN events on this thread (via `set_default`), so an assertion lands
+    /// on the operator's only view of a discarded flag rather than on a restatement
+    /// of the code.
+    struct WarnProbe(Arc<AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Run `f` under a WARN probe and report its result plus how many WARNs it produced.
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let warns = Arc::new(AtomicU64::new(0));
+        let out = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f()
+        };
+        (out, warns.load(AtomicOrdering::Relaxed))
+    }
+
+    /// The three knobs this reader owns — wiped together so a case for one can never
+    /// be coloured by a leftover value of another.
+    const ALL_ENV: &[&str] = &[ENABLED_ENV, FAILS_ENV, COOLDOWN_ENV];
+
+    /// Save/wipe/restore env vars for the duration of a test. Saves as `OsString` so
+    /// a pre-existing non-Unicode value is restored byte-for-byte.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl EnvGuard {
+        fn wipe(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved }
+        }
+        fn set(&self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            std::env::set_var(key, value);
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(s) => std::env::set_var(k, s),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(breaker_env_lock)]
+    fn an_unrecognised_breaker_flag_is_reported_not_silently_kept_enabled() {
+        let env = EnvGuard::wipe(ALL_ENV);
+        env.set(ENABLED_ENV, "flase"); // a typo of `false`
+        let (cfg, warns) = warns_of(BreakerConfig::from_env);
+        assert!(
+            cfg.enabled,
+            "an unreadable token keeps the safe (armed) default"
+        );
+        assert_eq!(
+            warns, 1,
+            "the operator asked to disable the breaker and was never told the request was discarded"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(breaker_env_lock)]
+    fn an_unset_breaker_flag_stays_silent_and_keeps_the_default() {
+        let _env = EnvGuard::wipe(ALL_ENV);
+        let (cfg, warns) = warns_of(BreakerConfig::from_env);
+        assert!(cfg.enabled);
+        assert_eq!(warns, 0, "a genuinely unset variable is the silent case");
+    }
+
+    #[test]
+    #[serial_test::serial(breaker_env_lock)]
+    fn the_documented_disable_tokens_disable_without_a_warning() {
+        let env = EnvGuard::wipe(ALL_ENV);
+        for tok in ["0", "false", "off", "no", "OFF", "  No  "] {
+            env.set(ENABLED_ENV, tok);
+            let (cfg, warns) = warns_of(BreakerConfig::from_env);
+            assert!(!cfg.enabled, "AMOS_BREAKER={tok:?} disables the breaker");
+            assert_eq!(warns, 0, "{tok:?} is a documented token and must not warn");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(breaker_env_lock)]
+    fn the_numeric_knobs_are_read() {
+        let env = EnvGuard::wipe(ALL_ENV);
+        env.set(FAILS_ENV, "7");
+        env.set(COOLDOWN_ENV, "45");
+        let (cfg, warns) = warns_of(BreakerConfig::from_env);
+        assert_eq!(cfg.fail_threshold, 7);
+        assert_eq!(cfg.cooldown, Duration::from_secs(45));
+        assert_eq!(warns, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(breaker_env_lock)]
+    fn a_non_unicode_breaker_flag_is_reported_not_silently_read_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        let env = EnvGuard::wipe(ALL_ENV);
+        env.set(ENABLED_ENV, std::ffi::OsStr::from_bytes(b"of\xfff"));
+        let (cfg, warns) = warns_of(BreakerConfig::from_env);
+        assert!(cfg.enabled);
+        assert_eq!(
+            warns, 1,
+            "a present-but-unreadable value must not read as `unset`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(breaker_env_lock)]
+    fn a_non_unicode_numeric_knob_is_reported_not_silently_read_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        let env = EnvGuard::wipe(ALL_ENV);
+        env.set(FAILS_ENV, std::ffi::OsStr::from_bytes(b"7\xff"));
+        let (cfg, warns) = warns_of(BreakerConfig::from_env);
+        assert_eq!(
+            cfg.fail_threshold,
+            BreakerConfig::default().fail_threshold,
+            "an unreadable value takes the documented default"
+        );
+        assert_eq!(warns, 1);
     }
 }

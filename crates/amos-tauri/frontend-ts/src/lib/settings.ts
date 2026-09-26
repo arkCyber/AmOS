@@ -260,7 +260,17 @@ export function normalizeNotifs(v: unknown): Notif[] {
     if (typeof o.badge === "number" && Number.isFinite(o.badge)) n.badge = o.badge;
     out.push(n);
   }
-  return out.length > NOTIF_CAP ? out.slice(out.length - NOTIF_CAP) : out;
+  // The store is **newest-first** (`addNotif` prepends; `osTimerWatcher`, `alarmCore`,
+  // `calendarCore`, `reminderCore`, `shortcuts` and `mergePushHistory` all keep the head), so
+  // the cap must drop the *oldest* rows — it must not keep the tail.
+  //
+  // Which rows those are is decided by `time`, not by array position: two writers (`MailApp`,
+  // `MessagesApp`) *append* their fresh rows rather than prepending, so an over-cap store need
+  // not be in canonical order. `time` is the one field every surviving row carries (a row
+  // without a finite numeric `time` is already dropped above), and `mergePushHistory` sorts its
+  // additions the same way. Within the cap the caller's order is preserved untouched (REQ-A1940).
+  if (out.length <= NOTIF_CAP) return out;
+  return out.sort((a, b) => b.time - a.time).slice(0, NOTIF_CAP);
 }
 
 /** Pure: mark one notification read (immutable). Absent id / already-read is a

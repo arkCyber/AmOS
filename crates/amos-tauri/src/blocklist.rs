@@ -12,8 +12,11 @@
 //!
 //! Persistence is a small JSON file (atomic write: temp + rename) so a crash
 //! cannot leave a half-written list. A corrupt file is **not** silently ignored:
-//! it is logged and the list starts empty (crashing because a settings file is
-//! damaged would be worse, but the failure is never hidden from the operator).
+//! it is logged, **moved aside** as `<name>.corrupt-<nonce>`, and the list starts
+//! empty (crashing because a settings file is damaged would be worse, but the
+//! failure is never hidden from the operator — and since `persist()` rewrites the
+//! configured path on the next edit, leaving the damaged bytes in place would let
+//! that one edit destroy the operator's only copy of the rules; REQ-A1937 / F-SH-935).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -40,7 +43,9 @@ impl BlocklistState {
     }
 
     /// Point the state at a file and load it (once per path). A missing file is
-    /// simply "no rules yet"; a corrupt one is logged and treated as empty.
+    /// simply "no rules yet"; a corrupt one is **moved aside** (as
+    /// `<name>.corrupt-<nonce>`) and treated as empty, so the next `persist()` cannot
+    /// overwrite the only copy of the operator's rules (REQ-A1937 / F-SH-935).
     pub fn configure(&self, path: PathBuf) {
         let mut slot = match self.path.lock() {
             Ok(p) => p,
@@ -61,12 +66,10 @@ impl BlocklistState {
                 // arm folded the two together and said nothing (audit PH-P2-04),
                 // while the sibling *parse* failure below has always logged.
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        target: "amos::blocklist",
-                        path = %path.display(),
-                        error = %e,
-                        "blocklist file could not be read — starting empty"
-                    );
+                    // The path stays in `slot` (the rules must keep being reachable
+                    // for a later write to repair), so whatever bytes are there get
+                    // preserved before `persist()` can overwrite them.
+                    keep_rules_aside(&path, &format!("could not be read: {e}"));
                 }
                 return;
             }
@@ -100,12 +103,7 @@ impl BlocklistState {
                     "blocklist loaded"
                 );
             }
-            Err(e) => tracing::warn!(
-                target: "amos::blocklist",
-                path = %path.display(),
-                kind = e.kind(),
-                "blocklist file unreadable — starting empty"
-            ),
+            Err(e) => keep_rules_aside(&path, &format!("is unreadable: {e}")),
         }
     }
 
@@ -278,6 +276,46 @@ pub fn shared() -> Arc<BlocklistState> {
 /// Resolve the persistence file from an app data dir.
 pub fn file_in(data_dir: &Path) -> PathBuf {
     data_dir.join(BLOCKLIST_FILE)
+}
+
+/// Rename a rules file that could not be read back to a `<name>.corrupt-<nonce>`
+/// sibling, returning the name it was kept under. `None` when there was nothing to
+/// move, or the rename itself failed.
+///
+/// `rename` is a **directory** operation, so it succeeds even when the file's
+/// *contents* cannot be read — which is the whole case this exists for. Keeping the
+/// path out of the writer's way is what makes the refusal observable: `persist()`
+/// rewrites the configured path from an almost-empty list on the next edit, so
+/// leaving the damaged bytes there would destroy the operator's only copy.
+fn preserve_unreadable_state(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|_| kept)
+}
+
+/// Report a rules file that could not be read back and keep its bytes beside it. The
+/// two `warn!` texts name *which* happened — kept under a `corrupt-*` sibling, or
+/// could not be moved — so a read-only directory is not mistaken for a clean run.
+fn keep_rules_aside(path: &Path, why: &str) {
+    match preserve_unreadable_state(path) {
+        Some(kept) => tracing::warn!(
+            target: "amos::blocklist",
+            path = %path.display(),
+            kept = %kept.display(),
+            "blocklist file {why} — kept beside the original; starting empty"
+        ),
+        None => tracing::warn!(
+            target: "amos::blocklist",
+            path = %path.display(),
+            "blocklist file {why} and could not be moved aside; starting empty"
+        ),
+    }
 }
 
 /// Serializable mirror of a rule.
@@ -1289,5 +1327,103 @@ mod tests {
                 role_status_from(Ok(true), Ok(false), Err("no vm".to_string()));
             assert!(!requestable);
         }
+    }
+
+    // --- F-SH-935 (REQ-A1937): an unreadable/corrupt rules file is kept aside, so the
+    //     next `persist()` cannot overwrite the only copy ---
+
+    /// Any `corrupt-*` file beside `path` — the loader's preserved copy of a rules
+    /// file it could not read back.
+    fn corrupt_aside(path: &Path) -> Option<PathBuf> {
+        let dir = path.parent()?;
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("corrupt-"))
+            })
+    }
+
+    /// The load-bearing case. `configure` reads a file it cannot parse, keeps the path
+    /// in `slot`, and answers "no rules"; `add`/`remove`/`clear`/`set_block_unknown`
+    /// then call `persist()`, which rewrites **that same path** from an almost-empty
+    /// snapshot. Before this, the operator's entire blocked-sender list was destroyed
+    /// by the next single edit, with nothing on disk to recover it from.
+    #[test]
+    fn a_corrupt_rules_file_is_kept_aside_so_the_next_write_cannot_destroy_it() {
+        let dir = tmp_dir("corrupt-kept");
+        let path = file_in(&dir);
+        let original = b"{ this is not json".to_vec();
+        std::fs::write(&path, &original).unwrap();
+
+        let s = BlocklistState::empty();
+        s.configure(path.clone());
+        assert!(
+            s.snapshot().rules.is_empty(),
+            "a corrupt file still starts empty (the old contract, kept)"
+        );
+
+        let kept = corrupt_aside(&path).expect(
+            "the unreadable rules file must be kept beside the original, not left for the \
+             next persist() to overwrite",
+        );
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            original,
+            "the kept copy is the original bytes, not a re-serialized snapshot"
+        );
+
+        // The reachable consequence: one edit writes a fresh file, and the old bytes
+        // are still recoverable from the sibling.
+        s.add("10086", "exact", "both", "", 1).unwrap();
+        assert!(
+            kept.exists(),
+            "the later persist() must not touch the kept copy"
+        );
+        assert!(
+            std::fs::read(&kept).unwrap() == original,
+            "the kept copy survives a rewrite of the live path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control: a file that *does* parse must be left exactly where it is —
+    /// the guard against an over-broad "move every file aside" fix.
+    #[test]
+    fn a_readable_rules_file_is_left_where_it_is() {
+        let dir = tmp_dir("good-kept");
+        let path = file_in(&dir);
+        let first = BlocklistState::empty();
+        first.configure(path.clone());
+        first
+            .add("+8613800138000", "exact", "both", "spam", 5)
+            .unwrap();
+
+        let second = BlocklistState::empty();
+        second.configure(path.clone());
+        assert!(second.blocks_call("+86 138-0013-8000"));
+        assert!(
+            corrupt_aside(&path).is_none(),
+            "a readable rules file must not be moved aside"
+        );
+        assert!(path.exists(), "and it must still be at its own path");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ordinary first run: nothing was written, so there is nothing to keep (and
+    /// nothing to report).
+    #[test]
+    fn a_missing_rules_file_keeps_nothing_aside() {
+        let dir = tmp_dir("missing-kept");
+        let path = file_in(&dir);
+        let s = BlocklistState::empty();
+        s.configure(path.clone());
+        assert!(s.snapshot().rules.is_empty());
+        assert!(
+            corrupt_aside(&path).is_none(),
+            "a first run has no file to keep"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

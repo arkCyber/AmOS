@@ -4,7 +4,7 @@
 //! utilities for context injection and session cleanup.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -291,29 +291,84 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Load sessions previously written by [`SessionManager::save`]. If the file
-    /// is absent or malformed, returns a fresh, empty manager (non-fatal).
+    /// Load sessions previously written by [`SessionManager::save`].
+    ///
+    /// Three distinct outcomes, because they carry three distinct facts:
+    ///
+    /// - **absent** (`NotFound`) — the honest first-run default, and silent:
+    ///   nothing was there to lose.
+    /// - a file that *exists* but **cannot be read back** (permissions, non-UTF-8
+    ///   bytes) — **kept aside** (`<name>.corrupt-<nonce>`) and reported once.
+    /// - a file that *exists* and reads but does not **parse** — also kept aside
+    ///   and reported.
+    ///
+    /// The aside matters because the daemon holds this same path
+    /// (`AMOS_SESSIONS_PATH`) and calls [`SessionManager::save`] on graceful
+    /// shutdown, so starting empty *on top of* it would overwrite the operator's
+    /// only copy of the session history. The returned manager is still empty in
+    /// both of the latter cases — the file is outside the trust boundary and its
+    /// contents are never trusted; what the aside buys is that the bytes are not
+    /// destroyed (REQ-A1939 / F-AI-037).
     pub fn load(path: &Path) -> Self {
-        let Ok(json) = std::fs::read_to_string(path) else {
-            return Self::default();
-        };
-        let stored: Vec<StoredSession> = match serde_json::from_str(&json) {
-            Ok(s) => s,
+        match std::fs::read_to_string(path) {
+            Ok(json) => match serde_json::from_str::<Vec<StoredSession>>(&json) {
+                Ok(stored) => {
+                    let mut sessions = HashMap::new();
+                    for s in stored {
+                        sessions.insert(s.id.clone(), s.into_metadata());
+                    }
+                    tracing::info!("loaded {} sessions from {}", sessions.len(), path.display());
+                    Self {
+                        sessions: Arc::new(RwLock::new(sessions)),
+                        session_timeout: Duration::from_secs(300),
+                    }
+                }
+                Err(e) => {
+                    keep_sessions_aside(path, &format!("is unparseable: {e}"));
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
-                tracing::warn!("failed to parse session file {}: {e}", path.display());
-                return Self::default();
+                keep_sessions_aside(path, &format!("is unreadable: {e}"));
+                Self::default()
             }
-        };
-        let mut sessions = HashMap::new();
-        for s in stored {
-            sessions.insert(s.id.clone(), s.into_metadata());
-        }
-        tracing::info!("loaded {} sessions from {}", sessions.len(), path.display());
-        Self {
-            sessions: Arc::new(RwLock::new(sessions)),
-            session_timeout: Duration::from_secs(300),
         }
     }
+}
+
+/// Move an unreadable/unparseable session file aside so a later
+/// [`SessionManager::save`] cannot overwrite it, and report it. The daemon keeps
+/// the original path live across shutdown, so the aside is what stops a fresh
+/// save from destroying the operator's only copy of the history.
+fn keep_sessions_aside(path: &Path, reason: &str) {
+    match preserve_unreadable_state(path) {
+        Some(kept) => tracing::warn!(
+            "session file {} {reason}; kept at {} and starting with no sessions",
+            path.display(),
+            kept.display()
+        ),
+        None => tracing::warn!(
+            "session file {} {reason}; could not be moved aside, starting with no sessions",
+            path.display()
+        ),
+    }
+}
+
+/// Rename `path` to a `<name>.corrupt-<nonce>` sibling. `None` when there was
+/// nothing to keep (not a regular file) or the rename failed — the caller warns
+/// either way and still starts empty. (Renaming works even when the file itself
+/// cannot be read, since it is a directory operation.)
+fn preserve_unreadable_state(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
 }
 
 /// Unix timestamp in whole seconds.
@@ -511,13 +566,11 @@ mod tests {
 
     #[tokio::test]
     async fn load_missing_or_malformed_file_is_empty() {
-        let dir = std::env::temp_dir();
-        let missing = SessionManager::load(
-            &dir.join(format!("amos-sess-missing-{}.json", std::process::id())),
-        );
+        let dir = tmp_dir("empty");
+        let missing = SessionManager::load(&dir.join("missing.json"));
         assert_eq!(missing.count_active().await, 0);
 
-        let bad = dir.join(format!("amos-sess-bad-{}.json", std::process::id()));
+        let bad = dir.join("sessions.json");
         std::fs::write(&bad, "not json").unwrap();
         let loaded = SessionManager::load(&bad);
         assert_eq!(
@@ -525,6 +578,172 @@ mod tests {
             0,
             "malformed file yields empty manager"
         );
-        let _ = std::fs::remove_file(&bad);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh temp dir per test (the aside files a load leaves behind are
+    /// siblings of the session file, so counting them needs a directory of our
+    /// own — not the shared temp dir).
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("amos-sess-{tag}-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `*.corrupt-*` file a load kept beside `dir`'s session file, if any.
+    fn corrupt_aside(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains("corrupt-"))
+    }
+
+    /// Counts WARN events so an assertion lands on the *observable* diagnostic:
+    /// the daemon's shutdown path has no caller to return an error to, so
+    /// tracing is the one channel that tells the operator the file was dropped.
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// A session file that **exists but cannot be read back** is kept aside
+    /// before the empty default is used, because the daemon holds this same path
+    /// (`AMOS_SESSIONS_PATH`) and calls `save` on graceful shutdown: without the
+    /// aside, that save rewrites the file from scratch and the operator's only
+    /// copy of the session history is gone. A non-UTF-8 byte sequence is the
+    /// reachable instance — `read_to_string` refuses it, which used to fold into
+    /// the same silent `Self::default()` as a missing file (REQ-A1939 /
+    /// F-AI-037).
+    #[tokio::test]
+    async fn an_unreadable_session_file_is_kept_aside_before_the_next_save_overwrites_it() {
+        let dir = tmp_dir("unreadable");
+        let path = dir.join("sessions.json");
+        let original: &[u8] = &[b'{', 0xff, 0xfe, b'}'];
+        std::fs::write(&path, original).unwrap();
+
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let loaded = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            SessionManager::load(&path)
+        };
+        assert_eq!(
+            loaded.count_active().await,
+            0,
+            "unreadable file => no sessions"
+        );
+        assert_eq!(
+            warns.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the drop must be audible: the shutdown path has no error to return to"
+        );
+
+        let kept = corrupt_aside(&dir).expect("the unreadable file was kept beside the original");
+        assert!(
+            !path.exists(),
+            "the live path no longer holds the undecodable bytes"
+        );
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            original,
+            "the bytes the operator left behind survive byte-for-byte"
+        );
+
+        // The proof that matters: a later save rewrites `path`, and the kept copy
+        // is still there to be recovered.
+        loaded.save(&path).await.expect("save");
+        assert!(path.exists(), "the live path is rewritten with fresh state");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            original,
+            "the aside is not the file a save touches"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The parse arm of the same defect: the file reads fine but is not the JSON
+    /// `save` writes, so starting empty on top of it would overwrite it.
+    #[tokio::test]
+    async fn an_unparseable_session_file_is_kept_aside_too() {
+        let dir = tmp_dir("unparseable");
+        let path = dir.join("sessions.json");
+        let original: &[u8] = b"{ this is not the session list";
+        std::fs::write(&path, original).unwrap();
+
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let loaded = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            SessionManager::load(&path)
+        };
+        assert_eq!(loaded.count_active().await, 0);
+        assert_eq!(warns.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let kept = corrupt_aside(&dir).expect("the unparseable file was kept aside");
+        assert_eq!(std::fs::read(&kept).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control for the two cases above: a *readable* session file is
+    /// loaded in place — nothing is moved aside.
+    #[tokio::test]
+    async fn a_readable_session_file_is_loaded_in_place_with_no_aside() {
+        let dir = tmp_dir("readable");
+        let path = dir.join("sessions.json");
+        let manager = SessionManager::default();
+        let id = manager.create("model1".to_string()).await;
+        manager.save(&path).await.expect("save");
+
+        let loaded = SessionManager::load(&path);
+        assert!(loaded.get(&id).await.is_some(), "the session survived");
+        assert!(
+            corrupt_aside(&dir).is_none(),
+            "a file that parsed is never moved aside"
+        );
+        assert!(path.exists(), "the live path is left where it was");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Negative control, disjoint from the two aside cases: a **missing** file is
+    /// not corruption. There is nothing to keep, so no aside is written and no
+    /// warning is emitted — the honest first-run default.
+    #[tokio::test]
+    async fn a_missing_session_file_keeps_nothing_aside_and_stays_silent() {
+        let dir = tmp_dir("missing");
+        let path = dir.join("sessions.json");
+
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let loaded = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            SessionManager::load(&path)
+        };
+        assert_eq!(loaded.count_active().await, 0);
+        assert_eq!(
+            warns.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an absent file is the honest first-run default, not a finding"
+        );
+        assert!(corrupt_aside(&dir).is_none(), "nothing to keep aside");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

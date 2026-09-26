@@ -1179,6 +1179,7 @@ export const zh = {
   "settings.aiSave": "保存",
   "settings.aiSaved": "已保存。重启 amos-ai 后生效",
   "settings.aiApplied": "已应用",
+  "settings.aiSwitchFailed": "切换失败，后端未重启（原因见下方诊断）",
   "settings.aiCurrent": "当前后端: {model}",
   "settings.aiProbe": "上次探测: {time}（每 10 秒刷新）",
   "settings.aiNote": "切到云端需 API Key；重启 daemon 时读此配置",

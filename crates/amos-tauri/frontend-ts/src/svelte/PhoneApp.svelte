@@ -31,7 +31,7 @@
   import { NOTIF_KEY, addNotif, newNotifId, normalizeNotifs } from "../lib/settings";
   import type { Notif } from "../lib/settings";
   import { bgT } from "./bgText";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import { iconSvg } from "../lib/sysIcons";
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
@@ -610,10 +610,20 @@
       icon: "📞",
       time: Date.now(),
     };
-    writeStoreValue(
-      NOTIF_KEY,
-      addNotif(normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, [])), entry),
-    );
+    // The same rule as the call-log write above, and as `ContactsApp.svelte`'s dial
+    // (which already checks this): a rejected notification write must be visible, not
+    // swallowed. `writeStoreValue` is `void`, so a full/unavailable store ate the
+    // notification silently while the page still reported the dial. The two writes target
+    // different keys (`amos.calllog` vs `amos.notifications`), so this one can fail on its
+    // own — the call-log verdict above is not a proxy for it (REQ-A1948 / F-SH-944).
+    if (
+      !writeStoreValueChecked(
+        NOTIF_KEY,
+        addNotif(normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, [])), entry),
+      )
+    ) {
+      storeErr = t("common.storeWriteFailed");
+    }
   };
 
   const tap = (k: string) => {

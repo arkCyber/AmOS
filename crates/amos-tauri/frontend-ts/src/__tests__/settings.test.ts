@@ -457,12 +457,41 @@ describe("settings / NC helpers", () => {
     expect(normalizeNotifs(null)).toEqual([]);
   });
 
-  test("normalizeNotifs caps a pathologically large store at NOTIF_CAP (keeps newest)", () => {
-    const big = Array.from({ length: NOTIF_CAP + 40 }, (_, i) => ({ id: `id${i}`, app: "信息", time: i }));
+  // REQ-A1940 / F-SH-937. This test used to pin the defect: it fed an **oldest-first**
+  // fixture and asserted the *tail* survived ("oldest id0..id39 evicted"), so it read as
+  // "keeps newest" only because its fixture had the store's order backwards. The store is
+  // newest-first (`addNotif` prepends; every other cap site — `osTimerWatcher`, `alarmCore`,
+  // `calendarCore`, `reminderCore`, `shortcuts`, `mergePushHistory` — keeps the head), so the
+  // old cap kept the *oldest* rows and an over-cap store dropped its **newest** notifications
+  // the next time it was normalized and written back.
+  test("normalizeNotifs caps a pathologically large store at NOTIF_CAP, keeping the NEWEST rows", () => {
+    const big = Array.from({ length: NOTIF_CAP + 40 }, (_, i) => ({
+      id: `id${i}`,
+      app: "信息",
+      // Canonical order: `id0` is the newest (what `addNotif` produces).
+      time: NOTIF_CAP + 40 - i,
+    }));
     const out = normalizeNotifs(big);
     expect(out.length).toBe(NOTIF_CAP);
-    expect(out[0]!.id).toBe("id40"); // oldest id0..id39 evicted
-    expect(out[out.length - 1]!.id).toBe(`id${NOTIF_CAP + 39}`); // newest tail intact
+    expect(out[0]!.id).toBe("id0"); // the newest survives
+    expect(out.map((n) => n.id)).not.toContain(`id${NOTIF_CAP + 39}`); // the oldest 40 go
+  });
+
+  test("the cap is decided by `time`, not by array position", () => {
+    // Two production writers (`MailApp` / `MessagesApp`) *append* their fresh rows instead of
+    // prepending, so an over-cap store need not be in canonical order. The survivors are
+    // ordered by `time` — the one field every surviving row carries — so the newest are kept
+    // whichever end the caller put them at.
+    const rows = Array.from({ length: NOTIF_CAP + 40 }, (_, i) => ({
+      id: `id${i}`,
+      app: "信息",
+      time: NOTIF_CAP + 40 - i, // id0 newest … id139 oldest
+    }));
+    const oldestFirst = [...rows].reverse();
+    const out = normalizeNotifs(oldestFirst);
+    expect(out.length).toBe(NOTIF_CAP);
+    expect(out[0]!.id).toBe("id0"); // newest by time, even though it was last in the array
+    expect(out[out.length - 1]!.id).toBe(`id${NOTIF_CAP - 1}`);
   });
   test("normalizeNotifs preserves the push-only fields, and drops a bogus one alone", () => {
     const out = normalizeNotifs([

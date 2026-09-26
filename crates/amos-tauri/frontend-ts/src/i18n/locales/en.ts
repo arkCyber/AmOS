@@ -1169,6 +1169,7 @@ export const en: Record<MessageKey, string> = {
   "settings.aiSave": "Save",
   "settings.aiSaved": "Saved. Takes effect after amos-ai restart",
   "settings.aiApplied": "Applied",
+  "settings.aiSwitchFailed": "Switch failed — the backend did not restart (reason in the diagnostics below)",
   "settings.aiCurrent": "Current backend: {model}",
   "settings.aiProbe": "Last probe: {time} (refreshes every 10 s)",
   "settings.aiNote": "Cloud needs an API Key; daemon reads this on launch",

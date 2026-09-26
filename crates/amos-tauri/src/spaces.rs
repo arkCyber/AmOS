@@ -19,12 +19,17 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AmosError, AmosResult, ErrorCode};
 use crate::store::SharedStore;
 
 /// Storage key for Spaces configuration in SharedStore
 const SPACES_KEY: &str = "amos.desktop.spaces";
+
+/// Prefix for the quarantine key that a value which cannot be parsed back is
+/// kept under (see [`SpaceManager::load`]).
+const SPACES_QUARANTINE_PREFIX: &str = "amos.desktop.spaces.corrupt-";
 
 /// A virtual desktop (Space) containing a set of windows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -93,16 +98,36 @@ impl SpaceManager {
         }
     }
 
-    /// Load SpaceManager from SharedStore, or create default if not found
+    /// Load a SpaceManager from `store`.
+    ///
+    /// Three outcomes, because they carry three distinct facts:
+    ///
+    /// - **no value stored** — the honest first-run default, and silent: there is
+    ///   nothing to lose.
+    /// - a value that **parses** — loaded as-is.
+    /// - a value that **does not parse** (hand-edited, or written by an older
+    ///   build whose shape this one cannot read — e.g. a value saved before
+    ///   `next_id` existed fails the all-fields-required `Deserialize`) — its raw
+    ///   JSON is **kept** under a `amos.desktop.spaces.corrupt-<nonce>` key and
+    ///   reported once, then the default is used.
+    ///
+    /// The quarantine is load-bearing: every mutating command (`spaces_switch` /
+    /// `create` / `delete` / `rename` / `move_window` / `unfile`) calls
+    /// [`Self::save`], which `insert`s the **whole** manager under [`SPACES_KEY`]
+    /// and persists the store — so without the copy, the first click after a failed
+    /// load would destroy the operator's only Spaces ledger (names, window filing,
+    /// and which desktop was active). The default is still what runs: the value is
+    /// outside the trust boundary and never trusted; what the quarantine buys is
+    /// that its bytes survive (REQ-A1942 / F-SH-939).
     pub fn load(store: &SharedStore) -> Self {
         match store.get(SPACES_KEY) {
-            Some(json) => {
-                // Try to deserialize; fall back to default on error
-                serde_json::from_str::<SpaceManager>(&json).unwrap_or_else(|_| {
-                    tracing::warn!("[Spaces] Failed to deserialize, using default");
+            Some(json) => match serde_json::from_str::<SpaceManager>(&json) {
+                Ok(manager) => manager,
+                Err(e) => {
+                    quarantine_unparseable_spaces(store, &json, &e);
                     Self::new()
-                })
-            }
+                }
+            },
             None => Self::new(),
         }
     }
@@ -325,6 +350,24 @@ impl SpaceManager {
     }
 }
 
+/// Keep a Spaces value that could not be parsed back under a
+/// `amos.desktop.spaces.corrupt-<nonce>` key and report it, so a later
+/// [`SpaceManager::save`] (which rewrites [`SPACES_KEY`] and persists the store)
+/// cannot be the thing that destroys the operator's only copy. The default
+/// SpaceManager is still what runs — the bytes are preserved, not trusted.
+fn quarantine_unparseable_spaces(store: &SharedStore, raw: &str, err: &serde_json::Error) {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{SPACES_QUARANTINE_PREFIX}{nonce}");
+    store.insert(&key, raw.to_string());
+    tracing::warn!(
+        "[Spaces] stored config is unparseable ({err}); kept {} bytes at {key} and using the default desktop",
+        raw.len()
+    );
+}
+
 impl Default for SpaceManager {
     fn default() -> Self {
         Self::new()
@@ -386,6 +429,131 @@ pub type SpaceManagerState = Mutex<SpaceManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts WARN events so an assertion lands on the *observable* diagnostic:
+    /// a failed load has no caller to return an error to, so tracing is the one
+    /// channel that tells the operator the ledger was dropped.
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// The quarantine key a failed load kept `raw` under, if any.
+    fn quarantined(store: &SharedStore) -> Option<String> {
+        store
+            .snapshot()
+            .keys()
+            .find(|k| k.starts_with(SPACES_QUARANTINE_PREFIX))
+            .cloned()
+    }
+
+    /// A stored value that **cannot be parsed back** is kept under a
+    /// `amos.desktop.spaces.corrupt-<nonce>` key before the default is used, because
+    /// every mutating command calls `save`, which rewrites `SPACES_KEY` and persists
+    /// the store: without the copy, the first click after a failed load destroys the
+    /// operator's only Spaces ledger. A value saved by a build that had no `next_id`
+    /// is the reachable instance — `Deserialize` requires all three fields
+    /// (REQ-A1942 / F-SH-939).
+    #[test]
+    fn an_unparseable_stored_config_is_quarantined_before_the_next_save_overwrites_it() {
+        let store = SharedStore::memory();
+        // Two fields only: exactly what a pre-`next_id` build would have written.
+        let original =
+            r#"{"spaces":[{"id":"space-0","name":"工作","windows":["files"]}],"active_index":0}"#;
+        store.insert(SPACES_KEY, original.to_string());
+
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mgr = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            SpaceManager::load(&store)
+        };
+        assert_eq!(
+            mgr.spaces.len(),
+            1,
+            "unparseable value => the default sets in"
+        );
+        assert_eq!(mgr.spaces[0].name, "桌面 1");
+        assert_eq!(
+            warns.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the drop must be audible: the load has no error to return to"
+        );
+
+        let key =
+            quarantined(&store).expect("the unparseable value was kept under a quarantine key");
+        assert_eq!(
+            store.get(&key).as_deref(),
+            Some(original),
+            "the bytes the operator left behind survive verbatim"
+        );
+
+        // The proof that matters: a later save rewrites SPACES_KEY, and the kept copy
+        // is still there to be recovered.
+        mgr.save(&store).expect("save");
+        assert_ne!(
+            store.get(SPACES_KEY).as_deref(),
+            Some(original),
+            "the live key now holds a fresh default ledger"
+        );
+        assert_eq!(
+            store.get(&key).as_deref(),
+            Some(original),
+            "the quarantine key is not the key a save touches"
+        );
+    }
+
+    /// Negative control, disjoint from the case above: an **absent** value is the
+    /// honest first-run state, not corruption — nothing is quarantined and no
+    /// warning is emitted.
+    #[test]
+    fn an_absent_stored_config_quarantines_nothing_and_stays_silent() {
+        let store = SharedStore::memory();
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mgr = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            SpaceManager::load(&store)
+        };
+        assert_eq!(mgr.spaces.len(), 1);
+        assert_eq!(
+            warns.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an absent key is the honest first-run default, not a finding"
+        );
+        assert!(quarantined(&store).is_none(), "nothing to keep");
+    }
+
+    /// Positive control: a stored value that **does** parse is loaded in place —
+    /// nothing is quarantined.
+    #[test]
+    fn a_parseable_stored_config_is_loaded_without_quarantine() {
+        let store = SharedStore::memory();
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space("files", "space-1").unwrap();
+        mgr.save(&store).expect("save");
+
+        let loaded = SpaceManager::load(&store);
+        assert_eq!(loaded.spaces.len(), 2);
+        assert_eq!(loaded.spaces[1].name, "工作");
+        assert!(
+            quarantined(&store).is_none(),
+            "a parsed value is never kept"
+        );
+    }
 
     #[test]
     fn new_manager_has_default_space() {

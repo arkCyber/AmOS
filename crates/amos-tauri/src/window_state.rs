@@ -32,6 +32,11 @@
 //!   JSON, or a permission error all produce a `warn!` instead of a default
 //!   behavior the user cannot see — "the window jumped back to default" must
 //!   be diagnosable.
+//! * **An unparsable file is kept, not overwritten.**  Both flush paths rewrite
+//!   the whole file, so a malformed one is renamed to `<name>.corrupt-<nonce>`
+//!   beside the original before the merge starts from the pending entries alone:
+//!   the user's bytes survive to be recovered, instead of being replaced by the
+//!   next window drag.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -272,11 +277,9 @@ impl WindowStateStore {
             return 0;
         }
 
-        // Read existing on-disk state (lossy on parse error: see `load`).
-        let mut file: WindowStateFile = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        // Read existing on-disk state; an unparsable file is kept aside, not merged
+        // as empty (see `read_for_merge`).
+        let mut file: WindowStateFile = read_for_merge(&path);
         for (k, v) in due.iter() {
             file.windows.insert(k.clone(), v.clone());
         }
@@ -319,10 +322,7 @@ impl WindowStateStore {
         if pending.is_empty() {
             return;
         }
-        let mut file: WindowStateFile = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let mut file: WindowStateFile = read_for_merge(&path);
         for (k, v) in pending.iter() {
             file.windows.insert(k.clone(), v.clone());
         }
@@ -395,6 +395,55 @@ fn write_atomic(path: &Path, file: &WindowStateFile) -> std::io::Result<()> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Move a window-state file that could not be parsed aside so the flush cannot
+/// overwrite it.  `None` when there was nothing to keep or the rename failed.
+fn preserve_unreadable_state(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
+}
+
+/// Read the on-disk file for a merge, preserving an **unparsable** one aside before
+/// answering empty.
+///
+/// Both flush paths merge the on-disk map with the pending entries and then
+/// `write_atomic` the *whole* file, so folding a parse failure into `Default` would
+/// replace every other window's geometry with the few entries that happened to be
+/// pending.  A missing file (first run) is genuinely nothing to merge and stays
+/// silent; a malformed one is kept beside the original.
+fn read_for_merge(path: &Path) -> WindowStateFile {
+    let Ok(bytes) = std::fs::read(path) else {
+        return WindowStateFile::default();
+    };
+    match serde_json::from_slice::<WindowStateFile>(&bytes) {
+        Ok(file) => file,
+        Err(e) => {
+            match preserve_unreadable_state(path) {
+                Some(kept) => tracing::warn!(
+                    target: "amos::window_state",
+                    error = %e,
+                    path = %path.display(),
+                    kept = %kept.display(),
+                    "window-state file could not be parsed; kept aside, merging only the pending entries"
+                ),
+                None => tracing::warn!(
+                    target: "amos::window_state",
+                    error = %e,
+                    path = %path.display(),
+                    "window-state file could not be parsed and could not be moved aside; merging only the pending entries"
+                ),
+            }
+            WindowStateFile::default()
+        }
+    }
 }
 
 /// Drop nonsense coordinates and dimensions; keep only what fits the screen.
@@ -642,5 +691,115 @@ mod tests {
         let parsed_wrapped: WindowStateFile =
             serde_json::from_slice(wrapped).expect("wrapped legacy parses");
         assert_eq!(parsed_wrapped.windows.get("main").unwrap().x, Some(10));
+    }
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "amos-wstate-{tag}-{}-{nonce}.json",
+            std::process::id()
+        ))
+    }
+
+    /// The `<stem>.corrupt-*` sibling of `path`, if one was kept beside it.
+    ///
+    /// Matched on the **stem**: every test in this module shares one temp dir, so a
+    /// directory-wide search for `corrupt-` could pick up a sibling test's kept file.
+    fn kept_aside(path: &Path) -> Option<PathBuf> {
+        let stem = path.file_stem()?.to_string_lossy().into_owned();
+        let prefix = format!("{stem}.corrupt-");
+        std::fs::read_dir(path.parent()?)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+            })
+    }
+
+    fn geom(x: i32, y: i32, w: u32, h: u32) -> WindowState {
+        WindowState {
+            x: Some(x),
+            y: Some(y),
+            width: Some(w),
+            height: Some(h),
+            visible: Some(true),
+            ..Default::default()
+        }
+    }
+
+    /// A file that cannot be parsed must be **moved aside** before a flush rewrites it:
+    /// both flush paths merge the on-disk map with the pending entries and then
+    /// `write_atomic` the whole file, so folding a parse failure into an empty map
+    /// replaces *every other* window's geometry with the few entries that happened to
+    /// be pending (REQ-A1938 / F-SH-936).
+    #[test]
+    fn an_unreadable_window_state_file_is_preserved_not_silently_overwritten() {
+        let path = temp_path("corrupt-preserved");
+        std::fs::write(&path, "{ not valid json !").unwrap();
+
+        let s = WindowStateStore::at_path(path.clone());
+        assert!(
+            s.load("main").is_none(),
+            "an unreadable file yields no state"
+        );
+
+        // Exit flush: no debounce to wait for.
+        s.queue("main", geom(10, 20, 800, 600));
+        s.flush_all();
+
+        let kept = kept_aside(&path)
+            .expect("the unreadable window-state file was kept under a corrupt-* name");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{ not valid json !",
+            "the user's bytes survive intact"
+        );
+        assert!(
+            path.exists(),
+            "a fresh file is written at the original path"
+        );
+        assert!(kept.exists(), "and the preserved bytes are still there");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&kept);
+    }
+
+    /// Positive control: a file that **parses** is merged in place and nothing is
+    /// moved aside, so the fix cannot degenerate into "rename every file away" —
+    /// which would itself drop the other windows' entries the merge was for.
+    #[test]
+    fn a_readable_window_state_file_is_merged_without_being_moved_aside() {
+        let path = temp_path("readable");
+        let mut existing = WindowStateFile::default();
+        existing
+            .windows
+            .insert("settings".into(), geom(120, 80, 900, 640));
+        std::fs::write(&path, serde_json::to_vec(&existing).unwrap()).unwrap();
+
+        let s = WindowStateStore::at_path(path.clone());
+        s.queue("main", geom(10, 20, 800, 600));
+        s.flush_all();
+
+        assert!(
+            kept_aside(&path).is_none(),
+            "nothing is moved aside when the file parses"
+        );
+        let back: WindowStateFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("fresh file parses");
+        assert!(
+            back.windows.contains_key("settings"),
+            "the pre-existing window survives the merge"
+        );
+        assert!(
+            back.windows.contains_key("main"),
+            "and the pending window is merged in"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

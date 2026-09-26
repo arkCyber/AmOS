@@ -26,7 +26,7 @@
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { iconSvg } from "../lib/sysIcons";
   import { NOTIF_KEY, normalizeNotifs, type Notif } from "../lib/settings";
-  import { withoutAppNotifs } from "../lib/notifApp";
+  import { replaceAppNotifs } from "../lib/notifApp";
   import { bgT } from "./bgText";
   import { t, locale, ALL_LABEL_DICTS } from "./locale.svelte";
   import { mailChannel } from "./appLinks";
@@ -295,11 +295,7 @@
   // Publish unread INBOX mail as app notifications → dock/launcher badge.
   $effect(() => {
     if (!bridged() || mailbox !== "INBOX") return;
-    const others = withoutAppNotifs(
-      normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, [])),
-      "mail",
-      ALL_LABEL_DICTS,
-    );
+    const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
     const fresh: Notif[] = list
       .filter((s) => !s.flags.seen)
       .slice(0, MAIL_NOTIF_CAP)
@@ -311,7 +307,7 @@
         body: s.from ? fmtAddr(s.from) : undefined,
         time: s.date * 1000,
       }));
-    writeStoreValue(NOTIF_KEY, [...others, ...fresh]);
+    writeStoreValue(NOTIF_KEY, replaceAppNotifs(existing, "mail", fresh, ALL_LABEL_DICTS));
   });
 
   /**

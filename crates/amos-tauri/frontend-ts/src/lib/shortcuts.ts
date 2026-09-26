@@ -1964,13 +1964,20 @@ async function executeAction(
     // ------------------------------------------------------------------
 
     case "show_notification":
-      postNotification(params.title, params.body, "⚡");
+      // REQ-A1947 / F-SH-943：通知是这一步唯一的产物，store 拒写就等于这一步**什么都没做**，
+      // 必须让 `executeShortcut` 折成 `success:false`（与上方 `open_app` 同一条规矩），
+      // 而不是照旧 `return input` 报成功。
+      if (!postNotification(params.title, params.body, "⚡")) {
+        throw new Error(`显示通知失败：通知未写入（store 拒写）`);
+      }
       return input;
 
     case "show_alert":
       // AmOS 没有模态框系统；"警告"落成通知中心里一条 ⚠️ 记录 —— 至少是**用户看得见**的，
       // 而不是控制台里的一行日志（旧实现就是后者）。
-      postNotification(params.title, params.message, "⚠️");
+      if (!postNotification(params.title, params.message, "⚠️")) {
+        throw new Error(`显示警告失败：通知未写入（store 拒写）`);
+      }
       return input;
 
     case "open_app": {
@@ -2146,8 +2153,17 @@ function splitText(text: unknown, separator: string): string[] {
  * 这里原先写死中文字面量「快捷指令」：REQ-A1134 的清扫找的是字典查表（`zh[...]`），
  * 而字面量不是查询，于是英文界面下这条通知的署名一直是中文 —— 正是 `bgText.ts` 开头
  * 记的那个危害。这一层不在渲染里（快捷指令由动作执行器在任意时刻触发），只能用 `bgT`。
+ *
+ * REQ-A1947 / FMEA F-SH-943：本函数以前是 `void`，末尾 `writeStoreValue(NOTIF_KEY, next)`
+ * —— 那把判决**扔掉了**（`writeStoreValue` 不返回，`writeJson` 在拒写时连
+ * `STORE_CHANGED_EVENT` 都不派发）。通知是 `show_notification` ∕ `show_alert` 这两条
+ * 动作**唯一**的产物，于是 store 写不进的那一趟、屏幕上什么都没出现，动作却照旧
+ * `return input`、`executeShortcut` 以 `success:true` 收尾（`runCount` 加一、审计与执行
+ * 日志各记一条成功）—— 与同一文件里 `open_app` 早已修掉的形状（REQ-A1193 ∕ F-SH-481）
+ * 逐字相同。同商店的兄弟生产者（`reminderCore` ∕ `calendarCore` 的 tick、
+ * `pushNotifBridge`）都已用 `writeStoreValueChecked` 并把判决带出去，这里是最后的例外。
  */
-function postNotification(title: unknown, body: unknown, icon: string): void {
+function postNotification(title: unknown, body: unknown, icon: string): boolean {
   const n: Notif = {
     id: newNotifId(),
     app: bgT("app.shortcuts"),
@@ -2159,7 +2175,7 @@ function postNotification(title: unknown, body: unknown, icon: string): void {
   };
   const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
   const next = addNotif(existing, n).slice(0, NOTIF_CAP);
-  writeStoreValue(NOTIF_KEY, next);
+  return writeStoreValueChecked(NOTIF_KEY, next);
 }
 
 /**

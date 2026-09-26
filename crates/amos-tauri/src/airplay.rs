@@ -9,11 +9,16 @@
 // no public API by which a third-party app may enumerate or select an AirPlay receiver — the
 // Apple surfaces are either UI-level (`AVRoutePickerView`, which presents *system* UI) or need a
 // live `AVPlayer` session on the main thread — and there is no in-tree RAOP/Cast client for
-// Android/Linux. So `connect` / `start_stream` / `set_volume` refuse with a reason instead of
-// returning `Ok`; `is_available()` answers the narrower question "does this platform have
+// Android/Linux. So every mutating operation — `connect` / `disconnect` / `start_stream` /
+// `stop_stream` / `set_volume` — refuses with a reason instead of returning `Ok`; `is_available()`
+// answers the narrower question "does this platform have
 // AirPlay at all", which is why the panel can still offer the feature and then explain itself.
 //
-// On unsupported hosts: returns "unavailable" (no fake success)
+// On unsupported hosts: returns "unavailable" (no fake success).
+//
+// The same rule covers **discovery**: `start_discovery` reports the platform's own answer and
+// lists only the devices the platform enumerated, never a fabricated set — an empty list means
+// "no receiver heard", not "here are some demo ones" (REQ-A1945 ∕ F-SH-941).
 
 use serde::{Deserialize, Serialize};
 
@@ -110,14 +115,33 @@ pub enum AirPlayResult {
     NotImplemented { reason: String },
 }
 
-/// Why the three **mutating** operations refuse instead of reporting success (REQ-A467).
+/// Why the **mutating** operations refuse instead of reporting success (REQ-A467).
 ///
 /// There is no platform call behind them. Reporting `Ok` while flipping local state put
 /// "connected" / "streaming" in front of the user for a receiver nothing had talked to — the one
 /// thing this module's header promises not to do. The reason names the constraint so a reader can
-/// tell "we cannot do this" apart from "it broke".
+/// tell "we cannot do this" apart from "it broke". `disconnect` and `stop_stream` were missed in
+/// the first pass and fixed under REQ-A1936.
 const NOT_IMPLEMENTED: &str = "AirPlay receiver control is not implemented: no platform API lets \
      an app select or drive a receiver, so nothing was sent to any device";
+
+/// The outcome discovery reports from the platform's own answer.
+///
+/// This is the **one** place the "never invent a receiver" rule lives, kept as a free
+/// function so it can be tested on a host whose platform seam cannot succeed in a test
+/// thread (the Apple seam needs the main thread; the non-Apple seam is a stub). It is the
+/// seam that used to fabricate: on a debug build with an empty platform list it
+/// substituted three demo receivers and still answered `Ok`, so the panel listed AirPlay
+/// targets no radio had heard — in direct contradiction of this module's header
+/// ("On unsupported hosts: returns 'unavailable' (no fake success)"). (REQ-A1945 / F-SH-941.)
+fn discovery_outcome(
+    platform_result: AirPlayResult,
+    platform_devices: Vec<AirPlayDevice>,
+) -> (AirPlayResult, Vec<AirPlayDevice>) {
+    // The platform's own answer, untouched: a refusal stays a refusal, and the device list
+    // is exactly what the platform enumerated — never supplemented with invented receivers.
+    (platform_result, platform_devices)
+}
 
 /// Manager state
 pub struct AirPlayManager {
@@ -187,7 +211,11 @@ impl AirPlayManager {
         "AirPlay service not initialized".to_string()
     }
 
-    /// Start device discovery
+    /// Start device discovery.
+    ///
+    /// The result and the device list both come from the platform through
+    /// [`discovery_outcome`] — this function never invents a device and never upgrades a
+    /// platform refusal to `Ok` (REQ-A1945 / F-SH-941).
     pub fn start_discovery(&mut self) -> AirPlayResult {
         if !self.is_available() {
             return AirPlayResult::Unavailable {
@@ -195,42 +223,12 @@ impl AirPlayManager {
             };
         }
 
-        self.discovering = true;
-
-        // Platform-specific discovery implementation
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            let result = platform_start_discovery(&mut self.platform_discovery);
-            if !matches!(result, AirPlayResult::Ok) {
-                return result;
-            }
-
-            // Also load platform devices
-            let platform_devices = platform_get_devices(&self.platform_discovery);
-            if !platform_devices.is_empty() {
-                self.devices = platform_devices;
-                return AirPlayResult::Ok;
-            }
-
-            // Fall back to demo devices in debug mode if no real devices found
-            #[cfg(debug_assertions)]
-            {
-                self.devices = Self::demo_devices();
-            }
-
-            AirPlayResult::Ok
-        }
-
-        // For other platforms, use demo devices in development
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        {
-            #[cfg(debug_assertions)]
-            {
-                self.devices = Self::demo_devices();
-            }
-
-            AirPlayResult::Ok
-        }
+        let platform_result = platform_start_discovery(&mut self.platform_discovery);
+        let platform_devices = platform_get_devices(&self.platform_discovery);
+        let (result, devices) = discovery_outcome(platform_result, platform_devices);
+        self.devices = devices;
+        self.discovering = matches!(result, AirPlayResult::Ok);
+        result
     }
 
     /// Stop device discovery
@@ -286,7 +284,15 @@ impl AirPlayManager {
         }
     }
 
-    /// Disconnect from current device
+    /// Disconnect from current device.
+    ///
+    /// Refuses with a reason (REQ-A467 / REQ-A1936). The body used to clear `status.active` /
+    /// `status.device` / `status.stream_kind` / `status.playing` and return `Ok` — the exact
+    /// "flipping local state and reporting success" this module's header forbids, since no
+    /// receiver was ever told to tear anything down. It was missed when `connect` /
+    /// `start_stream` / `set_volume` were fixed, and two tests
+    /// (`test_manager_disconnect_not_connected`) had pinned the flip as deliberate
+    /// ("idempotent"). The status now keeps whatever the last **real** answer reported.
     pub fn disconnect(&mut self) -> AirPlayResult {
         if !self.is_available() {
             return AirPlayResult::Unavailable {
@@ -294,19 +300,9 @@ impl AirPlayManager {
             };
         }
 
-        if let Some(device) = &self.status.device {
-            // Update device list
-            if let Some(d) = self.devices.iter_mut().find(|d| d.id == device.id) {
-                d.connected = false;
-            }
+        AirPlayResult::NotImplemented {
+            reason: NOT_IMPLEMENTED.to_string(),
         }
-
-        self.status.active = false;
-        self.status.device = None;
-        self.status.stream_kind = None;
-        self.status.playing = false;
-
-        AirPlayResult::Ok
     }
 
     /// Start streaming media
@@ -362,7 +358,11 @@ impl AirPlayManager {
         }
     }
 
-    /// Stop current stream
+    /// Stop current stream.
+    ///
+    /// Refuses with a reason (REQ-A467 / REQ-A1936): the body used to clear `stream_kind` /
+    /// `playing` and return `Ok` while no receiver was told to stop anything. `start_stream`
+    /// already refuses, so there is no stream this could honestly stop.
     pub fn stop_stream(&mut self) -> AirPlayResult {
         if !self.is_available() {
             return AirPlayResult::Unavailable {
@@ -370,10 +370,9 @@ impl AirPlayManager {
             };
         }
 
-        self.status.stream_kind = None;
-        self.status.playing = false;
-
-        AirPlayResult::Ok
+        AirPlayResult::NotImplemented {
+            reason: NOT_IMPLEMENTED.to_string(),
+        }
     }
 
     /// Set playback volume.
@@ -395,43 +394,6 @@ impl AirPlayManager {
         AirPlayResult::NotImplemented {
             reason: NOT_IMPLEMENTED.to_string(),
         }
-    }
-
-    /// Generate demo devices for development
-    #[cfg(debug_assertions)]
-    fn demo_devices() -> Vec<AirPlayDevice> {
-        vec![
-            AirPlayDevice {
-                id: "demo-appletv".to_string(),
-                name: "Living Room Apple TV".to_string(),
-                kind: DeviceKind::AppleTv,
-                supports_video: true,
-                supports_audio: true,
-                supports_mirroring: true,
-                signal_strength: 85,
-                connected: false,
-            },
-            AirPlayDevice {
-                id: "demo-homepod".to_string(),
-                name: "Bedroom HomePod".to_string(),
-                kind: DeviceKind::Audio,
-                supports_video: false,
-                supports_audio: true,
-                supports_mirroring: false,
-                signal_strength: 70,
-                connected: false,
-            },
-            AirPlayDevice {
-                id: "demo-tv".to_string(),
-                name: "Samsung Smart TV".to_string(),
-                kind: DeviceKind::Tv,
-                supports_video: true,
-                supports_audio: true,
-                supports_mirroring: true,
-                signal_strength: 60,
-                connected: false,
-            },
-        ]
     }
 }
 
@@ -552,11 +514,11 @@ mod tests {
         let mut mgr = AirPlayManager::new();
         if mgr.is_available() {
             let result = mgr.start_discovery();
+            // No arm asserts a non-empty device list: discovery reports only what the platform
+            // enumerated, and inventing receivers on `Ok` is the defect REQ-A1945 ∕ F-SH-941
+            // removed. `Ok` here means the platform started (a genuinely empty list is fine).
             match result {
-                AirPlayResult::Ok => {
-                    #[cfg(debug_assertions)]
-                    assert!(!mgr.get_devices().is_empty());
-                }
+                AirPlayResult::Ok => {}
                 // Every other outcome is a refusal, and all three refusal variants that can
                 // carry a reason must carry one: "it did not work" with no sentence is the
                 // defect worth failing on. Before REQ-A388 this was a single-pattern `match`
@@ -570,6 +532,56 @@ mod tests {
                 AirPlayResult::DeviceNotFound => {}
             }
         }
+    }
+
+    /// REQ-A1945 / F-SH-941: discovery must never **invent** a receiver. An empty platform
+    /// list means "no device heard", not "here are three demo ones" — the old body answered
+    /// `Ok` with `demo-appletv` / `demo-homepod` / `demo-tv` in debug builds, so the panel
+    /// listed AirPlay targets no radio had heard. This pins the honest answer.
+    #[test]
+    fn discovery_never_invents_devices_from_an_empty_platform_list() {
+        let (result, devices) = discovery_outcome(AirPlayResult::Ok, Vec::new());
+        assert!(matches!(result, AirPlayResult::Ok));
+        assert!(
+            devices.is_empty(),
+            "an empty platform list must not be supplemented with fabricated receivers, got {devices:?}"
+        );
+    }
+
+    /// REQ-A1945 / F-SH-941: a platform refusal is never upgraded to `Ok`. The non-Apple
+    /// stub answers `Unavailable`, and the manager used to override it with `Ok`.
+    #[test]
+    fn discovery_keeps_the_platforms_own_refusal() {
+        let (result, devices) = discovery_outcome(
+            AirPlayResult::Unavailable {
+                reason: "AirPlay platform integration not implemented for this OS".to_string(),
+            },
+            Vec::new(),
+        );
+        assert!(
+            matches!(result, AirPlayResult::Unavailable { .. }),
+            "a platform refusal must not be upgraded to Ok, got {result:?}"
+        );
+        assert!(devices.is_empty(), "a refused discovery reports no devices");
+    }
+
+    /// REQ-A1945 / F-SH-941: the platform's own enumerated devices pass through untouched.
+    #[test]
+    fn discovery_keeps_the_devices_the_platform_reported() {
+        let device = AirPlayDevice {
+            id: "real-receiver".to_string(),
+            name: "A receiver the platform heard".to_string(),
+            kind: DeviceKind::AppleTv,
+            supports_video: true,
+            supports_audio: true,
+            supports_mirroring: true,
+            signal_strength: 42,
+            connected: false,
+        };
+        let (result, devices) = discovery_outcome(AirPlayResult::Ok, vec![device]);
+        assert!(matches!(result, AirPlayResult::Ok));
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "real-receiver");
     }
 
     /// REQ-A467: `connect` used to flip `device.connected` / `status.active` and answer `Ok` with
@@ -619,6 +631,100 @@ mod tests {
         assert!(
             !mgr.get_devices().iter().any(|d| d.connected),
             "a refused connect must not mark the device connected"
+        );
+    }
+
+    /// Build a manager that *looks* like it has a live session, so a test can prove the
+    /// mutating operations leave that state alone rather than silently clearing it.
+    fn manager_with_a_pretend_session() -> AirPlayManager {
+        let mut mgr = AirPlayManager::new();
+        let device = AirPlayDevice {
+            id: "probe-device".to_string(),
+            name: "A receiver the manager believes in".to_string(),
+            kind: DeviceKind::AppleTv,
+            supports_video: true,
+            supports_audio: true,
+            supports_mirroring: true,
+            signal_strength: 50,
+            connected: true,
+        };
+        mgr.devices.push(device.clone());
+        mgr.status.active = true;
+        mgr.status.device = Some(device);
+        mgr.status.stream_kind = Some(StreamKind::Audio);
+        mgr.status.playing = true;
+        mgr
+    }
+
+    /// REQ-A1936: `disconnect` was missed when REQ-A467 fixed `connect` / `start_stream` /
+    /// `set_volume`. It cleared `status.active` / `status.device` / `status.stream_kind` /
+    /// `status.playing` and answered `Ok` — "flipping local state and reporting success", the
+    /// one thing this module's header forbids, and no receiver was ever told to tear anything
+    /// down. Its two sibling tests even pinned the flip as deliberate ("idempotent"). This
+    /// pins the opposite: a refusal that explains itself, and a status that did not move.
+    #[test]
+    fn test_disconnect_refuses_and_does_not_fake_a_teardown() {
+        let mut mgr = manager_with_a_pretend_session();
+        if !mgr.is_available() {
+            return;
+        }
+
+        match mgr.disconnect() {
+            AirPlayResult::NotImplemented { reason } => {
+                assert!(!reason.is_empty(), "a refusal must explain itself");
+            }
+            other => panic!("disconnect must refuse, got {other:?}"),
+        }
+
+        let status = mgr.get_status();
+        assert!(
+            status.active,
+            "a refused disconnect must not clear the session it cannot tear down"
+        );
+        assert!(
+            status.device.is_some(),
+            "a refused disconnect must not forget the device"
+        );
+        assert_eq!(
+            status.stream_kind,
+            Some(StreamKind::Audio),
+            "a refused disconnect must not clear the stream kind"
+        );
+        assert!(
+            status.playing,
+            "a refused disconnect must not report playback stopped"
+        );
+        assert!(
+            mgr.get_devices().iter().any(|d| d.connected),
+            "a refused disconnect must not unmark the device"
+        );
+    }
+
+    /// REQ-A1936: `stop_stream`'s mirror of the same miss — it cleared `stream_kind` /
+    /// `playing` and answered `Ok` while no receiver was told to stop anything.
+    #[test]
+    fn test_stop_stream_refuses_and_does_not_fake_a_stop() {
+        let mut mgr = manager_with_a_pretend_session();
+        if !mgr.is_available() {
+            return;
+        }
+
+        match mgr.stop_stream() {
+            AirPlayResult::NotImplemented { reason } => {
+                assert!(!reason.is_empty(), "a refusal must explain itself");
+            }
+            other => panic!("stop_stream must refuse, got {other:?}"),
+        }
+
+        let status = mgr.get_status();
+        assert_eq!(
+            status.stream_kind,
+            Some(StreamKind::Audio),
+            "a refused stop must not clear the stream kind"
+        );
+        assert!(
+            status.playing,
+            "a refused stop must not report playback stopped"
         );
     }
 }
