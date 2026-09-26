@@ -280,57 +280,92 @@ impl Sexp {
     }
 }
 
+impl Drop for Sexp {
+    /// Dismantle a list **iteratively** (REQ-A1912). A `Vec<Sexp>` field drops its
+    /// children recursively by default, so a deeply nested structure parsed without
+    /// recursion would still exhaust the stack when it is freed — re-opening the very
+    /// crash the iterative parser closed.
+    fn drop(&mut self) {
+        let mut stack = match self {
+            Sexp::List(items) => std::mem::take(items),
+            Sexp::Str(_) | Sexp::Atom(_) => return,
+        };
+        while let Some(mut node) = stack.pop() {
+            if let Sexp::List(items) = &mut node {
+                stack.append(items);
+            }
+        }
+    }
+}
+
 fn sexp_skip_ws(b: &[u8], i: &mut usize) {
     while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\r' | b'\n') {
         *i += 1;
     }
 }
 
-fn sexp_parse_node(b: &[u8], i: &mut usize) -> Option<Sexp> {
-    sexp_skip_ws(b, i);
-    match b.get(*i)? {
-        b'(' => {
-            *i += 1;
-            let mut items = Vec::new();
-            loop {
-                sexp_skip_ws(b, i);
-                if b.get(*i) == Some(&b')') {
-                    *i += 1;
-                    return Some(Sexp::List(items));
-                }
-                items.push(sexp_parse_node(b, i)?);
+/// Read one quoted string (the opening `"` is at `*i`). A `"` and a `\` inside
+/// are escaped with a backslash (RFC 3501 `quoted`).
+fn sexp_parse_quoted(b: &[u8], i: &mut usize) -> Option<Sexp> {
+    *i += 1; // the opening quote
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        match b.get(*i)? {
+            b'"' => {
+                *i += 1;
+                return Some(Sexp::Str(String::from_utf8_lossy(&out).to_string()));
             }
-        }
-        b'"' => {
-            *i += 1;
-            let mut out: Vec<u8> = Vec::new();
-            loop {
-                match b.get(*i)? {
-                    b'"' => {
-                        *i += 1;
-                        return Some(Sexp::Str(String::from_utf8_lossy(&out).to_string()));
-                    }
-                    // A quoted string escapes `"` and `\` with a backslash.
-                    b'\\' => {
-                        *i += 1;
-                        out.push(*b.get(*i)?);
-                        *i += 1;
-                    }
-                    c => {
-                        out.push(*c);
-                        *i += 1;
-                    }
-                }
-            }
-        }
-        _ => {
-            let start = *i;
-            while *i < b.len() && !matches!(b[*i], b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')') {
+            // A quoted string escapes `"` and `\` with a backslash.
+            b'\\' => {
+                *i += 1;
+                out.push(*b.get(*i)?);
                 *i += 1;
             }
-            Some(Sexp::Atom(
-                String::from_utf8_lossy(&b[start..*i]).to_string(),
-            ))
+            c => {
+                out.push(*c);
+                *i += 1;
+            }
+        }
+    }
+}
+
+/// Read one unquoted atom (`NIL`, a number, a subtype) up to the next delimiter.
+fn sexp_parse_atom(b: &[u8], i: &mut usize) -> Sexp {
+    let start = *i;
+    while *i < b.len() && !matches!(b[*i], b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')') {
+        *i += 1;
+    }
+    Sexp::Atom(String::from_utf8_lossy(&b[start..*i]).to_string())
+}
+
+/// Parse one node of a `BODYSTRUCTURE` s-expression.
+///
+/// **Iterative, never recursive** (REQ-A1912): the input is a `BODYSTRUCTURE`
+/// item from a *remote* IMAP server, so its nesting depth is attacker-chosen —
+/// a recursive-descent parser lets `((((…))))` exhaust the stack and abort the
+/// whole mail daemon. The open lists live on a heap `Vec` instead, so a deeply
+/// nested structure costs memory bounded by the input length, never a crash.
+fn sexp_parse_node(b: &[u8], i: &mut usize) -> Option<Sexp> {
+    let mut open: Vec<Vec<Sexp>> = Vec::new();
+    loop {
+        sexp_skip_ws(b, i);
+        let value = match b.get(*i)? {
+            b'(' => {
+                *i += 1;
+                open.push(Vec::new());
+                continue;
+            }
+            b')' => {
+                *i += 1;
+                Sexp::List(open.pop()?)
+            }
+            b'"' => sexp_parse_quoted(b, i)?,
+            _ => sexp_parse_atom(b, i),
+        };
+        match open.last_mut() {
+            Some(parent) => parent.push(value),
+            // Not inside any list: this was the one node the caller asked for.
+            None => return Some(value),
         }
     }
 }
@@ -360,59 +395,85 @@ fn param_value(params: &Sexp, key: &str) -> Option<String> {
 /// that claims an `attachment` disposition without a readable octet count is a
 /// structure we cannot describe, and it makes the whole walk `None` rather than
 /// reporting a fabricated `0`-byte file.
-fn collect_attachment_parts(node: &Sexp, out: &mut Vec<AttachmentMeta>) -> Option<()> {
-    let Sexp::List(items) = node else {
-        // `NIL` — a bodyless message: no parts, and not a malformed structure.
-        return Some(());
-    };
-    match items.first() {
-        // multipart/*: the parts come first, then the subtype string.
-        Some(Sexp::List(_)) => {
-            for it in items {
-                match it {
-                    Sexp::List(_) => collect_attachment_parts(it, out)?,
-                    _ => break,
-                }
-            }
-            return Some(());
-        }
-        // message/rfc822 keeps its encapsulated message's body at index 8.
-        Some(Sexp::Str(t)) if t.eq_ignore_ascii_case("MESSAGE") => {
-            if let Some(body) = items.get(8) {
-                collect_attachment_parts(body, out)?;
-            }
-        }
-        Some(Sexp::Str(_)) => {}
-        _ => return Some(()),
+fn collect_attachment_parts(root: &Sexp, out: &mut Vec<AttachmentMeta>) -> Option<()> {
+    /// One step of the walk: visit a node, or — for a `message/rfc822` part —
+    /// consider a container's own disposition *after* its encapsulated body.
+    enum Walk<'a> {
+        Node(&'a Sexp),
+        Disposition(&'a [Sexp]),
     }
-    let disposition = items.iter().find_map(|it| {
-        let Sexp::List(d) = it else { return None };
-        let kind = d.first()?.as_str()?;
-        kind.eq_ignore_ascii_case("attachment").then_some(d)
-    });
-    let Some(d) = disposition else {
-        return Some(());
-    };
-    let mime = format!(
-        "{}/{}",
-        items.first()?.as_str()?.to_ascii_lowercase(),
-        items.get(1)?.as_str()?.to_ascii_lowercase()
-    );
-    let size = items.get(6)?.as_str()?.parse::<u64>().ok()?;
-    let id = format!("part-{}", out.len() + 1);
-    // The disposition's own `FILENAME` parameter, else the part's `NAME`, else
-    // the part id — an obvious placeholder, never a filename we did not read.
-    let filename = d
-        .get(1)
-        .and_then(|p| param_value(p, "filename"))
-        .or_else(|| items.get(2).and_then(|p| param_value(p, "name")))
-        .unwrap_or_else(|| id.clone());
-    out.push(AttachmentMeta {
-        id,
-        filename,
-        mime,
-        size,
-    });
+
+    // Iterative (REQ-A1912): the tree's depth tracks the remote `BODYSTRUCTURE`,
+    // so the recursion this replaced was attacker-depth. The work list is heap.
+    let mut stack: Vec<Walk<'_>> = vec![Walk::Node(root)];
+    while let Some(work) = stack.pop() {
+        let items = match work {
+            Walk::Disposition(items) => items,
+            Walk::Node(node) => {
+                let Sexp::List(items) = node else {
+                    // `NIL` — a bodyless message: no parts, and not a malformed structure.
+                    continue;
+                };
+                match items.first() {
+                    // multipart/*: the parts come first, then the subtype string.
+                    Some(Sexp::List(_)) => {
+                        // Pushed in reverse so the stack pops them left-to-right — the
+                        // order the recursive walk produced, which the `part-N` ids depend on.
+                        let children: Vec<&Sexp> = items
+                            .iter()
+                            .take_while(|it| matches!(it, Sexp::List(_)))
+                            .collect();
+                        for it in children.into_iter().rev() {
+                            stack.push(Walk::Node(it));
+                        }
+                        continue;
+                    }
+                    // message/rfc822 keeps its encapsulated message's body at index 8.
+                    Some(Sexp::Str(t)) if t.eq_ignore_ascii_case("MESSAGE") => {
+                        // The body's parts are collected *before* this part's own disposition
+                        // (the recursion recursed, then fell through), so the body is visited
+                        // first and this container's disposition last.
+                        stack.push(Walk::Disposition(items.as_slice()));
+                        if let Some(body) = items.get(8) {
+                            stack.push(Walk::Node(body));
+                        }
+                        continue;
+                    }
+                    Some(Sexp::Str(_)) => {}
+                    _ => continue,
+                }
+                items.as_slice()
+            }
+        };
+        let disposition = items.iter().find_map(|it| {
+            let Sexp::List(d) = it else { return None };
+            let kind = d.first()?.as_str()?;
+            kind.eq_ignore_ascii_case("attachment").then_some(d)
+        });
+        let Some(d) = disposition else {
+            continue;
+        };
+        let mime = format!(
+            "{}/{}",
+            items.first()?.as_str()?.to_ascii_lowercase(),
+            items.get(1)?.as_str()?.to_ascii_lowercase()
+        );
+        let size = items.get(6)?.as_str()?.parse::<u64>().ok()?;
+        let id = format!("part-{}", out.len() + 1);
+        // The disposition's own `FILENAME` parameter, else the part's `NAME`, else
+        // the part id — an obvious placeholder, never a filename we did not read.
+        let filename = d
+            .get(1)
+            .and_then(|p| param_value(p, "filename"))
+            .or_else(|| items.get(2).and_then(|p| param_value(p, "name")))
+            .unwrap_or_else(|| id.clone());
+        out.push(AttachmentMeta {
+            id,
+            filename,
+            mime,
+            size,
+        });
+    }
     Some(())
 }
 
@@ -2563,6 +2624,42 @@ mod tests {
         .is_none());
         // Trailing junk is not a structure either.
         assert!(parse_attachment_meta("(\"TEXT\" \"PLAIN\") garbage").is_none());
+    }
+
+    /// A `BODYSTRUCTURE` is read from a **remote** server, so its nesting depth is
+    /// the server's choice. A deep one must cost memory, not the stack (REQ-A1912):
+    /// the recursive walk this replaced aborted the process here.
+    #[test]
+    fn a_deeply_nested_body_structure_is_walked_without_recursion() {
+        let depth = 200_000;
+        let mut structure = "(".repeat(depth);
+        structure.push_str("NIL");
+        structure.push_str(&")".repeat(depth));
+        let got = parse_attachment_meta(&structure).expect("a readable structure");
+        assert!(got.is_empty(), "a nest of lists describes no attachment");
+    }
+
+    /// A `message/rfc822` part is walked into its encapsulated body *before* its own
+    /// disposition is considered — one attached file inside, one attached message
+    /// outside, in that order (REQ-A1912 pins the order the iterative walk preserves).
+    #[test]
+    fn an_attached_message_reports_its_inner_parts_before_itself() {
+        let inner = "(\"APPLICATION\" \"ZIP\" (\"NAME\" \"inner.zip\") NIL NIL \"BASE64\" 7 1 (\"ATTACHMENT\" (\"FILENAME\" \"inner.zip\")) NIL NIL NIL)";
+        let outer = format!(
+            "(\"MESSAGE\" \"RFC822\" (\"NAME\" \"outer.eml\") NIL NIL \"7BIT\" 100 NIL {inner} 3 (\"ATTACHMENT\" (\"FILENAME\" \"outer.eml\")))"
+        );
+        let got = parse_attachment_meta(&outer).expect("a readable structure");
+        assert_eq!(
+            got.len(),
+            2,
+            "inner part then the attached message: {got:?}"
+        );
+        assert_eq!(got[0].filename, "inner.zip");
+        assert_eq!(got[0].mime, "application/zip");
+        assert_eq!(got[0].size, 7);
+        assert_eq!(got[1].filename, "outer.eml");
+        assert_eq!(got[1].mime, "message/rfc822");
+        assert_eq!(got[1].size, 100);
     }
 
     /// The `BODYSTRUCTURE` item is sliced by its own parentheses — a paren inside
